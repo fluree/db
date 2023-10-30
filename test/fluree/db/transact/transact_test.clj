@@ -51,7 +51,8 @@
               [:type :id "@type"]
               [:id :id "@id"]]
              @(fluree/query db-ok '{:select [?s ?p ?o]
-                                    :where  [[?s ?p ?o]]})))))
+                                    :where  {:id ?s
+                                             ?p ?o}})))))
 
   (testing "Allow transacting `false` values"
     (let [conn    (test-utils/create-conn)
@@ -69,7 +70,7 @@
               [:type :id "@type"]
               [:id :id "@id"]]
              @(fluree/query db-bool '{:select [?s ?p ?o]
-                                      :where  [[?s ?p ?o]]})))))
+                                      :where  {:id ?s, ?p ?o}})))))
 
   (testing "mixed data types (ref & string) are handled correctly"
     (let [conn   (test-utils/create-conn)
@@ -83,8 +84,7 @@
           _db    @(fluree/commit! ledger db)
           loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
           db     (fluree/db loaded)
-          query  '{:select {?b [:*]}
-                   :where  [[?b :id :ex/brian]]}]
+          query  '{:select {:ex/brian [:*]}}]
       (is (= [{:id               :ex/brian
                :ex/favCoffeeShop [{:id :wiki/Q37158} "Clemmons Coffee"]}]
              @(fluree/query db query)))))
@@ -101,8 +101,7 @@
           _db    @(fluree/commit! ledger db)
           loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
           db     (fluree/db loaded)
-          query  '{:select {?b [:*]}
-                   :where  [[?b :id :ex/wes]]}]
+          query  '{:select {:ex/wes [:*]}}]
       (is (= [{:id                        :ex/wes
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
              @(fluree/query db query)))))
@@ -119,8 +118,7 @@
           _db    @(fluree/commit! ledger db)
           loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
           db     (fluree/db loaded)
-          query  '{:select {?b [:*]}
-                   :where  [[?b :id :ex/brian]]}]
+          query  '{:select {:ex/brian [:*]}}]
       (is (= [{:id               :ex/brian
                :ex/favCoffeeShop [{:id :wiki/Q37158} "Clemmons Coffee"]}]
              @(fluree/query db query)))))
@@ -137,8 +135,7 @@
           _db    @(fluree/commit! ledger db)
           loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
           db     (fluree/db loaded)
-          query  '{:select {?b [:*]}
-                   :where  [[?b :id :ex/wes]]}]
+          query  '{:select {:ex/wes [:*]}}]
       (is (= [{:id                        :ex/wes
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
              @(fluree/query db query))))))
@@ -170,7 +167,7 @@
                             (fluree/db ledger)
                             (into policy data))
           user-query      '{:select {?s [:*]}
-                            :where  [[?s :type :ex/User]]}]
+                            :where  {:id ?s, :type :ex/User}}]
       (let [users [{:id :ex/john, :type :ex/User, :schema/name "John"}
                    {:id :ex/alice, :type :ex/User, :schema/name "Alice"}]]
         (is (= users
@@ -198,8 +195,9 @@
             db2     @(fluree/stage db0 movies)
             _       (assert (not (util/exception? db2)))
             query   {"select" "?title"
-                     "where"  [["?m" "type" "ex:Movie"]
-                               ["?m" "ex:title" "?title"]]}
+                     "where"  {"@id"      "?m"
+                               "type"     "ex:Movie"
+                               "ex:title" "?title"}}
             results @(fluree/query db2 query)]
         (is (= 100 (count results)))
         (is (every? (set results)
@@ -220,7 +218,7 @@
                                     :type :ex/Nothing})
         _           @(fluree/commit! ledger db)
         user-query  '{:select {?s [:*]}
-                      :where  [[?s :type :ex/User]]}]
+                      :where  {:id ?s, :type :ex/User}}]
     (testing "Top-level context is used for transaction nodes"
       (let [txn {:f/ledger ledger-name
                  :context  {:f     "https://ns.flur.ee/ledger#"
@@ -301,7 +299,7 @@
             db1  @(fluree/transact! conn txn1 nil)]
         (is (= [{:id :ex/foo, :type :ex/Person, :ex/name "Foo"}]
                @(fluree/query db1 '{:select {?p [:*]}
-                                    :where  [[?p :type :ex/Person]]})))
+                                    :where  {:id ?p, :type :ex/Person}})))
         (is (thrown-with-msg? Exception #"Invalid compact-iri"
                               @(fluree/transact! conn txn2 nil)))))
     (testing "Throws on invalid txn"
@@ -331,7 +329,8 @@
                "http://example.org/terms/isScary" false}]
              @(fluree/query db1 {"@context" nil
                                  "select"   '{?m ["*"]}
-                                 "where"    '[[?m "@type" "http://example.org/terms/SeaMonster"]]})))))
+                                 "where"    '{"@id" ?m
+                                              "@type" "http://example.org/terms/SeaMonster"}})))))
   (testing "@base & @vocab work w/ stage2"
     (let [conn        (test-utils/create-conn)
           ctx         ["https://ns.flur.ee"
@@ -351,4 +350,5 @@
                "http://example.org/terms/isScary" false}]
              @(fluree/query db1 '{"@context" nil
                                   "select"   {?m ["*"]}
-                                  "where"    [[?m "@type" "http://example.org/terms/SeaMonster"]]}))))))
+                                  "where"    {"@id" ?m
+                                              "@type" "http://example.org/terms/SeaMonster"}}))))))
