@@ -183,15 +183,15 @@
     (-> explain-data
         (v/format-explained-errors nil))))
 
-
 (defn coerce-query
   [qry]
   (try*
     (coerce-query* qry)
     (catch* e
-            (let [error-msg        (humanize-error e)
-                  _         (log/trace "humanized errors:" error-msg)]
-              (throw (ex-info error-msg {:status 400, :error :db/invalid-query}))))))
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-query})
+          throw))))
 
 (def parse-selector
   (m/parser ::selector {:registry registry}))

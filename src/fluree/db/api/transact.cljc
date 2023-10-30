@@ -48,22 +48,22 @@
           expanded                (json-ld/expand txn)
           opts                    (util/get-first-value expanded const/iri-opts)
           parsed-opts             (cond-> parsed-opts did (assoc :did did))
-
           {:keys [maxFuel meta] :as parsed-opts*} (parse-opts opts parsed-opts)]
       (if (or maxFuel meta)
-        (let [start-time   #?(:clj (System/nanoTime)
+        (let [start-time   #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))
               fuel-tracker (fuel/tracker maxFuel)]
-          (try* (let [result (<? (tx/stage2 db fuel-tracker expanded parsed-opts*))]
-                  {:status 200
-                   :result result
-                   :time   (util/response-time-formatted start-time)
-                   :fuel   (fuel/tally fuel-tracker)})
-                (catch* e
-                        (throw (ex-info "Error staging database"
-                                        {:time (util/response-time-formatted start-time)
-                                         :fuel (fuel/tally fuel-tracker)}
-                                        e)))))
+          (try*
+            (let [result (<? (tx/stage2 db fuel-tracker expanded parsed-opts*))]
+              {:status 200
+               :result result
+               :time   (util/response-time-formatted start-time)
+               :fuel   (fuel/tally fuel-tracker)})
+            (catch* e
+              (throw (ex-info "Error staging database"
+                              {:time (util/response-time-formatted start-time)
+                               :fuel (fuel/tally fuel-tracker)}
+                              e)))))
         (<? (tx/stage2 db expanded parsed-opts*))))))
 
 (defn parse-json-ld-txn
