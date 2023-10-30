@@ -283,10 +283,10 @@
     ::bind                 [:+ {:error/message "bind values must be mappings from variables to functions"}
                             [:catn [:var ::var]
                              [:binding ::function]]]
-    ::where-op             [:enum {:decode/fql    string->keyword
-                                   :decode/json   string->keyword
-                                   :error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind"}
-                            :graph :filter :optional :union :bind]
+    ::where-op             [:and
+                            :keyword
+                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind"}
+                             :graph :filter :optional :union :bind]]
     ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
