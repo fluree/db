@@ -92,7 +92,7 @@
     ;; failures will have the same `:in`, despite the limit failure
     ;; being more specific. This second number differentiates
     ;; those cases.
-    [(- (count in)) (if (and (or (contains? properties :max )
+    [(- (count in)) (if (and (or (contains? properties :max)
                                  (contains? properties :min))
                              (= type :malli.core/limits))
                       -1
@@ -244,11 +244,11 @@
   Prefers top-level `:fn` errors, if present, otherwise
   chooses an error based on heuristics."
   [explained-error opts]
-   (let [error-opts   (or opts default-error-overrides)
-         {:keys [errors schema value]} explained-error
-         e (or (top-level-fn-error errors)
-               (choose-relevant-error explained-error))]
-     (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts))))))
+  (let [error-opts (or opts default-error-overrides)
+        {:keys [errors schema value]} explained-error
+        e          (or (top-level-fn-error errors)
+                       (choose-relevant-error explained-error))]
+    (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts))))))
 
 (def registry
   (merge
@@ -307,14 +307,15 @@
                             [:where [:ref ::where]]]
     ::where-map            [:orn {:error/message "Invalid where map, must be either named graph or valid where operation map"}
                             [:named ::graph-map]
-                            [:default [:and
-                                      [:map-of {:max 1 :error/message "Unnamed where map can only have 1 key/value pair"}
-                                       ::where-op :any]
-                                      [:multi {:dispatch where-op}
-                                       [:filter [:map [:filter [:ref ::filter]]]]
-                                       [:optional [:map [:optional [:ref ::optional]]]]
-                                       [:union [:map [:union [:ref ::union]]]]
-                                       [:bind [:map [:bind [:ref ::bind]]]]]]]]
+                            [:default
+                             [:and
+                              [:map-of {:max 1 :error/message "Unnamed where map can only have 1 key/value pair"}
+                               ::where-op :any]
+                              [:multi {:dispatch where-op}
+                               [:filter [:map [:filter [:ref ::filter]]]]
+                               [:optional [:map [:optional [:ref ::optional]]]]
+                               [:union [:map [:union [:ref ::union]]]]
+                               [:bind [:map [:bind [:ref ::bind]]]]]]]]
     ::where-tuple          [:orn {:error/message "Invalid tuple"}
                             [:triple ::triple]
                             [:remote [:sequential {:max 4} :any]]]
