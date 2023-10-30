@@ -1,5 +1,6 @@
 (ns fluree.db.query.history
   (:require [clojure.core.async :as async :refer [go >! <!]]
+            [fluree.db.query.fql.syntax :as syntax]
             [malli.core :as m]
             [malli.transform :as mt]
             [fluree.json-ld :as json-ld]
@@ -114,8 +115,7 @@
        - positive t-value
        - datetime string
        - :latest keyword"
-  (m/coercer ::history-query (mt/transformer {:name :fql})
-             {:registry registry}))
+  (m/coercer ::history-query syntax/fql-transformer {:registry registry}))
 
 (def explain-error
   (m/explainer ::history-query {:registry registry}))

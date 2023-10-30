@@ -294,10 +294,10 @@
                             [:collection [:sequential ::where-pattern]]]
     ::union                [:sequential [:sequential ::where-pattern]]
     ::bind                 [:map-of {:error/message "Invalid bind, must be a map with variable keys"} ::var :any]
-    ::where-op             [:enum {:decode/fql  string->keyword
-                                   :decode/json string->keyword
-                                   :error/message "Unrecognized operation in where map, must be one of: filter, optional, union, bind"}
-                            :filter :optional :union :bind]
+    ::where-op             [:and
+                            :keyword
+                            [:enum {:error/message "Unrecognized operation in where map, must be one of: filter, optional, union, bind"}
+                             :filter :optional :union :bind]]
     ::graph                [:orn {:error/message "Value of \"graph\" should be ledger alias or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
