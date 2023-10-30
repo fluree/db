@@ -93,7 +93,7 @@
                      :ex/location {:id nil}}]
                    @(fluree/query update-name
                                   {:select {'?s [:*]}
-                                   :where  [['?s :schema/name "Alice"]]
+                                   :where  {:id '?s, :schema/name "Alice"}
                                    :opts {:did alice-did}}))
                 "Alice should be allowed to update her own name.")))
         (testing "using role only"
@@ -109,7 +109,7 @@
                        :schema/priceCurrency "USD"}]
                      @(fluree/query update-price
                                     {:select {'?s [:*]}
-                                     :where  [['?s :type :ex/Product]]}))
+                                     :where  {:id '?s, :type :ex/Product}}))
                   "Updated :schema/price should have been allowed, and entire product is visible in query."))
             (let [update-name @(fluree/stage db+policy
                                              {:id          :ex/widget
@@ -120,7 +120,7 @@
                        :schema/name "Widget2"}]
                      @(fluree/query update-name
                                     {:select {'?s [:*]}
-                                     :where  [['?s :type :ex/Product]]
+                                     :where  {:id '?s, :type :ex/Product}
                                      :opts {:role :ex/userRole}}))
                   "Updated :schema/name should have been allowed, and only name is visible in query."))))
       (testing "Policy doesn't allow a modification"
