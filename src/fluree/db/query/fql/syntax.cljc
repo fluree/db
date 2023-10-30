@@ -169,10 +169,13 @@
   [x]
   (triple-validator x))
 
+(def fql-transformer
+  (mt/transformer
+   {:name     :fql
+    :decoders (mt/-json-decoders)}))
+
 (def coerce-query*
-  (m/coercer ::query (mt/transformer {:name :fql}) {:registry registry}))
-
-
+  (m/coercer ::query fql-transformer {:registry registry}))
 
 (defn humanize-error
   [error]
@@ -197,7 +200,7 @@
   (m/parser ::selector {:registry registry}))
 
 (def coerce-modification*
-  (m/coercer ::modification (mt/transformer {:name :fql}) {:registry registry}))
+  (m/coercer ::modification fql-transformer {:registry registry}))
 
 (defn coerce-modification
   [mdfn]
