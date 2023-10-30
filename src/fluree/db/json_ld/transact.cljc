@@ -680,7 +680,6 @@
      (let [db* (if-let [policy-opts (perm/policy-opts parsed-opts)]
                  (<? (perm/wrap-policy db policy-opts))
                  db)
-
            tx-state      (->tx-state2 db*)
            context       (ctx-util/extract db* txn parsed-opts)
            parsed-txn    (q-parse/parse-txn txn context)

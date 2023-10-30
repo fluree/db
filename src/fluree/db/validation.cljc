@@ -98,7 +98,7 @@
     ;; failures will have the same `:in`, despite the limit failure
     ;; being more specific. This second number differentiates
     ;; those cases.
-    [(- (count in)) (if (and (or (contains? properties :max )
+    [(- (count in)) (if (and (or (contains? properties :max)
                                  (contains? properties :min))
                              (= type :malli.core/limits))
                       -1
@@ -250,11 +250,11 @@
   Prefers top-level `:fn` errors, if present, otherwise
   chooses an error based on heuristics."
   [explained-error opts]
-   (let [error-opts   (or opts default-error-overrides)
-         {:keys [errors schema value]} explained-error
-         e (or (top-level-fn-error errors)
-               (choose-relevant-error explained-error))]
-     (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts))))))
+  (let [error-opts (or opts default-error-overrides)
+        {:keys [errors schema value]} explained-error
+        e          (or (top-level-fn-error errors)
+                       (choose-relevant-error explained-error))]
+    (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts))))))
 
 (def registry
   (merge

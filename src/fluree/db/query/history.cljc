@@ -1,6 +1,6 @@
 (ns fluree.db.query.history
   (:require [clojure.core.async :as async :refer [go >! <!]]
-            [clojure.string :as str]
+            [fluree.db.query.fql.syntax :as syntax]
             [malli.core :as m]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
@@ -11,13 +11,10 @@
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.docs :as docs]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.db.json-ld :as jld-db]
-            [fluree.db.validation :as v]
-            [malli.error :as me]
-            [malli.transform :as mt]))
+            [fluree.db.validation :as v]))
 
 (defn history-query-schema
   "Returns schema for history queries, with any extra key/value pairs `extra-kvs`
@@ -59,7 +56,7 @@
           [:or {:error/message "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
            [:= :latest]
            [:int {:min 0
-                  :error/message "Must be a positive value"} ]
+                  :error/message "Must be a positive value"}]
            [:re datatype/iso8601-datetime-re]]]
          [:to {:optional true}
           [:or {:error/message "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
@@ -71,7 +68,7 @@
           [:or {:error/message "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
            [:= :latest]
            [:int {:min 0
-                  :error/message "Must be a positive value"} ]
+                  :error/message "Must be a positive value"}]
            [:re datatype/iso8601-datetime-re]]]]
         [:fn {:error/message "Must provide: either \"from\" or \"to\", or the key \"at\" "}
          (fn [{:keys [from to at]}]
@@ -117,8 +114,7 @@
        - positive t-value
        - datetime string
        - :latest keyword"
-  (m/coercer ::history-query (mt/transformer {:name :fql})
-             {:registry registry}))
+  (m/coercer ::history-query syntax/fql-transformer {:registry registry}))
 
 (def explain-error
   (m/explainer ::history-query {:registry registry}))

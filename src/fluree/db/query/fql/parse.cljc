@@ -337,7 +337,10 @@
 (defn parse-where
   [q vars context]
   (when-let [where (:where q)]
-    (parse-where-clause where vars context)))
+    (-> where
+        syntax/coerce-where
+        (log/debug->val "coerced where clause:")
+        (parse-where-clause vars context))))
 
 (defn parse-as-fn
   [f]
@@ -606,19 +609,19 @@
 
 (defn parse-txn
   [txn context]
-  (let [[vars values] (parse-values {:values (util/get-first-value txn const/iri-values)})
-        where         (parse-where {:where (util/get-first-value txn const/iri-where)} vars context)
+  (let [vals-map  {:values (util/get-first-value txn const/iri-values)}
+        [vars values] (parse-values vals-map)
+        where-map {:where (util/get-first-value txn const/iri-where)}
+        where     (parse-where where-map vars context)
 
-        delete (-> txn
-                   (util/get-first-value const/iri-delete)
-                   (json-ld/expand context)
-                   util/sequential
-                   parse-triples)
-        insert (-> txn
-                   (util/get-first-value const/iri-insert)
-                   (json-ld/expand context)
-                   util/sequential
-                   parse-triples)]
+        delete    (-> (util/get-first-value txn const/iri-delete)
+                      (json-ld/expand context)
+                      (util/sequential)
+                      (parse-triples))
+        insert    (-> (util/get-first-value txn const/iri-insert)
+                      (json-ld/expand context)
+                      (util/sequential)
+                      (parse-triples))]
     (cond-> {}
       context            (assoc :context context)
       where              (assoc :where where)

@@ -1,11 +1,9 @@
 (ns fluree.db.query.fql.syntax
-  (:require [clojure.string :as str]
-            [fluree.db.util.core :refer [try* catch*]]
+  (:require [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
             [fluree.db.util.docs :as docs]
             [malli.core :as m]
-            [malli.error :as me]
             [malli.transform :as mt]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -162,8 +160,13 @@
     ::from            ::v/from
     ::from-named      ::v/from-named}))
 
+(def fql-transformer
+  (mt/transformer
+   {:name     :fql
+    :decoders (mt/-json-decoders)}))
+
 (def coerce-query*
-  (m/coercer ::query (mt/transformer {:name :fql}) {:registry registry}))
+  (m/coercer ::query fql-transformer {:registry registry}))
 
 (defn humanize-error
   [error]
@@ -179,15 +182,29 @@
   (try*
     (coerce-query* qry)
     (catch* e
-            (let [error-msg        (humanize-error e)
-                  _         (log/trace "humanized errors:" error-msg)]
-              (throw (ex-info error-msg {:status 400, :error :db/invalid-query}))))))
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-query})
+          throw))))
+
+(def coerce-where*
+  (m/coercer ::where fql-transformer {:registry registry}))
+
+(defn coerce-where
+  [where]
+  (try*
+    (coerce-where* where)
+    (catch* e
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-query})
+          throw))))
 
 (def parse-selector
   (m/parser ::selector {:registry registry}))
 
 (def coerce-modification*
-  (m/coercer ::modification (mt/transformer {:name :fql}) {:registry registry}))
+  (m/coercer ::modification fql-transformer {:registry registry}))
 
 (defn coerce-modification
   [mdfn]
