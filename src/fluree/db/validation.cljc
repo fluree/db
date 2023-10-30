@@ -42,7 +42,7 @@
 (defn where-pattern-type
   [pattern]
   (if (sequential? pattern)
-    (first pattern)
+    (-> pattern first keyword)
     :node))
 
 (defn string->keyword
