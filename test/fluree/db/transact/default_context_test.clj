@@ -67,7 +67,7 @@
                :ex/y "bar-1"
                :id   :ex/foo}]
              @(fluree/query db1-load '{:select {?s [:*]}
-                                       :where  [[?s :ex/x nil]]}))))
+                                       :where  {:id ?s, :ex/x nil}}))))
 
     (testing "Updated default context is correct"
       (is (= {"ex-new" "http://example.org/ns/"
@@ -97,7 +97,7 @@
                :id       :ex-new/foo2}]
              @(fluree/query (fluree/db ledger-updated-load)
                             '{:select {?s [:*]}
-                              :where  [[?s :ex-new/x nil]]}))))
+                              :where  {:id ?s, :ex-new/x nil}}))))
 
     (testing "All default contexts can be retrieved by t"
       (is (= {"ex"     "http://example.org/ns/"
