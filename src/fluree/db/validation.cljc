@@ -285,7 +285,7 @@
                              [:binding ::function]]]
     ::where-op             [:enum {:decode/fql    string->keyword
                                    :decode/json   string->keyword
-                                   :error/message "unrecognized operation in where tuple, must be one of: graph, filter, optional, union, bind"}
+                                   :error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind"}
                             :graph :filter :optional :union :bind]
     ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
                             [:ledger ::ledger]
