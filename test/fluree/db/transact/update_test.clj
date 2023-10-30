@@ -26,53 +26,54 @@
 
           ;; delete everything for :ex/alice
           db-subj-delete @(fluree/stage db
-                                        '{:delete [:ex/alice ?p ?o]
-                                          :where  [[:ex/alice ?p ?o]]})
+                                        '{:delete {:id :ex/alice, ?p ?o}
+                                          :where  {:id :ex/alice, ?p ?o}})
 
           ;; delete any :schema/age values for :ex/bob
           db-subj-pred-del @(fluree/stage db
-                                          '{:delete [:ex/bob :schema/age ?o]
-                                            :where  [[:ex/bob :schema/age ?o]]})
+                                          '{:delete {:id :ex/bob, :schema/age ?o}
+                                            :where  {:id :ex/bob, :schema/age ?o}})
 
           ;; delete all subjects with a :schema/email predicate
           db-all-preds @(fluree/stage db
-                                      '{:delete [?s ?p ?o]
-                                        :where  [[?s :schema/email ?x]
-                                                 [?s ?p ?o]]})
+                                      '{:delete {:id ?s, ?p ?o}
+                                        :where  {:id           ?s
+                                                 :schema/email ?x
+                                                 ?p            ?o}})
 
           ;; delete all subjects where :schema/age = 30
           db-age-delete @(fluree/stage db
-                                       '{:delete [?s ?p ?o]
-                                         :where  [[?s :schema/age 30]
-                                                  [?s ?p ?o]]})
+                                       '{:delete {:id ?s, ?p ?o}
+                                         :where  {:id         ?s
+                                                  :schema/age 30
+                                                  ?p          ?o}})
 
           ;; Change Bob's age - but only if his age is still 22
           db-update-bob @(fluree/stage db
-                                       '{:delete [:ex/bob :schema/age 22]
-                                         :insert [:ex/bob :schema/age 23]
-                                         :where  [[:ex/bob :schema/age 22]]})
+                                       '{:delete {:id :ex/bob, :schema/age 22}
+                                         :insert {:id :ex/bob, :schema/age 23}
+                                         :where  {:id :ex/bob, :schema/age 22}})
 
           ;; Shouldn't change Bob's age as the current age is not a match
           db-update-bob2 @(fluree/stage db
-                                        '{:delete [:ex/bob :schema/age 99]
-                                          :insert [:ex/bob :schema/age 23]
-                                          :where  [[:ex/bob :schema/age 99]]})
+                                        '{:delete {:id :ex/bob, :schema/age 99}
+                                          :insert {:id :ex/bob, :schema/age 23}
+                                          :where  {:id :ex/bob, :schema/age 99}})
 
           ;; change Jane's age regardless of its current value
           db-update-jane @(fluree/stage db
-                                        '{:delete [:ex/jane :schema/age ?current-age]
-                                          :insert [:ex/jane :schema/age 31]
-                                          :where  [[:ex/jane :schema/age ?current-age]]})]
+                                        '{:delete {:id :ex/jane, :schema/age ?current-age}
+                                          :insert {:id :ex/jane, :schema/age 31}
+                                          :where  {:id :ex/jane, :schema/age ?current-age}})]
 
       (is (= @(fluree/query db-subj-delete
                             '{:select ?name
-                              :where  [[?s :schema/name ?name]]})
+                              :where  {:schema/name ?name}})
              ["Bob" "Jane"])
           "Only Jane and Bob should be left in the db.")
 
       (is (= @(fluree/query db-subj-pred-del
-                            '{:selectOne {?s [:*]}
-                              :where     [[?s :id :ex/bob]]})
+                            '{:selectOne {:ex/bob [:*]}})
              {:id          :ex/bob,
               :type    :ex/User,
               :schema/name "Bob"})
@@ -80,13 +81,13 @@
 
       (is (= @(fluree/query db-all-preds
                             '{:select ?name
-                              :where  [[?s :schema/name ?name]]})
+                              :where  {:schema/name ?name}})
              ["Bob"])
           "Only Bob should be left, as he is the only one without an email.")
 
       (is (= @(fluree/query db-age-delete
                             '{:select ?name
-                              :where  [[?s :schema/name ?name]]})
+                              :where  {:schema/name ?name}})
              ["Alice" "Bob"])
           "Only Bob and Alice should be left in the db.")
 
@@ -96,8 +97,7 @@
                  :schema/name "Bob"
                  :schema/age  23}]
                @(fluree/query db-update-bob
-                              '{:select {?s [:*]}
-                                :where  [[?s :id :ex/bob]]}))
+                              '{:select {:ex/bob [:*]}}))
             "Bob's age should now be updated to 23 (from 22)."))
 
       (testing "No update should happen if there is no match."
@@ -106,8 +106,7 @@
                  :schema/name "Bob"
                  :schema/age  22}]
                @(fluree/query db-update-bob2
-                              '{:select {?s [:*]}
-                                :where  [[?s :id :ex/bob]]}))
+                              '{:select {:ex/bob [:*]}}))
             "Bob's age should have not been changed and still be 22."))
 
       (testing "Replacing existing property value with new property value."
@@ -117,8 +116,7 @@
                  :schema/email "jane@flur.ee"
                  :schema/age   31}]
                @(fluree/query db-update-jane
-                              '{:select {?s [:*]}
-                                :where  [[?s :id :ex/jane]]}))
+                              '{:select {:ex/jane [:*]}}))
             "Jane's age should now be updated to 31 (from 30).")))))
 
 (deftest transaction-functions
@@ -134,12 +132,14 @@
                                               {"id" "ex:hash-fns"
                                                "ex:message" "abc"}])
                           (fluree/stage {"delete" []
-                                         "where" [["?s" "id" "ex:hash-fns"]
-                                                  ["?s" "ex:message" "?message"]
-                                                  {"bind" {"?sha256" "(sha256 ?message)"
-                                                           "?sha512" "(sha512 ?message)"}}]
-                                         "insert" [["?s" "ex:sha256" "?sha256"]
-                                                   ["?s" "ex:sha512" "?sha512"]]}))]
+                                         "where" [{"id" "ex:hash-fns"
+                                                   "ex:message" "?message"}
+                                                  ["bind"
+                                                   "?sha256" "(sha256 ?message)"
+                                                   "?sha512" "(sha512 ?message)"]]
+                                         "insert" {"id" "ex:hash-fns"
+                                                   "ex:sha256" "?sha256"
+                                                   "ex:sha512" "?sha512"}}))]
           (is (= {"ex:sha512" "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
                   "ex:sha256" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}
                  @(fluree/query @updated {"where" [["?s" "id" "ex:hash-fns"]]
@@ -416,8 +416,9 @@
         db1 @(fluree/commit! ledger love)]
     (testing "before deletion"
       (let [q       '{:select [?s ?p ?o]
-                      :where  [[?s "schema:description" ?o]
-                               [?s ?p ?o]]}
+                      :where  {"@id"                ?s
+                               "schema:description" ?o
+                               ?p                   ?o}}
             subject @(fluree/query db1 q)]
         (is (= [["ex:fluree" "schema:description" "We ❤️ Data"]
                 ["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
@@ -429,13 +430,16 @@
                          {:context  {:id "@id", :graph "@graph",
                                      :f  "https://ns.flur.ee/ledger#"}
                           :f/ledger ledger-id
-                          :graph    {:delete '[?s ?p ?o]
-                                     :where  '[[?s "schema:description" ?o]
-                                               [?s ?p ?o]]}} nil)
+                          :graph    {:delete '{"id" ?s, ?p ?o}
+                                     :where  '{"id"                  ?s
+                                               "schema:description" ?o
+                                               ?p                   ?o}}}
+                         nil)
       (let [db2   (fluree/db @(fluree/load conn ledger-id))
             q       '{:select [?s ?p ?o]
-                      :where  [[?s "schema:description" ?o]
-                               [?s ?p ?o]]}
+                      :where  {"id"                 ?s
+                               "schema:description" ?o
+                               ?p                   ?o}}
             subject @(fluree/query db2 q)]
         (is (= []
                subject)
