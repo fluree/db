@@ -2,7 +2,6 @@
   (:require [clojure.core.async :as async :refer [go >! <!]]
             [fluree.db.query.fql.syntax :as syntax]
             [malli.core :as m]
-            [malli.transform :as mt]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
