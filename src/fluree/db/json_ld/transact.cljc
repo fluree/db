@@ -612,24 +612,25 @@
                                        (group-by flake/p)))
                 o-pred-shapes   (when (seq pid->ref-flakes)
                                   (<? (shacl/targetobject-shapes db-before (keys pid->ref-flakes))))
-                ;; thes target subjects in s-flakes
+                ;; these target subjects in s-flakes
                 referring-pids (when has-target-objects-of-shapes
                                  (<? (query-range/index-range db-before :opst = [sid]
                                                               {:flake-xf (map flake/p)})))
                 s-pred-shapes  (when (seq referring-pids)
                                  (<? (shacl/targetobject-shapes db-before referring-pids)))
-                subject-meta   {:new?    (boolean new-subject?)
-                                :classes classes
-                                :shacl   (into class-shapes s-pred-shapes)}]
+                shacl-shapes   (into class-shapes s-pred-shapes)]
             (recur r (reduce
                        (fn [subj-mods o-pred-shape]
                          (let [target-os (->> (get pid->ref-flakes (:target-objects-of o-pred-shape))
                                               (mapv flake/o))]
                            (reduce (fn [subj-mods target-o]
-                                     (update-in subj-mods [target-o :shacl] conj o-pred-shape))
+                                     (update-in subj-mods [target-o :shacl] (fnil conj []) o-pred-shape))
                                    subj-mods
                                    target-os)))
-                       (-> subj-mods (assoc sid subject-meta))
+                       (-> subj-mods
+                           (assoc-in [sid :new?] (boolean new-subject?))
+                           (update-in [sid :classes] (fnil into []) classes)
+                           (update-in [sid :shacl] (fnil into []) shacl-shapes))
                        o-pred-shapes)))
           subj-mods)))))
 

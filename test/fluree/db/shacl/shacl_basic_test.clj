@@ -1512,32 +1512,32 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
 
 (deftest ^:integration shape-based-constraints
   (testing "sh:node"
-    (let [conn           @(fluree/connect {:method :memory})
-          ledger         @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
-                                                                                   {"ex" "http://example.com/"}]})
-          db0            (fluree/db ledger)
+    (let [conn   @(fluree/connect {:method :memory})
+          ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
+                                                                           {"ex" "http://example.com/"}]})
+          db0    (fluree/db ledger)
 
           db1            @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
-                                              "insert" [{"id"          "ex:AddressShape"
-                                                         "type"        "sh:NodeShape"
-                                                         "sh:property" [{"sh:path"     {"id" "ex:postalCode"}
-                                                                         "sh:maxCount" 1}]}
-                                                        {"id"             "ex:PersonShape"
-                                                         "type"           "sh:NodeShape"
-                                                         "sh:targetClass" {"id" "ex:Person"}
-                                                         "sh:property"    [{"sh:path"     {"id" "ex:address"}
-                                                                            "sh:node"     {"id" "ex:AddressShape"}
-                                                                            "sh:minCount" 1}]}]})
+                                              "insert"   [{"id"          "ex:AddressShape"
+                                                           "type"        "sh:NodeShape"
+                                                           "sh:property" [{"sh:path"     {"id" "ex:postalCode"}
+                                                                           "sh:maxCount" 1}]}
+                                                          {"id"             "ex:PersonShape"
+                                                           "type"           "sh:NodeShape"
+                                                           "sh:targetClass" {"id" "ex:Person"}
+                                                           "sh:property"    [{"sh:path"     {"id" "ex:address"}
+                                                                              "sh:node"     {"id" "ex:AddressShape"}
+                                                                              "sh:minCount" 1}]}]})
           valid-person   @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                              "insert" {"id"         "ex:Bob"
-                                                        "type"       "ex:Person"
-                                                        "ex:address" {"ex:postalCode" "12345"}}})
+                                              "insert"   {"id"         "ex:Bob"
+                                                          "type"       "ex:Person"
+                                                          "ex:address" {"ex:postalCode" "12345"}}})
           invalid-person @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                              "insert" {"id"         "ex:Reto"
-                                                        "type"       "ex:Person"
-                                                        "ex:address" {"ex:postalCode" ["12345" "45678"]}}})]
+                                              "insert"   {"id"         "ex:Reto"
+                                                          "type"       "ex:Person"
+                                                          "ex:address" {"ex:postalCode" ["12345" "45678"]}}})]
       (is (= [{"id"         "ex:Bob",
-               "type" "ex:Person",
+               "type"       "ex:Person",
                "ex:address" {"ex:postalCode" "12345"}}]
              @(fluree/query valid-person {"select" {"ex:Bob" ["*" {"ex:address" ["ex:postalCode"]}]}})))
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
@@ -1549,35 +1549,37 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                                                 {"ex" "http://example.com/"}]})
           db0         (fluree/db ledger)
           db1         @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
-                                           "insert" [{"id"             "ex:KidShape"
-                                                      "type"           "sh:NodeShape"
-                                                      "sh:targetClass" {"id" "ex:Kid"}
-                                                      "sh:property"
-                                                      [{"sh:path"                {"id" "ex:parent"}
-                                                        "sh:minCount"            2
-                                                        "sh:maxCount"            2
-                                                        "sh:qualifiedValueShape" {"sh:path"    {"id" "ex:gender"}
-                                                                                  "sh:pattern" "female"}
-                                                        "sh:qualifiedMinCount"   1}]}
-                                                     {"id"        "ex:Bob"
-                                                      "ex:gender" "male"}
-                                                     {"id"        "ex:Jane"
-                                                      "ex:gender" "female"}]})
+                                           "insert"   [{"id"             "ex:KidShape"
+                                                        "type"           "sh:NodeShape"
+                                                        "sh:targetClass" {"id" "ex:Kid"}
+                                                        "sh:property"
+                                                        [{"sh:path"                {"id" "ex:parent"}
+                                                          "sh:minCount"            2
+                                                          "sh:maxCount"            2
+                                                          "sh:qualifiedValueShape" {"sh:path"    {"id" "ex:gender"}
+                                                                                    "sh:pattern" "female"}
+                                                          "sh:qualifiedMinCount"   1}]}
+                                                       {"id"        "ex:Bob"
+                                                        "ex:gender" "male"}
+                                                       {"id"        "ex:Jane"
+                                                        "ex:gender" "female"}]})
           valid-kid   @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                           "insert" {"id"        "ex:ValidKid"
-                                                     "type"      "ex:Kid"
-                                                     "ex:parent" [{"id" "ex:Bob"} {"id" "ex:Jane"}]}})
+                                           "insert"   {"id"        "ex:ValidKid"
+                                                       "type"      "ex:Kid"
+                                                       "ex:parent" [{"id" "ex:Bob"} {"id" "ex:Jane"}]}})
           invalid-kid @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                           "insert" {"id"        "ex:InvalidKid"
-                                                     "type"      "ex:Kid"
-                                                     "ex:parent" [{"id" "ex:Bob"}
-                                                                  {"id"        "ex:Zorba"
-                                                                   "ex:gender" "alien"}]}})]
-      (is (= [{"id"        "ex:ValidKid"
-               "type" "ex:Kid"
-               "ex:parent" [{"id" "ex:Bob"}
-                            {"id" "ex:Jane"}]}]
-             @(fluree/query valid-kid {"select" {"ex:ValidKid" ["*"]}})))
+                                           "insert"   {"id"        "ex:InvalidKid"
+                                                       "type"      "ex:Kid"
+                                                       "ex:parent" [{"id" "ex:Bob"}
+                                                                    {"id"        "ex:Zorba"
+                                                                     "ex:gender" "alien"}]}})]
+      (is (= {"id"        "ex:ValidKid"
+              "type"      "ex:Kid"
+              "ex:parent" [{"id" "ex:Bob"}
+                           {"id" "ex:Jane"}]}
+             (-> @(fluree/query valid-kid {"select" {"ex:ValidKid" ["*"]}})
+                 first
+                 (update "ex:parent" (partial sort-by #(get % "id"))))))
       (is (str/starts-with? (ex-message invalid-kid)
                             "SHACL PropertyShape exception - path "))))
   (testing "sh:qualifiedValueShape node shape"
@@ -1586,98 +1588,102 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                                            {"ex" "http://example.com/"}]})
           db0    (fluree/db ledger)
 
-          db1    @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
-                                      "insert" [{"id" "ex:KidShape"
-                                                 "type" "sh:NodeShape"
-                                                 "sh:targetClass" {"id" "ex:Kid"}
-                                                 "sh:property"
-                                                 [{"sh:path" {"id" "ex:parent"}
-                                                   "sh:minCount" 2
-                                                   "sh:maxCount" 2
-                                                   "sh:qualifiedValueShape"
-                                                   {"id" "ex:ParentShape"
-                                                    "type" "sh:NodeShape"
-                                                    "sh:targetClass" {"id" "ex:Parent"}
-                                                    "sh:property" {"sh:path" {"id" "ex:gender"}
-                                                                   "sh:pattern" "female"}}
-                                                   "sh:qualifiedMinCount" 1}]}
-                                                {"id" "ex:Mom"
-                                                 "type" "ex:Parent"
-                                                 "ex:gender" "female"}
-                                                {"id" "ex:Dad"
-                                                 "type" "ex:Parent"
-                                                 "ex:gender" "male"}]})
-          valid-kid @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                         "insert" {"id" "ex:ValidKid"
-                                                   "type" "ex:Kid"
-                                                   "ex:parent" [{"id" "ex:Mom"} {"id" "ex:Dad"}]}})
+          db1         @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                           "insert"   [{"id"             "ex:KidShape"
+                                                        "type"           "sh:NodeShape"
+                                                        "sh:targetClass" {"id" "ex:Kid"}
+                                                        "sh:property"
+                                                        [{"sh:path"              {"id" "ex:parent"}
+                                                          "sh:minCount"          2
+                                                          "sh:maxCount"          2
+                                                          "sh:qualifiedValueShape"
+                                                          {"id"             "ex:ParentShape"
+                                                           "type"           "sh:NodeShape"
+                                                           "sh:targetClass" {"id" "ex:Parent"}
+                                                           "sh:property"    {"sh:path"    {"id" "ex:gender"}
+                                                                             "sh:pattern" "female"}}
+                                                          "sh:qualifiedMinCount" 1}]}
+                                                       {"id"        "ex:Mom"
+                                                        "type"      "ex:Parent"
+                                                        "ex:gender" "female"}
+                                                       {"id"        "ex:Dad"
+                                                        "type"      "ex:Parent"
+                                                        "ex:gender" "male"}]})
+          valid-kid   @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
+                                           "insert"   {"id"        "ex:ValidKid"
+                                                       "type"      "ex:Kid"
+                                                       "ex:parent" [{"id" "ex:Mom"} {"id" "ex:Dad"}]}})
           invalid-kid @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                           "insert" {"id" "ex:InvalidKid"
-                                                     "type" "ex:Kid"
-                                                     "ex:parent" [{"id" "ex:Bob"}
-                                                                  {"id" "ex:Zorba"
-                                                                   "type" "ex:Parent"
-                                                                   "ex:gender" "alien"}]}})]
-      (is (= [{"id" "ex:ValidKid"
-               "type" "ex:Kid"
-               "ex:parent" [{"id" "ex:Mom"}
-                            {"id" "ex:Dad"}]}]
-             @(fluree/query valid-kid {"select" {"ex:ValidKid" ["*"]}})))
+                                           "insert"   {"id"        "ex:InvalidKid"
+                                                       "type"      "ex:Kid"
+                                                       "ex:parent" [{"id" "ex:Bob"}
+                                                                    {"id"        "ex:Zorba"
+                                                                     "type"      "ex:Parent"
+                                                                     "ex:gender" "alien"}]}})]
+      (is (= {"id"        "ex:ValidKid"
+              "type"      "ex:Kid"
+              "ex:parent" [{"id" "ex:Dad"}
+                           {"id" "ex:Mom"}]}
+             (-> @(fluree/query valid-kid {"select" {"ex:ValidKid" ["*"]}})
+                 first
+                 (update "ex:parent" (partial sort-by #(get % "id"))))))
       (is (= "SHACL PropertyShape exception - sh:pattern: value alien does not match pattern \"female\" or it is not a literal value."
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
-    (let [conn         @(fluree/connect {:method :memory})
-          ledger       @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
-                                                                                 {"ex" "http://example.com/"}]})
-          db0          (fluree/db ledger)
+    (let [conn   @(fluree/connect {:method :memory})
+          ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
+                                                                           {"ex" "http://example.com/"}]})
+          db0    (fluree/db ledger)
 
-          db1          @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
-                                            "insert" [{"id"      "ex:Digit"
-                                                       "ex:name" "Toe"}
-                                                      {"id"             "ex:HandShape"
-                                                       "type"           "sh:NodeShape"
-                                                       "sh:targetClass" {"id" "ex:Hand"}
-                                                       "sh:property"
-                                                       [{"sh:path" {"id" "ex:digit"}
-                                                         "sh:maxCount" 5}
-                                                        {"sh:path" {"id" "ex:digit"}
-                                                         "sh:qualifiedValueShape" {"sh:path" {"id" "ex:name"}
-                                                                                   "sh:pattern" "Thumb"}
-                                                         "sh:qualifiedMinCount" 1
-                                                         "sh:qualifiedMaxCount" 1
-                                                         "sh:qualifiedValueShapesDisjoint" true}
-                                                        {"sh:path" {"id" "ex:digit"}
-                                                         "sh:qualifiedValueShape" {"sh:path" {"id" "ex:name"}
-                                                                                   "sh:pattern" "Finger"}
-                                                         "sh:qualifiedMinCount" 4
-                                                         "sh:qualifiedMaxCount" 4
-                                                         "sh:qualifiedValueShapesDisjoint" true}]}]})
+          db1 @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                   "insert"   [{"id"      "ex:Digit"
+                                                "ex:name" "Toe"}
+                                               {"id"             "ex:HandShape"
+                                                "type"           "sh:NodeShape"
+                                                "sh:targetClass" {"id" "ex:Hand"}
+                                                "sh:property"
+                                                [{"sh:path"     {"id" "ex:digit"}
+                                                  "sh:maxCount" 5}
+                                                 {"sh:path"                         {"id" "ex:digit"}
+                                                  "sh:qualifiedValueShape"          {"sh:path"    {"id" "ex:name"}
+                                                                                     "sh:pattern" "Thumb"}
+                                                  "sh:qualifiedMinCount"            1
+                                                  "sh:qualifiedMaxCount"            1
+                                                  "sh:qualifiedValueShapesDisjoint" true}
+                                                 {"sh:path"                         {"id" "ex:digit"}
+                                                  "sh:qualifiedValueShape"          {"sh:path"    {"id" "ex:name"}
+                                                                                     "sh:pattern" "Finger"}
+                                                  "sh:qualifiedMinCount"            4
+                                                  "sh:qualifiedMaxCount"            4
+                                                  "sh:qualifiedValueShapesDisjoint" true}]}]})
 
           valid-hand   @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                            "insert" {"id"       "ex:ValidHand"
-                                                      "type"     "ex:Hand"
-                                                      "ex:digit" [{"ex:name" "Thumb"}
-                                                                  {"ex:name" "Finger"}
-                                                                  {"ex:name" "Finger"}
-                                                                  {"ex:name" "Finger"}
-                                                                  {"ex:name" "Finger"}]}})
+                                            "insert"   {"id"       "ex:ValidHand"
+                                                        "type"     "ex:Hand"
+                                                        "ex:digit" [{"ex:name" "Thumb"}
+                                                                    {"ex:name" "Finger"}
+                                                                    {"ex:name" "Finger"}
+                                                                    {"ex:name" "Finger"}
+                                                                    {"ex:name" "Finger"}]}})
           invalid-hand @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                            "insert" {"id"       "ex:InvalidHand"
-                                                      "type"     "ex:Hand"
-                                                      "ex:digit" [{"ex:name" "Thumb"}
-                                                                  {"ex:name" "Finger"}
-                                                                  {"ex:name" "Finger"}
-                                                                  {"ex:name" "Finger"}
-                                                                  {"ex:name" ["Finger" "Thumb"]}]}})]
-      (is (= [{"id"       "ex:ValidHand",
-               "type" "ex:Hand",
-               "ex:digit"
-               [{"ex:name" "Thumb"}
-                {"ex:name" "Finger"}
-                {"ex:name" "Finger"}
-                {"ex:name" "Finger"}
-                {"ex:name" "Finger"}]}]
-             @(fluree/query valid-hand {"select" {"ex:ValidHand" ["*" {"ex:digit" ["ex:name"]}]}})))
+                                            "insert"   {"id"       "ex:InvalidHand"
+                                                        "type"     "ex:Hand"
+                                                        "ex:digit" [{"ex:name" "Thumb"}
+                                                                    {"ex:name" "Finger"}
+                                                                    {"ex:name" "Finger"}
+                                                                    {"ex:name" "Finger"}
+                                                                    {"ex:name" ["Finger" "Thumb"]}]}})]
+      (is (= {"id"   "ex:ValidHand",
+              "type" "ex:Hand",
+              "ex:digit"
+              [{"ex:name" "Finger"}
+               {"ex:name" "Finger"}
+               {"ex:name" "Finger"}
+               {"ex:name" "Finger"}
+               {"ex:name" "Thumb"}]}
+             (-> @(fluree/query valid-hand {"select" {"ex:ValidHand" ["*" {"ex:digit" ["ex:name"]}]}})
+                 first
+                 (update "ex:digit" (partial sort-by #(get % "ex:name"))))))
       (is (str/starts-with? (ex-message invalid-hand)
                             "SHACL PropertyShape exception - path ")))))
 
@@ -1740,7 +1746,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                      "insert" {"id" "ex:PersonShape"
                                                "type" "sh:NodeShape"
                                                "sh:targetClass" {"id" "ex:Person"}
-                                               "sh:property" [{"sh:path" [{"id" "ex:cool"} {"id" "ex:dude"}]
+                                               "sh:property" [{"sh:path" {"@list" [{"id" "ex:cool"} {"id" "ex:dude"}]}
                                                                "sh:nodeKind" {"id" "sh:BlankNode"}
                                                                "sh:minCount" 1}]}})
             valid-person @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
