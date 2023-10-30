@@ -635,7 +635,7 @@
          ;; else
          acc)))
    {}
-   property-flakes))
+   (sort-by (comp :i flake/m) property-flakes)))
 
 ;; TODO - pass along additional shape metadata to provided better error message.
 (defn register-datatype
