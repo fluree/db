@@ -326,19 +326,19 @@
   (parse-node-map m context))
 
 (defmethod parse-pattern :union
-  [[_ & union] vars context]
+  [[_ & unions] vars context]
   (let [parsed (mapv (fn [clause]
                        (parse-where-clause clause vars context))
-                     union)]
+                     unions)]
     [(where/->pattern :union parsed)]))
 
 (defmethod parse-pattern :optional
-  [[_ & optional] vars context]
+  [[_ & optionals] vars context]
   (into []
         (comp (map (fn [clause]
                  (parse-where-clause clause vars context)))
               (map (partial where/->pattern :optional)))
-        optional))
+        optionals))
 
 (defmethod parse-pattern :bind
   [[_ & binds] _vars _context]
