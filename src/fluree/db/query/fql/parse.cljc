@@ -333,9 +333,12 @@
     [(where/->pattern :union parsed)]))
 
 (defmethod parse-pattern :optional
-  [[_ optional] vars context]
-  (let [parsed (parse-where-clause optional vars context)]
-    [(where/->pattern :optional parsed)]))
+  [[_ & optional] vars context]
+  (into []
+        (comp (map (fn [clause]
+                 (parse-where-clause clause vars context)))
+              (map (partial where/->pattern :optional)))
+        optional))
 
 (defmethod parse-pattern :bind
   [[_ & binds] _vars _context]
