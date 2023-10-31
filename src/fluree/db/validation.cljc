@@ -276,7 +276,7 @@
     ::function             [:orn
                             [:string-fn [:and :string [:re #"^\(.+\)$"]]]
                             [:list-fn [:and list? [:cat :symbol [:* any?]]]]]
-    ::optional             [:+ {:error/message "optional clause must be a sequence of valid where clauses."}
+    ::optional             [:+ {:error/message "optional pattern must be a sequence of valid where clauses."}
                             [:schema [:ref ::where]]]
     ::union                [:+ {:error/message "union pattern must be a sequence of valid where clauses."}
                             [:schema [:ref ::where]]]
