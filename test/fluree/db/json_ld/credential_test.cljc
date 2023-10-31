@@ -112,7 +112,7 @@
                     (done)))))))
 
 #?(:clj
-   (deftest ^:kaocha/pending ^:integration cred-wrapped-transactions-and-queries
+   (deftest ^:pending ^:integration cred-wrapped-transactions-and-queries
      (let [conn   @(fluree/connect {:method :memory})
            ledger @(fluree/create conn "credentialtest" {:defaultContext
                                                          [test-utils/default-str-context
