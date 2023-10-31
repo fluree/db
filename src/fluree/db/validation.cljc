@@ -293,7 +293,7 @@
     ::node-map-key         [:orn {:error/message "node map keys must be an iri or variable"}
                             [:iri ::iri]
                             [:var ::var]]
-    ::node-map-value       [:orn {:error/message "node map values must be an iri, string, number, boolean, map, or variable"}
+    ::node-map-value       [:orn {:error/message "node map values must be an iri, string, number, boolean, map, variable, or array"}
                             [:var ::var]
                             [:string :string]
                             [:boolean :boolean]
@@ -301,7 +301,8 @@
                             [:double :double]
                             [:nil :nil]
                             [:iri ::iri]
-                            [:map [:ref ::node-map]]]
+                            [:map [:ref ::node-map]]
+                            [:collection [:sequential [:ref ::node-map-value]]]]
     ::node-map             [:map-of {:error/message "Invalid node map"}
                             [:ref ::node-map-key] [:ref ::node-map-value]]
     ::where-pattern        [:multi {:dispatch where-pattern-type}
