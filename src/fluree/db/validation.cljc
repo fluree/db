@@ -276,8 +276,8 @@
     ::function             [:orn
                             [:string-fn [:and :string [:re #"^\(.+\)$"]]]
                             [:list-fn [:and list? [:cat :symbol [:* any?]]]]]
-    ::optional             [:ref {:error/message "optional clause must be a valid where clause."}
-                            ::where]
+    ::optional             [:+ {:error/message "optional pattern must be a sequence of valid where clauses."}
+                            [:schema [:ref ::where]]]
     ::union                [:+ {:error/message "union pattern must be a sequence of valid where clauses."}
                             [:schema [:ref ::where]]]
     ::bind                 [:+ {:error/message "bind values must be mappings from variables to functions"}
@@ -311,7 +311,9 @@
                             [:filter [:catn
                                       [:op ::where-op]
                                       [:fns [:* ::function]]]]
-                            [:optional [:tuple ::where-op [:ref ::optional]]]
+                            [:optional [:catn
+                                        [:op ::where-op]
+                                        [:clauses ::optional]]]
                             [:union [:catn
                                      [:op ::where-op]
                                      [:clauses ::union]]]
