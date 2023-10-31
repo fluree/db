@@ -138,31 +138,33 @@
   [as-fn bind-var aggregate?]
   (->AsSelector as-fn bind-var aggregate?))
 
-(defrecord SubgraphSelector [var selection depth spec]
+(defrecord SubgraphSelector [subj selection depth spec]
   ValueSelector
   (implicit-grouping? [_] false)
   (format-value
     [_ db iri-cache context compact error-ch solution]
     (go
-      (let [db-alias (:alias db)
-            sid      (-> solution
-                         (get var)
-                         (where/get-sid db-alias))]
-        (try*
-          (let [flakes (<? (query-range/index-range db :spot = [sid]))]
-            ;; TODO: Replace these nils with fuel values when we turn fuel back on
-            (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))
-         (catch* e
-           (log/error e "Error formatting subgraph for subject:" sid)
-           (>! error-ch e)))))))
+      (try*
+        (let [db-alias (:alias db)
+              sid      (if (where/variable? subj)
+                         (-> solution
+                             (get subj)
+                             (where/get-sid db-alias))
+                         (<? (dbproto/-subid db subj true)))
+              flakes   (<? (query-range/index-range db :spot = [sid]))]
+          ;; TODO: Replace these nils with fuel values when we turn fuel back on
+          (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))
+        (catch* e
+                (log/error e "Error formatting subgraph for subject:" subj)
+                (>! error-ch e))))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied
   `variable` within a where solution and extracts the subgraph containing
   attributes and values associated with that subject specified by `selection`
   from a database value."
-  [variable selection depth spec]
-  (->SubgraphSelector variable selection depth spec))
+  [subj selection depth spec]
+  (->SubgraphSelector subj selection depth spec))
 
 (defn format-values
   "Formats the values from the specified where search solution `solution`

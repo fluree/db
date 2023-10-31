@@ -33,6 +33,5 @@
                :schema/name  "Alice"}]
              @(fluree/query db-age-retract
                             '{:context ["" {:ex "http://example.org/ns/"}],
-                              :select {?s [:*]},
-                              :where [[?s :id :ex/alice]]}))
+                              :select {:ex/alice [:*]}}))
           "Alice should no longer have an age property"))))

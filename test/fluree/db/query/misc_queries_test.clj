@@ -29,7 +29,7 @@
                :type    :ex/User,
                :schema/name "Alice"}]
              @(fluree/query db {:select {'?s [:_id :* {:ex/favArtist [:_id :schema/name]}]}
-                                :where  [['?s :type :ex/User]]}))))))
+                                :where  {:id '?s, :type :ex/User}}))))))
 
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
@@ -42,46 +42,39 @@
     (testing "current query"
       (is (= [{:id   :ex/dan
                :ex/x 1}]
-             @(fluree/query db {:where  [["?s" :id :ex/dan]]
-                                :select {"?s" [:*]}}))
+             @(fluree/query db {:select {:ex/dan [:*]}}))
           "default context")
       (is (= [{:id    :foo/dan
                :foo/x 1}]
              @(fluree/query db {"@context" ["" {:foo "http://example.org/ns/"}]
-                                :where     [["?s" :id :foo/dan]]
-                                :select    {"?s" [:*]}}))
+                                :select    {:foo/dan [:*]}}))
           "default unwrapped objects")
       (is (= [{:id    :foo/dan
                :foo/x [1]}]
              @(fluree/query db {"@context" ["" {:foo   "http://example.org/ns/"
                                                 :foo/x {:container :set}}]
-                                :where     [["?s" :id :foo/dan]]
-                                :select    {"?s" [:*]}}))
+                                :select    {:foo/dan [:*]}}))
           "override unwrapping with :set")
       (is (= [{:id     :ex/dan
                "foo:x" [1]}]
              @(fluree/query db {"@context" ["" {"foo"   "http://example.org/ns/"
                                                 "foo:x" {"@container" "@list"}}]
-                                :where     [["?s" "@id" "foo:dan"]]
-                                :select    {"?s" ["*"]}}))
+                                :select    {"foo:dan" ["*"]}}))
           "override unwrapping with @list")
       (is (= [{"@id"                     "http://example.org/ns/dan"
                "http://example.org/ns/x" 1}]
              @(fluree/query db {"@context" nil
-                                :where     [["?s" "@id" "http://example.org/ns/dan"]]
-                                :select    {"?s" ["*"]}}))
+                                :select    {"http://example.org/ns/dan" ["*"]}}))
           "clear context with nil")
       (is (= [{"@id"                     "http://example.org/ns/dan"
                "http://example.org/ns/x" 1}]
              @(fluree/query db {"@context" {}
-                                :where     [["?s" "@id" "http://example.org/ns/dan"]]
-                                :select    {"?s" ["*"]}}))
+                                :select    {"http://example.org/ns/dan" ["*"]}}))
           "clear context with empty context")
       (is (= [{"@id"                     "http://example.org/ns/dan"
                "http://example.org/ns/x" 1}]
              @(fluree/query db {"@context" []
-                                :where     [["?s" "@id" "http://example.org/ns/dan"]]
-                                :select    {"?s" ["*"]}}))
+                                :select    {"http://example.org/ns/dan" ["*"]}}))
           "clear context with empty context vector"))
     (testing "history query"
       (is (= [{:f/t       1
@@ -105,21 +98,21 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/everything" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
-                   (fluree/db ledger)
-                   {:graph [{:id           :ex/alice,
-                             :type         :ex/User,
-                             :schema/name  "Alice"
-                             :schema/email "alice@flur.ee"
-                             :schema/age   42}
-                            {:id          :ex/bob,
-                             :type        :ex/User,
-                             :schema/name "Bob"
-                             :schema/age  22}
-                            {:id           :ex/jane,
-                             :type         :ex/User,
-                             :schema/name  "Jane"
-                             :schema/email "jane@flur.ee"
-                             :schema/age   30}]})]
+                    (fluree/db ledger)
+                    {:graph [{:id           :ex/alice,
+                              :type         :ex/User,
+                              :schema/name  "Alice"
+                              :schema/email "alice@flur.ee"
+                              :schema/age   42}
+                             {:id          :ex/bob,
+                              :type        :ex/User,
+                              :schema/name "Bob"
+                              :schema/age  22}
+                             {:id           :ex/jane,
+                              :type         :ex/User,
+                              :schema/name  "Jane"
+                              :schema/email "jane@flur.ee"
+                              :schema/age   30}]})]
       (testing "Query that pulls entire database."
         (is (= [[:ex/jane :id "http://example.org/ns/jane"]
                 [:ex/jane :type :ex/User]
@@ -143,74 +136,75 @@
                 [:type :id "@type"]
                 [:id :id "@id"]]
                @(fluree/query db {:select ['?s '?p '?o]
-                                  :where  [['?s '?p '?o]]}))
+                                  :where  {:id '?s
+                                           '?p '?o}}))
             "Entire database should be pulled.")
-        (is (= [{:id :ex/jane,
-                 :type :ex/User,
-                 :schema/name "Jane",
+        (is (= [{:id           :ex/jane,
+                 :type         :ex/User,
+                 :schema/name  "Jane",
                  :schema/email "jane@flur.ee",
-                 :schema/age 30}
-                {:id :ex/jane,
-                 :type :ex/User,
-                 :schema/name "Jane",
+                 :schema/age   30}
+                {:id           :ex/jane,
+                 :type         :ex/User,
+                 :schema/name  "Jane",
                  :schema/email "jane@flur.ee",
-                 :schema/age 30}
-                {:id :ex/jane,
-                 :type :ex/User,
-                 :schema/name "Jane",
+                 :schema/age   30}
+                {:id           :ex/jane,
+                 :type         :ex/User,
+                 :schema/name  "Jane",
                  :schema/email "jane@flur.ee",
-                 :schema/age 30}
-                {:id :ex/jane,
-                 :type :ex/User,
-                 :schema/name "Jane",
+                 :schema/age   30}
+                {:id           :ex/jane,
+                 :type         :ex/User,
+                 :schema/name  "Jane",
                  :schema/email "jane@flur.ee",
-                 :schema/age 30}
-                {:id :ex/jane,
-                 :type :ex/User,
-                 :schema/name "Jane",
+                 :schema/age   30}
+                {:id           :ex/jane,
+                 :type         :ex/User,
+                 :schema/name  "Jane",
                  :schema/email "jane@flur.ee",
-                 :schema/age 30}
-                {:id :ex/bob,
-                 :type :ex/User,
+                 :schema/age   30}
+                {:id          :ex/bob,
+                 :type        :ex/User,
                  :schema/name "Bob",
-                 :schema/age 22}
-                {:id :ex/bob,
-                 :type :ex/User,
+                 :schema/age  22}
+                {:id          :ex/bob,
+                 :type        :ex/User,
                  :schema/name "Bob",
-                 :schema/age 22}
-                {:id :ex/bob,
-                 :type :ex/User,
+                 :schema/age  22}
+                {:id          :ex/bob,
+                 :type        :ex/User,
                  :schema/name "Bob",
-                 :schema/age 22}
-                {:id :ex/bob,
-                 :type :ex/User,
+                 :schema/age  22}
+                {:id          :ex/bob,
+                 :type        :ex/User,
                  :schema/name "Bob",
-                 :schema/age 22}
-                {:id :ex/alice,
-                 :type :ex/User,
-                 :schema/name "Alice",
+                 :schema/age  22}
+                {:id           :ex/alice,
+                 :type         :ex/User,
+                 :schema/name  "Alice",
                  :schema/email "alice@flur.ee",
-                 :schema/age 42}
-                {:id :ex/alice,
-                 :type :ex/User,
-                 :schema/name "Alice",
+                 :schema/age   42}
+                {:id           :ex/alice,
+                 :type         :ex/User,
+                 :schema/name  "Alice",
                  :schema/email "alice@flur.ee",
-                 :schema/age 42}
-                {:id :ex/alice,
-                 :type :ex/User,
-                 :schema/name "Alice",
+                 :schema/age   42}
+                {:id           :ex/alice,
+                 :type         :ex/User,
+                 :schema/name  "Alice",
                  :schema/email "alice@flur.ee",
-                 :schema/age 42}
-                {:id :ex/alice,
-                 :type :ex/User,
-                 :schema/name "Alice",
+                 :schema/age   42}
+                {:id           :ex/alice,
+                 :type         :ex/User,
+                 :schema/name  "Alice",
                  :schema/email "alice@flur.ee",
-                 :schema/age 42}
-                {:id :ex/alice,
-                 :type :ex/User,
-                 :schema/name "Alice",
+                 :schema/age   42}
+                {:id           :ex/alice,
+                 :type         :ex/User,
+                 :schema/name  "Alice",
                  :schema/email "alice@flur.ee",
-                 :schema/age 42}
+                 :schema/age   42}
                 {:id :schema/age}
                 {:id :schema/email}
                 {:id :schema/name}
@@ -219,11 +213,11 @@
                 {:id :type}
                 {:id :id}]
                @(fluree/query db {:select {'?s ["*"]}
-                                  :where  [['?s '?p '?o]]}))
+                                  :where  {:id '?s, '?p '?o}}))
             "Every triple should be returned.")
         (let [db*    @(fluree/commit! ledger db)
               result @(fluree/query db* {:select ['?s '?p '?o]
-                                         :where  [['?s '?p '?o]]})]
+                                         :where  {:id '?s, '?p '?o}})]
           (is (pred-match?
                [[:ex/jane :id "http://example.org/ns/jane"]
                 [:ex/jane :type :ex/User]
@@ -286,7 +280,7 @@
           db     (fluree/db people)]
       (testing "with non-string objects"
         (let [test-subject @(fluree/query db {:select ['?s '?p]
-                                              :where [['?s '?p 22]]})]
+                                              :where {:id '?s, '?p 22}})]
           (is (util/exception? test-subject)
               "return errors")
           (is (= :db/invalid-query
@@ -294,7 +288,7 @@
               "have 'invalid query' error codes")))
       (testing "with string objects"
         (let [test-subject @(fluree/query db {:select ['?s '?p]
-                                              :where [['?s '?p "Bob"]]})]
+                                              :where {:id '?s, '?p "Bob"}})]
           (is (util/exception? test-subject)
               "return errors")
           (is (= :db/invalid-query
@@ -326,13 +320,13 @@
     (testing "type"
       (is (= [[:ex/User]]
              @(fluree/query db '{:select [?class]
-                                 :where  [[:ex/jane :type ?class]]})))
+                                 :where  {:id :ex/jane, :type ?class}})))
       (is (= [[:ex/jane :ex/User]
               [:ex/bob :ex/User]
               [:ex/alice :ex/User]
               [:ex/dave :ex/nonUser]]
              @(fluree/query db '{:select [?s ?class]
-                                 :where  [[?s :type ?class]]}))))
+                                 :where  {:id ?s, :type ?class}}))))
     (testing "shacl targetClass"
       (let [shacl-db @(fluree/stage
                         (fluree/db ledger)
@@ -344,7 +338,7 @@
                                            :sh/datatype :xsd/string}]})]
         (is (= [[:ex/User]]
                @(fluree/query shacl-db '{:select [?class]
-                                         :where  [[:ex/UserShape :sh/targetClass ?class]]})))))))
+                                         :where  {:id :ex/UserShape, :sh/targetClass ?class}})))))))
 
 (deftest ^:integration type-handling
   (let [conn @(fluree/connect {:method :memory})
@@ -366,12 +360,12 @@
     (is (= [{"id" "ex:queen" "type" "ex:Heart"}
             {"id" "ex:king" "type" "ex:Heart"}]
            @(fluree/query db1 {"select" {"?s" ["*"]}
-                               "where" [["?s" "type" "ex:Heart"]]}))
+                               "where" {"id" "?s", "type" "ex:Heart"}}))
         "Query with type and type in results")
     (is (= [{"id" "ex:queen" "type" "ex:Heart"}
             {"id" "ex:king" "type" "ex:Heart"}]
            @(fluree/query db1 {"select" {"?s" ["*"]}
-                               "where" [["?s" "rdf:type" "ex:Heart"]]}))
+                               "where" {"id" "?s", "rdf:type" "ex:Heart"}}))
         "Query with rdf:type and type in results")
 
     (is (util/exception? db2)
@@ -381,5 +375,5 @@
 
     (is (= [{"id" "ex:two" "type" "ex:Diamond"}]
            @(fluree/query db3 {"select" {"?s" ["*"]}
-                               "where" [["?s" "type" "ex:Diamond"]]}))
+                               "where" {"id" "?s", "type" "ex:Diamond"}}))
         "Can transact with rdf:type aliased to type.")))

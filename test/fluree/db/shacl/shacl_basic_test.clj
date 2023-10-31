@@ -21,8 +21,7 @@
                         "insert" {:id :ex/myClassInstance
                                   :type :ex/MyClass
                                   :schema/description "Now a new subject uses MyClass as a Class"}})
-          query-res @(fluree/query db2 '{:select {?s [:*]}
-                                         :where  [[?s :id :ex/myClassInstance]]})]
+          query-res @(fluree/query db2 '{:select {:ex/myClassInstance [:*]}})]
       (is (= query-res
              [{:id                 :ex/myClassInstance
                :type           :ex/MyClass
@@ -34,7 +33,7 @@
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :type :ex/User]]}
+                        :where  {:id '?s, :type :ex/User}}
           db           @(fluree/stage2
                           (fluree/db ledger)
                           {"@context" "https://ns.flur.ee"
@@ -95,7 +94,7 @@
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :type :ex/User]]}
+                        :where  {:id '?s, :type :ex/User}}
           db           @(fluree/stage2
                           (fluree/db ledger)
                           {"@context" "https://ns.flur.ee"
@@ -146,7 +145,7 @@
     (let [conn          (test-utils/create-conn)
           ledger        @(fluree/create conn "shacl/c" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query    {:select {'?s [:*]}
-                         :where  [['?s :type :ex/User]]}
+                         :where  {:id '?s, :type :ex/User}}
           db            @(fluree/stage2
                            (fluree/db ledger)
                           {"@context" "https://ns.flur.ee"
@@ -190,7 +189,7 @@
     (let [conn       (test-utils/create-conn)
           ledger     @(fluree/create conn "shacl/pairs" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query {:select {'?s [:*]}
-                      :where  [['?s :type :ex/User]]}]
+                      :where  {:id '?s, :type :ex/User}}]
       (testing "single-cardinality equals"
         (let [db           @(fluree/stage2
                               (fluree/db ledger)
@@ -652,7 +651,7 @@
     (let [conn       (test-utils/create-conn)
           ledger     @(fluree/create conn "shacl/value-range" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query {:select {'?s [:*]}
-                      :where  [['?s :type :ex/User]]}]
+                      :where  {:id '?s, :type :ex/User}}]
       (testing "exclusive constraints"
         (let [db          @(fluree/stage2
                              (fluree/db ledger)
@@ -799,7 +798,7 @@
                                               {:defaultContext
                                                ["" {:ex "http://example.org/ns/"}]})
           user-query          {:select {'?s [:*]}
-                               :where  [['?s :type :ex/User]]}
+                               :where  {:id '?s, :type :ex/User}}
           db                  @(fluree/stage2
                                  (fluree/db ledger)
                                  {"@context" "https://ns.flur.ee"
@@ -894,7 +893,7 @@
                                                  {:defaultContext
                                                   ["" {:ex "http://example.org/ns/"}]})
           user-query             {:select {'?s [:*]}
-                                  :where  [['?s :type :ex/User]]}
+                                  :where  {:id '?s, :type :ex/User}}
           db                     @(fluree/stage2
                                     (fluree/db ledger)
                                     {"@context" "https://ns.flur.ee"
@@ -979,7 +978,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :type :ex/User]]}
+                        :where  {:id '?s, :type :ex/User}}
           db           @(fluree/stage2
                           (fluree/db ledger)
                           {"@context" "https://ns.flur.ee"
@@ -1100,8 +1099,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                  "ex:parent"   {"id"          "ex:Anakin"
                                 "type" "ex:Parent"
                                 "schema:name" "Anakin"}}]
-               @(fluree/query valid-parent {"select" {"?s" ["*" {"ex:parent" ["*"]}]}
-                                            "where"  [["?s" "id" "ex:Luke"]]})))
+               @(fluree/query valid-parent {"select" {"ex:Luke" ["*" {"ex:parent" ["*"]}]}})))
 
         (is (util/exception? invalid-pal))
 
@@ -1131,8 +1129,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                  "schema:name" "J.D.",
                  "ex:pal"      [{"schema:name" "Turk"}
                                 {"schema:name" "Rowdy"}]}]
-               @(fluree/query valid-pal {"select" {"?s" ["*" {"ex:pal" ["schema:name"]}]}
-                                         "where"  [["?s" "id" "ex:good-pal"]]})))
+               @(fluree/query valid-pal {"select" {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})))
         (is (util/exception? invalid-pal))
         (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
                (ex-message invalid-pal)))))
@@ -1160,8 +1157,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                                            "type"        "ex:Princess"
                                                                            "schema:name" "Gerb"}}})]
         (is (= [{"id" "ex:Mork", "type" "ex:Princess", "schema:name" "Mork"}]
-               @(fluree/query valid-princess {"select" {"?s" ["*"]}
-                                              "where"  [["?s" "id" "ex:Mork"]]})))
+               @(fluree/query valid-princess {"select" {"ex:Mork" ["*"]}})))
 
         (is (util/exception? invalid-princess))
         (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
@@ -1297,7 +1293,8 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                "type" "ex:Pony"
                "ex:color" [{"id" "ex:Pink"} {"id" "ex:Purple"}]}]
              @(fluree/query db3 '{"select" {"?p" ["*"]}
-                                  "where"  [["?p" "type" "ex:Pony"]]})))))
+                                  "where"  {"id" "?p"
+                                            "type" "ex:Pony"}})))))
   (testing "mixed values and refs"
     (let [conn   @(fluree/connect {:method :memory
                                    :defaults
@@ -1542,8 +1539,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
       (is (= [{"id"         "ex:Bob",
                "type"       "ex:Person",
                "ex:address" {"ex:postalCode" "12345"}}]
-             @(fluree/query valid-person {"select" {"?s" ["*" {"ex:address" ["ex:postalCode"]}]}
-                                          "where"  [["?s" "id" "ex:Bob"]]})))
+             @(fluree/query valid-person {"select" {"ex:Bob" ["*" {"ex:address" ["ex:postalCode"]}]}})))
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message invalid-person)))))
 
@@ -1581,8 +1577,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
               "type"      "ex:Kid"
               "ex:parent" [{"id" "ex:Bob"}
                            {"id" "ex:Jane"}]}
-             (-> @(fluree/query valid-kid {"select" {"?s" ["*"]}
-                                           "where"  [["?s" "id" "ex:ValidKid"]]})
+             (-> @(fluree/query valid-kid {"select" {"ex:ValidKid" ["*"]}})
                  first
                  (update "ex:parent" (partial sort-by #(get % "id"))))))
       (is (str/starts-with? (ex-message invalid-kid)
@@ -1629,8 +1624,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
               "type"      "ex:Kid"
               "ex:parent" [{"id" "ex:Dad"}
                            {"id" "ex:Mom"}]}
-             (-> @(fluree/query valid-kid {"select" {"?s" ["*"]}
-                                           "where"  [["?s" "id" "ex:ValidKid"]]})
+             (-> @(fluree/query valid-kid {"select" {"ex:ValidKid" ["*"]}})
                  first
                  (update "ex:parent" (partial sort-by #(get % "id"))))))
       (is (= "SHACL PropertyShape exception - sh:pattern: value alien does not match pattern \"female\" or it is not a literal value."
@@ -1687,8 +1681,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                {"ex:name" "Finger"}
                {"ex:name" "Finger"}
                {"ex:name" "Thumb"}]}
-             (-> @(fluree/query valid-hand {"select" {"?s" ["*" {"ex:digit" ["ex:name"]}]}
-                                            "where"  [["?s" "id" "ex:ValidHand"]]})
+             (-> @(fluree/query valid-hand {"select" {"ex:ValidHand" ["*" {"ex:digit" ["ex:name"]}]}})
                  first
                  (update "ex:digit" (partial sort-by #(get % "ex:name"))))))
       (is (str/starts-with? (ex-message invalid-hand)
@@ -1745,8 +1738,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
         (is (= [{"id" "ex:Bob",
                  "type" "ex:Person",
                  "ex:cool" {"ex:isCool" true}}]
-               @(fluree/query valid-person {"select" {"?s" ["*" {"ex:cool" ["ex:isCool"]}]}
-                                            "where" [["?s" "id" "ex:Bob"]]})))
+               @(fluree/query valid-person {"select" {"ex:Bob" ["*" {"ex:cool" ["ex:isCool"]}]}})))
         (is (= "SHACL PropertyShape exception - sh:hasValue: at least one value must be true."
                (ex-message invalid-person)))))
     (testing "extended path constraints"
@@ -1769,7 +1761,6 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
         (is (= [{"id" "ex:Bob",
                  "type" "ex:Person",
                  "ex:cool" {"ex:dude" {"ex:isBlank" true}}}]
-               @(fluree/query valid-person {"select" {"?s" ["*" {"ex:cool" [{"ex:dude" ["ex:isBlank"]}]}]}
-                                            "where" [["?s" "id" "ex:Bob"]]})))
+               @(fluree/query valid-person {"select" {"ex:Bob" ["*" {"ex:cool" [{"ex:dude" ["ex:isBlank"]}]}]}})))
         (is (= "SHACL PropertyShape exception - sh:nodekind: every value must be a blank node identifier."
                (ex-message invalid-person)))))))

@@ -54,7 +54,7 @@
               {:id      :blah/two
                :ex/name "Two"}]
              @(fluree/query db3-load '{:select {?s [:*]}
-                                       :where  [[?s :ex/name nil]]}))))))
+                                       :where  {:id ?s, :ex/name nil}}))))))
 
 
 (deftest ^:integration default-context-stability-memory
@@ -93,7 +93,7 @@
               {:id      :blah/two
                :ex/name "Two"}]
              @(fluree/query db3-load '{:select {?s [:*]}
-                                       :where  [[?s :ex/name nil]]}))))))
+                                       :where  {:id ?s, :ex/name nil}}))))))
 
 
 (deftest ^:integration default-context-stability-file
@@ -137,4 +137,4 @@
                 {:id      :blah/two
                  :ex/name "Two"}]
                @(fluree/query db3-load '{:select {?s [:*]}
-                                         :where  [[?s :ex/name nil]]})))))))
+                                         :where  {:id ?s, :ex/name nil}})))))))

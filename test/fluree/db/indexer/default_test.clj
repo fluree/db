@@ -39,6 +39,6 @@
             db-commit @(fluree/commit! ledger db)
             loaded (test-utils/retry-load conn (:alias ledger) 100)
             q {"select" {"?s" ["*"]}
-               "where" [["?s" "type" "ex:Bar"]]}]
+               "where" {"@id" "?s", "type" "ex:Bar"}}]
         (is (= @(fluree/query (fluree/db loaded) q)
                @(fluree/query db q)))))))

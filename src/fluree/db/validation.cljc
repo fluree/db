@@ -36,8 +36,14 @@
   (= const/iri-id x))
 
 (defn where-op [x]
-  (when (map? x)
-    (-> x first key)))
+  (when (sequential? x)
+    (first x)))
+
+(defn where-pattern-type
+  [pattern]
+  (if (sequential? pattern)
+    (-> pattern first keyword)
+    :node))
 
 (defn string->keyword
   [x]
@@ -263,66 +269,58 @@
                             ::iri-key ::iri]
     ::json-ld-keyword      [:keyword {:decode/json decode-json-ld-keyword
                                       :decode/fql  decode-json-ld-keyword}]
-    ::var                  [:fn {:error/message "Invalid variable, should be one or more characters beginning with `?`"}
+    ::var                  [:fn {:error/message "variable should be one or more characters beginning with `?`"}
                             variable?]
     ::val                  [:fn value?]
-    ::subject              [:orn {:error/message "Subject must be a subject id, ident, or iri"}
-                            [:sid [:fn {:error/message "Invalid subject id"} sid?]]
-                            [:ident [:fn {:error/message "Invalid pred ident, must be two-tuple of [pred-name-or-id pred-value] "}pred-ident?]]
-                            [:iri ::iri]]
-    ::triple               [:catn
-                            [:subject [:orn
-                                       [:var ::var]
-                                       [:val ::subject]]]
-                            [:predicate [:orn
-                                         [:var ::var]
-                                         [:iri ::iri]]]
-                            [:object [:orn
-                                      [:var ::var]
-                                      [:ident [:fn {:error/message "Invalid pred ident, must be two-tuple of [pred-name-or-id pred-value] "}pred-ident?]]
-                                      [:iri-map ::iri-map]
-                                      [:val :any]]]]
+    ::subject              ::iri
     ::function             [:orn
                             [:string-fn [:and :string [:re #"^\(.+\)$"]]]
                             [:list-fn [:and list? [:cat :symbol [:* any?]]]]]
-    ::where-pattern        [:orn {:error/message "Invalid where pattern, must be a where map or tuple"}
-                            [:map ::where-map]
-                            [:tuple ::where-tuple]]
-    ::filter               [:sequential {:error/message "Filter must be a function call wrapped in a vector"} ::function]
-    ::optional             [:orn {:error/message "Invalid optional, must be a single where clause or vector of where clauses."}
-                            [:single ::where-pattern]
-                            [:collection [:sequential ::where-pattern]]]
-    ::union                [:sequential [:sequential ::where-pattern]]
-    ::bind                 [:map-of {:error/message "Invalid bind, must be a map with variable keys"} ::var :any]
+    ::optional             [:ref {:error/message "optional clause must be a valid where clause."}
+                            ::where]
+    ::union                [:+ {:error/message "union pattern must be a sequence of valid where clauses."}
+                            [:schema [:ref ::where]]]
+    ::bind                 [:+ {:error/message "bind values must be mappings from variables to functions"}
+                            [:catn [:var ::var]
+                             [:binding ::function]]]
     ::where-op             [:and
                             :keyword
-                            [:enum {:error/message "Unrecognized operation in where map, must be one of: filter, optional, union, bind"}
-                             :filter :optional :union :bind]]
-    ::graph                [:orn {:error/message "Value of \"graph\" should be ledger alias or variable"}
+                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind"}
+                             :graph :filter :optional :union :bind]]
+    ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
-    ::graph-map            [:map {:closed true
-                                  :error/message "Named where map must be a map specifying the graph to query and valid where clause"}
-                            [:graph ::graph]
-                            [:where [:ref ::where]]]
-    ::where-map            [:orn {:error/message "Invalid where map, must be either named graph or valid where operation map"}
-                            [:named ::graph-map]
-                            [:default
-                             [:and
-                              [:map-of {:max 1 :error/message "Unnamed where map can only have 1 key/value pair"}
-                               ::where-op :any]
-                              [:multi {:dispatch where-op}
-                               [:filter [:map [:filter [:ref ::filter]]]]
-                               [:optional [:map [:optional [:ref ::optional]]]]
-                               [:union [:map [:union [:ref ::union]]]]
-                               [:bind [:map [:bind [:ref ::bind]]]]]]]]
-    ::where-tuple          [:orn {:error/message "Invalid tuple"}
-                            [:triple ::triple]
-                            [:remote [:sequential {:max 4} :any]]]
-    ::where                [:sequential {:error/message "Where must be a vector of clauses"}
-                            [:orn {:error/message "where clauses must be valid tuples or maps"}
-                             [:where-map ::where-map]
-                             [:tuple ::where-tuple]]]
+    ::node-map-key         [:orn {:error/message "node map keys must be an iri or variable"}
+                            [:iri ::iri]
+                            [:var ::var]]
+    ::node-map-value       [:orn {:error/message "node map values must be an iri, string, number, boolean, map, or variable"}
+                            [:var ::var]
+                            [:string :string]
+                            [:boolean :boolean]
+                            [:int :int]
+                            [:double :double]
+                            [:nil :nil]
+                            [:iri ::iri]
+                            [:map [:ref ::node-map]]]
+    ::node-map             [:map-of {:error/message "Invalid node map"}
+                            [:ref ::node-map-key] [:ref ::node-map-value]]
+    ::where-pattern        [:multi {:dispatch where-pattern-type
+                                    :error/message "where clause patterns must be either a node map or a filter, optional, union, bind, or graph array."}
+                            [:node ::node-map]
+                            [:filter [:catn
+                                      [:op ::where-op]
+                                      [:fns [:* ::function]]]]
+                            [:optional [:tuple ::where-op [:ref ::optional]]]
+                            [:union [:catn
+                                     [:op ::where-op]
+                                     [:clauses ::union]]]
+                            [:bind [:catn
+                                    [:op ::where-op]
+                                    [:bindings ::bind]]]
+                            [:graph [:tuple ::where-op ::graph [:ref ::where]]]]
+    ::where                [:orn {:error/message "where clause must be a single node map pattern or a sequence of where patterns"}
+                            [:single ::node-map]
+                            [:collection [:sequential ::where-pattern]]]
     ::ledger               ::iri
     ::from                 [:orn {:error/message "from must be a ledger iri or vector of ledger iris"}
                             [:single ::ledger]
@@ -330,12 +328,12 @@
                                           {:error/message "all values in `from`/`from-named` must be ledger iris"}
                                           ::ledger]]]
     ::from-named           ::from
-    ::delete               [:orn {:error/message "delete statements must be a triple or vector of triples"}
-                            [:single ::triple]
-                            [:collection [:sequential ::triple]]]
-    ::insert               [:orn {:error/message "insert statements must be a triple or vector of triples"}
-                            [:single ::triple]
-                            [:collection [:sequential ::triple]]]
+    ::delete               [:orn {:error/message "delete statements must be a node map or sequence of node maps"}
+                            [:single ::node-map]
+                            [:collection [:sequential ::node-map]]]
+    ::insert               [:orn {:error/message "insert statements must be a node map or sequence of node maps"}
+                            [:single ::node-map]
+                            [:collection [:sequential ::node-map]]]
     ::single-var-binding   [:tuple ::var [:sequential ::val]]
     ::multiple-var-binding [:tuple
                             [:sequential ::var]
@@ -347,7 +345,7 @@
                             [:map-of ::json-ld-keyword :any]
                             [:map
                              [:context {:optional true} ::context]
-                             [:delete ::delete]
+                             [:delete {:optional true} ::delete]
                              [:insert {:optional true} ::insert]
                              [:where ::where]
                              [:values {:optional true} ::values]]]

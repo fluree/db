@@ -145,5 +145,5 @@
 
       (is (= []
              @(fluree/query alice-db '{:select {?s [:*]}
-                                       :where  [[?s :schema/price 99.99]]}))
+                                       :where  {:id ?s, :schema/price 99.99}}))
           "There shouldn't be an exception, just empty vector."))))

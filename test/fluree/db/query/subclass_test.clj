@@ -46,7 +46,7 @@
 
       (is (= @(fluree/query db3
                             {:select {'?s [:*]}
-                             :where  [['?s :type :schema/CreativeWork]]})
+                             :where  {:id '?s, :type :schema/CreativeWork}})
              [{:id                               :wiki/Q836821,
                :type                         :schema/Movie,
                :schema/name                      "The Hitchhiker's Guide to the Galaxy",

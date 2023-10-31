@@ -104,14 +104,17 @@
   #?(:clj  (MapEntry/create typ data)
      :cljs (MapEntry. typ data nil)))
 
-(defn ->ident
-  "Build a pattern that already matches the two-tuple database identifier `x`"
-  [x]
-  {::ident x})
-
 (defn ->iri-ref
   [x]
   {::iri x})
+
+(defn variable?
+  [sym]
+  (and (symbol? sym)
+       (-> sym
+           name
+           first
+           (= \?))))
 
 (defn ->var-filter
   "Build a query function specification for the variable `var` out of the
@@ -120,6 +123,13 @@
   (-> var
       unmatched-var
       (assoc ::fn f)))
+
+(defn lang-matcher
+  "Return a function that returns true if the language metadata of a matched
+  pattern equals the supplied language code `lang`."
+  [lang]
+  (fn [mch]
+    (-> mch ::meta :lang (= lang))))
 
 (defn ->val-filter
   "Build a query function specification for the explicit value `val` out of the
@@ -675,16 +685,18 @@
 
 (defn search
   [ds q fuel-tracker error-ch]
-  (let [where-clause      (:where q)
-        initial-solutions (-> q
-                              :values
-                              not-empty
-                              (or [blank-solution]))
-        out-ch            (async/chan)]
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [initial-solution ch]
-                            (-> (match-clause ds fuel-tracker initial-solution where-clause error-ch)
-                                (async/pipe ch)))
-                          (async/to-chan! initial-solutions))
+  (let [out-ch (async/chan 2)
+        initial-solution-ch (-> q
+                                :values
+                                not-empty
+                                (or [blank-solution])
+                                async/to-chan!)]
+    (if-let [where-clause (:where q)]
+      (async/pipeline-async 2
+                            out-ch
+                            (fn [initial-solution ch]
+                              (-> (match-clause ds fuel-tracker initial-solution where-clause error-ch)
+                                  (async/pipe ch)))
+                            initial-solution-ch)
+      (async/pipe initial-solution-ch out-ch))
     out-ch))

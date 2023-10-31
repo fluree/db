@@ -1,11 +1,9 @@
 (ns fluree.db.query.fql.syntax
-  (:require [clojure.string :as str]
-            [fluree.db.util.core :refer [try* catch*]]
+  (:require [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
             [fluree.db.util.docs :as docs]
             [malli.core :as m]
-            [malli.error :as me]
             [malli.transform :as mt]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -53,7 +51,7 @@
    (into [:map {:closed true}
           [:from {:optional true} ::from]
           [:from-named {:optional true} ::from-named]
-          [:where ::where]
+          [:where {:optional true} ::where]
           [:t {:optional true} ::t]
           [:context {:optional true} ::context]
           [:select {:optional true} ::select]
@@ -65,7 +63,6 @@
           [:order-by {:optional true} ::order-by]
           [:groupBy {:optional true} ::group-by]
           [:group-by {:optional true} ::group-by]
-          [:filter {:optional true} ::filter]
           [:having {:optional true} ::function]
           [:values {:optional true} ::values]
           [:limit {:optional true} ::limit]
@@ -124,9 +121,11 @@
                         [:wildcard ::wildcard]
                         [:predicate ::iri]
                         [:subselect-map [:ref ::subselect-map]]]]
+    ::select-map-key  [:orn {:error/message "select map key must be a variable or iri"}
+                       [:var ::var] [:iri ::iri]]
     ::select-map      [:map-of {:max 1
                                 :error/message "Only one key/val for select-map"}
-                       ::var ::subselection]
+                       ::select-map-key ::subselection]
     ::selector        [:orn {:error/message "selector must be either a variable, wildcard symbol (`*`), iri, function application, or select map"}
                        [:wildcard ::wildcard]
                        [:var ::var]
@@ -150,7 +149,6 @@
     ::group-by        [:orn {:error/message "groupBy clause must be a variable or a vector of variables"}
                        [:clause ::var]
                        [:collection [:sequential ::var]]]
-    ::triple          ::v/triple
     ::filter          ::v/filter
     ::where           ::v/where
     ::values          ::v/values
@@ -161,13 +159,6 @@
     ::modification    ::v/modification-txn
     ::from            ::v/from
     ::from-named      ::v/from-named}))
-
-(def triple-validator
-  (m/validator ::triple {:registry registry}))
-
-(defn triple?
-  [x]
-  (triple-validator x))
 
 (def fql-transformer
   (mt/transformer
