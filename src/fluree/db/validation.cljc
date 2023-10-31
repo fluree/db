@@ -305,7 +305,8 @@
                             [:collection [:sequential [:ref ::node-map-value]]]]
     ::node-map             [:map-of {:error/message "Invalid node map"}
                             [:ref ::node-map-key] [:ref ::node-map-value]]
-    ::where-pattern        [:multi {:dispatch where-pattern-type}
+    ::where-pattern        [:multi {:dispatch where-pattern-type
+                                    :error/message "where clause patterns must be either a node map or a filter, optional, union, bind, or graph array."}
                             [:node ::node-map]
                             [:filter [:catn
                                       [:op ::where-op]
