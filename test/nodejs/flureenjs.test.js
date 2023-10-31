@@ -65,7 +65,10 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
     db1,
     {
       select: { "?s": ["*"] },
-      where: [["?s", "type", "ex:User"]]
+      where: {
+        "id": "?s",
+        "type": "ex:User"
+      }
     }
   );
 
@@ -86,7 +89,10 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
     {
       "@context": ["", { "flhubee": "http://schema.org/name" }],
       select: { "?s": ["*"] },
-      where: [["?s", "type", "ex:User"]]
+      where: {
+        "id": "?s",
+        "type": "ex:User"
+      }
     }
   );
 
@@ -112,8 +118,7 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
 
   const results2 = await flureenjs.query(db2, {
     "@context": ["", { b: "fake:iri/" }],
-    select: { "?s": ["*"] },
-    where: [["?s", "@id", "uniqueId"]],
+    select: { "uniqueId": ["*"] },
   });
 
   expect(results2).toStrictEqual([
