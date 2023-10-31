@@ -249,7 +249,7 @@
     (parse-variable p)
     (where/->predicate p)))
 
-(declare parse-statements)
+(declare parse-statement parse-statements)
 
 (defn parse-object-map
   [s-mch p-mch o context]
@@ -277,6 +277,11 @@
 
     (map? o)
     (parse-object-map s-mch p-mch o context)
+
+    (sequential? o)
+    #(mapcat (fn [o*]
+               (parse-statement s-mch p-mch o* context))
+             o)
 
     (type-pred-match? p-mch)
     (let [class-ref (parse-class o context)]
