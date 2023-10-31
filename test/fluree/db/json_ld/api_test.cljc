@@ -1067,9 +1067,7 @@
 
         (is (= {"@id" "http://example.com/t1" "@type" "my:ContextTest" "http://example.com/pred" true}
                @(fluree/query db1 {"@context"  nil
-                                   "where"     [["?s" "@id" "http://example.com/t1"]
-                                                ["?s" "@type" "my:ContextTest"]]
-                                   "selectOne" {"?s" ["*"]}}))
+                                   "selectOne" {"http://example.com/t1" ["*"]}}))
             "default context was used to expand")))
 
     (testing "use instead of default context"
@@ -1077,8 +1075,7 @@
                                      "insert"   {"@id" "ex:t2" "@type" "my:ContextTest" "ex:pred" true}})]
         (is (= {"@id" "DEFAULTOVERRIDEN:ns/t2" "@type" "my:ContextTest" "DEFAULTOVERRIDEN:ns/pred" true}
                @(fluree/query db2 {"@context"  nil
-                                   "where"     [["?s" "@id" "DEFAULTOVERRIDEN:ns/t2"]]
-                                   "selectOne" {"?s" ["*"]}}))
+                                   "selectOne" {"DEFAULTOVERRIDEN:ns/t2" ["*"]}}))
             "supplied context used, default context not used")))
 
     (testing "use with default context"
@@ -1086,8 +1083,7 @@
                                      "insert"   {"@id" "ex:t3" "@type" "my:ContextTest" "ex:pred" {"@id" "foo:me"}}})]
         (is (= {"@id" "http://example.com/t3" "@type" "my:ContextTest" "http://example.com/pred" {"@id" "ns:foo/me"}}
                @(fluree/query db3 {"@context"  nil
-                                   "where"     [["?s" "@id" "http://example.com/t3"]]
-                                   "selectOne" {"?s" ["*"]}}))
+                                   "selectOne" {"http://example.com/t3" ["*"]}}))
             "default context used, supplemented by supplied context")))
 
     (testing "use no context"
@@ -1096,6 +1092,5 @@
                                      "insert"   {"@id" "ex:t4" "@type" "my:ContextTest" "ex:pred" "not expanded"}})]
         (is (= {"@id" "ex:t4" "@type" "my:ContextTest" "ex:pred" "not expanded"}
                @(fluree/query db4 {"@context"  nil
-                                   "where"     [["?s" "@id" "ex:t4"]]
-                                   "selectOne" {"?s" ["*"]}}))
+                                   "selectOne" {"ex:t4" ["*"]}}))
             "no default context was used")))))
