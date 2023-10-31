@@ -52,11 +52,12 @@
                              values)
                         {:status 400 :error :db/invalid-query}))))))
 
-(def type-preds #{const/iri-type const/iri-rdf-type})
+(def type-pred-iris #{const/iri-type const/iri-rdf-type})
 
-(defn type-pred?
-  [p]
-  (contains? type-preds p))
+(defn type-pred-match?
+  [p-mch]
+  (let [p-iri (::where/iri p-mch)]
+    (contains? type-pred-iris p-iri)))
 
 (defn safe-read
   [code-str]
@@ -248,43 +249,57 @@
     (parse-variable p)
     (where/->predicate p)))
 
-(declare parse-statements)
+(declare parse-statement parse-statements)
+
+(defn parse-object-map
+  [s-mch p-mch o context]
+  (let [o* (expand-keys o context)]
+    (if-let [v (get o* const/iri-value)]
+      (let [attrs (dissoc o* const/iri-value)
+            o-mch (parse-value-attributes v attrs)]
+        [[s-mch p-mch o-mch]])
+      (let [id-map  (with-id o*)
+            o-mch   (-> id-map
+                        (get const/iri-id)
+                        (parse-subject context))
+            o-attrs (dissoc id-map const/iri-id)]
+        ;; return a thunk wrapping the recursive call to preserve stack
+        ;; space by delaying execution
+        #(into [[s-mch p-mch o-mch]]
+               (parse-statements o-mch o-attrs context))))))
 
 (defn parse-statement*
-  [s-mch p o context]
-  (let [p-mch (parse-predicate p)]
-    (if (map? o)
-      (let [o* (expand-keys o context)]
-        (if-let [v (get o* const/iri-value)]
-          (let [attrs (dissoc o* const/iri-value)
-                o-mch (parse-value-attributes v attrs)]
-            [[s-mch p-mch o-mch]])
-          (let [id-map  (with-id o*)
-                o-mch   (-> id-map
-                            (get const/iri-id)
-                            (parse-subject context))
-                o-attrs (dissoc id-map const/iri-id)]
-            ;; return a thunk wrapping the recursive call to preserve stack
-            ;; space by delaying execution
-            #(into [[s-mch p-mch o-mch]]
-                   (parse-statements o-mch o-attrs context)))))
-      (if (v/variable? o)
-        (let [o-mch (parse-variable o)]
-          [[s-mch p-mch o-mch]])
-        (if (-> p-mch ::where/iri type-pred?)
-          (let [class-ref (parse-class o context)]
-            [(where/->pattern :class [s-mch p-mch class-ref])])
-          (let [o-mch (where/anonymous-value o)]
-            [[s-mch p-mch o-mch]]))))))
+  [s-mch p-mch o context]
+  (cond
+    (v/variable? o)
+    (let [o-mch (parse-variable o)]
+      [[s-mch p-mch o-mch]])
+
+    (map? o)
+    (parse-object-map s-mch p-mch o context)
+
+    (sequential? o)
+    #(mapcat (fn [o*]
+               (parse-statement s-mch p-mch o* context))
+             o)
+
+    (type-pred-match? p-mch)
+    (let [class-ref (parse-class o context)]
+      [(where/->pattern :class [s-mch p-mch class-ref])])
+
+    :else
+    (let [o-mch (where/anonymous-value o)]
+      [[s-mch p-mch o-mch]])))
 
 (defn parse-statement
-  [s-mch p o context]
-  (trampoline parse-statement* s-mch p o context))
+  [s-mch p-mch o context]
+  (trampoline parse-statement* s-mch p-mch o context))
 
 (defn parse-statements*
   [s-mch attrs context]
   #(mapcat (fn [[p o]]
-             (parse-statement s-mch p o context))
+             (let [p-mch (parse-predicate p)]
+               (parse-statement s-mch p-mch o context)))
            attrs))
 
 (defn parse-statements
