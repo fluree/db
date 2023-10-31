@@ -80,6 +80,18 @@
               ["Alice" "Green" "alice@flur.ee"]
               ["Brian" nil nil]]))
 
+      ;; query with two optionals in the same vector
+      (is (= @(fluree/query db '{:select [?name ?favColor ?email]
+                                 :where  [{:id          ?s
+                                           :type        :ex/User
+                                           :schema/name ?name}
+                                          [:optional
+                                           {:id ?s, :ex/favColor ?favColor}
+                                           {:id ?s, :schema/email ?email}]]})
+             [["Cam" nil "cam@flur.ee"]
+              ["Alice" "Green" "alice@flur.ee"]
+              ["Brian" nil nil]]))
+
       ;; optional with unnecessary embedded vector statement
       (is (= @(fluree/query db '{:select [?name ?favColor]
                                  :where  [{:id ?s
