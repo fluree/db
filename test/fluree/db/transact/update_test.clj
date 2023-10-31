@@ -175,9 +175,7 @@
                                                     "ex:hours" "?hours"
                                                     "ex:minutes" "?minutes"
                                                     "ex:seconds" "?seconds"
-                                                    "ex:tz" "?tz1"}
-                                                   {"id" "?s"
-                                                    "ex:tz" "?tz2"}]
+                                                    "ex:tz" ["?tz1" "?tz2"]}]
                                          "values" ["?s" ["ex:datetime-fns"]]}))]
           (is (= {"ex:now" "2023-06-13T19:53:57.234345Z"
                   "ex:year" 2023
@@ -253,9 +251,7 @@
                                         "insert" [{"id" "?s"
                                                    "ex:strStarts" "?a-start"
                                                    "ex:strEnds" "?a-end"
-                                                   "ex:subStr" "?sub1"}
-                                                  {"id" "?s"
-                                                   "ex:subStr" "?sub2"
+                                                   "ex:subStr" ["?sub1" "?sub2"]
                                                    "ex:strLen" "?strlen"
                                                    "ex:ucase" "?upcased"
                                                    "ex:lcase" "?downcased"
@@ -309,9 +305,7 @@
                                           "insert" [{"id" "?s"
                                                      "ex:uuid" "?uuid"
                                                      "ex:struuid" "?struuid"
-                                                     "ex:str" "?str"}
-                                                    {"id" "?s"
-                                                     "ex:str" "?str2"
+                                                     "ex:str" ["?str" "?str2"]
                                                      "ex:isNumeric" "?isnum"
                                                      "ex:isNotNumeric" "?isNotNum"
                                                      "ex:isBlank" "?isBlank"
@@ -325,14 +319,14 @@
                   "ex:isNumeric" true
                   "ex:isNotNumeric" false}
                  @(fluree/query @updated {"selectOne" {"ex:rdf-term-fns" ["ex:isIRI" "ex:isURI" "ex:isLiteral"
-                                                             "ex:lang" "ex:datatype" "ex:IRI" "ex:bnode" "ex:strdt" "ex:strLang"
-                                                             "ex:isBlank"
-                                                             "ex:isNotBlank"
-                                                             "ex:isNumeric"
-                                                             "ex:isNotNumeric"
-                                                             "ex:str"
-                                                             "ex:uuid"
-                                                             "ex:struuid"]}}))))))
+                                                                          "ex:lang" "ex:datatype" "ex:IRI" "ex:bnode" "ex:strdt" "ex:strLang"
+                                                                          "ex:isBlank"
+                                                                          "ex:isNotBlank"
+                                                                          "ex:isNumeric"
+                                                                          "ex:isNotNumeric"
+                                                                          "ex:str"
+                                                                          "ex:uuid"
+                                                                          "ex:struuid"]}}))))))
 
     (testing "functional forms"
       (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
@@ -381,7 +375,7 @@
             run-err   @(fluree/stage db2 {"delete" []
                                           "where" [{"id" "?s", "ex:text" "?text"}
                                                    ["bind" "?err" "(abs ?text)"]]
-                                          "insert" [["?s" "ex:error" "?err"]]
+                                          "insert" {"id" "?s", "ex:error" "?err"}
                                           "values" ["?s" ["ex:error"]]})]
         (is (= "Query function references illegal symbol: foo"
                (-> parse-err
