@@ -156,8 +156,13 @@
                               (string? (::where/val o-mch)))
                        (assoc o-mch ::where/val (<? (dbproto/-subid db (::where/val o-mch) {:expand? false})))
                        o-mch)]
-          (async/pipe (where/resolve-flake-range db fuel-tracker retract-xf error-ch [s-cmp p-cmp o-cmp])
-                      retract-flakes-ch))
+          ;; we need to match an individual flake, so if we are missing s p or o we want to close the ch
+          (if (and (where/get-value s-cmp)
+                   (where/get-value p-cmp)
+                   (where/get-value o-cmp))
+            (async/pipe (where/resolve-flake-range db fuel-tracker retract-xf error-ch [s-cmp p-cmp o-cmp])
+                        retract-flakes-ch)
+            (async/close! retract-flakes-ch)))
         (catch* e
                 (log/error e "Error retracting triple")
                 (>! error-ch e))))

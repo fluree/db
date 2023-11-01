@@ -349,6 +349,7 @@
       (is (= [{"@id"                              "http://example.org/nessie"
                "@type"                            "http://example.org/terms/SeaMonster"
                "http://example.org/terms/isScary" false}]
+
              @(fluree/query db1 '{"@context" nil
                                   "select"   {?m ["*"]}
                                   "where"    {"@id" ?m
@@ -389,3 +390,23 @@
                                            "select"   "?json"
                                            "where"  {"@id" "?s" "ex:json" "?json"}})))
           "comes out as data from select clause"))))
+
+(deftest ^:integration no-where-solutions
+  (let [conn   @(fluree/connect {:method :memory})
+        ledger @(fluree/create conn "insert-delete")
+        db0    (fluree/db ledger)
+
+        db1 @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                 "insert"   [{"@id" "ex:andrew" "schema:name" "Andrew"}]})
+
+        db2 @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
+                                 "where"    {"@id"                "ex:andrew"
+                                             "schema:description" "?o"}
+                                 "delete"   {"@id"                "ex:andrew"
+                                             "schema:description" "?o"}
+                                 "insert"   {"@id"                "ex:andrew"
+                                             "schema:description" "He's great!"}})]
+    (is (= {"@id"                "ex:andrew"
+            "schema:name"        "Andrew"
+            "schema:description" "He's great!"}
+           @(fluree/query db2 {"selectOne" {"ex:andrew" ["*"]}})))))

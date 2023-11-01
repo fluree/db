@@ -580,7 +580,10 @@
   [db fuel-tracker parsed-txn tx-state]
   (go
     (let [error-ch  (async/chan)
-          update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
+          ;; ensure at least one solution is on the solution-ch
+          solution-ch (async/merge [(async/to-chan [where/blank-solution])
+                                    (where/search db parsed-txn fuel-tracker error-ch)])
+          update-ch (->> solution-ch
                          (update/modify2 db parsed-txn tx-state fuel-tracker error-ch)
                          (exec/into-flakeset fuel-tracker))]
       (async/alt!
