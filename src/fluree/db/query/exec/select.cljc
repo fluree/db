@@ -13,7 +13,8 @@
             [fluree.db.util.core :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
-            [fluree.db.datatype :as datatype]))
+            [fluree.db.datatype :as datatype]
+            [fluree.db.util.json :as json]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -26,6 +27,15 @@
 (defmethod display :default
   [match _ _ _ _]
   (go (where/get-value match)))
+
+(defmethod display const/$rdf:json
+  [match db iri-cach compact error-ch]
+  (go
+    (let [v (where/get-value match)]
+      (try* (json/parse v false)
+            (catch* e
+                    (log/error e "Error displaying json:" v)
+                    (>! error-ch e))))))
 
 (defmethod display const/$xsd:anyURI
   [match db iri-cache compact error-ch]
