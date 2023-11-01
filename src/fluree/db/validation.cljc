@@ -350,6 +350,6 @@
                              [:context {:optional true} ::context]
                              [:delete {:optional true} ::delete]
                              [:insert {:optional true} ::insert]
-                             [:where ::where]
+                             [:where {:optional true} ::where]
                              [:values {:optional true} ::values]]]
     ::context              :any}))
