@@ -88,11 +88,6 @@
        (-write w "#IPFSConnection ")
        (-write w (pr (conn-core/printer-map conn))))))
 
-#?(:clj
-   (defmethod print-method IPFSConnection [^IPFSConnection conn, ^Writer w]
-     (.write w (str "#IPFSConnection "))
-     (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"

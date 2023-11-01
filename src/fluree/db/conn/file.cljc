@@ -178,12 +178,6 @@
        (-write w "#FileConnection ")
        (-write w (pr (conn-core/printer-map conn))))))
 
-#?(:clj
-   (defmethod print-method FileConnection [^FileConnection conn, ^Writer w]
-     (.write w (str "#FileConnection "))
-     (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
-
 (defn trim-last-slash
   [s]
   (if (str/ends-with? s "/")

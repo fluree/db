@@ -73,11 +73,6 @@
        (-write w "#RemoteConnection ")
        (-write w (pr (conn-core/printer-map conn))))))
 
-#?(:clj
-   (defmethod print-method RemoteConnection [^RemoteConnection conn, ^Writer w]
-     (.write w (str "#RemoteConnection "))
-     (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"

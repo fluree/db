@@ -137,11 +137,6 @@
        (-write w "#MemoryConnection ")
        (-write w (pr (conn-core/printer-map conn))))))
 
-#?(:clj
-   (defmethod print-method MemoryConnection [^MemoryConnection conn, ^Writer w]
-     (.write w (str "#MemoryConnection "))
-     (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"

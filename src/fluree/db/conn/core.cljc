@@ -113,7 +113,7 @@
                              (or existing new-p-chan)))
         p-chan      (get-in new-state [:ledger ledger-alias])
         not-cached? (= p-chan new-p-chan)]
-    (log/debug "Registering ledger: " ledger-alias " not-cached? " not-cached?)
+    (log/debug "Registering ledger: " ledger-alias " cached? " (not not-cached?))
     [not-cached? p-chan]))
 
 (defn release-ledger
