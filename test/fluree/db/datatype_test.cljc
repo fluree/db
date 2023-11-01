@@ -306,6 +306,12 @@
     (is (= "en-US" (coerce " en-US" const/$xsd:language)))
     (is (= "es-MX" (coerce "\tes-MX" const/$xsd:language))))
 
+  (testing "json"
+    (is (= "{\":edn\":\"data\",\":is\":[\"cool\",\"right?\",1,false,1]}"
+           (coerce {:edn "data" :is ["cool" "right?" 1 false 1.0]} const/$rdf:json)))
+    (is (= "{\"is\":[\"cool\",\"right?\",1,false,1],\"json\":\"data\"}"
+           (coerce {"json" "data" "is" ["cool" "right?" 1 false 1.0]} const/$rdf:json))))
+
   (testing "non-coerced datatypes"
     (is (= "whatever" (coerce "whatever" const/$xsd:hexBinary)))
     (is (= "thingy" (coerce "thingy" const/$xsd:duration)))))

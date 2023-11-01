@@ -5,7 +5,8 @@
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.json :as json]))
 
 ;; handles :select response map for JSON-LD based queries
 
@@ -117,7 +118,8 @@
                                          p-flakes)
                                acc []]
                           (if f
-                            (let [res (if (= const/$xsd:anyURI (flake/dt f))
+                            (let [res (cond
+                                        (= const/$xsd:anyURI (flake/dt f))
                                         (cond
                                           ;; have a specified sub-selection (graph crawl)
                                           (:spec spec)
@@ -135,6 +137,11 @@
                                                                 (<? (cache-sid->iri db cache compact-fn const/$xsd:anyURI))))
                                                 c-iri  (<? (dbproto/-iri db (flake/o f) compact-fn))]
                                             {id-key c-iri}))
+
+                                        (= const/$rdf:json (flake/dt f))
+                                        (json/parse (flake/o f) false)
+
+                                        :else
                                         (flake/o f))]
                               (recur r (conj acc res)))
                             (if (and (= 1 (count acc))

@@ -352,3 +352,39 @@
                                   "select"   {?m ["*"]}
                                   "where"    {"@id" ?m
                                               "@type" "http://example.org/terms/SeaMonster"}}))))))
+
+(deftest json-objects
+  (testing "Allow transacting `json` values"
+    (let [conn   @(fluree/connect {:method :memory})
+          ledger @(fluree/create conn "jsonpls" {:defaultContext [test-utils/default-str-context
+                                                                  {"ex" "http://example.org/ns/"}]})
+          db0    (fluree/db ledger)
+          db1    @(fluree/stage2
+                    db0
+                    {"@context" "https://ns.flur.ee"
+                     "insert"
+                     [{"@id"     "ex:alice"
+                       "@type"   "ex:Person"
+                       "ex:json" {"@type"  "@json"
+                                  "@value" {"json" "data"
+                                            "is"   ["cool" "right?" 1 false 1.0]}}}
+                      {"@id"     "ex:bob"
+                       "@type"   "ex:Person"
+                       "ex:json" {"@type"  "@json"
+                                  "@value" {:edn "data"
+                                            :is  ["cool" "right?" 1 false 1.0]}}}]})]
+      (is (= #{{"id"     "ex:bob",
+                "type"   "ex:Person",
+                "ex:json" {":edn" "data", ":is" ["cool" "right?" 1 false 1]}}
+               {"id"     "ex:alice",
+                "type"   "ex:Person",
+                "ex:json" {"json" "data", "is" ["cool" "right?" 1 false 1]}}}
+             (into #{} @(fluree/query db1 {"where"  {"@id" "?s" "@type" "ex:Person"}
+                                           "select" {"?s" ["*"]}})))
+          "comes out as data from subject crawl")
+      (is (= #{{":edn" "data", ":is" ["cool" "right?" 1 false 1]}
+               {"json" "data", "is" ["cool" "right?" 1 false 1]}}
+             (into #{} @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"}
+                                           "select"   "?json"
+                                           "where"  {"@id" "?s" "ex:json" "?json"}})))
+          "comes out as data from select clause"))))

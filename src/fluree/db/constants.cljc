@@ -230,8 +230,8 @@
 (def ^:const $xsd:unsignedByte 31)                          ;; store as number
 (def ^:const $xsd:hexBinary 32)
 (def ^:const $xsd:base64Binary 33)
+(def ^:const $rdf:json 36)
 ;; NOTE: Add multibyte type?
-;; NOTE: Add JSON type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
 
 
