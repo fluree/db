@@ -155,15 +155,15 @@
     [_ db iri-cache context compact error-ch solution]
     (go
       (try*
-        (let [db-alias (:alias db)
-              sid      (if (where/variable? subj)
-                         (-> solution
-                             (get subj)
-                             (where/get-sid db-alias))
-                         (<? (dbproto/-subid db subj true)))
-              flakes   (<? (query-range/index-range db :spot = [sid]))]
-          ;; TODO: Replace these nils with fuel values when we turn fuel back on
-          (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))
+        (let [db-alias (:alias db)]
+          (when-let [sid (if (where/variable? subj)
+                           (-> solution
+                               (get subj)
+                               (where/get-sid db-alias))
+                           (<? (dbproto/-subid db subj false)))]
+            (let [flakes (<? (query-range/index-range db :spot = [sid]))]
+              ;; TODO: Replace these nils with fuel values when we turn fuel back on
+              (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))))
         (catch* e
                 (log/error e "Error formatting subgraph for subject:" subj)
                 (>! error-ch e))))))

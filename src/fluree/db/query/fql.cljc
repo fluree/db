@@ -64,7 +64,9 @@
        (or (update/insert? x)
            (update/retract? x))
        (or (contains? x :where)
-           (contains? x "where"))))
+           (contains? x "where")
+           (contains? x :values)
+           (contains? x "values"))))
 
 (defn modify
   ([db t json-ld]

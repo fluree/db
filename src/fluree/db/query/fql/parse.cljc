@@ -249,6 +249,9 @@
     (parse-variable p)
     (where/->predicate p)))
 
+(def id-predicate-match
+  (parse-predicate const/iri-id))
+
 (declare parse-statement parse-statements)
 
 (defn parse-object-map
@@ -312,7 +315,10 @@
                   (get const/iri-id)
                   (parse-subject context))
         attrs (dissoc m const/iri-id)]
-    (parse-statements s-mch attrs context)))
+    (if (empty? attrs)
+      (let[o-mch (-> s-mch ::where/iri where/anonymous-value)]
+        [[s-mch id-predicate-match o-mch]])
+      (parse-statements s-mch attrs context))))
 
 (defn parse-node-map
   [m context]
