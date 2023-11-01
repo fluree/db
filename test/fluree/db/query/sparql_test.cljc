@@ -82,23 +82,28 @@
     (let [query "SELECT ?person
                  WHERE {?person person:handle \"jdoe\".}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person:handle" "jdoe"]]
+      (is (= [{"@id"           "?person"
+               "person:handle" "jdoe"}]
              where))))
   (testing "multi clause"
     (let [query "SELECT ?person ?nums
                  WHERE {?person person:handle \"jdoe\".
                         ?person person:favNums ?nums.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person:handle" "jdoe"]
-              ["?person" "person:favNums" "?nums"]]
+      (is (= [{"@id"           "?person"
+               "person:handle" "jdoe"}
+              {"@id"            "?person"
+               "person:favNums" "?nums"}]
              where))))
   (testing "multi-clause, semicolon separator"
     (let [query "SELECT ?person ?nums
                  WHERE {?person person:handle \"jdoe\";
                                 person:favNums ?nums.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person:handle" "jdoe"]
-              ["?person" "person:favNums" "?nums"]]
+      (is (= [{"@id"           "?person"
+               "person:handle" "jdoe"}
+              {"@id"            "?person"
+               "person:favNums" "?nums"}]
              where))))
   (testing "multiple objects, semicolon separator"
     (let [query "SELECT ?person ?fullName ?favNums
@@ -106,9 +111,12 @@
                                 person:fullName ?fullName;
                                 person:favNums ?favNums}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person:handle" "jdoe"]
-              ["?person" "person:fullName" "?fullName"]
-              ["?person" "person:favNums" "?favNums"]]
+      (is (= [{"@id"           "?person"
+               "person:handle" "jdoe"}
+              {"@id"             "?person"
+               "person:fullName" "?fullName"}
+              {"@id"            "?person"
+               "person:favNums" "?favNums"}]
              where))))
   (testing "UNION"
     (let [query "SELECT ?person ?age
@@ -117,11 +125,11 @@
                         UNION {?person person:handle \"anguyen\".}
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [{:union
-               [[["?person" "person:age" 70]
-                 ["?person" "person:handle" "dsanchez"]]
-                [["?person" "person:handle" "anguyen"]]]}
-              ["?person" "person:age" "?age"]]
+      (is (= [[:union
+               [[{"@id" "?person", "person:age" 70}
+                 {"@id" "?person", "person:handle" "dsanchez"}]
+                [{"@id" "?person", "person:handle" "anguyen"}]]]
+              {"@id" "?person", "person:age" "?age"}]
              where))))
   (testing "FILTER"
     (let [query "SELECT ?handle ?num
@@ -129,17 +137,17 @@
                         ?person person:favNums ?num.
                         FILTER ( ?num > 10 ).}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person:handle" "?handle"]
-              ["?person" "person:favNums" "?num"]
-              {:filter ["(> ?num 10)"]}]
+      (is (= [{"@id" "?person", "person:handle" "?handle"}
+              {"@id" "?person", "person:favNums" "?num"}
+              [:filter ["(> ?num 10)"]]]
              where))))
   (testing "OPTIONAL"
     (let [query "SELECT ?handle ?num
                  WHERE {?person person:handle ?handle.
                         OPTIONAL {?person person:favNums ?num.}}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person:handle" "?handle"]
-              {:optional [["?person" "person:favNums" "?num"]]}]
+      (is (= [{"@id" "?person", "person:handle" "?handle"}
+              [:optional [{"@id" "?person", "person:favNums" "?num"}]]]
              where)))
     (testing "multi-clause"
       (let [query "SELECT ?person ?name ?handle ?favNums
@@ -147,10 +155,10 @@
                           OPTIONAL {?person person:handle ?handle.
                                     ?person person:favNums ?favNums.}}"
             {:keys [where]} (sparql/->fql query)]
-        (is (= [["?person" "person:fullName" "?name"]
-                {:optional
-                 [["?person" "person:handle" "?handle"]
-                  ["?person" "person:favNums" "?favNums"]]}]
+        (is (= [{"@id" "?person", "person:fullName" "?name"}
+                [:optional
+                 [{"@id" "?person", "person:handle" "?handle"}
+                  {"@id" "?person", "person:favNums" "?favNums"}]]]
                where))))
     (testing "OPTIONAL + FILTER"
       (let [query "SELECT ?handle ?num
@@ -158,30 +166,30 @@
                           OPTIONAL {?person person:favNums ?num.
                                     FILTER( ?num > 10 )}}"
             {:keys [where]} (sparql/->fql query)]
-        (is (= [["?person" "person:handle" "?handle"]
-                {:optional
-                 [["?person" "person:favNums" "?num"]
-                  {:filter ["(> ?num 10)"]}]}]
+        (is (= [{"@id" "?person", "person:handle" "?handle"}
+                [:optional
+                 [{"@id" "?person", "person:favNums" "?num"}
+                  [:filter ["(> ?num 10)"]]]]]
                where)))))
   (testing "VALUES"
     (let [query "SELECT ?handle
                  WHERE {VALUES ?handle { \"dsanchez\" }
                         ?person person:handle ?handle.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [{:bind {"?handle" "dsanchez"}}
-              ["?person" "person:handle" "?handle"]]
+      (is (= [[:bind {"?handle" "dsanchez"}]
+              {"@id" "?person", "person:handle" "?handle"}]
              where))))
   (testing "BIND"
     (let [query "SELECT ?person ?handle
                  WHERE {BIND (\"dsanchez\" AS ?handle)
                         ?person person:handle ?handle.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [{:bind {"?handle" "dsanchez"}}
-              ["?person" "person:handle" "?handle"]]
-             where))))
+      (is (= [[:bind {"?handle" "dsanchez"}]
+              {"@id" "?person", "person:handle" "?handle"}]
+             where)))))
 
-  ;;TODO: not yet supported
-  #_(testing "language labels"))
+;;TODO: not yet supported
+#_(testing "language labels")
 
 (deftest parse-prefixes
   (testing "PREFIX"
@@ -192,8 +200,8 @@
           {:keys [context where]} (sparql/->fql query)]
       (is (= {"foaf" "http://xmlns.com/foaf/0.1/"}
              context))
-      (is (= [["?x" "foaf:name" "?name"]
-              ["?x" "foaf:mbox" "?mbox"]]
+      (is (= [{"@id" "?x", "foaf:name" "?name"}
+              {"@id" "?x", "foaf:mbox" "?mbox"}]
              where))))
   (testing "multiple PREFIXes"
     (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
@@ -270,9 +278,9 @@
                       ?person person:follows+ ?follows.
                       ?follows person:handle ?followHandle.}"
         {:keys [where]} (sparql/->fql query)]
-    (is (= [["?person" "person:handle" "anguyen"]
-            ["?person" "person:follows+" "?follows"]
-            ["?follows" "person:handle" "?followHandle"]]
+    (is (= [{"@id" "?person", "person:handle" "anguyen"}
+            {"@id" "?person", "person:follows+" "?follows"}
+            {"@id" "?follows", "person:handle" "?followHandle"}]
            where)))
   (testing "depth"
     (let [query "SELECT ?followHandle
@@ -280,9 +288,9 @@
                         ?person person:follows+3 ?follows.
                         ?follows person:handle ?followHandle.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person:handle" "anguyen"]
-              ["?person" "person:follows+3" "?follows"]
-              ["?follows" "person:handle" "?followHandle"]]
+      (is (= [{"@id" "?person", "person:handle" "anguyen"}
+              {"@id" "?person", "person:follows+3" "?follows"}
+              {"@id" "?follows", "person:handle" "?followHandle"}]
              where)))))
 
 ;; TODO
@@ -300,8 +308,7 @@
                (catch #?(:clj  clojure.lang.ExceptionInfo
                          :cljs :default) e (ex-data e))))))))
 
-;; TODO: Uncomment CLJS tests once sparql parser is reimplemented
-(deftest ^:pending ^:integration query-test
+(deftest ^:integration query-test
   (let [people-data [{"id"              "ex:jdoe"
                       "type"            "ex:Person"
                       "person:handle"   "jdoe"
@@ -581,15 +588,4 @@
                            WHERE {BIND (\"jdoe\" AS ?handle)
                                   ?person person:handle ?handle.}"
                    results @(fluree/query db query {:format :sparql})]
-               (is (= ["ex:jdoe" "jdoe"] results))))
-
-           ;; SELECT * queries will need some kind of special handling as there isn't
-           ;; an exact corollary in FQL. Will need to find all in-scope vars and turn
-           ;; it all into a :select map of {?var1 ["*"], ?var2 ["*"], ...}
-         #_(testing "SELECT * query works"
-             (let [query   "SELECT *
-                            WHERE {?person person:handle \"jdoe\".
-                                   ?person person:fullName ?fullName.}"
-                   results @(fluree/query db query {:format :sparql})]
-               (is (= [["ex:jdoe" "Jane Doe"]]
-                      results))))))))
+               (is (= ["ex:jdoe" "jdoe"] results))))))))

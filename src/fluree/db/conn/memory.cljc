@@ -79,6 +79,10 @@
   [data-atom context-key]
   (read-data data-atom context-key))
 
+(defn close
+  [id state]
+  (log/info "Closing memory connection" id)
+  (swap! state assoc :closed? true))
 
 (defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom
                              parallelism msg-in-ch msg-out-ch nameservices data-atom]
@@ -90,9 +94,7 @@
   (-ctx-read [_ context-key] (go (read-context data-atom context-key)))
 
   conn-proto/iConnection
-  (-close [_]
-    (log/info "Closing memory connection" id)
-    (swap! state assoc :closed? true))
+  (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :memory)
   (-parallelism [_] parallelism)

@@ -1,6 +1,8 @@
 (ns fluree.db.datatype
   (:require [fluree.db.constants :as const]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]
             [clojure.string :as str]
             #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc]))
@@ -44,7 +46,8 @@
    "http://www.w3.org/2001/XMLSchema#unsignedByte"         const/$xsd:unsignedByte
    "http://www.w3.org/2001/XMLSchema#hexBinary"            const/$xsd:hexBinary
    "http://www.w3.org/2001/XMLSchema#base64Binary"         const/$xsd:base64Binary
-   "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" const/$rdf:langString})
+   "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" const/$rdf:langString
+   "@json"                                                 const/$rdf:json})
 
 
 (def iso8601-offset-pattern
@@ -288,6 +291,13 @@
         (str/replace #"\s+" " ")
         str/trim)))
 
+(defn- coerce-json
+  [value]
+  (try*
+    (json-ld/normalize-data value)
+    (catch* e
+            (log/error e "Unable to normalize json" value))))
+
 (defn- check-signed
   "Returns nil if required-type and n conflict in terms of signedness
   (e.g. unsignedInt but n is negative, nonPositiveInteger but n is greater than
@@ -373,6 +383,9 @@
 
     (const/$xsd:token const/$xsd:language)
     (coerce-token value)
+
+    const/$rdf:json
+    (coerce-json value)
 
     ;; else
     value))

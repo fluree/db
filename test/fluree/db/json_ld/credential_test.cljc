@@ -112,7 +112,7 @@
                     (done)))))))
 
 #?(:clj
-   (deftest ^:pending ^:integration cred-wrapped-transactions-and-queries
+   (deftest ^:integration cred-wrapped-transactions-and-queries
      (let [conn   @(fluree/connect {:method :memory})
            ledger @(fluree/create conn "credentialtest" {:defaultContext
                                                          [test-utils/default-str-context
@@ -131,17 +131,14 @@
            ;; can't use credentials until after an identity with a role has been created
            db1       @(test-utils/transact ledger tx)
 
-           mdfn {"delete" {"@id" (:id auth)
-                           "name" "Daniel"
+           mdfn {"delete" {"@id"     "?s"
+                           "name"    "Daniel"
                            "favnums" 1}
-                 "insert" [{"@id" (:id auth)
-                            "name" "D"}
-                           {"@id" (:id auth)
-                            "favnums" 4}
-                           {"@id" (:id auth)
-                            "favnums" 5}
-                           {"@id" (:id auth)
-                            "favnums" 6}]}
+                 "insert" {"@id"     "?s"
+                           "name"    "D"
+                           "favnums" [4 5 6]}
+                 "where"  {"@id" "?s"}
+                 "values" ["?s" [(:id auth)]]}
 
            db2 @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
 

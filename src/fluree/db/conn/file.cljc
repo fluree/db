@@ -110,6 +110,11 @@
   [conn context-key]
   (json/parse (read-address conn context-key) true))
 
+(defn close
+  [id state]
+  (log/info "Closing file connection" id)
+  (swap! state assoc :closed? true))
+
 (defrecord FileConnection [id state ledger-defaults parallelism msg-in-ch
                            nameservices serializer msg-out-ch lru-cache-atom]
 
@@ -128,9 +133,7 @@
        :cljs (async/go (json/parse (read-address conn index-address) true))))
 
   conn-proto/iConnection
-  (-close [_]
-    (log/info "Closing file connection" id)
-    (swap! state assoc :closed? true))
+  (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :file)
   (-parallelism [_] parallelism)

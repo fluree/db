@@ -303,7 +303,8 @@
                             [:iri ::iri]
                             [:map [:ref ::node-map]]
                             [:collection [:sequential [:ref ::node-map-value]]]]
-    ::node-map             [:map-of {:error/message "Invalid node map"}
+    ::node-map             [:map-of {:error/message "Invalid node map"
+                                     :min 1}
                             [:ref ::node-map-key] [:ref ::node-map-value]]
     ::where-pattern        [:multi {:dispatch where-pattern-type
                                     :error/message "where clause patterns must be either a node map or a filter, optional, union, bind, or graph array."}
@@ -350,6 +351,6 @@
                              [:context {:optional true} ::context]
                              [:delete {:optional true} ::delete]
                              [:insert {:optional true} ::insert]
-                             [:where ::where]
+                             [:where {:optional true} ::where]
                              [:values {:optional true} ::values]]]
     ::context              :any}))
