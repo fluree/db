@@ -131,17 +131,13 @@
            ;; can't use credentials until after an identity with a role has been created
            db1       @(test-utils/transact ledger tx)
 
-           mdfn {"delete" {"@id" (:id auth)
+           mdfn {"delete" {"@id" "?s"
                            "name" "Daniel"
                            "favnums" 1}
-                 "insert" [{"@id" (:id auth)
-                            "name" "D"}
-                           {"@id" (:id auth)
-                            "favnums" 4}
-                           {"@id" (:id auth)
-                            "favnums" 5}
-                           {"@id" (:id auth)
-                            "favnums" 6}]}
+                 "insert" {"@id" "?s"
+                           "name" "D"
+                           "favnums" [4 5 6]}
+                 "values" ["?s" [(:id auth)]]}
 
            db2 @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
 
