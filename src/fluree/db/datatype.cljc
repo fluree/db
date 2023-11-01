@@ -295,7 +295,8 @@
   [value]
   (try*
     (json-ld/normalize-data value)
-    (catch* _)))
+    (catch* e
+            (log/error e "Unable to normalize json" value))))
 
 (defn- check-signed
   "Returns nil if required-type and n conflict in terms of signedness

@@ -31,7 +31,7 @@
 (defmethod display const/$rdf:json
   [match db iri-cach compact error-ch]
   (go
-    (let [v (::where/val match)]
+    (let [v (where/get-value match)]
       (try* (json/parse v false)
             (catch* e
                     (log/error e "Error displaying json:" v)
