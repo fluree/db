@@ -588,15 +588,4 @@
                            WHERE {BIND (\"jdoe\" AS ?handle)
                                   ?person person:handle ?handle.}"
                    results @(fluree/query db query {:format :sparql})]
-               (is (= ["ex:jdoe" "jdoe"] results))))
-
-           ;; SELECT * queries will need some kind of special handling as there isn't
-           ;; an exact corollary in FQL. Will need to find all in-scope vars and turn
-           ;; it all into a :select map of {?var1 ["*"], ?var2 ["*"], ...}
-         #_(testing "SELECT * query works"
-             (let [query   "SELECT *
-                            WHERE {?person person:handle \"jdoe\".
-                                   ?person person:fullName ?fullName.}"
-                   results @(fluree/query db query {:format :sparql})]
-               (is (= [["ex:jdoe" "Jane Doe"]]
-                      results))))))))
+               (is (= ["ex:jdoe" "jdoe"] results))))))))
