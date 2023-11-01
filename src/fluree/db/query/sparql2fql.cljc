@@ -137,21 +137,14 @@
 
 (defn handle-object-in-property-list-path
   "Given a subject, predicate, and either an ObjectPath or Object List, returns an array of where clauses."
-  ([subject predicate object]
-   (handle-object-in-property-list-path subject predicate object nil))
-  ([subject predicate object source]
-   (case (first object)
-     ;; Single clause in [ ]
-     :ObjectPath (if source
-                   [[source subject predicate (handle-object (second object))]]
-                   [[subject predicate (handle-object (second object))]])
+  [subject predicate object]
+  (case (first object)
+    ;; Single clause in [ ]
+    :ObjectPath [{"@id" subject, predicate (handle-object (second object))}]
 
-     ;; Multiple clauses
-     :ObjectList (if source
-                   (map #(vector source subject predicate (handle-object (second %)))
-                        (rest object))
-                   (map #(vector subject predicate (handle-object (second %)))
-                        (rest object))))))
+    ;; Multiple clauses
+    :ObjectList (map #(hash-map "@id" subject, predicate (handle-object (second %)))
+                      (rest object))))
 
 (defn handle-path-primary
   "Returns a predicate.
@@ -194,7 +187,7 @@
     predicate))
 
 (defn handle-property-list-path-not-empty
-  "Returns an array of where clauses, i.e. [[?s ?p ?o] [?s ?p1 ?o1]]
+  "Returns an array of where clauses, i.e. [{\"@id\" ?s, ?p ?o} {\"@id\" ?s, ?p1 ?o1}]
   BNF -- ( Path | Var ) ObjectPath ( ( ( Path | Simple ) ObjectList )? )* "
   [subject prop-path]
   (loop [[path-item & r] prop-path
@@ -417,7 +410,7 @@
         bind-value (if (str/starts-with? bind-value "\"")
                      (edn/read-string bind-value)
                      bind-value)]
-    {:bind {var bind-value}}))
+    [:bind {var bind-value}]))
 
 (defn handle-arg-list
   "BNF -- NIL | 'DISTINCT'? Expression ( Expression )* "
@@ -478,11 +471,11 @@
   "BNF -- GroupGraphPattern ( <'UNION'> GroupGraphPattern )*
   {\"union\": [ [[s p o][s1 p1 p1]] [[s2 p2 o2]] ]   "
   [group-or-union]
-  {:union (mapv handle-where-clause group-or-union)})
+  [:union (mapv handle-where-clause group-or-union)])
 
 (defn handle-optional-graph-pattern
   [optional]
-  {:optional (first (mapv handle-where-clause optional))})
+  [:optional (first (mapv handle-where-clause optional))])
 
 
 (defn handle-graph-pattern-not-triples
@@ -505,13 +498,13 @@
     (throw (ex-info (str "This feature is not yet implemented in SPARQL. Provided: " not-triples) {:status 400 :error :db/invalid-query}))
 
     :Filter
-    {:filter (handle-constraint (-> not-triples second second))}
+    [:filter (handle-constraint (-> not-triples second second))]
 
     :Bind
     (handle-bind (rest not-triples))
 
     :InlineData
-    {:bind (handle-values (second not-triples))}))
+    [:bind (handle-values (second not-triples))]))
 
 (defn handle-group-condition
   "BNF -- BuiltInCall | FunctionCall | Expression ( 'AS' Var )? | Var"
