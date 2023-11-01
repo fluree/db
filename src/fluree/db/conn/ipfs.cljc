@@ -17,6 +17,11 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn close
+  [id state]
+  (log/info "Closing IPFS Connection" id)
+  (swap! state assoc :closed? true))
+
 ;; IPFS Connection object
 
 (defrecord IPFSConnection [id state ledger-defaults lru-cache-atom
@@ -34,9 +39,7 @@
     (ipfs/write ipfs-endpoint context-data))
 
   conn-proto/iConnection
-  (-close [_]
-    (log/info "Closing IPFS Connection" id)
-    (swap! state assoc :closed? true))
+  (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :ipfs)
   (-parallelism [_] parallelism)
