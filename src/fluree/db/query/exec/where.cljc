@@ -100,6 +100,10 @@
   [match]
   (::val match))
 
+(defn get-meta
+  [match]
+  (::meta match))
+
 (defn sanitize-match
   [match]
   (select-keys match [::iri ::val ::datatype ::sids]))

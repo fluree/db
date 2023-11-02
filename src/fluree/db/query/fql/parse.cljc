@@ -591,9 +591,8 @@
 
         ;; ref object
         :else
-        (let [ref-cmp (-> (where/match-iri (if (nil? id) (temp-bnode-id bnode-counter) id))
-                          (assoc ::where/datatype const/iri-id)
-                          (cond-> m (assoc ::where/meta m)))
+        (let [ref-cmp (cond-> (where/match-iri (if (nil? id) (temp-bnode-id bnode-counter) id))
+                        m (assoc ::where/meta m))
               v-map* (if (nil? id)
                        ;; project newly created bnode-id into v-map
                        (assoc v-map :id (where/get-iri ref-cmp))

@@ -964,10 +964,11 @@
                                                            "f:action" [{"@id" "f:view"}]}
                                                 "f:property" {"f:path" {"@id" "schema:ssn"}
                                                               "f:allow" {"@id" "ex:ssnViewRule"
-                                                                         "f:targetRole" "ex:userRole"
+                                                                         "f:targetRole" {"@id" "ex:userRole"}
                                                                          "f:action" {"@id" "f:view"}
-                                                                         "f:equals" {"@list" [{"@id" "f:$identity"}
-                                                                                              {"@id" "ex:user"}]}}}}]}})
+                                                                         "f:equals" {"@list"
+                                                                                     [{"@id" "f:$identity"}
+                                                                                      {"@id" "ex:user"}]}}}}]}})
 
            db6 @(fluree/stage2 db5 {"@context" "https://ns.flur.ee",
                                     "insert" [{"@id" "schema:givenName", "@type" "rdf:Property"}
