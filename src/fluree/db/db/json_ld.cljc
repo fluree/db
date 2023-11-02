@@ -32,9 +32,7 @@
   "Returns subject id or nil if no match."
   [db iri]
   (go-try
-    (some-> (<? (query-range/index-range db :post = [const/$xsd:anyURI iri]))
-            first
-            flake/s)))
+    (first (<? (query-range/index-range db :post = [const/$xsd:anyURI iri] {:flake-xf (map flake/s)})))))
 
 (defn expand-iri
   "Expands an IRI from the db's context."
