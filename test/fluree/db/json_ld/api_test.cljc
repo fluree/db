@@ -1047,13 +1047,13 @@
                                        "where" {"id" "?s", "schema:givenName" "?name"}})))
            "equivalentProperty annotations work")
 
-       (is (= 150
+       (is (= 149
               (-> @(fluree/history ledger {:commit-details true :t {:from :latest}})
                   (first)
                   (get "f:commit")
                   (get "f:data")
                   (get "f:flakes"))))
-       (is (= 150
+       (is (= 149
               (-> @(fluree/history loaded {:commit-details true :t {:from :latest}})
                   (first)
                   (get "f:commit")
