@@ -364,18 +364,18 @@
          (->> (query-range/filter-authorized db start-flake end-flake error-ch))))))
 
 
-(defn evaluate-subject-iri
+(defn resolve-subject-sid
   [db error-ch s-mch]
   (go (try*
         (let [db-alias (:alias db)
               s-iri    (::iri s-mch)]
-          (when-let [sid (<? (dbproto/-subid db s-iri false))]
+          (when-let [sid (<? (dbproto/-subid db s-iri {:expand? false}))]
             (match-sid s-mch db-alias sid)))
         (catch* e
                 (log/error e "Error resolving subject id")
                 (>! error-ch e)))))
 
-(defn evaluate-predicate-iri
+(defn resolve-predicate-sid
   [db p-mch]
   (let [db-alias (:alias db)
         p-iri    (::iri p-mch)]
@@ -383,21 +383,21 @@
                        (dbproto/-p-prop db :id p-iri))]
       (match-sid p-mch db-alias pid))))
 
-(defn evaluate-iris
+(defn resolve-sids
   [db error-ch [s p o]]
   (go
     (let [db-alias (:alias db)
           s*       (if (and (matched-iri? s)
                             (not (get-sid s db-alias)))
-                     (<! (evaluate-subject-iri db error-ch s))
+                     (<! (resolve-subject-sid db error-ch s))
                      s)
           p*       (if (and (matched-iri? p)
                             (not (get-sid p db-alias)))
-                     (evaluate-predicate-iri db p)
+                     (resolve-predicate-sid db p)
                      p)
           o*       (if (and (matched-iri? o)
                             (not (get-sid o db-alias)))
-                     (<! (evaluate-subject-iri db error-ch o))
+                     (<! (resolve-subject-sid db error-ch o))
                      o)]
       (when (and (some? s*) (some? p*) (some? o*))
         [s* p* o*]))))
@@ -414,7 +414,7 @@
   (go
     (let [db-alias (:alias db)
           triple   (assign-matched-values pattern solution filters)]
-      (if-let [[s p o] (<! (evaluate-iris db error-ch triple))]
+      (if-let [[s p o] (<! (resolve-sids db error-ch triple))]
         (let [pid (get-sid p db-alias)]
           (if-let [props (and pid (get-equivalent-properties db pid))]
             (let [prop-ch (async/to-chan! (conj props pid))]
@@ -495,15 +495,15 @@
             [s p o]    (assign-matched-values triple solution filters)
             s*         (if (and (matched-iri? s)
                                 (not (get-sid s db-alias)))
-                         (<! (evaluate-subject-iri db error-ch s))
+                         (<! (resolve-subject-sid db error-ch s))
                          s)
             p*         (if (and (matched-iri? p)
                                 (not (get-sid p db-alias)))
-                         (evaluate-predicate-iri db p)
+                         (resolve-predicate-sid db p)
                          p)
             o*         (if (and (matched-iri? o)
                                 (not (get-sid o db-alias)))
-                         (evaluate-predicate-iri db o)
+                         (resolve-predicate-sid db o)
                          o)]
         (if (and (some? s*) (some? p*) (some? o*))
           (let

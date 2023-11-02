@@ -596,7 +596,7 @@
                           (cond-> m (assoc ::where/meta m)))
               v-map* (if (nil? id)
                        ;; project newly created bnode-id into v-map
-                       (assoc v-map :id (::where/iri ref-cmp))
+                       (assoc v-map :id (where/get-iri ref-cmp))
                        v-map)]
           (conj (parse-subj-cmp bnode-counter triples v-map*) [subj-cmp pred-cmp ref-cmp]))))
 

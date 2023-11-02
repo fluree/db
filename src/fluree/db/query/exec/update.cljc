@@ -33,7 +33,7 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [triple ch]
-                            (go (let [triple* (<! (where/evaluate-iris db error-ch triple))]
+                            (go (let [triple* (<! (where/resolve-sids db error-ch triple))]
                                   (-> db
                                       (retract-triple triple* t solution fuel-tracker error-ch)
                                       (async/pipe ch)))))
@@ -74,7 +74,7 @@
   (async/pipeline-async 2
                         out-ch
                         (fn [triple ch]
-                           (go (let [triple* (<! (where/evaluate-iris db error-ch triple))]
+                           (go (let [triple* (<! (where/resolve-sids db error-ch triple))]
                                 (-> db
                                     (insert-triple triple* t solution error-ch)
                                     (async/pipe ch)))))
@@ -142,35 +142,13 @@
                                  ;;(eg the commit pipeline) relies on
                                  (when-not (iri-mapping? f)
                                    (flake/flip-flake f t))))
-              db-alias   (:alias db)
 
-              [s-mch p-mch o-mch] (where/assign-matched-values triple solution nil)
-
-              s  (or (where/get-sid s-mch db-alias)
-                     (where/get-iri s-mch))
-              p  (or (where/get-sid p-mch db-alias)
-                     (where/get-iri p-mch))
-              o  (or (where/get-value o-mch)
-                     (where/get-iri o-mch)
-                     (where/get-sid o-mch db-alias))
-              dt (::where/datatype o-mch)
-              m  (::where/meta o-mch)
-
-              s-cmp  (if (string? s)
-                       (where/match-sid s-mch db-alias (<? (dbproto/-subid db s {:expand? false})))
-                       s-mch)
-              p-cmp  (if (string? p)
-                       (where/match-sid p-mch db-alias (<? (dbproto/-subid db p {:expand? false})))
-                       p-mch)
-              o-cmp  (if (and (= const/iri-id dt) (string? o))
-                       (where/match-sid o-mch db-alias (<? (dbproto/-subid db o {:expand? false})))
-                       o-mch)]
+              components  (->> (where/assign-matched-values triple solution nil)
+                               (where/resolve-sids db error-ch)
+                               (<!))]
           ;; we need to match an individual flake, so if we are missing s p or o we want to close the ch
-          (if (and (where/matched-sid? s-cmp)
-                   (where/matched-sid? p-cmp)
-                   (or (where/matched-value? o-cmp)
-                       (where/matched-sid? o-cmp)))
-            (async/pipe (where/resolve-flake-range db fuel-tracker retract-xf error-ch [s-cmp p-cmp o-cmp])
+          (if components
+            (async/pipe (where/resolve-flake-range db fuel-tracker retract-xf error-ch components)
                         retract-flakes-ch)
             (async/close! retract-flakes-ch)))
         (catch* e
