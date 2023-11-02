@@ -311,13 +311,15 @@
 
 (defn modify2
   [db parsed-txn tx-state fuel-tracker error-ch solution-ch]
-  (cond
-    (and (insert? parsed-txn)
-         (retract? parsed-txn))
-    (insert-retract2 db parsed-txn tx-state fuel-tracker error-ch solution-ch)
+  (let [solution-ch* (async/pipe solution-ch
+                                 (async/chan 2 (where/with-default where/blank-solution)))]
+    (cond
+      (and (insert? parsed-txn)
+           (retract? parsed-txn))
+      (insert-retract2 db parsed-txn tx-state fuel-tracker error-ch solution-ch*)
 
-    (insert? parsed-txn)
-    (insert2 db parsed-txn tx-state error-ch solution-ch)
+      (insert? parsed-txn)
+      (insert2 db parsed-txn tx-state error-ch solution-ch*)
 
-    (retract? parsed-txn)
-    (retract2 db parsed-txn tx-state fuel-tracker error-ch solution-ch)))
+      (retract? parsed-txn)
+      (retract2 db parsed-txn tx-state fuel-tracker error-ch solution-ch*))))
