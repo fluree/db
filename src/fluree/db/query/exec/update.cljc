@@ -146,15 +146,15 @@
               [s-mch p-mch o-mch] (where/assign-matched-values triple solution nil)
 
               s-cmp  (if (string? (::where/val s-mch))
-                       (assoc s-mch ::where/val (<? (dbproto/-subid db (::where/val s-mch) true)))
+                       (assoc s-mch ::where/val (<? (dbproto/-subid db (::where/val s-mch) {:expand? false})))
                        s-mch)
 
               p-cmp  (if (string? (::where/val p-mch))
-                       (assoc p-mch ::where/val (<? (dbproto/-subid db (::where/val p-mch) true)))
+                       (assoc p-mch ::where/val (<? (dbproto/-subid db (::where/val p-mch) {:expand? false})))
                        p-mch)
               o-cmp  (if (and (= const/$xsd:anyURI (::where/val o-mch))
                               (string? (::where/val o-mch)))
-                       (assoc o-mch ::where/val (<? (dbproto/-subid db (::where/val o-mch) true)))
+                       (assoc o-mch ::where/val (<? (dbproto/-subid db (::where/val o-mch) {:expand? false})))
                        o-mch)]
           (async/pipe (where/resolve-flake-range db fuel-tracker retract-xf error-ch [s-cmp p-cmp o-cmp])
                       retract-flakes-ch))
@@ -215,25 +215,25 @@
             dt (::where/datatype o-mch)
             m  (::where/m o-mch)
 
-            existing-sid   (<? (dbproto/-subid db s))
+            existing-sid   (<? (dbproto/-subid db s {:expand? false}))
             [sid s-iri]    (if (temp-bnode? s)
                              (let [bnode-sid (next-sid s)]
                                [bnode-sid (bnode-id bnode-sid)])
                              [(or existing-sid (get jld-ledger/predefined-properties s) (next-sid s)) s])
             new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
 
-            existing-pid   (<? (dbproto/-subid db p))
+            existing-pid   (<? (dbproto/-subid db p {:expand? false}))
             pid            (or existing-pid (get jld-ledger/predefined-properties p) (next-pid p))
             new-pred-flake (when-not existing-pid (create-id-flake pid p t))
 
-            existing-dt  (when dt (<? (dbproto/-subid db dt)))
+            existing-dt  (when dt (<? (dbproto/-subid db dt {:expand? false})))
             dt-sid       (cond existing-dt  existing-dt
                                (string? dt) (or (get jld-ledger/predefined-properties dt) (next-pid dt))
                                :else        (datatype/infer o (:lang m)))
             new-dt-flake (when (and (not existing-dt) (string? dt)) (create-id-flake dt-sid dt t))
 
             ref?             (= dt const/iri-id)
-            existing-ref-sid (when ref? (<? (dbproto/-subid db o)))
+            existing-ref-sid (when ref? (<? (dbproto/-subid db o {:expand? false})))
             ref-sid          (when ref?
                                (if existing-ref-sid
                                  existing-ref-sid

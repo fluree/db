@@ -1,7 +1,9 @@
 (ns fluree.db.util.context
   (:require [clojure.string :as str]
             [fluree.json-ld :as json-ld]
-            [fluree.db.dbproto :as dbproto]))
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.util.core :as util]
+            [fluree.db.constants :as const]))
 
 ;; handles some default context merging.
 
@@ -181,6 +183,28 @@
   (cond (contains? jsonld :context) (:context jsonld)
         (contains? jsonld "@context") (get jsonld "@context")
         :else ::dbproto/default-context))
+
+(defn validate-txn-context
+  [txn]
+  (when-not (and (or (contains? txn :context)
+                     (contains? txn "@context"))
+                 (->> (get txn "@context" (:context txn))
+                      (util/sequential)
+                      (filter #{"https://ns.flur.ee"})
+                      (not-empty)))
+    (throw (ex-info "Transaction must include an @context key with a value that includes `https://ns.flur.ee`."
+                    {:status 400, :error :db/invalid-transaction-context}))))
+
+(defn txn-context
+  "Remove the fluree context from the supplied context."
+  [txn]
+  (validate-txn-context txn)
+  (let [supplied-context (->> (get txn "@context" (:context txn))
+                              (util/sequential)
+                              (remove #{"https://ns.flur.ee"}))]
+    (if (seq supplied-context)
+      supplied-context
+      ::dbproto/default-context)))
 
 (defn extract
   [db jsonld opts]
