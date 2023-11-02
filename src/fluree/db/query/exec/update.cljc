@@ -142,24 +142,34 @@
                                  ;;(eg the commit pipeline) relies on
                                  (when-not (iri-mapping? f)
                                    (flake/flip-flake f t))))
+              db-alias   (:alias db)
 
               [s-mch p-mch o-mch] (where/assign-matched-values triple solution nil)
 
-              s-cmp  (if (string? (::where/val s-mch))
-                       (assoc s-mch ::where/val (<? (dbproto/-subid db (::where/val s-mch) {:expand? false})))
-                       s-mch)
+              s  (or (where/get-sid s-mch db-alias)
+                     (where/get-iri s-mch))
+              p  (or (where/get-sid p-mch db-alias)
+                     (where/get-iri p-mch))
+              o  (or (where/get-value o-mch)
+                     (where/get-iri o-mch)
+                     (where/get-sid o-mch db-alias))
+              dt (::where/datatype o-mch)
+              m  (::where/meta o-mch)
 
-              p-cmp  (if (string? (::where/val p-mch))
-                       (assoc p-mch ::where/val (<? (dbproto/-subid db (::where/val p-mch) {:expand? false})))
+              s-cmp  (if (string? s)
+                       (where/match-sid s-mch db-alias (<? (dbproto/-subid db s {:expand? false})))
+                       s-mch)
+              p-cmp  (if (string? p)
+                       (where/match-sid p-mch db-alias (<? (dbproto/-subid db p {:expand? false})))
                        p-mch)
-              o-cmp  (if (and (= const/$xsd:anyURI (::where/val o-mch))
-                              (string? (::where/val o-mch)))
-                       (assoc o-mch ::where/val (<? (dbproto/-subid db (::where/val o-mch) {:expand? false})))
+              o-cmp  (if (and (= const/iri-id dt) (string? o))
+                       (where/match-sid o-mch db-alias (<? (dbproto/-subid db o {:expand? false})))
                        o-mch)]
           ;; we need to match an individual flake, so if we are missing s p or o we want to close the ch
-          (if (and (where/get-value s-cmp)
-                   (where/get-value p-cmp)
-                   (where/get-value o-cmp))
+          (if (and (where/matched-sid? s-cmp)
+                   (where/matched-sid? p-cmp)
+                   (or (where/matched-value? o-cmp)
+                       (where/matched-sid? o-cmp)))
             (async/pipe (where/resolve-flake-range db fuel-tracker retract-xf error-ch [s-cmp p-cmp o-cmp])
                         retract-flakes-ch)
             (async/close! retract-flakes-ch)))
@@ -209,16 +219,20 @@
   [db triple {:keys [t next-sid next-pid]} solution error-ch]
   (go
     (try*
-      (let [db-alias (:alias db)
-            [s-mch p-mch o-mch] (where/assign-matched-values triple solution nil)
+      (let [[s-mch p-mch o-mch] (where/assign-matched-values triple solution nil)
+            db-alias            (:alias db)
+
             s  (or (where/get-sid s-mch db-alias)
-                   (::where/val s-mch))
+                   (where/get-iri s-mch))
             p  (or (where/get-sid p-mch db-alias)
-                   (::where/val p-mch))
-            o  (or (where/get-sid o-mch db-alias)
-                   (::where/val o-mch))
+                   (where/get-iri p-mch))
+            ;; can't use truthiness for a ::where/val of `false`
+            o  (if (where/matched-value? o-mch)
+                 (where/get-value o-mch)
+                 (or (where/get-iri o-mch)
+                     (where/get-sid o-mch db-alias)))
             dt (::where/datatype o-mch)
-            m  (::where/m o-mch)
+            m  (::where/meta o-mch)
 
             existing-sid   (<? (dbproto/-subid db s {:expand? false}))
             [sid s-iri]    (if (temp-bnode? s)
@@ -238,15 +252,12 @@
             new-dt-flake (when (and (not existing-dt) (string? dt)) (create-id-flake dt-sid dt t))
 
             ref?             (= dt const/iri-id)
+
             existing-ref-sid (when ref? (<? (dbproto/-subid db o {:expand? false})))
-            ref-sid          (when ref?
-                               (if existing-ref-sid
-                                 existing-ref-sid
-                                 (or (get jld-ledger/predefined-properties o) (next-sid o))))
-            ref-iri          (when ref?
-                               (if (temp-bnode? o)
-                                 (bnode-id ref-sid)
-                                 o))
+            ref-sid          (when ref? (or existing-ref-sid (get jld-ledger/predefined-properties o) (next-sid o)))
+            ref-iri          (when ref? (if (temp-bnode? o)
+                                          (bnode-id ref-sid)
+                                          o))
             new-ref-flake    (when (and ref? (not existing-ref-sid))
                                (create-id-flake ref-sid ref-iri t))
 

@@ -34,8 +34,14 @@
        (assoc ::meta m))))
 
 (defn match-iri
-  [mch iri]
-  (assoc mch ::iri iri))
+  ([iri]
+   (match-iri unmatched iri))
+  ([mch iri]
+   (assoc mch ::iri iri)))
+
+(defn get-iri
+  [match]
+  (-> match ::iri))
 
 (defn matched-iri?
   [match]

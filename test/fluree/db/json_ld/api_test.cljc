@@ -986,9 +986,13 @@
 
            committed @(fluree/commit! ledger db7)
            loaded    @(fluree/load conn ledger-id)]
-       (is (= ["AP" "Dan" "KP" "NP"]
-              @(fluree/query db1 {"where" {"id" "?s", "ex:name" "?name"}
-                                  "select" "?name"})))
+       (is (= #{"AP" "Dan" "KP" "NP"}
+              (into #{} @(fluree/query db1 {"where" {"id" "?s", "ex:name" "?name"}
+                                            "select" "?name"}))))
+
+       (is (= {"BORG" 4 "Murray" 1}
+              (frequencies @(fluree/query db2 {"where" {"id" "?s", "ex:name" "?name"}
+                                               "select" "?name"}))))
        (is (= [{"id" "ex:mp"
                 "type" "ex:Cat"
                 "ex:name" "Murray"
