@@ -581,22 +581,21 @@
                 triples
                 (map vector (range) list))
 
+        ;; literal object
         (some? value)
-        (let [obj-cmp (if (v/variable? value)
+        (let [m*      (cond-> m language (assoc :lang language))
+              obj-cmp (if (v/variable? value)
                         (parse-variable value)
-                        (cond-> {::where/val value}
-                          (or m language) (assoc ::where/m (cond-> m language (assoc :lang language)))
-                          type (assoc ::where/datatype type)))]
+                        (where/anonymous-value value type m*))]
           (conj triples [subj-cmp pred-cmp obj-cmp]))
 
+        ;; ref object
         :else
-        (let [ref-cmp (if (nil? id)
-                        {::where/val (temp-bnode-id bnode-counter) ::where/datatype const/iri-id}
-                        (cond-> {::where/val id ::where/datatype const/iri-id}
-                          m (assoc ::where/m m)))
+        (let [ref-cmp (cond-> (where/match-iri (if (nil? id) (temp-bnode-id bnode-counter) id))
+                        m (assoc ::where/meta m))
               v-map* (if (nil? id)
                        ;; project newly created bnode-id into v-map
-                       (assoc v-map :id (::where/val ref-cmp))
+                       (assoc v-map :id (where/get-iri ref-cmp))
                        v-map)]
           (conj (parse-subj-cmp bnode-counter triples v-map*) [subj-cmp pred-cmp ref-cmp]))))
 
@@ -608,17 +607,17 @@
                    values)
         pred-cmp (cond (v/variable? pred) (parse-variable pred)
                        ;; we want the actual iri here, not the keyword
-                       (= pred :type)     {::where/val const/iri-type}
-                       :else              {::where/val pred})]
+                       (= pred :type)     (where/match-iri const/iri-type)
+                       :else              (where/match-iri pred))]
     (reduce (partial parse-obj-cmp bnode-counter subj-cmp pred-cmp nil)
             triples
             values*)))
 
 (defn parse-subj-cmp
   [bnode-counter triples {:keys [id] :as node}]
-  (let [subj-cmp (cond (nil? id) {::where/val (temp-bnode-id bnode-counter)}
-                       (v/variable? id) (parse-variable id)
-                       :else {::where/val id})]
+  (let [subj-cmp (cond (v/variable? id) (parse-variable id)
+                       (nil? id)        (where/match-iri (temp-bnode-id bnode-counter))
+                       :else            (where/match-iri id))]
     (reduce (partial parse-pred-cmp bnode-counter subj-cmp)
             triples
             (dissoc node :id :idx))))

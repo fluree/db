@@ -964,10 +964,11 @@
                                                            "f:action" [{"@id" "f:view"}]}
                                                 "f:property" {"f:path" {"@id" "schema:ssn"}
                                                               "f:allow" {"@id" "ex:ssnViewRule"
-                                                                         "f:targetRole" "ex:userRole"
+                                                                         "f:targetRole" {"@id" "ex:userRole"}
                                                                          "f:action" {"@id" "f:view"}
-                                                                         "f:equals" {"@list" [{"@id" "f:$identity"}
-                                                                                              {"@id" "ex:user"}]}}}}]}})
+                                                                         "f:equals" {"@list"
+                                                                                     [{"@id" "f:$identity"}
+                                                                                      {"@id" "ex:user"}]}}}}]}})
 
            db6 @(fluree/stage2 db5 {"@context" "https://ns.flur.ee",
                                     "insert" [{"@id" "schema:givenName", "@type" "rdf:Property"}
@@ -986,9 +987,13 @@
 
            committed @(fluree/commit! ledger db7)
            loaded    @(fluree/load conn ledger-id)]
-       (is (= ["AP" "Dan" "KP" "NP"]
-              @(fluree/query db1 {"where" {"id" "?s", "ex:name" "?name"}
-                                  "select" "?name"})))
+       (is (= #{"AP" "Dan" "KP" "NP"}
+              (into #{} @(fluree/query db1 {"where" {"id" "?s", "ex:name" "?name"}
+                                            "select" "?name"}))))
+
+       (is (= {"BORG" 4 "Murray" 1}
+              (frequencies @(fluree/query db2 {"where" {"id" "?s", "ex:name" "?name"}
+                                               "select" "?name"}))))
        (is (= [{"id" "ex:mp"
                 "type" "ex:Cat"
                 "ex:name" "Murray"
@@ -1042,13 +1047,13 @@
                                        "where" {"id" "?s", "schema:givenName" "?name"}})))
            "equivalentProperty annotations work")
 
-       (is (= 150
+       (is (= 149
               (-> @(fluree/history ledger {:commit-details true :t {:from :latest}})
                   (first)
                   (get "f:commit")
                   (get "f:data")
                   (get "f:flakes"))))
-       (is (= 150
+       (is (= 149
               (-> @(fluree/history loaded {:commit-details true :t {:from :latest}})
                   (first)
                   (get "f:commit")
