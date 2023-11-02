@@ -46,7 +46,8 @@
   (go-try
     (let [{txn :subject did :did} (or (<? (cred/verify txn))
                                       {:subject txn})
-          txn-context             (ctx-util/txn-context txn)
+          txn-context             (or (:context parsed-opts)
+                                      (ctx-util/txn-context txn))
           expanded                (json-ld/expand txn)
           opts                    (util/get-first-value expanded const/iri-opts)
           parsed-opts             (cond-> parsed-opts
