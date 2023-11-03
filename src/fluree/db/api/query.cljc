@@ -192,12 +192,12 @@
         db-map))))
 
 (defn load-dataset
-  [conn defaults named opts]
+  [conn defaults named global-t opts]
   (go-try
     (if (and (= (count defaults) 1)
              (empty? named))
       (let [alias (first defaults)]
-        (<? (load-alias conn alias nil opts))) ; return an unwrapped db if the data set
+        (<? (load-alias conn alias global-t opts))) ; return an unwrapped db if the data set
                                                ; consists of one ledger
       (let [all-aliases  (->> defaults (concat named) distinct)
             db-map       (<? (load-aliases conn all-aliases opts))
@@ -212,13 +212,13 @@
   (go-try
     (let [{query :subject, did :did} (or (<? (cred/verify query))
                                          {:subject query})
-          {:keys [opts] :as query*}  (update query :opts sanitize-query-options did)
+          {:keys [t opts] :as query*}  (update query :opts sanitize-query-options did)
 
           default-aliases (some-> query* :from util/sequential)
           named-aliases   (some-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [ds          (<? (load-dataset conn default-aliases named-aliases opts))
+        (let [ds          (<? (load-dataset conn default-aliases named-aliases t opts))
               query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
               max-fuel    (:max-fuel opts)
               default-ctx (conn-proto/-default-context conn)

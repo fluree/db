@@ -1,5 +1,6 @@
 (ns fluree.db.query.time-travel-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]))
@@ -89,3 +90,44 @@
       (is (= 4 (count all-movies)))
       (is (util/exception? too-early))
       (is (re-matches #"There is no data as of .+" (ex-message too-early))))))
+
+(deftest ^:integration federated-time-travel-test
+  (testing "Federated queries with time travel"
+    (let [conn    (test-utils/create-conn {:defaults {:context-type :string
+                                                      :context      {"id"     "@id",
+                                                                     "type"   "@type",
+                                                                     "ex"     "http://example.org/",
+                                                                     "f"      "https://ns.flur.ee/ledger#",
+                                                                     "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                                                     "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                                                                     "schema" "http://schema.org/",
+                                                                     "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
+
+          t1 @(fluree/create-with-txn conn
+                                      {"f:ledger" "test/time"
+                                       "@graph"   [{"@id"   "ex:time-test"
+                                                    "@type" "ex:foo"
+                                                    "ex:time" 1}]}
+                                      {:context-type :string})
+          t2 @(fluree/transact! conn {"f:ledger" "test/time"
+                                      "@graph"   [{"@id"   "ex:time-test"
+                                                   "ex:time" 2}]}
+                                {:context-type :string})]
+
+      (testing "Single ledger"
+        (let [q '{:from   "test/time"
+                  :select {"ex:time-test" ["*"]}
+                  :t      1}]
+          (is (= [{:id       "ex:time-test"
+                   :type     "ex:foo"
+                   "ex:time" 1}]
+                 @(fluree/query-connection conn q))
+              "should return only results for `t` of `1`"))
+        (let [q            '{:from   "test/time"
+                             :select {"ex:time-test" ["*"]}
+                             :t      "1988-05-30T12:40:44.823Z"}
+              invalid-time (try @(fluree/query-connection conn q)
+                                (catch Exception e e))]
+          (is (str/includes?  (ex-message invalid-time)
+                              "There is no data as of")
+              "should return an error"))))))
