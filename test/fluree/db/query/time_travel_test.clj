@@ -103,19 +103,19 @@
                                                                      "schema" "http://schema.org/",
                                                                      "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
 
-          t1 @(fluree/create-with-txn conn
-                                      {"f:ledger" "test/time"
+          ledger1 @(fluree/create-with-txn conn
+                                      {"f:ledger" "test/time1"
                                        "@graph"   [{"@id"   "ex:time-test"
                                                     "@type" "ex:foo"
                                                     "ex:time" 1}]}
                                       {:context-type :string})
-          t2 @(fluree/transact! conn {"f:ledger" "test/time"
-                                      "@graph"   [{"@id"   "ex:time-test"
-                                                   "ex:time" 2}]}
+          _ @(fluree/transact! conn {"f:ledger" "test/time1"
+                                     "@graph"   [{"@id"   "ex:time-test"
+                                                  "ex:time" 2}]}
                                 {:context-type :string})]
 
       (testing "Single ledger"
-        (let [q '{:from   "test/time"
+        (let [q '{:from   "test/time1"
                   :select {"ex:time-test" ["*"]}
                   :t      1}]
           (is (= [{:id       "ex:time-test"
@@ -123,11 +123,52 @@
                    "ex:time" 1}]
                  @(fluree/query-connection conn q))
               "should return only results for `t` of `1`"))
-        (let [q            '{:from   "test/time"
+        (let [q            '{:from   "test/time1"
                              :select {"ex:time-test" ["*"]}
                              :t      "1988-05-30T12:40:44.823Z"}
               invalid-time (try @(fluree/query-connection conn q)
                                 (catch Exception e e))]
           (is (str/includes?  (ex-message invalid-time)
                               "There is no data as of")
-              "should return an error"))))))
+              "should return an error")))
+      (testing "Across multiple ledgers"
+        (let [ledger2 @(fluree/create-with-txn conn
+                                               {"f:ledger" "test/time2"
+                                                "@graph"   [{"@id"   "ex:time-test"
+                                                             "ex:p1" "value1"}]}
+                                               {:context-type :string})
+              _ @(fluree/transact! conn
+                                   {"f:ledger" "test/time2"
+                                    "@graph"   [{"@id"   "ex:time-test"
+                                                 "ex:p1" "value2"}]}
+                                   {:context-type :string})]
+
+          (let [q '{:from   ["test/time1" "test/time2"]
+                    :select [?p1 ?time]
+                    :where {"@id" "ex:time-test"
+                            "ex:p1" ?p1
+                            "ex:time" ?time}
+                    :t      1}]
+            (is (= [["value1" 1]]
+                   @(fluree/query-connection conn q))
+                "should return results for `t` of `1` across both ledgers")))
+        (testing "Some ledgers do not have data for given t"
+          (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+            (let [ledger-valid @(fluree/create-with-txn conn
+                                                         {"f:ledger" "test/time-before"
+                                                          "@graph" [{"@id" "ex:time-test"
+                                                                     "ex:p1" "value"}]}
+                                                         {:context-type :string})]
+              (let [q '{:from   ["test/time1" "test/time2" "test/time-before"]
+                        :select [?p1 ?time]
+                        :where {"@id" "ex:time-test"
+                                "ex:p1" ?p1
+                                "ex:time" ?time}
+                        ;;`t` is valid for `ledger-valid`,
+                        ;;but not the others
+                        :t      "1988-05-30T12:40:44.823Z"}
+                    invalid-time (try @(fluree/query-connection conn q)
+                                      (catch Exception e e))]
+                (is (str/includes? (ex-message invalid-time)
+                                   "There is no data as of")
+                    "should return an error")))))))))

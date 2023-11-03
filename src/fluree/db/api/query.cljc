@@ -180,13 +180,13 @@
       (<? (restrict-db db t opts)))))
 
 (defn load-aliases
-  [conn aliases opts]
+  [conn aliases global-t opts]
   (go-try
     (loop [[alias & r] aliases
            db-map      {}]
       (if alias
         ;; TODO: allow restricting federated dataset components individually by t
-        (let [db      (<? (load-alias conn alias nil opts))
+        (let [db      (<? (load-alias conn alias global-t opts))
               db-map* (assoc db-map alias db)]
           (recur r db-map*))
         db-map))))
@@ -200,7 +200,7 @@
         (<? (load-alias conn alias global-t opts))) ; return an unwrapped db if the data set
                                                ; consists of one ledger
       (let [all-aliases  (->> defaults (concat named) distinct)
-            db-map       (<? (load-aliases conn all-aliases opts))
+            db-map       (<? (load-aliases conn all-aliases global-t opts))
             default-coll (-> db-map
                              (select-keys defaults)
                              vals)
