@@ -457,8 +457,8 @@
                subject)
             "returns no results")))))
 
-(deftest ^:pending ^:integration random-transaction-test
-  (testing "this exists b/c it throws an 'Illegal reference object value' error"
+(deftest ^:integration issue-core-49-transaction-test
+  (testing "issue https://github.com/fluree/core/issues/49 stays fixed"
     (let [conn        (test-utils/create-conn
                        {:context      test-utils/default-str-context
                         :context-type :string})
@@ -489,5 +489,7 @@
                                      "schema:description" "?o"}
                          "insert"   {"@id"                "ex:mosquitos"
                                      "schema:description" "We ❤️ All Blood"}})]
-      (is (= [{"@id" "ex:mosquitos", "schema:description" "We ❤️ All Blood"}]
+      (is (= [{"id"                 "ex:mosquitos"
+               "type"               "ex:Monster"
+               "schema:description" "We ❤️ All Blood"}]
              @(fluree/query db2 {:select {"ex:mosquitos" ["*"]}}))))))
