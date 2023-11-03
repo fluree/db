@@ -174,10 +174,21 @@
 (defn load-alias
   [conn alias t opts]
   (go-try
-    (let [address (<? (nameservice/primary-address conn alias nil))
-          ledger  (<? (jld-ledger/load conn address))
-          db      (ledger-proto/-db ledger)]
-      (<? (restrict-db db t opts)))))
+   (try
+     (let [address (<? (nameservice/primary-address conn alias nil))
+           ledger  (<? (jld-ledger/load conn address))
+           db      (ledger-proto/-db ledger)]
+       (<? (restrict-db db t opts)))
+     (catch Exception e
+       (throw (let [e-data (ex-data e)]
+                (if (= 400
+                     (:status e-data))
+                  (ex-info
+                   (str "Error loading " alias ": "
+                        (ex-message e))
+                   e-data
+                   e)
+                  e)))))))
 
 (defn load-aliases
   [conn aliases global-t opts]
