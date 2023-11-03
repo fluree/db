@@ -135,12 +135,16 @@
         (let [ledger2 @(fluree/create-with-txn conn
                                                {"f:ledger" "test/time2"
                                                 "@graph"   [{"@id"   "ex:time-test"
-                                                             "ex:p1" "value1"}]}
+                                                             "ex:p1" "value1"}
+                                                            {"@id" "ex:foo"
+                                                             "ex:p2" "t1"}]}
                                                {:context-type :string})
               _ @(fluree/transact! conn
                                    {"f:ledger" "test/time2"
                                     "@graph"   [{"@id"   "ex:time-test"
-                                                 "ex:p1" "value2"}]}
+                                                 "ex:p1" "value2"}
+                                                {"@id"   "ex:foo"
+                                                 "ex:p2" "t2"}]}
                                    {:context-type :string})]
 
           (let [q '{:from   ["test/time1" "test/time2"]
@@ -152,6 +156,16 @@
             (is (= [["value1" 1]]
                    @(fluree/query-connection conn q))
                 "should return results for `t` of `1` across both ledgers")))
+        (let [q '{:from-named ["test/time1" "test/time2"]
+                  :select     [?p2 ?time]
+                  :where      [[:graph "test/time1" {"@id"     "ex:time-test"
+                                                     "ex:time" ?time}]
+                               [:graph "test/time2" {"@id"   "ex:foo"
+                                                     "ex:p2" ?p2}]]
+                  :t 1}]
+          (is (= [["t1" 1]]
+                 @(fluree/query-connection conn q))
+              "should be results as of `t` = 1 for both ledgers"))
         (testing "Some ledgers do not have data for given t"
           (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
             (let [ledger-valid @(fluree/create-with-txn conn

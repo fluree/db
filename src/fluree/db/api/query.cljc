@@ -198,7 +198,7 @@
              (empty? named))
       (let [alias (first defaults)]
         (<? (load-alias conn alias global-t opts))) ; return an unwrapped db if the data set
-                                               ; consists of one ledger
+                                                    ; consists of one ledger
       (let [all-aliases  (->> defaults (concat named) distinct)
             db-map       (<? (load-aliases conn all-aliases global-t opts))
             default-coll (-> db-map
