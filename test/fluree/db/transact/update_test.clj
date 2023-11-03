@@ -456,3 +456,38 @@
         (is (= []
                subject)
             "returns no results")))))
+
+(deftest ^:pending ^:integration random-transaction-test
+  (testing "this exists b/c it throws an 'Illegal reference object value' error"
+    (let [conn        (test-utils/create-conn
+                       {:context      test-utils/default-str-context
+                        :context-type :string})
+          ledger-name "rando-txn"
+          ledger      @(fluree/create conn "rando-txn")
+          db0         (fluree/db ledger)
+          db1         @(fluree/stage2
+                        db0
+                        {"@context" "https://ns.flur.ee"
+                         "ledger"   ledger-name
+                         "insert"
+                         [{"@id"                "ex:fluree"
+                           "@type"              "schema:Organization"
+                           "schema:description" "We ❤️ Data"}
+                          {"@id"                "ex:w3c"
+                           "@type"              "schema:Organization"
+                           "schema:description" "We ❤️ Internet"}
+                          {"@id"                "ex:mosquitos"
+                           "@type"              "ex:Monster"
+                           "schema:description" "We ❤️ Human Blood"}]})
+          db2         @(fluree/stage2
+                        db1
+                        {"@context" "https://ns.flur.ee"
+                         "ledger"   ledger-name
+                         "where"    {"@id"                "ex:mosquitos"
+                                     "schema:description" "?o"}
+                         "delete"   {"@id"                "ex:mosquitos"
+                                     "schema:description" "?o"}
+                         "insert"   {"@id"                "ex:mosquitos"
+                                     "schema:description" "We ❤️ All Blood"}})]
+      (is (= [{"@id" "ex:mosquitos", "schema:description" "We ❤️ All Blood"}]
+             @(fluree/query db2 {:select {"ex:mosquitos" ["*"]}}))))))
