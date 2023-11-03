@@ -285,13 +285,51 @@
               cat)
         flakes))
 
+(defn pred-dt-constraints
+  "Collect any shacl datatype constraints and the predicates they apply to."
+  [new-flakes]
+  (loop [[s-flakes & r] (partition-by flake/s new-flakes)
+         res []]
+    (println "DEP s-flakes" (pr-str s-flakes))
+    (if s-flakes
+      (if-let [dt-constraints (->> s-flakes
+                                   (filterv #(= const/$sh:datatype (flake/p %)))
+                                   (mapv #(flake/o %))
+                                   (first))]
+        (let [path (->> s-flakes
+                        (filterv #(= const/$sh:path (flake/p %)))
+                        (sort-by #(:i (flake/m %)))
+                        (mapv #(flake/o %))
+                        (last))]
+          (recur r (conj res [path dt-constraints])))
+        (recur r res))
+      res)))
+
+;; TODO: this cannot be reconstructed from just the pred sids, need to figure out loading
+(defn add-pred-datatypes
+  "Add a :datatype key to the pred meta map for any predicates with a sh:datatype
+  constraint. Only one datatype constraint can be valid for a given datatype, most
+  recent wins."
+  [{:keys [pred] :as schema} new-flakes]
+  (-> schema
+      (assoc :pred (reduce (fn [pred [pid dt-constraint]]
+                             (let [{:keys [iri] :as pred-meta}
+                                   (-> (get pred pid)
+                                       (assoc :datatype dt-constraint))]
+                               (-> pred
+                                   (assoc pid pred-meta)
+                                   (assoc iri pred-meta))))
+                           pred
+                           (pred-dt-constraints new-flakes)))))
+
 (defn hydrate-schema
   "Updates the :schema key of a by processing just the vocabulary flakes out of the new flakes."
   [db new-flakes]
   (let [pred-sids    (predicate-sids new-flakes)
         vocab-flakes (filterv #(pred-sids (flake/s %)) new-flakes)
         {:keys [t refs coll pred shapes prefix fullText subclasses]}
-        (schema vocab-flakes (:t db))]
+        (-> (schema vocab-flakes (:t db))
+            (add-pred-datatypes new-flakes))]
     (-> db
         (assoc-in [:schema :t] t)
         (update-in [:schema :refs] into refs)

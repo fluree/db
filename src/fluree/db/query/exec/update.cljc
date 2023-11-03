@@ -218,10 +218,12 @@
             ref-iri      (where/get-iri o-mch)
             m            (where/get-meta o-mch)
             dt           (where/get-datatype o-mch)
+            sh-dt        (dbproto/-p-prop db :datatype p-iri)
             existing-dt  (when dt (<? (dbproto/-subid db dt {:expand? false})))
             dt-sid       (cond ref-iri      const/$xsd:anyURI
                                existing-dt  existing-dt
                                (string? dt) (or (get jld-ledger/predefined-properties dt) (next-pid dt))
+                               sh-dt        sh-dt
                                :else        (datatype/infer o-val (:lang m)))
             new-dt-flake (when (and (not existing-dt) (string? dt)) (create-id-flake dt-sid dt t))
 
