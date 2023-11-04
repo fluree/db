@@ -127,7 +127,7 @@
 (defn authorize-flake
   [db error-ch flake]
   (go
-    (try* (if (or (schema-util/is-schema-flake? flake)
+    (try* (if (or (schema-util/is-schema-flake? db flake)
                   (<? (perm-validate/allow-flake? db flake)))
             flake
             ::unauthorized)
