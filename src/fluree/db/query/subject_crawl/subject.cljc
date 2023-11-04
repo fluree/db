@@ -8,8 +8,8 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.exec :refer [drop-offset take-limit]]
-            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af
-                                                          resolve-ident-vars filter-subject]]
+            [fluree.db.query.subject-crawl.common :refer [result-af resolve-ident-vars
+                                                          filter-subject]]
             [fluree.db.permissions-validate :refer [filter-subject-flakes]]
             [fluree.db.dbproto :as dbproto]))
 
@@ -18,51 +18,27 @@
 (defn- subjects-chan
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
-  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o p-ref?] :as _where-clause}]
-  (let [o*          (if-some [v (:value o)]
+  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o] :as _where-clause}]
+  (let [idx-root    (get db :post)
+        novelty     (get novelty :post)
+        o*          (if-some [v (:value o)]
                       v
                       (when-let [variable (:variable o)]
                         (get vars variable)))
         p*          (:value p)
         o-dt        (:datatype o)
-        idx*        (index/for-components nil p* o* o-dt)
-        [fflake lflake] (case idx*
-                          :post [(flake/create nil p* o* o-dt nil nil util/min-integer)
-                                 (flake/create nil p* o* o-dt nil nil util/max-integer)])
-        filter-fn   (when (:filter o)
+        first-flake (flake/create nil p* o* o-dt nil nil util/min-integer)
+        last-flake  (flake/create nil p* o* o-dt nil nil util/max-integer)
+        filter-xf   (when (:filter o)
                       (let [f (filter/extract-combined-filter (:filter o))]
-                        #(-> % flake/o f)))
-        return-chan (async/chan 10 (comp (map flake/s)
-                                         (dedupe)))]
-    (let [idx-root  (get db idx*)
-          cmp       (:comparator idx-root)
-          range-set (flake/sorted-set-by cmp fflake lflake)
-          in-range? (fn [node]
-                      (query-range/intersects-range? node range-set))
-          query-xf  (where-subj-xf {:start-test  >=
-                                    :start-flake fflake
-                                    :end-test    <=
-                                    :end-flake   lflake
-                                    :xf          (when filter-fn
-                                                   (map (fn [flakes]
-                                                          (filter filter-fn flakes))))})
-          resolver  (index/->CachedTRangeResolver conn (get novelty idx*) t t (:lru-cache-atom conn))
-          tree-chan (index/tree-chan resolver idx-root in-range? 1 query-xf error-ch)]
-      (async/go-loop []
-        (let [next-chunk (<! tree-chan)]
-          (if (nil? next-chunk)
-            (async/close! return-chan)
-            (let [more? (loop [vs (seq next-chunk)
-                               i  0]
-                          (if vs
-                            (if (>! return-chan (first vs))
-                              (recur (next vs) (inc i))
-                              false)
-                            true))]
-              (if more?
-                (recur)
-                (async/close! return-chan)))))))
-    return-chan))
+                        (filter (fn [flake]
+                                  (-> flake flake/o f)))))
+        query-xf    (comp (query-range/extract-query-flakes {:flake-xf filter-xf})
+                          cat
+                          (map flake/s)
+                          (dedupe))
+        resolver    (index/->CachedTRangeResolver conn novelty t t (:lru-cache-atom conn))]
+    (index/tree-chan resolver idx-root first-flake last-flake any? 10 query-xf error-ch)))
 
 
 (defn flakes-xf

@@ -2,27 +2,11 @@
   (:require [clojure.core.async :refer [go] :as async]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.index :as index]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.schema :as schema-util]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.permissions-validate :as perm-validate]))
+            [fluree.db.dbproto :as dbproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn where-subj-xf
-  "Transducing function to extract matching subjects from initial where clause."
-  [{:keys [start-test start-flake end-test end-flake xf]}]
-  (apply comp (cond-> [(filter index/resolved-leaf?)
-                       (map :flakes)
-                       (map (fn [flakes]
-                              (flake/subrange flakes
-                                              start-test start-flake
-                                              end-test end-flake)))]
-                      xf
-                      (conj xf))))
-
 
 (defn result-af
   [{:keys [result-fn error-ch] :as _opts}]
