@@ -7,7 +7,6 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.query.exec :refer [drop-offset take-limit]]
             [fluree.db.query.subject-crawl.common :refer [result-af resolve-ident-vars
                                                           filter-subject]]
             [fluree.db.permissions-validate :refer [filter-subject-flakes]]
@@ -74,12 +73,12 @@
     (async/go
       (if (number? _id-val)
         (async/>! return-ch _id-val)
-        (let [sid (async/<! (dbproto/-subid db _id-val))]
+        (let [sid (<! (dbproto/-subid db _id-val))]
           (cond (util/exception? sid)
-                (async/put! error-ch sid)
+                (>! error-ch sid)
 
                 (some? sid)
-                (async/put! return-ch sid))))
+                (>! return-ch sid))))
       (async/close! return-ch))
     return-ch))
 
