@@ -964,10 +964,11 @@
                                                            "f:action" [{"@id" "f:view"}]}
                                                 "f:property" {"f:path" {"@id" "schema:ssn"}
                                                               "f:allow" {"@id" "ex:ssnViewRule"
-                                                                         "f:targetRole" "ex:userRole"
+                                                                         "f:targetRole" {"@id" "ex:userRole"}
                                                                          "f:action" {"@id" "f:view"}
-                                                                         "f:equals" {"@list" [{"@id" "f:$identity"}
-                                                                                              {"@id" "ex:user"}]}}}}]}})
+                                                                         "f:equals" {"@list"
+                                                                                     [{"@id" "f:$identity"}
+                                                                                      {"@id" "ex:user"}]}}}}]}})
 
            db6 @(fluree/stage2 db5 {"@context" "https://ns.flur.ee",
                                     "insert" [{"@id" "schema:givenName", "@type" "rdf:Property"}
@@ -986,9 +987,13 @@
 
            committed @(fluree/commit! ledger db7)
            loaded    @(fluree/load conn ledger-id)]
-       (is (= ["AP" "Dan" "KP" "NP"]
-              @(fluree/query db1 {"where" {"id" "?s", "ex:name" "?name"}
-                                  "select" "?name"})))
+       (is (= #{"AP" "Dan" "KP" "NP"}
+              (into #{} @(fluree/query db1 {"where" {"id" "?s", "ex:name" "?name"}
+                                            "select" "?name"}))))
+
+       (is (= {"BORG" 4 "Murray" 1}
+              (frequencies @(fluree/query db2 {"where" {"id" "?s", "ex:name" "?name"}
+                                               "select" "?name"}))))
        (is (= [{"id" "ex:mp"
                 "type" "ex:Cat"
                 "ex:name" "Murray"
@@ -1042,15 +1047,56 @@
                                        "where" {"id" "?s", "schema:givenName" "?name"}})))
            "equivalentProperty annotations work")
 
-       (is (= 150
+       (is (= 149
               (-> @(fluree/history ledger {:commit-details true :t {:from :latest}})
                   (first)
                   (get "f:commit")
                   (get "f:data")
                   (get "f:flakes"))))
-       (is (= 150
+       (is (= 149
               (-> @(fluree/history loaded {:commit-details true :t {:from :latest}})
                   (first)
                   (get "f:commit")
                   (get "f:data")
                   (get "f:flakes")))))))
+
+#?(:clj
+   (deftest context-handling
+     (let [conn      @(fluree/connect {:method :memory})
+           ledger-id "update-syntax"
+           ledger    @(fluree/create conn ledger-id {:defaultContext [test-utils/default-str-context
+                                                                      {"ex" "http://example.com/"}]})
+           db0       (fluree/db ledger)]
+       (testing "use default context"
+         (let [db1 @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                        "insert"   {"@id" "ex:t1" "@type" "my:ContextTest" "ex:pred" true}})]
+
+           (is (= {"@id" "http://example.com/t1" "@type" "my:ContextTest" "http://example.com/pred" true}
+                  @(fluree/query db1 {"@context"  nil
+                                      "selectOne" {"http://example.com/t1" ["*"]}}))
+               "default context was used to expand")))
+
+       (testing "use instead of default context"
+         (let [db2 @(fluree/stage2 db0 {"@context" ["https://ns.flur.ee" {"ex" "DEFAULTOVERRIDEN:ns/"}]
+                                        "insert"   {"@id" "ex:t2" "@type" "my:ContextTest" "ex:pred" true}})]
+           (is (= {"@id" "DEFAULTOVERRIDEN:ns/t2" "@type" "my:ContextTest" "DEFAULTOVERRIDEN:ns/pred" true}
+                  @(fluree/query db2 {"@context"  nil
+                                      "selectOne" {"DEFAULTOVERRIDEN:ns/t2" ["*"]}}))
+               "supplied context used, default context not used")))
+
+       (testing "use with default context"
+         (let [db3 @(fluree/stage2 db0 {"@context" ["https://ns.flur.ee" "" {"foo" "ns:foo/"}]
+                                        "insert"   {"@id" "ex:t3" "@type" "my:ContextTest" "ex:pred" {"@id" "foo:me"}}})]
+           (is (= {"@id" "http://example.com/t3" "@type" "my:ContextTest" "http://example.com/pred" {"@id" "ns:foo/me"}}
+                  @(fluree/query db3 {"@context"  nil
+                                      "selectOne" {"http://example.com/t3" ["*"]}}))
+               "default context used, supplemented by supplied context")))
+
+       (testing "use no context"
+         ;; clearing context with nil produces an error because `insert` can't be found
+         (let [db4 @(fluree/stage2 db0 {"@context" ["https://ns.flur.ee" {}]
+                                        "insert"   {"@id" "ex:t4" "@type" "my:ContextTest" "ex:pred" "not expanded"}})]
+           (is (= {"@id" "ex:t4" "@type" "my:ContextTest" "ex:pred" "not expanded"}
+                  @(fluree/query db4 {"@context"  nil
+                                      "selectOne" {"ex:t4" ["*"]}}))
+               "no default context was used"))))))

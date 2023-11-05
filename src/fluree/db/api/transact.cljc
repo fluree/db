@@ -9,6 +9,7 @@
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [catch* try*]]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.credential :as cred]))
@@ -45,9 +46,14 @@
   (go-try
     (let [{txn :subject did :did} (or (<? (cred/verify txn))
                                       {:subject txn})
+          txn-context             (or (:context parsed-opts)
+                                      (ctx-util/txn-context txn))
           expanded                (json-ld/expand txn)
           opts                    (util/get-first-value expanded const/iri-opts)
-          parsed-opts             (cond-> parsed-opts did (assoc :did did))
+          parsed-opts             (cond-> parsed-opts
+                                    did (assoc :did did)
+                                    txn-context (assoc :context txn-context))
+
           {:keys [maxFuel meta] :as parsed-opts*} (parse-opts opts parsed-opts)]
       (if (or maxFuel meta)
         (let [start-time   #?(:clj  (System/nanoTime)

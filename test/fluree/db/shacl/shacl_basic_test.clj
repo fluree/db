@@ -1289,12 +1289,14 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                             "SHACL PropertyShape exception - sh:in: value must be one of "))
 
       (is (not (util/exception? db3)))
-      (is (= [{"id"       "ex:PastelPony"
-               "type" "ex:Pony"
-               "ex:color" [{"id" "ex:Pink"} {"id" "ex:Purple"}]}]
-             @(fluree/query db3 '{"select" {"?p" ["*"]}
-                                  "where"  {"id" "?p"
-                                            "type" "ex:Pony"}})))))
+      (is (= {"id"       "ex:PastelPony"
+              "type" "ex:Pony"
+              "ex:color" [{"id" "ex:Pink"} {"id" "ex:Purple"}]}
+             (-> @(fluree/query db3 '{"select" {"?p" ["*"]}
+                                      "where"  {"id" "?p"
+                                                "type" "ex:Pony"}})
+                 first
+                 (update "ex:color" (partial sort-by #(get % "id"))))))))
   (testing "mixed values and refs"
     (let [conn   @(fluree/connect {:method :memory
                                    :defaults
