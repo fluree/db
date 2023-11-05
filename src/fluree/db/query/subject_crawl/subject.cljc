@@ -83,22 +83,6 @@
       (async/close! return-ch))
     return-ch))
 
-(defn resolve-refs
-  "If the where clause has a ref, we need to resolve it to a subject id."
-  [db vars {:keys [p-ref? o] :as where-clause}]
-  (go-try
-    (if p-ref?
-      (let [v   (if-some [v (:value o)]
-                  v
-                  (when-let [variable (:variable o)]
-                    (get vars variable)))
-            sid (when v
-                  (or (<? (dbproto/-subid db v)) 0))]
-        (if sid
-          (assoc where-clause :o {:value sid})
-          (assoc where-clause :o {:value nil})))
-      where-clause)))
-
 (defn resolve-o-ident
   "If the predicate is a ref? type with an 'o' value, it must be resolved into a subject id."
   [db {:keys [o] :as where-clause}]
