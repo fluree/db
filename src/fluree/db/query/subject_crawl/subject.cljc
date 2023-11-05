@@ -36,7 +36,7 @@
         query-xf    (comp (query-range/extract-query-flakes {:flake-xf filter-xf})
                           cat
                           (map flake/s)
-                          (dedupe))
+                          (distinct))
         resolver    (index/->CachedTRangeResolver conn novelty t t (:lru-cache-atom conn))]
     (index/tree-chan resolver idx-root first-flake last-flake any? 10 query-xf error-ch)))
 
