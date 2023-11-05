@@ -106,20 +106,7 @@
       (async/pipeline-async parallelism flakes-ch flakes-af sid-ch)
       (async/pipeline-async parallelism result-ch (result-af opts*) flakes-ch)
 
-      (loop [acc []]
-        (let [[next-res ch] (async/alts! [error-ch result-ch])]
-          (cond
-            (= ch error-ch)
-            (do (async/close! sid-ch)
-                (async/close! flakes-ch)
-                (async/close! result-ch)
-                (throw next-res))
-
-            (nil? next-res)
-            (do (async/close! sid-ch)
-                (async/close! flakes-ch)
-                (async/close! result-ch)
-                (finish-fn acc))
-
-            :else
-            (recur (conj acc next-res))))))))
+      (let [final-ch (async/transduce identity (completing conj finish-fn) [] result-ch)]
+        (async/alt!
+          error-ch ([e] e)
+          final-ch ([results] results))))))

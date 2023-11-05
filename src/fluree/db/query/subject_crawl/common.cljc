@@ -1,5 +1,5 @@
 (ns fluree.db.query.subject-crawl.common
-  (:require [clojure.core.async :refer [go] :as async]
+  (:require [clojure.core.async :refer [go >!] :as async]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
@@ -13,13 +13,13 @@
   (fn [flakes port]
     (go
       (try*
-        (some->> flakes
-                 result-fn
-                 <?
-                 not-empty
-                 (async/put! port))
+        (let [result (<? (result-fn flakes))]
+          (when (not-empty result)
+            (>! port result)))
         (async/close! port)
-        (catch* e (async/put! error-ch e) (async/close! port) nil)))))
+        (catch* e
+                (log/error e "Error processing subject query result")
+                (>! error-ch e))))))
 
 
 (defn passes-filter?
