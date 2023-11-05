@@ -26,8 +26,8 @@
                           (swap! (:cache policy) assoc s classes)
                           classes))
           fns       (keep #(or (get-in policy [const/iri-view :class % p :function])
-                               (get-in policy [const/iri-view :class % :default
-                                               :function])) class-ids)]
+                               (get-in policy [const/iri-view :class % :default :function]))
+                          class-ids)]
       (loop [[[async? f] & r] fns]
         ;; return first truthy response, else false
         (if f
