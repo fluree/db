@@ -349,9 +349,7 @@
          opts        {:idx         idx
                       :from-t      t
                       :to-t        t
-                      :start-test  >=
                       :start-flake start-flake
-                      :end-test    <=
                       :end-flake   end-flake
                       :flake-xf    flake-xf*}]
      (-> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
