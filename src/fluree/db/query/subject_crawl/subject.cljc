@@ -104,12 +104,14 @@
           offset-xf (if offset
                       (drop offset)
                       identity)
-          flakes-ch (cond->> (async/chan 32 offset-xf)
-                      limit (async/take limit))
+          flakes-ch  (async/chan 32 offset-xf)
+          limit-ch   (if limit
+                       (async/take limit flakes-ch)
+                       flakes-ch)
           result-ch (async/chan)]
 
       (async/pipeline-async parallelism flakes-ch flakes-af sid-ch)
-      (async/pipeline-async parallelism result-ch (result-af opts*) flakes-ch)
+      (async/pipeline-async parallelism result-ch (result-af opts*) limit-ch)
 
       (let [final-ch (async/transduce identity (completing conj finish-fn) [] result-ch)]
         (async/alt!
