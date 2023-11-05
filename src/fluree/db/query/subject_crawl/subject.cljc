@@ -82,30 +82,19 @@
       (async/close! return-ch))
     return-ch))
 
-(defn resolve-o-ident
-  "If the predicate is a ref? type with an 'o' value, it must be resolved into a subject id."
-  [db {:keys [o] :as where-clause}]
-  (go-try
-    (let [_id (or (<? (dbproto/-subid db (:ident o))) 0)]
-      (assoc where-clause :o {:value _id}))))
-
 
 (defn subj-crawl
   [{:keys [db error-ch f-where limit offset parallelism vars ident-vars
            finish-fn] :as opts}]
   (go-try
     (log/trace "subj-crawl opts:" opts)
-    (let [{:keys [o p-ref?]} f-where
-          vars*     (if ident-vars
+    (let [vars*     (if ident-vars
                       (<? (resolve-ident-vars db vars ident-vars))
                       vars)
           opts*     (assoc opts :vars vars*)
-          f-where*  (if (and p-ref? (:ident o))
-                      (<? (resolve-o-ident db f-where))
-                      f-where)
-          sid-ch    (if (#{:_id :iri} (:type f-where*))
-                      (subjects-id-chan db error-ch vars* f-where*)
-                      (subjects-chan db error-ch vars* f-where*))
+          sid-ch    (if (#{:_id :iri} (:type f-where))
+                      (subjects-id-chan db error-ch vars* f-where)
+                      (subjects-chan db error-ch vars* f-where))
           flakes-af (flakes-xf opts*)
           offset-xf (if offset
                       (drop offset)
