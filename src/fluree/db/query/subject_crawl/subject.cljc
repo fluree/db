@@ -3,6 +3,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.range :as query-range]
+            [fluree.db.constants :as const]
             [fluree.db.index :as index]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
@@ -39,19 +40,23 @@
         resolver    (index/->CachedTRangeResolver conn novelty t t (:lru-cache-atom conn))]
     (index/tree-chan resolver idx-root first-flake last-flake any? 10 query-xf error-ch)))
 
+(defn permissioned-db?
+  [db]
+  (not (get-in db [:policy const/iri-view :root?])))
 
 (defn flakes-xf
-  [{:keys [db fuel-vol max-fuel error-ch vars filter-map permissioned?] :as _opts}]
+  [{:keys [db fuel-vol max-fuel error-ch vars filter-map] :as _opts}]
   (fn [sid port]
     (async/go
       (try*
         ;; TODO: Right now we enforce permissions after the index-range call, but
         ;; TODO: in some circumstances we can know user can see no subject flakes
         ;; TODO: and if detected, could avoid index-range call entirely.
-        (let [flakes (cond->> (<? (query-range/index-range db :spot = [sid]))
-                              filter-map (filter-subject vars filter-map)
-                              permissioned? (filter-subject-flakes db)
-                              permissioned? <?)]
+        (let [flake-range (cond->> (<? (query-range/index-range db :spot = [sid]))
+                            filter-map (filter-subject vars filter-map))
+              flakes      (if (permissioned-db? db)
+                            (<? (filter-subject-flakes db flake-range))
+                            flake-range)]
           (when (seq flakes)
             (async/put! port flakes))
 
