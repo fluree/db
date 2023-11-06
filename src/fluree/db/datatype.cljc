@@ -412,6 +412,6 @@
   [value datatype]
   (let [value* (coerce value datatype)]
     (if (nil? value*)
-      (throw (ex-info (str "Data type " datatype " cannot be coerced from provided value: " value ".")
+      (throw (ex-info (str "Value " value " cannot be coerced to provided datatype: " datatype ".")
                       {:status 400 :error, :db/value-coercion}))
       value*)))

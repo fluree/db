@@ -128,11 +128,11 @@
                             :schema/name true}})]
       (is (util/exception? db-int-name)
           "Exception, because :schema/name is an integer and not a string.")
-      (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+      (is (= "Value 42 cannot be coerced to provided datatype: 1."
              (ex-message db-int-name)))
       (is (util/exception? db-bool-name)
           "Exception, because :schema/name is a boolean and not a string.")
-      (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+      (is (= "Value true cannot be coerced to provided datatype: 1."
              (ex-message db-bool-name)))
       (is (= @(fluree/query db-ok user-query)
              [{:id          :ex/john
@@ -1063,7 +1063,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message db-two-ages)))
       (is (util/exception? db-num-email))
-      (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+      (is (= "Value 42 cannot be coerced to provided datatype: 1."
              (ex-message db-num-email)))
       (is (= [{:id           :ex/john
                :type     :ex/User
@@ -1345,7 +1345,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                  {"id"      "ex:Bob"
                                                   "ex:name" 123
                                                   "type"    "ex:User"}]})]
-        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+        (is (= "Value 123 cannot be coerced to provided datatype: 1."
                (ex-message db-bad-friend-name)))))
     (testing "maxCount"
       (let [conn          @(fluree/connect {:method :memory
@@ -1499,9 +1499,11 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                            "sh:targetObjectsOf" {"@id" "ex:friend"}
                                            "sh:property" [{"sh:path" {"@id" "ex:name"}
                                                            "sh:datatype" {"@id" "xsd:string"}}]}})
+
+            ;; need to specify type in order to avoid sh:datatype coercion
             db2 @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
                                      "insert" {"id" "ex:Bob"
-                                               "ex:name" 123
+                                               "ex:name" {"@type" "xsd:integer" "@value" 123}
                                                "type" "ex:User"}})
             db-forbidden-friend @(fluree/stage2 db2
                                                 {"@context" "https://ns.flur.ee"
@@ -1703,9 +1705,10 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                   "sh:targetObjectsOf" {"@id" "ex:friend"}
                                   "sh:property" [{"sh:path" {"@id" "ex:name"}
                                                   "sh:datatype" {"@id" "xsd:string"}}]}})
+            ;; need to specify type in order to avoid sh:datatype coercion
             db2 @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
                                      "insert" {"id" "ex:Bob"
-                                               "ex:name" 123
+                                               "ex:name" {"@type" "xsd:integer" "@value" 123}
                                                "type" "ex:User"}})
             db-forbidden-friend @(fluree/stage2 db2
                                                 {"@context" "https://ns.flur.ee"
