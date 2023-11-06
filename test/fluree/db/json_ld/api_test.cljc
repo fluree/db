@@ -1029,10 +1029,12 @@
            "rootRole user can see all ex:Users")
 
        (is (= [{"id" "ex:john"
+                "type" "ex:User"
                 "schema:email" "john@flur.ee"
                 "schema:birthDate" "2022-08-17"
                 "schema:name" "John"}
                {"id" "ex:alice"
+                "type" "ex:User"
                 "schema:email" "alice@flur.ee"
                 "schema:birthDate" "2022-08-17"
                 "schema:name" "Alice"
