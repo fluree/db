@@ -113,7 +113,8 @@
       (async/pipeline-async parallelism flakes-ch flakes-af sid-ch)
       (async/pipeline-async parallelism result-ch (result-af opts*) limit-ch)
 
-      (let [final-ch (async/transduce identity (completing conj finish-fn) [] result-ch)]
+      (let [final-ch (async/into [] result-ch)]
         (async/alt!
           error-ch ([e] e)
-          final-ch ([results] results))))))
+          final-ch ([results]
+                    (finish-fn results)))))))
