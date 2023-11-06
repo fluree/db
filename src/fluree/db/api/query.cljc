@@ -171,36 +171,61 @@
     :fql (query-fql db query)
     :sparql (query-sparql db query)))
 
+(defn contextualize-ledger-400-error
+  [info-str e]
+  (let [e-data (ex-data e)]
+    (if (= 400
+           (:status e-data))
+      (ex-info
+       (str info-str
+            (ex-message e))
+       e-data
+       e)
+      e)))
+
 (defn load-alias
   [conn alias t opts]
   (go-try
-    (let [address (<? (nameservice/primary-address conn alias nil))
-          ledger  (<? (jld-ledger/load conn address))
-          db      (ledger-proto/-db ledger)]
-      (<? (restrict-db db t opts)))))
+   (try
+     (let [address (<? (nameservice/primary-address conn alias nil))
+           ledger  (<? (jld-ledger/load conn address))
+           db      (ledger-proto/-db ledger)]
+       (<? (restrict-db db t opts)))
+     (catch Exception e
+       (throw (contextualize-ledger-400-error
+               (str "Error loading ledger " alias ": ")
+               e))))))
 
 (defn load-aliases
-  [conn aliases opts]
-  (go-try
-    (loop [[alias & r] aliases
-           db-map      {}]
-      (if alias
-        ;; TODO: allow restricting federated dataset components individually by t
-        (let [db      (<? (load-alias conn alias nil opts))
-              db-map* (assoc db-map alias db)]
-          (recur r db-map*))
-        db-map))))
+  [conn aliases global-t opts]
+  (do (when (some? global-t)
+        (try (util/str->epoch-ms global-t)
+             (catch Exception e
+               (throw
+                (contextualize-ledger-400-error
+                 (str "Error in federated query: top-level `t` values "
+                      "must be iso-8601 wall-clock times. ")
+                 e)))))
+      (go-try
+       (loop [[alias & r] aliases
+              db-map      {}]
+         (if alias
+           ;; TODO: allow restricting federated dataset components individually by t
+           (let [db      (<? (load-alias conn alias global-t opts))
+                 db-map* (assoc db-map alias db)]
+             (recur r db-map*))
+           db-map)))))
 
 (defn load-dataset
-  [conn defaults named opts]
+  [conn defaults named global-t opts]
   (go-try
     (if (and (= (count defaults) 1)
              (empty? named))
       (let [alias (first defaults)]
-        (<? (load-alias conn alias nil opts))) ; return an unwrapped db if the data set
-                                               ; consists of one ledger
+        (<? (load-alias conn alias global-t opts))) ; return an unwrapped db if the data set
+                                                    ; consists of one ledger
       (let [all-aliases  (->> defaults (concat named) distinct)
-            db-map       (<? (load-aliases conn all-aliases opts))
+            db-map       (<? (load-aliases conn all-aliases global-t opts))
             default-coll (-> db-map
                              (select-keys defaults)
                              vals)
@@ -212,13 +237,13 @@
   (go-try
     (let [{query :subject, did :did} (or (<? (cred/verify query))
                                          {:subject query})
-          {:keys [opts] :as query*}  (update query :opts sanitize-query-options did)
+          {:keys [t opts] :as query*}  (update query :opts sanitize-query-options did)
 
           default-aliases (some-> query* :from util/sequential)
           named-aliases   (some-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [ds          (<? (load-dataset conn default-aliases named-aliases opts))
+        (let [ds          (<? (load-dataset conn default-aliases named-aliases t opts))
               query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
               max-fuel    (:max-fuel opts)
               default-ctx (conn-proto/-default-context conn)
