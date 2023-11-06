@@ -171,6 +171,18 @@
     :fql (query-fql db query)
     :sparql (query-sparql db query)))
 
+(defn contextualize-ledger-400-error
+  [info-str e]
+  (let [e-data (ex-data e)]
+    (if (= 400
+           (:status e-data))
+      (ex-info
+       (str info-str
+            (ex-message e))
+       e-data
+       e)
+      e)))
+
 (defn load-alias
   [conn alias t opts]
   (go-try
@@ -180,27 +192,29 @@
            db      (ledger-proto/-db ledger)]
        (<? (restrict-db db t opts)))
      (catch Exception e
-       (throw (let [e-data (ex-data e)]
-                (if (= 400
-                     (:status e-data))
-                  (ex-info
-                   (str "Error loading " alias ": "
-                        (ex-message e))
-                   e-data
-                   e)
-                  e)))))))
+       (throw (contextualize-ledger-400-error
+               (str "Error loading ledger " alias ": ")
+               e))))))
 
 (defn load-aliases
   [conn aliases global-t opts]
-  (go-try
-    (loop [[alias & r] aliases
-           db-map      {}]
-      (if alias
-        ;; TODO: allow restricting federated dataset components individually by t
-        (let [db      (<? (load-alias conn alias global-t opts))
-              db-map* (assoc db-map alias db)]
-          (recur r db-map*))
-        db-map))))
+  (do (when (some? global-t)
+        (try (util/str->epoch-ms global-t)
+             (catch Exception e
+               (throw
+                (contextualize-ledger-400-error
+                 (str "Error in federated query: top-level `t` values "
+                      "must be iso-8601 wall-clock times. ")
+                 e)))))
+      (go-try
+       (loop [[alias & r] aliases
+              db-map      {}]
+         (if alias
+           ;; TODO: allow restricting federated dataset components individually by t
+           (let [db      (<? (load-alias conn alias global-t opts))
+                 db-map* (assoc db-map alias db)]
+             (recur r db-map*))
+           db-map)))))
 
 (defn load-dataset
   [conn defaults named global-t opts]
