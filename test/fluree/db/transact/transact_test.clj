@@ -413,18 +413,19 @@
 
 (deftest ^:integration shacl-datatype-coercion
   (let [conn   @(fluree/connect {:method :memory})
-        ledger @(fluree/create conn "insert-delete" {:defaultContext
-                                                     {"ex"     "http://example.org/",
-                                                      "f"      "https://ns.flur.ee/ledger#",
-                                                      "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-                                                      "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
-                                                      "schema" "http://schema.org/",
-                                                      "sh"     "http://www.w3.org/ns/shacl#",
-                                                      "xsd"    "http://www.w3.org/2001/XMLSchema#"}})
+        ledger-id "sh-datatype"
+        ledger @(fluree/create conn ledger-id {:defaultContext
+                                               {"ex" "http://example.org/",
+                                                "f" "https://ns.flur.ee/ledger#",
+                                                "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#",
+                                                "schema" "http://schema.org/",
+                                                "sh" "http://www.w3.org/ns/shacl#",
+                                                "xsd" "http://www.w3.org/2001/XMLSchema#"}})
 
         db0 (fluree/db ledger)
         db1 @(fluree/stage2 db0 {"@context" "https://ns.flur.ee",
-                                 "ledger"   "sh-datatype-bug",
+                                 "ledger"   ledger-id
                                  "insert"   {"@id"            "ex:NodeShape/Yeti",
                                              "@type"          "sh:NodeShape",
                                              "sh:targetClass" {"@id" "ex:Yeti"},
@@ -434,13 +435,24 @@
 
 
         db2 @(fluree/stage2 db1 {"@context" "https://ns.flur.ee",
-                                 "ledger"   "sh-datatype-bug",
+                                 "ledger"   ledger-id
                                  "insert"   {"@id"         "ex:freddy",
                                              "@type"       "ex:Yeti",
                                              "schema:name" "Freddy",
                                              "schema:age"  8}})
 
-        ]
+        _ @(fluree/commit! ledger db2)
+        loaded @(fluree/load conn ledger-id)
+
+        db3 @(fluree/stage2 (fluree/db loaded) {"@context" "https://ns.flur.ee",
+                                                "ledger" ledger-id
+                                                "insert" {"@id" "ex:letti",
+                                                          "@type" "ex:Yeti",
+                                                          "schema:name" "Letti",
+                                                          "schema:age" "alot"}})]
     (is (= {"schema:age" 8}
            @(fluree/query db2 {"selectOne" {"ex:freddy" ["schema:age"]}}))
-        "8 is converted from a long to an int.")))
+        "8 is converted from a long to an int.")
+    (is (= "Value alot cannot be coerced to provided datatype: 7."
+           (ex-message db3))
+        "datatype constraint is restored after a load")))
