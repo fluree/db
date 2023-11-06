@@ -6,7 +6,6 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.subject :refer [subj-crawl]]
             [fluree.db.query.subject-crawl.common :refer [order-results]]
-            [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -73,11 +72,11 @@
         select-spec (retrieve-select-spec db parsed-query)
         context     (:context parsed-query)
         compact-fn  (json-ld/compact-fn context)
-        result-fn   (partial json-ld-resp/flakes->res db cache context compact-fn fuel-vol fuel select-spec 0)
         finish-fn   (build-finishing-fn parsed-query)
         opts        {:rdf-type?     rdf-type?
                      :db            db
                      :cache         cache
+                     :compact-fn    compact-fn
                      :fuel-vol      fuel-vol
                      :max-fuel      fuel
                      :select-spec   select-spec
@@ -91,7 +90,6 @@
                      :f-where       f-where
                      :parse-json?   (:parse-json? opts)
                      :query         parsed-query
-                     :result-fn     result-fn
                      :finish-fn     finish-fn}]
     (log/trace "simple-subject-crawl opts:" opts)
     (if rel-binding?
