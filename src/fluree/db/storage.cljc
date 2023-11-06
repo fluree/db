@@ -105,6 +105,18 @@
       (notify-new-index-file changes-ch garbage' res)
       garbage')))
 
+(defn extract-schema-root
+  "Transform the schema cache for serialization by turning every predicate into a tuple of [pid datatype]."
+  [{:keys [schema]}]
+  (->> (:pred schema)
+       (reduce (fn [root [k {:keys [datatype]}]]
+                 (if (number? k)
+                   (if datatype
+                     (conj root [k datatype])
+                     (conj root [k]))
+                   root))
+               [])))
+
 (defn write-db-root
   [db changes-ch custom-ecount]
   (go-try
@@ -112,12 +124,11 @@
                   tspo fork fork-block schema]} db
           t'        (- t)
           ledger-alias (:id commit)
-          pred-sids (->> schema :pred keys (into [] (comp (filter (fn [k] (number? k))) ; remove non-sid keys
-                                                          (distinct))))
+          preds     (extract-schema-root db)
           data      {:ledger-alias ledger-alias
                      :t         t'
                      :ecount    (or custom-ecount ecount)
-                     :preds     pred-sids
+                     :preds     preds
                      :stats     (select-keys stats [:flakes :size])
                      :spot      (child-data spot)
                      :psot      (child-data psot)
