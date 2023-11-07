@@ -33,3 +33,10 @@
 (defn names
   [ds]
   (-> ds :named keys))
+
+(defn to-seq
+  [ds]
+  (-> #{}
+      (into (:default ds))
+      (into (-> ds :named vals))
+      seq))
