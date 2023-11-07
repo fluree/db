@@ -171,15 +171,18 @@
   (reduce-kv (fn [m k v2]
                (if-let [v1 (get m k)]
                  (let [combined-v (cond
-                           (and (sequential? v1)
-                                (sequential? v2))
-                           (into v1 v2)
+                                    (and (vector? v1)
+                                         (vector? v2))
+                                    (into v1 v2)
 
-                           (sequential? v1)
-                           (conj v1 v2)
+                                    (vector? v1)
+                                    (conj v1 v2)
 
-                           (sequential? v2)
-                           (cons v1 v2))]
+                                    (vector? v2)
+                                    (into [v1] v2)
+
+                                    :else
+                                    [v1 v2])]
                    (assoc m k combined-v))
                  (assoc m k v2)))
              g1 g2))
