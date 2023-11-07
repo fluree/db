@@ -26,7 +26,11 @@
 
 (set! *warn-on-reflection* true)
 
-
+(defn read-json-resource
+  "Utility function to read and parse a json file on the resource path into edn
+  without converting anything to keywords"
+  [rsc]
+  (-> rsc io/resource slurp (json/parse false)))
 
 (comment
 
