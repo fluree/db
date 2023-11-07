@@ -108,13 +108,13 @@
           limit-ch   (if limit
                        (async/take limit flakes-ch)
                        flakes-ch)
-          result-ch (async/chan)]
+          result-ch (async/chan)
+          final-ch  (async/into [] result-ch)]
 
       (async/pipeline-async parallelism flakes-ch flakes-af sid-ch)
       (async/pipeline-async parallelism result-ch (result-af opts*) limit-ch)
 
-      (let [final-ch (async/into [] result-ch)]
-        (async/alt!
-          error-ch ([e] e)
-          final-ch ([results]
-                    (finish-fn results)))))))
+      (async/alt!
+        error-ch ([e] e)
+        final-ch ([results]
+                  (finish-fn results))))))
