@@ -14,6 +14,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
             [fluree.db.datatype :as datatype]
+            [fluree.db.query.dataset :as dataset :refer [dataset?]]
             [fluree.db.util.json :as json]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -148,25 +149,61 @@
   [as-fn bind-var aggregate?]
   (->AsSelector as-fn bind-var aggregate?))
 
+(defn resolve-subgraph
+  [db subj spec iri-cache context compact error-ch solution]
+  (go
+    (try*
+      (let [db-alias (:alias db)]
+        (when-let [sid (if (where/variable? subj)
+                         (-> solution
+                             (get subj)
+                             (where/get-sid db-alias))
+                         (<? (dbproto/-subid db subj false)))]
+          (let [flakes (<? (query-range/index-range db :spot = [sid]))]
+            ;; TODO: Replace these nils with fuel values when we turn fuel back on
+            (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))))
+      (catch* e
+              (log/error e "Error formatting subgraph for subject:" subj)
+              (>! error-ch e)))))
+
+(defn merge-subgraph
+  [g1 g2]
+  (reduce-kv (fn [m k v2]
+               (if-let [v1 (get m k)]
+                 (let [combined-v (cond
+                           (and (sequential? v1)
+                                (sequential? v2))
+                           (into v1 v2)
+
+                           (sequential? v1)
+                           (conj v1 v2)
+
+                           (sequential? v2)
+                           (cons v1 v2))]
+                   (assoc m k combined-v))
+                 (assoc m k v2)))
+             g1 g2))
+
 (defrecord SubgraphSelector [subj selection depth spec]
   ValueSelector
   (implicit-grouping? [_] false)
   (format-value
-    [_ db iri-cache context compact error-ch solution]
-    (go
-      (try*
-        (let [db-alias (:alias db)]
-          (when-let [sid (if (where/variable? subj)
-                           (-> solution
-                               (get subj)
-                               (where/get-sid db-alias))
-                           (<? (dbproto/-subid db subj false)))]
-            (let [flakes (<? (query-range/index-range db :spot = [sid]))]
-              ;; TODO: Replace these nils with fuel values when we turn fuel back on
-              (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))))
-        (catch* e
-                (log/error e "Error formatting subgraph for subject:" subj)
-                (>! error-ch e))))))
+    [_ ds iri-cache context compact error-ch solution]
+    (if (dataset? ds)
+      (let [subgraph-ch (async/chan 2)]
+        ;; first look up the subgraphs in each dataset component
+        (async/pipeline-async 2
+                              subgraph-ch
+                              (fn [db ch]
+                                (async/pipe (resolve-subgraph db subj spec iri-cache
+                                                              context compact error-ch
+                                                              solution)
+                                            ch))
+                              (-> ds dataset/to-seq async/to-chan!))
+        ;; then combine all the subgraphs
+        (async/reduce merge-subgraph {} subgraph-ch))
+
+      (resolve-subgraph ds subj spec iri-cache context compact error-ch solution))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied
