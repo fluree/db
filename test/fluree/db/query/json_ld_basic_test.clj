@@ -276,6 +276,29 @@
              @(fluree/query db {:select {"?s" ["*"]}
                                 :where  {:id          "?s"
                                          :ex/favColor "?color"}})))
+
+      (is (= [{:type         :ex/User
+               :schema/email "cam@example.org"
+               :ex/favNums   [5 10]
+               :schema/age   34
+               :ex/last      "Jones"
+               :schema/name  "Cam"
+               :id           :ex/cam
+               :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
+               :ex/favColor  "Blue"}
+              {:id           :ex/alice
+               :type         :ex/User
+               :schema/name  "Alice"
+               :ex/last      "Smith"
+               :schema/email "alice@example.org"
+               :schema/age   42
+               :ex/favNums   [9 42 76]
+               :ex/favColor  "Green"}]
+             @(fluree/query db {:select {"?s" ["*"]}
+                                :where  {:id          "?s"
+                                         :ex/favColor "?color"}
+                                :limit  2})))
+
       (is (= [{:id           :ex/alice
                :type         :ex/User
                :schema/name  "Alice"

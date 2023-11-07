@@ -1,41 +1,26 @@
 (ns fluree.db.query.subject-crawl.common
-  (:require [clojure.core.async :refer [go] :as async]
+  (:require [clojure.core.async :refer [go >!] :as async]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.index :as index]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.schema :as schema-util]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.permissions-validate :as perm-validate]))
+            [fluree.db.query.json-ld.response :as json-ld-resp]
+            [fluree.db.dbproto :as dbproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn where-subj-xf
-  "Transducing function to extract matching subjects from initial where clause."
-  [{:keys [start-test start-flake end-test end-flake xf]}]
-  (apply comp (cond-> [(filter index/resolved-leaf?)
-                       (map :flakes)
-                       (map (fn [flakes]
-                              (flake/subrange flakes
-                                              start-test start-flake
-                                              end-test end-flake)))]
-                      xf
-                      (conj xf))))
-
-
 (defn result-af
-  [{:keys [result-fn error-ch] :as _opts}]
+  [{:keys [db cache context compact-fn fuel-vol fuel select-spec error-ch] :as _opts}]
   (fn [flakes port]
     (go
       (try*
-        (some->> flakes
-                 result-fn
-                 <?
-                 not-empty
-                 (async/put! port))
+        (let [result (<? (json-ld-resp/flakes->res db cache context compact-fn fuel-vol fuel select-spec 0 flakes))]
+          (when (not-empty result)
+            (>! port result)))
         (async/close! port)
-        (catch* e (async/put! error-ch e) (async/close! port) nil)))))
+        (catch* e
+                (log/error e "Error processing subject query result")
+                (>! error-ch e))))))
 
 
 (defn passes-filter?
