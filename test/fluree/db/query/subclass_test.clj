@@ -66,3 +66,52 @@
                                  {:select {'?s [:*]}
                                   :where  {:id '?s, :type :schema/CreativeWork}})))
           "CreativeWork query should return both Book and Movie"))))
+
+(deftest ^:pending ^:integration subclass-inferencing-test
+  (testing "issue core/48"
+    (let [conn        (test-utils/create-conn
+                       {:context      test-utils/default-str-context
+                        :context-type :string})
+          ledger-name "subclass-inferencing-test"
+          ledger      @(fluree/create conn ledger-name)
+          db0         (fluree/db ledger)
+          db1         @(fluree/stage2
+                        db0
+                        {"@context" "https://ns.flur.ee"
+                         "insert"
+                         [{"@id"         "ex:freddy"
+                           "@type"       "ex:Yeti"
+                           "schema:name" "Freddy"}
+                          {"@id"         "ex:letty"
+                           "@type"       "ex:Yeti"
+                           "schema:name" "Leticia"}
+                          {"@id"         "ex:betty"
+                           "@type"       "ex:Yeti"
+                           "schema:name" "Betty"}
+                          {"@id"         "ex:andrew"
+                           "@type"       "schema:Person",
+                           "schema:name" "Andrew Johnson"}]})
+          db2         @(fluree/stage2
+                        db1
+                        {"@context" "https://ns.flur.ee"
+                         "insert"
+                         [{"@id"   "ex:Humanoid"
+                           "@type" "rdfs:Class"}
+                          {"@id"             "ex:Yeti"
+                           "rdfs:subClassOf" {"@id" "ex:Humanoid"}}
+                          {"@id"             "schema:Person"
+                           "rdfs:subClassOf" {"@id" "ex:Humanoid"}}]})]
+      (is (= #{{"id"          "ex:freddy"
+                "type"        "ex:Yeti"
+                "schema:name" "Freddy"}
+               {"id"          "ex:letty"
+                "type"        "ex:Yeti"
+                "schema:name" "Leticia"}
+               {"id"          "ex:betty"
+                "type"        "ex:Yeti"
+                "schema:name" "Betty"}
+               {"id"          "ex:andrew"
+                "type"        "schema:Person"
+                "schema:name" "Andrew Johnson"}}
+             (set @(fluree/query db2 {"where"  {"@id" "?s", "@type" "ex:Humanoid"}
+                                      "select" {"?s" ["*"]}})))))))
