@@ -246,24 +246,6 @@
     (let [schema  (<? (vocab-map db))]
       (assoc db :schema schema))))
 
-(defn schema
-  [vocab-flakes t]
-  (let [base-schema (base-schema)
-        schema      (update-with* base-schema t vocab-flakes)
-        refs        (extract-ref-sids (:pred schema))]
-    (-> schema
-        (assoc :refs refs))))
-
-(defn load-schema
-  [{:keys [preds t] :as db}]
-  (go-try
-    (loop [[pred-sid & r] preds
-           vocab-flakes (flake/sorted-set-by flake/cmp-flakes-spot)]
-      (if pred-sid
-        (let [pred-flakes (<? (query-range/index-range db :spot = [pred-sid]))]
-          (recur r (into vocab-flakes pred-flakes)))
-        (schema vocab-flakes t)))))
-
 (defn predicate-sids
   "Extract predicate sids from flakes."
   [flakes]
@@ -285,13 +267,56 @@
               cat)
         flakes))
 
+(defn pred-dt-constraints
+  "Collect any shacl datatype constraints and the predicates they apply to."
+  [new-flakes]
+  (loop [[s-flakes & r] (partition-by flake/s new-flakes)
+         res []]
+    (println "DEP s-flakes" (pr-str s-flakes))
+    (if s-flakes
+      (if-let [dt-constraints (->> s-flakes
+                                   (filterv #(= const/$sh:datatype (flake/p %)))
+                                   (mapv #(flake/o %))
+                                   (first))]
+        (let [path (->> s-flakes
+                        (filterv #(= const/$sh:path (flake/p %)))
+                        (sort-by #(:i (flake/m %)))
+                        (mapv #(flake/o %))
+                        (last))]
+          (recur r (conj res [path dt-constraints])))
+        (recur r res))
+      res)))
+
+(defn add-pred-datatypes
+  "Add a :datatype key to the pred meta map for any predicates with a sh:datatype
+  constraint. Only one datatype constraint can be valid for a given datatype, most
+  recent wins."
+  [{:keys [pred] :as schema} pred-tuples]
+  (reduce (fn [schema [pid dt]]
+            (let [{:keys [iri] :as pred-meta} (-> schema :pred (get pid)
+                                                  (assoc :datatype dt))]
+              (-> schema
+                  (assoc-in [:pred pid] pred-meta)
+                  (assoc-in [:pred iri] pred-meta))))
+          schema
+          pred-tuples))
+
+(defn build-schema
+  [vocab-flakes t]
+  (let [base-schema (base-schema)
+        schema      (update-with* base-schema t vocab-flakes)
+        refs        (extract-ref-sids (:pred schema))]
+    (-> schema
+        (assoc :refs refs))))
+
 (defn hydrate-schema
   "Updates the :schema key of a by processing just the vocabulary flakes out of the new flakes."
   [db new-flakes]
   (let [pred-sids    (predicate-sids new-flakes)
         vocab-flakes (filterv #(pred-sids (flake/s %)) new-flakes)
         {:keys [t refs coll pred shapes prefix fullText subclasses]}
-        (schema vocab-flakes (:t db))]
+        (-> (build-schema vocab-flakes (:t db))
+            (add-pred-datatypes (pred-dt-constraints new-flakes)))]
     (-> db
         (assoc-in [:schema :t] t)
         (update-in [:schema :refs] into refs)
@@ -301,3 +326,15 @@
         (update-in [:schema :fullText] into fullText)
         (assoc-in [:schema :subclasses] subclasses)
         (assoc-in [:schema :shapes] shapes))))
+
+(defn load-schema
+  [{:keys [preds t] :as db}]
+  (go-try
+    (loop [[[pred-sid datatype] & r] preds
+           vocab-flakes (flake/sorted-set-by flake/cmp-flakes-spot)]
+      (if pred-sid
+        (let [pred-flakes (<? (query-range/index-range db :spot = [pred-sid]))]
+          (recur r (into vocab-flakes pred-flakes)))
+        (-> (build-schema vocab-flakes (:t db))
+            ;; only use predicates that have a dt
+            (add-pred-datatypes (filterv #(> (count %) 1) preds)))))))
