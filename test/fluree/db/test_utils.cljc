@@ -127,7 +127,7 @@
   [conn]
   (let [ledger @(fluree/create conn "test/movies")]
     (doseq [movie movies]
-      (let [staged @(fluree/stage (fluree/db ledger) movie)]
+      (let [staged @(fluree/stage2 (fluree/db ledger) {"@context" "https://ns.flur.ee" "insert" movie})]
         @(fluree/commit! ledger staged
                          {:message (str "Commit " (get movie "name"))
                           :push?   true})))
@@ -140,7 +140,7 @@
                                  {:defaultContext
                                   ["" {:ex "http://example.org/ns/"}]})
          ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
-         staged-p (fluree/stage (fluree/db ledger) people)
+         staged-p (fluree/stage2 (fluree/db ledger) {"@context" "https://ns.flur.ee" "insert" people})
          staged   #?(:clj @staged-p :cljs (<p! staged-p))
          commit-p (fluree/commit! ledger staged {:message "Adding people"
                                                  :push? true})]
@@ -151,7 +151,7 @@
   ([ledger data]
    (transact ledger data {}))
   ([ledger data commit-opts]
-   (let [staged @(fluree/stage (fluree/db ledger) data)]
+   (let [staged @(fluree/stage2 (fluree/db ledger) data)]
      (fluree/commit! ledger staged commit-opts))))
 
 (defn retry-promise-wrapped
