@@ -32,12 +32,47 @@
   (or (get const/code->namespace ns-code)
       (-> db :namespaces-codes (get ns-code))))
 
+(def name-code-xf
+  (comp (partition-all 8)
+        (map bytes/UTF8->long)))
+
+(defn name->codes
+  [nme]
+  (into []
+        name-code-xf
+        (bytes/string->UTF8 nme)))
+
 (defn append-name-codes
   [ns-sid nme]
   (into ns-sid
-        (comp (partition-all 8)
-              (map bytes/UTF8->long))
+        name-code-xf
         (bytes/string->UTF8 nme)))
+
+(defn codes->name
+  [nme-codes]
+  (->> nme-codes
+       (mapcat bytes/long->UTF8)
+       bytes/UTF8->string))
+
+(defn get-ns-code
+  [sid]
+  (nth sid 0))
+
+(defn get-name-codes
+  [sid]
+  (subvec sid 1))
+
+(defn get-namespace
+  [db sid]
+  (-> sid
+      get-ns-code
+      (as-> ns-code (code->namespace db ns-code))))
+
+(defn get-name
+  [sid]
+  (->> sid
+       get-name-codes
+       codes->name))
 
 (defn iri->subid
   "Converts a string iri into a vector of long integer codes. The first code
@@ -51,10 +86,5 @@
 (defn subid->iri
   "Converts a vector as would be returned by `iri->subid` back into a string iri."
   [db sid]
-  (let [ns-code   (nth sid 0)
-        ns        (code->namespace db ns-code)
-        nme-codes (subvec sid 1)]
-    (->> nme-codes
-         (map bytes/long->UTF8)
-         (map bytes/UTF8->string)
-         (apply str ns))))
+  (str (get-namespace db sid)
+       (get-name sid)))
