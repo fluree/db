@@ -10,6 +10,10 @@
   #?(:clj (:import (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn deserialize-meta
+  [serialized-meta]
+  (util/keywordize-keys serialized-meta))
+
 (defn deserialize-object
   [serialized-obj dt]
   (datatype/coerce serialized-obj dt))
@@ -19,8 +23,8 @@
   (let [dt (get flake-vec flake/dt-pos)]
     (-> flake-vec
         (update flake/obj-pos deserialize-object dt)
+        (update flake/m-pos deserialize-meta)
         (flake/parts->Flake))))
-
 
 (defn- deserialize-child-node
   "Turns :first and :rhs into flakes"
