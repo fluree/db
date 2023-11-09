@@ -20,6 +20,8 @@
 (defn blank-db
   "When not bootstrapping with a transaction, bootstraps initial base set of flakes required for a db."
   [blank-db]
-  (let [t           -1
+  (let [t           (dec (:t blank-db))
         base-flakes (jld-transact/base-flakes t)]
-    (commit-data/update-novelty blank-db base-flakes)))
+    (-> blank-db
+        #_(update :t dec)
+        #_(commit-data/update-novelty base-flakes))))

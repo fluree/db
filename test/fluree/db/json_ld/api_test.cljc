@@ -836,8 +836,11 @@
              (let [response    @(fluree/stage db0 test-utils/people
                                                {:meta true})
                    db          (:result response)
-                   flake-total (count (<?? (query-range/index-range db :spot)))]
-               (is (= flake-total (:fuel response))
+                   flake-total (- (-> db :stats :flakes)
+                                  (-> db0 :stats :flakes))]
+
+               (is (= flake-total
+                      (:fuel response))
                    "Reports fuel for all the generated flakes")))
            (testing "without the `:meta` option"
              (let [response @(fluree/stage db0 test-utils/people)]
@@ -849,8 +852,9 @@
                (is (re-find #"Fuel limit exceeded"
                             (-> response ex-cause ex-message))))))
          (testing "queries"
-           (let [db          @(fluree/stage db0 test-utils/people)
-                 flake-total (count (<?? (query-range/index-range db :spot)))
+           (let [db          @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people})
+                 flake-total (- (-> db :stats :flakes)
+                                (-> db0 :stats :flakes))
                  query       '{:select [?s ?p ?o]
                                :where  {:id ?s
                                         ?p ?o}}]
@@ -884,25 +888,25 @@
                 db0    (fluree/db ledger)]
             (testing "transactions"
               (testing "with the `:meta` option"
-                (let [response    (<p! (fluree/stage db0 test-utils/people {:meta true}))
+                (let [response    (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people} {:meta true}))
                       db          (:result response)
                       flake-total (count (<? (query-range/index-range db :spot)))]
                   (is (= flake-total (:fuel response))
                       "Reports fuel for all the generated flakes")))
               (testing "without the `:meta` option"
-                (let [response (<p! (fluree/stage db0 test-utils/people))]
+                (let [response (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))]
                   (is (nil? (:fuel response))
                       "Returns no fuel")))
               (testing "short-circuits if request fuel exhausted"
                 (let [response (try
-                                 (<p! (fluree/stage db0 test-utils/people
+                                 (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}
                                                     {:max-fuel 1}))
                                  (catch :default e (ex-cause e)))]
                   (is (util/exception? response))
                   (is (re-find #"Fuel limit exceeded"
                                (-> response ex-cause ex-message))))))
             (testing "queries"
-              (let [db          (<p! (fluree/stage db0 test-utils/people))
+              (let [db          (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))
                     flake-total (count (<? (query-range/index-range db :spot)))
                     query       '{:select [?s ?p ?o]
                                   :where  {:id ?s
@@ -921,7 +925,7 @@
                                 :where  {:id ?s
                                          ?p ?o}
                                 :opts   {:max-fuel 1}}
-                      db      (<p! (fluree/stage db0 test-utils/people))
+                      db      (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))
                       results (try
                                 (<p! (fluree/query db query))
                                 (catch :default e (ex-cause e)))]
