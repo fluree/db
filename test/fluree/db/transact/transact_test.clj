@@ -15,44 +15,46 @@
           ledger           @(fluree/create conn "tx/disallow" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
 
           stage-id-only    (try
-                             @(fluree/stage
-                               (fluree/db ledger)
-                               {:id :ex/alice})
+                             @(fluree/stage2
+                                (fluree/db ledger)
+                                {"@context" "https://ns.flur.ee"
+                                 "insert" {:id :ex/alice}})
                              (catch Exception e e))
           stage-empty-txn  (try
-                             @(fluree/stage
-                               (fluree/db ledger)
-                               {})
+                             @(fluree/stage2
+                                (fluree/db ledger)
+                                {"@context" "https://ns.flur.ee"
+                                 "insert" {}})
                              (catch Exception e e))
           stage-empty-node (try
-                             @(fluree/stage
-                               (fluree/db ledger)
-                               [{:id         :ex/alice
-                                 :schema/age 42}
-                                {}])
+                             @(fluree/stage2
+                                (fluree/db ledger)
+                                {"@context" "https://ns.flur.ee"
+                                 "insert"
+                                 [{:id         :ex/alice
+                                   :schema/age 42}
+                                  {}]})
                              (catch Exception e e))
-          db-ok            @(fluree/stage
-                             (fluree/db ledger)
-                             {:id         :ex/alice
-                              :schema/age 42})]
-      (is (util/exception? stage-id-only))
-      (is (str/starts-with? (ex-message stage-id-only)
-                            "Invalid transaction, transaction node contains no properties for @id:"))
-      (is (util/exception? stage-empty-txn))
-      (is (= (ex-message stage-empty-txn)
-             "Invalid transaction, transaction node contains no properties."))
-      (is (util/exception? stage-empty-node))
-      (is (= (ex-message stage-empty-node)
-             "Invalid transaction, transaction node contains no properties."))
-      (is (= [[:ex/alice :id "http://example.org/ns/alice"]
-              [:ex/alice :schema/age 42]
-              [:schema/age :id "http://schema.org/age"]
-              [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
-              [:type :id "@type"]
-              [:id :id "@id"]]
-             @(fluree/query db-ok '{:select [?s ?p ?o]
-                                    :where  {:id ?s
-                                             ?p ?o}})))))
+          db-ok            @(fluree/stage2
+                              (fluree/db ledger)
+                              {"@context" "https://ns.flur.ee"
+                               "insert"
+                               {:id         :ex/alice
+                                :schema/age 42}})]
+      (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
+             (ex-message stage-id-only)))
+      (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
+             (ex-message stage-empty-txn)))
+      (is (= {:flakes 4, :size 278, :indexed 0}
+             (:stats stage-empty-node))
+          "empty nodes are allowed as long as there is other data, they are just noops")
+      (is (= #{[:ex/alice :id "http://example.org/ns/alice"]
+               [:ex/alice :schema/age 42]
+               [:schema/age :id "http://schema.org/age"]
+               [:id :id "@id"]}
+             (set @(fluree/query db-ok '{:select [?s ?p ?o]
+                                         :where  {:id ?s
+                                                  ?p ?o}}))))))
 
   (testing "Allow transacting `false` values"
     (let [conn    (test-utils/create-conn)

@@ -638,22 +638,25 @@
 
 (defn parse-txn
   [txn context]
-  (let [vals-map  {:values (util/get-first-value txn const/iri-values)}
+  (let [vals-map      {:values (util/get-first-value txn const/iri-values)}
         [vars values] (parse-values vals-map)
-        where-map {:where (util/get-first-value txn const/iri-where)}
-        where     (parse-where where-map vars context)
+        where-map     {:where (util/get-first-value txn const/iri-where)}
+        where         (parse-where where-map vars context)
 
-        delete    (-> (util/get-first-value txn const/iri-delete)
-                      (json-ld/expand context)
-                      (util/sequential)
-                      (parse-triples))
-        insert    (-> (util/get-first-value txn const/iri-insert)
-                      (json-ld/expand context)
-                      (util/sequential)
-                      (parse-triples))]
+        delete (-> (util/get-first-value txn const/iri-delete)
+                   (json-ld/expand context)
+                   (util/sequential)
+                   (parse-triples))
+        insert (-> (util/get-first-value txn const/iri-insert)
+                   (json-ld/expand context)
+                   (util/sequential)
+                   (parse-triples))]
+    (when (and (empty? insert) (empty? delete))
+      (throw (ex-info (str "Invalid transaction, insert or delete clause must contain nodes with objects.")
+                      {:status 400 :error :db/invalid-transaction})))
     (cond-> {}
-      context            (assoc :context context)
-      where              (assoc :where where)
-      (seq values)       (assoc :values values)
-      (not-empty delete) (assoc :delete delete)
-      (not-empty insert) (assoc :insert insert))))
+      context      (assoc :context context)
+      where        (assoc :where where)
+      (seq values) (assoc :values values)
+      (seq delete) (assoc :delete delete)
+      (seq insert) (assoc :insert insert))))
