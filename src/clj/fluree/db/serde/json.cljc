@@ -17,6 +17,10 @@
     const/$xsd:dateTime
     const/$xsd:time})
 
+(defn time-type?
+  [dt]
+  (contains? time-types dt))
+
 (defn deserialize-subject
   [sid]
   (let [ns  (nth sid 0)
@@ -25,13 +29,14 @@
 
 (defn deserialize-flake
   [flake-vec]
-  (if-let [flake-time-dt (time-types (get flake-vec 3))]
-    (-> flake-vec
-        (update 2 (fn [val]
-                    #?(:clj (datatype/coerce val flake-time-dt)
-                       :cljs (js/Date. val))) )
-        (flake/parts->Flake))
-    (flake/parts->Flake flake-vec)))
+  (let [dt (get flake-vec flake/dt-pos)]
+    (if (time-type? dt)
+      (-> flake-vec
+          (update flake/obj-pos (fn [obj]
+                                  #?(:clj (datatype/coerce obj dt)
+                                     :cljs (js/Date. obj))) )
+          (flake/parts->Flake))
+      (flake/parts->Flake flake-vec))))
 
 
 (defn- deserialize-child-node
@@ -68,7 +73,8 @@
 
 (defn- deserialize-branch-node
   [branch]
-  (assoc branch :children (mapv deserialize-child-node (:children branch))
+  (assoc branch
+         :children (mapv deserialize-child-node (:children branch))
          :rhs (some-> (:rhs branch)
                       (deserialize-flake))))
 
@@ -85,7 +91,7 @@
 #?(:clj (def ^DateTimeFormatter xsdDateFormatter
           (DateTimeFormatter/ofPattern "uuuu-MM-dd[XXXXX]")))
 
-(defn serialize-flake-value
+(defn serialize-object
   "Flakes with time types will have time objects as values.
   We need to serialize these into strings that will be successfully re-coerced into
   the same objects upon loading."
@@ -99,6 +105,11 @@
                        :cljs (.toJSON val))
     val))
 
+(defn serialize-meta
+  [m]
+  (when m
+    (util/stringify-keys m)))
+
 (defn serialize-flake
   "Serializes flakes into vectors, ensuring values are written such that they will
   be correctly coerced when loading.
@@ -106,8 +117,8 @@
   Flakes with an 'm' value need keys converted from keyword keys into strings."
   [flake]
   (-> (vec flake)
-      (update 2 serialize-flake-value (flake/dt flake))
-      (cond-> (flake/m flake) (assoc 5 (util/stringify-keys (flake/m flake))))))
+      (update flake/obj-pos serialize-object (flake/dt flake))
+      (update flake/m-pos serialize-meta)))
 
 (defn- deserialize-garbage
   [garbage-data]

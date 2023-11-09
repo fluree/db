@@ -50,9 +50,10 @@
                                                      db iri-map
                                                      compact-fn))}
                                (if (nil? all-refs?) true all-refs?)]
-                              [{"@value" (serde-json/serialize-flake-value
-                                           (flake/o p-flake)
-                                           pdt)} false])
+                              [{"@value" (-> p-flake
+                                             flake/o
+                                             (serde-json/serialize-object pdt))}
+                               false])
             obj*      (cond-> obj
                         list? (assoc :i (-> p-flake flake/m :i))
                         (contains? serde-json/time-types pdt)

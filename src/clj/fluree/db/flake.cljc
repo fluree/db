@@ -233,6 +233,14 @@
   [flake]
   [(s flake) (p flake) (o flake) (dt flake) (t flake) (op flake) (m flake)])
 
+(def subj-pos 0)
+(def pred-pos 1)
+(def obj-pos 2)
+(def dt-pos 3)
+(def t-pos 4)
+(def op-pos 5)
+(def m-pos 6)
+
 (def maximum
   (->Flake max-s max-p max-s max-dt max-t max-op max-meta))
 
