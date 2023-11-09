@@ -49,6 +49,14 @@
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" const/$rdf:langString
    "@json"                                                 const/$rdf:json})
 
+(def time-types
+  #{const/$xsd:date
+    const/$xsd:dateTime
+    const/$xsd:time})
+
+(defn time-type?
+  [dt]
+  (contains? time-types dt))
 
 (def iso8601-offset-pattern
   "(Z|(?:[+-][0-9]{2}:[0-9]{2}))?")
@@ -345,15 +353,18 @@
 
     const/$xsd:date
     (when (string? value)
-      (parse-iso8601-date value))
+      #?(:clj (parse-iso8601-date value)
+         :cljs (js/Date. value)))
 
     const/$xsd:dateTime
     (when (string? value)
-      (parse-iso8601-datetime value))
+      #?(:clj (parse-iso8601-datetime value)
+         :cljs (js/Date. value)))
 
     const/$xsd:time
     (when (string? value)
-      (parse-iso8601-time value))
+      #?(:clj (parse-iso8601-time value)
+         :cljs (js/Date. value)))
 
     const/$xsd:decimal
     (coerce-decimal value)

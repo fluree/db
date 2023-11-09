@@ -7,36 +7,19 @@
             [fluree.db.util.core :as util]
             #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc]))
-  #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
-                              LocalDateTime ZoneOffset)
-                   (java.time.format DateTimeFormatter))))
+  #?(:clj (:import (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
 
-(def time-types
-  #{const/$xsd:date
-    const/$xsd:dateTime
-    const/$xsd:time})
-
-(defn time-type?
-  [dt]
-  (contains? time-types dt))
-
-(defn deserialize-subject
-  [sid]
-  (let [ns  (nth sid 0)
-        nme (nth sid 1)]
-    (iri/append-name-codes [ns] nme)))
+(defn deserialize-object
+  [serialized-obj dt]
+  (datatype/coerce serialized-obj dt))
 
 (defn deserialize-flake
   [flake-vec]
   (let [dt (get flake-vec flake/dt-pos)]
-    (if (time-type? dt)
-      (-> flake-vec
-          (update flake/obj-pos (fn [obj]
-                                  #?(:clj (datatype/coerce obj dt)
-                                     :cljs (js/Date. obj))) )
-          (flake/parts->Flake))
-      (flake/parts->Flake flake-vec))))
+    (-> flake-vec
+        (update flake/obj-pos deserialize-object dt)
+        (flake/parts->Flake))))
 
 
 (defn- deserialize-child-node
