@@ -10,6 +10,12 @@
   #?(:clj (:import (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn deserialize-subject
+  [serialized-sid]
+  (let [ns  (nth serialized-sid 0)
+        nme (nth serialized-sid 1)]
+    (iri/append-name-codes [ns] nme)))
+
 (defn deserialize-meta
   [serialized-meta]
   (util/keywordize-keys serialized-meta))
@@ -68,6 +74,12 @@
 (defn- deserialize-leaf-node
   [leaf]
   (assoc leaf :flakes (mapv deserialize-flake (:flakes leaf))))
+
+(defn serialize-subject
+  [sid]
+  (let [ns-code (iri/get-ns-code sid)
+        nme     (iri/get-name sid)]
+    [ns-code nme]))
 
 #?(:clj (def ^DateTimeFormatter xsdDateTimeFormatter
           (DateTimeFormatter/ofPattern "uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSS[XXXXX]")))
