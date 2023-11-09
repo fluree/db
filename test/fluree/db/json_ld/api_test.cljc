@@ -711,12 +711,14 @@
              ledger @(fluree/create conn "shacl/a" {:defaultContext ["" {"ex" "http://example.org/ns/"}]})
 
              db1 @(test-utils/transact ledger
-                                       {"@type" "sh:NodeShape",
-                                        "sh:targetClass" {"id" "schema:Person"}
-                                        "sh:property"
-                                        [{"sh:path" {"id" "schema:familyName"}
-                                          "sh:datatype" {"id" "xsd:string"}}]})
-             property-query {:select {"?s" ["*"]}
+                                       {"@context" "https://ns.flur.ee"
+                                        "insert"
+                                        {"@type" "sh:NodeShape",
+                                         "sh:targetClass" {"id" "schema:Person"}
+                                         "sh:property"
+                                         [{"sh:path" {"id" "schema:familyName"}
+                                           "sh:datatype" {"id" "xsd:string"}}]}})
+             property-query {:select {"?s" ["*" {"sh:property" ["sh:path" "sh:datatype"]}]}
                              :where {"id" "?s", "sh:property" "?property"}}
              shape-id (-> @(fluree/query db1 property-query)
                           first
@@ -725,24 +727,31 @@
          (is (= [{"id" shape-id
                   "type" "sh:NodeShape",
                   "sh:targetClass" {"id" "schema:Person"},
-                  "sh:property" {"id" "_:f211106232532993"}}]
+                  "sh:property" {"sh:path" {"id" "schema:familyName"}, "sh:datatype" {"id" "xsd:string"}}}]
                 @(fluree/query db1 property-query)))
          (is (= [{"id" shape-id
                   "type" "sh:NodeShape",
                   "sh:targetClass" {"id" "schema:Person"},
-                  "sh:property" {"id" "_:f211106232532993"}}]
+                  "sh:property" {"sh:path" {"id" "schema:familyName"}, "sh:datatype" {"id" "xsd:string"}}}]
                 @(fluree/query (fluree/db loaded1) property-query)))
          (testing "load ref retracts"
            (let [db2 @(test-utils/transact loaded1
-                                           {"@id" shape-id
-                                            "sh:property"
-                                            [{"sh:path" {"id" "schema:age"}
-                                              "sh:datatype" {"id" "xsd:string"}}]})
+                                           {"@context" "https://ns.flur.ee"
+                                            "where" [{"@id" shape-id
+                                                      "sh:property" "?prop"}
+                                                     {"@id" "?prop"
+                                                      "?p" "?o"}]
+                                            "delete"
+                                            {"@id" "?prop" "?p" "?o"}
+                                            "insert"
+                                            {"@id" "?prop"
+                                             "sh:path" {"id" "schema:age"}
+                                             "sh:datatype" {"id" "xsd:string"}}})
                  loaded2 (test-utils/retry-load conn ledger-alias 100)]
              (is (= [{"id" shape-id
                       "type" "sh:NodeShape",
                       "sh:targetClass" {"id" "schema:Person"},
-                      "sh:property" {"id" "_:f211106232532994"}}]
+                      "sh:property" {"sh:path" {"id" "schema:age"}, "sh:datatype" {"id" "xsd:string"}}}]
                     @(fluree/query (fluree/db loaded2) property-query)))))))
     (testing "can load after deletion of entire subjects"
        (let [conn              @(fluree/connect
@@ -833,8 +842,8 @@
              db0    (fluree/db ledger)]
          (testing "transactions"
            (testing "with the `:meta` option"
-             (let [response    @(fluree/stage db0 test-utils/people
-                                               {:meta true})
+             (let [response    @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}
+                                              {:meta true})
                    db          (:result response)
                    flake-total (- (-> db :stats :flakes)
                                   (-> db0 :stats :flakes))]
@@ -843,18 +852,17 @@
                       (:fuel response))
                    "Reports fuel for all the generated flakes")))
            (testing "without the `:meta` option"
-             (let [response @(fluree/stage db0 test-utils/people)]
+             (let [response @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people})]
                (is (nil? (:fuel response))
                    "Returns no fuel")))
            (testing "short-circuits if request fuel exhausted"
-             (let [response @(fluree/stage db0 test-utils/people
+             (let [response @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}
                                             {:maxFuel 1})]
                (is (re-find #"Fuel limit exceeded"
                             (-> response ex-cause ex-message))))))
          (testing "queries"
            (let [db          @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people})
-                 flake-total (- (-> db :stats :flakes)
-                                (-> db0 :stats :flakes))
+                 flake-total (-> db :stats :flakes)
                  query       '{:select [?s ?p ?o]
                                :where  {:id ?s
                                         ?p ?o}}]
@@ -872,7 +880,7 @@
                              :where  {:id ?s
                                       ?p ?o}
                              :opts   {:max-fuel 1}}
-                   db      @(fluree/stage db0 test-utils/people)
+                   db      @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people})
                    results @(fluree/query db query)]
                (is (util/exception? results))
                (is (re-find #"Fuel limit exceeded"
@@ -880,59 +888,59 @@
      :cljs
      (async done
        (go
-        (testing "fuel tracking"
-          (let [conn   (<! (test-utils/create-conn))
-                ledger (<p! (fluree/create conn "test/fuel-tracking"
-                                           {:defaultContext
-                                            ["" {:ex "http://example.org/ns/"}]}))
-                db0    (fluree/db ledger)]
-            (testing "transactions"
-              (testing "with the `:meta` option"
-                (let [response    (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people} {:meta true}))
-                      db          (:result response)
-                      flake-total (count (<? (query-range/index-range db :spot)))]
-                  (is (= flake-total (:fuel response))
-                      "Reports fuel for all the generated flakes")))
-              (testing "without the `:meta` option"
-                (let [response (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))]
-                  (is (nil? (:fuel response))
-                      "Returns no fuel")))
-              (testing "short-circuits if request fuel exhausted"
-                (let [response (try
-                                 (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}
-                                                    {:max-fuel 1}))
+         (testing "fuel tracking"
+           (let [conn   (<! (test-utils/create-conn))
+                 ledger (<p! (fluree/create conn "test/fuel-tracking"
+                                            {:defaultContext
+                                             ["" {:ex "http://example.org/ns/"}]}))
+                 db0    (fluree/db ledger)]
+             (testing "transactions"
+               (testing "with the `:meta` option"
+                 (let [response    (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people} {:meta true}))
+                       db          (:result response)
+                       flake-total (count (<? (query-range/index-range db :spot)))]
+                   (is (= flake-total (:fuel response))
+                       "Reports fuel for all the generated flakes")))
+               (testing "without the `:meta` option"
+                 (let [response (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))]
+                   (is (nil? (:fuel response))
+                       "Returns no fuel")))
+               (testing "short-circuits if request fuel exhausted"
+                 (let [response (try
+                                  (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}
+                                                      {:max-fuel 1}))
+                                  (catch :default e (ex-cause e)))]
+                   (is (util/exception? response))
+                   (is (re-find #"Fuel limit exceeded"
+                                (-> response ex-cause ex-message))))))
+             (testing "queries"
+               (let [db          (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))
+                     flake-total (count (<? (query-range/index-range db :spot)))
+                     query       '{:select [?s ?p ?o]
+                                   :where  {:id ?s
+                                            ?p ?o}}]
+                 (testing "queries not returning metadata"
+                   (let [sut (<p! (fluree/query db query))]
+                     (is (nil? (:fuel sut))
+                         "Reports no fuel")))
+                 (testing "queries returning metadata"
+                   (let [query* (assoc-in query [:opts :meta] true)
+                         sut    (<p! (fluree/query db query*))]
+                     (is (= flake-total (:fuel sut))
+                         "Reports that all flakes were traversed"))))
+               (testing "short-circuits if request fuel exhausted"
+                 (let [query   '{:select [?s ?p ?o]
+                                 :where  {:id ?s
+                                          ?p ?o}
+                                 :opts   {:max-fuel 1}}
+                       db      (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))
+                       results (try
+                                 (<p! (fluree/query db query))
                                  (catch :default e (ex-cause e)))]
-                  (is (util/exception? response))
-                  (is (re-find #"Fuel limit exceeded"
-                               (-> response ex-cause ex-message))))))
-            (testing "queries"
-              (let [db          (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))
-                    flake-total (count (<? (query-range/index-range db :spot)))
-                    query       '{:select [?s ?p ?o]
-                                  :where  {:id ?s
-                                           ?p ?o}}]
-                (testing "queries not returning metadata"
-                  (let [sut (<p! (fluree/query db query))]
-                    (is (nil? (:fuel sut))
-                        "Reports no fuel")))
-                (testing "queries returning metadata"
-                  (let [query* (assoc-in query [:opts :meta] true)
-                        sut    (<p! (fluree/query db query*))]
-                    (is (= flake-total (:fuel sut))
-                        "Reports that all flakes were traversed"))))
-              (testing "short-circuits if request fuel exhausted"
-                (let [query   '{:select [?s ?p ?o]
-                                :where  {:id ?s
-                                         ?p ?o}
-                                :opts   {:max-fuel 1}}
-                      db      (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))
-                      results (try
-                                (<p! (fluree/query db query))
-                                (catch :default e (ex-cause e)))]
-                  (is (util/exception? results))
-                  (is (re-find #"Fuel limit exceeded"
-                               (-> results ex-cause ex-message))))))))
-        (done)))))
+                   (is (util/exception? results))
+                   (is (re-find #"Fuel limit exceeded"
+                                (-> results ex-cause ex-message))))))))
+         (done)))))
 
 #?(:clj
    (deftest transaction-test
@@ -1099,13 +1107,13 @@
                                        "where" {"id" "?s", "schema:givenName" "?name"}})))
            "equivalentProperty annotations work")
 
-       (is (= 149
+       (is (= 148
               (-> @(fluree/history ledger {:commit-details true :t {:from :latest}})
                   (first)
                   (get "f:commit")
                   (get "f:data")
                   (get "f:flakes"))))
-       (is (= 149
+       (is (= 148
               (-> @(fluree/history loaded {:commit-details true :t {:from :latest}})
                   (first)
                   (get "f:commit")
