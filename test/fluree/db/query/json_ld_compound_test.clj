@@ -8,27 +8,29 @@
   (testing "Simple compound queries."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/compounda" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-          db     @(fluree/stage
-                   (fluree/db ledger)
-                   [{:id           :ex/brian,
-                     :type         :ex/User,
-                     :schema/name  "Brian"
-                     :schema/email "brian@example.org"
-                     :schema/age   50
-                     :ex/favNums   7}
-                    {:id           :ex/alice,
-                     :type         :ex/User,
-                     :schema/name  "Alice"
-                     :schema/email "alice@example.org"
-                     :schema/age   50
-                     :ex/favNums   [42, 76, 9]}
-                    {:id           :ex/cam,
-                     :type         :ex/User,
-                     :schema/name  "Cam"
-                     :schema/email "cam@example.org"
-                     :schema/age   34
-                     :ex/favNums   [5, 10]
-                     :ex/friend    [:ex/brian :ex/alice]}])
+          db     @(fluree/stage2
+                    (fluree/db ledger)
+                   {"@context" "https://ns.flur.ee"
+                    "insert"
+                    [{:id           :ex/brian,
+                      :type         :ex/User,
+                      :schema/name  "Brian"
+                      :schema/email "brian@example.org"
+                      :schema/age   50
+                      :ex/favNums   7}
+                     {:id           :ex/alice,
+                      :type         :ex/User,
+                      :schema/name  "Alice"
+                      :schema/email "alice@example.org"
+                      :schema/age   50
+                      :ex/favNums   [42, 76, 9]}
+                     {:id           :ex/cam,
+                      :type         :ex/User,
+                      :schema/name  "Cam"
+                      :schema/email "cam@example.org"
+                      :schema/age   34
+                      :ex/favNums   [5, 10]
+                      :ex/friend    [:ex/brian :ex/alice]}]})
 
           two-tuple-select-with-crawl
           @(fluree/query db '{:select [?age {?f [:*]}]
@@ -150,28 +152,24 @@
 
 
       ;; checking s, p, o values all pulled correctly and all IRIs are resolved from sid integer & compacted
-      (is (= @(fluree/query db
-                            '{:select [?s ?p ?o]
-                              :where  {:id         ?s
-                                       :schema/age 34
-                                       ?p          ?o}})
-             [[:ex/cam :id "http://example.org/ns/cam"]
-              [:ex/cam :type :ex/User]
-              [:ex/cam :schema/name "Cam"]
-              [:ex/cam :schema/email "cam@example.org"]
-              [:ex/cam :schema/age 34]
-              [:ex/cam :ex/favNums 5]
-              [:ex/cam :ex/favNums 10]
-              [:ex/cam :ex/friend :ex/brian]
-              [:ex/cam :ex/friend :ex/alice]])
+      (is (= #{[:ex/cam :id "http://example.org/ns/cam"]
+               [:ex/cam :type :ex/User]
+               [:ex/cam :schema/name "Cam"]
+               [:ex/cam :schema/email "cam@example.org"]
+               [:ex/cam :schema/age 34]
+               [:ex/cam :ex/favNums 5]
+               [:ex/cam :ex/favNums 10]
+               [:ex/cam :ex/friend :ex/brian]
+               [:ex/cam :ex/friend :ex/alice]}
+             (set @(fluree/query db
+                                 '{:select [?s ?p ?o]
+                                   :where  {:id         ?s
+                                            :schema/age 34
+                                            ?p          ?o}})))
           "IRIs are resolved from subj ids, whether s, p, or o vals.")
 
       ;; checking object-subject joins
-      (is (= @(fluree/query db
-                            '{:select {?s ["*" {:ex/friend ["*"]}]}
-                              :where  {:id        ?s
-                                       :ex/friend {:schema/name "Alice"}}})
-             [{:id :ex/cam,
+      (is (= [{:id :ex/cam,
                :type :ex/User,
                :schema/name "Cam",
                :schema/email "cam@example.org",
@@ -189,5 +187,9 @@
                  :schema/name "Alice",
                  :schema/email "alice@example.org",
                  :schema/age 50,
-                 :ex/favNums [9 42 76]}]}])
+                 :ex/favNums [9 42 76]}]}]
+             @(fluree/query db
+                            '{:select {?s ["*" {:ex/friend ["*"]}]}
+                              :where  {:id        ?s
+                                       :ex/friend {:schema/name "Alice"}}}))
           "Subjects appearing as objects should be referenceable."))))
