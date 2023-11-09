@@ -601,10 +601,16 @@
 
 (defn parse-pred-cmp
   [bnode-counter subj-cmp triples [pred values]]
-  (let [values*  (if (= pred :type)
-                   ;; homogenize @type values so they have the same structure as other predicates
-                   (map #(do {:id %}) values)
-                   values)
+  (let [values*  (cond (= pred :type)
+                       ;; homogenize @type values so they have the same structure as other predicates
+                       (map #(do {:id %}) values)
+
+                       (= pred const/iri-rdf-type)
+                       (throw (ex-info (str (pr-str const/iri-rdf-type) " is not a valid predicate IRI."
+                                            " Please use the JSON-LD \"@type\" keyword instead.")
+                                       {:status 400 :error :db/invalid-predicate}))
+                       :else
+                       values)
         pred-cmp (cond (v/variable? pred) (parse-variable pred)
                        ;; we want the actual iri here, not the keyword
                        (= pred :type)     (where/match-iri const/iri-type)
