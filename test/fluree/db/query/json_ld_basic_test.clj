@@ -124,12 +124,14 @@
     (let [conn   (test-utils/create-conn)
           movies (test-utils/load-movies conn)]
       (testing "define @list container in context"
-        (let [db        @(fluree/stage (fluree/db movies)
-                                       {:context {:id      "@id"
-                                                  :ex      "http://example.org/ns#"
-                                                  :ex/list {"@container" "@list"}}
-                                        :id      "list-test"
-                                        :ex/list [42 2 88 1]})
+        (let [db        @(fluree/stage2 (fluree/db movies)
+                                        {"@context" "https://ns.flur.ee"
+                                         "insert"
+                                         {:context {:id      "@id"
+                                                    :ex      "http://example.org/ns#"
+                                                    :ex/list {"@container" "@list"}}
+                                          :id      "list-test"
+                                          :ex/list [42 2 88 1]}})
               query-res @(fluree/query db '{:context   ["" {:ex "http://example.org/ns#"}]
                                             :selectOne {"list-test" [:*]}})]
           (is (= {:id      "list-test"
@@ -137,11 +139,13 @@
                  query-res)
               "Order of query result is different from transaction.")))
       (testing "define @list directly on subject"
-        (let [db        @(fluree/stage (fluree/db movies)
-                                       {:context {:id      "@id"
-                                                  :ex      "http://example.org/ns#"}
-                                        :id      "list-test2"
-                                        :ex/list {"@list" [42 2 88 1]}})
+        (let [db        @(fluree/stage2 (fluree/db movies)
+                                        {"@context" "https://ns.flur.ee"
+                                         "insert"
+                                         {:context {:id      "@id"
+                                                    :ex      "http://example.org/ns#"}
+                                          :id      "list-test2"
+                                          :ex/list {"@list" [42 2 88 1]}}})
               query-res @(fluree/query db '{:context   ["" {:ex "http://example.org/ns#"}],
                                             :selectOne {"list-test2" [:*]},})]
           (is (= {:id      "list-test2"
@@ -152,41 +156,43 @@
 (deftest ^:integration simple-subject-crawl-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/simple-subject-crawl" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-        db     @(fluree/stage
+        db     @(fluree/stage2
                   (fluree/db ledger)
-                  [{:id           :ex/brian,
-                    :type         :ex/User,
-                    :schema/name  "Brian"
-                    :ex/last      "Smith"
-                    :schema/email "brian@example.org"
-                    :schema/age   50
-                    :ex/favColor  "Green"
-                    :ex/favNums   7}
-                   {:id           :ex/alice,
-                    :type         :ex/User,
-                    :schema/name  "Alice"
-                    :ex/last      "Smith"
-                    :schema/email "alice@example.org"
-                    :ex/favColor  "Green"
-                    :schema/age   42
-                    :ex/favNums   [42, 76, 9]}
-                   {:id           :ex/cam,
-                    :type         :ex/User,
-                    :schema/name  "Cam"
-                    :ex/last      "Jones"
-                    :schema/email "cam@example.org"
-                    :schema/age   34
-                    :ex/favColor  "Blue"
-                    :ex/favNums   [5, 10]
-                    :ex/friend    [:ex/brian :ex/alice]}
-                   {:id           :ex/david,
-                    :type         :ex/User,
-                    :schema/name  "David"
-                    :ex/last      "Jones"
-                    :schema/email "david@example.org"
-                    :schema/age   46
-                    :ex/favNums   [15 70]
-                    :ex/friend    [:ex/cam]}])]
+                  {"@context" "https://ns.flur.ee"
+                   "insert"
+                   [{:id           :ex/brian,
+                     :type         :ex/User,
+                     :schema/name  "Brian"
+                     :ex/last      "Smith"
+                     :schema/email "brian@example.org"
+                     :schema/age   50
+                     :ex/favColor  "Green"
+                     :ex/favNums   7}
+                    {:id           :ex/alice,
+                     :type         :ex/User,
+                     :schema/name  "Alice"
+                     :ex/last      "Smith"
+                     :schema/email "alice@example.org"
+                     :ex/favColor  "Green"
+                     :schema/age   42
+                     :ex/favNums   [42, 76, 9]}
+                    {:id           :ex/cam,
+                     :type         :ex/User,
+                     :schema/name  "Cam"
+                     :ex/last      "Jones"
+                     :schema/email "cam@example.org"
+                     :schema/age   34
+                     :ex/favColor  "Blue"
+                     :ex/favNums   [5, 10]
+                     :ex/friend    [:ex/brian :ex/alice]}
+                    {:id           :ex/david,
+                     :type         :ex/User,
+                     :schema/name  "David"
+                     :ex/last      "Jones"
+                     :schema/email "david@example.org"
+                     :schema/age   46
+                     :ex/favNums   [15 70]
+                     :ex/friend    [:ex/cam]}]})]
     (testing "direct id"
       ;;TODO not getting reparsed as ssc
       (is (= [{:id           :ex/brian,
