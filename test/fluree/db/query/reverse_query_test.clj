@@ -12,15 +12,15 @@
                     (fluree/db ledger)
                     {"@context" "https://ns.flur.ee"
                      "insert"
-                     [{:id           :ex/brian,
-                       :type         :ex/User,
+                     [{:id           :ex/brian
+                       :type         :ex/User
                        :schema/name  "Brian"
                        :ex/friend    [:ex/alice]}
-                      {:id           :ex/alice,
-                       :type         :ex/User,
+                      {:id           :ex/alice
+                       :type         :ex/User
                        :schema/name  "Alice"}
-                      {:id           :ex/cam,
-                       :type         :ex/User,
+                      {:id           :ex/cam
+                       :type         :ex/User
                        :schema/name  "Cam"
                        :ex/friend    [:ex/brian :ex/alice]}]})]
 
@@ -29,16 +29,19 @@
              {:schema/name "Brian"
               :friended    :ex/cam}))
 
-      (is (= @(fluree/query db '{:context   ["" {:friended {:reverse :ex/friend}}],
+      (is (= @(fluree/query db '{:context   ["" {:friended {:reverse :ex/friend}}]
                                  :selectOne {:ex/alice [:schema/name :friended]}})
              {:schema/name "Alice"
               :friended    [:ex/cam :ex/brian]}))
 
 
-      (is (= @(fluree/query db '{:context   ["" {:friended {:reverse :ex/friend}}],
+      (is (= {:schema/name "Brian"
+              :friended    {:id          :ex/cam
+                            :type        :ex/User
+                            :schema/name "Cam"
+                            :ex/friend   #{{:id :ex/brian} {:id :ex/alice}}}}
+             (-> db
+                 (fluree/query '{:context   ["" {:friended {:reverse :ex/friend}}]
                                  :selectOne {:ex/brian [:schema/name {:friended [:*]}]}})
-             {:schema/name "Brian",
-              :friended    {:id           :ex/cam,
-                            :type     :ex/User,
-                            :schema/name  "Cam",
-                            :ex/friend    [{:id :ex/brian} {:id :ex/alice}]}})))))
+                 deref
+                 (update-in [:friended :ex/friend] set)))))))
