@@ -595,10 +595,14 @@
              subj-mods      {}]
         (if s-flakes
           (let [sid            (flake/s (first s-flakes))
-                new-subject?   (first (filterv #(= const/$xsd:anyURI (flake/p %)) s-flakes))
-                new-classes    (->> s-flakes
-                                    (filterv #(= const/$rdf:type (flake/p %)))
-                                    (mapv flake/o))
+                new-subject?   (->> s-flakes
+                                    (filter #(= const/$xsd:anyURI (flake/p %)))
+                                    first)
+                new-classes    (into #{}
+                                     (comp
+                                       (filter #(= const/$rdf:type (flake/p %)))
+                                       (map flake/o))
+                                     s-flakes)
                 classes        (if new-subject?
                                  new-classes
                                  (into new-classes
