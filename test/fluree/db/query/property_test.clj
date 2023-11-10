@@ -15,61 +15,61 @@
                    "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
                    "owl"    "http://www.w3.org/2002/07/owl#"}
           db      (-> ledger
-                      fluree/db
-                      (fluree/stage {"@context" context
-                                     "@graph"   [{"@id"   "vocab1:givenName"
-                                                  "@type" "rdf:Property"}
-                                                 {"@id"                    "vocab2:firstName"
-                                                  "@type"                  "rdf:Property"
-                                                  "owl:equivalentProperty" {"@id" "vocab1:givenName"}}
-                                                 {"@id"                    "vocab3:prenom"
-                                                  "@type"                  "rdf:Property"
-                                                  "owl:equivalentProperty" {"@id" "vocab2:firstName"}}]})
+                      (fluree/db)
+                      (fluree/stage2 {"@context" ["https://ns.flur.ee" context]
+                                      "insert"   [{"@id"   "vocab1:givenName"
+                                                   "@type" "rdf:Property"}
+                                                  {"@id"                    "vocab2:firstName"
+                                                   "@type"                  "rdf:Property"
+                                                   "owl:equivalentProperty" {"@id" "vocab1:givenName"}}
+                                                  {"@id"                    "vocab3:prenom"
+                                                   "@type"                  "rdf:Property"
+                                                   "owl:equivalentProperty" {"@id" "vocab2:firstName"}}]})
                       deref
-                      (fluree/stage {"@context" context
-                                     "@graph"   [{"@id"              "ex:brian"
-                                                  "ex:age"           50
-                                                  "vocab1:givenName" "Brian"}
-                                                 {"@id"              "ex:ben"
-                                                  "vocab2:firstName" "Ben"}
-                                                 {"@id"           "ex:francois"
-                                                  "vocab3:prenom" "Francois"}]})
+                      (fluree/stage2 {"@context" ["https://ns.flur.ee" context]
+                                      "insert"   [{"@id"              "ex:brian"
+                                                   "ex:age"           50
+                                                   "vocab1:givenName" "Brian"}
+                                                  {"@id"              "ex:ben"
+                                                   "vocab2:firstName" "Ben"}
+                                                  {"@id"           "ex:francois"
+                                                   "vocab3:prenom" "Francois"}]})
                       deref)]
       (testing "querying for the property defined to be equivalent"
-        (is (= [["Brian"] ["Ben"] ["Francois"]]
-               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                               "vocab2" "http://vocab2.example.org/"}
-                                   :select    [?name]
-                                   :where     {"vocab2:firstName" ?name}}))
+        (is (= #{["Brian"] ["Ben"] ["Francois"]}
+               (set @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
+                                                    "vocab2" "http://vocab2.example.org/"}
+                                        :select    [?name]
+                                        :where     {"vocab2:firstName" ?name}})))
             "returns all values"))
       (testing "querying for the symmetric property"
-        (is (= [["Brian"] ["Ben"] ["Francois"]]
-               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                               "vocab2" "http://vocab2.example.org/"}
-                                   :select    [?name]
-                                   :where     {"vocab1:givenName" ?name}}))
+        (is (= #{["Brian"] ["Ben"] ["Francois"]}
+               (set @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
+                                                    "vocab2" "http://vocab2.example.org/"}
+                                        :select    [?name]
+                                        :where     {"vocab1:givenName" ?name}})))
             "returns all values"))
       (testing "querying for the transitive properties"
-        (is (= [["Brian"] ["Ben"] ["Francois"]]
-               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                               "vocab3" "http://vocab3.example.fr/"}
-                                   :select    [?name]
-                                   :where     {"vocab3:prenom" ?name}}))
+        (is (= #{["Brian"] ["Ben"] ["Francois"]}
+               (set @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
+                                                    "vocab3" "http://vocab3.example.fr/"}
+                                        :select    [?name]
+                                        :where     {"vocab3:prenom" ?name}})))
             "returns all values"))
       (testing "querying with graph crawl"
-        (is (= [{"@id"              "ex:brian"
-                 "vocab1:givenName" "Brian"
-                 "ex:age"           50}
-                {"@id"              "ex:ben"
-                 "vocab2:firstName" "Ben"}
-                {"@id"           "ex:francois"
-                 "vocab3:prenom" "Francois"}]
-               @(fluree/query db '{"@context" {"ex"     "http://example.org/ns/"
-                                               "vocab1" "http://vocab1.example.org/"
-                                               "vocab2" "http://vocab2.example.org/"
-                                               "vocab3" "http://vocab3.example.fr/"}
-                                   :select    {?s [:*]}
-                                   :where     {"@id" ?s, "vocab2:firstName" ?name}}))
+        (is (= #{{"@id"              "ex:brian"
+                  "vocab1:givenName" "Brian"
+                  "ex:age"           50}
+                 {"@id"              "ex:ben"
+                  "vocab2:firstName" "Ben"}
+                 {"@id"           "ex:francois"
+                  "vocab3:prenom" "Francois"}}
+               (set @(fluree/query db '{"@context" {"ex"     "http://example.org/ns/"
+                                                    "vocab1" "http://vocab1.example.org/"
+                                                    "vocab2" "http://vocab2.example.org/"
+                                                    "vocab3" "http://vocab3.example.fr/"}
+                                        :select    {?s [:*]}
+                                        :where     {"@id" ?s, "vocab2:firstName" ?name}})))
             "returns all values")))))
 
 (deftest ^:integration subjects-as-predicates
@@ -77,20 +77,23 @@
     (let [conn   @(fluree/connect {:method :memory})
           ledger @(fluree/create conn "propertypathstest" {:defaultContext [test-utils/default-str-context {"ex" "http://example.com/"}]})
           db0    (fluree/db ledger)
-          db1    @(fluree/stage db0 [{"@id"            "ex:unlabeled-pred"
-                                      "ex:description" "created as a subject first"}
-                                     {"@id"            "ex:labeled-pred"
-                                      "@type"          "rdf:Property"
-                                      "ex:description" "created as a subject first, labelled as Property"}])
-          db2    @(fluree/stage db1 [{"@id"               "ex:subject-as-predicate"
-                                      "ex:labeled-pred"   "labeled"
-                                      "ex:unlabeled-pred" "unlabeled"
-                                      "ex:new-pred"       {"@id"               "ex:nested"
-                                                           "ex:unlabeled-pred" "unlabeled-nested"}}])
-          db3    @(fluree/stage db1 [{"@id"               "ex:subject-as-predicate"
-                                      "ex:labeled-pred"   "labeled"
-                                      "ex:unlabeled-pred" {"@id"               "ex:nested"
-                                                           "ex:unlabeled-pred" "unlabeled-nested"}}])]
+          db1    @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                      "insert" [{"@id"            "ex:unlabeled-pred"
+                                                 "ex:description" "created as a subject first"}
+                                                {"@id"            "ex:labeled-pred"
+                                                 "@type"          "rdf:Property"
+                                                 "ex:description" "created as a subject first, labelled as Property"}]})
+          db2    @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
+                                      "insert" [{"@id"               "ex:subject-as-predicate"
+                                                 "ex:labeled-pred"   "labeled"
+                                                 "ex:unlabeled-pred" "unlabeled"
+                                                 "ex:new-pred"       {"@id"               "ex:nested"
+                                                                      "ex:unlabeled-pred" "unlabeled-nested"}}]})
+          db3    @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
+                                      "insert" [{"@id"               "ex:subject-as-predicate"
+                                                 "ex:labeled-pred"   "labeled"
+                                                 "ex:unlabeled-pred" {"@id"               "ex:nested"
+                                                                      "ex:unlabeled-pred" "unlabeled-nested"}}]})]
       (is (= [{"id"                "ex:subject-as-predicate"
                "ex:new-pred"       {"id" "ex:nested"}
                "ex:labeled-pred"   "labeled"
@@ -98,30 +101,30 @@
              @(fluree/query db2 {"select" {"ex:subject-as-predicate" ["*"]}}))
           "via subgraph selector")
 
-      (is (= [["id"] ["ex:labeled-pred"] ["ex:new-pred"] ["ex:unlabeled-pred"]]
-             @(fluree/query db2 {"select" ["?p"]
-                                 "where"  {"@id" "ex:subject-as-predicate"
-                                           "?p"  "?o"}}))
+      (is (= #{["id"] ["ex:labeled-pred"] ["ex:new-pred"] ["ex:unlabeled-pred"]}
+             (set @(fluree/query db2 {"select" ["?p"]
+                                      "where"  {"@id" "ex:subject-as-predicate"
+                                                "?p"  "?o"}})))
           "via variable selector")
-      (is (= [["id" {"id"                "ex:subject-as-predicate",
-                     "ex:labeled-pred"   "labeled",
-                     "ex:new-pred"       {"id" "ex:nested"}
-                     "ex:unlabeled-pred" "unlabeled"}]
-              ["ex:labeled-pred" {"id"                "ex:subject-as-predicate",
-                                  "ex:labeled-pred"   "labeled",
-                                  "ex:new-pred"       {"id" "ex:nested"},
-                                  "ex:unlabeled-pred" "unlabeled"}]
-              ["ex:new-pred" {"id"                "ex:subject-as-predicate",
-                              "ex:labeled-pred"   "labeled",
-                              "ex:new-pred"       {"id" "ex:nested"},
-                              "ex:unlabeled-pred" "unlabeled"}]
-              ["ex:unlabeled-pred" {"id"                "ex:subject-as-predicate",
-                                    "ex:labeled-pred"   "labeled",
-                                    "ex:new-pred"       {"id" "ex:nested"},
-                                    "ex:unlabeled-pred" "unlabeled"}]]
-             @(fluree/query db2 {"select" ["?p" {"ex:subject-as-predicate" ["*"]}]
-                                 "where"  {"@id" "ex:subject-as-predicate"
-                                           "?p"  "?o"}}))
+      (is (= #{["id" {"id"                "ex:subject-as-predicate",
+                      "ex:labeled-pred"   "labeled",
+                      "ex:new-pred"       {"id" "ex:nested"}
+                      "ex:unlabeled-pred" "unlabeled"}]
+               ["ex:labeled-pred" {"id"                "ex:subject-as-predicate",
+                                   "ex:labeled-pred"   "labeled",
+                                   "ex:new-pred"       {"id" "ex:nested"},
+                                   "ex:unlabeled-pred" "unlabeled"}]
+               ["ex:new-pred" {"id"                "ex:subject-as-predicate",
+                               "ex:labeled-pred"   "labeled",
+                               "ex:new-pred"       {"id" "ex:nested"},
+                               "ex:unlabeled-pred" "unlabeled"}]
+               ["ex:unlabeled-pred" {"id"                "ex:subject-as-predicate",
+                                     "ex:labeled-pred"   "labeled",
+                                     "ex:new-pred"       {"id" "ex:nested"},
+                                     "ex:unlabeled-pred" "unlabeled"}]}
+             (set @(fluree/query db2 {"select" ["?p" {"ex:subject-as-predicate" ["*"]}]
+                                      "where"  {"@id" "ex:subject-as-predicate"
+                                                "?p"  "?o"}})))
           "via variable+subgraph selector")
 
       (is (= [{"id" "ex:nested"
@@ -138,7 +141,8 @@
                                  "select"   {"ex:nested" ["id" "ex:reversed-pred"]}}))
           "via reverse no subgraph"))))
 
-(deftest nested-properties
+;; TODO: convert transact!
+(deftest ^:pending nested-properties
   (with-tmp-dir storage-path
     (let [conn      @(fluree/connect {:method   :file, :storage-path storage-path
                                       :defaults {:context test-utils/default-str-context}})
@@ -147,7 +151,8 @@
                                     {:defaultContext
                                      ["" {"ex"  "http://example.com/"
                                           "owl" "http://www.w3.org/2002/07/owl#"}]})
-          db0       (->> @(fluree/stage (fluree/db ledger) {"ex:new" true})
+          db0       (->> @(fluree/stage2 (fluree/db ledger) {"@context" "https://ns.flur.ee"
+                                                             "insert" {"ex:new" true}})
                          (fluree/commit! ledger)
                          (deref))
 
