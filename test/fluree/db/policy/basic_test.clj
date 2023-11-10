@@ -14,56 +14,60 @@
           ledger    @(fluree/create conn "policy/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
-          db        @(fluree/stage
+          db        @(fluree/stage2
                        (fluree/db ledger)
-                       [{:id               :ex/alice,
-                         :type             :ex/User,
-                         :schema/name      "Alice"
-                         :schema/email     "alice@flur.ee"
-                         :schema/birthDate "2022-08-17"
-                         :schema/ssn       "111-11-1111"
-                         :ex/location      {:ex/state   "NC"
-                                            :ex/country "USA"}}
-                        {:id               :ex/john,
-                         :type             :ex/User,
-                         :schema/name      "John"
-                         :schema/email     "john@flur.ee"
-                         :schema/birthDate "2021-08-17"
-                         :schema/ssn       "888-88-8888"}
-                        {:id                   :ex/widget,
-                         :type                 :ex/Product,
-                         :schema/name          "Widget"
-                         :schema/price         99.99
-                         :schema/priceCurrency "USD"}
-                        ;; assign root-did to :ex/rootRole
-                        {:id     root-did
-                         :f/role :ex/rootRole}
-                        ;; assign alice-did to :ex/userRole and also link the did to :ex/alice via :ex/user
-                        {:id      alice-did
-                         :ex/user :ex/alice
-                         :f/role  :ex/userRole}])
+                       {"@context" "https://ns.flur.ee"
+                        "insert"
+                        [{:id               :ex/alice,
+                          :type             :ex/User,
+                          :schema/name      "Alice"
+                          :schema/email     "alice@flur.ee"
+                          :schema/birthDate "2022-08-17"
+                          :schema/ssn       "111-11-1111"
+                          :ex/location      {:ex/state   "NC"
+                                             :ex/country "USA"}}
+                         {:id               :ex/john,
+                          :type             :ex/User,
+                          :schema/name      "John"
+                          :schema/email     "john@flur.ee"
+                          :schema/birthDate "2021-08-17"
+                          :schema/ssn       "888-88-8888"}
+                         {:id                   :ex/widget,
+                          :type                 :ex/Product,
+                          :schema/name          "Widget"
+                          :schema/price         99.99
+                          :schema/priceCurrency "USD"}
+                         ;; assign root-did to :ex/rootRole
+                         {:id     root-did
+                          :f/role :ex/rootRole}
+                         ;; assign alice-did to :ex/userRole and also link the did to :ex/alice via :ex/user
+                         {:id      alice-did
+                          :ex/user :ex/alice
+                          :f/role  :ex/userRole}]})
 
-          db+policy @(fluree/stage
+          db+policy @(fluree/stage2
                        db
                        ;; add policy targeting :ex/rootRole that can view and modify everything
-                       [{:id           :ex/rootPolicy,
-                         :type         [:f/Policy], ;; must be of type :f/Policy, else it won't be treated as a policy
-                         :f/targetNode :f/allNodes ;; :f/allNodes special keyword meaning every node (everything)
-                         :f/allow      [{:id           :ex/rootAccessAllow
-                                         :f/targetRole :ex/rootRole ;; our name for global / root role
-                                         :f/action     [:f/view :f/modify]}]}
-                        ;; add a policy targeting :ex/userRole that can see all users, but only SSN if belonging to themselves
-                        {:id            :ex/UserPolicy,
-                         :type          [:f/Policy],
-                         :f/targetClass :ex/User
-                         :f/allow       [{:id           :ex/globalViewAllow
-                                          :f/targetRole :ex/userRole ;; our assigned name for standard user's role (given to Alice above)
-                                          :f/action     [:f/view]}]
-                         :f/property    [{:f/path  :schema/ssn
-                                          :f/allow [{:id           :ex/ssnViewRule
-                                                     :f/targetRole :ex/userRole
-                                                     :f/action     [:f/view]
-                                                     :f/equals     {:list [:f/$identity :ex/user]}}]}]}])]
+                       {"@context" "https://ns.flur.ee"
+                        "insert"
+                        [{:id           :ex/rootPolicy,
+                          :type         [:f/Policy], ;; must be of type :f/Policy, else it won't be treated as a policy
+                          :f/targetNode :f/allNodes ;; :f/allNodes special keyword meaning every node (everything)
+                          :f/allow      [{:id           :ex/rootAccessAllow
+                                          :f/targetRole :ex/rootRole ;; our name for global / root role
+                                          :f/action     [:f/view :f/modify]}]}
+                         ;; add a policy targeting :ex/userRole that can see all users, but only SSN if belonging to themselves
+                         {:id            :ex/UserPolicy,
+                          :type          [:f/Policy],
+                          :f/targetClass :ex/User
+                          :f/allow       [{:id           :ex/globalViewAllow
+                                           :f/targetRole :ex/userRole ;; our assigned name for standard user's role (given to Alice above)
+                                           :f/action     [:f/view]}]
+                          :f/property    [{:f/path  :schema/ssn
+                                           :f/allow [{:id           :ex/ssnViewRule
+                                                      :f/targetRole :ex/userRole
+                                                      :f/action     [:f/view]
+                                                      :f/equals     {:list [:f/$identity :ex/user]}}]}]}]})]
       (let [root-wrapped-db            @(fluree/wrap-policy
                                           db+policy {:did  root-did
                                                      :role :ex/rootRole})
@@ -235,8 +239,11 @@
                             :schema/ssn       "888-88-8888",
                             :id               :ex/john})
                 "Root can see John's ssn in commit details."))
-          (let [_ @(test-utils/transact ledger {:id          :ex/john
-                                                :schema/name "Jack"})]
+          (let [_ @(test-utils/transact ledger {"@context" "https://ns.flur.ee"
+                                                "delete" {:id :ex/john
+                                                          :schema/name "John"}
+                                                "insert" {:id          :ex/john
+                                                          :schema/name "Jack"}})]
             (is (= [{:f/t       1,
                      :f/assert  [{:schema/name "John", :id :ex/john}],
                      :f/retract []}
@@ -261,45 +268,49 @@
                                         :schema "http://schema.org/"
                                         :ex     "http://example.org/ns/"}})
           alice-did   "did:fluree:Tf6i5oh2ssYNRpxxUM2zea1Yo7x4uRqyTeU"
-          db          @(fluree/stage
+          db          @(fluree/stage2
                          (fluree/db ledger)
-                         [{:id          :ex/alice,
-                           :type        :ex/User,
-                           :schema/name "Alice"
-                           :ex/secret   "alice's secret"}
-                          {:id          :ex/bob,
-                           :type        :ex/User,
-                           :schema/name "Bob"
-                           :ex/secret   "bob's secret"}
-                          {:id                   :ex/widget,
-                           :type                 :ex/Product,
-                           :schema/name          "Widget"
-                           :schema/price         99.99
-                           :schema/priceCurrency "USD"
-                           :ex/secret            "this is overpriced"}])
-          db          @(fluree/stage
+                         {"@context" "https://ns.flur.ee"
+                          "insert"
+                          [{:id          :ex/alice,
+                            :type        :ex/User,
+                            :schema/name "Alice"
+                            :ex/secret   "alice's secret"}
+                           {:id          :ex/bob,
+                            :type        :ex/User,
+                            :schema/name "Bob"
+                            :ex/secret   "bob's secret"}
+                           {:id                   :ex/widget,
+                            :type                 :ex/Product,
+                            :schema/name          "Widget"
+                            :schema/price         99.99
+                            :schema/priceCurrency "USD"
+                            :ex/secret            "this is overpriced"}]})
+          db          @(fluree/stage2
                          db
-                         [{:id                              alice-did
-                           :ex/user                         :ex/alice
-                           "https://ns.flur.ee/ledger#role" :ex/userRole}
-                          {:id                                     :ex/UserPolicy
-                           :type
-                           ["https://ns.flur.ee/ledger#Policy"]
-                           "https://ns.flur.ee/ledger#targetClass" :ex/User
-                           "https://ns.flur.ee/ledger#allow"
-                           [{:id                                    :ex/globalViewAllow
-                             "https://ns.flur.ee/ledger#targetRole" :ex/userRole
-                             "https://ns.flur.ee/ledger#action"
-                             [{:id "https://ns.flur.ee/ledger#view"}]}]
-                           "https://ns.flur.ee/ledger#property"
-                           [{"https://ns.flur.ee/ledger#path" :ex/secret
-                             "https://ns.flur.ee/ledger#allow"
-                             [{:id                                    :ex/ssnViewRule
-                               "https://ns.flur.ee/ledger#targetRole" :ex/userRole
-                               "https://ns.flur.ee/ledger#action"
-                               [{:id "https://ns.flur.ee/ledger#view"}]
-                               "https://ns.flur.ee/ledger#equals"
-                               {:list [{:id "https://ns.flur.ee/ledger#$identity"} :ex/user]}}]}]}])]
+                         {"@context" "https://ns.flur.ee"
+                          "insert"
+                          [{:id                              alice-did
+                            :ex/user                         :ex/alice
+                            "https://ns.flur.ee/ledger#role" :ex/userRole}
+                           {:id                                     :ex/UserPolicy
+                            :type
+                            ["https://ns.flur.ee/ledger#Policy"]
+                            "https://ns.flur.ee/ledger#targetClass" :ex/User
+                            "https://ns.flur.ee/ledger#allow"
+                            [{:id                                    :ex/globalViewAllow
+                              "https://ns.flur.ee/ledger#targetRole" :ex/userRole
+                              "https://ns.flur.ee/ledger#action"
+                              [{:id "https://ns.flur.ee/ledger#view"}]}]
+                            "https://ns.flur.ee/ledger#property"
+                            [{"https://ns.flur.ee/ledger#path" :ex/secret
+                              "https://ns.flur.ee/ledger#allow"
+                              [{:id                                    :ex/ssnViewRule
+                                "https://ns.flur.ee/ledger#targetRole" :ex/userRole
+                                "https://ns.flur.ee/ledger#action"
+                                [{:id "https://ns.flur.ee/ledger#view"}]
+                                "https://ns.flur.ee/ledger#equals"
+                                {:list [{:id "https://ns.flur.ee/ledger#$identity"} :ex/user]}}]}]}]})]
       (is (= [{:id :ex/bob, :type :ex/User, :schema/name "Bob"}
               {:id          :ex/alice, :type :ex/User, :ex/secret "alice's secret"
                :schema/name "Alice"}]
