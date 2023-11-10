@@ -26,10 +26,10 @@
                      :schema/age   30}])
           db1    @(fluree/commit! ledger db0)]
       (testing "stable commit id"
-        (is (= "fluree:commit:sha256:bkbx42yw5xqjhj6qbilvms4gj4bksowxl3k2rwvtlzwfnlhjcjuz"
+        (is (= "fluree:commit:sha256:bn7xmmt2hnsjxe7za3e663zhbdv2udnczetgspjpmvuusgtveioe"
                (get-in db1 [:commit :id]))))
       (testing "stable commit address"
-        (is (= "fluree:memory://2f36f5af396fa586ccf126d81e5c0700639f264662e9409f750a9e2806b8373f"
+        (is (= "fluree:memory://0af069b101e5edadf788674a0733572404bdddcb37c994bc3624c9b11d7958e6"
                (get-in db1 [:commit :address]))))
       (testing "stable default context id"
         (is (= "fluree:context:68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"
@@ -38,8 +38,8 @@
         (is (= "fluree:memory://68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"
                (get-in db1 [:commit :defaultContext :address]))))
       (testing "stable db id"
-        (is (= "fluree:db:sha256:bbeducmbtm7ducvewuufjhl26p2a7v2mb5dasv5ykwdti2uamegm4"
+        (is (= "fluree:db:sha256:bbi3wkfjrhyuwffoyj2uuds5dxpl5akmtqtsv33tn52lifgxp64le"
                (get-in db1 [:commit :data :id]))))
       (testing "stable db address"
-        (is (= "fluree:memory://2a0a2bcf83cd202649b3f3418116ccffe7857f03b8d3c5432e49907b667d06c0"
+        (is (= "fluree:memory://b0e96920a7245f795fd287eebd47ca03302f23025737a136dc98009d11a16d69"
                (get-in db1 [:commit :data :address])))))))
