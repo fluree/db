@@ -167,12 +167,14 @@
                             :schema/name "John"}})
           ; no :schema/name
           db-extra-prop (try
-                          @(fluree/stage
-                            db
-                            {:id           :ex/john
-                             :type         :ex/User
-                             :schema/name  "John"
-                             :schema/email "john@flur.ee"})
+                          @(fluree/stage2
+                             db
+                            {"@context" "https://ns.flur.ee"
+                             "insert"
+                             {:id           :ex/john
+                              :type         :ex/User
+                              :schema/name  "John"
+                              :schema/email "john@flur.ee"}})
                           (catch Exception e e))]
       (is (util/exception? db-extra-prop))
       (is (str/starts-with? (ex-message db-extra-prop)
