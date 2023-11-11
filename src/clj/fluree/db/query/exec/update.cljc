@@ -3,12 +3,12 @@
             [fluree.db.fuel :as fuel]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log]
             [clojure.core.async :as async :refer [<! >! go]]
-            [clojure.string :as str]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.datatype :as datatype]))
 
@@ -179,17 +179,6 @@
                           solution-ch)
     retract-ch))
 
-(defn blank-node?
-  "Is the iri a fluree-generated temporary blank-node?"
-  [iri]
-  (when iri
-    (str/starts-with? iri "_:fdb")))
-
-(defn blank-node-id
-  "A stable blank-node."
-  [sid]
-  (str "_:f" sid))
-
 (defn create-id-flake
   [sid iri t]
   (flake/create sid const/$xsd:anyURI iri const/$xsd:string t true nil))
@@ -204,11 +193,8 @@
             s-iri          (where/get-iri s-mch)
             existing-sid   (or (where/get-sid s-mch db-alias)
                                (<? (dbproto/-subid db s-iri {:expand? false})))
-            [sid s-iri*]   (if (blank-node? s-iri)
-                             (let [blank-node-sid (next-sid s-iri)]
-                               [blank-node-sid (blank-node-id blank-node-sid)])
-                             [(or existing-sid (get jld-ledger/predefined-properties s-iri) (next-sid s-iri)) s-iri])
-            new-subj-flake (when-not existing-sid (create-id-flake sid s-iri* t))
+            sid            (or existing-sid (get jld-ledger/predefined-properties s-iri) (next-sid s-iri))
+            new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
 
             p-iri          (where/get-iri p-mch)
             existing-pid   (or (where/get-sid p-mch db-alias) (<? (dbproto/-subid db p-iri {:expand? false})))
@@ -234,11 +220,8 @@
             ref-sid          (when ref? (or existing-ref-sid
                                             (get jld-ledger/predefined-properties ref-iri)
                                             (next-sid ref-iri)))
-            ref-iri*         (when ref? (if (blank-node? ref-iri)
-                                          (blank-node-id ref-sid)
-                                          ref-iri))
             new-ref-flake    (when (and ref? (not existing-ref-sid))
-                               (create-id-flake ref-sid ref-iri* t))
+                               (create-id-flake ref-sid ref-iri t))
 
             ;; o needs to be a sid if it's a ref, otherwise the literal o
             o*        (if ref?
