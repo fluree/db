@@ -20,17 +20,26 @@
   [serialized-meta]
   (util/keywordize-keys serialized-meta))
 
+(defn subject-reference?
+  [dt]
+  (= const/$xsd:anyURI dt))
+
 (defn deserialize-object
   [serialized-obj dt]
-  (datatype/coerce serialized-obj dt))
+  (if (subject-reference? dt)
+    (deserialize-subject serialized-obj)
+    (datatype/coerce serialized-obj dt)))
 
 (defn deserialize-flake
   [flake-vec]
-  (let [dt (get flake-vec flake/dt-pos)]
-    (-> flake-vec
-        (update flake/obj-pos deserialize-object dt)
-        (update flake/m-pos deserialize-meta)
-        (flake/parts->Flake))))
+  (let [s  (-> flake-vec (get flake/subj-pos) deserialize-subject)
+        p  (-> flake-vec (get flake/pred-pos) deserialize-subject)
+        dt (get flake-vec flake/dt-pos)
+        o  (-> flake-vec (get flake/obj-pos) (deserialize-object dt))
+        t  (get flake-vec flake/t-pos)
+        op (get flake-vec flake/op-pos)
+        m  (-> flake-vec (get flake/m-pos) (deserialize-meta))]
+    (flake/create s p o dt t op m)))
 
 (defn- deserialize-child-node
   "Turns :first and :rhs into flakes"
@@ -75,7 +84,7 @@
   [leaf]
   (assoc leaf :flakes (mapv deserialize-flake (:flakes leaf))))
 
-(defn serialize-subject
+(defn serialize-sid
   [sid]
   (let [ns-code (iri/get-ns-code sid)
         nme     (iri/get-name sid)]
@@ -90,19 +99,32 @@
 #?(:clj (def ^DateTimeFormatter xsdDateFormatter
           (DateTimeFormatter/ofPattern "uuuu-MM-dd[XXXXX]")))
 
+(defn serialize-subject
+  [sid]
+  (serialize-sid sid))
+
+(defn serialize-predicate
+  [pid]
+  (serialize-sid pid))
+
 (defn serialize-object
   "Flakes with time types will have time objects as values.
   We need to serialize these into strings that will be successfully re-coerced into
   the same objects upon loading."
   [val dt]
   (uc/case (int dt)
-    const/$xsd:dateTime #?(:clj (.format xsdDateTimeFormatter val)
-                           :cljs (.toJSON val))
+    const/$xsd:anyURI    (serialize-subject val)
+    const/$xsd:dateTime  #?(:clj (.format xsdDateTimeFormatter val)
+                            :cljs (.toJSON val))
     const/$xsd:date      #?(:clj (.format xsdDateFormatter val)
                             :cljs (.toJSON val))
-    const/$xsd:time #?(:clj (.format xsdTimeFormatter val)
-                       :cljs (.toJSON val))
+    const/$xsd:time      #?(:clj (.format xsdTimeFormatter val)
+                            :cljs (.toJSON val))
     val))
+
+(defn serialize-datatype
+  [dt]
+  (serialize-sid dt))
 
 (defn serialize-meta
   [m]
@@ -115,9 +137,15 @@
 
   Flakes with an 'm' value need keys converted from keyword keys into strings."
   [flake]
-  (-> (vec flake)
-      (update flake/obj-pos serialize-object (flake/dt flake))
-      (update flake/m-pos serialize-meta)))
+  (let [s   (-> flake flake/s serialize-subject)
+        p   (-> flake flake/p serialize-predicate)
+        dt* (flake/dt flake)
+        dt  (serialize-datatype dt*)
+        o   (-> flake flake/o (serialize-object dt))
+        t   (flake/t flake)
+        op  (flake/op flake)
+        m   (-> flake flake/m serialize-meta)]
+    [s p o dt t op m]))
 
 (defn- deserialize-garbage
   [garbage-data]
