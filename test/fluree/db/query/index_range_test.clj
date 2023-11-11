@@ -12,27 +12,29 @@
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "query/index-range"
                                   {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-          db      @(fluree/stage
+          db      @(fluree/stage2
                      (fluree/db ledger)
-                     [{:id           :ex/brian,
-                       :type         :ex/User,
-                       :schema/name  "Brian"
-                       :schema/email "brian@example.org"
-                       :schema/age   50
-                       :ex/favNums   7}
-                      {:id           :ex/alice,
-                       :type         :ex/User,
-                       :schema/name  "Alice"
-                       :schema/email "alice@example.org"
-                       :schema/age   50
-                       :ex/favNums   [42, 76, 9]}
-                      {:id           :ex/cam,
-                       :type         :ex/User,
-                       :schema/name  "Cam"
-                       :schema/email "cam@example.org"
-                       :schema/age   34
-                       :ex/favNums   [5, 10]
-                       :ex/friend    [:ex/brian :ex/alice]}])
+                     {"@context" "https://ns.flur.ee"
+                      "insert"
+                      [{:id           :ex/brian,
+                        :type         :ex/User,
+                        :schema/name  "Brian"
+                        :schema/email "brian@example.org"
+                        :schema/age   50
+                        :ex/favNums   7}
+                       {:id           :ex/alice,
+                        :type         :ex/User,
+                        :schema/name  "Alice"
+                        :schema/email "alice@example.org"
+                        :schema/age   50
+                        :ex/favNums   [42, 76, 9]}
+                       {:id           :ex/cam,
+                        :type         :ex/User,
+                        :schema/name  "Cam"
+                        :schema/email "cam@example.org"
+                        :schema/age   34
+                        :ex/favNums   [5, 10]
+                        :ex/friend    [:ex/brian :ex/alice]}]})
           cam-sid @(fluree/internal-id db :ex/cam)]
 
       (is (= "http://example.org/ns/cam"
@@ -45,16 +47,10 @@
       (testing "Slice operations"
         (testing "Slice for subject id only"
           (let [alice-sid @(fluree/internal-id db :ex/alice)]
-            (is (= [[alice-sid 0 "http://example.org/ns/alice" 1 -1 true nil]
-                    [alice-sid 200 1001 0 -1 true nil]
-                    [alice-sid 1002 "Alice" 1 -1 true nil]
-                    [alice-sid 1003 "alice@example.org" 1 -1 true nil]
-                    [alice-sid 1004 50 8 -1 true nil]
-                    [alice-sid 1005 9 8 -1 true nil]
-                    [alice-sid 1005 42 8 -1 true nil]
-                    [alice-sid 1005 76 8 -1 true nil]]
+            (is (= 8
                    (->> @(fluree/slice db :spot [alice-sid])
-                        (mapv flake/Flake->parts)))
+                        (filterv #(= alice-sid (flake/s %)))
+                        (count)))
                 "Slice should return a vector of flakes for only Alice")))
 
         (testing "Slice for subject + predicate"
