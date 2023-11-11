@@ -813,22 +813,22 @@
                   :where  {:id          "?person"
                            :type        :ex/User
                            :schema/name "?name"}}
-        expected [[:ex/liam "Liam"]
-                  [:ex/cam "Cam"]
-                  [:ex/alice "Alice"]
-                  [:ex/brian "Brian"]]]
+        expected #{[:ex/liam "Liam"]
+                   [:ex/cam "Cam"]
+                   [:ex/alice "Alice"]
+                   [:ex/brian "Brian"]}]
     (testing "basic query works"
       #?(:clj
          (let [conn    (test-utils/create-conn)
                ledger  (test-utils/load-people conn)
-               results @(fluree/query (fluree/db ledger) query)]
+               results (set @(fluree/query (fluree/db ledger) query))]
            (is (= expected results)))
          :cljs
          (async done
            (go
              (let [conn    (<! (test-utils/create-conn))
                    ledger  (<! (test-utils/load-people conn))
-                   results (<p! (fluree/query (fluree/db ledger) query))]
+                   results (set (<p! (fluree/query (fluree/db ledger) query)))]
                (is (= expected results))
                (done))))))))
 
@@ -896,26 +896,30 @@
                  db0    (fluree/db ledger)]
              (testing "transactions"
                (testing "with the `:meta` option"
-                 (let [response    (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people} {:meta true}))
+                 (let [response    (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                                            "insert" test-utils/people} {:meta true}))
                        db          (:result response)
-                       flake-total (count (<? (query-range/index-range db :spot)))]
+                       flake-total (- (-> db :stats :flakes)
+                                      (-> db0 :stats :flakes))]
                    (is (= flake-total (:fuel response))
                        "Reports fuel for all the generated flakes")))
                (testing "without the `:meta` option"
-                 (let [response (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))]
+                 (let [response (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                                         "insert" test-utils/people}))]
                    (is (nil? (:fuel response))
                        "Returns no fuel")))
                (testing "short-circuits if request fuel exhausted"
                  (let [response (try
-                                  (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}
-                                                      {:max-fuel 1}))
+                                  (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                                           "insert" test-utils/people}
+                                                      {:maxFuel 1}))
                                   (catch :default e (ex-cause e)))]
-                   (is (util/exception? response))
                    (is (re-find #"Fuel limit exceeded"
                                 (-> response ex-cause ex-message))))))
              (testing "queries"
-               (let [db          (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))
-                     flake-total (count (<? (query-range/index-range db :spot)))
+               (let [db          (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                                          "insert" test-utils/people}))
+                     flake-total (-> db :stats :flakes)
                      query       '{:select [?s ?p ?o]
                                    :where  {:id ?s
                                             ?p ?o}}]
@@ -933,7 +937,8 @@
                                  :where  {:id ?s
                                           ?p ?o}
                                  :opts   {:max-fuel 1}}
-                       db      (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}))
+                       db      (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                                        "insert" test-utils/people}))
                        results (try
                                  (<p! (fluree/query db query))
                                  (catch :default e (ex-cause e)))]
