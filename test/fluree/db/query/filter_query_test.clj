@@ -7,40 +7,42 @@
 (deftest ^:integration filter-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/filter" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-        db     @(fluree/stage
+        db     @(fluree/stage2
                   (fluree/db ledger)
-                 [{:id           :ex/brian,
-                   :type         :ex/User,
-                   :schema/name  "Brian"
-                   :ex/last      "Smith"
-                   :schema/email "brian@example.org"
-                   :schema/age   50
-                   :ex/favNums   7}
-                  {:id           :ex/alice,
-                   :type         :ex/User,
-                   :schema/name  "Alice"
-                   :ex/last      "Smith"
-                   :schema/email "alice@example.org"
-                   :ex/favColor  "Green"
-                   :schema/age   42
-                   :ex/favNums   [42, 76, 9]}
-                  {:id          :ex/cam,
-                   :type        :ex/User,
-                   :schema/name "Cam"
-                   :ex/last     "Jones"
-                   :schema/email    "cam@example.org"
-                   :schema/age  34
-                   :ex/favColor "Blue"
-                   :ex/favNums  [5, 10]
-                   :ex/friend   [:ex/brian :ex/alice]}
-                  {:id          :ex/david,
-                   :type        :ex/User,
-                   :schema/name "David"
-                   :ex/last     "Jones"
-                   :schema/email    "david@example.org"
-                   :schema/age  46
-                   :ex/favNums  [15 70]
-                   :ex/friend   [:ex/cam]}])]
+                  {"@context" "https://ns.flur.ee"
+                   "insert"
+                   [{:id           :ex/brian,
+                     :type         :ex/User,
+                     :schema/name  "Brian"
+                     :ex/last      "Smith"
+                     :schema/email "brian@example.org"
+                     :schema/age   50
+                     :ex/favNums   7}
+                    {:id           :ex/alice,
+                     :type         :ex/User,
+                     :schema/name  "Alice"
+                     :ex/last      "Smith"
+                     :schema/email "alice@example.org"
+                     :ex/favColor  "Green"
+                     :schema/age   42
+                     :ex/favNums   [42, 76, 9]}
+                    {:id          :ex/cam,
+                     :type        :ex/User,
+                     :schema/name "Cam"
+                     :ex/last     "Jones"
+                     :schema/email    "cam@example.org"
+                     :schema/age  34
+                     :ex/favColor "Blue"
+                     :ex/favNums  [5, 10]
+                     :ex/friend   [:ex/brian :ex/alice]}
+                    {:id          :ex/david,
+                     :type        :ex/User,
+                     :schema/name "David"
+                     :ex/last     "Jones"
+                     :schema/email    "david@example.org"
+                     :schema/age  46
+                     :ex/favNums  [15 70]
+                     :ex/friend   [:ex/cam]}]})]
 
     (testing "single filter"
       (is (= [["David" 46]
