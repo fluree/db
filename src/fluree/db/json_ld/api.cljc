@@ -301,6 +301,11 @@
            (promise-wrap
             (transact-api/ledger-transact! ledger parsed-txn opts*))))))))
 
+(defn create-with-txn2
+  [conn txn]
+  (promise-wrap
+    (transact-api/create-with-txn conn txn)))
+
 (defn status
   "Returns current status of ledger branch."
   ([ledger] (ledger-proto/-status ledger))
