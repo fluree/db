@@ -320,7 +320,7 @@
                                 :opts   {:role :ex/userRole
                                          :did  alice-did}}))))))
 
-(deftest ^:pending missing-type
+(deftest ^:integration missing-type
   (let [conn @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "policy" {:defaultContext [test-utils/default-str-context
                                                                {"ex" "http://example.com/"}]})

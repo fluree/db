@@ -141,8 +141,7 @@
                                  "select"   {"ex:nested" ["id" "ex:reversed-pred"]}}))
           "via reverse no subgraph"))))
 
-;; TODO: convert transact!
-(deftest ^:pending nested-properties
+(deftest ^:integration nested-properties
   (with-tmp-dir storage-path
     (let [conn      @(fluree/connect {:method   :file, :storage-path storage-path
                                       :defaults {:context test-utils/default-str-context}})
@@ -152,14 +151,15 @@
                                      ["" {"ex"  "http://example.com/"
                                           "owl" "http://www.w3.org/2002/07/owl#"}]})
           db0       (->> @(fluree/stage2 (fluree/db ledger) {"@context" "https://ns.flur.ee"
-                                                             "insert" {"ex:new" true}})
+                                                             "insert"   {"ex:new" true}})
                          (fluree/commit! ledger)
                          (deref))
 
 
-          db1 @(fluree/transact!
-                 conn {"f:ledger" ledger-id
-                       "@graph"
+          db1 @(fluree/transact!2
+                 conn {"ledger"   ledger-id
+                       "@context" "https://ns.flur.ee"
+                       "insert"
                        [{"@id"                    "ex:givenName"
                          "@type"                  "rdf:Property"
                          "owl:equivalentProperty" {"@id"   "ex:firstName"
@@ -167,20 +167,19 @@
                          "ex:preds"               {"@list" [{"@id"   "ex:cool"
                                                              "@type" "rdf:Property"}
                                                             {"@id"   "ex:fool"
-                                                             "@type" "rdf:Property"}]}}]}
-                 nil)
+                                                             "@type" "rdf:Property"}]}}]})
 
-          db2    @(fluree/transact!
-                    conn {"f:ledger" ledger-id
-                          "@graph"   [{"@id"          "ex:andrew"
+          db2    @(fluree/transact!2
+                    conn {"ledger"   ledger-id
+                          "@context" "https://ns.flur.ee"
+                          "insert"   [{"@id"          "ex:andrew"
                                        "ex:firstName" "Andrew"
                                        "ex:age"       35}
                                       {"@id"          "ex:dan"
                                        "ex:givenName" "Dan"}
                                       {"@id"     "ex:other"
                                        "ex:fool" false
-                                       "ex:cool" true}]}
-                    nil)
+                                       "ex:cool" true}]})
           loaded @(fluree/load conn ledger-id)
           dbl    (fluree/db loaded)]
       (testing "before load"
