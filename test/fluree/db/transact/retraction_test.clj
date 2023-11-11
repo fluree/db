@@ -7,27 +7,31 @@
   (testing "Retractions of individual properties and entire subjects."
     (let [conn           (test-utils/create-conn)
           ledger         @(fluree/create conn "tx/retract")
-          db             @(fluree/stage
+          db             @(fluree/stage2
                             (fluree/db ledger)
-                            {:context ["" {:ex "http://example.org/ns/"}]
-                             :graph   [{:id          :ex/alice,
-                                        :type        :ex/User,
-                                        :schema/name "Alice"
-                                        :schema/age  42}
-                                       {:id          :ex/bob,
-                                        :type        :ex/User,
-                                        :schema/name "Bob"
-                                        :schema/age  22}
-                                       {:id          :ex/jane,
-                                        :type        :ex/User,
-                                        :schema/name "Jane"
-                                        :schema/age  30}]})
-          ;; retract Alice's age attribute by using nil
-          db-age-retract @(fluree/stage
+                            {"@context" "https://ns.flur.ee"
+                             "insert"
+                             {:context ["" {:ex "http://example.org/ns/"}]
+                              :graph   [{:id          :ex/alice,
+                                         :type        :ex/User,
+                                         :schema/name "Alice"
+                                         :schema/age  42}
+                                        {:id          :ex/bob,
+                                         :type        :ex/User,
+                                         :schema/name "Bob"
+                                         :schema/age  22}
+                                        {:id          :ex/jane,
+                                         :type        :ex/User,
+                                         :schema/name "Jane"
+                                         :schema/age  30}]}})
+          ;; retract Alice's age attribute
+          db-age-retract @(fluree/stage2
                             db
-                            {:context    ["" {:ex "http://example.org/ns/"}]
-                             :id         :ex/alice,
-                             :schema/age nil})]
+                            {"@context" "https://ns.flur.ee"
+                             "delete"
+                             {:context    ["" {:ex "http://example.org/ns/"}]
+                              :id         :ex/alice,
+                              :schema/age 42}})]
       (is (= [{:id           :ex/alice,
                :type     :ex/User,
                :schema/name  "Alice"}]
