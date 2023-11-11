@@ -179,14 +179,14 @@
                           solution-ch)
     retract-ch))
 
-(defn temp-bnode?
-  "Is the iri a fluree-generated temporary bnode?"
+(defn blank-node?
+  "Is the iri a fluree-generated temporary blank-node?"
   [iri]
   (when iri
     (str/starts-with? iri "_:fdb")))
 
-(defn bnode-id
-  "A stable bnode."
+(defn blank-node-id
+  "A stable blank-node."
   [sid]
   (str "_:f" sid))
 
@@ -202,10 +202,11 @@
             db-alias            (:alias db)
 
             s-iri          (where/get-iri s-mch)
-            existing-sid   (or (where/get-sid s-mch db-alias) (<? (dbproto/-subid db s-iri {:expand? false})))
-            [sid s-iri*]   (if (temp-bnode? s-iri)
-                             (let [bnode-sid (next-sid s-iri)]
-                               [bnode-sid (bnode-id bnode-sid)])
+            existing-sid   (or (where/get-sid s-mch db-alias)
+                               (<? (dbproto/-subid db s-iri {:expand? false})))
+            [sid s-iri*]   (if (blank-node? s-iri)
+                             (let [blank-node-sid (next-sid s-iri)]
+                               [blank-node-sid (blank-node-id blank-node-sid)])
                              [(or existing-sid (get jld-ledger/predefined-properties s-iri) (next-sid s-iri)) s-iri])
             new-subj-flake (when-not existing-sid (create-id-flake sid s-iri* t))
 
@@ -233,8 +234,8 @@
             ref-sid          (when ref? (or existing-ref-sid
                                             (get jld-ledger/predefined-properties ref-iri)
                                             (next-sid ref-iri)))
-            ref-iri*         (when ref? (if (temp-bnode? ref-iri)
-                                          (bnode-id ref-sid)
+            ref-iri*         (when ref? (if (blank-node? ref-iri)
+                                          (blank-node-id ref-sid)
                                           ref-iri))
             new-ref-flake    (when (and ref? (not existing-ref-sid))
                                (create-id-flake ref-sid ref-iri* t))
