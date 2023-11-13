@@ -311,14 +311,14 @@
                                 [{:id "https://ns.flur.ee/ledger#view"}]
                                 "https://ns.flur.ee/ledger#equals"
                                 {:list [{:id "https://ns.flur.ee/ledger#$identity"} :ex/user]}}]}]}]})]
-      (is (= [{:id :ex/bob, :type :ex/User, :schema/name "Bob"}
-              {:id          :ex/alice, :type :ex/User, :ex/secret "alice's secret"
-               :schema/name "Alice"}]
-             @(fluree/query db {:where  '{:id   ?s
-                                          :type :ex/User}
-                                :select '{?s [:*]}
-                                :opts   {:role :ex/userRole
-                                         :did  alice-did}}))))))
+      (is (= #{{:id :ex/bob, :type :ex/User, :schema/name "Bob"}
+               {:id          :ex/alice, :type :ex/User, :ex/secret "alice's secret"
+                :schema/name "Alice"}}
+             (set @(fluree/query db {:where  '{:id   ?s
+                                               :type :ex/User}
+                                     :select '{?s [:*]}
+                                     :opts   {:role :ex/userRole
+                                              :did  alice-did}})))))))
 
 (deftest ^:integration missing-type
   (let [conn @(fluree/connect {:method :memory})
