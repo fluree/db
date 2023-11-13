@@ -81,6 +81,10 @@
                    :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
                                          {:status 400, :error :db/unsupported-operation})))))))
 
+(defn connect-file
+  [opts]
+  (connect (assoc opts :method :file)))
+
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.
   - server - (optional) IPFS http api server endpoint, defaults to http://127.0.0.1:5001/
