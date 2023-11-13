@@ -183,10 +183,10 @@
           loaded @(fluree/load conn ledger-id)
           dbl    (fluree/db loaded)]
       (testing "before load"
-        (is (= [{"id" "ex:dan", "ex:givenName" "Dan"}
-                {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]
-               @(fluree/query db2 {"select" {"?s" ["*"]}
-                                   "where"  {"@id" "?s", "ex:givenName" "?o"}})))
+        (is (= #{{"id" "ex:dan", "ex:givenName" "Dan"}
+                 {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}}
+               (set @(fluree/query db2 {"select" {"?s" ["*"]}
+                                        "where"  {"@id" "?s", "ex:givenName" "?o"}}))))
         (is (= [{"id" "ex:dan", "ex:givenName" "Dan"}
                 {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]
                @(fluree/query db2 {"select" {"?s" ["*"]}
@@ -203,10 +203,10 @@
                 {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]
                @(fluree/query dbl {"select" {"?s" ["*"]}
                                    "where"  {"@id" "?s", "ex:givenName" "?o"}})))
-        (is (= [{"id" "ex:dan", "ex:givenName" "Dan"}
-                {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]
-               @(fluree/query dbl {"select" {"?s" ["*"]}
-                                   "where"  {"@id" "?s", "ex:firstName" "?o"}})))
+        (is (= #{{"id" "ex:dan", "ex:givenName" "Dan"}
+                 {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}}
+               (set @(fluree/query dbl {"select" {"?s" ["*"]}
+                                        "where"  {"@id" "?s", "ex:firstName" "?o"}}))))
 
         (is (= [["ex:other" true false]]
                @(fluree/query dbl {"select" ["?s" "?cool" "?fool"]

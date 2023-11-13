@@ -150,7 +150,7 @@
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
              @(fluree/query db query))))))
 
-(deftest ^:pending object-var-test
+(deftest object-var-test
   (testing "var in object position works"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "var-in-obj")
