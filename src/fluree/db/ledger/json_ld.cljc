@@ -158,16 +158,10 @@
                         (get-first-value const/iri-t))
           latest-db (ledger-proto/-db ledger {:branch branch})
           latest-t  (- (:t latest-db))]
-      (log/debug "notify of new commit for ledger: " (:alias ledger) " at t value: " commit-t
-                 " where current cached db t value is: " latest-t)
+      (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
+                 "where current cached db t value is:" latest-t)
       ;; note, index updates will have same t value as current one, so still need to check if t = latest-t
       (cond
-
-        (< commit-t latest-t)
-        (do
-          (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
-                    " however, latest-t is more current: " latest-t)
-          false)
 
         (= commit-t (inc latest-t))
         (let [updated-db  (<? (jld-reify/merge-commit conn latest-db false [commit proof]))
@@ -181,6 +175,18 @@
           (log/debug "Received commit update that is more than 1 ahead of current ledger state. "
                      "Will dump in-memory ledger and force a reload: " (:alias ledger))
           (close-ledger ledger)
+          false)
+
+        (= commit-t latest-t)
+        (do
+          (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
+                    " however we already have this commit so not applying: " latest-t)
+          false)
+
+        (< commit-t latest-t)
+        (do
+          (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
+                    " however, latest-t is more current: " latest-t)
           false)))))
 
 (defrecord JsonLDLedger [id address alias did indexer

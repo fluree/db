@@ -136,12 +136,13 @@
   [conn commit-map]
   (go-try
     (let [expanded-commit (json-ld/expand commit-map)
-          ledger-alias    (get-first-value expanded-commit const/iri-alias)
-          ledger          (some-> (cached-ledger conn ledger-alias)
-                                  <?)]
-      (if ledger
-        (<? (ledger-proto/-notify ledger expanded-commit))
-        (log/debug "No cached ledger found for commit: " commit-map)))))
+          ledger-alias    (get-first-value expanded-commit const/iri-alias)]
+      (if ledger-alias
+        (if-let [ledger-c (cached-ledger conn ledger-alias)]
+          (<? (ledger-proto/-notify (<? ledger-c) expanded-commit))
+          (log/debug "No cached ledger found for commit: " commit-map))
+        (log/warn "Notify called with a data that does not have a ledger alias."
+                  "Are you sure it is a commit?: " commit-map)))))
 
 (defn printer-map
   "Returns map of important data for print writer"
