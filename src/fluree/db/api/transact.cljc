@@ -12,7 +12,8 @@
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
-            [fluree.db.json-ld.credential :as cred]))
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.ledger.proto :as ledger-proto]))
 
 (defn stage
   [db json-ld opts]
@@ -36,7 +37,7 @@
         (<? (dbproto/-stage db json-ld opts*))))))
 
 (defn parse-opts
-  [opts parsed-opts]
+  [parsed-opts opts]
   (reduce (fn [opts* [k v]] (assoc opts* (keyword k) v))
           parsed-opts
           opts))
@@ -54,7 +55,7 @@
                                     did (assoc :did did)
                                     txn-context (assoc :context txn-context))
 
-          {:keys [maxFuel meta] :as parsed-opts*} (parse-opts opts parsed-opts)]
+          {:keys [maxFuel meta] :as parsed-opts*} (parse-opts parsed-opts opts)]
       (if (or maxFuel meta)
         (let [start-time   #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))
@@ -153,3 +154,54 @@
                        txn-context (assoc :txn-context txn-context)
                        default-context (assoc :defaultContext default-context))]
           (<? (ledger-transact! ledger txn opts)))))))
+
+(defn transact!2
+  [conn txn]
+  (go-try
+    (let [{txn :subject did :did} (or (<? (cred/verify txn))
+                                      {:subject txn})
+
+          txn-context (ctx-util/txn-context txn)
+          expanded    (json-ld/expand txn)
+          ledger-id   (util/get-first-value expanded const/iri-ledger)
+          _ (when-not ledger-id
+              (throw (ex-info "Invalid transaction, missing required key: ledger."
+                              {:status 400 :error :db/invalid-transaction})))
+          address     (<? (nameservice/primary-address conn ledger-id nil))
+
+          opts (cond-> (util/get-first-value expanded const/iri-opts)
+                 did         (assoc :did did)
+                 txn-context (assoc :context txn-context))
+
+          parsed-opts (parse-opts {} opts)]
+      (if-not (<? (nameservice/exists? conn address))
+        (throw (ex-info "Ledger does not exist" {:ledger address}))
+        (let [ledger (<? (jld-ledger/load conn address))
+              db     (<? (stage2 (ledger-proto/-db ledger) txn parsed-opts))]
+          (<? (ledger-proto/-commit! ledger db)))))))
+
+(defn create-with-txn
+  [conn txn]
+  (go-try
+    (let [{txn :subject did :did} (or (<? (cred/verify txn))
+                                      {:subject txn})
+
+          txn-context (ctx-util/txn-context txn)
+          expanded    (json-ld/expand txn)
+          ledger-id   (util/get-first-value expanded const/iri-ledger)
+          _ (when-not ledger-id
+              (throw (ex-info "Invalid transaction, missing required key: ledger."
+                              {:status 400 :error :db/invalid-transaction})))
+          address     (<? (nameservice/primary-address conn ledger-id nil))
+
+          opts (cond-> (util/get-first-value expanded const/iri-opts)
+                 did         (assoc :did did)
+                 txn-context (assoc :context txn-context))
+
+          parsed-opts (parse-opts {} opts)]
+      (if (<? (nameservice/exists? conn address))
+        (throw (ex-info (str "Ledger " ledger-id " already exists")
+                        {:status 409 :error :db/ledger-exists}))
+        (let [ledger (<? (jld-ledger/create conn ledger-id parsed-opts))
+              db     (<? (stage2 (ledger-proto/-db ledger) txn parsed-opts))]
+          (<? (ledger-proto/-commit! ledger db)))))))

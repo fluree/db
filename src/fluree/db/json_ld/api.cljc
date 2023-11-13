@@ -264,6 +264,11 @@
      (log/trace "transact! parsed-txn:" parsed-txn)
      (transact-api/transact! conn parsed-txn opts))))
 
+(defn transact!2
+  [conn txn]
+  (promise-wrap
+    (transact-api/transact!2 conn txn)))
+
 (defn create-with-txn
   "Creates a new ledger named by the @id key (or its context alias) in txn if it
   doesn't exist and transacts the data in txn's @graph (or its context alias)
@@ -295,6 +300,11 @@
            create-promise
            (promise-wrap
             (transact-api/ledger-transact! ledger parsed-txn opts*))))))))
+
+(defn create-with-txn2
+  [conn txn]
+  (promise-wrap
+    (transact-api/create-with-txn conn txn)))
 
 (defn status
   "Returns current status of ledger branch."

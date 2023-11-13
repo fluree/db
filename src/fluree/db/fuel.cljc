@@ -1,6 +1,7 @@
 (ns fluree.db.fuel
   (:require [clojure.core.async :as async :refer [put!]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.flake :as flake]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -33,7 +34,9 @@
          (rf))
 
         ([result next]
-         (vswap! counter inc)
+         (if (flake/flake? next)
+           (vswap! counter inc)
+           (vswap! counter + (count (remove result next))))
          (let [t     (tally trkr)
                limit (:limit trkr)]
            (when (and (> limit 0) (> t limit))

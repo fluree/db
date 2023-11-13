@@ -3,7 +3,9 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as db-proto]
             [fluree.db.json-ld.transact :as jld-transact]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.flake :as flake]
+            [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -20,6 +22,8 @@
 (defn blank-db
   "When not bootstrapping with a transaction, bootstraps initial base set of flakes required for a db."
   [blank-db]
-  (let [t           -1
+  (let [t           (dec (:t blank-db))
         base-flakes (jld-transact/base-flakes t)]
-    (commit-data/update-novelty blank-db base-flakes)))
+    (-> blank-db
+        (assoc :t t)
+        (commit-data/update-novelty [(flake/create const/$xsd:anyURI const/$xsd:anyURI const/iri-id const/$xsd:string t true nil)]))))

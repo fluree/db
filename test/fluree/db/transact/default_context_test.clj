@@ -17,9 +17,10 @@
         db1                 (with-redefs
                              [util/current-time-iso
                               (constantly "1971-01-01T00:00:00.00000Z")]
-                             @(test-utils/transact ledger [{:id   :ex/foo
-                                                            :ex/x "foo-1"
-                                                            :ex/y "bar-1"}]))
+                             @(test-utils/transact ledger {"@context" "https://ns.flur.ee"
+                                                           "insert"   [{:id   :ex/foo
+                                                                        :ex/x "foo-1"
+                                                                        :ex/y "bar-1"}]}))
         ledger1-load        @(fluree/load conn "default-context-update")
         db1-load            (fluree/db ledger1-load)
 
@@ -32,10 +33,11 @@
         db-update-cmt       (with-redefs
                              [util/current-time-iso
                               (constantly "1981-01-01T00:00:00.00000Z")]
-                             (->> [{:id       :ex-new/foo2
-                                    :ex-new/x "foo-2"
-                                    :ex-new/y "bar-2"}]
-                                  (fluree/stage db-update-ctx)
+                             (->> {"@context" "https://ns.flur.ee"
+                                   "insert"  [{:id       :ex-new/foo2
+                                               :ex-new/x "foo-2"
+                                               :ex-new/y "bar-2"}]}
+                                  (fluree/stage2 db-update-ctx)
                                   deref
                                   (fluree/commit! ledger)
                                   deref))
@@ -173,9 +175,10 @@
             db1                 (with-redefs
                                  [util/current-time-iso
                                   (constantly "1971-01-01T00:00:00.00000Z")]
-                                 @(test-utils/transact ledger [{:id   :ex/foo
-                                                                :ex/x "foo-1"
-                                                                :ex/y "bar-1"}]))
+                                 @(test-utils/transact ledger {"@context" "https://ns.flur.ee"
+                                                               "insert"   [{:id   :ex/foo
+                                                                            :ex/x "foo-1"
+                                                                            :ex/y "bar-1"}]}))
             _                   (fluree/default-context-at-t ledger 1)
 
             ledger1-load        (test-utils/retry-load
@@ -191,10 +194,11 @@
             db-update-cmt       (with-redefs
                                  [util/current-time-iso
                                   (constantly "1981-01-01T00:00:00.00000Z")]
-                                 (->> [{:id       :ex-new/foo2
-                                        :ex-new/x "foo-2"
-                                        :ex-new/y "bar-2"}]
-                                      (fluree/stage db-update-ctx)
+                                 (->> {"@context" "https://ns.flur.ee"
+                                       "insert"  [{:id       :ex-new/foo2
+                                                   :ex-new/x "foo-2"
+                                                   :ex-new/y "bar-2"}]}
+                                      (fluree/stage2 db-update-ctx)
                                       deref
                                       (fluree/commit! ledger)
                                       deref))

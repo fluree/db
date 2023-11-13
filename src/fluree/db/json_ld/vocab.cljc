@@ -272,7 +272,6 @@
   [new-flakes]
   (loop [[s-flakes & r] (partition-by flake/s new-flakes)
          res []]
-    (println "DEP s-flakes" (pr-str s-flakes))
     (if s-flakes
       (if-let [dt-constraints (->> s-flakes
                                    (filterv #(= const/$sh:datatype (flake/p %)))
