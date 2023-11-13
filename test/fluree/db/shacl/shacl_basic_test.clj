@@ -24,7 +24,7 @@
           query-res @(fluree/query db2 '{:select {:ex/myClassInstance [:*]}})]
       (is (= query-res
              [{:id                 :ex/myClassInstance
-               :type           :ex/MyClass
+               :type               :ex/MyClass
                :schema/description "Now a new subject uses MyClass as a Class"}])))))
 
 
@@ -46,7 +46,7 @@
                                               :sh/maxCount 1
                                               :sh/datatype :xsd/string}]}})
           db-ok        @(fluree/stage2
-                          db
+                         db
                          {"@context" "https://ns.flur.ee"
                           "insert"
                           {:id              :ex/john
@@ -56,7 +56,7 @@
           ; no :schema/name
           db-no-names  (try
                          @(fluree/stage2
-                            db
+                           db
                            {"@context" "https://ns.flur.ee"
                             "insert"
                             {:id              :ex/john
@@ -65,7 +65,7 @@
                          (catch Exception e e))
           db-two-names (try
                          @(fluree/stage2
-                            db
+                           db
                            {"@context" "https://ns.flur.ee"
                             "insert"
                             {:id              :ex/john
@@ -82,7 +82,7 @@
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message db-two-names)))
       (is (= [{:id              :ex/john,
-               :type        :ex/User,
+               :type            :ex/User,
                :schema/name     "John",
                :schema/callSign "j-rock"}]
              @(fluree/query db-ok user-query))
@@ -136,7 +136,7 @@
              (ex-message db-bool-name)))
       (is (= @(fluree/query db-ok user-query)
              [{:id          :ex/john
-               :type    :ex/User
+               :type        :ex/User
                :schema/name "John"}])
           "basic rdf:type query response not correct"))))
 
@@ -147,7 +147,7 @@
           user-query    {:select {'?s [:*]}
                          :where  {:id '?s, :type :ex/User}}
           db            @(fluree/stage2
-                           (fluree/db ledger)
+                          (fluree/db ledger)
                           {"@context" "https://ns.flur.ee"
                            "insert"
                            {:id                   :ex/UserShape
@@ -159,7 +159,7 @@
                             :sh/ignoredProperties [:type]}})
 
           db-ok         @(fluree/stage2
-                           db
+                          db
                           {"@context" "https://ns.flur.ee"
                            "insert"
                            {:id          :ex/john
@@ -181,7 +181,7 @@
                             "SHACL shape is closed, extra properties not allowed: [10"))
 
       (is (= [{:id          :ex/john
-               :type    :ex/User
+               :type        :ex/User
                :schema/name "John"}]
              @(fluree/query db-ok user-query))
           "basic type query response not correct"))))
@@ -227,7 +227,7 @@
                  (ex-message db-not-equal)))
 
           (is (= [{:id           :ex/alice
-                   :type     :ex/User
+                   :type         :ex/User
                    :schema/name  "Alice"
                    :ex/firstName "Alice"}]
                  @(fluree/query db-ok user-query)))))
@@ -242,7 +242,7 @@
                                  :sh/property    [{:sh/path   :ex/favNums
                                                    :sh/equals :ex/luckyNums}]}})
               db-ok         @(fluree/stage2
-                               db
+                              db
                               {"@context" "https://ns.flur.ee"
                                "insert"
                                {:id           :ex/alice
@@ -252,7 +252,7 @@
                                 :ex/luckyNums [11 17]}})
 
               db-ok2        @(fluree/stage2
-                               db
+                              db
                               {"@context" "https://ns.flur.ee"
                                "insert"
                                {:id           :ex/alice
@@ -263,7 +263,7 @@
 
               db-not-equal1 (try
                               @(fluree/stage2
-                                 db
+                                db
                                 {"@context" "https://ns.flur.ee"
                                  "insert"
                                  {:id           :ex/brian
@@ -285,7 +285,7 @@
                               (catch Exception e e))
               db-not-equal3 (try
                               @(fluree/stage2
-                                 db
+                                db
                                 {"@context" "https://ns.flur.ee"
                                  "insert"
                                  {:id           :ex/brian
@@ -322,13 +322,13 @@
           (is (= "SHACL PropertyShape exception - sh:equals: [11 17] not equal to [\"11\" \"17\"]."
                  (ex-message db-not-equal4)))
           (is (= [{:id           :ex/alice
-                   :type     :ex/User
+                   :type         :ex/User
                    :schema/name  "Alice"
                    :ex/favNums   [11 17]
                    :ex/luckyNums [11 17]}]
                  @(fluree/query db-ok user-query)))
           (is (= [{:id           :ex/alice
-                   :type     :ex/User
+                   :type         :ex/User
                    :schema/name  "Alice"
                    :ex/favNums   [11 17]
                    :ex/luckyNums [11 17]}]
@@ -404,7 +404,7 @@
                  (ex-message db-not-disjoint3)))
 
           (is (= [{:id           :ex/alice
-                   :type     :ex/User
+                   :type         :ex/User
                    :schema/name  "Alice"
                    :ex/favNums   [11 17]
                    :ex/luckyNums 1}]
@@ -525,13 +525,13 @@
                                 "SHACL PropertyShape exception - sh:lessThan:"))
 
           (is (= [{:id          :ex/alice
-                   :type    :ex/User
+                   :type        :ex/User
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       [18 19]}]
                  @(fluree/query db-ok1 user-query)))
           (is (= [{:id          :ex/alice
-                   :type    :ex/User
+                   :type        :ex/User
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       18}]
@@ -636,13 +636,13 @@
           (is (= "SHACL PropertyShape exception - sh:lessThanOrEquals: 17 not less than or equal to 16, or values are not valid for comparison; sh:lessThanOrEquals: 17 not less than or equal to 12, or values are not valid for comparison."
                  (ex-message db-fail4)))
           (is (= [{:id          :ex/alice
-                   :type    :ex/User
+                   :type        :ex/User
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       [17 19]}]
                  @(fluree/query db-ok1 user-query)))
           (is (= [{:id          :ex/alice
-                   :type    :ex/User
+                   :type        :ex/User
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       17}]
@@ -656,7 +656,7 @@
                       :where  {:id '?s, :type :ex/User}}]
       (testing "exclusive constraints"
         (let [db          @(fluree/stage2
-                             (fluree/db ledger)
+                            (fluree/db ledger)
                             {"@context" "https://ns.flur.ee"
                              "insert"
                              {:id             :ex/ExclusiveNumRangeShape
@@ -666,7 +666,7 @@
                                                 :sh/minExclusive 1
                                                 :sh/maxExclusive 100}]}})
               db-ok       @(fluree/stage2
-                             db
+                            db
                             {"@context" "https://ns.flur.ee"
                              "insert"
                              {:id         :ex/john
@@ -700,7 +700,7 @@
 
           (is (= @(fluree/query db-ok user-query)
                  [{:id         :ex/john
-                   :type   :ex/User
+                   :type       :ex/User
                    :schema/age 2}]))))
       (testing "inclusive constraints"
         (let [db          @(fluree/stage2
@@ -752,10 +752,10 @@
                  (ex-message db-too-high)))
           (is (= @(fluree/query db-ok2 user-query)
                  [{:id         :ex/alice
-                   :type   :ex/User
+                   :type       :ex/User
                    :schema/age 100}
                   {:id         :ex/brian
-                   :type   :ex/User
+                   :type       :ex/User
                    :schema/age 1}]))))
       (testing "non-numeric values"
         (let [db         @(fluree/stage2
@@ -880,7 +880,7 @@
       (is (str/starts-with? (ex-message db-ref-value)
                             "SHACL PropertyShape exception - sh:maxLength: value "))
       (is (= [{:id          :ex/john
-               :type    :ex/User
+               :type        :ex/User
                :schema/name "John"}]
              @(fluree/query db-ok-str user-query)))
       (is (= [{:id          :ex/john
@@ -967,11 +967,11 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
       (is (str/starts-with? (ex-message db-ref-value)
                             "SHACL PropertyShape exception - sh:pattern: value "))
       (is (= [{:id          :ex/brian
-               :type    :ex/User
+               :type        :ex/User
                :ex/greeting "hello\nworld!"}]
              @(fluree/query db-ok-greeting user-query)))
       (is (= [{:id           :ex/john
-               :type     :ex/User
+               :type         :ex/User
                :ex/birthYear 1984}]
              @(fluree/query db-ok-birthyear user-query))))))
 
@@ -1068,7 +1068,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
       (is (= "Value 42 cannot be coerced to provided datatype: 1."
              (ex-message db-num-email)))
       (is (= [{:id           :ex/john
-               :type     :ex/User
+               :type         :ex/User
                :schema/age   40
                :schema/email "john@example.org"
                :schema/name  "John"}]
@@ -1099,7 +1099,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
         (is (= [{"id"          "ex:Luke",
                  "schema:name" "Luke",
                  "ex:parent"   {"id"          "ex:Anakin"
-                                "type" "ex:Parent"
+                                "type"        "ex:Parent"
                                 "schema:name" "Anakin"}}]
                @(fluree/query valid-parent {"select" {"ex:Luke" ["*" {"ex:parent" ["*"]}]}})))
 
@@ -1111,7 +1111,6 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
       (let [;; a valid Pal is anybody who has a pal with a name
             db1         @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
                                              "insert" {"@type"          "sh:NodeShape"
-                                                       ;; "sh:targetNode" {"@id" "ex:good-pal"}
                                                        "sh:targetClass" {"@id" "ex:Pal"}
                                                        "sh:property"    [{"sh:path"     {"@list" [{"id" "ex:pal"} {"id" "schema:name"}]}
                                                                           "sh:minCount" 1}]}})
@@ -1126,9 +1125,9 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                        "type"        "ex:Pal"
                                                        "schema:name" "Darth Vader"
                                                        "ex:pal"      {"ex:evil" "has no name"}}})]
-        (is (= [{"id"          "ex:good-pal",
-                 "type" "ex:Pal"
-                 "schema:name" "J.D.",
+        (is (= [{"id"          "ex:good-pal"
+                 "type"        "ex:Pal"
+                 "schema:name" "J.D."
                  "ex:pal"      [{"schema:name" "Turk"}
                                 {"schema:name" "Rowdy"}]}]
                @(fluree/query valid-pal {"select" {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})))
@@ -1282,20 +1281,20 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                  "ex:color" [{"id" "ex:Pink"}
                                                              {"id" "ex:Green"}]}]})
           db3    @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                      "insert" [{"id"       "ex:PastelPony"
-                                                 "type"     "ex:Pony"
-                                                 "ex:color" [{"id" "ex:Pink"}
-                                                             {"id" "ex:Purple"}]}]})]
+                                      "insert"   [{"id"       "ex:PastelPony"
+                                                   "type"     "ex:Pony"
+                                                   "ex:color" [{"id" "ex:Pink"}
+                                                               {"id" "ex:Purple"}]}]})]
       (is (util/exception? db2))
       (is (str/starts-with? (ex-message db2)
                             "SHACL PropertyShape exception - sh:in: value must be one of "))
 
       (is (not (util/exception? db3)))
       (is (= {"id"       "ex:PastelPony"
-              "type" "ex:Pony"
+              "type"     "ex:Pony"
               "ex:color" [{"id" "ex:Pink"} {"id" "ex:Purple"}]}
              (-> @(fluree/query db3 '{"select" {"?p" ["*"]}
-                                      "where"  {"id" "?p"
+                                      "where"  {"id"   "?p"
                                                 "type" "ex:Pony"}})
                  first
                  (update "ex:color" (partial sort-by #(get % "id"))))))))
@@ -1715,8 +1714,8 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
             db-forbidden-friend @(fluree/stage2 db2
                                                 {"@context" "https://ns.flur.ee"
                                                  "insert"
-                                                 {"id" "ex:Alice"
-                                                  "type" "ex:User"
+                                                 {"id"        "ex:Alice"
+                                                  "type"      "ex:User"
                                                   "ex:friend" {"@id" "ex:Bob"}}})]
         (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
                (ex-message db-forbidden-friend)))))
