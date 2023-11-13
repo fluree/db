@@ -5,11 +5,11 @@
 
 (deftest ^:integration deleting-data
   (testing "Deletions of entire subjects."
-    (let [conn             (test-utils/create-conn)
-          ledger           @(fluree/create conn "tx/delete"
-                                           {:defaultContext
-                                            ["" {:ex "http://example.org/ns/"}]})
-          db               @(fluree/stage2
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "tx/delete"
+                                 {:defaultContext
+                                  ["" {:ex "http://example.org/ns/"}]})
+          db     @(fluree/stage2
                               (fluree/db ledger)
                               {"@context" "https://ns.flur.ee"
                                "insert"
@@ -29,53 +29,53 @@
                                          :schema/age   30}]}})
 
           ;; delete everything for :ex/alice
-          db-subj-delete   @(fluree/stage2 db
-                                           {"@context" "https://ns.flur.ee"
-                                            "where"  '{:id :ex/alice, "?p" "?o"}
-                                            "delete" '{:id :ex/alice, "?p" "?o"}})
+          db-subj-delete @(fluree/stage2 db
+                                         {"@context" "https://ns.flur.ee"
+                                          "where"    '{:id :ex/alice, "?p" "?o"}
+                                          "delete"   '{:id :ex/alice, "?p" "?o"}})
 
           ;; delete any :schema/age values for :ex/bob
           db-subj-pred-del @(fluree/stage2 db
                                            '{"@context" "https://ns.flur.ee"
-                                             "delete" {:id :ex/bob, :schema/age "?o"}
-                                             "where"  {:id :ex/bob, :schema/age "?o"}})
+                                             "delete"   {:id :ex/bob, :schema/age "?o"}
+                                             "where"    {:id :ex/bob, :schema/age "?o"}})
 
           ;; delete all subjects with a :schema/email predicate
-          db-all-preds     @(fluree/stage2 db
-                                           '{"@context" "https://ns.flur.ee"
-                                             "delete" {:id "?s", "?p" "?o"}
-                                             "where"  {:id           "?s"
-                                                       :schema/email "?x"
-                                                       "?p"            "?o"}})
+          db-all-preds @(fluree/stage2 db
+                                       '{"@context" "https://ns.flur.ee"
+                                         "delete"   {:id "?s", "?p" "?o"}
+                                         "where"    {:id           "?s"
+                                                     :schema/email "?x"
+                                                     "?p"          "?o"}})
 
           ;; delete all subjects where :schema/age = 30
-          db-age-delete    @(fluree/stage2 db
-                                           '{"@context" "https://ns.flur.ee"
-                                             "delete" {:id "?s", "?p" "?o"}
-                                             "where"  {:id         "?s"
-                                                       :schema/age 30
-                                                       "?p"          "?o"}})
+          db-age-delete @(fluree/stage2 db
+                                        '{"@context" "https://ns.flur.ee"
+                                          "delete"   {:id "?s", "?p" "?o"}
+                                          "where"    {:id         "?s"
+                                                      :schema/age 30
+                                                      "?p"        "?o"}})
 
           ;; Change Bob's age - but only if his age is still 22
-          db-update-bob    @(fluree/stage2 db
-                                           '{"@context" "https://ns.flur.ee"
-                                             "delete" {:id :ex/bob, :schema/age 22}
-                                             "insert" {:id :ex/bob, :schema/age 23}
-                                             "where"  {:id :ex/bob, :schema/age 22}})
+          db-update-bob @(fluree/stage2 db
+                                        '{"@context" "https://ns.flur.ee"
+                                          "delete"   {:id :ex/bob, :schema/age 22}
+                                          "insert"   {:id :ex/bob, :schema/age 23}
+                                          "where"    {:id :ex/bob, :schema/age 22}})
 
           ;; Shouldn't change Bob's age as the current age is not a match
-          db-update-bob2   @(fluree/stage2 db
-                                           '{"@context" "https://ns.flur.ee"
-                                             "delete" {:id "?s" , :schema/age 99}
-                                             "insert" {:id "?s" , :schema/age 23}
-                                             "where"  {:id "?s" , :schema/age 99}})
+          db-update-bob2 @(fluree/stage2 db
+                                         '{"@context" "https://ns.flur.ee"
+                                           "delete"   {:id "?s" :schema/age 99}
+                                           "insert"   {:id "?s" :schema/age 23}
+                                           "where"    {:id "?s" :schema/age 99}})
 
           ;; change Jane's age regardless of its current value
-          db-update-jane   @(fluree/stage2 db
-                                           '{"@context" "https://ns.flur.ee"
-                                             "delete" {:id :ex/jane, :schema/age "?current-age"}
-                                             "insert" {:id :ex/jane, :schema/age 31}
-                                             "where"  {:id :ex/jane, :schema/age "?current-age"}})]
+          db-update-jane @(fluree/stage2 db
+                                         '{"@context" "https://ns.flur.ee"
+                                           "delete"   {:id :ex/jane, :schema/age "?current-age"}
+                                           "insert"   {:id :ex/jane, :schema/age 31}
+                                           "where"    {:id :ex/jane, :schema/age "?current-age"}})]
 
       (is (= @(fluree/query db-subj-delete
                             '{:select ?name
@@ -139,20 +139,20 @@
     (testing "hash functions"
       (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
         (let [updated (-> @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                               "insert" [{"id"     "ex:create-predicates"
-                                                          "ex:md5" 0 "ex:sha1" 0 "ex:sha256" 0 "ex:sha384" 0 "ex:sha512" 0}
-                                                         {"id"         "ex:hash-fns"
-                                                          "ex:message" "abc"}]})
+                                               "insert"   [{"id"     "ex:create-predicates"
+                                                            "ex:md5" 0 "ex:sha1" 0 "ex:sha256" 0 "ex:sha384" 0 "ex:sha512" 0}
+                                                           {"id"         "ex:hash-fns"
+                                                            "ex:message" "abc"}]})
                           (fluree/stage2 {"@context" "https://ns.flur.ee"
-                                          "delete" []
-                                          "where"  [{"id"         "ex:hash-fns"
-                                                     "ex:message" "?message"}
+                                          "delete"   []
+                                          "where"    [{"id"         "ex:hash-fns"
+                                                       "ex:message" "?message"}
                                                     ["bind"
                                                      "?sha256" "(sha256 ?message)"
                                                      "?sha512" "(sha512 ?message)"]]
-                                          "insert" {"id"        "ex:hash-fns"
-                                                    "ex:sha256" "?sha256"
-                                                    "ex:sha512" "?sha512"}}))]
+                                          "insert"   {"id"        "ex:hash-fns"
+                                                      "ex:sha256" "?sha256"
+                                                      "ex:sha512" "?sha512"}}))]
           (is (= {"ex:sha512" "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
                   "ex:sha256" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}
                  @(fluree/query @updated {"selectOne" {"ex:hash-fns" ["ex:sha512" "ex:sha256"]}}))))))
@@ -161,17 +161,17 @@
         (let [updated (-> @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
                                                "insert"
                                                [{"id"         "ex:create-predicates"
-                                                 "ex:now"     0 "ex:year" 0 "ex:month" 0 "ex:day" 0 "ex:hours" 0
-                                                 "ex:minutes" 0 "ex:seconds" 0 "ex:timezone" 0 "ex:tz" 0}
+                                                 "ex:now"     0 "ex:year"    0 "ex:month"    0 "ex:day" 0 "ex:hours" 0
+                                                 "ex:minutes" 0 "ex:seconds" 0 "ex:timezone" 0 "ex:tz"  0}
                                                 {"id"                "ex:datetime-fns"
                                                  "ex:localdatetime"  "2023-06-13T14:17:22.435"
                                                  "ex:offsetdatetime" "2023-06-13T14:17:22.435-05:00"
                                                  "ex:utcdatetime"    "2023-06-13T14:17:22.435Z"}]})
                           (fluree/stage2 {"@context" "https://ns.flur.ee"
-                                          "where"  [{"id"                "?s"
-                                                     "ex:localdatetime"  "?localdatetime"
-                                                     "ex:offsetdatetime" "?offsetdatetime"
-                                                     "ex:utcdatetime"    "?utcdatetime"}
+                                          "where"    [{"id"                "?s"
+                                                       "ex:localdatetime"  "?localdatetime"
+                                                       "ex:offsetdatetime" "?offsetdatetime"
+                                                       "ex:utcdatetime"    "?utcdatetime"}
                                                     ["bind"
                                                      "?now" "(now)"
                                                      "?year" "(year ?localdatetime)"
@@ -182,16 +182,16 @@
                                                      "?seconds" "(seconds ?localdatetime)"
                                                      "?tz1" "(tz ?utcdatetime)"
                                                      "?tz2" "(tz ?offsetdatetime)"]]
-                                          "insert" [{"id"         "?s"
-                                                     "ex:now"     "?now"
-                                                     "ex:year"    "?year"
-                                                     "ex:month"   "?month"
-                                                     "ex:day"     "?day"
-                                                     "ex:hours"   "?hours"
-                                                     "ex:minutes" "?minutes"
-                                                     "ex:seconds" "?seconds"
-                                                     "ex:tz"      ["?tz1" "?tz2"]}]
-                                          "values" ["?s" ["ex:datetime-fns"]]}))]
+                                          "insert"   [{"id"         "?s"
+                                                       "ex:now"     "?now"
+                                                       "ex:year"    "?year"
+                                                       "ex:month"   "?month"
+                                                       "ex:day"     "?day"
+                                                       "ex:hours"   "?hours"
+                                                       "ex:minutes" "?minutes"
+                                                       "ex:seconds" "?seconds"
+                                                       "ex:tz"      ["?tz1" "?tz2"]}]
+                                          "values"   ["?s" ["ex:datetime-fns"]]}))]
           (is (= {"ex:now"     "2023-06-13T19:53:57.234345Z"
                   "ex:year"    2023
                   "ex:month"   6
@@ -209,30 +209,30 @@
 
     (testing "numeric functions"
       (let [updated (-> @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                             "insert" [{"id"     "ex:create-predicates"
-                                                        "ex:abs" 0 "ex:round" 0 "ex:ceil" 0 "ex:floor" 0 "ex:rand" 0}
-                                                       {"id"         "ex:numeric-fns"
-                                                        "ex:pos-int" 2
-                                                        "ex:neg-int" -2
-                                                        "ex:decimal" 1.4}]})
+                                             "insert"   [{"id"     "ex:create-predicates"
+                                                          "ex:abs" 0 "ex:round" 0 "ex:ceil" 0 "ex:floor" 0 "ex:rand" 0}
+                                                         {"id"         "ex:numeric-fns"
+                                                          "ex:pos-int" 2
+                                                          "ex:neg-int" -2
+                                                          "ex:decimal" 1.4}]})
                         (fluree/stage2 {"@context" "https://ns.flur.ee"
-                                        "where"  [{"id"         "?s"
-                                                   "ex:pos-int" "?pos-int"
-                                                   "ex:neg-int" "?neg-int"
-                                                   "ex:decimal" "?decimal"}
+                                        "where"    [{"id"         "?s"
+                                                     "ex:pos-int" "?pos-int"
+                                                     "ex:neg-int" "?neg-int"
+                                                     "ex:decimal" "?decimal"}
                                                   ["bind"
                                                    "?abs" "(abs ?neg-int)"
                                                    "?round" "(round ?decimal)"
                                                    "?ceil" "(ceil ?decimal)"
                                                    "?floor" "(floor ?decimal)"
                                                    "?rand" "(rand)"]]
-                                        "insert" {"id"       "?s"
-                                                  "ex:abs"   "?abs"
-                                                  "ex:round" "?round"
-                                                  "ex:ceil"  "?ceil"
-                                                  "ex:floor" "?floor"
-                                                  "ex:rand"  "?rand"}
-                                        "values" ["?s" ["ex:numeric-fns"]]}))]
+                                        "insert"   {"id"       "?s"
+                                                    "ex:abs"   "?abs"
+                                                    "ex:round" "?round"
+                                                    "ex:ceil"  "?ceil"
+                                                    "ex:floor" "?floor"
+                                                    "ex:rand"  "?rand"}
+                                        "values"   ["?s" ["ex:numeric-fns"]]}))]
         (is (= {"ex:abs"   2
                 "ex:round" 1
                 "ex:ceil"  2
@@ -246,17 +246,17 @@
                                            "selectOne" "?rand"})))))
     (testing "string functions"
       (let [updated (-> @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                             "insert" [{"id" "ex:create-predicates"
-                                                        "ex:strLen" 0 "ex:subStr" 0 "ex:ucase" 0
-                                                        "ex:lcase" 0 "ex:strStarts" 0 "ex:strEnds" 0
-                                                        "ex:contains" 0 "ex:strBefore" 0 "ex:strAfter" 0
-                                                        "ex:encodeForUri" 0 "ex:concat" 0
-                                                        "ex:langMatches" 0 "ex:regex" 0 "ex:replace" 0}
-                                                       {"id"      "ex:string-fns"
-                                                        "ex:text" "Abcdefg"}]})
+                                             "insert"   [{"id"              "ex:create-predicates"
+                                                          "ex:strLen"       0 "ex:subStr"    0 "ex:ucase"    0
+                                                          "ex:lcase"        0 "ex:strStarts" 0 "ex:strEnds"  0
+                                                          "ex:contains"     0 "ex:strBefore" 0 "ex:strAfter" 0
+                                                          "ex:encodeForUri" 0 "ex:concat"    0
+                                                          "ex:langMatches"  0 "ex:regex"     0 "ex:replace"  0}
+                                                         {"id"      "ex:string-fns"
+                                                          "ex:text" "Abcdefg"}]})
                         (fluree/stage2 {"@context" "https://ns.flur.ee"
-                                        "where"  [{"id"      "?s"
-                                                   "ex:text" "?text"}
+                                        "where"    [{"id"      "?s"
+                                                     "ex:text" "?text"}
                                                   ["bind"
                                                    "?strlen" "(strLen ?text)"
                                                    "?sub1" "(subStr ?text 5)"
@@ -270,19 +270,19 @@
                                                    "?strAfter" "(strAfter ?text \"bcd\")"
                                                    "?concatted" "(concat ?text \" \" \"STR1 \" \"STR2\")"
                                                    "?matched" "(regex ?text \"^Abc\")"]]
-                                        "insert" [{"id"           "?s"
-                                                   "ex:strStarts" "?a-start"
-                                                   "ex:strEnds"   "?a-end"
-                                                   "ex:subStr"    ["?sub1" "?sub2"]
-                                                   "ex:strLen"    "?strlen"
-                                                   "ex:ucase"     "?upcased"
-                                                   "ex:lcase"     "?downcased"
-                                                   "ex:contains"  "?contains"
-                                                   "ex:strBefore" "?strBefore"
-                                                   "ex:strAfter"  "?strAfter"
-                                                   "ex:concat"    "?concatted"
-                                                   "ex:regex"     "?matched"}]
-                                        "values" ["?s" ["ex:string-fns"]]}))]
+                                        "insert"   [{"id"           "?s"
+                                                     "ex:strStarts" "?a-start"
+                                                     "ex:strEnds"   "?a-end"
+                                                     "ex:subStr"    ["?sub1" "?sub2"]
+                                                     "ex:strLen"    "?strlen"
+                                                     "ex:ucase"     "?upcased"
+                                                     "ex:lcase"     "?downcased"
+                                                     "ex:contains"  "?contains"
+                                                     "ex:strBefore" "?strBefore"
+                                                     "ex:strAfter"  "?strAfter"
+                                                     "ex:concat"    "?concatted"
+                                                     "ex:regex"     "?matched"}]
+                                        "values"   ["?s" ["ex:string-fns"]]}))]
         (is (= {"ex:strEnds"   false
                 "ex:strStarts" false
                 "ex:contains"  false
@@ -306,23 +306,23 @@
       (with-redefs [fluree.db.query.exec.eval/uuid    (fn [] "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47")
                     fluree.db.query.exec.eval/struuid (fn [] "34bdb25f-9fae-419b-9c50-203b5f306e47")]
         (let [updated (-> @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                               "insert" [{"id"         "ex:create-predicates"
-                                                          "ex:isBlank" 0 "ex:isNumeric" 0 "ex:str" 0 "ex:uuid" 0
-                                                          "ex:struuid" 0 "ex:isNotNumeric" 0 "ex:isNotBlank" 0}
-                                                         ;; "ex:isIRI" 0 "ex:isURI" 0 "ex:isLiteral" 0 "ex:lang" 0
-                                                         ;; "ex:IRI" 0
-                                                         ;; "ex:datatype" 0 "ex:bnode" 0 "ex:strdt" 0 "ex:strLang" 0
+                                               "insert"   [{"id"         "ex:create-predicates"
+                                                            "ex:isBlank" 0 "ex:isNumeric"    0 "ex:str"        0 "ex:uuid" 0
+                                                            "ex:struuid" 0 "ex:isNotNumeric" 0 "ex:isNotBlank" 0}
+                                                           ;; "ex:isIRI" 0 "ex:isURI" 0 "ex:isLiteral" 0 "ex:lang" 0
+                                                           ;; "ex:IRI" 0
+                                                           ;; "ex:datatype" 0 "ex:bnode" 0 "ex:strdt" 0 "ex:strLang" 0
 
-                                                         {"id"        "ex:rdf-term-fns"
-                                                          "ex:text"   "Abcdefg"
-                                                          "ex:number" 1
-                                                          "ex:ref"    {"ex:bool" false}}
-                                                         {"ex:foo" "bar"}]})
+                                                           {"id"        "ex:rdf-term-fns"
+                                                            "ex:text"   "Abcdefg"
+                                                            "ex:number" 1
+                                                            "ex:ref"    {"ex:bool" false}}
+                                                           {"ex:foo" "bar"}]})
                           (fluree/stage2 {"@context" "https://ns.flur.ee"
-                                          "where"  [{"id"        "?s"
-                                                     "ex:text"   "?text"
-                                                     "ex:number" "?num"
-                                                     "ex:ref"    "?r"}
+                                          "where"    [{"id"        "?s"
+                                                       "ex:text"   "?text"
+                                                       "ex:number" "?num"
+                                                       "ex:ref"    "?r"}
                                                     ["bind"
                                                      "?str" "(str ?num)"
                                                      "?uuid" "(uuid)"
@@ -331,15 +331,15 @@
                                                      "?isNotBlank" "(isBlank ?num)"
                                                      "?isnum" "(isNumeric ?num)"
                                                      "?isNotNum" "(isNumeric ?text)"]]
-                                          "insert" [{"id"              "?s"
-                                                     "ex:uuid"         "?uuid"
-                                                     "ex:struuid"      "?struuid"
-                                                     "ex:str"          ["?str" "?str2"]
-                                                     "ex:isNumeric"    "?isnum"
-                                                     "ex:isNotNumeric" "?isNotNum"
-                                                     "ex:isBlank"      "?isBlank"
-                                                     "ex:isNotBlank"   "?isNotBlank"}]
-                                          "values" ["?s" ["ex:rdf-term-fns"]]}))]
+                                          "insert"   [{"id"              "?s"
+                                                       "ex:uuid"         "?uuid"
+                                                       "ex:struuid"      "?struuid"
+                                                       "ex:str"          ["?str" "?str2"]
+                                                       "ex:isNumeric"    "?isnum"
+                                                       "ex:isNotNumeric" "?isNotNum"
+                                                       "ex:isBlank"      "?isBlank"
+                                                       "ex:isNotBlank"   "?isNotBlank"}]
+                                          "values"   ["?s" ["ex:rdf-term-fns"]]}))]
           (is (= {"ex:str"          "1"
                   "ex:uuid"         "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"
                   "ex:struuid"      "34bdb25f-9fae-419b-9c50-203b5f306e47",
@@ -359,25 +359,25 @@
 
     (testing "functional forms"
       (let [updated (-> @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                             "insert" [{"id"               "ex:create-predicates"
-                                                        "ex:bound"         0
-                                                        "ex:if"            0
-                                                        "ex:coalesce"      0
-                                                        "ex:not-exists"    0
-                                                        "ex:exists"        0
-                                                        "ex:logical-or"    0
-                                                        "ex:logical-and"   0
-                                                        "ex:rdfterm-equal" 0
-                                                        "ex:sameTerm"      0
-                                                        "ex:in"            0
-                                                        "ex:not-in"        0}
-                                                       {"id"      "ex:functional-fns"
-                                                        "ex:text" "Abcdefg"}]})
+                                             "insert"   [{"id"               "ex:create-predicates"
+                                                          "ex:bound"         0
+                                                          "ex:if"            0
+                                                          "ex:coalesce"      0
+                                                          "ex:not-exists"    0
+                                                          "ex:exists"        0
+                                                          "ex:logical-or"    0
+                                                          "ex:logical-and"   0
+                                                          "ex:rdfterm-equal" 0
+                                                          "ex:sameTerm"      0
+                                                          "ex:in"            0
+                                                          "ex:not-in"        0}
+                                                         {"id"      "ex:functional-fns"
+                                                          "ex:text" "Abcdefg"}]})
                         (fluree/stage2 {"@context" "https://ns.flur.ee"
-                                        "where"  [{"id" "?s", "ex:text" "?text"}
+                                        "where"    [{"id" "?s", "ex:text" "?text"}
                                                   ["bind" "?bound" "(bound ?text)"]]
-                                        "insert" {"id" "?s", "ex:bound" "?bound"}
-                                        "values" ["?s" ["ex:functional-fns"]]}))]
+                                        "insert"   {"id" "?s", "ex:bound" "?bound"}
+                                        "values"   ["?s" ["ex:functional-fns"]]}))]
         (is (= {"ex:bound" true}
                @(fluree/query @updated {"selectOne" {"ex:functional-fns" ["ex:bound"
                                                                           "ex:if"
@@ -392,22 +392,22 @@
                                                                           "ex:not-in"]}})))))
     (testing "error handling"
       (let [db2       @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                           "insert" [{"id"       "ex:create-predicates"
-                                                      "ex:text"  0
-                                                      "ex:error" 0}
-                                                     {"id"      "ex:error"
-                                                      "ex:text" "Abcdefg"}]})
+                                           "insert"   [{"id"       "ex:create-predicates"
+                                                        "ex:text"  0
+                                                        "ex:error" 0}
+                                                       {"id"      "ex:error"
+                                                        "ex:text" "Abcdefg"}]})
             parse-err @(fluree/stage2 db2 {"@context" "https://ns.flur.ee"
-                                           "where"  [{"id" "?s", "ex:text" "?text"}
+                                           "where"    [{"id" "?s", "ex:text" "?text"}
                                                      ["bind" "?err" "(foo ?text)"]]
-                                           "insert" {"id" "?s", "ex:text" "?err"}
-                                           "values" ["?s" ["ex:error"]]})
+                                           "insert"   {"id" "?s", "ex:text" "?err"}
+                                           "values"   ["?s" ["ex:error"]]})
 
-            run-err   @(fluree/stage2 db2 {"@context" "https://ns.flur.ee"
-                                           "where"  [{"id" "?s", "ex:text" "?text"}
-                                                     ["bind" "?err" "(abs ?text)"]]
-                                           "insert" {"id" "?s", "ex:error" "?err"}
-                                           "values" ["?s" ["ex:error"]]})]
+            run-err @(fluree/stage2 db2 {"@context" "https://ns.flur.ee"
+                                         "where"    [{"id" "?s", "ex:text" "?text"}
+                                                   ["bind" "?err" "(abs ?text)"]]
+                                         "insert"   {"id" "?s", "ex:error" "?err"}
+                                         "values"   ["?s" ["ex:error"]]})]
         (is (= "Query function references illegal symbol: foo"
                (-> parse-err
                    Throwable->map

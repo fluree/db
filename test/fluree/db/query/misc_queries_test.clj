@@ -32,8 +32,8 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query-context" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage2 (fluree/db ledger) {"@context" "https://ns.flur.ee"
-                                                   "insert" [{:id :ex/dan :ex/x 1}
-                                                             {:id :ex/wes :ex/x 2}]})]
+                                                   "insert"   [{:id :ex/dan :ex/x 1}
+                                                               {:id :ex/wes :ex/x 2}]})]
 
     @(fluree/commit! ledger db)
 
@@ -132,7 +132,6 @@
                  [:schema/email :id "http://schema.org/email"]
                  [:schema/name :id "http://schema.org/name"]
                  [:ex/User :id "http://example.org/ns/User"]
-                 #_[:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
                  [:type :id "@type"]
                  [:id :id "@id"]}
                (set @(fluree/query db {:select ['?s '?p '?o]
@@ -212,7 +211,7 @@
                 {:id :schema/email}
                 {:id :schema/name}]
                (sort-by :id @(fluree/query db {:select {'?s ["*"]}
-                                       :where  {:id '?s, '?p '?o}})))
+                                               :where  {:id '?s, '?p '?o}})))
             "Every triple should be returned.")
         (let [db*    @(fluree/commit! ledger db)
               result @(fluree/query db* {:select ['?s '?p '?o]

@@ -10,27 +10,27 @@
           ledger @(fluree/create conn "query/compounda" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage2
                     (fluree/db ledger)
-                   {"@context" "https://ns.flur.ee"
-                    "insert"
-                    [{:id           :ex/brian,
-                      :type         :ex/User,
-                      :schema/name  "Brian"
-                      :schema/email "brian@example.org"
-                      :schema/age   50
-                      :ex/favNums   7}
-                     {:id           :ex/alice,
-                      :type         :ex/User,
-                      :schema/name  "Alice"
-                      :schema/email "alice@example.org"
-                      :schema/age   50
-                      :ex/favNums   [42, 76, 9]}
-                     {:id           :ex/cam,
-                      :type         :ex/User,
-                      :schema/name  "Cam"
-                      :schema/email "cam@example.org"
-                      :schema/age   34
-                      :ex/favNums   [5, 10]
-                      :ex/friend    [:ex/brian :ex/alice]}]})
+                    {"@context" "https://ns.flur.ee"
+                     "insert"
+                     [{:id           :ex/brian,
+                       :type         :ex/User,
+                       :schema/name  "Brian"
+                       :schema/email "brian@example.org"
+                       :schema/age   50
+                       :ex/favNums   7}
+                      {:id           :ex/alice,
+                       :type         :ex/User,
+                       :schema/name  "Alice"
+                       :schema/email "alice@example.org"
+                       :schema/age   50
+                       :ex/favNums   [42, 76, 9]}
+                      {:id           :ex/cam,
+                       :type         :ex/User,
+                       :schema/name  "Cam"
+                       :schema/email "cam@example.org"
+                       :schema/age   34
+                       :ex/favNums   [5, 10]
+                       :ex/friend    [:ex/brian :ex/alice]}]})
 
           two-tuple-select-with-crawl
           @(fluree/query db '{:select [?age {?f [:*]}]

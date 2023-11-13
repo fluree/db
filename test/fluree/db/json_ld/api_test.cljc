@@ -265,19 +265,19 @@
                ledger         @(fluree/create conn1 ledger-alias
                                               {:defaultContext ["" ledger-context]})
                db             @(fluree/stage2
-                     (fluree/db ledger)
-                     {"@context" "https://ns.flur.ee"
-                      "insert"
-                      [{:id             :ex/wes
-                        :type           :ex/User
-                        :schema/name    "Wes"
-                        :schema/email   "wes@example.org"
-                        :schema/age     42
-                        :schema/favNums [1 2 3]
-                        :ex/friend      {:id           :ex/jake
-                                         :type         :ex/User
-                                         :schema/name  "Jake"
-                                         :schema/email "jake@example.org"}}]})
+                                 (fluree/db ledger)
+                                 {"@context" "https://ns.flur.ee"
+                                  "insert"
+                                  [{:id             :ex/wes
+                                    :type           :ex/User
+                                    :schema/name    "Wes"
+                                    :schema/email   "wes@example.org"
+                                    :schema/age     42
+                                    :schema/favNums [1 2 3]
+                                    :ex/friend      {:id           :ex/jake
+                                                     :type         :ex/User
+                                                     :schema/name  "Jake"
+                                                     :schema/email "jake@example.org"}}]})
                db             @(fluree/commit! ledger db)
                target-t       (:t db)
                loaded         @(fluree/load conn1 ledger-alias)

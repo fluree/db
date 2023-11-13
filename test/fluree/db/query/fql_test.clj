@@ -197,7 +197,6 @@
   (testing "Querying ledgers loaded with language-tagged strings"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "jobs")
-          db0    (fluree/db ledger)
           db     @(fluree/stage2
                     (fluree/db ledger)
                     {"@context" ["https://ns.flur.ee"
@@ -247,14 +246,14 @@
                                 ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage2
                   (fluree/db ledger)
-                 {"@context" "https://ns.flur.ee"
-                  "insert"
-                  [{:id      :ex/homer
-                    :ex/name "Homer"
-                    :ex/age  36}
-                   {:id      :ex/bart
-                    :ex/name "Bart"
-                    :ex/age  "forever 10"}]})]
+                  {"@context" "https://ns.flur.ee"
+                   "insert"
+                   [{:id      :ex/homer
+                     :ex/name "Homer"
+                     :ex/age  36}
+                    {:id      :ex/bart
+                     :ex/name "Bart"
+                     :ex/age  "forever 10"}]})]
     (testing "including datatype in query results"
       (let [query   '{:select [?age ?dt]
                       :where  [{:ex/age ?age}

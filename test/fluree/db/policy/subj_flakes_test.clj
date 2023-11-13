@@ -98,14 +98,14 @@
           "Alice cannot see John's ssn.")
       (is (= 5
              (count alice-db-john))
-          "Alice can but can see John's everything but ssn.")
+          "Alice can see John's everything but ssn.")
 
       (is (= 1
              (count (filterv #(= ssn-sid (flake/p %)) alice-db-alice)))
           "Alice cannot see her own ssn.")
       (is (= 7
              (count alice-db-alice))
-          "Alice can but can see her own everything.")
+          "Alice can see her own everything.")
 
       (is (= []
              alice-db-widget)

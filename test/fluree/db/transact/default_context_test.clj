@@ -18,9 +18,9 @@
                              [util/current-time-iso
                               (constantly "1971-01-01T00:00:00.00000Z")]
                              @(test-utils/transact ledger {"@context" "https://ns.flur.ee"
-                                                           "insert"  [{:id   :ex/foo
-                                                                       :ex/x "foo-1"
-                                                                       :ex/y "bar-1"}]}))
+                                                           "insert"   [{:id   :ex/foo
+                                                                        :ex/x "foo-1"
+                                                                        :ex/y "bar-1"}]}))
         ledger1-load        @(fluree/load conn "default-context-update")
         db1-load            (fluree/db ledger1-load)
 
@@ -176,9 +176,9 @@
                                  [util/current-time-iso
                                   (constantly "1971-01-01T00:00:00.00000Z")]
                                  @(test-utils/transact ledger {"@context" "https://ns.flur.ee"
-                                                               "insert"  [{:id   :ex/foo
-                                                                           :ex/x "foo-1"
-                                                                           :ex/y "bar-1"}]}))
+                                                               "insert"   [{:id   :ex/foo
+                                                                            :ex/x "foo-1"
+                                                                            :ex/y "bar-1"}]}))
             _                   (fluree/default-context-at-t ledger 1)
 
             ledger1-load        (test-utils/retry-load

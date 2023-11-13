@@ -155,8 +155,8 @@
                  (:error (ex-data update-price)))
               "Exception should be of type :db/policy-exception"))
         (let [update-email @(fluree/stage2 db+policy {"@context" "https://ns.flur.ee"
-                                                      "insert" {:id          :ex/john
-                                                                :schema/email "john@foo.bar"}}
+                                                      "insert"   {:id           :ex/john
+                                                                  :schema/email "john@foo.bar"}}
                                           {:role :ex/user})]
 
           (is (util/exception? update-email)

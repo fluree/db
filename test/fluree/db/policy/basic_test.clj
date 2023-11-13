@@ -240,10 +240,10 @@
                             :id               :ex/john})
                 "Root can see John's ssn in commit details."))
           (let [_ @(test-utils/transact ledger {"@context" "https://ns.flur.ee"
-                                                "delete" {:id :ex/john
-                                                          :schema/name "John"}
-                                                "insert" {:id          :ex/john
-                                                          :schema/name "Jack"}})]
+                                                "delete"   {:id          :ex/john
+                                                            :schema/name "John"}
+                                                "insert"   {:id          :ex/john
+                                                            :schema/name "Jack"}})]
             (is (= [{:f/t       1,
                      :f/assert  [{:schema/name "John", :id :ex/john}],
                      :f/retract []}

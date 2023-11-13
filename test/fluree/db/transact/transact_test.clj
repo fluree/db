@@ -11,20 +11,20 @@
 
 (deftest ^:integration staging-data
   (testing "Disallow staging invalid transactions"
-    (let [conn             (test-utils/create-conn)
-          ledger           @(fluree/create conn "tx/disallow" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "tx/disallow" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
 
           stage-id-only    (try
                              @(fluree/stage2
                                 (fluree/db ledger)
                                 {"@context" "https://ns.flur.ee"
-                                 "insert" {:id :ex/alice}})
+                                 "insert"   {:id :ex/alice}})
                              (catch Exception e e))
           stage-empty-txn  (try
                              @(fluree/stage2
                                 (fluree/db ledger)
                                 {"@context" "https://ns.flur.ee"
-                                 "insert" {}})
+                                 "insert"   {}})
                              (catch Exception e e))
           stage-empty-node (try
                              @(fluree/stage2
@@ -54,7 +54,7 @@
                [:id :id "@id"]}
              (set @(fluree/query db-ok '{:select [?s ?p ?o]
                                          :where  {:id ?s
-                                                  ?p ?o}}))))))
+                                                  ?p  ?o}}))))))
 
   (testing "Allow transacting `false` values"
     (let [conn    (test-utils/create-conn)
@@ -63,10 +63,10 @@
                                    ["" {:ex "http://example.org/ns/"}]})
           db-bool @(fluree/stage2
                      (fluree/db ledger)
-                    {"@context" "https://ns.flur.ee"
-                     "insert"
-                     {:id        :ex/alice
-                      :ex/isCool false}})]
+                     {"@context" "https://ns.flur.ee"
+                      "insert"
+                      {:id        :ex/alice
+                       :ex/isCool false}})]
       (is (= #{[:ex/alice :id "http://example.org/ns/alice"]
                [:ex/alice :ex/isCool false]
                [:ex/isCool :id "http://example.org/ns/isCool"]
@@ -200,14 +200,14 @@
             ledger  @(fluree/create conn "movies2"
                                     {:defaultContext
                                      ["" {"ex" "https://example.com/"}]})
-            db (fluree/db ledger)
+            db      (fluree/db ledger)
             db0     @(fluree/stage2 db {"@context" "https://ns.flur.ee"
-                                        "insert" shacl})
+                                        "insert"   shacl})
             _       (assert (not (util/exception? db0)))
             db1     @(fluree/commit! ledger db0)
             _       (assert (not (util/exception? db1)))
             db2     @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
-                                         "insert"  movies})
+                                         "insert"   movies})
             _       (assert (not (util/exception? db2)))
             query   {"select" "?title"
                      "where"  {"@id"      "?m"

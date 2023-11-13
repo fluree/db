@@ -134,16 +134,16 @@
           root-did (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           db       @(fluree/stage2
                       (fluree/db ledger)
-                     {"@context" "https://ns.flur.ee"
-                      "insert"
-                      [{"id"     root-did
-                        "f:role" {"id" "ex:rootRole"}}
-                       {"id"           "ex:rootPolicy",
-                        "type"         ["f:Policy"],
-                        "f:targetNode" {"id" "f:allNodes"}
-                        "f:allow"      [{"id"           "ex:rootAccessAllow"
-                                         "f:targetRole" {"id" "ex:rootRole"}
-                                         "f:action"     [{"id" "f:view"} {"id" "f:modify"}]}]}]})]
+                      {"@context" "https://ns.flur.ee"
+                       "insert"
+                       [{"id"     root-did
+                         "f:role" {"id" "ex:rootRole"}}
+                        {"id"           "ex:rootPolicy",
+                         "type"         ["f:Policy"],
+                         "f:targetNode" {"id" "f:allNodes"}
+                         "f:allow"      [{"id"           "ex:rootAccessAllow"
+                                          "f:targetRole" {"id" "ex:rootRole"}
+                                          "f:action"     [{"id" "f:view"} {"id" "f:modify"}]}]}]})]
       (testing "Root policy contains {:root? true} for each applicable :f/action"
         (let [sid-root-did @(fluree/internal-id db root-did)
               sid-rootRole @(fluree/internal-id db :ex/rootRole)

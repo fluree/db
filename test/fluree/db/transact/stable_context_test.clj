@@ -16,22 +16,22 @@
                                                    :ex   "http://example.org/ns/"
                                                    :blah "http://blah.me/wow/ns/"}})
         db1      @(test-utils/transact ledger {"@context" "https://ns.flur.ee"
-                                               "insert" [{:id      :blah/one
-                                                          :ex/name "One"}]})
+                                               "insert"   [{:id      :blah/one
+                                                            :ex/name "One"}]})
         db1-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem-ld"
                                                    100))
 
         db2      (->> @(fluree/stage2 db1-load {"@context" "https://ns.flur.ee"
-                                                "insert" [{:id      :blah/two
-                                                           :ex/name "Two"}]})
+                                                "insert"   [{:id      :blah/two
+                                                             :ex/name "Two"}]})
                       (fluree/commit! ledger)
                       deref)
         db2-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem-ld"
                                                    100))
 
         db3      (->> @(fluree/stage2 db2-load {"@context" "https://ns.flur.ee"
-                                                "insert" [{:id      :blah/three
-                                                           :ex/name "Three"}]})
+                                                "insert"   [{:id      :blah/three
+                                                             :ex/name "Three"}]})
                       (fluree/commit! ledger)
                       deref)
         db3-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem-ld"

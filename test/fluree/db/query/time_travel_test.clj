@@ -129,7 +129,7 @@
           _       (with-redefs [util/current-time-iso (fn [] t2)]
                     @(fluree/transact!2 conn {"@context" "https://ns.flur.ee"
                                               "ledger"   "test/time1"
-                                              "insert"   [{"@id"     "ex:time-test"
+                                              "insert"   [{"@id"   "ex:time-test"
                                                           "ex:time" 2}]}))
           _       (with-redefs [util/current-time-iso (fn [] t2)]
                     @(fluree/transact!2 conn
