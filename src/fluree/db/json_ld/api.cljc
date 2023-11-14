@@ -226,7 +226,6 @@
    (let [result-ch (transact-api/stage db json-ld opts)]
      (promise-wrap result-ch))))
 
-
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
   aggregated together.
