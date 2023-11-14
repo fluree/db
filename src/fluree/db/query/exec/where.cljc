@@ -251,8 +251,8 @@
               (match-iri matched iri)
               matched))
           (catch* e
-                  (log/error e "Error looking up iri")
-                  (>! error-ch e)))))
+            (log/error e "Error looking up iri")
+            (>! error-ch e)))))
 
 (defn match-predicate-iri
   [db matched]
@@ -326,8 +326,8 @@
 
          idx         (try* (index/for-components s p o o-dt)
                            (catch* e
-                                   (log/error e "Error resolving flake range")
-                                   (async/put! error-ch e)))
+                             (log/error e "Error resolving flake range")
+                             (async/put! error-ch e)))
          idx-root    (get db idx)
          novelty     (get-in db [:novelty idx])
          [o* o-fn*]  (augment-object-fn idx s p o o-fn alias)
@@ -374,8 +374,8 @@
           (when-let [sid (<? (dbproto/-subid db s-iri {:expand? false}))]
             (match-sid s-mch db-alias sid)))
         (catch* e
-                (log/error e "Error resolving subject id")
-                (>! error-ch e)))))
+          (log/error e "Error resolving subject id")
+          (>! error-ch e)))))
 
 (defn resolve-predicate-sid
   [db p-mch]
