@@ -220,32 +220,6 @@
   (reset! shapes {:class {}
                   :pred  {}}))
 
-(defn vocab-map
-  "Returns a map of the schema for a db to allow quick lookups of schema properties.
-  Schema is a map with keys:
-  - :t - the 't' value when schema built, allows schema equality checks
-  - :coll - collection info, mapping cid->name and name->cid all within the same map
-  - :pred - predicate info, mapping pid->properties and name->properties for quick lookup based on id or name respectively
-  - :fullText - contains predicate ids that need fulltext search
-  "
-  [{:keys [t] :as db}]
-  (go-try
-    (let [vocab-flakes (<? (query-range/index-range db :spot
-                                                    >= [schema-util/schema-sid-end]
-                                                    <= [0]))
-          base-schema  (base-schema)
-          schema       (update-with* base-schema t vocab-flakes)
-          refs         (extract-ref-sids (:pred schema))]
-      (-> schema
-          (assoc :refs refs)))))
-
-(defn refresh-schema
-  "Updates the schema map of a db."
-  [db]
-  (go-try
-    (let [schema (<? (vocab-map db))]
-      (assoc db :schema schema))))
-
 (defn predicate-flakes-by-type
   "Returns a map of predicate flakes mapped by type"
   [flakes]

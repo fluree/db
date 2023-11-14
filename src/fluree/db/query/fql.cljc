@@ -1,12 +1,10 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! go]]
-            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.exec :as exec]
-            [fluree.db.query.exec.update :as update]
             [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
@@ -57,22 +55,3 @@
          (if (= :simple-subject-crawl (:strategy q))
            (simple-subject-crawl db* q)
            (exec/query db* fuel-tracker q)))))))
-
-(defn update?
-  [x]
-  (and (map? x)
-       (or (update/insert? x)
-           (update/retract? x))
-       (or (contains? x :where)
-           (contains? x "where")
-           (contains? x :values)
-           (contains? x "values"))))
-
-(defn modify
-  ([db t json-ld]
-   (modify db t nil json-ld))
-
-  ([db t fuel-tracker {:keys [opts] :as mdfn-map}]
-   (let [ctx  (ctx-util/extract db mdfn-map opts)
-         mdfn (parse/parse-modification mdfn-map ctx)]
-     (exec/modify db t fuel-tracker mdfn))))
