@@ -49,7 +49,7 @@
                                       {:subject txn})
           txn-context             (or (:context parsed-opts)
                                       (ctx-util/txn-context txn))
-          expanded                (json-ld/expand txn)
+          expanded                (json-ld/expand (ctx-util/use-fluree-context txn))
           opts                    (util/get-first-value expanded const/iri-opts)
           parsed-opts             (cond-> parsed-opts
                                     did (assoc :did did)
@@ -162,7 +162,7 @@
                                       {:subject txn})
 
           txn-context (ctx-util/txn-context txn)
-          expanded    (json-ld/expand txn)
+          expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
           ledger-id   (util/get-first-value expanded const/iri-ledger)
           _ (when-not ledger-id
               (throw (ex-info "Invalid transaction, missing required key: ledger."
@@ -187,7 +187,7 @@
                                       {:subject txn})
 
           txn-context (ctx-util/txn-context txn)
-          expanded    (json-ld/expand txn)
+          expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
           ledger-id   (util/get-first-value expanded const/iri-ledger)
           _ (when-not ledger-id
               (throw (ex-info "Invalid transaction, missing required key: ledger."
