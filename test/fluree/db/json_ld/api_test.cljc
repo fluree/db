@@ -1133,8 +1133,7 @@
                                                                       {"ex" "http://example.com/"}]})
            db0       (fluree/db ledger)]
        (testing "use default context"
-         (let [db1 @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
-                                        "insert"   {"@id" "ex:t1" "@type" "my:ContextTest" "ex:pred" true}})]
+         (let [db1 @(fluree/stage2 db0 {"insert" {"@id" "ex:t1" "@type" "my:ContextTest" "ex:pred" true}})]
 
            (is (= {"@id" "http://example.com/t1" "@type" "my:ContextTest" "http://example.com/pred" true}
                   @(fluree/query db1 {"@context"  nil
@@ -1142,7 +1141,7 @@
                "default context was used to expand")))
 
        (testing "use instead of default context"
-         (let [db2 @(fluree/stage2 db0 {"@context" ["https://ns.flur.ee" {"ex" "DEFAULTOVERRIDEN:ns/"}]
+         (let [db2 @(fluree/stage2 db0 {"@context" {"ex" "DEFAULTOVERRIDEN:ns/"}
                                         "insert"   {"@id" "ex:t2" "@type" "my:ContextTest" "ex:pred" true}})]
            (is (= {"@id" "DEFAULTOVERRIDEN:ns/t2" "@type" "my:ContextTest" "DEFAULTOVERRIDEN:ns/pred" true}
                   @(fluree/query db2 {"@context"  nil
@@ -1150,7 +1149,7 @@
                "supplied context used, default context not used")))
 
        (testing "use with default context"
-         (let [db3 @(fluree/stage2 db0 {"@context" ["https://ns.flur.ee" "" {"foo" "ns:foo/"}]
+         (let [db3 @(fluree/stage2 db0 {"@context" ["" {"foo" "ns:foo/"}]
                                         "insert"   {"@id" "ex:t3" "@type" "my:ContextTest" "ex:pred" {"@id" "foo:me"}}})]
            (is (= {"@id" "http://example.com/t3" "@type" "my:ContextTest" "http://example.com/pred" {"@id" "ns:foo/me"}}
                   @(fluree/query db3 {"@context"  nil
@@ -1158,8 +1157,7 @@
                "default context used, supplemented by supplied context")))
 
        (testing "use no context"
-         ;; clearing context with nil produces an error because `insert` can't be found
-         (let [db4 @(fluree/stage2 db0 {"@context" ["https://ns.flur.ee" {}]
+         (let [db4 @(fluree/stage2 db0 {"@context" nil
                                         "insert"   {"@id" "ex:t4" "@type" "my:ContextTest" "ex:pred" "not expanded"}})]
            (is (= {"@id" "ex:t4" "@type" "my:ContextTest" "ex:pred" "not expanded"}
                   @(fluree/query db4 {"@context"  nil
