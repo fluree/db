@@ -75,11 +75,11 @@
                                  {:defaultContext
                                   ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage (fluree/db ledger)
-                                 {"@context" "https://ns.flur.ee"
-                                  "insert"
-                                  {:id               :ex/brian
-                                   :ex/favCoffeeShop [:wiki/Q37158
-                                                      "Clemmons Coffee"]}})
+                                {"@context" "https://ns.flur.ee"
+                                 "insert"
+                                 {:id               :ex/brian
+                                  :ex/favCoffeeShop [:wiki/Q37158
+                                                     "Clemmons Coffee"]}})
           _db    @(fluree/commit! ledger db)
           loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
           db     (fluree/db loaded)
@@ -94,11 +94,11 @@
                                  {:defaultContext
                                   ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage (fluree/db ledger)
-                                 {"@context" "https://ns.flur.ee"
-                                  "insert"
-                                  {:id :ex/wes
-                                   :ex/aFewOfMyFavoriteThings
-                                   {"@list" [2011 "jabalí"]}}})
+                                {"@context" "https://ns.flur.ee"
+                                 "insert"
+                                 {:id :ex/wes
+                                  :ex/aFewOfMyFavoriteThings
+                                  {"@list" [2011 "jabalí"]}}})
           _db    @(fluree/commit! ledger db)
           loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
           db     (fluree/db loaded)
@@ -113,11 +113,11 @@
                                  {:defaultContext
                                   ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage (fluree/db ledger)
-                                 {"@context" "https://ns.flur.ee"
-                                  "insert"
-                                  {:id               :ex/brian
-                                   :ex/favCoffeeShop [:wiki/Q37158
-                                                      "Clemmons Coffee"]}})
+                                {"@context" "https://ns.flur.ee"
+                                 "insert"
+                                 {:id               :ex/brian
+                                  :ex/favCoffeeShop [:wiki/Q37158
+                                                     "Clemmons Coffee"]}})
           _db    @(fluree/commit! ledger db)
           loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
           db     (fluree/db loaded)
@@ -132,11 +132,11 @@
                                  {:defaultContext
                                   ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage (fluree/db ledger)
-                                 {"@context" "https://ns.flur.ee"
-                                  "insert"
-                                  {:id :ex/wes
-                                   :ex/aFewOfMyFavoriteThings
-                                   {"@list" [2011 "jabalí"]}}})
+                                {"@context" "https://ns.flur.ee"
+                                 "insert"
+                                 {:id :ex/wes
+                                  :ex/aFewOfMyFavoriteThings
+                                  {"@list" [2011 "jabalí"]}}})
           _db    @(fluree/commit! ledger db)
           loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
           db     (fluree/db loaded)
@@ -250,10 +250,10 @@
                                      ["" {:ex "http://example.org/ns/"}]})
         ;; can't `transact!` until ledger can be loaded (ie has at least one commit)
         db          @(fluree/stage (fluree/db ledger)
-                                    {"@context" "https://ns.flur.ee"
-                                     "insert"
-                                     {:id   :ex/firstTransaction
-                                      :type :ex/Nothing}})
+                                   {"@context" "https://ns.flur.ee"
+                                    "insert"
+                                    {:id   :ex/firstTransaction
+                                     :type :ex/Nothing}})
         _           @(fluree/commit! ledger db)
         user-query  '{:select {?s [:*]}
                       :where  {:id ?s, :type :ex/User}}]
@@ -497,3 +497,19 @@
     (is (= "Value alot cannot be coerced to provided datatype: 7."
            (ex-message db3))
         "datatype constraint is restored after a load")))
+
+(deftest ^:pending ^:integration unbound-var-in-insert-test
+  (testing "unbound var in insert clause returns parse error"
+    (let [conn   (test-utils/create-conn
+                  {:context      test-utils/default-str-context
+                   :context-type :string})
+          ledger @(fluree/create conn "unbound-var-in-insert")
+          result @(fluree/stage
+                   (fluree/db ledger)
+                   {"@context" "https://ns.flur.ee"
+                    "insert"
+                    {"@context"           ["" {"ex" "http://example.org/"}]
+                     "@id"                "ex:mosquitos"
+                     "schema:description" "?x"}})]
+      (is (= "variable ?x is unbound"
+             (ex-message result))))))
