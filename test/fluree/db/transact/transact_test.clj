@@ -502,3 +502,19 @@
     (is (= "Value alot cannot be coerced to provided datatype: 7."
            (ex-message db3))
         "datatype constraint is restored after a load")))
+
+(deftest ^:pending ^:integration unbound-var-in-insert-test
+  (testing "unbound var in insert clause returns parse error"
+    (let [conn   (test-utils/create-conn
+                  {:context      test-utils/default-str-context
+                   :context-type :string})
+          ledger @(fluree/create conn "unbound-var-in-insert")
+          result @(fluree/stage2
+                   (fluree/db ledger)
+                   {"@context" "https://ns.flur.ee"
+                    "insert"
+                    {"@context"           ["" {"ex" "http://example.org/"}]
+                     "@id"                "ex:mosquitos"
+                     "schema:description" "?x"}})]
+      (is (= "variable ?x is unbound"
+             (ex-message result))))))
