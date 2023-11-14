@@ -187,11 +187,10 @@
                  {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}}
                (set @(fluree/query db2 {"select" {"?s" ["*"]}
                                         "where"  {"@id" "?s", "ex:givenName" "?o"}}))))
-        (is (= [{"id" "ex:dan", "ex:givenName" "Dan"}
-                {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]
-               @(fluree/query db2 {"select" {"?s" ["*"]}
-                                   "where"  {"@id" "?s", "ex:firstName" "?o"}})))
-
+        (is (= #{{"id" "ex:dan", "ex:givenName" "Dan"}
+                 {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}}
+               (set @(fluree/query db2 {"select" {"?s" ["*"]}
+                                        "where"  {"@id" "?s", "ex:firstName" "?o"}}))))
         (is (= [["ex:other" true false]]
                @(fluree/query db2 {"select" ["?s" "?cool" "?fool"]
                                    "where"  {"@id"     "?s",
@@ -199,10 +198,10 @@
                                              "ex:fool" "?fool"}}))
             "handle list values"))
       (testing "after load"
-        (is (= [{"id" "ex:dan", "ex:givenName" "Dan"}
-                {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]
-               @(fluree/query dbl {"select" {"?s" ["*"]}
-                                   "where"  {"@id" "?s", "ex:givenName" "?o"}})))
+        (is (= #{{"id" "ex:dan", "ex:givenName" "Dan"}
+                 {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}}
+               (set @(fluree/query dbl {"select" {"?s" ["*"]}
+                                        "where"  {"@id" "?s", "ex:givenName" "?o"}}))))
         (is (= #{{"id" "ex:dan", "ex:givenName" "Dan"}
                  {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}}
                (set @(fluree/query dbl {"select" {"?s" ["*"]}
