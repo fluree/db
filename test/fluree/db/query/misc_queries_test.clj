@@ -355,12 +355,12 @@
       (is (= [[:ex/User]]
              @(fluree/query db '{:select [?class]
                                  :where  {:id :ex/jane, :type ?class}})))
-      (is (= [[:ex/jane :ex/User]
-              [:ex/bob :ex/User]
-              [:ex/alice :ex/User]
-              [:ex/dave :ex/nonUser]]
-             @(fluree/query db '{:select [?s ?class]
-                                 :where  {:id ?s, :type ?class}}))))
+      (is (= #{[:ex/jane :ex/User]
+               [:ex/bob :ex/User]
+               [:ex/alice :ex/User]
+               [:ex/dave :ex/nonUser]}
+             (set @(fluree/query db '{:select [?s ?class]
+                                      :where  {:id ?s, :type ?class}})))))
     (testing "shacl targetClass"
       (let [shacl-db @(fluree/stage
                         (fluree/db ledger)
