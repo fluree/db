@@ -1,5 +1,4 @@
-(ns fluree.db.constants
-  (:require [clojure.set :refer [map-invert]]))
+(ns fluree.db.constants)
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -239,25 +238,3 @@
 (def ^:const $_tag:id 30)
 
 (def ^:const $fluree:default-context 150)
-
-(def namespace->code
-  "iri namespace mapping. 0 signifies relative iris. 1-100 are reserved; user
-  supplied namespaces start at 101."
-  {"@"                                           1
-   "_:"                                          2
-   "https://ns.flur.ee/ledger#"                  3
-   "http://www.w3.org/2001/XMLSchema#"           4
-   "http://www.w3.org/1999/02/22-rdf-syntax-ns#" 5
-   "http://www.w3.org/2000/01/rdf-schema#"       6
-   "http://www.w3.org/ns/shacl#"                 7
-   "http://www.w3.org/2002/07/owl#"              8
-   "http://www.w3.org/2008/05/skos#"             9
-   "http://xmlns.com/foaf/0.1/"                  10
-   "http://schema.org/"                          11
-   "https://www.wikidata.org/wiki/"              12
-   "urn:uuid"                                    13
-   "urn:isbn:"                                   14
-   "urn:issn"                                    15})
-
-(def code->namespace
-  (map-invert namespace->code))
