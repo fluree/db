@@ -14,7 +14,7 @@
           ledger    @(fluree/create conn "policy/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
-          db        @(fluree/stage2
+          db        @(fluree/stage
                        (fluree/db ledger)
                        {"@context" "https://ns.flur.ee"
                         "insert"
@@ -45,7 +45,7 @@
                           :ex/user :ex/alice
                           :f/role  :ex/userRole}]})
 
-          db+policy @(fluree/stage2
+          db+policy @(fluree/stage
                        db
                        ;; add policy targeting :ex/rootRole that can view and modify everything
                        {"@context" "https://ns.flur.ee"
@@ -268,7 +268,7 @@
                                         :schema "http://schema.org/"
                                         :ex     "http://example.org/ns/"}})
           alice-did   "did:fluree:Tf6i5oh2ssYNRpxxUM2zea1Yo7x4uRqyTeU"
-          db          @(fluree/stage2
+          db          @(fluree/stage
                          (fluree/db ledger)
                          {"@context" "https://ns.flur.ee"
                           "insert"
@@ -286,7 +286,7 @@
                             :schema/price         99.99
                             :schema/priceCurrency "USD"
                             :ex/secret            "this is overpriced"}]})
-          db          @(fluree/stage2
+          db          @(fluree/stage
                          db
                          {"@context" "https://ns.flur.ee"
                           "insert"
@@ -328,7 +328,7 @@
 
         alice-did    "did:fluree:Tf6i5oh2ssYNRpxxUM2zea1Yo7x4uRqyTeU"
 
-        db1 @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+        db1 @(fluree/stage db0 {"@context" "https://ns.flur.ee"
                                  "insert" [{"id" "ex:alice"
                                             "type" "ex:User"
                                             "ex:secret" "alice's secret"}

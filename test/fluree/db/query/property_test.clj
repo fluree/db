@@ -16,7 +16,7 @@
                    "owl"    "http://www.w3.org/2002/07/owl#"}
           db      (-> ledger
                       (fluree/db)
-                      (fluree/stage2 {"@context" ["https://ns.flur.ee" context]
+                      (fluree/stage {"@context" ["https://ns.flur.ee" context]
                                       "insert"   [{"@id"   "vocab1:givenName"
                                                    "@type" "rdf:Property"}
                                                   {"@id"                    "vocab2:firstName"
@@ -26,7 +26,7 @@
                                                    "@type"                  "rdf:Property"
                                                    "owl:equivalentProperty" {"@id" "vocab2:firstName"}}]})
                       deref
-                      (fluree/stage2 {"@context" ["https://ns.flur.ee" context]
+                      (fluree/stage {"@context" ["https://ns.flur.ee" context]
                                       "insert"   [{"@id"              "ex:brian"
                                                    "ex:age"           50
                                                    "vocab1:givenName" "Brian"}
@@ -77,19 +77,19 @@
     (let [conn   @(fluree/connect {:method :memory})
           ledger @(fluree/create conn "propertypathstest" {:defaultContext [test-utils/default-str-context {"ex" "http://example.com/"}]})
           db0    (fluree/db ledger)
-          db1    @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+          db1    @(fluree/stage db0 {"@context" "https://ns.flur.ee"
                                       "insert" [{"@id"            "ex:unlabeled-pred"
                                                  "ex:description" "created as a subject first"}
                                                 {"@id"            "ex:labeled-pred"
                                                  "@type"          "rdf:Property"
                                                  "ex:description" "created as a subject first, labelled as Property"}]})
-          db2    @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
+          db2    @(fluree/stage db1 {"@context" "https://ns.flur.ee"
                                       "insert" [{"@id"               "ex:subject-as-predicate"
                                                  "ex:labeled-pred"   "labeled"
                                                  "ex:unlabeled-pred" "unlabeled"
                                                  "ex:new-pred"       {"@id"               "ex:nested"
                                                                       "ex:unlabeled-pred" "unlabeled-nested"}}]})
-          db3    @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
+          db3    @(fluree/stage db1 {"@context" "https://ns.flur.ee"
                                       "insert" [{"@id"               "ex:subject-as-predicate"
                                                  "ex:labeled-pred"   "labeled"
                                                  "ex:unlabeled-pred" {"@id"               "ex:nested"
@@ -150,13 +150,13 @@
                                     {:defaultContext
                                      ["" {"ex"  "http://example.com/"
                                           "owl" "http://www.w3.org/2002/07/owl#"}]})
-          db0       (->> @(fluree/stage2 (fluree/db ledger) {"@context" "https://ns.flur.ee"
+          db0       (->> @(fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
                                                              "insert"   {"ex:new" true}})
                          (fluree/commit! ledger)
                          (deref))
 
 
-          db1 @(fluree/transact!2
+          db1 @(fluree/transact!
                  conn {"ledger"   ledger-id
                        "@context" "https://ns.flur.ee"
                        "insert"
@@ -169,7 +169,7 @@
                                                             {"@id"   "ex:fool"
                                                              "@type" "rdf:Property"}]}}]})
 
-          db2    @(fluree/transact!2
+          db2    @(fluree/transact!
                     conn {"ledger"   ledger-id
                           "@context" "https://ns.flur.ee"
                           "insert"   [{"@id"          "ex:andrew"

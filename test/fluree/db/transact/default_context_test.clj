@@ -37,7 +37,7 @@
                                    "insert"  [{:id       :ex-new/foo2
                                                :ex-new/x "foo-2"
                                                :ex-new/y "bar-2"}]}
-                                  (fluree/stage2 db-update-ctx)
+                                  (fluree/stage db-update-ctx)
                                   deref
                                   (fluree/commit! ledger)
                                   deref))
@@ -198,7 +198,7 @@
                                        "insert"  [{:id       :ex-new/foo2
                                                    :ex-new/x "foo-2"
                                                    :ex-new/y "bar-2"}]}
-                                      (fluree/stage2 db-update-ctx)
+                                      (fluree/stage db-update-ctx)
                                       deref
                                       (fluree/commit! ledger)
                                       deref))

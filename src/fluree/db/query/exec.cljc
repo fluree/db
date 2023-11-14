@@ -71,14 +71,3 @@
       (let [track-fuel (fuel/track fuel-tracker)]
         (async/transduce track-fuel into flakeset flake-ch))
       (async/reduce into flakeset flake-ch))))
-
-(defn modify
-  [db t fuel-tracker mdfn]
-  (go
-    (let [error-ch  (async/chan)
-          update-ch (->> (where/search db mdfn fuel-tracker error-ch)
-                         (update/modify db mdfn t fuel-tracker error-ch)
-                         (into-flakeset fuel-tracker))]
-      (async/alt!
-        error-ch ([e] e)
-        update-ch ([flakes] flakes)))))

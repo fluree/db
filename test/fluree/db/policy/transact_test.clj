@@ -12,7 +12,7 @@
           ledger    @(fluree/create conn "policy/tx-a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
-          db        @(fluree/stage2
+          db        @(fluree/stage
                        (fluree/db ledger)
                        {"@context" "https://ns.flur.ee"
                         "insert"
@@ -43,7 +43,7 @@
                           :ex/user :ex/alice
                           :f/role  [:ex/userRole :ex/otherRole]}]})
 
-          db+policy @(fluree/stage2
+          db+policy @(fluree/stage
                        db
                        {"@context" "https://ns.flur.ee"
                         "insert"
@@ -83,7 +83,7 @@
                                                       :f/action     [:f/view :f/modify]}]}]}]})]
       (testing "Policy allowed modification"
         (testing "using role + id"
-          (let [update-name @(fluree/stage2 db+policy
+          (let [update-name @(fluree/stage db+policy
                                             {"@context" "https://ns.flur.ee"
                                              "delete"
                                              {:id          :ex/alice
@@ -106,7 +106,7 @@
                                    :opts {:did alice-did}}))
                 "Alice should be allowed to update her own name.")))
         (testing "using role only"
-            (let [update-price @(fluree/stage2 db+policy
+            (let [update-price @(fluree/stage db+policy
                                                {"@context" "https://ns.flur.ee"
                                                 "delete"
                                                 {:id          :ex/widget
@@ -125,7 +125,7 @@
                                     {:select {'?s [:*]}
                                      :where  {:id '?s, :type :ex/Product}}))
                   "Updated :schema/price should have been allowed, and entire product is visible in query."))
-            (let [update-name @(fluree/stage2 db+policy
+            (let [update-name @(fluree/stage db+policy
                                               {"@context" "https://ns.flur.ee"
                                                "delete"
                                                {:id          :ex/widget
@@ -143,7 +143,7 @@
                                      :opts {:role :ex/userRole}}))
                   "Updated :schema/name should have been allowed, and only name is visible in query."))))
       (testing "Policy doesn't allow a modification"
-        (let [update-price @(fluree/stage2 db+policy {"@context" "https://ns.flur.ee"
+        (let [update-price @(fluree/stage db+policy {"@context" "https://ns.flur.ee"
                                                       "insert" {:id           :ex/widget
                                                                 :schema/price 42.99}}
                                           {:did root-did
@@ -154,7 +154,7 @@
           (is (= :db/policy-exception
                  (:error (ex-data update-price)))
               "Exception should be of type :db/policy-exception"))
-        (let [update-email @(fluree/stage2 db+policy {"@context" "https://ns.flur.ee"
+        (let [update-email @(fluree/stage db+policy {"@context" "https://ns.flur.ee"
                                                       "insert"   {:id           :ex/john
                                                                   :schema/email "john@foo.bar"}}
                                           {:role :ex/user})]
@@ -165,7 +165,7 @@
           (is (= :db/policy-exception
                  (:error (ex-data update-email)))
               "exception should be of type :db/policy-exception"))
-        (let [update-name-other-role @(fluree/stage2 db+policy {"@context" "https://ns.flur.ee"
+        (let [update-name-other-role @(fluree/stage db+policy {"@context" "https://ns.flur.ee"
                                                                 "insert" {:id          :ex/widget
                                                                           :schema/name "Widget2"}}
                                                     {:did alice-did

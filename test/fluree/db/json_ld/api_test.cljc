@@ -23,7 +23,7 @@
              check1       @(fluree/exists? conn ledger-alias)
              ledger       @(fluree/create conn ledger-alias)
              check2       @(fluree/exists? conn ledger-alias)
-             _            @(fluree/stage2 (fluree/db ledger)
+             _            @(fluree/stage (fluree/db ledger)
                                           {"@context" "https://ns.flur.ee"
                                            "insert"
                                            [{:id :f/me
@@ -36,7 +36,7 @@
        (let [conn         (test-utils/create-conn)
              ledger-alias "testledger"
              ledger       @(fluree/create conn ledger-alias)
-             db           @(fluree/stage2 (fluree/db ledger)
+             db           @(fluree/stage (fluree/db ledger)
                                           {"@context" "https://ns.flur.ee"
                                            "insert"
                                            [{:id           :f/me
@@ -52,7 +52,7 @@
           (let [conn         (<! (test-utils/create-conn))
                 ledger-alias "testledger"
                 ledger       (<p! (fluree/create conn ledger-alias))
-                db           (<p! (fluree/stage2 (fluree/db ledger)
+                db           (<p! (fluree/stage (fluree/db ledger)
                                                  {"@context" "https://ns.flur.ee"
                                                   "insert"
                                                   [{:id           :f/me
@@ -88,7 +88,7 @@
                                  :context-type :keyword}})
                ledger-alias "load-from-file-test-single-card"
                ledger       @(fluree/create conn ledger-alias {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-               db           @(fluree/stage2
+               db           @(fluree/stage
                                (fluree/db ledger)
                                {"@context" "https://ns.flur.ee"
                                 "insert"
@@ -108,7 +108,7 @@
                                   :ex/favNums   5
                                   :ex/friend    :ex/brian}]})
                db        @(fluree/commit! ledger db)
-               db        @(fluree/stage2
+               db        @(fluree/stage
                             db
                             {"@context" "https://ns.flur.ee"
                              "insert"
@@ -131,7 +131,7 @@
                                  :context-type :keyword}})
                ledger-alias "load-from-file-test-multi-card"
                ledger       @(fluree/create conn ledger-alias {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-               db           @(fluree/stage2
+               db           @(fluree/stage
                                (fluree/db ledger)
                                {"@context" "https://ns.flur.ee"
                                 "insert"
@@ -157,7 +157,7 @@
                                   :ex/favNums   [5 10]
                                   :ex/friend    [:ex/brian :ex/alice]}]})
                db        @(fluree/commit! ledger db)
-               db        @(fluree/stage2
+               db        @(fluree/stage
                             db
                             ;; test a multi-cardinality retraction
                             {"@context" "https://ns.flur.ee"
@@ -185,7 +185,7 @@
                ledger-alias   "load-from-file-with-context"
                ledger         @(fluree/create conn ledger-alias
                                               {:defaultContext ["" ledger-context]})
-               db             @(fluree/stage2
+               db             @(fluree/stage
                                  (fluree/db ledger)
                                  {"@context" "https://ns.flur.ee"
                                   "insert"
@@ -232,7 +232,7 @@
                ledger-alias   "load-from-file-query"
                ledger         @(fluree/create conn ledger-alias
                                               {:defaultContext ["" ledger-context]})
-               db             @(fluree/stage2
+               db             @(fluree/stage
                                  (fluree/db ledger)
                                  {"@context" "https://ns.flur.ee"
                                   "insert"
@@ -264,7 +264,7 @@
                ledger-alias   "load-from-file-with-context"
                ledger         @(fluree/create conn1 ledger-alias
                                               {:defaultContext ["" ledger-context]})
-               db             @(fluree/stage2
+               db             @(fluree/stage
                                  (fluree/db ledger)
                                  {"@context" "https://ns.flur.ee"
                                   "insert"
@@ -298,7 +298,7 @@
                                  :context-type :keyword}})
                ledger-alias "load-lists-test"
                ledger       @(fluree/create conn ledger-alias)
-               db           @(fluree/stage2
+               db           @(fluree/stage
                                (fluree/db ledger)
                                {"@context" "https://ns.flur.ee"
                                 "insert"
@@ -337,7 +337,7 @@
                                    :context-type :keyword}})
                  ledger-alias "load-policy-test"
                  ledger       @(fluree/create conn ledger-alias)
-                 db           @(fluree/stage2
+                 db           @(fluree/stage
                                  (fluree/db ledger)
                                  {"@context" "https://ns.flur.ee"
                                   "insert"
@@ -353,7 +353,7 @@
                                    {:id      "did:fluree:123"
                                     :ex/user :ex/alice
                                     :f/role  :ex/userRole}]})
-                 db+policy    @(fluree/stage2
+                 db+policy    @(fluree/stage
                                  db
                                  {"@context" "https://ns.flur.ee"
                                   "insert"
@@ -409,7 +409,7 @@
                                         {:context (merge test-utils/default-str-context
                                                          {"ex" "http://example.org/ns/"})}})
                ledger @(fluree/create conn "index/datetimes")
-               db     @(fluree/stage2
+               db     @(fluree/stage
                          (fluree/db ledger)
                          {"@context" "https://ns.flur.ee"
                           "insert"
@@ -445,7 +445,7 @@
                               :context-type :keyword}})
              ledger-alias "load-from-memory-test-single-card"
              ledger       @(fluree/create conn ledger-alias {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-             db           @(fluree/stage2
+             db           @(fluree/stage
                              (fluree/db ledger)
                              {"@context" "https://ns.flur.ee"
                               "insert"
@@ -464,7 +464,7 @@
                                 :ex/favNums   5
                                 :ex/friend    :ex/brian}]})
              db           @(fluree/commit! ledger db)
-             db           @(fluree/stage2
+             db           @(fluree/stage
                              db
                              {"@context" "https://ns.flur.ee"
                               "insert"
@@ -486,7 +486,7 @@
                               :context-type :keyword}})
              ledger-alias "load-from-memory-test-multi-card"
              ledger       @(fluree/create conn ledger-alias {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-             db           @(fluree/stage2
+             db           @(fluree/stage
                              (fluree/db ledger)
                              {"@context" "https://ns.flur.ee"
                               "insert"
@@ -512,7 +512,7 @@
                                 :ex/favNums   [5 10]
                                 :ex/friend    [:ex/brian :ex/alice]}]})
              db           @(fluree/commit! ledger db)
-             db           @(fluree/stage2
+             db           @(fluree/stage
                              db
                              ;; test a multi-cardinality retraction
                              {"@context" "https://ns.flur.ee"
@@ -539,7 +539,7 @@
              ledger-alias   "load-from-memory-with-context"
              ledger         @(fluree/create conn ledger-alias
                                             {:defaultContext ["" ledger-context]})
-             db             @(fluree/stage2
+             db             @(fluree/stage
                                (fluree/db ledger)
                                {"@context" "https://ns.flur.ee"
                                 "insert"
@@ -583,7 +583,7 @@
              ledger-alias   "load-from-memory-query"
              ledger         @(fluree/create conn ledger-alias
                                             {:defaultContext ["" ledger-context]})
-             db             @(fluree/stage2
+             db             @(fluree/stage
                                (fluree/db ledger)
                                {"@context" "https://ns.flur.ee"
                                 "insert"
@@ -610,7 +610,7 @@
                               :context-type :keyword}})
              ledger-alias "load-lists-test"
              ledger       @(fluree/create conn ledger-alias)
-             db           @(fluree/stage2
+             db           @(fluree/stage
                              (fluree/db ledger)
                              {"@context" "https://ns.flur.ee"
                               "insert"
@@ -647,7 +647,7 @@
                                 :context-type :keyword}})
                ledger-alias "load-policy-test"
                ledger       @(fluree/create conn ledger-alias)
-               db           @(fluree/stage2
+               db           @(fluree/stage
                                (fluree/db ledger)
                                {"@context" "https://ns.flur.ee"
                                 "insert"
@@ -663,7 +663,7 @@
                                  {:id      "did:fluree:123"
                                   :ex/user :ex/alice
                                   :f/role  :ex/userRole}]})
-               db+policy    @(fluree/stage2
+               db+policy    @(fluree/stage
                                db
                                {"@context" "https://ns.flur.ee"
                                 "insert"
@@ -761,7 +761,7 @@
                                     :context-type :keyword}})
              ledger-alias      "tx/delete"
              ledger            @(fluree/create conn ledger-alias {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-             db1               @(fluree/stage2
+             db1               @(fluree/stage
                                   (fluree/db ledger)
                                   {"@context" "https://ns.flur.ee"
                                    "insert"
@@ -783,7 +783,7 @@
              _                 @(fluree/commit! ledger db1)
              loaded1           (test-utils/retry-load conn ledger-alias 100)
              loaded-db1        (fluree/db loaded1)
-             db2               @(fluree/stage2
+             db2               @(fluree/stage
                                   loaded-db1
                                   {"@context" "https://ns.flur.ee"
                                    "where" {:id :ex/mosquitos, "?p" "?o"}
@@ -794,7 +794,7 @@
          (is (= [{:id :ex/fluree} {:id :ex/w3c} {:id :ex/kittens}]
                 @(fluree/query loaded-db2 description-query))
              "The id :ex/mosquitos should be removed")
-         (let [db3        @(fluree/stage2
+         (let [db3        @(fluree/stage
                              loaded-db2
                              {"@context" "https://ns.flur.ee"
                               "delete" {:id "?s", "?p" "?o"}
@@ -842,7 +842,7 @@
              db0    (fluree/db ledger)]
          (testing "transactions"
            (testing "with the `:meta` option"
-             (let [response    @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}
+             (let [response    @(fluree/stage db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}
                                               {:meta true})
                    db          (:result response)
                    flake-total (- (-> db :stats :flakes)
@@ -852,16 +852,16 @@
                       (:fuel response))
                    "Reports fuel for all the generated flakes")))
            (testing "without the `:meta` option"
-             (let [response @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people})]
+             (let [response @(fluree/stage db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people})]
                (is (nil? (:fuel response))
                    "Returns no fuel")))
            (testing "short-circuits if request fuel exhausted"
-             (let [response @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}
+             (let [response @(fluree/stage db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people}
                                             {:maxFuel 1})]
                (is (re-find #"Fuel limit exceeded"
                             (-> response ex-cause ex-message))))))
          (testing "queries"
-           (let [db          @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people})
+           (let [db          @(fluree/stage db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people})
                  flake-total (-> db :stats :flakes)
                  query       '{:select [?s ?p ?o]
                                :where  {:id ?s
@@ -880,7 +880,7 @@
                              :where  {:id ?s
                                       ?p ?o}
                              :opts   {:max-fuel 1}}
-                   db      @(fluree/stage2 db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people})
+                   db      @(fluree/stage db0 {"@context" "https://ns.flur.ee" "insert" test-utils/people})
                    results @(fluree/query db query)]
                (is (util/exception? results))
                (is (re-find #"Fuel limit exceeded"
@@ -896,7 +896,7 @@
                  db0    (fluree/db ledger)]
              (testing "transactions"
                (testing "with the `:meta` option"
-                 (let [response    (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                 (let [response    (<p! (fluree/stage db0 {"@context" "https://ns.flur.ee"
                                                             "insert" test-utils/people} {:meta true}))
                        db          (:result response)
                        flake-total (- (-> db :stats :flakes)
@@ -904,20 +904,20 @@
                    (is (= flake-total (:fuel response))
                        "Reports fuel for all the generated flakes")))
                (testing "without the `:meta` option"
-                 (let [response (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                 (let [response (<p! (fluree/stage db0 {"@context" "https://ns.flur.ee"
                                                          "insert" test-utils/people}))]
                    (is (nil? (:fuel response))
                        "Returns no fuel")))
                (testing "short-circuits if request fuel exhausted"
                  (let [response (try
-                                  (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                  (<p! (fluree/stage db0 {"@context" "https://ns.flur.ee"
                                                            "insert" test-utils/people}
                                                       {:maxFuel 1}))
                                   (catch :default e (ex-cause e)))]
                    (is (re-find #"Fuel limit exceeded"
                                 (-> response ex-cause ex-message))))))
              (testing "queries"
-               (let [db          (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+               (let [db          (<p! (fluree/stage db0 {"@context" "https://ns.flur.ee"
                                                           "insert" test-utils/people}))
                      flake-total (-> db :stats :flakes)
                      query       '{:select [?s ?p ?o]
@@ -937,7 +937,7 @@
                                  :where  {:id ?s
                                           ?p ?o}
                                  :opts   {:max-fuel 1}}
-                       db      (<p! (fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                       db      (<p! (fluree/stage db0 {"@context" "https://ns.flur.ee"
                                                         "insert" test-utils/people}))
                        results (try
                                  (<p! (fluree/query db query))
@@ -954,7 +954,7 @@
            ledger @(fluree/create conn ledger-id {:defaultContext [test-utils/default-str-context {"ex" "ns:ex/"}]})
            db0    (fluree/db ledger)
 
-           db1 @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+           db1 @(fluree/stage db0 {"@context" "https://ns.flur.ee"
                                     "insert" [{"@id" "ex:dp"
                                                "ex:name" "Dan"
                                                "ex:child" [{"@id" "ex:ap" "ex:name" "AP"}
@@ -962,7 +962,7 @@
                                                "ex:spouse" [{"@id" "ex:kp" "ex:name" "KP"
                                                              "ex:spouse" {"@id" "ex:dp"}}]}]})
 
-           db2 @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
+           db2 @(fluree/stage db1 {"@context" "https://ns.flur.ee"
                                     "where" {"id" "?s", "ex:name" "?name"}
                                     "delete" {"@id" "?s" "ex:name" "?name"}
                                     "insert" {"@graph"
@@ -979,7 +979,7 @@
                                                  "ex:zip" {"@value" 55105 "@type" "ex:PostalCode"}
                                                  "ex:state" "MN"}
                                                 "ex:favs" {"@list" ["Persey" {"@id" "ex:dp"}]}}]}})
-           db3 @(fluree/stage2 db2 {"@context" "https://ns.flur.ee"
+           db3 @(fluree/stage db2 {"@context" "https://ns.flur.ee"
                                     "insert" {"@type" "sh:NodeShape"
                                               "sh:targetClass" {"@id" "ex:Friend"}
                                               "sh:property"
@@ -987,7 +987,7 @@
                                                 "sh:maxCount" 1
                                                 "sh:datatype" {"@id" "xsd:string"}}]}})
 
-           db4 @(fluree/stage2 db3 {"@context" "https://ns.flur.ee"
+           db4 @(fluree/stage db3 {"@context" "https://ns.flur.ee"
                                     "insert" {"@id" "ex:mp"
                                               "@type" "ex:Friend"
                                               "ex:nickname" "Murrseph Gordon-Levitt"}})
@@ -995,7 +995,7 @@
            root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
            alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
 
-           db5 @(fluree/stage2 db3 {"@context" "https://ns.flur.ee"
+           db5 @(fluree/stage db3 {"@context" "https://ns.flur.ee"
                                     "insert" {"@graph"
                                               [{"@id" root-did "f:role" {"@id" "ex:rootRole"}}
                                                {"@id" alice-did "f:role" {"@id" "ex:userRole"} "ex:user" {"@id" "ex:alice"}}
@@ -1033,7 +1033,7 @@
                                                                                      [{"@id" "f:$identity"}
                                                                                       {"@id" "ex:user"}]}}}}]}})
 
-           db6 @(fluree/stage2 db5 {"@context" "https://ns.flur.ee",
+           db6 @(fluree/stage db5 {"@context" "https://ns.flur.ee",
                                     "insert" [{"@id" "schema:givenName", "@type" "rdf:Property"}
                                               {"@id" "ex:firstName",
                                                "@type" "rdf:Property",
@@ -1042,7 +1042,7 @@
                                                "@type" "rdf:Property",
                                                "owl:equivalentProperty" {"@id" "ex:firstName"}}]})
 
-           db7 @(fluree/stage2 db6 {"@context" "https://ns.flur.ee",
+           db7 @(fluree/stage db6 {"@context" "https://ns.flur.ee",
                                     "insert" [{"@id" "ex:andrew", "schema:givenName" "Andrew"}
                                               {"@id" "ex:freddy", "foaf:name" "Freddy"}
                                               {"@id" "ex:letty", "ex:firstName" "Leticia"}
@@ -1133,7 +1133,7 @@
                                                                       {"ex" "http://example.com/"}]})
            db0       (fluree/db ledger)]
        (testing "use default context"
-         (let [db1 @(fluree/stage2 db0 {"insert" {"@id" "ex:t1" "@type" "my:ContextTest" "ex:pred" true}})]
+         (let [db1 @(fluree/stage db0 {"insert" {"@id" "ex:t1" "@type" "my:ContextTest" "ex:pred" true}})]
 
            (is (= {"@id" "http://example.com/t1" "@type" "my:ContextTest" "http://example.com/pred" true}
                   @(fluree/query db1 {"@context"  nil
@@ -1141,24 +1141,24 @@
                "default context was used to expand")))
 
        (testing "use instead of default context"
-         (let [db2 @(fluree/stage2 db0 {"@context" {"ex" "DEFAULTOVERRIDEN:ns/"}
-                                        "insert"   {"@id" "ex:t2" "@type" "my:ContextTest" "ex:pred" true}})]
+         (let [db2 @(fluree/stage db0 {"@context" {"ex" "DEFAULTOVERRIDEN:ns/"}
+                                       "insert"   {"@id" "ex:t2" "@type" "my:ContextTest" "ex:pred" true}})]
            (is (= {"@id" "DEFAULTOVERRIDEN:ns/t2" "@type" "my:ContextTest" "DEFAULTOVERRIDEN:ns/pred" true}
                   @(fluree/query db2 {"@context"  nil
                                       "selectOne" {"DEFAULTOVERRIDEN:ns/t2" ["*"]}}))
                "supplied context used, default context not used")))
 
        (testing "use with default context"
-         (let [db3 @(fluree/stage2 db0 {"@context" ["" {"foo" "ns:foo/"}]
-                                        "insert"   {"@id" "ex:t3" "@type" "my:ContextTest" "ex:pred" {"@id" "foo:me"}}})]
+         (let [db3 @(fluree/stage db0 {"@context" ["" {"foo" "ns:foo/"}]
+                                       "insert"   {"@id" "ex:t3" "@type" "my:ContextTest" "ex:pred" {"@id" "foo:me"}}})]
            (is (= {"@id" "http://example.com/t3" "@type" "my:ContextTest" "http://example.com/pred" {"@id" "ns:foo/me"}}
                   @(fluree/query db3 {"@context"  nil
                                       "selectOne" {"http://example.com/t3" ["*"]}}))
                "default context used, supplemented by supplied context")))
 
        (testing "use no context"
-         (let [db4 @(fluree/stage2 db0 {"@context" nil
-                                        "insert"   {"@id" "ex:t4" "@type" "my:ContextTest" "ex:pred" "not expanded"}})]
+         (let [db4 @(fluree/stage db0 {"@context" nil
+                                       "insert"   {"@id" "ex:t4" "@type" "my:ContextTest" "ex:pred" "not expanded"}})]
            (is (= {"@id" "ex:t4" "@type" "my:ContextTest" "ex:pred" "not expanded"}
                   @(fluree/query db4 {"@context"  nil
                                       "selectOne" {"ex:t4" ["*"]}}))

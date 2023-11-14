@@ -124,7 +124,7 @@
     (let [conn   (test-utils/create-conn)
           movies (test-utils/load-movies conn)]
       (testing "define @list container in context"
-        (let [db        @(fluree/stage2 (fluree/db movies)
+        (let [db        @(fluree/stage (fluree/db movies)
                                         {"@context" "https://ns.flur.ee"
                                          "insert"
                                          {:context {:id      "@id"
@@ -139,7 +139,7 @@
                  query-res)
               "Order of query result is different from transaction.")))
       (testing "define @list directly on subject"
-        (let [db        @(fluree/stage2 (fluree/db movies)
+        (let [db        @(fluree/stage (fluree/db movies)
                                         {"@context" "https://ns.flur.ee"
                                          "insert"
                                          {:context {:id      "@id"
@@ -156,7 +156,7 @@
 (deftest ^:integration simple-subject-crawl-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/simple-subject-crawl" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-        db     @(fluree/stage2
+        db     @(fluree/stage
                   (fluree/db ledger)
                   {"@context" "https://ns.flur.ee"
                    "insert"

@@ -8,7 +8,7 @@
   (testing "Testing various 'union' query clauses."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/union" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-          db     @(fluree/stage2
+          db     @(fluree/stage
                     (fluree/db ledger)
                     {"@context" "https://ns.flur.ee"
                      "insert"
