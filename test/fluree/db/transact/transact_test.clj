@@ -150,6 +150,32 @@
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
              @(fluree/query db query))))))
 
+(deftest ^:pending object-var-test
+  (testing "var in object position works"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "var-in-obj")
+          db1    @(fluree/stage2
+                   (fluree/db ledger)
+                   {"@context" ["https://ns.flur.ee" {"ex" "http://example.org/"}]
+                    "insert"   {"@id"       "ex:jane"
+                                "ex:friend" {"@id"           "ex:alice"
+                                             "ex:bestFriend" {"@id" "ex:bob"}}}})
+          db2    @(fluree/stage2
+                   db1
+                   {"@context" ["https://ns.flur.ee" {"ex" "http://example.org/"}]
+                    "where"    {"@id"       "?s"
+                                "ex:friend" {"ex:bestFriend" "?bestFriend"}}
+                    "insert"   {"@id"          "?s"
+                                "ex:friendBFF" {"@id" "?bestFriend"}}})]
+      (is (= [{"@id"          "ex:jane"
+               "ex:friend"    {"@id" "ex:alice", "ex:bestFriend" {"@id" "ex:bob"}}
+               "ex:friendBFF" {"@id" "ex:bob"}}]
+             @(fluree/query
+               db2
+               {"@context" {"ex" "http://example.org/"}
+                "select"   {"ex:jane" ["*"]}
+                "depth"    3}))))))
+
 (deftest policy-ordering-test
   (testing "transaction order does not affect query results"
     (let [conn            (test-utils/create-conn)
