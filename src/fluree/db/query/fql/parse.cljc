@@ -8,7 +8,7 @@
             [clojure.set :as set]
             [clojure.walk :refer [postwalk]]
             [fluree.json-ld :as json-ld]
-            [fluree.db.util.core :as util :refer [try* catch* get-first-value]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.validation :as v]
             [fluree.db.constants :as const]
@@ -342,7 +342,7 @@
   [[_ & optionals] vars context]
   (into []
         (comp (map (fn [clause]
-                 (parse-where-clause clause vars context)))
+                     (parse-where-clause clause vars context)))
               (map (partial where/->pattern :optional)))
         optionals))
 
@@ -574,30 +574,41 @@
 
 (declare parse-subj-cmp)
 (defn parse-obj-cmp
-  [bnode-counter subj-cmp pred-cmp m triples {:keys [list id value type language] :as v-map}]
-  (cond list
-        (reduce (fn [triples [i list-item]]
-                  (parse-obj-cmp bnode-counter subj-cmp pred-cmp {:i i} triples list-item))
-                triples
-                (map vector (range) list))
+  [bnode-counter subj-cmp pred-cmp m triples
+   {:keys [list id value type language] :as v-map}]
+  (log/trace "parse-obj-cmp v-map:" v-map)
+  (cond
+    list
+    (reduce (fn [triples [i list-item]]
+              (parse-obj-cmp bnode-counter subj-cmp pred-cmp {:i i} triples list-item))
+            triples
+            (map vector (range) list))
 
-        ;; literal object
-        (some? value)
-        (let [m*      (cond-> m language (assoc :lang language))
-              obj-cmp (if (v/variable? value)
-                        (parse-variable value)
-                        (where/anonymous-value value type m*))]
-          (conj triples [subj-cmp pred-cmp obj-cmp]))
+    ;; literal object
+    (some? value)
+    (let [m*      (cond-> m language (assoc :lang language))
+          obj-cmp (if (v/variable? value)
+                    (parse-variable value)
+                    (where/anonymous-value value type m*))]
+      (conj triples [subj-cmp pred-cmp obj-cmp]))
 
-        ;; ref object
-        :else
-        (let [ref-cmp (cond-> (where/match-iri (if (nil? id) (temp-bnode-id bnode-counter) id))
-                        m (assoc ::where/meta m))
-              v-map* (if (nil? id)
-                       ;; project newly created bnode-id into v-map
-                       (assoc v-map :id (where/get-iri ref-cmp))
-                       v-map)]
-          (conj (parse-subj-cmp bnode-counter triples v-map*) [subj-cmp pred-cmp ref-cmp]))))
+    ;; ref object
+    :else
+    (let [ref-obj (if (v/variable? id)
+                    (parse-variable id)
+                    (where/match-iri
+                     (if (nil? id)
+                       (temp-bnode-id bnode-counter)
+                       id)))
+          ref-cmp (if m
+                    (assoc ref-obj ::where/meta m)
+                    ref-obj)
+          v-map*  (if (nil? id)
+                    ;; project newly created bnode-id into v-map
+                    (assoc v-map :id (where/get-iri ref-cmp))
+                    v-map)]
+      (conj (parse-subj-cmp bnode-counter triples v-map*)
+            [subj-cmp pred-cmp ref-cmp]))))
 
 (defn parse-pred-cmp
   [bnode-counter subj-cmp triples [pred values]]
