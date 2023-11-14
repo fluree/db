@@ -15,19 +15,21 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "ledger/datatype")]
     (testing "Querying predicates with mixed datatypes"
-      (let [mixed-db @(fluree/stage (fluree/db ledger)
-                                    [{:context     default-context
-                                      :id          :ex/coco
-                                      :type        :schema/Person
-                                      :schema/name "Coco"}
-                                     {:context     default-context
-                                      :id          :ex/halie
-                                      :type        :schema/Person
-                                      :schema/name "Halie"}
-                                     {:context     default-context
-                                      :id          :ex/john
-                                      :type        :schema/Person
-                                      :schema/name 3}])]
+      (let [mixed-db @(fluree/stage2 (fluree/db ledger)
+                                     {"@context" "https://ns.flur.ee"
+                                      "insert"
+                                      [{:context     default-context
+                                        :id          :ex/coco
+                                        :type        :schema/Person
+                                        :schema/name "Coco"}
+                                       {:context     default-context
+                                        :id          :ex/halie
+                                        :type        :schema/Person
+                                        :schema/name "Halie"}
+                                       {:context     default-context
+                                        :id          :ex/john
+                                        :type        :schema/Person
+                                        :schema/name 3}]})]
         (is (= [{:id          :ex/halie
                  :type        :schema/Person
                  :schema/name "Halie"}]

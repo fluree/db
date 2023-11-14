@@ -137,7 +137,8 @@
   (go-try
     (let [expanded-commit (json-ld/expand commit-map)
           ledger-alias    (get-first-value expanded-commit const/iri-alias)
-          ledger          (cached-ledger conn ledger-alias)]
+          ledger          (some-> (cached-ledger conn ledger-alias)
+                                  <?)]
       (if ledger
         (<? (ledger-proto/-notify ledger expanded-commit))
         (log/debug "No cached ledger found for commit: " commit-map)))))

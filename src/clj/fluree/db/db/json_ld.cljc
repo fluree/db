@@ -89,7 +89,7 @@
                                            :error  :db/invalid-ident})))
 
                         :else
-                        (throw (ex-info (str "Entid lookup must be a number or valid two-tuple identity: " (pr-str ident))
+                        (throw (ex-info (str "Entid lookup must be a number: " (pr-str ident))
                                         {:status 400
                                          :error  :db/invalid-ident})))]
           (cond

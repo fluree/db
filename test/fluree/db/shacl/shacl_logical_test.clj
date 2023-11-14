@@ -13,48 +13,58 @@
                                             ["" {:ex "http://example.org/ns/"}]})
           user-query       {:select {'?s [:*]}
                             :where  {:id '?s, :type :ex/User}}
-          db               @(fluree/stage
+          db               @(fluree/stage2
                               (fluree/db ledger)
-                              {:id             :ex/UserShape
-                               :type           [:sh/NodeShape]
-                               :sh/targetClass :ex/User
-                               :sh/not         [{:sh/path     :schema/companyName
-                                                 :sh/minCount 1}
-                                                {:sh/path   :schema/name
-                                                 :sh/equals :schema/callSign}]
-                               :sh/property    [{:sh/path     :schema/callSign
-                                                 :sh/minCount 1
-                                                 :sh/maxCount 1
-                                                 :sh/datatype :xsd/string}]})
-          db-ok            @(fluree/stage
+                              {"@context" "https://ns.flur.ee"
+                               "insert"
+                               {:id             :ex/UserShape
+                                :type           [:sh/NodeShape]
+                                :sh/targetClass :ex/User
+                                :sh/not         [{:sh/path     :schema/companyName
+                                                  :sh/minCount 1}
+                                                 {:sh/path   :schema/name
+                                                  :sh/equals :schema/callSign}]
+                                :sh/property    [{:sh/path     :schema/callSign
+                                                  :sh/minCount 1
+                                                  :sh/maxCount 1
+                                                  :sh/datatype :xsd/string}]}})
+          db-ok            @(fluree/stage2
                               db
-                              {:id              :ex/john,
-                               :type            [:ex/User],
-                               :schema/name     "John"
-                               :schema/callSign "j-rock"})
+                              {"@context" "https://ns.flur.ee"
+                               "insert"
+                               {:id              :ex/john,
+                                :type            [:ex/User],
+                                :schema/name     "John"
+                                :schema/callSign "j-rock"}})
           db-company-name  (try
-                             @(fluree/stage
+                             @(fluree/stage2
                                 db
-                                {:id                 :ex/john,
-                                 :type               [:ex/User],
-                                 :schema/companyName "WrongCo"
-                                 :schema/callSign    "j-rock"})
+                                {"@context" "https://ns.flur.ee"
+                                 "insert"
+                                 {:id                 :ex/john,
+                                  :type               [:ex/User],
+                                  :schema/companyName "WrongCo"
+                                  :schema/callSign    "j-rock"}})
                              (catch Exception e e))
           db-two-names     (try
-                             @(fluree/stage
+                             @(fluree/stage2
                                 db
-                                {:id                 :ex/john,
-                                 :type               [:ex/User],
-                                 :schema/companyName ["John", "Johnny"]
-                                 :schema/callSign    "j-rock"})
+                                {"@context" "https://ns.flur.ee"
+                                 "insert"
+                                 {:id                 :ex/john,
+                                  :type               [:ex/User],
+                                  :schema/companyName ["John", "Johnny"]
+                                  :schema/callSign    "j-rock"}})
                              (catch Exception e e))
           db-callsign-name (try
-                             @(fluree/stage
+                             @(fluree/stage2
                                 db
-                                {:id              :ex/john
-                                 :type            [:ex/User]
-                                 :schema/name     "Johnny Boy"
-                                 :schema/callSign "Johnny Boy"})
+                                {"@context" "https://ns.flur.ee"
+                                 "insert"
+                                 {:id              :ex/john
+                                  :type            [:ex/User]
+                                  :schema/name     "Johnny Boy"
+                                  :schema/callSign "Johnny Boy"}})
                              (catch Exception e e))
           ok-results       @(fluree/query db-ok user-query)]
       (is (util/exception? db-company-name))
@@ -80,50 +90,60 @@
                                         ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
                         :where  {:id '?s, :type :ex/User}}
-          db           @(fluree/stage
+          db           @(fluree/stage2
                           (fluree/db ledger)
-                          {:id             :ex/UserShape
-                           :type           [:sh/NodeShape]
-                           :sh/targetClass :ex/User
-                           :sh/not         [{:sh/path         :schema/age
-                                             :sh/minInclusive 130}
-                                            {:sh/path         :schema/favNums
-                                             :sh/maxExclusive 9000}]
-                           :sh/property    [{:sh/path     :schema/age
-                                             :sh/minCount 1
-                                             :sh/maxCount 1
-                                             :sh/datatype :xsd/long}]})
-          db-ok        @(fluree/stage
+                          {"@context" "https://ns.flur.ee"
+                           "insert"
+                           {:id             :ex/UserShape
+                            :type           [:sh/NodeShape]
+                            :sh/targetClass :ex/User
+                            :sh/not         [{:sh/path         :schema/age
+                                              :sh/minInclusive 130}
+                                             {:sh/path         :schema/favNums
+                                              :sh/maxExclusive 9000}]
+                            :sh/property    [{:sh/path     :schema/age
+                                              :sh/minCount 1
+                                              :sh/maxCount 1
+                                              :sh/datatype :xsd/long}]}})
+          db-ok        @(fluree/stage2
                           db
-                          {:id              :ex/john,
-                           :type            [:ex/User],
-                           :schema/name     "John"
-                           :schema/callSign "j-rock"
-                           :schema/age      42
-                           :schema/favNums  [9004 9008 9015 9016 9023 9042]})
-          db-too-old   @(fluree/stage
+                          {"@context" "https://ns.flur.ee"
+                           "insert"
+                           {:id              :ex/john,
+                            :type            [:ex/User],
+                            :schema/name     "John"
+                            :schema/callSign "j-rock"
+                            :schema/age      42
+                            :schema/favNums  [9004 9008 9015 9016 9023 9042]}})
+          db-too-old   @(fluree/stage2
                           db
-                          {:id                 :ex/john,
-                           :type               [:ex/User],
-                           :schema/companyName "WrongCo"
-                           :schema/callSign    "j-rock"
-                           :schema/age         131})
-          db-too-low   @(fluree/stage
+                          {"@context" "https://ns.flur.ee"
+                           "insert"
+                           {:id                 :ex/john,
+                            :type               [:ex/User],
+                            :schema/companyName "WrongCo"
+                            :schema/callSign    "j-rock"
+                            :schema/age         131}})
+          db-too-low   @(fluree/stage2
                           db
-                          {:id                 :ex/john,
-                           :type               [:ex/User],
-                           :schema/companyName ["John", "Johnny"]
-                           :schema/callSign    "j-rock"
-                           :schema/age         27
-                           :schema/favNums     [4 8 15 16 23 42]})
-          db-two-probs @(fluree/stage
+                          {"@context" "https://ns.flur.ee"
+                           "insert"
+                           {:id                 :ex/john,
+                            :type               [:ex/User],
+                            :schema/companyName ["John", "Johnny"]
+                            :schema/callSign    "j-rock"
+                            :schema/age         27
+                            :schema/favNums     [4 8 15 16 23 42]}})
+          db-two-probs @(fluree/stage2
                           db
-                          {:id              :ex/john
-                           :type            [:ex/User]
-                           :schema/name     "Johnny Boy"
-                           :schema/callSign "Johnny Boy"
-                           :schema/age      900
-                           :schema/favNums  [4 8 15 16 23 42]})
+                          {"@context" "https://ns.flur.ee"
+                           "insert"
+                           {:id              :ex/john
+                            :type            [:ex/User]
+                            :schema/name     "Johnny Boy"
+                            :schema/callSign "Johnny Boy"
+                            :schema/age      900
+                            :schema/favNums  [4 8 15 16 23 42]}})
           ok-results   @(fluree/query db-ok user-query)]
       (is (util/exception? db-too-old))
       (is (= "SHACL PropertyShape exception - sh:not sh:minInclusive: value 131 must be less than 130."
@@ -151,50 +171,64 @@
                                       ["" {:ex "http://example.org/ns/"}]})
           user-query {:select {'?s [:*]}
                       :where  {:id '?s, :type :ex/User}}
-          db         @(fluree/stage
+          db         @(fluree/stage2
                         (fluree/db ledger)
-                        {:id             :ex/UserShape
-                         :type           [:sh/NodeShape]
-                         :sh/targetClass :ex/User
-                         :sh/not         [{:sh/path      :ex/tag
-                                           :sh/minLength 4}
-                                          {:sh/path      :schema/name
-                                           :sh/maxLength 10}
-                                          {:sh/path    :ex/greeting
-                                           :sh/pattern "hello.*"}]})
-          db-ok-name @(fluree/stage
+                        {"@context" "https://ns.flur.ee"
+                         "insert"
+                         {:id             :ex/UserShape
+                          :type           [:sh/NodeShape]
+                          :sh/targetClass :ex/User
+                          :sh/not         [{:sh/path      :ex/tag
+                                            :sh/minLength 4}
+                                           {:sh/path      :schema/name
+                                            :sh/maxLength 10}
+                                           {:sh/path    :ex/greeting
+                                            :sh/pattern "hello.*"}]}})
+          db-ok-name @(fluree/stage2
                         db
-                        {:id          :ex/jean-claude
-                         :type        :ex/User,
-                         :schema/name "Jean-Claude"})
-          db-ok-tag  @(fluree/stage
+                        {"@context" "https://ns.flur.ee"
+                         "insert"
+                         {:id          :ex/jean-claude
+                          :type        :ex/User,
+                          :schema/name "Jean-Claude"}})
+          db-ok-tag  @(fluree/stage2
                         db
-                        {:id     :ex/al,
-                         :type   :ex/User,
-                         :ex/tag 1})
+                        {"@context" "https://ns.flur.ee"
+                         "insert"
+                         {:id     :ex/al,
+                          :type   :ex/User,
+                          :ex/tag 1}})
 
-          db-ok-greeting        @(fluree/stage
+          db-ok-greeting        @(fluree/stage2
                                    db
-                                   {:id          :ex/al,
-                                    :type        :ex/User,
-                                    :ex/greeting "HOWDY"})
-          db-name-too-short     (try @(fluree/stage
+                                   {"@context" "https://ns.flur.ee"
+                                    "insert"
+                                    {:id          :ex/al,
+                                     :type        :ex/User,
+                                     :ex/greeting "HOWDY"}})
+          db-name-too-short     (try @(fluree/stage2
                                         db
-                                        {:id          :ex/john,
-                                         :type        [:ex/User],
-                                         :schema/name "John"})
+                                        {"@context" "https://ns.flur.ee"
+                                         "insert"
+                                         {:id          :ex/john,
+                                          :type        [:ex/User],
+                                          :schema/name "John"}})
                                      (catch Exception e e))
-          db-tag-too-long       (try @(fluree/stage
+          db-tag-too-long       (try @(fluree/stage2
                                         db
-                                        {:id     :ex/john,
-                                         :type   [:ex/User],
-                                         :ex/tag 12345})
+                                        {"@context" "https://ns.flur.ee"
+                                         "insert"
+                                         {:id     :ex/john,
+                                          :type   [:ex/User],
+                                          :ex/tag 12345}})
                                      (catch Exception e e))
-          db-greeting-incorrect (try @(fluree/stage
+          db-greeting-incorrect (try @(fluree/stage2
                                         db
-                                        {:id          :ex/john,
-                                         :type        [:ex/User],
-                                         :ex/greeting "hello!"})
+                                        {"@context" "https://ns.flur.ee"
+                                         "insert"
+                                         {:id          :ex/john,
+                                          :type        [:ex/User],
+                                          :ex/greeting "hello!"}})
                                      (catch Exception e e))]
       (is (util/exception? db-name-too-short))
       (is (= "SHACL PropertyShape exception - sh:not sh:maxLength: value John must have string length greater than 10."

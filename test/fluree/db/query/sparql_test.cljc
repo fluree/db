@@ -333,7 +333,8 @@
          (go
           (let [conn   (<! (test-utils/create-conn {:context-type :string}))
                 ledger (<p! (fluree/create conn "people"))
-                db     (<p! (fluree/stage (fluree/db ledger) people-data))]
+                db     (<p! (fluree/stage2 (fluree/db ledger) {"@context" "https://ns.flur.ee"
+                                                               "insert" people-data}))]
             (testing "basic query works"
               (let [query   "SELECT ?person ?fullName
                              WHERE {?person person:handle \"jdoe\".
@@ -353,7 +354,8 @@
                                       ["" {"person" "http://example.org/Person#"}]})
                       deref
                       fluree/db
-                      (fluree/stage people-data)
+                      (fluree/stage2 {"@context" "https://ns.flur.ee"
+                                      "insert" people-data})
                       deref)]
          (testing "keyword context-type throws an error"
            (let [kw-conn @(fluree/connect {:method   :memory
@@ -542,7 +544,8 @@
                            "type"                          "http://example.org/Book"
                            "http://example.org/book/title" "The Hitchhiker's Guide to the Galaxy"}]]
            (testing "BASE IRI gets prefixed onto relative IRIs"
-             (let [book-db @(fluree/stage db book-data)
+             (let [book-db @(fluree/stage2 db {"@context" "https://ns.flur.ee"
+                                               "insert" book-data})
                    query   "BASE <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book <title> ?title.}"
@@ -551,7 +554,8 @@
                        ["2" "The Hitchhiker's Guide to the Galaxy"]]
                       results))))
            (testing "PREFIX declarations go into the context"
-             (let [book-db @(fluree/stage db book-data)
+             (let [book-db @(fluree/stage2 db {"@context" "https://ns.flur.ee"
+                                               "insert" book-data})
                    query   "PREFIX book: <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book book:title ?title.}"
