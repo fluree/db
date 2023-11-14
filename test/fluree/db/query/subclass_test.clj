@@ -3,8 +3,7 @@
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]))
 
-;; TODO: this is fixed in another branch
-(deftest ^:pending subclass-test
+(deftest subclass-test
   (testing "Subclass queries work."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/subclass")
@@ -67,7 +66,7 @@
                                   :where  {:id '?s, :type :schema/CreativeWork}})))
           "CreativeWork query should return both Book and Movie"))))
 
-(deftest ^:pending ^:integration subclass-inferencing-test
+(deftest ^:integration subclass-inferencing-test
   (testing "issue core/48"
     (let [conn        (test-utils/create-conn
                        {:context      test-utils/default-str-context
@@ -116,7 +115,7 @@
              (set @(fluree/query db2 {"where"  {"@id" "?s", "@type" "ex:Humanoid"}
                                       "select" {"?s" ["*"]}})))))))
 
-(deftest ^:pending ^:integration subclass-inferencing-after-load-test
+(deftest ^:integration subclass-inferencing-after-load-test
   (testing "issue core/48"
     (let [conn        (test-utils/create-conn
                        {:context      test-utils/default-str-context
