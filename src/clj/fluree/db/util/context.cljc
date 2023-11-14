@@ -198,13 +198,24 @@
 (defn txn-context
   "Remove the fluree context from the supplied context."
   [txn]
-  (validate-txn-context txn)
-  (let [supplied-context (->> (get txn "@context" (:context txn))
-                              (util/sequential)
-                              (remove #{"https://ns.flur.ee"}))]
+  (let [supplied-context (when (or (contains? txn :context)
+                                   (contains? txn "@context"))
+                              (->> (get txn "@context" (:context txn))
+                                   (util/sequential)
+                                   (remove #{"https://ns.flur.ee"})))]
+
     (if (seq supplied-context)
       supplied-context
       ::dbproto/default-context)))
+
+(defn use-fluree-context
+  "Clobber the top-level context and use the fluree context. This is only intended to be
+  use for the initial expansion of the top-level document, where all the keys should be
+  fluree vocabulary terms."
+  [txn]
+  (-> txn
+      (dissoc :context "@context")
+      (assoc "@context" "https://ns.flur.ee")))
 
 (defn extract
   [db jsonld opts]

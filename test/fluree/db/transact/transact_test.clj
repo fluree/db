@@ -13,30 +13,25 @@
   (testing "Disallow staging invalid transactions"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "tx/disallow" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          db0    (fluree/db ledger)
 
-          stage-id-only    (try
-                             @(fluree/stage2
-                                (fluree/db ledger)
-                                {"@context" "https://ns.flur.ee"
-                                 "insert"   {:id :ex/alice}})
-                             (catch Exception e e))
-          stage-empty-txn  (try
-                             @(fluree/stage2
-                                (fluree/db ledger)
-                                {"@context" "https://ns.flur.ee"
-                                 "insert"   {}})
-                             (catch Exception e e))
-          stage-empty-node (try
-                             @(fluree/stage2
-                                (fluree/db ledger)
-                                {"@context" "https://ns.flur.ee"
-                                 "insert"
-                                 [{:id         :ex/alice
-                                   :schema/age 42}
-                                  {}]})
-                             (catch Exception e e))
+          stage-id-only    @(fluree/stage2
+                              db0
+                              {"@context" "https://ns.flur.ee"
+                               "insert"   {:id :ex/alice}})
+          stage-empty-txn  @(fluree/stage2
+                              db0
+                              {"@context" "https://ns.flur.ee"
+                               "insert"   {}})
+          stage-empty-node @(fluree/stage2
+                              db0
+                              {"@context" "https://ns.flur.ee"
+                               "insert"
+                               [{:id         :ex/alice
+                                 :schema/age 42}
+                                {}]})
           db-ok            @(fluree/stage2
-                              (fluree/db ledger)
+                              db0
                               {"@context" "https://ns.flur.ee"
                                "insert"
                                {:id         :ex/alice
