@@ -7,7 +7,7 @@
   (testing "Retractions of individual properties and entire subjects."
     (let [conn           (test-utils/create-conn)
           ledger         @(fluree/create conn "tx/retract")
-          db             @(fluree/stage2
+          db             @(fluree/stage
                             (fluree/db ledger)
                             {"@context" "https://ns.flur.ee"
                              "insert"
@@ -25,7 +25,7 @@
                                          :schema/name "Jane"
                                          :schema/age  30}]}})
           ;; retract Alice's age attribute
-          db-age-retract @(fluree/stage2
+          db-age-retract @(fluree/stage
                             db
                             {"@context" "https://ns.flur.ee"
                              "delete"

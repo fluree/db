@@ -219,11 +219,11 @@
 
 
 
-(defn stage2
+(defn stage
   "Performs a transaction and queues change if valid (does not commit)"
-  ([db json-ld] (stage2 db json-ld nil))
+  ([db json-ld] (stage db json-ld nil))
   ([db json-ld opts]
-   (let [result-ch (transact-api/stage2 db json-ld opts)]
+   (let [result-ch (transact-api/stage db json-ld opts)]
      (promise-wrap result-ch))))
 
 
@@ -241,12 +241,12 @@
    (promise-wrap
      (ledger-proto/-commit! ledger db opts))))
 
-(defn transact!2
+(defn transact!
   [conn txn]
   (promise-wrap
-    (transact-api/transact!2 conn txn)))
+    (transact-api/transact! conn txn)))
 
-(defn create-with-txn2
+(defn create-with-txn
   [conn txn]
   (promise-wrap
     (transact-api/create-with-txn conn txn)))

@@ -18,7 +18,7 @@
           parsed-opts
           opts))
 
-(defn stage2
+(defn stage
   [db txn parsed-opts]
   (go-try
     (let [{txn :subject did :did} (or (<? (cred/verify txn))
@@ -37,7 +37,7 @@
                               :cljs (util/current-time-millis))
               fuel-tracker (fuel/tracker maxFuel)]
           (try*
-            (let [result (<? (tx/stage2 db fuel-tracker expanded parsed-opts*))]
+            (let [result (<? (tx/stage db fuel-tracker expanded parsed-opts*))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start-time)
@@ -47,9 +47,9 @@
                               {:time (util/response-time-formatted start-time)
                                :fuel (fuel/tally fuel-tracker)}
                               e)))))
-        (<? (tx/stage2 db expanded parsed-opts*))))))
+        (<? (tx/stage db expanded parsed-opts*))))))
 
-(defn transact!2
+(defn transact!
   [conn txn]
   (go-try
     (let [{txn :subject did :did} (or (<? (cred/verify txn))
@@ -71,7 +71,7 @@
       (if-not (<? (nameservice/exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))
         (let [ledger (<? (jld-ledger/load conn address))
-              db     (<? (stage2 (ledger-proto/-db ledger) txn parsed-opts))]
+              db     (<? (stage (ledger-proto/-db ledger) txn parsed-opts))]
           (<? (ledger-proto/-commit! ledger db)))))))
 
 (defn create-with-txn
@@ -97,5 +97,5 @@
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
         (let [ledger (<? (jld-ledger/create conn ledger-id parsed-opts))
-              db     (<? (stage2 (ledger-proto/-db ledger) txn parsed-opts))]
+              db     (<? (stage (ledger-proto/-db ledger) txn parsed-opts))]
           (<? (ledger-proto/-commit! ledger db)))))))

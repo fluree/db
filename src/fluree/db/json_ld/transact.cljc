@@ -213,9 +213,9 @@
           <?
           dbproto/-rootdb))))
 
-(defn stage2
+(defn stage
   ([db txn parsed-opts]
-   (stage2 db nil txn parsed-opts))
+   (stage db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (go-try
      (let [db* (if-let [policy-opts (perm/policy-opts parsed-opts)]

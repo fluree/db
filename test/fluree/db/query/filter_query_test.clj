@@ -7,7 +7,7 @@
 (deftest ^:integration filter-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/filter" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-        db     @(fluree/stage2
+        db     @(fluree/stage
                   (fluree/db ledger)
                   {"@context" "https://ns.flur.ee"
                    "insert"

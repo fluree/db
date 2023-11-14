@@ -8,7 +8,7 @@
   (testing "Select index's subject id in query using special keyword"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/subid" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-          db     @(fluree/stage2
+          db     @(fluree/stage
                     (fluree/db ledger)
                     {"@context" "https://ns.flur.ee"
                      "insert"
@@ -31,7 +31,7 @@
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query-context" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-        db     @(fluree/stage2 (fluree/db ledger) {"@context" "https://ns.flur.ee"
+        db     @(fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
                                                    "insert"   [{:id :ex/dan :ex/x 1}
                                                                {:id :ex/wes :ex/x 2}]})]
 
@@ -95,7 +95,7 @@
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/everything" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-          db     @(fluree/stage2
+          db     @(fluree/stage
                     (fluree/db ledger)
                     {"@context" "https://ns.flur.ee"
                      "insert"
@@ -330,7 +330,7 @@
 (deftest ^:integration class-queries
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/class" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-        db     @(fluree/stage2
+        db     @(fluree/stage
                   (fluree/db ledger)
                   {"@context" "https://ns.flur.ee"
                    "insert"
@@ -362,7 +362,7 @@
              @(fluree/query db '{:select [?s ?class]
                                  :where  {:id ?s, :type ?class}}))))
     (testing "shacl targetClass"
-      (let [shacl-db @(fluree/stage2
+      (let [shacl-db @(fluree/stage
                         (fluree/db ledger)
                         {"@context" "https://ns.flur.ee"
                          "insert"
@@ -380,7 +380,7 @@
   (let [conn @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "type-handling" {:defaultContext [test-utils/default-str-context {"ex" "http://example.org/ns/"}]})
         db0 (fluree/db ledger)
-        db1 @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+        db1 @(fluree/stage db0 {"@context" "https://ns.flur.ee"
                                  "insert" [{"id" "ex:ace"
                                             "type" "ex:Spade"}
                                            {"id" "ex:king"
@@ -389,10 +389,10 @@
                                             "type" "ex:Heart"}
                                            {"id" "ex:jack"
                                             "type" "ex:Club"}]})
-        db2 @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
+        db2 @(fluree/stage db1 {"@context" "https://ns.flur.ee"
                                  "insert" [{"id" "ex:two"
                                             "rdf:type" "ex:Diamond"}]})
-        db3 @(fluree/stage2 db1 {"@context" ["https://ns.flur.ee" "" {"rdf:type" "@type"}]
+        db3 @(fluree/stage db1 {"@context" ["https://ns.flur.ee" "" {"rdf:type" "@type"}]
                                  "insert" {"id" "ex:two"
                                            "rdf:type" "ex:Diamond"}})]
     (is (= #{{"id" "ex:queen" "type" "ex:Heart"}
