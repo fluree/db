@@ -1,11 +1,11 @@
 (ns fluree.db.json-ld.vocab
-  (:require [fluree.db.flake :as flake]
-            [fluree.db.constants :as const]
-            [fluree.db.util.async :refer [<? go-try]]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.schema :as schema-util]
-            [clojure.set :as set]
-            [fluree.db.json-ld.ledger :as jld-ledger]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.log :as log]
+            [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -243,29 +243,49 @@
   "Updates the schema map of a db."
   [db]
   (go-try
-    (let [schema  (<? (vocab-map db))]
+    (let [schema (<? (vocab-map db))]
       (assoc db :schema schema))))
 
-(defn predicate-sids
-  "Extract predicate sids from flakes."
+(defn predicate-flakes-by-type
+  "Returns a map of predicate flakes mapped by type"
   [flakes]
-  (into #{}
-        (comp (filter flake/op)
-              (map
-                (fn [f]
-                  (let [p (flake/p f)
-                        o (flake/o f)]
-                    (->> [p
-                          ;; if p is a predicate ref, we know o is a predicate sid as well
-                          (when (contains? jld-ledger/predicate-refs p)
-                            o)
-                          ;; if p (type) has an o that says s is a predicate, include s as well
-                          (when (and (= p const/$rdf:type)
+  (reduce (fn [ps f]
+            (if (flake/op f)
+              (let [p         (flake/p f)
+                    o         (flake/o f)
+                    _         (log/trace "predicate-flakes-by-type p:" p "o:" o)
+                    pred-type (cond
+                                (and (= const/$rdf:type p)
                                      (jld-ledger/class-or-property-sid o))
-                            (flake/s f))]
-                         (remove nil?)))))
-              cat)
-        flakes))
+                                (do
+                                  (log/trace "predicate-flakes-by-type found ::class-or-prop pred")
+                                  ::class-or-prop)
+
+                                (jld-ledger/predicate-refs p)
+                                ::ref)]
+                (if pred-type
+                  (update ps pred-type (fnil conj #{}) f)
+                  ps))
+              ps))
+          {} flakes))
+
+(defn filter-vocab-flakes
+  "Filters out the vocab-flakes from all-flakes using the predicate-flakes map
+  (as returned by predicate-flakes-by-type)."
+  [predicate-flakes all-flakes]
+  (let [ref-flakes               (::ref predicate-flakes)
+        class-or-prop-flakes     (::class-or-prop predicate-flakes)
+        ref-flake-os             (->> ref-flakes (map flake/o) set)
+        class-or-prop-flake-sids (->> class-or-prop-flakes (map flake/s) set)
+        predicate-sids           (->> all-flakes (map flake/p) set)]
+    (reduce (fn [vfs f]
+              (let [fs (flake/s f)]
+                (if (or (predicate-sids fs)
+                        (ref-flake-os fs)
+                        (class-or-prop-flake-sids fs))
+                  (conj vfs f)
+                  vfs)))
+            (or ref-flakes #{}) all-flakes)))
 
 (defn pred-dt-constraints
   "Collect any shacl datatype constraints and the predicates they apply to."
@@ -292,7 +312,7 @@
   recent wins."
   [{:keys [pred] :as schema} pred-tuples]
   (reduce (fn [schema [pid dt]]
-            (let [{:keys [iri] :as pred-meta} (-> schema :pred (get pid)
+            (let [{:keys [iri] :as pred-meta} (-> pred (get pid)
                                                   (assoc :datatype dt))]
               (-> schema
                   (assoc-in [:pred pid] pred-meta)
@@ -305,17 +325,21 @@
   (let [base-schema (base-schema)
         schema      (update-with* base-schema t vocab-flakes)
         refs        (extract-ref-sids (:pred schema))]
-    (-> schema
-        (assoc :refs refs))))
+    (assoc schema :refs refs)))
 
 (defn hydrate-schema
-  "Updates the :schema key of a by processing just the vocabulary flakes out of the new flakes."
+  "Updates the :schema key of db by processing just the vocabulary flakes out of
+  the new flakes."
   [db new-flakes]
-  (let [pred-sids    (predicate-sids new-flakes)
-        vocab-flakes (filterv #(pred-sids (flake/s %)) new-flakes)
+  (let [pred-flakes  (predicate-flakes-by-type new-flakes)
+        _            (log/trace "hydrate-schema pred-flakes:" pred-flakes)
+        vocab-flakes (filter-vocab-flakes pred-flakes new-flakes)
+        _            (log/trace "hydrate-schema vocab-flakes:" vocab-flakes)
         {:keys [t refs coll pred shapes prefix fullText subclasses]}
-        (-> (build-schema vocab-flakes (:t db))
+        (-> vocab-flakes
+            (build-schema (:t db))
             (add-pred-datatypes (pred-dt-constraints new-flakes)))]
+    (log/trace "hydrate-schema pred:" pred)
     (-> db
         (assoc-in [:schema :t] t)
         (update-in [:schema :refs] into refs)
@@ -329,11 +353,12 @@
 (defn load-schema
   [{:keys [preds t] :as db}]
   (go-try
-    (loop [[[pred-sid datatype] & r] preds
+    (loop [[[pred-sid] & r] preds
            vocab-flakes (flake/sorted-set-by flake/cmp-flakes-spot)]
       (if pred-sid
         (let [pred-flakes (<? (query-range/index-range db :spot = [pred-sid]))]
           (recur r (into vocab-flakes pred-flakes)))
-        (-> (build-schema vocab-flakes (:t db))
+        (-> vocab-flakes
+            (build-schema t)
             ;; only use predicates that have a dt
             (add-pred-datatypes (filterv #(> (count %) 1) preds)))))))

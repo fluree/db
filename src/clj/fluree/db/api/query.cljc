@@ -186,35 +186,36 @@
 (defn load-alias
   [conn alias t opts]
   (go-try
-   (try
+   (try*
      (let [address (<? (nameservice/primary-address conn alias nil))
            ledger  (<? (jld-ledger/load conn address))
            db      (ledger-proto/-db ledger)]
        (<? (restrict-db db t opts)))
-     (catch Exception e
+     (catch* e
        (throw (contextualize-ledger-400-error
                (str "Error loading ledger " alias ": ")
                e))))))
 
 (defn load-aliases
   [conn aliases global-t opts]
-  (do (when (some? global-t)
-        (try (util/str->epoch-ms global-t)
-             (catch Exception e
-               (throw
-                (contextualize-ledger-400-error
-                 (str "Error in federated query: top-level `t` values "
-                      "must be iso-8601 wall-clock times. ")
-                 e)))))
-      (go-try
-       (loop [[alias & r] aliases
-              db-map      {}]
-         (if alias
-           ;; TODO: allow restricting federated dataset components individually by t
-           (let [db      (<? (load-alias conn alias global-t opts))
-                 db-map* (assoc db-map alias db)]
-             (recur r db-map*))
-           db-map)))))
+  (when (some? global-t)
+    (try*
+      (util/str->epoch-ms global-t)
+      (catch* e
+        (throw
+         (contextualize-ledger-400-error
+          (str "Error in federated query: top-level `t` values "
+               "must be iso-8601 wall-clock times. ")
+          e)))))
+  (go-try
+   (loop [[alias & r] aliases
+          db-map      {}]
+     (if alias
+       ;; TODO: allow restricting federated dataset components individually by t
+       (let [db      (<? (load-alias conn alias global-t opts))
+             db-map* (assoc db-map alias db)]
+         (recur r db-map*))
+       db-map))))
 
 (defn load-dataset
   [conn defaults named global-t opts]

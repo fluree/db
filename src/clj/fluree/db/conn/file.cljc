@@ -219,7 +219,8 @@
 (defn connect
   "Create a new file system connection."
   [{:keys [defaults parallelism storage-path lru-cache-atom memory serializer nameservices]
-    :or   {serializer (json-serde)} :as _opts}]
+    :or {serializer (json-serde)
+         storage-path "data/ledger"} :as _opts}]
   (go
     (let [storage-path   (trim-last-slash storage-path)
           conn-id        (str (random-uuid))
