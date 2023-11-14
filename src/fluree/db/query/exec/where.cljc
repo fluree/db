@@ -206,7 +206,10 @@
                                        (map (fn [f]
                                               (partial f solution)))
                                        (apply every-pred))]
-                (assoc component ::fn filter-fn)))
+                (if filter-fn
+                  (assoc component ::fn filter-fn)
+                  (throw (ex-info (str "variable " variable " is unbound")
+                                  {:status 400, :error :db/invalid-transaction})))))
             component))
         triple-pattern))
 
