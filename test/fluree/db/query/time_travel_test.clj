@@ -52,7 +52,7 @@
                                                   #'util/current-time-iso
                                                   (fn [] start-iso)}
                                    (fn []
-                                     (let [db1 @(fluree/stage2
+                                     (let [db1 @(fluree/stage
                                                   (fluree/db ledger)
                                                   {"@context" "https://ns.flur.ee"
                                                    "insert" (first test-utils/movies)})]
@@ -62,7 +62,7 @@
                                                   #'util/current-time-iso
                                                   (fn [] three-loaded-iso)}
                                    (fn []
-                                     (let [db2 @(fluree/stage2
+                                     (let [db2 @(fluree/stage
                                                   (fluree/db ledger)
                                                   {"@context" "https://ns.flur.ee"
                                                    "insert" (second test-utils/movies)})]
@@ -72,7 +72,7 @@
                                                   #'util/current-time-iso
                                                   (fn [] all-loaded-iso)}
                                    (fn []
-                                     (let [db3 @(fluree/stage2
+                                     (let [db3 @(fluree/stage
                                                   (fluree/db ledger)
                                                   {"@context" "https://ns.flur.ee"
                                                    "insert" (nth test-utils/movies 2)})]
@@ -112,14 +112,14 @@
                                         :context-type :string}})
 
           ledger1 (with-redefs [util/current-time-iso (fn [] t1)]
-                    @(fluree/create-with-txn2 conn
+                    @(fluree/create-with-txn conn
                                               {"@context" "https://ns.flur.ee"
                                                "ledger"   "test/time1"
                                                "insert"   [{"@id"     "ex:time-test"
                                                             "@type"   "ex:foo"
                                                             "ex:time" 1}]}))
           ledger2 (with-redefs [util/current-time-iso (fn [] t1)]
-                    @(fluree/create-with-txn2 conn
+                    @(fluree/create-with-txn conn
                                               {"@context" "https://ns.flur.ee"
                                                "ledger"   "test/time2"
                                                "insert"   [{"@id"   "ex:time-test"
@@ -127,12 +127,12 @@
                                                            {"@id"   "ex:foo"
                                                             "ex:p2" "t1"}]}))
           _       (with-redefs [util/current-time-iso (fn [] t2)]
-                    @(fluree/transact!2 conn {"@context" "https://ns.flur.ee"
+                    @(fluree/transact! conn {"@context" "https://ns.flur.ee"
                                               "ledger"   "test/time1"
                                               "insert"   [{"@id"   "ex:time-test"
                                                           "ex:time" 2}]}))
           _       (with-redefs [util/current-time-iso (fn [] t2)]
-                    @(fluree/transact!2 conn
+                    @(fluree/transact! conn
                                         {"@context" "https://ns.flur.ee"
                                          "ledger"   "test/time2"
                                          "insert"   [{"@id"   "ex:time-test"
@@ -192,7 +192,7 @@
                 "should be results as of `t` = 1 for both ledgers")))
         (testing "Not all ledgers have data for given `t`"
           (with-redefs [util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
-            (let [ledger-valid @(fluree/create-with-txn2 conn
+            (let [ledger-valid @(fluree/create-with-txn conn
                                                          {"@context" "https://ns.flur.ee"
                                                           "ledger"   "test/time-before"
                                                           "insert"   [{"@id"   "ex:time-test"

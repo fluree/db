@@ -52,9 +52,11 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
   const db = await flureenjs.db(ledger);
 
   const db1 = await flureenjs.stage(db, {
-    id: "ex:john",
-    "@type": "ex:User",
-    "schema:name": "John"
+    insert: {
+      id: "ex:john",
+      "@type": "ex:User",
+      "schema:name": "John"
+    }
   });
 
   const dc = flureenjs.defaultContext(db1);
@@ -108,10 +110,12 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
 
 
   const db2 = await flureenjs.stage(db, {
-    "@id": "uniqueId",
-    foo: "foo",
-    bar: "bar",
-    "fake:iri/baz": "baz",
+    insert: {
+      "@id": "uniqueId",
+      foo: "foo",
+      bar: "bar",
+      "fake:iri/baz": "baz"
+    }
   });
 
   //  await flureenjs.commit(db);

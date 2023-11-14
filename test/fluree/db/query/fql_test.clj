@@ -197,7 +197,7 @@
   (testing "Querying ledgers loaded with language-tagged strings"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "jobs")
-          db     @(fluree/stage2
+          db     @(fluree/stage
                     (fluree/db ledger)
                     {"@context" ["https://ns.flur.ee"
                                  {"ex"         "http://example.com/vocab/"
@@ -244,7 +244,7 @@
         ledger @(fluree/create conn "people"
                                {:defaultContext
                                 ["" {:ex "http://example.org/ns/"}]})
-        db     @(fluree/stage2
+        db     @(fluree/stage
                   (fluree/db ledger)
                   {"@context" "https://ns.flur.ee"
                    "insert"
@@ -277,7 +277,7 @@
                                  "schema" "http://schema.org/",
                                  "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
         ledger @(fluree/create conn "test/love")
-        db     @(fluree/stage2 (fluree/db ledger)
+        db     @(fluree/stage (fluree/db ledger)
                                {"@context" "https://ns.flur.ee"
                                 "insert"
                                 [{"@id"                "ex:fluree",
@@ -347,7 +347,7 @@
                                                                   "schema" "http://schema.org/",
                                                                   "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
 
-          authors @(fluree/create-with-txn2 conn
+          authors @(fluree/create-with-txn conn
                                             {"@context" ["https://ns.flur.ee" "" "https://schema.org"]
                                              "ledger"   "test/authors"
                                              "insert"   [{"@id"   "https://www.wikidata.org/wiki/Q42"
@@ -356,7 +356,7 @@
                                                          {"@id"   "https://www.wikidata.org/wiki/Q173540"
                                                           "@type" "Person"
                                                           "name"  "Margaret Mitchell"}]})
-          books   @(fluree/create-with-txn2 conn
+          books   @(fluree/create-with-txn conn
                                             {"@context" ["https://ns.flur.ee" "" "https://schema.org"]
                                              "ledger"   "test/books"
                                              "insert"   [{"id"     "https://www.wikidata.org/wiki/Q3107329",
@@ -369,7 +369,7 @@
                                                           "name"   "Gone with the Wind",
                                                           "isbn"   "0-582-41805-4",
                                                           "author" {"@id" "https://www.wikidata.org/wiki/Q173540"}}]})
-          movies  @(fluree/create-with-txn2 conn
+          movies  @(fluree/create-with-txn conn
                                             {"@context" ["https://ns.flur.ee" "" "https://schema.org"]
                                              "ledger"   "test/movies"
                                              "insert"   [{"id"                        "https://www.wikidata.org/wiki/Q836821",

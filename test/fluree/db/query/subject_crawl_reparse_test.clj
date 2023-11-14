@@ -13,7 +13,7 @@
                                                                         :owl "http://www.w3.org/2002/07/owl#"
                                                                         :vocab1 "http://vocab1.example.org"
                                                                         :vocab2 "http://vocab2.example.org"}]})
-        db     @(fluree/stage2
+        db     @(fluree/stage
                   (fluree/db ledger)
                   {"@context" "https://ns.flur.ee"
                    "insert"

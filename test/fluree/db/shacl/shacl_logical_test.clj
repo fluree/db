@@ -13,7 +13,7 @@
                                             ["" {:ex "http://example.org/ns/"}]})
           user-query       {:select {'?s [:*]}
                             :where  {:id '?s, :type :ex/User}}
-          db               @(fluree/stage2
+          db               @(fluree/stage
                               (fluree/db ledger)
                               {"@context" "https://ns.flur.ee"
                                "insert"
@@ -28,7 +28,7 @@
                                                   :sh/minCount 1
                                                   :sh/maxCount 1
                                                   :sh/datatype :xsd/string}]}})
-          db-ok            @(fluree/stage2
+          db-ok            @(fluree/stage
                               db
                               {"@context" "https://ns.flur.ee"
                                "insert"
@@ -37,7 +37,7 @@
                                 :schema/name     "John"
                                 :schema/callSign "j-rock"}})
           db-company-name  (try
-                             @(fluree/stage2
+                             @(fluree/stage
                                 db
                                 {"@context" "https://ns.flur.ee"
                                  "insert"
@@ -47,7 +47,7 @@
                                   :schema/callSign    "j-rock"}})
                              (catch Exception e e))
           db-two-names     (try
-                             @(fluree/stage2
+                             @(fluree/stage
                                 db
                                 {"@context" "https://ns.flur.ee"
                                  "insert"
@@ -57,7 +57,7 @@
                                   :schema/callSign    "j-rock"}})
                              (catch Exception e e))
           db-callsign-name (try
-                             @(fluree/stage2
+                             @(fluree/stage
                                 db
                                 {"@context" "https://ns.flur.ee"
                                  "insert"
@@ -90,7 +90,7 @@
                                         ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
                         :where  {:id '?s, :type :ex/User}}
-          db           @(fluree/stage2
+          db           @(fluree/stage
                           (fluree/db ledger)
                           {"@context" "https://ns.flur.ee"
                            "insert"
@@ -105,7 +105,7 @@
                                               :sh/minCount 1
                                               :sh/maxCount 1
                                               :sh/datatype :xsd/long}]}})
-          db-ok        @(fluree/stage2
+          db-ok        @(fluree/stage
                           db
                           {"@context" "https://ns.flur.ee"
                            "insert"
@@ -115,7 +115,7 @@
                             :schema/callSign "j-rock"
                             :schema/age      42
                             :schema/favNums  [9004 9008 9015 9016 9023 9042]}})
-          db-too-old   @(fluree/stage2
+          db-too-old   @(fluree/stage
                           db
                           {"@context" "https://ns.flur.ee"
                            "insert"
@@ -124,7 +124,7 @@
                             :schema/companyName "WrongCo"
                             :schema/callSign    "j-rock"
                             :schema/age         131}})
-          db-too-low   @(fluree/stage2
+          db-too-low   @(fluree/stage
                           db
                           {"@context" "https://ns.flur.ee"
                            "insert"
@@ -134,7 +134,7 @@
                             :schema/callSign    "j-rock"
                             :schema/age         27
                             :schema/favNums     [4 8 15 16 23 42]}})
-          db-two-probs @(fluree/stage2
+          db-two-probs @(fluree/stage
                           db
                           {"@context" "https://ns.flur.ee"
                            "insert"
@@ -171,7 +171,7 @@
                                       ["" {:ex "http://example.org/ns/"}]})
           user-query {:select {'?s [:*]}
                       :where  {:id '?s, :type :ex/User}}
-          db         @(fluree/stage2
+          db         @(fluree/stage
                         (fluree/db ledger)
                         {"@context" "https://ns.flur.ee"
                          "insert"
@@ -184,14 +184,14 @@
                                             :sh/maxLength 10}
                                            {:sh/path    :ex/greeting
                                             :sh/pattern "hello.*"}]}})
-          db-ok-name @(fluree/stage2
+          db-ok-name @(fluree/stage
                         db
                         {"@context" "https://ns.flur.ee"
                          "insert"
                          {:id          :ex/jean-claude
                           :type        :ex/User,
                           :schema/name "Jean-Claude"}})
-          db-ok-tag  @(fluree/stage2
+          db-ok-tag  @(fluree/stage
                         db
                         {"@context" "https://ns.flur.ee"
                          "insert"
@@ -199,14 +199,14 @@
                           :type   :ex/User,
                           :ex/tag 1}})
 
-          db-ok-greeting        @(fluree/stage2
+          db-ok-greeting        @(fluree/stage
                                    db
                                    {"@context" "https://ns.flur.ee"
                                     "insert"
                                     {:id          :ex/al,
                                      :type        :ex/User,
                                      :ex/greeting "HOWDY"}})
-          db-name-too-short     (try @(fluree/stage2
+          db-name-too-short     (try @(fluree/stage
                                         db
                                         {"@context" "https://ns.flur.ee"
                                          "insert"
@@ -214,7 +214,7 @@
                                           :type        [:ex/User],
                                           :schema/name "John"}})
                                      (catch Exception e e))
-          db-tag-too-long       (try @(fluree/stage2
+          db-tag-too-long       (try @(fluree/stage
                                         db
                                         {"@context" "https://ns.flur.ee"
                                          "insert"
@@ -222,7 +222,7 @@
                                           :type   [:ex/User],
                                           :ex/tag 12345}})
                                      (catch Exception e e))
-          db-greeting-incorrect (try @(fluree/stage2
+          db-greeting-incorrect (try @(fluree/stage
                                         db
                                         {"@context" "https://ns.flur.ee"
                                          "insert"

@@ -21,7 +21,7 @@
         db1-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem-ld"
                                                    100))
 
-        db2      (->> @(fluree/stage2 db1-load {"@context" "https://ns.flur.ee"
+        db2      (->> @(fluree/stage db1-load {"@context" "https://ns.flur.ee"
                                                 "insert"   [{:id      :blah/two
                                                              :ex/name "Two"}]})
                       (fluree/commit! ledger)
@@ -29,7 +29,7 @@
         db2-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem-ld"
                                                    100))
 
-        db3      (->> @(fluree/stage2 db2-load {"@context" "https://ns.flur.ee"
+        db3      (->> @(fluree/stage db2-load {"@context" "https://ns.flur.ee"
                                                 "insert"   [{:id      :blah/three
                                                              :ex/name "Three"}]})
                       (fluree/commit! ledger)

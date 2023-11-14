@@ -7,7 +7,7 @@
   (testing "Subclass queries work."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/subclass")
-          db1    @(fluree/stage2
+          db1    @(fluree/stage
                    (fluree/db ledger)
                    {"@context" "https://ns.flur.ee"
                     "insert"
@@ -25,7 +25,7 @@
                                                             "@type" "Person"
                                                             "name"  "Douglas Adams"}}}})
           ;; add CreativeWork class
-          db2    @(fluree/stage2
+          db2    @(fluree/stage
                    db1
                    {"@context" "https://ns.flur.ee"
                     "insert"
@@ -39,7 +39,7 @@
                      "schema:source"   {"@id" "http://www.w3.org/wiki/WebSchemas/SchemaDotOrgSources#source_rNews"}}})
 
           ;; Make Book and Movie subclasses of CreativeWork
-          db3    @(fluree/stage2
+          db3    @(fluree/stage
                    db2
                    {"@context" "https://ns.flur.ee"
                     "insert"
@@ -74,7 +74,7 @@
           ledger-name "subclass-inferencing-test"
           ledger      @(fluree/create conn ledger-name)
           db0         (fluree/db ledger)
-          db1         @(fluree/stage2
+          db1         @(fluree/stage
                         db0
                         {"@context" "https://ns.flur.ee"
                          "insert"
@@ -90,7 +90,7 @@
                           {"@id"         "ex:andrew"
                            "@type"       "schema:Person",
                            "schema:name" "Andrew Johnson"}]})
-          db2         @(fluree/stage2
+          db2         @(fluree/stage
                         db1
                         {"@context" "https://ns.flur.ee"
                          "insert"
@@ -123,7 +123,7 @@
           ledger-name "subclass-inferencing-test"
           ledger      @(fluree/create conn ledger-name)
           db0         (fluree/db ledger)
-          db1         @(fluree/stage2
+          db1         @(fluree/stage
                         db0
                         {"@context" "https://ns.flur.ee"
                          "insert"
@@ -139,7 +139,7 @@
                           {"@id"         "ex:andrew"
                            "@type"       "schema:Person",
                            "schema:name" "Andrew Johnson"}]})
-          db2         @(fluree/stage2
+          db2         @(fluree/stage
                         db1
                         {"@context" "https://ns.flur.ee"
                          "insert"
