@@ -574,13 +574,14 @@
 
 (declare parse-subj-cmp)
 (defn parse-obj-cmp
-  [bnode-counter where subj-cmp pred-cmp m triples
+  [bnode-counter where bound-var-cache subj-cmp pred-cmp m triples
    {:keys [list id value type language] :as v-map}]
   (log/trace "parse-obj-cmp v-map:" v-map)
   (cond
     list
     (reduce (fn [triples [i list-item]]
-              (parse-obj-cmp bnode-counter where subj-cmp pred-cmp {:i i} triples list-item))
+              (parse-obj-cmp bnode-counter where bound-var-cache subj-cmp
+                             pred-cmp {:i i} triples list-item))
             triples
             (map vector (range) list))
 
@@ -588,7 +589,7 @@
     (some? value)
     (let [m*      (cond-> m language (assoc :lang language))
           obj-cmp (if (v/variable? value)
-                    (if (where/bound-variable? where value)
+                    (if (where/bound-variable? where value bound-var-cache)
                       (parse-variable value)
                       (throw
                        (ex-info (str "variable " value " is not bound")
@@ -599,7 +600,7 @@
     ;; ref object
     :else
     (let [ref-obj (if (v/variable? id)
-                    (if (where/bound-variable? where id)
+                    (if (where/bound-variable? where id bound-var-cache)
                       (parse-variable id)
                       (throw
                        (ex-info (str "variable " id " is not bound")
@@ -615,11 +616,11 @@
                     ;; project newly created bnode-id into v-map
                     (assoc v-map :id (where/get-iri ref-cmp))
                     v-map)]
-      (conj (parse-subj-cmp bnode-counter where triples v-map*)
+      (conj (parse-subj-cmp bnode-counter where bound-var-cache triples v-map*)
             [subj-cmp pred-cmp ref-cmp]))))
 
 (defn parse-pred-cmp
-  [bnode-counter where subj-cmp triples [pred values]]
+  [bnode-counter where bound-var-cache subj-cmp triples [pred values]]
   (let [values*  (cond (= pred :type)
                        ;; homogenize @type values so they have the same structure as other predicates
                        (map #(do {:id %}) values)
@@ -631,7 +632,7 @@
                        :else
                        values)
         pred-cmp (cond (v/variable? pred)
-                       (if (where/bound-variable? where pred)
+                       (if (where/bound-variable? where pred bound-var-cache)
                          (parse-variable pred)
                          (throw
                           (ex-info (str "variable " pred " is not bound")
@@ -640,15 +641,16 @@
                        ;; we want the actual iri here, not the keyword
                        (= pred :type)     (where/match-iri const/iri-type)
                        :else              (where/match-iri pred))]
-    (reduce (partial parse-obj-cmp bnode-counter where subj-cmp pred-cmp nil)
+    (reduce (partial parse-obj-cmp bnode-counter where bound-var-cache subj-cmp
+                     pred-cmp nil)
             triples
             values*)))
 
 (defn parse-subj-cmp
-  [bnode-counter where triples {:keys [id] :as node}]
+  [bnode-counter where bound-var-cache triples {:keys [id] :as node}]
   (let [subj-cmp (cond
                    (v/variable? id)
-                   (if (where/bound-variable? where id)
+                   (if (where/bound-variable? where id bound-var-cache)
                      (parse-variable id)
                      (throw
                       (ex-info (str "variable " id " is not bound")
@@ -656,15 +658,16 @@
 
                    (nil? id) (where/match-iri (temp-bnode-id bnode-counter))
                    :else     (where/match-iri id))]
-    (reduce (partial parse-pred-cmp bnode-counter where subj-cmp)
+    (reduce (partial parse-pred-cmp bnode-counter where bound-var-cache subj-cmp)
             triples
             (dissoc node :id :idx))))
 
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
   [expanded where]
-  (let [bnode-counter (volatile! 0)]
-    (reduce (partial parse-subj-cmp bnode-counter where)
+  (let [bnode-counter   (volatile! 0)
+        bound-var-cache (volatile! {})]
+    (reduce (partial parse-subj-cmp bnode-counter where bound-var-cache)
             []
             expanded)))
 

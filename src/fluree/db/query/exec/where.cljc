@@ -709,11 +709,20 @@
       (async/pipe initial-solution-ch out-ch))
     out-ch))
 
-(defn bound-variable?
+(defn bound-variable?*
   [where variable]
   (cond
-    (sequential? where) (some #(bound-variable? % variable) where)
+    (sequential? where) (some #(bound-variable?* % variable) where)
     (map? where) (if (and (contains? where ::var)
-                          (= (symbol variable) (::var where)))
+                          (= variable (::var where)))
                    true
-                   (some #(bound-variable? % variable) (vals where)))))
+                   (some #(bound-variable?* % variable) (vals where)))))
+
+(defn bound-variable?
+  [where variable cache]
+  (let [sym-var (symbol variable)]
+    (if (contains? @cache sym-var)
+      (get @cache sym-var)
+      (let [bound? (bound-variable?* where sym-var)]
+        (vswap! cache assoc sym-var bound?)
+        bound?))))
