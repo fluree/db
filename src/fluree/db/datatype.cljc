@@ -47,7 +47,9 @@
    "http://www.w3.org/2001/XMLSchema#hexBinary"            const/$xsd:hexBinary
    "http://www.w3.org/2001/XMLSchema#base64Binary"         const/$xsd:base64Binary
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" const/$rdf:langString
-   "@json"                                                 const/$rdf:json})
+   "@json"                                                 const/$rdf:json
+   "https://ns.flur.ee/ledger#queryType"                   const/$fluree:queryType})
+
 
 
 (def iso8601-offset-pattern

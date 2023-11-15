@@ -91,7 +91,9 @@
           "https://ns.flur.ee/ledger#context"                   const/$fluree:context
           const/iri-role                                        const/$_role
           const/iri-target-class                                const/$fluree:targetClass
-          const/iri-default-context                             const/$fluree:default-context}))
+          const/iri-default-context                             const/$fluree:default-context
+          const/iri-query                                       const/$fluree:query
+          const/iri-query-type                                  const/$fluree:queryType}))
 
 (def class-or-property-sid
   (into #{} (map predefined-properties class+property-iris)))

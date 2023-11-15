@@ -36,6 +36,8 @@
 (def ^:const iri-default-context "https://ns.flur.ee/ledger#defaultContext")
 (def ^:const iri-Context "https://ns.flur.ee/ledger#Context")
 (def ^:const iri-allow "https://ns.flur.ee/ledger#allow")
+(def ^:const iri-query "https://ns.flur.ee/ledger#query")
+(def ^:const iri-query-type "https://ns.flur.ee/ledger#queryType")
 (def ^:const iri-equals "https://ns.flur.ee/ledger#equals")
 (def ^:const iri-contains "https://ns.flur.ee/ledger#contains")
 (def ^:const iri-$identity "https://ns.flur.ee/ledger#$identity")
@@ -238,3 +240,6 @@
 (def ^:const $_tag:id 30)
 
 (def ^:const $fluree:default-context 150)
+;;stored queries
+(def ^:const $fluree:query 151)
+(def ^:const $fluree:queryType 152)

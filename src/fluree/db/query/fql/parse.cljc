@@ -573,13 +573,13 @@
 
 (declare parse-subj-cmp)
 (defn parse-obj-cmp
-  [bnode-counter subj-cmp pred-cmp m triples
+  [bnode-counter subj-cmp pred-cmp m ctx triples
    {:keys [list id value type language] :as v-map}]
   (log/trace "parse-obj-cmp v-map:" v-map)
   (cond
     list
     (reduce (fn [triples [i list-item]]
-              (parse-obj-cmp bnode-counter subj-cmp pred-cmp {:i i} triples list-item))
+              (parse-obj-cmp bnode-counter subj-cmp pred-cmp {:i i} ctx triples list-item))
             triples
             (map vector (range) list))
 
@@ -606,43 +606,59 @@
                     ;; project newly created bnode-id into v-map
                     (assoc v-map :id (where/get-iri ref-cmp))
                     v-map)]
-      (conj (parse-subj-cmp bnode-counter triples v-map*)
+      (conj (parse-subj-cmp bnode-counter ctx triples v-map*)
             [subj-cmp pred-cmp ref-cmp]))))
 
 (defn parse-pred-cmp
-  [bnode-counter subj-cmp triples [pred values]]
-  (let [values*  (cond (= pred :type)
-                       ;; homogenize @type values so they have the same structure as other predicates
-                       (map #(do {:id %}) values)
+  [bnode-counter subj-cmp ctx triples [pred values]]
+  (let [values*  (condp = pred
+                   ;; homogenize @type values so they have the same structure as other predicates
+                   :type (map #(do {:id %}) values)
 
-                       (= pred const/iri-rdf-type)
-                       (throw (ex-info (str (pr-str const/iri-rdf-type) " is not a valid predicate IRI."
-                                            " Please use the JSON-LD \"@type\" keyword instead.")
-                                       {:status 400 :error :db/invalid-predicate}))
-                       :else
-                       values)
+                   const/iri-rdf-type
+                   (throw (ex-info (str (pr-str const/iri-rdf-type) " is not a valid predicate IRI."
+                                        " Please use the JSON-LD \"@type\" keyword instead.")
+                                   {:status 400 :error :db/invalid-predicate}))
+
+                   const/iri-query (if (= 1 (count values))
+                                     (let [q             (get-in values [0 :value])
+                                           parsed-q (try* (-> q
+                                                              read-string
+                                                              (parse-query ctx))
+                                                          ;;TODO propagate underlying error
+                                                          (catch* e  (log/warn e "Invalid query " q)
+                                                                  (throw (ex-info (str "Invalid query provided as value of : "
+                                                                                       const/iri-query ": " q)
+                                                                                  {:status 400 :error :db/invalid-query}))))]
+                                       (assoc-in values [0 :value] parsed-q))
+                                     (throw (ex-info (str "Invalid value for " const/iri-query ": "
+                                                          "Must be exactly one query, provided: "
+                                                          values)
+                                                     {:status 400 :error :db/invalid-transaction})))
+                   ;;else
+                   values)
         pred-cmp (cond (v/variable? pred) (parse-variable pred)
                        ;; we want the actual iri here, not the keyword
                        (= pred :type)     (where/match-iri const/iri-type)
                        :else              (where/match-iri pred))]
-    (reduce (partial parse-obj-cmp bnode-counter subj-cmp pred-cmp nil)
+    (reduce (partial parse-obj-cmp bnode-counter subj-cmp pred-cmp nil ctx)
             triples
             values*)))
 
 (defn parse-subj-cmp
-  [bnode-counter triples {:keys [id] :as node}]
+  [bnode-counter ctx triples {:keys [id] :as node} ]
   (let [subj-cmp (cond (v/variable? id) (parse-variable id)
                        (nil? id)        (where/match-iri (temp-bnode-id bnode-counter))
                        :else            (where/match-iri id))]
-    (reduce (partial parse-pred-cmp bnode-counter subj-cmp)
+    (reduce (partial parse-pred-cmp bnode-counter subj-cmp ctx)
             triples
             (dissoc node :id :idx))))
 
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
-  [expanded]
+  [expanded ctx]
   (let [bnode-counter (volatile! 0)]
-    (reduce (partial parse-subj-cmp bnode-counter)
+    (reduce (partial parse-subj-cmp bnode-counter ctx)
             []
             expanded)))
 
@@ -656,11 +672,11 @@
         delete (-> (util/get-first-value txn const/iri-delete)
                    (json-ld/expand context)
                    (util/sequential)
-                   (parse-triples))
+                   (parse-triples context))
         insert (-> (util/get-first-value txn const/iri-insert)
                    (json-ld/expand context)
                    (util/sequential)
-                   (parse-triples))]
+                   (parse-triples context))]
     (when (and (empty? insert) (empty? delete))
       (throw (ex-info (str "Invalid transaction, insert or delete clause must contain nodes with objects.")
                       {:status 400 :error :db/invalid-transaction})))
