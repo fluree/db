@@ -25,9 +25,14 @@
                           ;; note, classes will return empty list if none found ()
                           (swap! (:cache policy) assoc s classes)
                           classes))
-          fns       (keep #(or (get-in policy [const/iri-view :class % p :function])
-                               (get-in policy [const/iri-view :class % :default :function]))
-                          class-ids)]
+          ;;TODO targetNodes that are not allNodes
+          node-fns       (when-let [all-node-sid (<? (dbproto/-subid (dbproto/-rootdb db) const/iri-all-nodes))]
+                           (get-in policy [const/iri-view :node all-node-sid :default :function]))
+          class-fns       (keep #(or (get-in policy [const/iri-view :class % p :function])
+                                     (get-in policy [const/iri-view :class % :default :function]))
+                                class-ids)
+          fns (cond-> class-fns
+                node-fns (conj node-fns))]
       (loop [[[async? f] & r] fns]
         ;; return first truthy response, else false
         (if f
@@ -76,6 +81,7 @@
               :else (recur r acc)))
           acc)))))
 
+;;TODO only does :class
 (defn group-policies-by-default
   "Groups policies for the specified action (e.g. :f/view, :f/modify)
   and provided class subject ids by either :default or :property.
@@ -114,6 +120,7 @@
         false))))
 
 
+;;TODO only does :class
 (defn filter-subject-flakes
   "Takes multiple flakes for the *same* subject and optimizes evaluation
   for the group. Returns the allowed flakes, or an empty vector if none

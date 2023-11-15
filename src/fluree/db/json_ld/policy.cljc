@@ -17,7 +17,7 @@
 ;; that need to get enforced (e.g. as opposed to generically allowing an entire Class, members
 ;; will need to get evaluated for specific criteria)
 (def restriction-properties
-  #{const/iri-equals const/iri-contains})
+  #{const/iri-equals const/iri-contains const/iri-query})
 
 ;; These special IRIs (today only one) get replaced with an actual value in the context of the
 ;; request.
@@ -53,7 +53,7 @@
   [roles all-policies]
   (keep
    (fn [policy]
-     (let [class-policies (->> (get policy const/iri-allow)
+     (let [allow-policies (->> (get policy const/iri-allow)
                                util/sequential
                                (filter #(-> %
                                             (get-in [const/iri-target-role :_id])
@@ -80,9 +80,9 @@
                                         (assoc prop-policy const/iri-allow
                                                            roles-policies)))))
                                  not-empty))]
-       (when (or class-policies prop-policies)
+       (when (or allow-policies prop-policies)
          (cond-> policy
-                 class-policies (assoc const/iri-allow class-policies)
+                 allow-policies (assoc const/iri-allow allow-policies)
                  prop-policies (assoc const/iri-property prop-policies)))))
    all-policies))
 
@@ -162,6 +162,7 @@
             (cond
               (contains? rule const/iri-equals) :f/equals
               (contains? rule const/iri-contains) :f/contains
+              (contains? rule const/iri-query) :f/query
               :else ::unrestricted-rule)))
 
 (defmethod compile-allow-rule-fn :f/equals
@@ -175,6 +176,11 @@
   ;; TODO
   (go-try
     (throw (ex-info ":f/contains not yet implemented!" {}))))
+
+(defmethod compile-allow-rule-fn :f/query
+  [db rule]
+  (go-try
+   (validate/generate-query-fn db rule)))
 
 (defmethod compile-allow-rule-fn ::unrestricted-rule
   [db rule]
@@ -283,7 +289,6 @@
           ;; return two-tuple of [full-key-seq updated-allow-rule-map]
           [ks* allow-rule*])))))
 
-
 (defn unrestricted-actions
   "A policy will be a 'root' (all access) policy if these 3 conditions apply:
    1) :f/targetNode value of :f/allNodes
@@ -379,8 +384,8 @@
               (into acc result))) [])
          <?)))
 
-
 (defn compile-node-policy
+  ;;TODO update
   "Compiles a node rule (where :f/targetNode is used).
 
   :f/targetNode that uses the special keyword :f/allNodes means that the target is for

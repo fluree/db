@@ -448,3 +448,57 @@
                                      :opts      {:did  "not-a-did"
                                                  :role "not-a-role"}}))
         "Should not be able to see any data")))
+
+(deftest ^:integration custom-query-policy-enforcement
+  (testing "Enforcement of policies that use custom `f:query`"
+    (let [conn     @(fluree/connect {:method :memory})
+          ledger    @(fluree/create conn "policy/a" )
+          alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
+          context   [test-utils/default-str-context {"ex" "http://example.com/"}]
+          db        @(fluree/stage
+                      (fluree/db ledger)
+                      {"@context" context
+                       "insert"
+                       [{"@id"              "ex:alice"
+                         "@type" "ex:User"}
+                        {"@id"              "ex:brian"
+                         "@type" "ex:User"
+                         "ex:confidential" true}
+                        {"@id"              "ex:andrew"
+                         "@type" "ex:User"
+                         "ex:confidential" false}
+                        {"@id"              "ex:cam"
+                         "@type" "ex:User"
+                         "ex:confidential" 12}
+                        {"@id"      alice-did
+                         "ex:user" {"id" "ex:alice"}
+                         "f:role"  {"id" "ex:publicRole"}}]})
+          db+policy        @(fluree/stage
+                             db
+                             {"@context" context
+                              "insert"
+                              {"@type" ["f:Policy"],
+                               "@id" "ex:confidentialUserPolicy"
+                               "f:targetNode" {"@id" "f:allNodes"},
+                               "f:allow"
+                               [{"@id" "ex:publicViewAllow",
+                                 "f:targetRole" {"@id" "ex:publicRole"},
+                                 "f:action" [{"@id" "f:view"}],
+                                 "f:query"
+                                 ;;TODO type of `f:query` should be in our custom ctx
+                                 {"@type" "f:queryType"
+                                  "@value"
+                                  ;;TODO: should be`@type` `@json`, instead of passing
+                                  ;;in string
+                                  (str
+                                   ;;TODO: update for `$this`-like behavior
+                                   {"select" [{"?s" ["_id" ]} "?isTrue"]
+                                    "where"
+                                    {"id" "?s" "ex:confidential" "?isTrue"}})}}]}})]
+      (testing "Enforcement on queries"
+        (is (= #{["ex:alice"] ["ex:andrew"]}
+               (into #{} @(fluree/query db+policy {"@context" context
+                                                   "select" ['?s]
+                                                   "where"  {"id"   '?s
+                                                             "type" "ex:User"}
+                                                   :opts {:role "http://example.com/publicRole"}}))))))))

@@ -2,6 +2,7 @@
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async]
+            [fluree.db.query.exec :as exec]
             [fluree.db.query.range :as query-range]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
@@ -129,3 +130,37 @@
           (do
             (swap! cache assoc equals-rule last-results)
             last-results))))))
+
+(defn generate-query-fn
+  "Returns validating function for :f/query rule.
+
+  Validating functions take two arguments, the db and the flake to be validated.
+
+  Returns two-tuple of [async? policy-fn] where async? is boolean if policy-fn returns an async channel
+  which must be resolved to get the final value.
+
+  All policy functions are evaluated for a truthy or falsey result which determines if the provided flake
+  can be operated on/viewed."
+  [db rule ]
+  (let [rule-id (get rule "@id")
+        cache-path [rule-id :query-result]
+        query (get rule const/iri-query)]
+    ;;TODO just run the query once beforehand?
+    ;;any reason to run it on the db used by allow-flake?
+    [true
+     (fn [db flake ]
+       (go-try
+        (let [q-result  (or (cache-get-value db cache-path)
+                            (->> (<? (exec/query (dbproto/-rootdb db)
+                                                 nil
+                                                 query))
+                                 (cache-store-value db cache-path)))
+              forbidden-sids (->> q-result
+                                  ;;FIXME this assumes
+                                  ;;special test case where subject is extracted in query
+                                  ;;needs to support `$this`-like behavior instead
+                                  (keep (fn [[id-map val]]
+                                          (when val
+                                            (:_id id-map))))
+                                  (into #{}))]
+          (not (contains? forbidden-sids (flake/s flake))))))]))
