@@ -509,6 +509,7 @@
                     "insert"
                     {"@context"           ["" {"ex" "http://example.org/"}]
                      "@id"                "ex:mosquitos"
-                     "schema:description" "?x"}})]
+                     "schema:description" "?x"}
+                    "where" {"@id" "?m"}})]
       (is (= "variable ?x is not bound"
              (ex-message result))))))
