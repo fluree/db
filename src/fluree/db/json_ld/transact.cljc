@@ -93,7 +93,7 @@
                                  (update counter-key inc)))))]
     (get iri->sid* iri)))
 
-(defn ->tx-state2
+(defn ->tx-state
   [db]
   (let [{:keys [schema branch ledger policy], db-t :t} db
         iri->sid (atom {:last-pid (jld-ledger/last-pid db)
@@ -115,7 +115,7 @@
   (go
     (let [error-ch  (async/chan)
           update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
-                         (update/modify2 db parsed-txn tx-state fuel-tracker error-ch)
+                         (update/modify db parsed-txn tx-state fuel-tracker error-ch)
                          (exec/into-flakeset fuel-tracker))]
       (async/alt!
         error-ch ([e] e)
@@ -168,7 +168,7 @@
                        o-pred-shapes)))
           subj-mods)))))
 
-(defn final-db2
+(defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
   [new-flakes {:keys [stage-update? db-before iri->sid policy t] :as tx-state}]
@@ -198,7 +198,7 @@
           ;; wrap it in an atom to reuse old validate-rules and policy/allowed? unchanged
           ;; TODO: remove the atom wrapper once subj-mods is no longer shared code
           tx-state* (assoc tx-state :subj-mods (atom subj-mods))]
-      (-> (final-db2 flakes tx-state)
+      (-> (final-db flakes tx-state)
           <?
           (validate-rules tx-state*)
           <?
@@ -214,7 +214,7 @@
      (let [db* (if-let [policy-opts (perm/policy-opts parsed-opts)]
                  (<? (perm/wrap-policy db policy-opts))
                  db)
-           tx-state      (->tx-state2 db*)
+           tx-state      (->tx-state db*)
 
            txn-context   (dbproto/-context db* (:context parsed-opts))
            parsed-txn    (q-parse/parse-txn txn txn-context)
