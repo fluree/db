@@ -20,7 +20,7 @@
                                :schema/name  "Bob"
                                :ex/favArtist {:id          :ex/picasso
                                               :schema/name "Picasso"}}]}})]
-      (is (->> @(fluree/query db {:select {'?s [:_id {:ex/favArtist [:_id ]}]}
+      (is (->> @(fluree/query db {:select {'?s [:_id {:ex/favArtist [:_id]}]}
                                   :where  {:id '?s, :type :ex/User}})
                (reduce (fn [sids {:keys [_id] :as node}]
                          (cond-> (conj sids _id)

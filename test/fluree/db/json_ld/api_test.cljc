@@ -964,7 +964,7 @@
 
            db2 @(fluree/stage db1 {"@context" "https://ns.flur.ee"
                                     "where" {"id" "?s", "ex:name" "?name"}
-                                    "delete" {"@id" "?s" "ex:name" "?name"}
+                                    "delete" {"@id" "?s", "ex:name" "?name"}
                                     "insert" {"@graph"
                                               [{"@id" "?s" "ex:name" "BORG"}
                                                {"@id" "ex:mp"

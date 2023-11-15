@@ -206,17 +206,14 @@
   [])
 
 
-
 (defn pull
   "Checks name service for ledger and pulls latest version locally."
   [])
 
 
-
 (defn combine
   "Combines multiple ledgers into a new, read-only ledger."
   [])
-
 
 
 (defn stage
@@ -225,6 +222,7 @@
   ([db json-ld opts]
    (let [result-ch (transact-api/stage db json-ld opts)]
      (promise-wrap result-ch))))
+
 
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
