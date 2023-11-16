@@ -32,7 +32,7 @@
 
 (defn iri?
   [pid]
-  (= const/$xsd:anyURI pid))
+  (= const/$id pid))
 
 (defn rdf-type?
   [pid]
@@ -132,9 +132,9 @@
                                           ;; no sub-selection, just return {@id <iri>} for each ref iri
                                           :else
                                           ;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
-                                          (let [id-key (:as (or (get @cache const/$xsd:anyURI)
-                                                                (wildcard-spec db cache compact-fn const/$xsd:anyURI)
-                                                                (<? (cache-sid->iri db cache compact-fn const/$xsd:anyURI))))
+                                          (let [id-key (:as (or (get @cache const/$id)
+                                                                (wildcard-spec db cache compact-fn const/$id)
+                                                                (<? (cache-sid->iri db cache compact-fn const/$id))))
                                                 c-iri  (<? (dbproto/-iri db (flake/o f) compact-fn))]
                                             {id-key c-iri}))
 

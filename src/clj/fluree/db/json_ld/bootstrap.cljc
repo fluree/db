@@ -26,4 +26,4 @@
         base-flakes (jld-transact/base-flakes t)]
     (-> blank-db
         (assoc :t t)
-        (commit-data/update-novelty [(flake/create const/$xsd:anyURI const/$xsd:anyURI const/iri-id const/$xsd:string t true nil)]))))
+        (commit-data/update-novelty [(flake/create const/$id const/$id const/iri-id const/$xsd:string t true nil)]))))

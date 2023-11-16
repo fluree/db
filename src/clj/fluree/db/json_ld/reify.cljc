@@ -12,7 +12,8 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
             [fluree.db.datatype :as datatype]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.json-ld.iri :as iri]))
 
 ;; generates a db/ledger from persisted data
 #?(:clj (set! *warn-on-reflection* true))
@@ -148,7 +149,7 @@
         acc))))
 
 (defn- assert-v-maps
-  [{:keys [db iri-cache pid existing-pid next-pid sid next-sid id k t acc list-members?] :as assert-state} v-maps]
+  [{:keys [db iri-cache pid existing-pid next-pid sid id k t acc list-members?] :as assert-state} v-maps]
   (go-try
     (loop [[v-map & r-v-maps] v-maps
            acc* acc]
@@ -162,8 +163,7 @@
                        (and ref-id (node? v-map))
                        (let [existing-sid (<? (get-iri-sid ref-id db iri-cache))
                              ref-sid      (or existing-sid
-                                              (jld-ledger/generate-new-sid
-                                                v-map pid iri-cache next-pid next-sid))
+                                              (iri/iri->sid db ref-id))
                              new-flake    (flake/create sid pid ref-sid
                                                         const/$xsd:anyURI t true meta)]
                          (log/trace "creating ref flake:" new-flake)
@@ -236,17 +236,15 @@
       [])))
 
 (defn assert-node
-  [db node t iri-cache ref-cache next-pid next-sid]
+  [db node t iri-cache ref-cache]
   (go-try
     (log/trace "assert-node:" node)
     (let [{:keys [id type]} node
           existing-sid    (<? (get-iri-sid id db iri-cache))
           sid             (or existing-sid
-                              (jld-ledger/generate-new-sid node nil iri-cache
-                                                           next-pid next-sid))
-          assert-state    {:db       db, :iri-cache iri-cache, :id id
-                           :next-pid next-pid, :ref-cache ref-cache, :sid sid
-                           :next-sid next-sid, :t t}
+                              (iri/iri->sid db id))
+          assert-state    {:db db, :iri-cache iri-cache, :id id
+                           :ref-cache ref-cache, :sid sid, :t t}
           type-assertions (if (seq type)
                             (<? (get-type-assertions assert-state type))
                             [])
@@ -263,13 +261,10 @@
   (go-try
     (let [last-pid (volatile! (jld-ledger/last-pid db))
           last-sid (volatile! (jld-ledger/last-sid db))
-          next-pid (fn [] (vswap! last-pid inc))
-          next-sid (fn [] (vswap! last-sid inc))
           flakes   (loop [[node & r] assertions
                           acc []]
                      (if node
-                       (let [assert-flakes (<? (assert-node db node t iri-cache ref-cache
-                                                            next-pid next-sid))]
+                       (let [assert-flakes (<? (assert-node db node t iri-cache ref-cache))]
                          (recur r (into acc assert-flakes)))
                        acc))]
       {:flakes flakes
@@ -404,7 +399,7 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates
   respective indexes and returns updated db"
-  [conn {:keys [ecount t] :as db} merged-db? [commit _proof]]
+  [conn {:keys [alias ecount t] :as db} merged-db? [commit _proof]]
   (go-try
     (let [iri-cache          (volatile! {})
           refs-cache         (volatile! (-> db :schema :refs))
@@ -427,9 +422,7 @@
           (commit-data/json-ld->map commit db)
 
           [prev-commit _] (some->> previous :address (read-commit conn) <?)
-          last-sid           (volatile! (jld-ledger/last-commit-sid db))
-          next-sid           (fn [] (vswap! last-sid inc))
-          db-sid             (next-sid)
+          db-sid             (iri/iri->sid db alias)
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new db-sid)
           previous-id        (when prev-commit (:id prev-commit))
@@ -441,13 +434,12 @@
                                (<? (commit-data/prev-data-flakes db db-sid t-new
                                                                  prev-data-id)))
           issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                               (<? (commit-data/issuer-flakes db t-new next-sid
-                                                              issuer-iri)))
+                               (<? (commit-data/issuer-flakes db t-new issuer-iri)))
           message-flakes     (when message
                                (commit-data/message-flakes t-new message))
           default-ctx-flakes (when defaultContext
                                (<? (commit-data/default-ctx-flakes
-                                     db t-new next-sid defaultContext)))
+                                     db t-new defaultContext)))
           all-flakes         (-> db
                                  (get-in [:novelty :spot])
                                  empty
@@ -467,9 +459,9 @@
                                    (into default-ctx-flakes)
                                    (= -1 t-new)
                                    (into commit-data/commit-schema-flakes)))
-          ecount*            (assoc ecount const/$_predicate pid
-                                           const/$_default sid
-                                           const/$_shard @last-sid)]
+          ecount*            (assoc ecount
+                                    const/$_predicate pid
+                                    const/$_default sid)]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))

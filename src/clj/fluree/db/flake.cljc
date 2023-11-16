@@ -4,6 +4,7 @@
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util]
             #?(:clj [clojure.pprint :as pprint]))
+  (:import (fluree.db SID))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -334,7 +335,7 @@
 (defn cmp-sid
   [sid1 sid2]
   (if (and sid1 sid2)
-    (compare sid1 sid2)
+    (SID/compare sid1 sid2)
     0))
 
 (defn cmp-subj
@@ -585,7 +586,7 @@
   reference: https://www.javamex.com/tutorials/memory/string_memory_usage.shtml"
   [^Flake f]
   (let [o      (o f)
-        dt     (int (dt f))
+        dt     (dt f)
         o-size (util/case+ dt
                  const/$xsd:string (* 2 (count o))
                  const/$xsd:anyURI 8

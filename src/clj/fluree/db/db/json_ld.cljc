@@ -1,6 +1,7 @@
 (ns fluree.db.db.json-ld
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql :as fql]
             [fluree.db.index :as index]
             [fluree.db.query.range :as query-range]
@@ -27,15 +28,6 @@
   {const/iri-view   {:root? true}
    const/iri-modify {:root? true}})
 
-
-(defn lookup-id
-  "Returns subject id or nil if no match."
-  [db iri]
-  (go-try
-    (some-> (<? (query-range/index-range db :post = [const/$xsd:anyURI iri]))
-            first
-            flake/s)))
-
 (defn expand-iri
   "Expands an IRI from the db's context."
   ([db iri]
@@ -44,20 +36,6 @@
    (if (keyword? iri)
      (json-ld/expand-iri iri (dbproto/-context db provided-context :keyword))
      (json-ld/expand-iri iri (dbproto/-context db provided-context :string)))))
-
-(defn iri->sid
-  "Returns subject id or nil if no match.
-
-  iri can be compact iri in string or keyword form."
-  [db iri {:keys [expand?]}]
-  (let [iri* (if expand?
-               (expand-iri db iri)
-               iri)]
-    ;; string? necessary because expand-iri will return original iri if not matched, and could be a keyword
-    (when (string? iri*)
-      (go-try
-        (<? (lookup-id db iri*))))))
-
 
 (defn subid
   "Returns subject ID of ident as async promise channel.
@@ -72,24 +50,10 @@
 
                         ;; assume iri
                         (string? ident)
-                        (<? (iri->sid db ident opts))
-
-                        ;; assume iri that needs to be expanded (should we allow this, or should it be expanded before getting this far?)
-                        (keyword? ident)
-                        (<? (iri->sid db ident opts))
-
-                        ;; TODO - should we validate this is an ident predicate? This will return first result of any indexed value
-                        (util/pred-ident? ident)
-                        (if-let [pid (dbproto/-p-prop db :id (first ident))]
-                          (some-> (<? (query-range/index-range db :post = [pid (second ident)]))
-                                  first
-                                  flake/s)
-                          (throw (ex-info (str "Subject ID lookup failed. The predicate " (pr-str (first ident)) " does not exist.")
-                                          {:status 400
-                                           :error  :db/invalid-ident})))
+                        (iri/iri->sid db ident)
 
                         :else
-                        (throw (ex-info (str "Entid lookup must be a number: " (pr-str ident))
+                        (throw (ex-info (str "Entid lookup must be a valid iri " (pr-str ident))
                                         {:status 400
                                          :error  :db/invalid-ident})))]
           (cond

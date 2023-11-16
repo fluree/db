@@ -5,6 +5,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.branch :as branch]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.policy :as perm]
@@ -113,8 +114,6 @@
      :stage-update?            (= t db-t) ;; if a previously staged db is getting updated again before committed
      :t                        t
      :iri->sid                 iri->sid
-     :next-pid                 (partial next-id iri->sid :last-pid)
-     :next-sid                 (partial next-id iri->sid :last-sid)
      :iris                     (volatile! {})}))
 
 (defn generate-flakes

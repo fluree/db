@@ -68,7 +68,7 @@
   (flake/create sid const/$xsd:anyURI iri const/$xsd:string t true nil))
 
 (defn insert-triple2
-  [db triple {:keys [t next-sid next-pid]} solution error-ch]
+  [db triple {:keys [t]} solution error-ch]
   (go
     (try*
       (let [db-alias            (:alias db)
@@ -86,7 +86,7 @@
           (let [s-iri          (where/get-iri s-mch)
                 existing-sid   (or (where/get-sid s-mch db-alias)
                                    (<? (dbproto/-subid db s-iri {:expand? false})))
-                sid            (or existing-sid (get jld-ledger/predefined-properties s-iri) (next-sid s-iri))
+                sid            (or existing-sid (get jld-ledger/predefined-properties s-iri) (iri/iri->sid db s-iri))
                 new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
 
                 p-iri            (where/get-iri p-mch)
@@ -94,7 +94,7 @@
                                      (<? (dbproto/-subid db p-iri {:expand? false})))
                 pid              (or existing-pid
                                      (get jld-ledger/predefined-properties p-iri)
-                                     (next-pid p-iri))
+                                     (iri/iri->sid db p-iri))
                 new-pred-flake   (when-not existing-pid (create-id-flake pid p-iri t))
 
                 o-val            (where/get-value o-mch)
@@ -108,7 +108,7 @@
                                    (or ref-sid ref-iri) const/$xsd:anyURI
                                    existing-dt existing-dt
                                    (string? dt) (or (get jld-ledger/predefined-properties dt)
-                                                    (next-pid dt))
+                                                    (iri/iri->sid db dt))
                                    sh-dt sh-dt
                                    :else (datatype/infer o-val (:lang m)))
                 new-dt-flake     (when (and (not existing-dt) (string? dt))
@@ -120,7 +120,7 @@
                 ref-sid          (if ref?
                                    (or existing-ref-sid
                                        (get jld-ledger/predefined-properties ref-iri)
-                                       (next-sid ref-iri))
+                                       (iri/iri->sid db ref-iri))
                                    ref-sid)
                 new-ref-flake    (when (and ref? (not existing-ref-sid))
                                    (create-id-flake ref-sid ref-iri t))

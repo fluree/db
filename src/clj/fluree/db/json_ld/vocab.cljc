@@ -195,7 +195,7 @@
               "_default"   {:name "_default" :id 11 :sid nil}}
         pred (map-pred-id+iri [{:iri const/iri-id
                                 :idx? true
-                                :id   const/$xsd:anyURI}
+                                :id   const/$id}
                                {:iri  "@type"
                                 :ref? true
                                 :idx? true

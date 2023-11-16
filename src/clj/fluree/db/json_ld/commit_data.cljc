@@ -8,7 +8,8 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const]
+            [fluree.db.json-ld.iri :as iri]))
 
 (comment
   ;; commit map - this map is what gets recorded in a few places:
@@ -491,14 +492,14 @@
   the db and that updates some internal state to reflect that this one is now
   used. It will only be called if needed. Used when committing to an in-memory
   ledger value and when reifying a ledger from storage on load."
-  [db t next-sid issuer-iri]
+  [db t issuer-iri]
   (go-try
     (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
       ;; create reference to existing issuer
       [(flake/create t const/$_commit:signer issuer-sid const/$xsd:anyURI t true
                      nil)]
       ;; create new issuer flake and a reference to it
-      (let [new-issuer-sid (next-sid)]
+      (let [new-issuer-sid (iri/iri->sid db issuer-iri)]
         [(flake/create t const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
                        true nil)
          (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri
@@ -518,12 +519,12 @@
   exist in the db and that updates some internal state to reflect that this one
   is now used. It will only be called if needed. Used when committing to an
   in-memory ledger value and when reifying a ledger from storage on load."
-  [db t next-sid {:keys [id address] :as _defaultContext}]
+  [db t {:keys [id address] :as _defaultContext}]
   (go-try
     (if-let [default-ctx-id (<? (dbproto/-subid db id))]
       [(flake/create t const/$_ledger:context default-ctx-id const/$xsd:anyURI t
                      true nil)]
-      (let [new-default-ctx-id (next-sid)]
+      (let [new-default-ctx-id (iri/iri->sid db id)]
         [(flake/create t const/$_ledger:context new-default-ctx-id
                        const/$xsd:anyURI t true nil)
          (flake/create new-default-ctx-id const/$xsd:anyURI id const/$xsd:string t
@@ -534,30 +535,27 @@
 
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
-  [prev-commit {:keys [commit] :as db}]
+  [prev-commit {:keys [alias commit] :as db}]
   (go-try
-    (let [last-sid           (volatile! (jld-ledger/last-commit-sid db))
-          next-sid           (fn [] (vswap! last-sid inc))
-
-          {:keys [data defaultContext issuer message]} commit
+    (let [{:keys [data defaultContext issuer message]} commit
           {db-t :t} data
 
           {previous-id :id prev-data :data} prev-commit
           prev-data-id       (:id prev-data)
 
           t                  (- db-t)
-          db-sid             (next-sid)
+          db-sid             (iri/iri->sid db alias)
           base-flakes        (commit-metadata-flakes commit t db-sid)
           prev-commit-flakes (when previous-id
                                (<? (prev-commit-flakes db t previous-id)))
           prev-db-flakes     (when prev-data-id
                                (<? (prev-data-flakes db db-sid t prev-data-id)))
           issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                               (<? (issuer-flakes db t next-sid issuer-iri)))
+                               (<? (issuer-flakes db t issuer-iri)))
           message-flakes     (when message
                                (message-flakes t message))
           default-ctx-flakes (when defaultContext
-                               (<? (default-ctx-flakes db t next-sid defaultContext)))
+                               (<? (default-ctx-flakes db t defaultContext)))
           commit-flakes      (cond-> base-flakes
                                      prev-commit-flakes (into prev-commit-flakes)
                                      prev-db-flakes (into prev-db-flakes)
@@ -565,7 +563,6 @@
                                      message-flakes (into message-flakes)
                                      default-ctx-flakes (into default-ctx-flakes))]
       (-> db
-          (assoc-in [:ecount const/$_shard] @last-sid)
           (cond-> (= 1 db-t) add-commit-schema-flakes)
           (update-novelty commit-flakes)
           add-tt-id))))

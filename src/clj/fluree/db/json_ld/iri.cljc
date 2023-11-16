@@ -93,18 +93,20 @@
 
 (defn get-name
   [sid]
-  (->> sid
-       get-name-codes
-       codes->name))
+  (->> sid get-name-codes codes->name))
 
 (defn iri->sid
   "Converts a string iri into a vector of long integer codes. The first code
   corresponds to the iri's namespace, and the remaining codes correspond to the
   iri's name split into 8-byte chunks"
-  [db iri]
-  (let [[ns nme] (decompose iri)]
-    (when-let [ns-code (namespace->code db ns)]
-      (append-name-codes [ns-code] nme))))
+  ([iri]
+   (let [[ns nme] (decompose iri)]
+     (when-let [ns-code (get namespaces ns)]
+       (append-name-codes [ns-code] nme))))
+  ([db iri]
+   (let [[ns nme] (decompose iri)]
+     (when-let [ns-code (namespace->code db ns)]
+       (append-name-codes [ns-code] nme)))))
 
 (defn sid->iri
   "Converts a vector as would be returned by `iri->subid` back into a string iri."

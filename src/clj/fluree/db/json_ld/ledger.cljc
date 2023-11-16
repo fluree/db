@@ -152,19 +152,6 @@
     const/$sh:zeroOrOnePath
     const/$rdf:type})
 
-(defn generate-new-sid
-  "Generates a new subject ID. If it is known this is a property or class will
-  assign the lower range of subject ids."
-  [{:keys [id] :as node} referring-pid iris next-pid next-sid]
-  (let [new-sid (or
-                  (get predefined-properties id)
-                  (if (or (class-or-property? node)
-                          (contains? predicate-refs referring-pid))
-                    (next-pid)
-                    (next-sid)))]
-    (vswap! iris assoc id new-sid)
-    new-sid))
-
 (defn generate-new-pid
   "Generates a new pid for a property that has not yet been used.
   Optionally 'refs-v' is a volatile! set of refs that gets used in
