@@ -312,7 +312,7 @@
   zero). Returns n otherwise."
   [n required-type]
   (when (number? n) ; these are all integer types, but this fn shouldn't care
-    (uc/case (int required-type)
+    (uc/case required-type
       const/$xsd:positiveInteger
       (if (>= 0 n) nil n)
 
@@ -338,7 +338,7 @@
    - numbers in strings
    - the strings 'true' or 'false' to a boolean"
   [value required-type]
-  (uc/case (int required-type)
+  (uc/case required-type
     (const/$xsd:string
      const/$rdf:langString)
     (when (string? value)
