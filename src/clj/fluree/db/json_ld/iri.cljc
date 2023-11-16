@@ -108,8 +108,17 @@
      (when-let [ns-code (namespace->code db ns)]
        (append-name-codes [ns-code] nme)))))
 
+(defn sid?
+  [x]
+  (vector? x))
+
 (defn sid->iri
   "Converts a vector as would be returned by `iri->subid` back into a string iri."
-  [db sid]
-  (str (get-namespace db sid)
-       (get-name sid)))
+  ([sid]
+   (-> sid
+       get-ns-code
+       (as-> ns (get namespaces ns))
+       (str (get-name sid))))
+  ([db sid]
+   (str (get-namespace db sid)
+        (get-name sid))))

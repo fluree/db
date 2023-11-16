@@ -44,9 +44,11 @@
   (let [return-chan (async/promise-chan)]
     (go
       (try*
-        (let [res (cond (number? ident)
-                        (when (not-empty (<? (query-range/index-range db :spot = [ident])))
-                          ident)
+        (let [res (cond (iri/sid? ident)
+                        (if (not-empty (<? (query-range/index-range db :spot = [ident])))
+                          ident
+                          (throw (ex-info (str "ident does not exist:" ident)
+                                          {})))
 
                         ;; assume iri
                         (string? ident)

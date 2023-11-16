@@ -81,7 +81,8 @@
                      (or (where/get-iri o-mch)
                          (where/get-sid o-mch db-alias)
                          (some? (where/get-value o-mch))))
-          ;; discard the matches if we don't have the values we need to construct an obj-flake
+          ;; discard the matches if we don't have the values we need to
+          ;; construct an obj-flake
           []
           (let [s-iri          (where/get-iri s-mch)
                 existing-sid   (or (where/get-sid s-mch db-alias)

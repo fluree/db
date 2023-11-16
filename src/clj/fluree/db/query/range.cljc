@@ -9,7 +9,8 @@
             #?(:clj  [clojure.core.async :refer [chan go >!] :as async]
                :cljs [cljs.core.async :refer [chan  >!] :refer-macros [go] :as async])
             [fluree.db.permissions-validate :as perm-validate]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -71,14 +72,6 @@
     :post pred-max-match
     :opst subject-max-match
     :tspo txn-max-match))
-
-(defn resolve-subid
-  "Expands an IRI @id for a subject and returns the index's subject-id integer (sid).
-
-  Only called when integer or nil is not provided, so can assume always have a compact
-  or full IRI as either a keyword or string."
-  [db id]
-  (dbproto/-subid db id))
 
 (defn resolve-match-flake
   [test s p o t op m]
@@ -298,19 +291,19 @@
          (match->flake-parts db idx end-match)]
 
      (go-try
-       (let [s1*         (if (or (number? s1) (nil? s1))
+       (let [s1*         (if (or (iri/sid? s1) (nil? s1))
                            s1
-                           (<? (resolve-subid db s1)))
+                           (iri/iri->sid db s1))
              start-flake (resolve-match-flake start-test s1* p1 o1 t1 op1 m1)
              s2*         (cond
-                           (or (number? s2) (nil? s2))
+                           (or (iri/sid? s2) (nil? s2))
                            s2
 
                            (= s2 s1) ; common case when 'test' is =
                            s1*
 
                            :else
-                           (<? (resolve-subid db s2)))
+                           (iri/iri->sid db s2))
              end-flake   (resolve-match-flake end-test s2* p2 o2 t2 op2 m2)
              error-ch    (chan)
              range-ch    (index-range* db
