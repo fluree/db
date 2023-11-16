@@ -571,24 +571,19 @@
 (def blank-node-prefix
   "_:fdb")
 
-(defn blank-node-id
+(defn new-blank-node-id
   "Generate a temporary blank-node id. This will get replaced during flake creation
   when a sid is generated."
-  [{:keys [t tt-id] :as _db} blank-node-counter]
-  (let [node-count    (vswap! blank-node-counter inc)
-        t*            (abs t)
-        id-components (if tt-id
-                        [blank-node-prefix t* tt-id node-count]
-                        [blank-node-prefix t* node-count])]
-    (str/join "-" id-components)))
+  []
+  (str blank-node-prefix (random-uuid)))
 
 (declare parse-subj-cmp)
 (defn parse-obj-cmp
-  [db blank-node-counter subj-cmp pred-cmp m triples
+  [subj-cmp pred-cmp m triples
    {:keys [list id value type language] :as v-map}]
   (cond list
         (reduce (fn [triples [i list-item]]
-                  (parse-obj-cmp db blank-node-counter subj-cmp pred-cmp {:i i} triples list-item))
+                  (parse-obj-cmp subj-cmp pred-cmp {:i i} triples list-item))
                 triples
                 (map vector (range) list))
 
@@ -606,7 +601,7 @@
                     (parse-variable id)
                     (where/match-iri
                      (if (nil? id)
-                       (blank-node-id db blank-node-counter)
+                       (new-blank-node-id)
                        id)))
           ref-cmp (if m
                     (assoc ref-obj ::where/meta m)
@@ -615,11 +610,11 @@
                     ;; project newly created bnode-id into v-map
                     (assoc v-map :id (where/get-iri ref-cmp))
                     v-map)]
-      (conj (parse-subj-cmp db blank-node-counter triples v-map*)
+      (conj (parse-subj-cmp triples v-map*)
             [subj-cmp pred-cmp ref-cmp]))))
 
 (defn parse-pred-cmp
-  [db blank-node-counter subj-cmp triples [pred values]]
+  [subj-cmp triples [pred values]]
   (let [values*  (cond (= pred :type)
                        ;; homogenize @type values so they have the same structure as other predicates
                        (map #(do {:id %}) values)
@@ -634,29 +629,28 @@
                        ;; we want the actual iri here, not the keyword
                        (= pred :type)     (where/match-iri const/iri-type)
                        :else              (where/match-iri pred))]
-    (reduce (partial parse-obj-cmp db blank-node-counter subj-cmp pred-cmp nil)
+    (reduce (partial parse-obj-cmp subj-cmp pred-cmp nil)
             triples
             values*)))
 
 (defn parse-subj-cmp
-  [db blank-node-counter triples {:keys [id] :as node}]
+  [triples {:keys [id] :as node}]
   (let [subj-cmp (cond (v/variable? id) (parse-variable id)
-                       (nil? id)        (where/match-iri (blank-node-id db blank-node-counter))
+                       (nil? id)        (where/match-iri (new-blank-node-id))
                        :else            (where/match-iri id))]
-    (reduce (partial parse-pred-cmp db blank-node-counter subj-cmp)
+    (reduce (partial parse-pred-cmp subj-cmp)
             triples
             (dissoc node :id :idx))))
 
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
-  [db expanded]
-  (let [blank-node-counter (volatile! 0)]
-    (reduce (partial parse-subj-cmp db blank-node-counter)
-            []
-            expanded)))
+  [expanded]
+  (reduce (partial parse-subj-cmp)
+          []
+          expanded))
 
 (defn parse-txn
-  [db txn context]
+  [txn context]
   (let [vals-map      {:values (util/get-first-value txn const/iri-values)}
         [vars values] (parse-values vals-map)
         where-map     {:where (util/get-first-value txn const/iri-where)}
@@ -664,11 +658,11 @@
         delete-clause (-> txn
                           (util/get-first-value const/iri-delete)
                           (json-ld/expand context))
-        delete        (->> delete-clause util/sequential (parse-triples db))
+        delete        (->> delete-clause util/sequential parse-triples)
         insert-clause (-> txn
                           (util/get-first-value const/iri-insert)
                           (json-ld/expand context))
-        insert        (->> insert-clause util/sequential (parse-triples db))]
+        insert        (->> insert-clause util/sequential parse-triples)]
     (when (and (empty? insert) (empty? delete))
       (throw (ex-info (str "Invalid transaction, insert or delete clause must contain nodes with objects.")
                       {:status 400 :error :db/invalid-transaction})))
