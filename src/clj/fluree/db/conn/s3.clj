@@ -7,7 +7,6 @@
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.conn.core :as conn-core]
-            [fluree.db.full-text :as full-text]
             [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.ledger.proto :as ledger-proto]
@@ -117,12 +116,7 @@
                                  (storage/resolve-index-node
                                    conn node
                                    (fn [] (conn-cache/lru-evict lru-cache-atom
-                                                                cache-key))))))))
-
-  full-text/IndexConnection
-  (open-storage [_conn _network _dbid _lang]
-    (throw (ex-info "S3 connection does not support full text operations."
-                    {:status 400, :error :db/unsupported-operation}))))
+                                                               cache-key)))))))))
 
 
 (defmethod print-method S3Connection [^S3Connection conn, ^Writer w]

@@ -18,8 +18,6 @@
 ;; generates a db/ledger from persisted data
 #?(:clj (set! *warn-on-reflection* true))
 
-(def ^:const max-vocab-sid (flake/max-subject-id const/$_collection))
-
 (defn list-value?
   "returns true if json-ld value is a list object."
   [v]

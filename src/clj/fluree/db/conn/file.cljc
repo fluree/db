@@ -16,7 +16,6 @@
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.util.bytes :as bytes]
-            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
             [fluree.db.ledger.proto :as ledger-proto])
@@ -166,13 +165,7 @@
           cache-key
           (fn [_]
             (storage/resolve-index-node conn node
-                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key))))))))
-
-  #?@(:clj
-      [full-text/IndexConnection
-       (open-storage [conn network dbid lang]
-         (throw (ex-info "File connection does not support full text operations."
-                         {:status 500 :error :db/unexpected-error})))]))
+                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
 
 #?(:cljs
    (extend-type FileConnection

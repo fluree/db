@@ -2,7 +2,6 @@
   (:require [fluree.db.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.context :as ctx-util]
-            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.method.ipfs.core :as ipfs]
@@ -76,13 +75,7 @@
           cache-key
           (fn [_]
             (storage/resolve-index-node conn node
-                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key))))))))
-
-  #?@(:clj
-      [full-text/IndexConnection
-       (open-storage [conn network dbid lang]
-         (throw (ex-info "IPFS connection does not support full text operations."
-                         {:status 500 :error :db/unexpected-error})))]))
+                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
 
 #?(:cljs
    (extend-type IPFSConnection

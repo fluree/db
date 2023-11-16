@@ -6,7 +6,6 @@
             [fluree.db.nameservice.memory :as ns-memory]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
-            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.platform :as platform]
@@ -124,13 +123,7 @@
     [_ node]
     ;; all root index nodes will be empty
 
-    (storage/resolve-empty-node node))
-
-  #?@(:clj
-      [full-text/IndexConnection
-       (open-storage [conn network dbid lang]
-         (throw (ex-info "Memory connection does not support full text operations."
-                         {:status 500 :error :db/unexpected-error})))]))
+    (storage/resolve-empty-node node)))
 
 #?(:cljs
    (extend-type MemoryConnection
