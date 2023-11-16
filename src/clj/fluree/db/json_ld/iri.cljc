@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.iri
-  (:require [fluree.db.util.bytes :as bytes]
+  (:require [fluree.db.util.core :as util]
+            [fluree.db.util.bytes :as bytes]
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]))
 
@@ -111,6 +112,12 @@
 (defn sid?
   [x]
   (vector? x))
+
+(def ^:const min-sid
+  [util/min-integer util/min-long])
+
+(def ^:const max-sid
+  [util/max-integer util/max-long])
 
 (defn sid->iri
   "Converts a vector as would be returned by `iri->subid` back into a string iri."

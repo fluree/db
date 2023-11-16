@@ -3,15 +3,13 @@
   (:require [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util]
+            [fluree.db.json-ld.iri :as iri]
             #?(:clj [clojure.pprint :as pprint]))
   (:import (fluree.db SID))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-;; maximum number of collections. 19 bits - 524,287 - javascript 9 bits - 511
-(def ^:const MAX-COLLECTION-ID #?(:clj  2r1111111111111111111
-                                  :cljs 2r111111111))
 ;; maximum number of subject indexes within a given collection. 44 bits - 17,592,186,044,415
 ;; javascript, 44 bits - 1
 (def ^:const MAX-COLL-SUBJECTS #?(:clj  2r11111111111111111111111111111111111111111111
@@ -39,35 +37,17 @@
   (+ (lshift cid 44) n))
 
 
-(defn ->sid-checked
-  "Like ->sid, but checks that cid and n are within allowable range."
-  [cid n]
-  (assert (< 0 cid MAX-COLLECTION-ID) (str "Collection id is out of allowable range of 0 - " MAX-COLLECTION-ID))
-  (assert (< 0 n MAX-COLL-SUBJECTS) (str "Subject number is out of allowable range of 0 - " MAX-COLL-SUBJECTS))
-  (->sid cid n))
-
-
-(defn min-subject-id
-  "For a given collection id, returns the min subject id that is allowed."
-  [cid]
-  (->sid cid 0))
-
-
 (defn max-subject-id
   "For a given collection id, returns the max subject id that is allowed."
   [cid]
   (->sid cid MAX-COLL-SUBJECTS))
 
-
-(def ^:const MIN-PREDICATE-ID (min-subject-id const/$_predicate))
-(def ^:const MAX-PREDICATE-ID (max-subject-id const/$_predicate))
-
-(def ^:const min-s util/max-long)
-(def ^:const max-s util/min-long)
-(def ^:const min-p 0)
-(def ^:const max-p MAX-PREDICATE-ID)
-(def ^:const min-dt util/min-integer)
-(def ^:const max-dt util/max-integer)
+(def ^:const min-s iri/min-sid)
+(def ^:const max-s iri/max-sid)
+(def ^:const min-p iri/min-sid)
+(def ^:const max-p iri/max-sid)
+(def ^:const min-dt iri/min-sid)
+(def ^:const max-dt iri/max-sid)
 (def ^:const min-t 0)
 (def ^:const max-t util/min-long)
 (def ^:const min-op false)
@@ -451,8 +431,8 @@
   "Returns all matching flakes to a specific 't' value."
   [ss t]
   (avl/subrange ss
-                >= (->Flake util/max-long nil nil nil t nil nil)
-                <= (->Flake util/min-long nil nil nil t nil nil)))
+                >= (->Flake min-s nil nil nil t nil nil)
+                <= (->Flake max-s nil nil nil t nil nil)))
 
 (defn subrange
   ([ss test flake]
