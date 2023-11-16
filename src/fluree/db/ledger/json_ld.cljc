@@ -6,7 +6,6 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.json-ld.bootstrap :as bootstrap]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.json-ld.commit :as jld-commit]
@@ -241,7 +240,7 @@
   [conn ledger-alias opts]
   (go-try
     (let [{:keys [defaultContext context-type did branch indexer include
-                  reindex-min-bytes reindex-max-bytes initial-tx new-context?]
+                  reindex-min-bytes reindex-max-bytes new-context?]
            :or   {branch       :main
                   new-context? true}} opts
           default-context (if defaultContext
@@ -292,11 +291,7 @@
                              :cache   (atom {})
                              :indexer indexer
                              :conn    conn})
-          blank-db        (jld-db/create ledger default-context context-type* new-context?)
-          bootstrap?      (boolean initial-tx)
-          db              (if bootstrap?
-                            (<? (bootstrap/bootstrap blank-db initial-tx))
-                            (bootstrap/blank-db blank-db))]
+          db              (jld-db/create ledger default-context context-type* new-context?)]
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-db-update ledger db)
       (when include
