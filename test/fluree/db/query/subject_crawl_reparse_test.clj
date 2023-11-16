@@ -5,7 +5,8 @@
    [fluree.db.json-ld.api :as fluree]
    [fluree.db.query.fql.parse :as parse]
    [fluree.db.query.subject-crawl.reparse :as reparse]
-   [fluree.db.dbproto :as dbproto]))
+   [fluree.db.dbproto :as dbproto]
+   [fluree.db.json-ld.iri :as iri]))
 
 (deftest test-reparse-as-ssc
   (let [conn   (test-utils/create-conn)
@@ -109,7 +110,7 @@
         (is (not (nil? context)))
         (is (= {:variable '?s}
                s))
-        (is (number? (:value p)))
+        (is (iri/sid? (:value p)))
         (let [{:keys [value datatype]} o]
           (is (= "Alice"
                  value))
@@ -121,7 +122,7 @@
         (is (not (nil? context)))
         (is (= {:variable '?s}
                s))
-        (is (number? (:value p)))
+        (is (iri/sid? (:value p)))
         (let [{:keys [value datatype]} o]
           (is (= 50
                  value))
