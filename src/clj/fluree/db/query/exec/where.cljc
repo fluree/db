@@ -76,6 +76,12 @@
       (matched-iri? match)
       (matched-sid? match)))
 
+(defn all-matched?
+  [[s p o]]
+  (and (matched-iri? s)
+       (matched-iri? p)
+       (matched? o)))
+
 (def unmatched?
   "Returns true if the triple pattern component `match` represents a variable
   without an associated value."
