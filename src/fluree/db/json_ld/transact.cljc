@@ -221,7 +221,7 @@
                                                    (:supplied-context parsed-opts))
                                             (dissoc :supplied-context)))]
                 (<? (perm/wrap-policy db policy-identity))
-                 db)
+                db)
            tx-state      (->tx-state db*)
 
            txn-context   (dbproto/-context db* (:context parsed-opts))

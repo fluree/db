@@ -497,7 +497,7 @@
            (ex-message db3))
         "datatype constraint is restored after a load")))
 
-(deftest ^:pending ^:integration unbound-var-in-insert-test
+(deftest ^:integration unbound-var-in-insert-test
   (testing "unbound var in insert clause returns parse error"
     (let [conn   (test-utils/create-conn
                   {:context      test-utils/default-str-context
@@ -510,5 +510,5 @@
                     {"@context"           ["" {"ex" "http://example.org/"}]
                      "@id"                "ex:mosquitos"
                      "schema:description" "?x"}})]
-      (is (= "variable ?x is unbound"
+      (is (= "variable ?x is not bound in where nor values clause"
              (ex-message result))))))
