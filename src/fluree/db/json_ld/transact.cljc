@@ -214,6 +214,9 @@
    (go-try
     (let [db* (if-let [policy-identity (perm/policy-identity
                                         (-> parsed-opts
+                                            ;;TODO once we remove default-context,
+                                            ;;should only have one context, with no need
+                                            ;;to swap here
                                             (assoc :context
                                                    (:supplied-context parsed-opts))
                                             (dissoc :supplied-context)))]

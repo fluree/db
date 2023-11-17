@@ -30,6 +30,9 @@
           parsed-opts             (cond-> parsed-opts
                                     did (assoc :did did)
                                     txn-context (assoc :context txn-context)
+                                    ;;TODO once we remove default-context, this supplied-context
+                                    ;;can just replace `txn-context` above as the value of
+                                    ;;the `:context` key
                                     true (assoc :supplied-context (ctx-util/extract+parse-supplied-context txn)))
 
           {:keys [maxFuel meta] :as parsed-opts*} (parse-opts parsed-opts opts)]
