@@ -250,7 +250,8 @@
           named-aliases   (some-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [ds          (<? (load-dataset conn default-aliases named-aliases t opts))
+        (let [ds          (<? (load-dataset conn default-aliases named-aliases t
+                                            (assoc  opts :context (ctx-util/extract+parse-supplied-context query))))
               query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
               max-fuel    (:max-fuel opts)
               default-ctx (conn-proto/-default-context conn)

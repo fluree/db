@@ -203,15 +203,28 @@
                                        :opts   {:did  alice-did
                                                 :role :ex/userRole}}))
           "Both user names should show, but only SSN for Alice")
-      (testing "history query"
         (let [_ @(fluree/commit! ledger db+policy)]
-          (is (= []
-                 @(fluree/history ledger {:context context
-                                          :history        [:ex/john :schema/ssn] :t {:from 1}
-                                          :commit-details true
-                                          :opts           {:did  alice-did
-                                                           :role :ex/userRole}}))
-              "Alice should not be able to see any history for John's ssn")
+          (testing "query-connection"
+            (is (= [["Alice" "111-11-1111"] ["John" nil]]
+                   @(fluree/query-connection conn
+                                             {:context context
+                                              :from "policy/a"
+                                              :select '[?name ?ssn]
+                                              :where  '[{:id          ?p
+                                                         :schema/name ?name}
+                                                        [:optional {:id         ?p
+                                                                    :schema/ssn ?ssn}]]
+                                              :opts   {:did  alice-did
+                                                       :role :ex/userRole}}))
+                "Both user names should show, but only SSN for Alice"))
+          (testing "history query"
+            (is (= []
+                   @(fluree/history ledger {:context context
+                                            :history        [:ex/john :schema/ssn] :t {:from 1}
+                                            :commit-details true
+                                            :opts           {:did  alice-did
+                                                             :role :ex/userRole}}))
+                "Alice should not be able to see any history for John's ssn"))
           (is (= [{:f/t       1,
                    :f/assert  [{:schema/ssn "111-11-1111", :id :ex/alice}],
                    :f/retract []}]
@@ -269,7 +282,7 @@
                                             :history [:ex/john :schema/name] :t {:from 1}
                                             :opts    {:did  alice-did
                                                       :role :ex/userRole}}))
-                "Alice should be able to see all history for John's name")))))))
+                "Alice should be able to see all history for John's name"))))))
 
 (deftest policy-without-f-context-term
   (testing "policies should work w/o an explicit f -> https://ns.flur.ee/ledger# context term"
