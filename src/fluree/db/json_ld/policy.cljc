@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.policy
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
+            [fluree.json-ld :as json-ld]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.policy-validate :as validate]
@@ -488,10 +489,12 @@
          (throw e))))))
 
 
-(defn policy-opts
-  [opts]
-  (-> (select-keys opts [:did :role :credential])
-      not-empty))
+(defn policy-identity
+  [{:keys [context] :as identity-map}]
+  (when-let [{:keys [role] :as identity} (-> (select-keys identity-map [:did :role :credential])
+                                             not-empty)]
+    (cond-> identity
+      (and role context) (update :role json-ld/expand-iri context))))
 
 (defn role-sids-for-sid
   [db sid]

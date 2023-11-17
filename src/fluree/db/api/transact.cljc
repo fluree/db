@@ -29,7 +29,8 @@
           opts                    (util/get-first-value expanded const/iri-opts)
           parsed-opts             (cond-> parsed-opts
                                     did (assoc :did did)
-                                    txn-context (assoc :context txn-context))
+                                    txn-context (assoc :context txn-context)
+                                    true (assoc :supplied-context (ctx-util/extract+parse-supplied-context txn)))
 
           {:keys [maxFuel meta] :as parsed-opts*} (parse-opts parsed-opts opts)]
       (if (or maxFuel meta)
