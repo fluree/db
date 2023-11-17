@@ -196,19 +196,21 @@
   `filters`, the variable's match filter function within `triple-pattern` is set
   to the value associated with that variable from the `filter` specification
   map."
-  [triple-pattern solution filters]
-  (mapv (fn [component]
-          (if-let [variable (::var component)]
-            (if-let [match (get solution variable)]
-              match
-              (let [filter-fn (some->> (get filters variable)
-                                       (map ::fn)
-                                       (map (fn [f]
-                                              (partial f solution)))
-                                       (apply every-pred))]
-                (assoc component ::fn filter-fn)))
-            component))
-        triple-pattern))
+  ([triple-pattern solution]
+   (assign-matched-values triple-pattern solution nil))
+  ([triple-pattern solution filters]
+   (mapv (fn [component]
+           (if-let [variable (::var component)]
+             (if-let [match (get solution variable)]
+               match
+               (let [filter-fn (some->> (get filters variable)
+                                        (map ::fn)
+                                        (map (fn [f]
+                                               (partial f solution)))
+                                        (apply every-pred))]
+                 (assoc component ::fn filter-fn)))
+             component))
+         triple-pattern)))
 
 (defn match-subject
   "Matches the subject of the supplied `flake` to the triple subject pattern

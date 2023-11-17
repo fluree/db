@@ -72,7 +72,7 @@
   (go
     (try*
       (let [db-alias            (:alias db)
-            [s-mch p-mch o-mch] (where/assign-matched-values triple solution nil)]
+            [s-mch p-mch o-mch] (where/assign-matched-values triple solution)]
         (log/trace "insert-triple o-mch:" o-mch)
         (if-not (and (or (where/get-iri s-mch)
                          (where/get-sid s-mch db-alias))
