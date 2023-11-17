@@ -5,4 +5,4 @@
  {assoc  [[:inner 0]] ; makes pairs indent under assoc instead of map arg
   go-try [[:block 0]]
   try*   [[:block 0]]
-  catch* [[:block 2]]}}
+  catch* [[:block 1]]}}
