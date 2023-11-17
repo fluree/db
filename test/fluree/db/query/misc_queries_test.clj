@@ -2,7 +2,8 @@
   (:require [clojure.test :refer :all]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util]
+            [test-with-files.tools :refer [with-tmp-dir]]))
 
 (deftest ^:integration select-sid
   (testing "Select index's subject id in query using special keyword"
@@ -412,3 +413,16 @@
            @(fluree/query db3 {"select" {"?s" ["*"]}
                                "where" {"id" "?s", "type" "ex:Diamond"}}))
         "Can transact with rdf:type aliased to type.")))
+
+(deftest ^:integration load-with-new-connection
+  (with-tmp-dir storage-path
+    (let [conn0   @(fluree/connect {:method :file :storage-path storage-path})
+          ledger-id "new3"
+          ledger @(fluree/create-with-txn conn0 {"ledger" ledger-id
+                                                 "insert" {"ex:createdAt" "now"}})
+
+          conn1   @(fluree/connect {:method :file :storage-path storage-path})]
+      (is (= [{"ex:createdAt" "now"}]
+             @(fluree/query-connection conn1 {:from ledger-id
+                                              :where {"@id" "?s" "ex:createdAt" "now"},
+                                              :select {"?s" ["ex:createdAt"]}}))))))
