@@ -7,7 +7,7 @@
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log]
-            [clojure.core.async :as async :refer [<! >! go]]
+            [clojure.core.async :as async :refer [>! go]]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.datatype :as datatype]))
 
@@ -17,27 +17,18 @@
 
 (defn retract-triple
   [db triple {:keys [t]} solution fuel-tracker error-ch]
-  (let [retract-flakes-ch (async/chan)]
-    (go
-      (try*
-        (let [retract-xf (keep (fn [f]
-                                 ;;do not retract the flakes which map subject ids to iris.
-                                 ;;they are an internal optimization, which downstream code
-                                 ;;(eg the commit pipeline) relies on
-                                 (when-not (iri-mapping? f)
-                                   (flake/flip-flake f t))))
-
-              components  (->> (where/assign-matched-values triple solution nil)
-                               (where/resolve-sids db error-ch)
-                               (<!))]
-          ;; we need to match an individual flake, so if we are missing s p or o we want to close the ch
-          (if components
-            (async/pipe (where/resolve-flake-range db fuel-tracker retract-xf error-ch components)
-                        retract-flakes-ch)
-            (async/close! retract-flakes-ch)))
-        (catch* e
-                (log/error e "Error retracting triple")
-                (>! error-ch e))))
+  (let [retract-flakes-ch (async/chan)
+        retract-xf        (keep (fn [f]
+                                  ;;do not retract the flakes which map subject ids to iris.
+                                  ;;they are an internal optimization, which downstream code
+                                  ;;(eg the commit pipeline) relies on
+                                  (when-not (iri-mapping? f)
+                                    (flake/flip-flake f t))))]
+    (if-let [components (->> (where/assign-matched-values triple solution)
+                             (where/compute-sids db))]
+      (async/pipe (where/resolve-flake-range db fuel-tracker retract-xf error-ch components)
+                  retract-flakes-ch)
+      (async/close! retract-flakes-ch))
     retract-flakes-ch))
 
 (defn retract-clause
