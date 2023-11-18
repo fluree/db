@@ -255,6 +255,8 @@
                      const/$_prefix     (flake/->sid const/$_prefix 1000)
                      const/$_shard      (flake/->sid const/$_shard 1000)})
 
+(def identity-flake
+  (flake/create const/$xsd:anyURI const/$xsd:anyURI const/iri-id const/$xsd:string 0 true nil))
 
 (defn create
   [{:keys [method alias conn] :as ledger} default-context context-type new-context?]
@@ -274,26 +276,28 @@
         context-type* (if (not= :keyword context-type)
                         :string
                         context-type)]
-    (map->JsonLdDb {:ledger           ledger
-                    :conn             conn
-                    :alias            alias
-                    :branch           (:name branch)
-                    :commit           (:commit branch)
-                    :t                0
-                    :tt-id            nil
-                    :stats            stats
-                    :spot             spot
-                    :post             post
-                    :opst             opst
-                    :tspo             tspo
-                    :schema           schema
-                    :comparators      index/default-comparators
-                    :novelty          novelty
-                    :policy           root-policy-map
-                    :default-context  default-context
-                    :context-type     context-type*
-                    :context-cache    (volatile! nil)
-                    :new-context?     new-context?
-                    :ecount           genesis-ecount
-                    :namespaces       {}
-                    :namespace-coedes {}})))
+    (-> {:ledger          ledger
+         :conn            conn
+         :alias           alias
+         :branch          (:name branch)
+         :commit          (:commit branch)
+         :t               0
+         :tt-id           nil
+         :stats           stats
+         :spot            spot
+         :post            post
+         :opst            opst
+         :tspo            tspo
+         :schema          schema
+         :comparators     index/default-comparators
+         :novelty         novelty
+         :policy          root-policy-map
+         :default-context default-context
+         :context-type    context-type*
+         :context-cache   (volatile! nil)
+         :new-context?    new-context?
+         :ecount          genesis-ecount
+         :namespaces       {}
+         :namespace-coedes {}}
+        map->JsonLdDb
+        (commit-data/update-novelty [identity-flake]))))

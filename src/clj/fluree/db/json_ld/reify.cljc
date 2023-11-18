@@ -408,8 +408,7 @@
           t-new              (- (db-t db-data))
           _                  (when (and (not= t-new (dec t))
                                         (not merged-db?)) ;; when including multiple dbs, t values will get reused.
-                               (throw (ex-info (str "Commit t value: " (- t-new)
-                                                    " has a gap from latest commit t value: " (- t) ".")
+                               (throw (ex-info (str "Cannot merge commit with t " (- t-new) " into db of t " (- t) ".")
                                                {:status 500 :error :db/invalid-commit})))
           assert             (db-assert db-data)
           retract            (db-retract db-data)
