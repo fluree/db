@@ -258,7 +258,7 @@
 
 (defn create
   [{:keys [method alias conn] :as ledger} default-context context-type new-context?]
-  (let [novelty       (new-novelty-map index/default-comparators)
+  (let [novelty (new-novelty-map index/default-comparators)
         {spot-cmp :spot
          post-cmp :post
          opst-cmp :opst
@@ -274,24 +274,26 @@
         context-type* (if (not= :keyword context-type)
                         :string
                         context-type)]
-    (map->JsonLdDb {:ledger          ledger
-                    :conn            conn
-                    :alias           alias
-                    :branch          (:name branch)
-                    :commit          (:commit branch)
-                    :t               0
-                    :tt-id           nil
-                    :stats           stats
-                    :spot            spot
-                    :post            post
-                    :opst            opst
-                    :tspo            tspo
-                    :schema          schema
-                    :comparators     index/default-comparators
-                    :novelty         novelty
-                    :policy          root-policy-map
-                    :default-context default-context
-                    :context-type    context-type*
-                    :context-cache   (volatile! nil)
-                    :new-context?    new-context?
-                    :ecount          genesis-ecount})))
+    (map->JsonLdDb {:ledger           ledger
+                    :conn             conn
+                    :alias            alias
+                    :branch           (:name branch)
+                    :commit           (:commit branch)
+                    :t                0
+                    :tt-id            nil
+                    :stats            stats
+                    :spot             spot
+                    :post             post
+                    :opst             opst
+                    :tspo             tspo
+                    :schema           schema
+                    :comparators      index/default-comparators
+                    :novelty          novelty
+                    :policy           root-policy-map
+                    :default-context  default-context
+                    :context-type     context-type*
+                    :context-cache    (volatile! nil)
+                    :new-context?     new-context?
+                    :ecount           genesis-ecount
+                    :namespaces       {}
+                    :namespace-coedes {}})))
