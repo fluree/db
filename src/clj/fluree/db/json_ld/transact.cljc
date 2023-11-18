@@ -82,32 +82,16 @@
             (recur r adds removes))))
       [(not-empty adds) (not-empty removes)])))
 
-(defn next-id
-  "Generate the next subject id - `counter-key` is either :last-pid or :last-sid."
-  [iri->sid counter-key iri]
-  (let [iri->sid* (swap! iri->sid
-                         (fn [iri->sid]
-                           (if (get iri->sid iri)
-                             iri->sid
-                             (-> iri->sid
-                                 (assoc iri (get iri->sid counter-key))
-                                 (update counter-key inc)))))]
-    (get iri->sid* iri)))
-
 (defn ->tx-state
   [db]
   (let [{:keys [schema branch ledger policy], db-t :t} db
-        iri->sid (atom {:last-pid (jld-ledger/last-pid db)
-                        :last-sid (jld-ledger/last-sid db)})
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t         (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
         db-before (dbproto/-rootdb db)]
     {:db-before                db-before
      :policy                   policy
      :stage-update?            (= t db-t) ;; if a previously staged db is getting updated again before committed
-     :t                        t
-     :iri->sid                 iri->sid
-     :iris                     (volatile! {})}))
+     :t                        t}))
 
 (defn generate-flakes
   [db fuel-tracker parsed-txn tx-state]
