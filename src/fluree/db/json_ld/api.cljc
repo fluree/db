@@ -301,7 +301,7 @@
   allows the permission attributes to be modified.
 
   Returns promise"
-  [db {:keys [context] :as identity-map}]
+  [db identity-map]
   (promise-wrap
    (->> identity-map
         perm/policy-identity
