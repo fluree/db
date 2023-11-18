@@ -158,17 +158,13 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [new-flakes {:keys [stage-update? db-before iri->sid policy t] :as tx-state}]
+  [new-flakes {:keys [stage-update? db-before policy t] :as tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
                          [new-flakes nil])
 
-          {:keys [last-pid last-sid]} @iri->sid
-
           db-after  (-> db-before
-                        (update :ecount assoc const/$_predicate last-pid)
-                        (update :ecount assoc const/$_default last-sid)
                         (assoc :policy policy) ;; re-apply policy to db-after
                         (assoc :t t)
                         (commit-data/update-novelty add remove)
