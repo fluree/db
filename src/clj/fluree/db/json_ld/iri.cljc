@@ -129,3 +129,22 @@
   ([db sid]
    (str (get-namespace db sid)
         (get-name sid))))
+
+(defn next-namespace-code
+  [db]
+  (->> (:namespace-codes db)
+       keys
+       (apply max)
+       inc))
+
+(defn iri->new-sid
+  [db iri]
+  (if-let [sid (iri->sid db iri)]
+    [db sid]
+    (let [[ns nme]    (decompose iri)
+          new-ns-code (next-namespace-code db)
+          db*         (-> db
+                          (update :namespaces assoc ns new-ns-code)
+                          (update :namespace-codes assoc new-ns-code ns))
+          sid         (append-name-codes [new-ns-code] nme)]
+      [db* sid])))
