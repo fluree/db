@@ -86,34 +86,35 @@
           []
           (let [s-iri          (where/get-iri s-mch)
                 existing-sid   (or (where/get-sid s-mch db-alias)
-                                   (<? (dbproto/-subid db s-iri {:expand? false})))
+                                   (iri/iri->sid db s-iri))
                 sid            (or existing-sid (get jld-ledger/predefined-properties s-iri) (iri/iri->sid db s-iri))
                 new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
 
-                p-iri            (where/get-iri p-mch)
-                existing-pid     (or (where/get-sid p-mch db-alias)
-                                     (<? (dbproto/-subid db p-iri {:expand? false})))
-                pid              (or existing-pid
-                                     (get jld-ledger/predefined-properties p-iri)
-                                     (iri/iri->sid db p-iri))
-                new-pred-flake   (when-not existing-pid (create-id-flake pid p-iri t))
+                p-iri          (where/get-iri p-mch)
+                existing-pid   (or (where/get-sid p-mch db-alias)
+                                   (iri/iri->sid db p-iri))
+                pid            (or existing-pid
+                                   (get jld-ledger/predefined-properties p-iri)
+                                   (iri/iri->sid db p-iri))
+                new-pred-flake (when-not existing-pid (create-id-flake pid p-iri t))
 
-                o-val            (where/get-value o-mch)
-                ref-iri          (where/get-iri o-mch)
-                ref-sid          (where/get-sid o-mch db-alias)
-                m                (where/get-meta o-mch)
-                dt               (where/get-datatype o-mch)
-                sh-dt            (dbproto/-p-prop db :datatype p-iri)
-                existing-dt      (when dt (<? (dbproto/-subid db dt {:expand? false})))
-                dt-sid           (cond
-                                   (or ref-sid ref-iri) const/$xsd:anyURI
-                                   existing-dt existing-dt
-                                   (string? dt) (or (get jld-ledger/predefined-properties dt)
-                                                    (iri/iri->sid db dt))
-                                   sh-dt sh-dt
-                                   :else (datatype/infer o-val (:lang m)))
-                new-dt-flake     (when (and (not existing-dt) (string? dt))
-                                   (create-id-flake dt-sid dt t))
+                o-val        (where/get-value o-mch)
+                ref-iri      (where/get-iri o-mch)
+                ref-sid      (where/get-sid o-mch db-alias)
+                m            (where/get-meta o-mch)
+                dt           (where/get-datatype o-mch)
+                sh-dt        (dbproto/-p-prop db :datatype p-iri)
+                existing-dt  (when dt
+                               (iri/iri->sid db dt))
+                dt-sid       (cond
+                               (or ref-sid ref-iri) const/$xsd:anyURI
+                               existing-dt          existing-dt
+                               (string? dt)         (or (get jld-ledger/predefined-properties dt)
+                                                        (iri/iri->sid db dt))
+                               sh-dt                sh-dt
+                               :else                (datatype/infer o-val (:lang m)))
+                new-dt-flake (when (and (not existing-dt) (string? dt))
+                               (create-id-flake dt-sid dt t))
 
                 ref?             (boolean ref-iri)
                 existing-ref-sid (when ref? (or ref-sid
@@ -127,9 +128,9 @@
                                    (create-id-flake ref-sid ref-iri t))
 
                 ;; o needs to be a sid if it's a ref, otherwise the literal o
-                o*               (or ref-sid (datatype/coerce-value o-val dt-sid))
-                _                (log/trace "insert-triple o*:" o*)
-                obj-flake        (flake/create sid pid o* dt-sid t true m)]
+                o*        (or ref-sid (datatype/coerce-value o-val dt-sid))
+                _         (log/trace "insert-triple o*:" o*)
+                obj-flake (flake/create sid pid o* dt-sid t true m)]
             (into [] (remove nil?) [new-subj-flake new-pred-flake new-dt-flake new-ref-flake obj-flake]))))
       (catch* e
         (log/error e "Error inserting new triple")
