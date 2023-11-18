@@ -303,11 +303,9 @@
   Returns promise"
   [db {:keys [context] :as identity-map}]
   (promise-wrap
-   (let    [identity-map* (cond-> identity-map
-                            context (update :context json-ld/parse-context))]
-     (->> identity-map*
-          perm/policy-identity
-          (perm/wrap-policy db)))))
+   (->> identity-map
+        perm/policy-identity
+        (perm/wrap-policy db))))
 
 
 (defn query
