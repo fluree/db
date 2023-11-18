@@ -161,7 +161,7 @@
                        (and ref-id (node? v-map))
                        (let [existing-sid (<? (get-iri-sid ref-id db iri-cache))
                              ref-sid      (or existing-sid
-                                              (iri/iri->sid db ref-id))
+                                              (iri/iri->sid ref-id (:namespaces db)))
                              new-flake    (flake/create sid pid ref-sid
                                                         const/$xsd:anyURI t true meta)]
                          (log/trace "creating ref flake:" new-flake)
@@ -240,7 +240,7 @@
     (let [{:keys [id type]} node
           existing-sid    (<? (get-iri-sid id db iri-cache))
           sid             (or existing-sid
-                              (iri/iri->sid db id))
+                              (iri/iri->sid id (:namespaces db)))
           assert-state    {:db db, :iri-cache iri-cache, :id id
                            :ref-cache ref-cache, :sid sid, :t t}
           type-assertions (if (seq type)
@@ -419,7 +419,7 @@
           (commit-data/json-ld->map commit db)
 
           [prev-commit _] (some->> previous :address (read-commit conn) <?)
-          db-sid             (iri/iri->sid db alias)
+          db-sid             (iri/iri->sid alias (:namespaces db))
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new db-sid)
           previous-id        (when prev-commit (:id prev-commit))

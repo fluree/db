@@ -499,7 +499,7 @@
       [(flake/create t const/$_commit:signer issuer-sid const/$xsd:anyURI t true
                      nil)]
       ;; create new issuer flake and a reference to it
-      (let [new-issuer-sid (iri/iri->sid db issuer-iri)]
+      (let [new-issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
         [(flake/create t const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
                        true nil)
          (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri
@@ -524,7 +524,7 @@
     (if-let [default-ctx-id (<? (dbproto/-subid db id))]
       [(flake/create t const/$_ledger:context default-ctx-id const/$xsd:anyURI t
                      true nil)]
-      (let [new-default-ctx-id (iri/iri->sid db id)]
+      (let [new-default-ctx-id (iri/iri->sid id (:namespaces db))]
         [(flake/create t const/$_ledger:context new-default-ctx-id
                        const/$xsd:anyURI t true nil)
          (flake/create new-default-ctx-id const/$xsd:anyURI id const/$xsd:string t
@@ -544,7 +544,7 @@
           prev-data-id       (:id prev-data)
 
           t                  (- db-t)
-          db-sid             (iri/iri->sid db alias)
+          db-sid             (iri/iri->sid alias (:namespaces db))
           base-flakes        (commit-metadata-flakes commit t db-sid)
           prev-commit-flakes (when previous-id
                                (<? (prev-commit-flakes db t previous-id)))

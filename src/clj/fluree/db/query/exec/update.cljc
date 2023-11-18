@@ -86,16 +86,16 @@
           []
           (let [s-iri          (where/get-iri s-mch)
                 existing-sid   (or (where/get-sid s-mch db-alias)
-                                   (iri/iri->sid db s-iri))
-                sid            (or existing-sid (get jld-ledger/predefined-properties s-iri) (iri/iri->sid db s-iri))
+                                   (iri/iri->sid s-iri (:namespaces db)))
+                sid            (or existing-sid (get jld-ledger/predefined-properties s-iri) (iri/iri->sid s-iri (:namespaces db)))
                 new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
 
                 p-iri          (where/get-iri p-mch)
                 existing-pid   (or (where/get-sid p-mch db-alias)
-                                   (iri/iri->sid db p-iri))
+                                   (iri/iri->sid p-iri (:namespaces db)))
                 pid            (or existing-pid
                                    (get jld-ledger/predefined-properties p-iri)
-                                   (iri/iri->sid db p-iri))
+                                   (iri/iri->sid p-iri (:namespaces db)))
                 new-pred-flake (when-not existing-pid (create-id-flake pid p-iri t))
 
                 o-val        (where/get-value o-mch)
@@ -105,12 +105,12 @@
                 dt           (where/get-datatype o-mch)
                 sh-dt        (dbproto/-p-prop db :datatype p-iri)
                 existing-dt  (when dt
-                               (iri/iri->sid db dt))
+                               (iri/iri->sid dt (:namespaces db)))
                 dt-sid       (cond
                                (or ref-sid ref-iri) const/$xsd:anyURI
                                existing-dt          existing-dt
                                (string? dt)         (or (get jld-ledger/predefined-properties dt)
-                                                        (iri/iri->sid db dt))
+                                                        (iri/iri->sid dt (:namespaces db)))
                                sh-dt                sh-dt
                                :else                (datatype/infer o-val (:lang m)))
                 new-dt-flake (when (and (not existing-dt) (string? dt))
@@ -122,7 +122,7 @@
                 ref-sid          (if ref?
                                    (or existing-ref-sid
                                        (get jld-ledger/predefined-properties ref-iri)
-                                       (iri/iri->sid db ref-iri))
+                                       (iri/iri->sid ref-iri (:namespaces db)))
                                    ref-sid)
                 new-ref-flake    (when (and ref? (not existing-ref-sid))
                                    (create-id-flake ref-sid ref-iri t))

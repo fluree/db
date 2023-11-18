@@ -4,7 +4,7 @@
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]))
 
-(def namespaces
+(def default-namespaces
   "iri namespace mapping. 0 signifies relative iris. 1-100 are reserved; user
   supplied namespaces start at 101."
   {"@"                                           1
@@ -23,8 +23,8 @@
    "urn:issn"                                    14
    "_:"                                          15})
 
-(def namespace-codes
-  (map-invert namespaces))
+(def default-namespace-codes
+  (map-invert default-namespaces))
 
 (defn decompose-by-char
   [iri c limit]
@@ -48,12 +48,12 @@
 
 (defn namespace->code
   [db iri-ns]
-  (or (get namespaces iri-ns)
+  (or (get default-namespaces iri-ns)
       (-> db :namespaces (get iri-ns))))
 
 (defn code->namespace
   [db ns-code]
-  (or (get namespace-codes ns-code)
+  (or (get default-namespace-codes ns-code)
       (-> db :namespaces-codes (get ns-code))))
 
 (def name-code-xf
@@ -101,12 +101,10 @@
   corresponds to the iri's namespace, and the remaining codes correspond to the
   iri's name split into 8-byte chunks"
   ([iri]
+   (iri->sid iri default-namespaces))
+  ([iri namespaces]
    (let [[ns nme] (decompose iri)]
      (when-let [ns-code (get namespaces ns)]
-       (append-name-codes [ns-code] nme))))
-  ([db iri]
-   (let [[ns nme] (decompose iri)]
-     (when-let [ns-code (namespace->code db ns)]
        (append-name-codes [ns-code] nme)))))
 
 (defn sid?
@@ -122,13 +120,12 @@
 (defn sid->iri
   "Converts a vector as would be returned by `iri->subid` back into a string iri."
   ([sid]
+   (sid->iri sid default-namespace-codes))
+  ([sid namespace-codes]
    (-> sid
        get-ns-code
-       (as-> ns (get namespaces ns))
-       (str (get-name sid))))
-  ([db sid]
-   (str (get-namespace db sid)
-        (get-name sid))))
+       (as-> ns-code (get namespace-codes ns-code))
+       (str (get-name sid)))))
 
 (defn next-namespace-code
   [db]

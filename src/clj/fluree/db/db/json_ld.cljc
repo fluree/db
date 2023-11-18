@@ -52,7 +52,7 @@
 
                         ;; assume iri
                         (string? ident)
-                        (iri/iri->sid db ident)
+                        (iri/iri->sid ident (:namespaces db))
 
                         :else
                         (throw (ex-info (str "Entid lookup must be a valid iri " (pr-str ident))
