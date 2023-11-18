@@ -391,3 +391,81 @@
                                 "where" {"@id" "?s" "type" "ex:User"}
                                 :opts {:role "ex:userRole"
                                        :did alice-did}}))))))
+
+(deftest ^:pending ^:integration identity-equals-test
+  (let [conn         @(fluree/connect {:method :memory})
+        context      {"ex"     "http://example.org/"
+                      "schema" "http://schema.org/"
+                      "f"      "https://ns.flur.ee/ledger#"}
+        ledger-alias "test/identity"
+        ledger       @(fluree/create conn ledger-alias)
+        did          "did:fluree:Tf5M4L7SNkziB4Q5gC8Hjuqu9WQKCwKpU1Y"
+        user-txn     {"@context" context
+                      "insert"   [{"@id"         "http://example.org/betty",
+                                   "@type"       "http://example.org/Yeti",
+                                   "schema:name" "Betty"
+                                   "schema:age"  55},
+                                  {"@id"         "ex:freddy",
+                                   "@type"       "ex:Yeti",
+                                   "schema:name" "Freddy",
+                                   "schema:age"  1002},
+                                  {"@id"         "ex:letty",
+                                   "@type"       "ex:Yeti",
+                                   "schema:name" "Leticia",
+                                   "schema:age"  38}
+                                  {"@id"     did
+                                   "ex:user" {"@id" "ex:freddy"}
+                                   "f:role"  {"@id" "ex:yetiRole"}}]}
+        policy-txn   {"@context" context
+                      "insert"
+                      {"@id"           "ex:yetiPolicy",
+                       "@type"         ["f:Policy"],
+                       "f:targetClass" {"@id" "ex:Yeti"},
+                       "f:allow"       [{"@id"          "ex:yetiViewAllow",
+                                         "f:targetRole" {"@id" "ex:yetiRole"},
+                                         "f:action"     [{"@id" "f:view"}]}],
+                       "f:property"    [{"@id"     "ex:yetisViewOnlyOwnAge",
+                                         "f:path"  {"@id" "schema:age"},
+                                         "f:allow" [{"@id"          "ex:ageViewRule",
+                                                     "f:targetRole" {"@id" "ex:yetiRole"},
+                                                     "f:action"     [{"@id" "f:view"}],
+                                                     "f:equals"     { "@list" [{"@id" "f:$identity"}, {"@id" "ex:user"}] }}]}]}}
+        db           @(fluree/stage (fluree/db ledger)
+                                    policy-txn)
+        db2          @(fluree/stage db
+                                    user-txn)
+        _            @(fluree/commit! ledger db2)]
+    (is (= [{"@id"         "http://example.org/betty",
+             "@type"       "http://example.org/Yeti",
+             "schema:name" "Betty",}
+            {"@id"         "http://example.org/freddy",
+             "@type"       "http://example.org/Yeti",
+             "schema:name" "Freddy",
+             "schema:age"  1002}
+            {"@id"         "http://example.org/letty",
+             "@type"       "http://example.org/Yeti",
+             "schema:name" "Leticia",}]
+           @(fluree/query db2 {"@context" {"schema" "http://schema.org/"}
+                               :from      ledger-alias
+                               :where     '{"@id"         ?s
+                                            "schema:name" "?name"}
+                               :select    '{?s ["*"]}
+                               :opts      {:did did}}) )
+        "Should return Freddy's age, but no one else's")
+    (is (= [{"@id"         "http://example.org/betty",
+             "@type"       "http://example.org/Yeti",
+             "schema:name" "Betty",}
+            {"@id"         "http://example.org/freddy",
+             "@type"       "http://example.org/Yeti",
+             "schema:name" "Freddy",
+             "schema:age"  1002}
+            {"@id"         "http://example.org/letty",
+             "@type"       "http://example.org/Yeti",
+             "schema:name" "Leticia",}]
+           @(fluree/query-connection conn {"@context" {"schema" "http://schema.org/"}
+                                           :from      ledger-alias
+                                           :where     '{"@id"         ?s
+                                                        "schema:name" "?name"}
+                                           :select    '{?s ["*"]}
+                                           :opts      {:did did}}) )
+        "Should return Freddy's age, but no one else's")))
