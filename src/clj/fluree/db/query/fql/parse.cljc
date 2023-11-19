@@ -31,7 +31,7 @@
   [vars vals]
   (let [var-matches (mapv parse-variable vars)
         binding     (mapv (fn [var-match value]
-                            (let [dt (datatype/infer value)]
+                            (let [dt (datatype/infer-iri value)]
                               (where/match-value var-match value dt)))
                           var-matches vals)]
     (zipmap vars binding)))

@@ -1,5 +1,6 @@
 (ns fluree.db.datatype
   (:require [fluree.db.constants :as const]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
@@ -104,6 +105,12 @@
      (integer? x) const/$xsd:long ; infer to long to prevent overflow
      (number? x)  const/$xsd:decimal
      (boolean? x) const/$xsd:boolean)))
+
+(defn infer-iri
+  ([x]
+   (-> x infer iri/sid->iri))
+  ([x lang]
+   (-> x (infer lang) iri/sid->iri)))
 
 #?(:cljs
    (defn- left-pad

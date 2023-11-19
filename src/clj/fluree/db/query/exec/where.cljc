@@ -23,13 +23,13 @@
   (assoc unmatched ::var var-sym))
 
 (defn match-value
-  ([mch x dt]
+  ([mch x dt-iri]
    (assoc mch
      ::val x
-     ::datatype dt))
-  ([mch x dt m]
+     ::datatype-iri dt-iri))
+  ([mch x dt-iri m]
    (-> mch
-       (match-value x dt)
+       (match-value x dt-iri)
        (assoc ::meta m))))
 
 (defn match-iri
@@ -67,7 +67,7 @@
   (if (or (matched-iri? mch)
           (matched-sid? mch))
     const/$xsd:anyURI
-    (::datatype mch)))
+    (::datatype-iri mch)))
 
 (defn matched?
   [match]
@@ -89,12 +89,12 @@
 (defn anonymous-value
   "Build a pattern that already matches an explicit value."
   ([v]
-   (let [dt (datatype/infer v)]
-     (anonymous-value v dt)))
-  ([v dt]
-   (match-value unmatched v dt))
-  ([v dt m]
-   (match-value unmatched v dt m)))
+   (let [dt-iri (datatype/infer-iri v)]
+     (anonymous-value v dt-iri)))
+  ([v dt-iri]
+   (match-value unmatched v dt-iri))
+  ([v dt-iri m]
+   (match-value unmatched v dt-iri m)))
 
 (defn unmatched-var?
   [match]
@@ -111,7 +111,7 @@
 
 (defn sanitize-match
   [match]
-  (select-keys match [::iri ::val ::datatype ::sids]))
+  (select-keys match [::iri ::val ::datatype-iri ::sids]))
 
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
@@ -241,16 +241,17 @@
   "Matches the object, data type, and metadata of the supplied `flake` to the
   triple object pattern component `o-match`."
   [o-match db flake]
-  (let [dt (flake/dt flake)]
+  (let [ns-codes (:namespace-codes db)
+        dt       (flake/dt flake)]
     (if (#{const/$xsd:anyURI} dt)
-      (let [alias    (:alias db)
-            ns-codes (:namespace-codes db)
-            oid      (flake/o flake)
-            o-iri    (iri/sid->iri oid ns-codes)]
+      (let [alias (:alias db)
+            oid   (flake/o flake)
+            o-iri (iri/sid->iri oid ns-codes)]
         (-> o-match
             (match-sid oid alias)
             (match-iri o-iri)))
-      (match-value o-match (flake/o flake) dt (flake/m flake)))))
+      (let [dt-iri (iri/sid->iri dt ns-codes)]
+        (match-value o-match (flake/o flake) dt-iri (flake/m flake))))))
 
 (defn match-flake
   "Assigns the unmatched variables within the supplied `triple-pattern` to their
@@ -292,7 +293,7 @@
   ([db fuel-tracker error-ch components]
    (resolve-flake-range db fuel-tracker nil error-ch components))
 
-  ([{:keys [alias conn t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
+  ([{:keys [alias conn t namespaces] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
    (let [s    (get-sid s-mch alias)
          s-fn (::fn s-mch)
          p    (get-sid p-mch alias)
@@ -300,7 +301,7 @@
          o    (or (get-value o-mch)
                   (get-sid o-mch alias))
          o-fn (::fn o-mch)
-         o-dt (get-datatype o-mch)
+         o-dt (-> o-mch get-datatype (iri/iri->sid namespaces))
 
          idx         (try* (index/for-components s p o o-dt)
                            (catch* e
@@ -578,7 +579,7 @@
 
 (defn add-fn-result-to-solution
   [solution var-name result]
-  (let [dt  (datatype/infer result)
+  (let [dt  (datatype/infer-iri result)
         mch (-> var-name
                 unmatched-var
                 (match-value result dt))]

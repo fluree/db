@@ -14,15 +14,20 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
             [fluree.db.datatype :as datatype]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.json :as json]
+            [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defmulti display
   "Format a where-pattern match for presentation based on the match's datatype.
   Return an async channel that will eventually contain the formatted match."
-  (fn [match db iri-cache compact error-ch]
-    (where/get-datatype match)))
+  (fn [match db _iri-cache _compact _error-ch]
+    (let [dt-iri (where/get-datatype match)]
+      (if (keyword? dt-iri)
+        dt-iri
+        (let [nses (:namespaces db)]
+          (iri/iri->sid dt-iri nses))))))
 
 (defmethod display :default
   [match _ _ _ _]
@@ -131,7 +136,7 @@
     [_ solution]
     (log/trace "AsSelector update-solution solution:" solution)
     (let [result (as-fn solution)
-          dt     (datatype/infer result)]
+          dt     (datatype/infer-iri result)]
       (log/trace "AsSelector update-solution result:" result)
       (assoc solution bind-var (-> bind-var
                                    where/unmatched-var
