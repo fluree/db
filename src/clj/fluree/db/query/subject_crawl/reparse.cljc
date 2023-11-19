@@ -127,7 +127,7 @@
     {:type type
      :s (reparse-subject-component s)
      :p (reparse-predicate-component db p)
-     :o (assoc (reparse-component o) :datatype (::where/datatype o))}))
+     :o (assoc (reparse-component o) :datatype (where/get-datatype o))}))
 
 (defn simple-subject-merge-where
   "Revises where clause for simple-subject-crawl query to optimize processing.

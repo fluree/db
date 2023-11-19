@@ -588,7 +588,8 @@
 
     ;; literal object
     (some? value)
-    (let [m*      (cond-> m language (assoc :lang language))
+    (let [m*      (cond-> m
+                    language (assoc :lang language))
           obj-cmp (if (v/variable? value)
                     (parse-variable value)
                     (where/anonymous-value value type m*))]
