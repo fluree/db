@@ -332,23 +332,23 @@
 (deftest ^:integration query-with-faux-compact-iri
   (testing "query with a faux compact IRI works"
     (let [conn   (test-utils/create-conn
-                  {:context      test-utils/default-str-context
-                   :context-type :string})
+                   {:context      test-utils/default-str-context
+                    :context-type :string})
           alias  "faux-compact-iri-query"
           ledger @(fluree/create conn alias)
-          db0    @(fluree/stage2 (fluree/db ledger)
-                                 {"@context" "https://ns.flur.ee"
-                                  "insert"
-                                  [{"id"      "foo"
-                                    "ex:name" "Foo"}
-                                   {"id"      "foaf:bar"
-                                    "ex:name" "Bar"}]})
+          db0    @(fluree/stage (fluree/db ledger)
+                                {"@context" "https://ns.flur.ee"
+                                 "insert"
+                                 [{"id"      "foo"
+                                   "ex:name" "Foo"}
+                                  {"id"      "foaf:bar"
+                                   "ex:name" "Bar"}]})
           _      @(fluree/commit! ledger db0)
           db1    (->> alias (fluree/load conn) deref fluree/db)]
 
       (is (= [["foaf:bar" "Bar"] ["foo" "Foo"]]
-             @(fluree/query db1 {"select"   ["?f" "?n"]
-                                 "where"    {"id"     "?f"
-                                             "ex:name" "?n"}})))
+             @(fluree/query db1 {"select" ["?f" "?n"]
+                                 "where"  {"id"      "?f"
+                                           "ex:name" "?n"}})))
       (is (= [{"id" "foo", "ex:name" "Foo"}]
              @(fluree/query db1 {"select" {"foo" ["*"]}}))))))
