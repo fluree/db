@@ -208,18 +208,18 @@
             (is (= [["Alice" "111-11-1111"] ["John" nil]]
                    @(fluree/query-connection conn
                                              {:context context
-                                              :from "policy/a"
-                                              :select '[?name ?ssn]
-                                              :where  '[{:id          ?p
-                                                         :schema/name ?name}
-                                                        [:optional {:id         ?p
-                                                                    :schema/ssn ?ssn}]]
-                                              :opts   {:did  alice-did
-                                                       :role :ex/userRole}}))
+                                              :from    "policy/a"
+                                              :select  '[?name ?ssn]
+                                              :where   '[{:id          ?p
+                                                          :schema/name ?name}
+                                                         [:optional {:id         ?p
+                                                                     :schema/ssn ?ssn}]]
+                                              :opts    {:did  alice-did
+                                                        :role :ex/userRole}}))
                 "Both user names should show, but only SSN for Alice"))
           (testing "history query"
             (is (= []
-                   @(fluree/history ledger {:context context
+                   @(fluree/history ledger {:context        context
                                             :history        [:ex/john :schema/ssn] :t {:from 1}
                                             :commit-details true
                                             :opts           {:did  alice-did
