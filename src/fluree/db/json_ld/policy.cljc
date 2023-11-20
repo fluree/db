@@ -493,8 +493,9 @@
   [{:keys [context] :as identity-map}]
   (when-let [{:keys [role] :as identity} (-> (select-keys identity-map [:did :role :credential])
                                              not-empty)]
-    (cond-> identity
-      (and role context) (update :role json-ld/expand-iri (json-ld/parse-context context)))))
+    (if (and role context)
+      (update identity :role json-ld/expand-iri (json-ld/parse-context context))
+      identity)))
 
 (defn role-sids-for-sid
   [db sid]
