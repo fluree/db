@@ -491,7 +491,8 @@
 
 (defn policy-identity
   [{:keys [context] :as identity-map}]
-  (when-let [{:keys [role] :as identity} (-> (select-keys identity-map [:did :role :credential])
+  (when-let [{:keys [role] :as identity} (-> identity-map
+                                             (select-keys [:did :role :credential])
                                              not-empty)]
     (if (and role context)
       (update identity :role json-ld/expand-iri (json-ld/parse-context context))
