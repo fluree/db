@@ -337,7 +337,7 @@
   "Used within cmp-obj to compare data types in more edge cases"
   [dt1 dt2]
   (if (and dt1 dt2)
-    (compare dt1 dt2)
+    (cmp-sid dt1 dt2)
     0))
 
 (defn cmp-obj
