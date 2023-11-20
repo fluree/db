@@ -27,11 +27,15 @@
   [db query-map]
   (go-try
    (let [{:keys [opts]} query-map
-         db*            (if-let [policy-opts (perm/policy-opts opts)]
-                          (<? (perm/wrap-policy db policy-opts))
-                          db)
          {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map)
-
+         db*            (if-let [policy-identity (perm/policy-identity
+                                                  ;;TODO only using query supplied context for policy opts,
+                                                  ;;should be the only context operation once we have removed
+                                                  ;;default-context
+                                                  (assoc opts :context
+                                                         (ctx-util/extract-supplied-context parsed)))]
+                          (<? (perm/wrap-policy db policy-identity))
+                          db)
          ;; from and to are positive ints, need to convert to negative or fill in default values
          {:keys [from to at]} t
          [from-t to-t] (if at
@@ -110,8 +114,8 @@
 (defn restrict-db
   [db t opts]
   (go-try
-    (let [db*  (if-let [policy-opts (perm/policy-opts opts)]
-                 (<? (perm/wrap-policy db policy-opts))
+    (let [db*  (if-let [policy-identity (perm/policy-identity opts)]
+                 (<? (perm/wrap-policy db policy-identity))
                  db)
           db** (-> (if t
                      (<? (time-travel/as-of db* t))
@@ -144,8 +148,10 @@
     (let [{query :subject, did :did}  (or (<? (cred/verify query))
                                           {:subject query})
           {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
-
-          db*      (<? (restrict-db db t opts))
+          ;;TODO: only using query context for opts, should be only context
+          ;;once default-context is removed
+          q-ctx    (ctx-util/extract-supplied-context query*)
+          db*      (<? (restrict-db db t (assoc opts :context q-ctx)))
           query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
           ctx      (ctx-util/extract db* query** opts)
           max-fuel (:max-fuel opts)]
@@ -244,7 +250,8 @@
           named-aliases   (some-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [ds          (<? (load-dataset conn default-aliases named-aliases t opts))
+        (let [ds          (<? (load-dataset conn default-aliases named-aliases t
+                                            (assoc  opts :context (ctx-util/extract-supplied-context query))))
               query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
               max-fuel    (:max-fuel opts)
               default-ctx (conn-proto/-default-context conn)

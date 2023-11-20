@@ -220,3 +220,10 @@
 (defn extract
   [db jsonld opts]
   (dbproto/-context db (get-context jsonld) (:context-type opts)))
+
+(defn extract-supplied-context
+  "Just retrieves the context from the given data,
+  without any default-context fallback logic"
+  [jsonld]
+  (cond (contains? jsonld :context) (:context jsonld)
+        (contains? jsonld "@context") (get jsonld "@context")))

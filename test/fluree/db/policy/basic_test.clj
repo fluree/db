@@ -10,13 +10,15 @@
 
 (deftest ^:integration query-policy-enforcement
   (testing "Testing basic policy enforcement on queries."
-    (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "policy/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+    (let [conn      @(fluree/connect {:method :memory
+                                      :defaults {:context-type :keyword}})
+          context   [test-utils/default-context {:ex "http://example.org/ns/"}]
+          ledger    @(fluree/create conn "policy/a")
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db        @(fluree/stage
                        (fluree/db ledger)
-                       {"@context" "https://ns.flur.ee"
+                       {"@context"          context
                         "insert"
                         [{:id               :ex/alice,
                           :type             :ex/User,
@@ -48,7 +50,7 @@
           db+policy @(fluree/stage
                        db
                        ;; add policy targeting :ex/rootRole that can view and modify everything
-                       {"@context" "https://ns.flur.ee"
+                       {"@context" context
                         "insert"
                         [{:id           :ex/rootPolicy,
                           :type         [:f/Policy], ;; must be of type :f/Policy, else it won't be treated as a policy
@@ -69,15 +71,17 @@
                                                       :f/action     [:f/view]
                                                       :f/equals     {:list [:f/$identity :ex/user]}}]}]}]})]
       (let [root-wrapped-db            @(fluree/wrap-policy
-                                          db+policy {:did  root-did
-                                                     :role :ex/rootRole})
+                                         db+policy {:did  root-did
+                                                    :role :ex/rootRole
+                                                    :context context})
             double-policy-query-result @(fluree/query
-                                          root-wrapped-db
-                                          {:select {'?s [:* {:ex/location [:*]}]}
-                                           :where  {:id   '?s
-                                                    :type :ex/User}
-                                           :opts   {:did  root-did
-                                                    :role :ex/rootRole}})]
+                                         root-wrapped-db
+                                         {:context context
+                                          :select {'?s [:* {:ex/location [:*]}]}
+                                          :where  {:id   '?s
+                                                   :type :ex/User}
+                                          :opts   {:did  root-did
+                                                   :role :ex/rootRole}})]
         (is (util/exception? double-policy-query-result)
             "Should be an error to try to apply policy twice on one db.")
         (is (str/includes? (ex-message double-policy-query-result)
@@ -99,7 +103,8 @@
                :ex/location      {:id         "_:f211106232532993",
                                   :ex/state   "NC",
                                   :ex/country "USA"}}]
-             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+             @(fluree/query db+policy {:context context
+                                       :select {'?s [:* {:ex/location [:*]}]}
                                        :where  {:id   '?s
                                                 :type :ex/User}
                                        :opts   {:did  root-did
@@ -121,7 +126,8 @@
                :ex/location      {:id         "_:f211106232532993",
                                   :ex/state   "NC",
                                   :ex/country "USA"}}]
-             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+             @(fluree/query db+policy {:context context
+                                       :select {'?s [:* {:ex/location [:*]}]}
                                        :where  {:id   '?s
                                                 :type :ex/User}
                                        :opts   {:did  root-did
@@ -134,7 +140,8 @@
                :schema/name          "Widget",
                :schema/price         99.99M,
                :schema/priceCurrency "USD"}]
-             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+             @(fluree/query db+policy {:context context
+                                       :select {'?s [:* {:ex/location [:*]}]}
                                        :where  {:id   '?s
                                                 :type :ex/Product}
                                        :opts   {:role :ex/rootRole}}))
@@ -149,7 +156,8 @@
                :schema/name      "Alice",
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17"}]
-             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+             @(fluree/query db+policy {:context context
+                                       :select {'?s [:* {:ex/location [:*]}]}
                                        :where  {:id   '?s
                                                 :type :ex/User}
                                        :opts   {:role :ex/userRole}}))
@@ -157,7 +165,8 @@
 
       ;; Alice cannot see product data as it was not explicitly allowed
       (is (= []
-             @(fluree/query db+policy {:select {'?s [:*]}
+             @(fluree/query db+policy {:context context
+                                       :select {'?s [:*]}
                                        :where  {:id   '?s
                                                 :type :ex/Product}
                                        :opts   {:did  alice-did
@@ -175,7 +184,8 @@
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17",
                :schema/ssn       "111-11-1111"}]
-             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+             @(fluree/query db+policy {:context context
+                                       :select {'?s [:* {:ex/location [:*]}]}
                                        :where  {:id   '?s
                                                 :type :ex/User}
                                        :opts   {:did  alice-did
@@ -184,7 +194,8 @@
 
       ;; Alice can only see her allowed data in a non-graph-crawl query too
       (is (= [["Alice" "111-11-1111"] ["John" nil]]
-             @(fluree/query db+policy {:select '[?name ?ssn]
+             @(fluree/query db+policy {:context context
+                                       :select '[?name ?ssn]
                                        :where  '[{:id          ?p
                                                   :schema/name ?name}
                                                  [:optional {:id         ?p
@@ -192,22 +203,38 @@
                                        :opts   {:did  alice-did
                                                 :role :ex/userRole}}))
           "Both user names should show, but only SSN for Alice")
-      (testing "history query"
         (let [_ @(fluree/commit! ledger db+policy)]
-          (is (= []
-                 @(fluree/history ledger {:history        [:ex/john :schema/ssn] :t {:from 1}
-                                          :commit-details true
-                                          :opts           {:did  alice-did
-                                                           :role :ex/userRole}}))
-              "Alice should not be able to see any history for John's ssn")
+          (testing "query-connection"
+            (is (= [["Alice" "111-11-1111"] ["John" nil]]
+                   @(fluree/query-connection conn
+                                             {:context context
+                                              :from    "policy/a"
+                                              :select  '[?name ?ssn]
+                                              :where   '[{:id          ?p
+                                                          :schema/name ?name}
+                                                         [:optional {:id         ?p
+                                                                     :schema/ssn ?ssn}]]
+                                              :opts    {:did  alice-did
+                                                        :role :ex/userRole}}))
+                "Both user names should show, but only SSN for Alice"))
+          (testing "history query"
+            (is (= []
+                   @(fluree/history ledger {:context        context
+                                            :history        [:ex/john :schema/ssn] :t {:from 1}
+                                            :commit-details true
+                                            :opts           {:did  alice-did
+                                                             :role :ex/userRole}}))
+                "Alice should not be able to see any history for John's ssn"))
           (is (= [{:f/t       1,
                    :f/assert  [{:schema/ssn "111-11-1111", :id :ex/alice}],
                    :f/retract []}]
-                 @(fluree/history ledger {:history [:ex/alice :schema/ssn] :t {:from 1}
+                 @(fluree/history ledger {:context context
+                                          :history [:ex/alice :schema/ssn] :t {:from 1}
                                           :opts    {:did  alice-did
                                                     :role :ex/userRole}}))
               "Alice should be able to see history for her own ssn.")
-          (let [[history-result]       @(fluree/history ledger {:history        [:ex/alice :schema/ssn] :t {:from 1}
+          (let [[history-result]       @(fluree/history ledger {:context context
+                                                                :history        [:ex/alice :schema/ssn] :t {:from 1}
                                                                 :commit-details true
                                                                 :opts           {:did  alice-did
                                                                                  :role :ex/userRole}})
@@ -226,7 +253,8 @@
                      :id               :ex/alice}]
                    commit-details-asserts)
                 "Alice should be able to see her own ssn in commit details, but not John's."))
-          (let [[history-result]       @(fluree/history ledger {:history        [:ex/alice :schema/ssn] :t {:from 1}
+          (let [[history-result]       @(fluree/history ledger {:context context
+                                                                :history        [:ex/alice :schema/ssn] :t {:from 1}
                                                                 :commit-details true
                                                                 :opts           {:did  root-did
                                                                                  :role :ex/rootRole}})
@@ -239,7 +267,7 @@
                             :schema/ssn       "888-88-8888",
                             :id               :ex/john})
                 "Root can see John's ssn in commit details."))
-          (let [_ @(test-utils/transact ledger {"@context" "https://ns.flur.ee"
+          (let [_ @(test-utils/transact ledger {"@context" context
                                                 "delete"   {:id          :ex/john
                                                             :schema/name "John"}
                                                 "insert"   {:id          :ex/john
@@ -250,10 +278,11 @@
                     {:f/t       2,
                      :f/assert  [{:schema/name "Jack", :id :ex/john}],
                      :f/retract [{:schema/name "John", :id :ex/john}]}]
-                   @(fluree/history ledger {:history [:ex/john :schema/name] :t {:from 1}
+                   @(fluree/history ledger {:context context
+                                            :history [:ex/john :schema/name] :t {:from 1}
                                             :opts    {:did  alice-did
                                                       :role :ex/userRole}}))
-                "Alice should be able to see all history for John's name")))))))
+                "Alice should be able to see all history for John's name"))))))
 
 (deftest policy-without-f-context-term
   (testing "policies should work w/o an explicit f -> https://ns.flur.ee/ledger# context term"

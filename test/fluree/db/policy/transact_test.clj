@@ -8,13 +8,15 @@
 
 (deftest ^:integration policy-enforcement
   (testing "Testing basic policy enforcement."
-    (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "policy/tx-a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+    (let [conn      @(fluree/connect {:method :memory
+                                      :defaults {:context-type :keyword}})
+          context   [test-utils/default-context {:ex "http://example.org/ns/"}]
+          ledger    @(fluree/create conn "policy/tx-a")
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db        @(fluree/stage
                        (fluree/db ledger)
-                       {"@context" "https://ns.flur.ee"
+                       {"@context" context
                         "insert"
                         [{:id               :ex/alice,
                           :type             :ex/User,
@@ -45,7 +47,7 @@
 
           db+policy @(fluree/stage
                        db
-                       {"@context" "https://ns.flur.ee"
+                       {"@context" context
                         "insert"
                         ;; add policy targeting :ex/rootRole that can view and modify everything
                         [{:id           :ex/rootPolicy,
@@ -84,7 +86,7 @@
       (testing "Policy allowed modification"
         (testing "using role + id"
           (let [update-name @(fluree/stage db+policy
-                                            {"@context" "https://ns.flur.ee"
+                                            {"@context" context
                                              "delete"
                                              {:id          :ex/alice
                                               :schema/email "alice@flur.ee"}
@@ -101,13 +103,14 @@
                      :schema/ssn "111-11-1111",
                      :ex/location {:id nil}}]
                    @(fluree/query update-name
-                                  {:select {'?s [:*]}
+                                  {:context context
+                                   :select {'?s [:*]}
                                    :where  {:id '?s, :schema/name "Alice"}
                                    :opts {:did alice-did}}))
                 "Alice should be allowed to update her own name.")))
         (testing "using role only"
             (let [update-price @(fluree/stage db+policy
-                                               {"@context" "https://ns.flur.ee"
+                                               {"@context" context
                                                 "delete"
                                                 {:id          :ex/widget
                                                  :schema/price 99.99}
@@ -122,11 +125,12 @@
                        :schema/price 105.99M,
                        :schema/priceCurrency "USD"}]
                      @(fluree/query update-price
-                                    {:select {'?s [:*]}
+                                    {:context context
+                                     :select {'?s [:*]}
                                      :where  {:id '?s, :type :ex/Product}}))
                   "Updated :schema/price should have been allowed, and entire product is visible in query."))
             (let [update-name @(fluree/stage db+policy
-                                              {"@context" "https://ns.flur.ee"
+                                              {"@context" context
                                                "delete"
                                                {:id          :ex/widget
                                                 :schema/name "Widget"}
@@ -138,12 +142,13 @@
               (is (= [{:type    :ex/Product
                        :schema/name "Widget2"}]
                      @(fluree/query update-name
-                                    {:select {'?s [:*]}
+                                    {:context context
+                                     :select {'?s [:*]}
                                      :where  {:id '?s, :type :ex/Product}
                                      :opts {:role :ex/userRole}}))
                   "Updated :schema/name should have been allowed, and only name is visible in query."))))
       (testing "Policy doesn't allow a modification"
-        (let [update-price @(fluree/stage db+policy {"@context" "https://ns.flur.ee"
+        (let [update-price @(fluree/stage db+policy {"@context" context
                                                       "insert" {:id           :ex/widget
                                                                 :schema/price 42.99}}
                                           {:did root-did
@@ -154,7 +159,7 @@
           (is (= :db/policy-exception
                  (:error (ex-data update-price)))
               "Exception should be of type :db/policy-exception"))
-        (let [update-email @(fluree/stage db+policy {"@context" "https://ns.flur.ee"
+        (let [update-email @(fluree/stage db+policy {"@context" context
                                                       "insert"   {:id           :ex/john
                                                                   :schema/email "john@foo.bar"}}
                                           {:role :ex/user})]
@@ -165,7 +170,7 @@
           (is (= :db/policy-exception
                  (:error (ex-data update-email)))
               "exception should be of type :db/policy-exception"))
-        (let [update-name-other-role @(fluree/stage db+policy {"@context" "https://ns.flur.ee"
+        (let [update-name-other-role @(fluree/stage db+policy {"@context" context
                                                                 "insert" {:id          :ex/widget
                                                                           :schema/name "Widget2"}}
                                                     {:did alice-did
