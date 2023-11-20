@@ -13,25 +13,32 @@
          (where/assign-matched-values triple solution))
        clause))
 
-(defn retract
-  [db txn {:keys [t] :as _tx-state} fuel-tracker error-ch solution-ch]
-  (let [clause           (:delete txn)
-        matched-ch       (async/chan 2 (comp (mapcat (partial assign-clause clause))
-                                             (filter where/all-matched?)
-                                             (map (partial where/compute-sids db))))
-        retract-ch       (async/chan 2 (comp cat
-                                             (map (fn [f]
-                                                    (flake/flip-flake f t)))))]
-    (async/pipe solution-ch matched-ch)
+(defn retract-xf
+  [t]
+  (comp cat
+        (map (fn [f]
+               (flake/flip-flake f t)))))
 
+(defn retract-matches
+  [db t fuel-tracker error-ch matched-ch]
+  (let [retract-ch (async/chan 2 (retract-xf t))]
     (async/pipeline-async 2
                           retract-ch
-                          (fn [triple ch]
+                          (fn [matched-triple ch]
                             (-> db
-                                (where/resolve-flake-range fuel-tracker error-ch triple)
+                                (where/resolve-flake-range fuel-tracker error-ch matched-triple)
                                 (async/pipe ch)))
                           matched-ch)
     retract-ch))
+
+(defn retract
+  [db txn {:keys [t] :as _tx-state} fuel-tracker error-ch solution-ch]
+  (let [clause     (:delete txn)
+        matched-ch (async/pipe solution-ch
+                               (async/chan 2 (comp (mapcat (partial assign-clause clause))
+                                                   (filter where/all-matched?)
+                                                   (map (partial where/compute-sids db)))))]
+    (retract-matches db t fuel-tracker error-ch matched-ch)))
 
 (defn matched-triple->flake
   [db t [s-mch p-mch o-mch]]
@@ -82,7 +89,7 @@
 (defn modify
   [db parsed-txn tx-state fuel-tracker error-ch solution-ch]
   (let [solution-ch* (async/pipe solution-ch
-                                 (async/chan 2 (where/with-default where/blank-solution)))]
+                                 (async/chan 2 (comp (where/with-default where/blank-solution))))]
     (cond
       (and (insert? parsed-txn)
            (retract? parsed-txn))
