@@ -4,150 +4,56 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util.core :refer [try* catch*]]
-            [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log]
-            [clojure.core.async :as async :refer [>! go]]
-            [fluree.db.json-ld.ledger :as jld-ledger]
-            [fluree.db.datatype :as datatype]))
+            [clojure.core.async :as async]))
 
-(defn iri-mapping?
-  [flake]
-  (= const/$xsd:anyURI (flake/p flake)))
-
-(defn retract-triple
-  [db triple {:keys [t]} solution fuel-tracker error-ch]
-  (let [retract-flakes-ch (async/chan)
-        retract-xf        (keep (fn [f]
-                                  ;;do not retract the flakes which map subject ids to iris.
-                                  ;;they are an internal optimization, which downstream code
-                                  ;;(eg the commit pipeline) relies on
-                                  (when-not (iri-mapping? f)
-                                    (flake/flip-flake f t))))]
-    (if-let [components (->> (where/assign-matched-values triple solution)
-                             (where/compute-sids db))]
-      (async/pipe (where/resolve-flake-range db fuel-tracker retract-xf error-ch components)
-                  retract-flakes-ch)
-      (async/close! retract-flakes-ch))
-    retract-flakes-ch))
-
-(defn retract-clause
-  [db clause tx-state solution fuel-tracker error-ch out-ch]
-  (let [clause-ch  (async/to-chan! clause)]
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [triple ch]
-                            (-> db
-                                (retract-triple triple tx-state solution fuel-tracker error-ch)
-                                (async/pipe ch)))
-                          clause-ch)
-    out-ch))
+(defn assign-clause
+  [clause solution]
+  (map (fn [triple]
+         (where/assign-matched-values triple solution))
+       clause))
 
 (defn retract
-  [db txn tx-state fuel-tracker error-ch solution-ch]
-  (let [{:keys [delete]} txn
-        retract-ch       (async/chan 2)]
+  [db txn {:keys [t] :as _tx-state} fuel-tracker error-ch solution-ch]
+  (let [clause           (:delete txn)
+        matched-ch       (async/chan 2 (comp (mapcat (partial assign-clause clause))
+                                             (filter where/all-matched?)
+                                             (map (partial where/compute-sids db))))
+        retract-ch       (async/chan 2 (comp cat
+                                             (map (fn [f]
+                                                    (flake/flip-flake f t)))))]
+    (async/pipe solution-ch matched-ch)
+
     (async/pipeline-async 2
                           retract-ch
-                          (fn [solution ch]
-                            (retract-clause db delete tx-state solution fuel-tracker error-ch ch))
-                          solution-ch)
+                          (fn [triple ch]
+                            (-> db
+                                (where/resolve-flake-range fuel-tracker error-ch triple)
+                                (async/pipe ch)))
+                          matched-ch)
     retract-ch))
 
-(defn create-id-flake
-  [sid iri t]
-  (flake/create sid const/$xsd:anyURI iri const/$xsd:string t true nil))
-
-(defn insert-triple
-  [db triple {:keys [t]} solution error-ch]
-  (go
-    (try*
-      (let [db-alias            (:alias db)
-            [s-mch p-mch o-mch] (where/assign-matched-values triple solution)]
-        (log/trace "insert-triple o-mch:" o-mch)
-        (if-not (and (or (where/get-iri s-mch)
-                         (where/get-sid s-mch db-alias))
-                     (or (where/get-iri p-mch)
-                         (where/get-sid p-mch db-alias))
-                     (or (where/get-iri o-mch)
-                         (where/get-sid o-mch db-alias)
-                         (some? (where/get-value o-mch))))
-          ;; discard the matches if we don't have the values we need to
-          ;; construct an obj-flake
-          []
-          (let [s-iri          (where/get-iri s-mch)
-                existing-sid   (or (where/get-sid s-mch db-alias)
-                                   (iri/iri->sid s-iri (:namespaces db)))
-                sid            (or existing-sid (get jld-ledger/predefined-properties s-iri) (iri/iri->sid s-iri (:namespaces db)))
-                new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
-
-                p-iri          (where/get-iri p-mch)
-                existing-pid   (or (where/get-sid p-mch db-alias)
-                                   (iri/iri->sid p-iri (:namespaces db)))
-                pid            (or existing-pid
-                                   (get jld-ledger/predefined-properties p-iri)
-                                   (iri/iri->sid p-iri (:namespaces db)))
-                new-pred-flake (when-not existing-pid (create-id-flake pid p-iri t))
-
-                o-val        (where/get-value o-mch)
-                ref-iri      (where/get-iri o-mch)
-                ref-sid      (where/get-sid o-mch db-alias)
-                m            (where/get-meta o-mch)
-                dt           (where/get-datatype o-mch)
-                sh-dt        (dbproto/-p-prop db :datatype p-iri)
-                existing-dt  (when dt
-                               (iri/iri->sid dt (:namespaces db)))
-                dt-sid       (cond
-                               (or ref-sid ref-iri) const/$xsd:anyURI
-                               existing-dt          existing-dt
-                               (string? dt)         (or (get jld-ledger/predefined-properties dt)
-                                                        (iri/iri->sid dt (:namespaces db)))
-                               sh-dt                sh-dt
-                               :else                (datatype/infer o-val (:lang m)))
-                new-dt-flake (when (and (not existing-dt) (string? dt))
-                               (create-id-flake dt-sid dt t))
-
-                ref?             (boolean ref-iri)
-                existing-ref-sid (when ref? (or ref-sid
-                                                (<? (dbproto/-subid db ref-iri {:expand? false}))))
-                ref-sid          (if ref?
-                                   (or existing-ref-sid
-                                       (get jld-ledger/predefined-properties ref-iri)
-                                       (iri/iri->sid ref-iri (:namespaces db)))
-                                   ref-sid)
-                new-ref-flake    (when (and ref? (not existing-ref-sid))
-                                   (create-id-flake ref-sid ref-iri t))
-
-                ;; o needs to be a sid if it's a ref, otherwise the literal o
-                o*        (or ref-sid (datatype/coerce-value o-val dt-sid))
-                _         (log/trace "insert-triple o*:" o*)
-                obj-flake (flake/create sid pid o* dt-sid t true m)]
-            (into [] (remove nil?) [new-subj-flake new-pred-flake new-dt-flake new-ref-flake obj-flake]))))
-      (catch* e
-        (log/error e "Error inserting new triple")
-        (>! error-ch e)))))
-
-(defn insert-clause
-  [db clause tx-state solution error-ch out-ch]
-  (async/pipeline-async 2
-                        out-ch
-                        (fn [triple ch]
-                          (-> db
-                              (insert-triple triple tx-state solution error-ch)
-                              (async/pipe ch)))
-                        (async/to-chan! clause))
-  out-ch)
+(defn matched-triple->flake
+  [db t [s-mch p-mch o-mch]]
+  (let [nses  (:namespaces db)
+        sid   (-> s-mch where/get-iri (iri/iri->sid nses))
+        p-iri (where/get-iri p-mch)
+        pid   (iri/iri->sid p-iri nses)
+        m     (where/get-meta o-mch)]
+    (if-let [oid (some-> o-mch where/get-iri (iri/iri->sid nses))]
+      (flake/create sid pid oid const/$xsd:anyURI t true m)
+      (let [v  (where/get-value o-mch)
+            dt (or (dbproto/-p-prop db :datatype p-iri)
+                   (-> o-mch where/get-datatype (iri/iri->sid nses)))]
+        (flake/create sid pid v dt t true m)))))
 
 (defn insert
-  [db txn tx-state error-ch solution-ch]
+  [db txn {:keys [t]} solution-ch]
   (let [clause    (:insert txn)
-        insert-ch (async/chan 2)]
-    (async/pipeline-async 2
-                          insert-ch
-                          (fn [solution ch]
-                            (insert-clause db clause tx-state solution error-ch ch))
-                          solution-ch)
-    insert-ch))
+        insert-ch (async/chan 2 (comp (mapcat (partial assign-clause clause))
+                                      (filter where/all-matched?)
+                                      (map (partial matched-triple->flake db t))))]
+    (async/pipe solution-ch insert-ch)))
 
 (defn insert-retract
   [db mdfn tx-state fuel-tracker error-ch solution-ch]
@@ -157,7 +63,7 @@
         solution-mult   (async/mult solution-ch*)
         insert-soln-ch  (->> (async/chan 2)
                              (async/tap solution-mult))
-        insert-ch       (insert db mdfn tx-state error-ch insert-soln-ch)
+        insert-ch       (insert db mdfn tx-state insert-soln-ch)
         retract-soln-ch (->> (async/chan 2)
                              (async/tap solution-mult))
         retract-ch      (retract db mdfn tx-state fuel-tracker error-ch retract-soln-ch)]
@@ -183,7 +89,7 @@
       (insert-retract db parsed-txn tx-state fuel-tracker error-ch solution-ch*)
 
       (insert? parsed-txn)
-      (insert db parsed-txn tx-state error-ch solution-ch*)
+      (insert db parsed-txn tx-state solution-ch*)
 
       (retract? parsed-txn)
       (retract db parsed-txn tx-state fuel-tracker error-ch solution-ch*))))
