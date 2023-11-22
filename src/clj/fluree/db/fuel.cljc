@@ -1,7 +1,6 @@
 (ns fluree.db.fuel
   (:require [clojure.core.async :as async :refer [put!]]
-            [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake]))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -34,15 +33,13 @@
          (rf))
 
         ([result next]
-         (if (flake/flake? next)
-           (vswap! counter inc)
-           (vswap! counter + (count (remove result next))))
-         (let [t     (tally trkr)
+         (vswap! counter inc)
+         (let [tly   (tally trkr)
                limit (:limit trkr)]
-           (when (and (> limit 0) (> t limit))
-             (log/trace "Fuel limit of" limit "exceeded:" t)
+           (when (< 0 limit tly)
+             (log/error "Fuel limit of" limit "exceeded:" tly)
              (put! (:error-ch trkr)
-                   (ex-info "Fuel limit exceeded" {:used t, :limit limit})))
+                   (ex-info "Fuel limit exceeded" {:used tly, :limit limit})))
            (rf result next)))
 
         ([result]

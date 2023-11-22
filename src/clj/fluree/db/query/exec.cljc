@@ -69,5 +69,5 @@
   (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)]
     (if fuel-tracker
       (let [track-fuel (fuel/track fuel-tracker)]
-        (async/transduce track-fuel into flakeset flake-ch))
+        (async/transduce track-fuel (completing conj) flakeset flake-ch))
       (async/reduce into flakeset flake-ch))))
