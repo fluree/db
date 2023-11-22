@@ -5,16 +5,13 @@
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.branch :as branch]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
@@ -93,13 +90,21 @@
      :stage-update?            (= t db-t) ;; if a previously staged db is getting updated again before committed
      :t                        t}))
 
+(defn into-flakeset
+  [fuel-tracker flake-ch]
+  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)]
+    (if fuel-tracker
+      (let [track-fuel (fuel/track fuel-tracker)]
+        (async/transduce track-fuel (completing conj) flakeset flake-ch))
+      (async/reduce into flakeset flake-ch))))
+
 (defn generate-flakes
   [db fuel-tracker parsed-txn tx-state]
   (go
     (let [error-ch  (async/chan)
           update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
                          (update/modify db parsed-txn tx-state fuel-tracker error-ch)
-                         (exec/into-flakeset fuel-tracker))]
+                         (into-flakeset fuel-tracker))]
       (async/alt!
         error-ch ([e] e)
         update-ch ([flakes] flakes)))))
