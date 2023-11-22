@@ -71,7 +71,7 @@
                (let [v (where/get-value o-mch)
                      [dt new-dt-ns] (or (dbproto/-p-prop db :datatype p-iri)
                                         (-> o-mch
-                                            where/get-datatype
+                                            where/get-datatype-iri
                                             (iri/iri->sid-with-namespace @namespaces)))]
                  (when new-dt-ns
                    (vswap! namespaces conj new-dt-ns))

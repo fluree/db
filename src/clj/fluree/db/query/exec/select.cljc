@@ -23,7 +23,7 @@
   "Format a where-pattern match for presentation based on the match's datatype.
   Return an async channel that will eventually contain the formatted match."
   (fn [match db _iri-cache _compact _error-ch]
-    (let [dt-iri (where/get-datatype match)]
+    (let [dt-iri (where/get-datatype-iri match)]
       (if (keyword? dt-iri)
         dt-iri
         (let [nses (:namespaces db)]

@@ -423,7 +423,7 @@
                   (let [dt-var   (var->dt-var var)
                         lang-var (var->lang-var var)]
                     `[mch#      (get ~soln-sym (quote ~var))
-                      ~dt-var   (where/get-datatype mch#)
+                      ~dt-var   (where/get-datatype-iri mch#)
                       ~lang-var (-> mch# ::where/meta :lang (or ""))
                       ~var      (cond->> (where/get-value mch#)
                                   (= ~dt-var ::group/grouping)

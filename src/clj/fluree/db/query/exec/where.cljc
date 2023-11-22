@@ -62,15 +62,18 @@
   [iri-mch db-alias]
   (get-in iri-mch [::sids db-alias]))
 
-(defn get-datatype
+(defn get-datatype-iri
   [mch]
   (if (or (matched-iri? mch)
           (matched-sid? mch))
-    const/$xsd:anyURI
+    const/$xsd:anyURI-iri
     (::datatype-iri mch)))
 
 (defn get-datatype-sid
   [mch db-alias]
+  (if (or (matched-iri? mch)
+          (matched-sid? mch))
+    const/$xsd:anyURI)
   (get-in mch [::datatype-sids db-alias]))
 
 (defn matched?
@@ -305,7 +308,7 @@
          o    (or (get-value o-mch)
                   (get-sid o-mch alias))
          o-fn (::fn o-mch)
-         o-dt (-> o-mch get-datatype (iri/iri->sid namespaces))
+         o-dt (-> o-mch get-datatype-iri (iri/iri->sid namespaces))
 
          idx         (try* (index/for-components s p o o-dt)
                            (catch* e

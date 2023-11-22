@@ -199,7 +199,8 @@
 ;; == xsd data types ==
 ;; major types (a) ref, (b) string, (c) number, (d) boolean
 ;; xsd common types
-(def ^:const $xsd:anyURI (iri/iri->sid "http://www.w3.org/2001/XMLSchema#anyURI"))
+(def ^:const $xsd:anyURI-iri "http://www.w3.org/2001/XMLSchema#anyURI")
+(def ^:const $xsd:anyURI (iri/iri->sid $xsd:anyURI-iri))
 (def ^:const $xsd:string (iri/iri->sid "http://www.w3.org/2001/XMLSchema#string"))
 (def ^:const $xsd:boolean (iri/iri->sid "http://www.w3.org/2001/XMLSchema#boolean"))
 (def ^:const $xsd:date (iri/iri->sid "http://www.w3.org/2001/XMLSchema#date"))
