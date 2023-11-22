@@ -40,26 +40,53 @@
                                                    (map (partial where/compute-sids db)))))]
     (retract-matches db t fuel-tracker error-ch matched-ch)))
 
-(defn matched-triple->flake
-  [db t [s-mch p-mch o-mch]]
-  (let [nses  (:namespaces db)
-        sid   (-> s-mch where/get-iri (iri/iri->sid nses))
-        p-iri (where/get-iri p-mch)
-        pid   (iri/iri->sid p-iri nses)
-        m     (where/get-meta o-mch)]
-    (if-let [oid (some-> o-mch where/get-iri (iri/iri->sid nses))]
-      (flake/create sid pid oid const/$xsd:anyURI t true m)
-      (let [v  (where/get-value o-mch)
-            dt (or (dbproto/-p-prop db :datatype p-iri)
-                   (-> o-mch where/get-datatype (iri/iri->sid nses)))]
-        (flake/create sid pid v dt t true m)))))
+(defn insert-flake-xf
+  [db t]
+  (fn [rf]
+    (let [namespaces (volatile! (:namespaces db))]
+      (fn
+        ([]
+         (rf))
+
+        ([result [s-mch p-mch o-mch]]
+         (let [m                (where/get-meta o-mch)
+               [sid new-sid-ns] (-> s-mch
+                                    where/get-iri
+                                    (iri/iri->sid-with-namespace @namespaces))]
+           (when new-sid-ns
+             (vswap! namespaces conj new-sid-ns))
+           (let [p-iri (where/get-iri p-mch)
+                 [pid new-pid-ns] (iri/iri->sid-with-namespace p-iri @namespaces)]
+             (when new-pid-ns
+               (vswap! namespaces conj new-pid-ns))
+             (if (where/matched-iri? o-mch)
+               (let [dt const/$xsd:anyURI
+                     [oid new-oid-ns] (-> o-mch
+                                          where/get-iri
+                                          (iri/iri->sid-with-namespace @namespaces))]
+                 (when new-oid-ns
+                   (vswap! namespaces conj new-oid-ns))
+                 (let [f (flake/create sid pid oid dt t true m)]
+                   (rf result [f @namespaces])))
+               (let [v (where/get-value o-mch)
+                     [dt new-dt-ns] (or (dbproto/-p-prop db :datatype p-iri)
+                                        (-> o-mch
+                                            where/get-datatype
+                                            (iri/iri->sid-with-namespace @namespaces)))]
+                 (when new-dt-ns
+                   (vswap! namespaces conj new-dt-ns))
+                 (let [f (flake/create sid pid v dt t true m)]
+                   (rf result [f @namespaces])))))))
+
+        ([result]
+         (rf result))))))
 
 (defn insert
   [db txn {:keys [t]} solution-ch]
   (let [clause    (:insert txn)
         insert-ch (async/chan 2 (comp (mapcat (partial assign-clause clause))
                                       (filter where/all-matched?)
-                                      (map (partial matched-triple->flake db t))))]
+                                      (insert-flake-xf db t)))]
     (async/pipe solution-ch insert-ch)))
 
 (defn insert-retract
@@ -75,7 +102,7 @@
                              (async/tap solution-mult))
         retract-ch      (retract db mdfn tx-state fuel-tracker error-ch retract-soln-ch)]
     (async/pipe solution-ch solution-ch*) ; now hook up the solution input
-                                        ; after everything is wired
+                                          ; after everything is wired
     (async/merge [insert-ch retract-ch])))
 
 (defn insert?
