@@ -69,6 +69,10 @@
     const/$xsd:anyURI
     (::datatype-iri mch)))
 
+(defn get-datatype-sid
+  [mch db-alias]
+  (get-in mch [::datatype-sids db-alias]))
+
 (defn matched?
   [match]
   (or (matched-value? match)
@@ -353,6 +357,14 @@
     (when-let [sid (iri/iri->sid s-iri nses)]
       (match-sid s-mch db-alias sid))))
 
+(defn compute-datatype-sid
+  [o-mch db]
+  (let [db-alias (:alias db)
+        nses     (:namespaces db)
+        dt-iri   (::datatype-iri o-mch)]
+    (when-let [sid (iri/iri->sid dt-iri nses)]
+      (assoc-in o-mch [::datatype-sid db-alias] sid))))
+
 (defn compute-sids
   [db [s p o]]
   (let [db-alias (:alias db)
@@ -367,7 +379,7 @@
         o*       (if (and (matched-iri? o)
                           (not (get-sid o db-alias)))
                    (compute-sid o db)
-                   o)]
+                   (compute-datatype-sid o db))]
     (when (and (some? s*) (some? p*) (some? o*))
       [s* p* o*])))
 
