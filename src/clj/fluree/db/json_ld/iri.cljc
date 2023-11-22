@@ -26,6 +26,8 @@
 (def default-namespace-codes
   (map-invert default-namespaces))
 
+(def last-default-code 100)
+
 (defn decompose-by-char
   [iri c limit]
   (when-let [char-idx (some-> iri
@@ -107,6 +109,23 @@
      (when-let [ns-code (get namespaces ns)]
        (append-name-codes [ns-code] nme)))))
 
+(defn next-namespace-code
+  [namespaces]
+  (->> namespaces
+       vals
+       (apply max last-default-code)
+       inc))
+
+(defn iri->sid-with-namespace
+  [iri namespaces]
+  (let [[ns nme]    (decompose iri)]
+    (if-let [ns-code (get namespaces ns)]
+      (let [sid (append-name-codes [ns-code] nme)]
+        [sid nil])
+      (let [new-ns-code (next-namespace-code namespaces)
+            sid         (append-name-codes [new-ns-code] nme)]
+        [sid [ns new-ns-code]]))))
+
 (defn sid?
   [x]
   (vector? x))
@@ -126,22 +145,3 @@
        get-ns-code
        (as-> ns-code (get namespace-codes ns-code))
        (str (get-name sid)))))
-
-(defn next-namespace-code
-  [db]
-  (->> (:namespace-codes db)
-       keys
-       (apply max)
-       inc))
-
-(defn iri->new-sid
-  [db iri]
-  (if-let [sid (iri->sid db iri)]
-    [db sid]
-    (let [[ns nme]    (decompose iri)
-          new-ns-code (next-namespace-code db)
-          db*         (-> db
-                          (update :namespaces assoc ns new-ns-code)
-                          (update :namespace-codes assoc new-ns-code ns))
-          sid         (append-name-codes [new-ns-code] nme)]
-      [db* sid])))
