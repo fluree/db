@@ -130,7 +130,7 @@
                            (vswap! (fn [ns-map]
                                      (if (contains? ns-map ns)
                                        ns-map
-                                       (let [new-ns-code (next-namespace-code namespaces)]
+                                       (let [new-ns-code (next-namespace-code ns-map)]
                                          (assoc ns-map ns new-ns-code)))))
                            (get ns))]
           (append-name-codes [ns-code] nme)))
