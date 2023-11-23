@@ -226,4 +226,4 @@
            [flakes]      (alts! chans :priority true)]
        (when (util/exception? flakes)
          (throw flakes))
-       (<? (flakes->final-db2 tx-state flakes))))))
+       (<? (flakes->final-db tx-state flakes))))))

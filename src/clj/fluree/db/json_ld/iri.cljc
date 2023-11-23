@@ -116,17 +116,6 @@
        (apply max last-default-code)
        inc))
 
-(defn iri->sid-with-namespace
-  [iri namespaces]
-  (let [[ns nme]    (decompose iri)]
-    (if-let [ns-code (get namespaces ns)]
-      (let [sid (append-name-codes [ns-code] nme)]
-        [sid nil])
-      (let [new-ns-code (next-namespace-code namespaces)
-            sid         (append-name-codes [new-ns-code] nme)]
-        [sid [ns new-ns-code]]))))
-
-
 (defprotocol SIDGenerator
   (generate-sid [g iri])
   (get-namespaces [g]))
@@ -136,10 +125,15 @@
   (let [namespaces (volatile! initial-namespaces)]
     (reify SIDGenerator
       (generate-sid [_ iri]
-        (let [[sid ns-mapping] (iri->sid-with-namespace iri @namespaces)]
-          (when ns-mapping
-            (vswap! namespaces conj ns-mapping))
-          sid))
+        (let [[ns nme] (decompose iri)
+              ns-code  (-> namespaces
+                           (vswap! (fn [ns-map]
+                                     (if (contains? ns-map ns)
+                                       ns-map
+                                       (let [new-ns-code (next-namespace-code namespaces)]
+                                         (assoc ns-map ns new-ns-code)))))
+                           (get ns))]
+          (append-name-codes [ns-code] nme)))
       (get-namespaces [_]
         @namespaces))))
 
