@@ -336,7 +336,7 @@
                    :context-type :string})
           alias  "faux-compact-iri-query"
           ledger @(fluree/create conn alias)
-          db0    @(fluree/stage2 (fluree/db ledger)
+          db0    @(fluree/stage (fluree/db ledger)
                                  {"@context" "https://ns.flur.ee"
                                   "insert"
                                   [{"id"      "foo"
