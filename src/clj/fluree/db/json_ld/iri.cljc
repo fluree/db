@@ -126,6 +126,23 @@
             sid         (append-name-codes [new-ns-code] nme)]
         [sid [ns new-ns-code]]))))
 
+
+(defprotocol SIDGenerator
+  (generate-sid [g iri])
+  (get-namespaces [g]))
+
+(defn sid-generator!
+  [initial-namespaces]
+  (let [namespaces (volatile! initial-namespaces)]
+    (reify SIDGenerator
+      (generate-sid [_ iri]
+        (let [[sid ns-mapping] (iri->sid-with-namespace iri @namespaces)]
+          (when ns-mapping
+            (vswap! namespaces conj ns-mapping))
+          sid))
+      (get-namespaces [_]
+        @namespaces))))
+
 (defn sid?
   [x]
   (vector? x))
