@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [go alts!]]
+            [clojure.set :refer [map-invert]]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
@@ -16,7 +17,8 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util]
+            [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -81,14 +83,16 @@
 
 (defn ->tx-state
   [db]
-  (let [{:keys [schema branch ledger policy], db-t :t} db
+  (let [{:keys [branch ledger policy], db-t :t} db
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
-        t         (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
+        t         (-> commit-t inc -) ; commit-t is always positive, need to
+                                      ; make negative for internal indexing
         db-before (dbproto/-rootdb db)]
-    {:db-before                db-before
-     :policy                   policy
-     :stage-update?            (= t db-t) ;; if a previously staged db is getting updated again before committed
-     :t                        t}))
+    {:db-before     db-before
+     :policy        policy
+     :stage-update? (= t db-t) ; if a previously staged db is getting updated
+                               ; again before committed
+     :t             t}))
 
 (defn into-flakeset
   [fuel-tracker flake-ch]
@@ -102,12 +106,15 @@
   [db fuel-tracker parsed-txn tx-state]
   (go
     (let [error-ch  (async/chan)
+          sid-gen   (iri/sid-generator! (:namespaces db))
           update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
-                         (update/modify db parsed-txn tx-state fuel-tracker error-ch)
+                         (update/modify db parsed-txn tx-state sid-gen fuel-tracker error-ch)
                          (into-flakeset fuel-tracker))]
       (async/alt!
         error-ch ([e] e)
-        update-ch ([flakes] flakes)))))
+        update-ch ([flakes]
+                   (let [nses (iri/get-namespaces sid-gen)]
+                     [nses flakes]))))))
 
 (defn subject-mods
   [new-flakes db-before]
@@ -160,33 +167,40 @@
                        o-pred-shapes)))
           subj-mods)))))
 
+(defn reset-namespaces
+  [db nses]
+  (let [codes (map-invert nses)]
+    (assoc db
+           :namespaces nses
+           :namespace-codes codes)))
+
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [new-flakes {:keys [stage-update? db-before policy t] :as tx-state}]
+  [namespaces new-flakes {:keys [stage-update? db-before policy t] :as tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-
           db-after  (-> db-before
                         (assoc :policy policy) ;; re-apply policy to db-after
                         (assoc :t t)
                         (commit-data/update-novelty add remove)
                         (commit-data/add-tt-id)
+                        (reset-namespaces namespaces)
                         (vocab/hydrate-schema add))]
       {:add add :remove remove :db-after db-after})))
 
-(defn flakes->final-db2
+(defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
   along with performing any final validation and policy enforcement."
-  [tx-state flakes]
+  [tx-state [nses flakes]]
   (go-try
     (let [subj-mods (<? (subject-mods flakes (:db-before tx-state)))
           ;; wrap it in an atom to reuse old validate-rules and policy/allowed? unchanged
           ;; TODO: remove the atom wrapper once subj-mods is no longer shared code
           tx-state* (assoc tx-state :subj-mods (atom subj-mods))]
-      (-> (final-db flakes tx-state)
+      (-> (final-db nses flakes tx-state)
           <?
           (validate-rules tx-state*)
           <?
