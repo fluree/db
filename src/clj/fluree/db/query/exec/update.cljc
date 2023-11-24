@@ -3,6 +3,7 @@
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
+            [fluree.db.datatype :as datatype]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log]
             [clojure.core.async :as async]))
@@ -52,9 +53,10 @@
         (flake/create sid pid oid dt t true m))
       (let [v  (where/get-value o-mch)
             dt (or (dbproto/-p-prop db :datatype p-iri)
-                   (-> o-mch
-                       where/get-datatype-iri
-                       (as-> dt-iri (iri/generate-sid sid-gen dt-iri))))]
+                   (some-> o-mch
+                           where/get-datatype-iri
+                           (as-> dt-iri (iri/generate-sid sid-gen dt-iri)))
+                   (datatype/infer v))]
         (flake/create sid pid v dt t true m)))))
 
 
