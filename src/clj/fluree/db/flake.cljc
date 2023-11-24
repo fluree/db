@@ -42,8 +42,8 @@
   [cid]
   (->sid cid MAX-COLL-SUBJECTS))
 
-(def ^:const min-s iri/min-sid)
-(def ^:const max-s iri/max-sid)
+(def ^:const min-s iri/max-sid)
+(def ^:const max-s iri/min-sid)
 (def ^:const min-p iri/min-sid)
 (def ^:const max-p iri/max-sid)
 (def ^:const min-dt iri/min-sid)
