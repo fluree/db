@@ -100,7 +100,7 @@
     (if fuel-tracker
       (let [track-fuel (fuel/track fuel-tracker)]
         (async/transduce track-fuel (completing conj) flakeset flake-ch))
-      (async/reduce into flakeset flake-ch))))
+      (async/reduce conj flakeset flake-ch))))
 
 (defn generate-flakes
   [db fuel-tracker parsed-txn tx-state]
