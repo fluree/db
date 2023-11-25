@@ -382,7 +382,9 @@
         o*       (if (and (matched-iri? o)
                           (not (get-sid o db-alias)))
                    (compute-sid o db)
-                   (compute-datatype-sid o db))]
+                   (if (unmatched-var? o)
+                     o
+                     (compute-datatype-sid o db)))]
     (when (and (some? s*) (some? p*) (some? o*))
       [s* p* o*])))
 
