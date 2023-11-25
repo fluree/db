@@ -146,7 +146,7 @@
       (= const/$rdfs:subClassOf pid)
       (update pred-map sid with-subclass obj)
 
-      (= const/$_predicate:equivalentProperty pid)
+      (= const/$owl:equivalentProperty pid)
       (update-equivalent-properties pred-map sid obj)
 
       :else pred-map)))

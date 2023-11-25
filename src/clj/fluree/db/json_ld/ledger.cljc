@@ -34,7 +34,7 @@
           "http://www.w3.org/2002/07/owl#Class"                 const/$owl:Class
           "http://www.w3.org/2002/07/owl#ObjectProperty"        const/$owl:ObjectProperty
           "http://www.w3.org/2002/07/owl#DatatypeProperty"      const/$owl:DatatypeProperty
-          "http://www.w3.org/2002/07/owl#equivalentProperty"    const/$_predicate:equivalentProperty
+          "http://www.w3.org/2002/07/owl#equivalentProperty"    const/$owl:equivalentProperty
           ;; shacl
           "http://www.w3.org/ns/shacl#NodeShape"                const/$sh:NodeShape
           "http://www.w3.org/ns/shacl#PropertyShape"            const/$sh:PropertyShape
@@ -131,7 +131,7 @@
 (def predicate-refs
   "The following predicates have objects that are refs to other predicates."
   #{const/$fluree:targetClass
-    const/$_predicate:equivalentProperty
+    const/$owl:equivalentProperty
     const/$rdfs:Class
     const/$rdfs:subClassOf
     const/$sh:alternativePath

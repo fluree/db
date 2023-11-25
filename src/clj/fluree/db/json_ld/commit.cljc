@@ -285,7 +285,7 @@
                                                        conn ledger default-context))
           commit* (assoc commit :defaultContext
                                 {:id      (str "fluree:context:" hash)
-                                 :type    const/iri-Context
+                                 :type    const/iri-ContextClass
                                  :address address})]
       [commit* context-res])))
 

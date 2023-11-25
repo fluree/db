@@ -35,7 +35,7 @@
 (def ^:const iri-tag "https://ns.flur.ee/ledger#tag")
 (def ^:const iri-updates "https://ns.flur.ee/ledger#updates")
 (def ^:const iri-default-context "https://ns.flur.ee/ledger#defaultContext")
-(def ^:const iri-Context "https://ns.flur.ee/ledger#Context")
+(def ^:const iri-ContextClass "https://ns.flur.ee/ledger#Context")
 (def ^:const iri-allow "https://ns.flur.ee/ledger#allow")
 (def ^:const iri-equals "https://ns.flur.ee/ledger#equals")
 (def ^:const iri-contains "https://ns.flur.ee/ledger#contains")
@@ -68,7 +68,6 @@
 (def ^:const iri-lang-string "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
 
 ;; system collection ids
-(def ^:const $_tx -1) ; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
 (def ^:const $_predicate 0)
 (def ^:const $_collection 1)
 (def ^:const $_shard 2)
@@ -79,39 +78,25 @@
 (def ^:const $_role 7)
 (def ^:const $_rule 8)
 (def ^:const $_setting 9)
-(def ^:const $_ctx 10)
 (def ^:const $_prefix 11)
 (def ^:const $_default 12)
 
-(def ^:const $numSystemCollections 19)                      ;; max number reserved for 'system'
-(def ^:const $maxSystemPredicates 999)
-
 ;; predicate id constants
 
-(def ^:const $_previous 52)
-(def ^:const $_v 58)
-(def ^:const $_address 59)
+(def ^:const $_previous (iri/iri->sid iri-previous))
+(def ^:const $_v (iri/iri->sid iri-v))
+(def ^:const $_address (iri/iri->sid iri-address))
+(def ^:const $_commit:message (iri/iri->sid iri-message))
+(def ^:const $_commit:time (iri/iri->sid iri-time))
+(def ^:const $_commit:signer (iri/iri->sid iri-issuer))
+(def ^:const $_ledger:alias (iri/iri->sid iri-alias))
+(def ^:const $_ledger:branch (iri/iri->sid iri-branch))
+(def ^:const $_ledger:context (iri/iri->sid iri-default-context))
 
-(def ^:const $_commit:dbId 51)                                ;; JSON-LD: turning into data/db id
-
-(def ^:const $_commit:idRef 53)
-(def ^:const $_commit:message 54)
-(def ^:const $_commit:time 55)
-(def ^:const $_commit:signer 57)
-
-
-(def ^:const $_ledger:alias 170)
-(def ^:const $_ledger:branch 171)
-(def ^:const $_ledger:context 172)
-
-(def ^:const $_commit:data 160)
-(def ^:const $_commitdata:flakes 182)
-(def ^:const $_commitdata:size 183)
-(def ^:const $_commitdata:t 184)
-
-(def ^:const $_predicate:fullText 27)
-(def ^:const $_predicate:equivalentProperty 35)                          ;; any unique alias for predicate
-
+(def ^:const $_commit:data (iri/iri->sid iri-data))
+(def ^:const $_commitdata:flakes (iri/iri->sid iri-flakes))
+(def ^:const $_commitdata:size (iri/iri->sid iri-size))
+(def ^:const $_commitdata:t (iri/iri->sid iri-t))
 
 (def ^:const $id (iri/iri->sid "@id"))
 
@@ -193,8 +178,9 @@
 
 ;; owl
 (def ^:const $owl:Class (iri/iri->sid "http://www.w3.org/2002/07/owl#Class"))
-(def ^:const $owl:ObjectProperty "http://www.w3.org/2002/07/owl#ObjectProperty")
+(def ^:const $owl:ObjectProperty (iri/iri->sid "http://www.w3.org/2002/07/owl#ObjectProperty"))
 (def ^:const $owl:DatatypeProperty (iri/iri->sid "http://www.w3.org/2002/07/owl#DatatypeProperty"))
+(def ^:const $owl:equivalentProperty (iri/iri->sid "http://www.w3.org/2002/07/owl#equivalentProperty"))
 
 ;; == xsd data types ==
 ;; major types (a) ref, (b) string, (c) number, (d) boolean
