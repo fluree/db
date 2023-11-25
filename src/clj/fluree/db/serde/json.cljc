@@ -34,11 +34,11 @@
   [flake-vec]
   (let [s  (-> flake-vec (get flake/subj-pos) deserialize-subject)
         p  (-> flake-vec (get flake/pred-pos) deserialize-subject)
-        dt (get flake-vec flake/dt-pos)
+        dt (-> flake-vec (get flake/dt-pos) deserialize-subject)
         o  (-> flake-vec (get flake/obj-pos) (deserialize-object dt))
         t  (get flake-vec flake/t-pos)
         op (get flake-vec flake/op-pos)
-        m  (-> flake-vec (get flake/m-pos) (deserialize-meta))]
+        m  (-> flake-vec (get flake/m-pos) deserialize-meta)]
     (flake/create s p o dt t op m)))
 
 (defn- deserialize-child-node
@@ -112,7 +112,7 @@
   We need to serialize these into strings that will be successfully re-coerced into
   the same objects upon loading."
   [val dt]
-  (uc/case (int dt)
+  (uc/case dt
     const/$xsd:anyURI    (serialize-subject val)
     const/$xsd:dateTime  #?(:clj (.format xsdDateTimeFormatter val)
                             :cljs (.toJSON val))
