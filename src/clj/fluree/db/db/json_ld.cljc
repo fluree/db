@@ -86,12 +86,9 @@
              (query-range/index-range :spot = [subject-id const/$rdf:type])
              <?))))
 
-(defn iri
-  "Returns the iri for a given subject ID"
-  [db subject-id compact-fn]
-  (go-try
-    (when-let [flake (first (<? (query-range/index-range db :spot = [subject-id 0])))]
-      (-> flake flake/o compact-fn))))
+(defn sid->iri
+  [{:keys [namespace-codes] :as _db} sid]
+  (iri/sid->iri sid namespace-codes))
 
 ;; ================ Jsonld record support fns ================================
 
@@ -200,8 +197,6 @@
   (-subid [this ident] (subid this ident {:strict? false :expand? true}))
   (-subid [this ident opts] (subid this ident opts))
   (-class-ids [this subject] (class-ids this subject))
-  (-iri [this subject-id] (iri this subject-id identity))
-  (-iri [this subject-id compact-fn] (iri this subject-id compact-fn))
   (-query [this query-map]
     (let [ctx-type (-> query-map :opts :context-type)
           q-ctx    (ctx-util/get-context query-map)

@@ -50,7 +50,8 @@
               v        (where/get-sid match db-alias)]
           (if-let [cached (-> @iri-cache (get v) :as)]
             cached
-            (try* (let [iri (<? (dbproto/-iri db v compact))]
+            (try* (let [ns-codes (:namespace-codes db)
+                        iri      (-> v (iri/sid->iri ns-codes) compact)]
                     (vswap! iri-cache assoc v {:as iri})
                     iri)
                   (catch* e

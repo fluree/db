@@ -5,6 +5,7 @@
             [fluree.db.serde.json :as serde-json]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.json-ld.credential :as cred]
@@ -24,19 +25,10 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn get-s-iri
-  "Returns an IRI from a subject id (sid).
-
-  Caches result in iri-map to speed up processing."
-  [sid db iri-map compact-fn]
-  ;; TODO - if we can move cache check into calling fns, we can avoid an extra async channel here
-  (go-try
-    (if-let [cached (get @iri-map sid)]
-      cached
-      ;; TODO following, if a retract was made there could be 2 matching flakes and want to make sure we take the latest add:true
-      (let [iri (or (<? (dbproto/-iri db sid compact-fn))
-                    (str "_:f" sid))]
-        (vswap! iri-map assoc sid iri)
-        iri))))
+  "Returns an IRI from a subject id (sid)."
+  [sid db compact-fn]
+  (let [ns-codes (:namespace-codes db)]
+    (-> sid (iri/sid->iri ns-codes) compact-fn)))
 
 (defn- subject-block-pred
   [db iri-map compact-fn list? p-flakes]
@@ -47,9 +39,8 @@
       (let [pdt       (flake/dt p-flake)
             ref?      (= const/$xsd:anyURI pdt)
             [obj all-refs?] (if ref?
-                              [{"@id" (<? (get-s-iri (flake/o p-flake)
-                                                     db iri-map
-                                                     compact-fn))}
+                              [{"@id" (get-s-iri (flake/o p-flake)
+                                                 db compact-fn)}
                                (if (nil? all-refs?) true all-refs?)]
                               [{"@value" (-> p-flake
                                              flake/o
@@ -61,9 +52,7 @@
                         ;;need to retain the `@type` for times
                         ;;so they will be coerced correctly when loading
                         (assoc "@type"
-                               (<? (get-s-iri pdt
-                                              db iri-map
-                                              compact-fn))))
+                               (get-s-iri pdt db compact-fn)))
             next-acc' (conj acc' obj*)]
         (if (seq r')
           (recur r' all-refs? next-acc')
@@ -85,7 +74,7 @@
            acc nil]
       (let [fflake          (first p-flakes)
             list?           (-> fflake flake/m :i)
-            p-iri           (-> fflake flake/p (get-s-iri db iri-map compact-fn) <?)
+            p-iri           (-> fflake flake/p (get-s-iri db compact-fn))
             [objs all-refs?] (<? (subject-block-pred db iri-map compact-fn
                                                      list? p-flakes))
             handle-all-refs (partial set-refs-type-in-ctx ctx p-iri)
@@ -118,7 +107,7 @@
              retract []]
         (if s-flakes
           (let [sid            (flake/s (first s-flakes))
-                s-iri          (<? (get-s-iri sid db id->iri compact-fn))
+                s-iri          (get-s-iri sid db compact-fn)
                 non-iri-flakes (remove #(= const/$xsd:anyURI (flake/p %)) s-flakes)
                 [assert* retract*]
                 (cond

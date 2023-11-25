@@ -6,20 +6,17 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.json :as json]
+            [fluree.db.json-ld.iri :as iri]))
 
 ;; handles :select response map for JSON-LD based queries
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn sid->iri
-  [db sid compact-fn]
-  (dbproto/-iri db sid compact-fn))
-
 (defn cache-sid->iri
   [db cache compact-fn sid]
   (go-try
-    (when-let [iri (<? (sid->iri db sid compact-fn))]
+    (when-let [iri (some-> sid (iri/sid->iri (:namespace-codes db)) compact-fn)]
       (vswap! cache assoc sid {:as iri})
       {:as iri})))
 
@@ -78,9 +75,9 @@
   (go-try
     (when (not-empty s-flakes)
       (loop [[p-flakes & r] (partition-by flake/p s-flakes)
-             acc (if _id?
-                   {:_id (flake/s (first s-flakes))}
-                   {})]
+             acc            (if _id?
+                              {:_id (flake/s (first s-flakes))}
+                              {})]
         (if p-flakes
           (let [ff    (first p-flakes)
                 p     (flake/p ff)
@@ -103,7 +100,7 @@
                         ;; flake's .-o value is a rdf:type, resolve subject id to IRI then JSON-LD compact it
                         (rdf-type? p)
                         (loop [[type-id & rest-types] (map flake/o p-flakes)
-                               acc []]
+                               acc                    []]
                           (if type-id
                             (recur rest-types
                                    (conj acc (:as (or (get @cache type-id)
@@ -116,7 +113,7 @@
                         (loop [[f & r] (if list?
                                          (sort-by #(:i (flake/m %)) p-flakes)
                                          p-flakes)
-                               acc []]
+                               acc     []]
                           (if f
                             (let [res (cond
                                         (= const/$xsd:anyURI (flake/dt f))
@@ -132,10 +129,11 @@
                                           ;; no sub-selection, just return {@id <iri>} for each ref iri
                                           :else
                                           ;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
-                                          (let [id-key (:as (or (get @cache const/$id)
-                                                                (wildcard-spec db cache compact-fn const/$id)
-                                                                (<? (cache-sid->iri db cache compact-fn const/$id))))
-                                                c-iri  (<? (dbproto/-iri db (flake/o f) compact-fn))]
+                                          (let [id-key   (:as (or (get @cache const/$id)
+                                                                  (wildcard-spec db cache compact-fn const/$id)
+                                                                  (<? (cache-sid->iri db cache compact-fn const/$id))))
+                                                ns-codes (:namespace-codes db)
+                                                c-iri    (-> f flake/o (iri/sid->iri ns-codes) compact-fn)]
                                             {id-key c-iri}))
 
                                         (= const/$rdf:json (flake/dt f))

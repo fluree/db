@@ -14,7 +14,8 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.db.json-ld :as jld-db]
-            [fluree.db.validation :as v]))
+            [fluree.db.validation :as v]
+            [fluree.db.json-ld.iri :as iri]))
 
 (defn history-query-schema
   "Returns schema for history queries, with any extra key/value pairs `extra-kvs`
@@ -129,13 +130,15 @@
   [db cache context compact fuel error-ch s-flakes]
   (go
     (try*
-     (let [json-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
-                                               {:wildcard? true, :depth 0}
-                                               0 s-flakes)]
-       (-> (<? json-chan)
-           ;; add the id in case the iri flake isn't present in s-flakes
-           (assoc :id (json-ld/compact (<? (dbproto/-iri db (flake/s (first s-flakes)))) compact))))
-     (catch* e
+      (let [json     (<? (json-ld-resp/flakes->res db cache context compact fuel 1000000
+                                                   {:wildcard? true, :depth 0}
+                                                   0 s-flakes))
+            sid      (->> s-flakes first flake/s)
+            ns-codes (:namespace-codes db)
+            iri      (iri/sid->iri sid ns-codes)]
+        ;; add the id in case the iri flake isn't present in s-flakes
+        (assoc json :id iri))
+      (catch* e
        (log/error e "Error transforming s-flakes.")
        (>! error-ch e)))))
 
