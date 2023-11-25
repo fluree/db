@@ -2,12 +2,10 @@
   (:require [fluree.crypto :as crypto]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]))
 

@@ -4,11 +4,17 @@
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]))
 
+(def ^:const f-ns "https://ns.flur.ee/ledger#")
+
+(defn fluree-iri
+  [nme]
+  (str f-ns nme))
+
 (def default-namespaces
   "iri namespace mapping. 0 signifies relative iris. 1-100 are reserved; user
   supplied namespaces start at 101."
   {"@"                                           1
-   "https://ns.flur.ee/ledger#"                  2
+   f-ns                                          2
    "http://www.w3.org/2001/XMLSchema#"           3
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#" 4
    "http://www.w3.org/2000/01/rdf-schema#"       5
@@ -22,6 +28,7 @@
    "urn:isbn:"                                   13
    "urn:issn"                                    14
    "_:"                                          15})
+
 
 (def default-namespace-codes
   (map-invert default-namespaces))
