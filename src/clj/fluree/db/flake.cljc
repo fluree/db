@@ -55,12 +55,6 @@
 (def ^:const min-meta util/min-integer)
 (def ^:const max-meta util/max-integer)
 
-(defn sid->cid
-  "Will return a collection id from a subject-id."
-  [sid]
-  #?(:clj  (bit-shift-right sid 44)
-     :cljs (js/Math.floor (lshift sid -44))))
-
 
 (deftype Flake [s p o dt t op m]
   #?@(:clj  [clojure.lang.Seqable
