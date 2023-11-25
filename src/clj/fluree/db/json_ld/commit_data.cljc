@@ -433,22 +433,24 @@
   db-sid. Used when committing to an in-memory ledger value and when reifying
   a ledger from storage on load."
   [{:keys [address alias branch data id time v] :as _commit} t db-sid]
-  (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data]
+  (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data
+        t-sid (-> t - iri/fluree-iri iri/iri->sid)]
+
     [;; link db to associated commit meta: @id
-     (flake/create t const/$xsd:anyURI id const/$xsd:string t true nil)
+     (flake/create t-sid const/$xsd:anyURI id const/$xsd:string t true nil)
 
      ;; commit flakes
      ;; address
-     (flake/create t const/$_address address const/$xsd:string t true nil)
+     (flake/create t-sid const/$_address address const/$xsd:string t true nil)
      ;; alias
-     (flake/create t const/$_ledger:alias alias const/$xsd:string t true nil)
+     (flake/create t-sid const/$_ledger:alias alias const/$xsd:string t true nil)
      ;; branch
-     (flake/create t const/$_ledger:branch branch const/$xsd:string t true nil)
+     (flake/create t-sid const/$_ledger:branch branch const/$xsd:string t true nil)
      ;; v
-     (flake/create t const/$_v v const/$xsd:int t true nil)
+     (flake/create t-sid const/$_v v const/$xsd:int t true nil)
      ;; time
-     (flake/create t const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil) ;; data
-     (flake/create t const/$_commit:data db-sid const/$xsd:anyURI t true nil)
+     (flake/create t-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil) ;; data
+     (flake/create t-sid const/$_commit:data db-sid const/$xsd:anyURI t true nil)
 
      ;; db flakes
      ;; @id
@@ -470,8 +472,9 @@
   load."
   [db t previous-id]
   (go-try
-    (let [prev-sid (<? (dbproto/-subid db previous-id))]
-      [(flake/create t const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
+    (let [t-sid    (-> t - iri/fluree-iri iri/iri->sid)
+          prev-sid (<? (dbproto/-subid db previous-id))]
+      [(flake/create t-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
 
 (defn prev-data-flakes
   "Builds and returns a channel containing the previous data flakes for the
@@ -492,23 +495,25 @@
   ledger value and when reifying a ledger from storage on load."
   [db t issuer-iri]
   (go-try
-    (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
-      ;; create reference to existing issuer
-      [(flake/create t const/$_commit:signer issuer-sid const/$xsd:anyURI t true
-                     nil)]
-      ;; create new issuer flake and a reference to it
-      (let [new-issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
-        [(flake/create t const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
-                       true nil)
-         (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri
-                       const/$xsd:string t true nil)]))))
+    (let [t-sid (-> t - iri/fluree-iri iri/iri->sid)]
+      (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
+        ;; create reference to existing issuer
+        [(flake/create t-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true
+                       nil)]
+        ;; create new issuer flake and a reference to it
+        (let [new-issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
+          [(flake/create t-sid const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
+                         true nil)
+           (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri
+                         const/$xsd:string t true nil)])))))
 
 (defn message-flakes
   "Builds and returns the commit message flakes for the given t and message.
   Used when committing to an in-memory ledger value and when reifying a ledger
   from storage on load."
   [t message]
-  [(flake/create t const/$_commit:message message const/$xsd:string t true nil)])
+  (let [t-sid (-> t - iri/fluree-iri iri/iri->sid)]
+    [(flake/create t-sid const/$_commit:message message const/$xsd:string t true nil)]))
 
 (defn default-ctx-flakes
   "Builds and returns a channel containing the default context flakes for the
@@ -519,16 +524,17 @@
   in-memory ledger value and when reifying a ledger from storage on load."
   [db t {:keys [id address] :as _defaultContext}]
   (go-try
-    (if-let [default-ctx-id (<? (dbproto/-subid db id))]
-      [(flake/create t const/$_ledger:context default-ctx-id const/$xsd:anyURI t
-                     true nil)]
-      (let [new-default-ctx-id (iri/iri->sid id (:namespaces db))]
-        [(flake/create t const/$_ledger:context new-default-ctx-id
-                       const/$xsd:anyURI t true nil)
-         (flake/create new-default-ctx-id const/$xsd:anyURI id const/$xsd:string t
-                       true nil)
-         (flake/create new-default-ctx-id const/$_address address
-                       const/$xsd:string t true nil)]))))
+    (let [t-sid (-> t - iri/fluree-iri iri/iri->sid)]
+      (if-let [default-ctx-id (<? (dbproto/-subid db id))]
+        [(flake/create t-sid const/$_ledger:context default-ctx-id const/$xsd:anyURI t
+                       true nil)]
+        (let [new-default-ctx-id (iri/iri->sid id (:namespaces db))]
+          [(flake/create t-sid const/$_ledger:context new-default-ctx-id
+                         const/$xsd:anyURI t true nil)
+           (flake/create new-default-ctx-id const/$xsd:anyURI id const/$xsd:string t
+                         true nil)
+           (flake/create new-default-ctx-id const/$_address address
+                         const/$xsd:string t true nil)])))))
 
 
 (defn add-commit-flakes
