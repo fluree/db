@@ -6,6 +6,12 @@
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const fdb-256-ns "fluree:db:sha256")
+(def ^:const f-mem-ns "fluree:memory://")
+(def ^:const f-file-ns "fluree:file://")
+(def ^:const f-ipfs-ns "fluree:ipfs://")
+(def ^:const f-s3-ns "fluree:s3://")
+(def ^:const f-ctx-ns "fluree:context:")
+
 
 (defn fluree-iri
   [nme]
@@ -15,21 +21,26 @@
   "iri namespace mapping. 0 signifies relative iris. 1-100 are reserved; user
   supplied namespaces start at 101."
   {"@"                                           1
-   f-ns                                          2
-   fdb-256-ns                                    3
-   "http://www.w3.org/2001/XMLSchema#"           4
-   "http://www.w3.org/1999/02/22-rdf-syntax-ns#" 5
-   "http://www.w3.org/2000/01/rdf-schema#"       6
-   "http://www.w3.org/ns/shacl#"                 7
-   "http://www.w3.org/2002/07/owl#"              8
-   "http://www.w3.org/2008/05/skos#"             9
-   "http://xmlns.com/foaf/0.1/"                  10
-   "http://schema.org/"                          11
-   "https://www.wikidata.org/wiki/"              12
-   "urn:uuid"                                    13
-   "urn:isbn:"                                   14
-   "urn:issn"                                    15
-   "_:"                                          16})
+   "http://www.w3.org/2001/XMLSchema#"           2
+   "http://www.w3.org/1999/02/22-rdf-syntax-ns#" 3
+   "http://www.w3.org/2000/01/rdf-schema#"       4
+   "http://www.w3.org/ns/shacl#"                 5
+   "http://www.w3.org/2002/07/owl#"              6
+   "http://www.w3.org/2008/05/skos#"             7
+   "http://xmlns.com/foaf/0.1/"                  8
+   "http://schema.org/"                          0
+   "https://www.wikidata.org/wiki/"              10
+   "urn:uuid"                                    11
+   "urn:isbn:"                                   12
+   "urn:issn"                                    13
+   "_:"                                          14
+   f-ns                                          15
+   fdb-256-ns                                    16
+   f-mem-ns                                      17
+   f-file-ns                                     18
+   f-ipfs-ns                                     19
+   f-s3-ns                                       20
+   f-ctx-ns                                      21})
 
 
 (def default-namespace-codes
