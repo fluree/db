@@ -81,7 +81,7 @@
         (if p-flakes
           (let [ff    (first p-flakes)
                 p     (flake/p ff)
-                iri   (dbproto/-p-prop db :iri p)
+                iri   (iri/sid->iri p (:namespace-codes db))
                 list? (contains? (flake/m ff) :i)
                 spec  (or (get select-spec iri)
                           (when wildcard?
