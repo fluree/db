@@ -435,7 +435,6 @@
   [{:keys [address alias branch data id time v] :as _commit} t db-sid]
   (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data
         t-sid (-> t - iri/fluree-iri iri/iri->sid)]
-
     [;; link db to associated commit meta: @id
      (flake/create t-sid const/$xsd:anyURI id const/$xsd:string t true nil)
 
@@ -542,13 +541,13 @@
   [prev-commit {:keys [alias commit] :as db}]
   (go-try
     (let [{:keys [data defaultContext issuer message]} commit
-          {db-t :t} data
+          {db-t :t, db-id :id} data
 
           {previous-id :id prev-data :data} prev-commit
           prev-data-id       (:id prev-data)
 
           t                  (- db-t)
-          db-sid             (iri/iri->sid alias (:namespaces db))
+          db-sid             (iri/iri->sid db-id)
           base-flakes        (commit-metadata-flakes commit t db-sid)
           prev-commit-flakes (when previous-id
                                (<? (prev-commit-flakes db t previous-id)))

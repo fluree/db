@@ -73,8 +73,8 @@
   [mch db-alias]
   (if (or (matched-iri? mch)
           (matched-sid? mch))
-    const/$xsd:anyURI)
-  (get-in mch [::datatype-sids db-alias]))
+    const/$xsd:anyURI
+    (get-in mch [::datatype-sids db-alias])))
 
 (defn matched?
   [match]

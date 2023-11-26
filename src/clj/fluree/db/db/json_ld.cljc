@@ -183,7 +183,7 @@
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
   (-c-prop [this property collection] (jsonld-c-prop this property collection))
-  (-class-prop [this property class]
+  (-class-prop [_this property class]
     (if (= :subclasses property)
       (get @(:subclasses schema) class)
       (get-in schema [:pred class property])))

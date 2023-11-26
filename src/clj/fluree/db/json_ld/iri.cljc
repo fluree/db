@@ -5,6 +5,7 @@
             [clojure.set :refer [map-invert]]))
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
+(def ^:const fdb-256-ns "fluree:db:sha256")
 
 (defn fluree-iri
   [nme]
@@ -15,19 +16,20 @@
   supplied namespaces start at 101."
   {"@"                                           1
    f-ns                                          2
-   "http://www.w3.org/2001/XMLSchema#"           3
-   "http://www.w3.org/1999/02/22-rdf-syntax-ns#" 4
-   "http://www.w3.org/2000/01/rdf-schema#"       5
-   "http://www.w3.org/ns/shacl#"                 6
-   "http://www.w3.org/2002/07/owl#"              7
-   "http://www.w3.org/2008/05/skos#"             8
-   "http://xmlns.com/foaf/0.1/"                  9
-   "http://schema.org/"                          10
-   "https://www.wikidata.org/wiki/"              11
-   "urn:uuid"                                    12
-   "urn:isbn:"                                   13
-   "urn:issn"                                    14
-   "_:"                                          15})
+   fdb-256-ns                                    3
+   "http://www.w3.org/2001/XMLSchema#"           4
+   "http://www.w3.org/1999/02/22-rdf-syntax-ns#" 5
+   "http://www.w3.org/2000/01/rdf-schema#"       6
+   "http://www.w3.org/ns/shacl#"                 7
+   "http://www.w3.org/2002/07/owl#"              8
+   "http://www.w3.org/2008/05/skos#"             9
+   "http://xmlns.com/foaf/0.1/"                  10
+   "http://schema.org/"                          11
+   "https://www.wikidata.org/wiki/"              12
+   "urn:uuid"                                    13
+   "urn:isbn:"                                   14
+   "urn:issn"                                    15
+   "_:"                                          16})
 
 
 (def default-namespace-codes

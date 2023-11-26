@@ -317,7 +317,7 @@
                   (parse-subject context))
         attrs (dissoc m const/iri-id)]
     (if (empty? attrs)
-      (let[o-mch (-> s-mch ::where/iri where/anonymous-value)]
+      (let [o-mch (-> s-mch ::where/iri where/anonymous-value)]
         [[s-mch id-predicate-match o-mch]])
       (parse-statements s-mch attrs context))))
 
