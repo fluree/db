@@ -228,7 +228,7 @@
         sid      (flake/s flake)
         s-iri    (iri/sid->iri sid ns-codes)]
     (-> s-match
-        (match-sid sid alias)
+        (match-sid alias sid)
         (match-iri s-iri))))
 
 (defn match-predicate
@@ -241,7 +241,7 @@
         pid      (flake/p flake)
         p-iri    (iri/sid->iri pid ns-codes)]
     (-> p-match
-        (match-sid pid alias)
+        (match-sid alias pid)
         (match-iri p-iri))))
 
 (defn match-object
@@ -255,7 +255,7 @@
             oid   (flake/o flake)
             o-iri (iri/sid->iri oid ns-codes)]
         (-> o-match
-            (match-sid oid alias)
+            (match-sid alias oid)
             (match-iri o-iri)))
       (let [dt-iri (iri/sid->iri dt ns-codes)]
         (match-value o-match (flake/o flake) dt-iri (flake/m flake))))))
