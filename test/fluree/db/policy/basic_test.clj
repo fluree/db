@@ -446,7 +446,6 @@
              "@type"       "http://example.org/Yeti",
              "schema:name" "Leticia",}]
            @(fluree/query db2 {"@context" {"schema" "http://schema.org/"}
-                               :from      ledger-alias
                                :where     '{"@id"         ?s
                                             "schema:name" "?name"}
                                :select    '{?s ["*"]}
