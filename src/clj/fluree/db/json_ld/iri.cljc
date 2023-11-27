@@ -5,7 +5,7 @@
             [clojure.set :refer [map-invert]]))
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
-(def ^:const fdb-256-ns "fluree:db:sha256")
+(def ^:const fdb-256-ns "fluree:db:sha256:")
 (def ^:const f-mem-ns "fluree:memory://")
 (def ^:const f-file-ns "fluree:file://")
 (def ^:const f-ipfs-ns "fluree:ipfs://")

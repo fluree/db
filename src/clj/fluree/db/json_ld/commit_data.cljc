@@ -2,7 +2,6 @@
   (:require [fluree.crypto :as crypto]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.async :refer [<? go-try]]
@@ -410,7 +409,6 @@
   [{:keys [address alias branch data id time v] :as _commit} t db-sid]
   (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data
         t-sid (-> t - iri/fluree-iri iri/iri->sid)]
-
     [;; commit flakes
      ;; address
      (flake/create t-sid const/$_address address const/$xsd:string t true nil)
