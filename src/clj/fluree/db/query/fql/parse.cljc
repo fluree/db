@@ -248,7 +248,9 @@
   [p]
   (if (v/variable? p)
     (parse-variable p)
-    (where/->predicate p)))
+    (if (contains? type-pred-iris p)
+      (where/->predicate const/iri-rdf-type)
+      (where/->predicate p))))
 
 (def id-predicate-match
   (parse-predicate const/iri-id))
