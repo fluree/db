@@ -270,8 +270,7 @@
 
 (defn extra-data-flake?
   [f]
-  (or (= const/$xsd:anyURI (flake/p f))
-      (= const/$rdfs:Class (flake/o f))))
+  (= const/$rdfs:Class (flake/o f)))
 
 (defn commit-t-flakes->json-ld
   "Build a commit maps given a set of all flakes with the same t."

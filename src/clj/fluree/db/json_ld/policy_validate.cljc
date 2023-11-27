@@ -42,8 +42,9 @@
           (let [next-res (<? (query-range/index-range db-root :spot = [last-result next-pid]))
                 ;; in case of mixed data types, take the first IRI result - unless we
                 ;; are at the end of the path in which case take the first value regardless
-                next-val (some #(if (= const/$xsd:anyURI (flake/dt %))
-                                  (flake/o %)) next-res)]
+                next-val (some #(when (= const/$xsd:anyURI (flake/dt %))
+                                  (flake/o %))
+                               next-res)]
             (when (> (count next-res) 1)
               (log/warn (str "f:equals used for identity " ident " and path: " equals-rule
                              " however the query produces more than one result, the first one "

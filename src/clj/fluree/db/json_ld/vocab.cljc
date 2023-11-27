@@ -130,9 +130,6 @@
         with-properties (fnil assoc initial-map)
         with-subclass   (fnil add-subclass initial-map)]
     (cond
-      (= const/$xsd:anyURI pid)
-      (update pred-map sid with-properties :iri obj)
-
       (= const/$rdf:type pid)
       (if (property-sids obj)
         (if (= const/$owl:ObjectProperty obj)

@@ -124,9 +124,7 @@
              subj-mods      {}]
         (if s-flakes
           (let [sid            (flake/s (first s-flakes))
-                new-subject?   (->> s-flakes
-                                    (filter #(= const/$xsd:anyURI (flake/p %)))
-                                    first)
+                new-subject?   (first s-flakes)
                 new-classes    (into #{}
                                      (comp
                                        (filter #(= const/$rdf:type (flake/p %)))
@@ -140,9 +138,7 @@
                 class-shapes   (<? (shacl/class-shapes db-before classes))
                 ;; these target objects in s-flakes
                 pid->ref-flakes (when has-target-objects-of-shapes
-                                  (->> s-flakes
-                                       (filterv #(= const/$xsd:anyURI (flake/dt %)))
-                                       (group-by flake/p)))
+                                  (group-by flake/p s-flakes))
                 o-pred-shapes   (when (seq pid->ref-flakes)
                                   (<? (shacl/targetobject-shapes db-before (keys pid->ref-flakes))))
                 ;; these target subjects in s-flakes

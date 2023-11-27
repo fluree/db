@@ -383,24 +383,6 @@
          (update-in [:stats :size] + flake-size)
          (update-in [:stats :flakes] + flake-count)))))
 
-(def commit-schema-flakes
-  #{(flake/create const/$_previous const/$xsd:anyURI const/iri-previous const/$xsd:string -1 true nil)
-    (flake/create const/$_address const/$xsd:anyURI const/iri-address const/$xsd:string -1 true nil)
-    (flake/create const/$_v const/$xsd:anyURI const/iri-v const/$xsd:string -1 true nil)
-
-    (flake/create const/$_ledger:alias const/$xsd:anyURI const/iri-alias const/$xsd:string -1 true nil)
-    (flake/create const/$_ledger:branch const/$xsd:anyURI const/iri-branch const/$xsd:string -1 true nil)
-    (flake/create const/$_ledger:context const/$xsd:anyURI const/iri-default-context const/$xsd:string -1 true nil)
-
-    (flake/create const/$_commit:signer const/$xsd:anyURI const/iri-issuer const/$xsd:string -1 true nil)
-    (flake/create const/$_commit:message const/$xsd:anyURI const/iri-message const/$xsd:string -1 true nil)
-    (flake/create const/$_commit:time const/$xsd:anyURI const/iri-time const/$xsd:string -1 true nil)
-    (flake/create const/$_commit:data const/$xsd:anyURI const/iri-data const/$xsd:string -1 true nil)
-
-    (flake/create const/$_commitdata:flakes const/$xsd:anyURI const/iri-flakes const/$xsd:string -1 true nil)
-    (flake/create const/$_commitdata:size const/$xsd:anyURI const/iri-size const/$xsd:string -1 true nil)
-    (flake/create const/$_commitdata:t const/$xsd:anyURI const/iri-t const/$xsd:string -1 true nil)})
-
 (defn add-tt-id
   "Associates a unique tt-id for any in-memory staged db in their index roots.
   tt-id is used as part of the caching key, by having this in place it means
@@ -421,13 +403,6 @@
           db indexes)
         (assoc :tt-id tt-id))))
 
-(defn add-commit-schema-flakes
-  [db]
-  (-> db
-      (update-novelty commit-schema-flakes)
-      add-tt-id
-      (update :schema vocab/update-with* -1 commit-schema-flakes)))
-
 (defn commit-metadata-flakes
   "Builds and returns the commit metadata flakes for the given commit, t, and
   db-sid. Used when committing to an in-memory ledger value and when reifying
@@ -435,10 +410,8 @@
   [{:keys [address alias branch data id time v] :as _commit} t db-sid]
   (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data
         t-sid (-> t - iri/fluree-iri iri/iri->sid)]
-    [;; link db to associated commit meta: @id
-     (flake/create t-sid const/$xsd:anyURI id const/$xsd:string t true nil)
 
-     ;; commit flakes
+    [;; commit flakes
      ;; address
      (flake/create t-sid const/$_address address const/$xsd:string t true nil)
      ;; alias
@@ -452,8 +425,6 @@
      (flake/create t-sid const/$_commit:data db-sid const/$xsd:anyURI t true nil)
 
      ;; db flakes
-     ;; @id
-     (flake/create db-sid const/$xsd:anyURI db-id const/$xsd:string t true nil)
      ;; t
      (flake/create db-sid const/$_commitdata:t db-t const/$xsd:int t true nil)
      ;; address
@@ -502,9 +473,7 @@
         ;; create new issuer flake and a reference to it
         (let [new-issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
           [(flake/create t-sid const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
-                         true nil)
-           (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri
-                         const/$xsd:string t true nil)])))))
+                         true nil)])))))
 
 (defn message-flakes
   "Builds and returns the commit message flakes for the given t and message.
@@ -530,8 +499,6 @@
         (let [new-default-ctx-id (iri/iri->sid id (:namespaces db))]
           [(flake/create t-sid const/$_ledger:context new-default-ctx-id
                          const/$xsd:anyURI t true nil)
-           (flake/create new-default-ctx-id const/$xsd:anyURI id const/$xsd:string t
-                         true nil)
            (flake/create new-default-ctx-id const/$_address address
                          const/$xsd:string t true nil)])))))
 
@@ -566,6 +533,5 @@
                                      message-flakes (into message-flakes)
                                      default-ctx-flakes (into default-ctx-flakes))]
       (-> db
-          (cond-> (= 1 db-t) add-commit-schema-flakes)
           (update-novelty commit-flakes)
           add-tt-id))))

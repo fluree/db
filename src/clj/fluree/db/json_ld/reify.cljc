@@ -147,42 +147,30 @@
         acc))))
 
 (defn- assert-v-maps
-  [{:keys [db iri-cache pid existing-pid next-pid sid id k t acc list-members?] :as assert-state} v-maps]
+  [{:keys [db pid sid id t acc list-members?] :as assert-state} v-maps]
   (go-try
     (loop [[v-map & r-v-maps] v-maps
-           acc* acc]
+           acc*               acc]
       (log/trace "assert-v-maps v-map:" v-map)
       (log/trace "assert-v-maps id:" id)
       (let [ref-id (:id v-map)
             meta   (when list-members? {:i (-> v-map :idx last)})
-            acc**
-                   (cond->
-                     (cond
-                       (and ref-id (node? v-map))
-                       (let [existing-sid (<? (get-iri-sid ref-id db iri-cache))
-                             ref-sid      (or existing-sid
-                                              (iri/iri->sid ref-id (:namespaces db)))
-                             new-flake    (flake/create sid pid ref-sid
-                                                        const/$xsd:anyURI t true meta)]
-                         (log/trace "creating ref flake:" new-flake)
-                         (cond-> (conj acc* new-flake)
-                                 (nil? existing-sid) (conj
-                                                       (flake/create ref-sid const/$xsd:anyURI
-                                                                     ref-id
-                                                                     const/$xsd:string
-                                                                     t true nil))))
-                       (list-value? v-map)
-                       (let [list-vals (:list v-map)]
-                         (<? (assert-v-maps (assoc assert-state :list-members? true) list-vals)))
+            acc**  (cond
+                     (and ref-id (node? v-map))
+                     (let [ref-sid   (iri/iri->sid ref-id (:namespaces db))
+                           new-flake (flake/create sid pid ref-sid
+                                                   const/$xsd:anyURI t true meta)]
+                       (log/trace "creating ref flake:" new-flake)
+                       (conj acc* new-flake))
+                     (list-value? v-map)
+                     (let [list-vals (:list v-map)]
+                       (<? (assert-v-maps (assoc assert-state :list-members? true) list-vals)))
 
-                       :else (let [[value dt] (datatype/from-expanded v-map nil)
-                                   new-flake (flake/create sid pid value dt t true meta)]
-                               (log/trace "creating value flake:" new-flake)
-                               (conj acc* new-flake)))
-
-                     (nil? existing-pid) (conj (flake/create pid const/$xsd:anyURI k
-                                                             const/$xsd:string t true
-                                                             nil)))]
+                     :else
+                     (let [[value dt] (datatype/from-expanded v-map nil)
+                           new-flake  (flake/create sid pid value dt t true meta)]
+                       (log/trace "creating value flake:" new-flake)
+                       (conj acc* new-flake)))]
         (if (seq r-v-maps)
           (recur r-v-maps acc**)
           acc**)))))
@@ -221,9 +209,7 @@
                                 (jld-ledger/generate-new-pid type-item iri-cache
                                                              next-pid nil nil))
                 type-flakes (when-not existing-id
-                              [(flake/create type-id const/$xsd:anyURI type-item
-                                             const/$xsd:string t true nil)
-                               (flake/create type-id const/$rdf:type
+                              [(flake/create type-id const/$rdf:type
                                              const/$rdfs:Class const/$xsd:anyURI
                                              t true nil)])]
             (recur r (cond-> (conj acc
@@ -246,12 +232,8 @@
           type-assertions (if (seq type)
                             (<? (get-type-assertions assert-state type))
                             [])
-          base-flakes     (if existing-sid
-                            type-assertions
-                            (conj type-assertions
-                                  (flake/create sid const/$xsd:anyURI id
-                                                const/$xsd:string t true nil)))
-          assert-state*   (assoc assert-state :base-flakes base-flakes)]
+          base-flakes      type-assertions
+          assert-state*    (assoc assert-state :base-flakes base-flakes)]
       (<? (assert-node* assert-state* node)))))
 
 (defn assert-flakes
@@ -453,9 +435,7 @@
                                    message-flakes
                                    (into message-flakes)
                                    default-ctx-flakes
-                                   (into default-ctx-flakes)
-                                   (= -1 t-new)
-                                   (into commit-data/commit-schema-flakes)))
+                                   (into default-ctx-flakes)))
           ecount*            (assoc ecount
                                     const/$_predicate pid
                                     const/$_default sid)]

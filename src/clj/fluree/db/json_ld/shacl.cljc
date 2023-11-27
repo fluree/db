@@ -544,8 +544,6 @@
    (fn [acc property-flake]
      (let [o (flake/o property-flake)]
        (condp = (flake/p property-flake)
-         const/$xsd:anyURI
-         (assoc acc :id o)
          const/$sh:path
          (update acc :path (fnil conj []) o)
 
@@ -754,19 +752,12 @@
     (assoc p-shape :pattern #?(:clj  (Pattern/compile pattern (or valid-flags 0))
                                :cljs (js/RegExp. pattern (or valid-flags ""))))))
 
-(defn non-iri-flake?
-  [f]
-  (-> f
-      flake/p
-      (not= const/$xsd:anyURI)))
-
 (defn resolve-path-type
   "Associate each property path object with its path type in order to govern path flake resolution during validation."
   [db path-pid]
   (go-try
     (if-let [path-flake (->> (<? (query-range/index-range db :spot = [path-pid]
-                                                          {:flake-xf    (filter non-iri-flake?)
-                                                           :flake-limit 1}))
+                                                          {:flake-limit 1}))
                              first)]
       (let [o (flake/o path-flake)
             p (flake/p path-flake)]
@@ -811,9 +802,6 @@
                   p-shape (<? (build-property-shape db p p-shape-flakes))]
               (recur r' shape (conj p-shapes p-shape)))
             (let [shape* (condp = p
-                           const/$xsd:anyURI
-                           (assoc shape :id o)
-
                            const/$sh:targetClass
                            (assoc shape :target-class o)
 
@@ -821,10 +809,6 @@
                            (if (true? o)
                              (assoc shape :closed? true)
                              shape)
-
-                           const/$sh:ignoredProperties
-                           (update shape :ignored-properties
-                                   (fnil conj #{const/$xsd:anyURI}) o)
 
                            ;; else
                            shape)]

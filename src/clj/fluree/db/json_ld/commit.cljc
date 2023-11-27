@@ -108,23 +108,15 @@
         (if s-flakes
           (let [sid            (flake/s (first s-flakes))
                 s-iri          (get-s-iri sid db compact-fn)
-                non-iri-flakes (remove #(= const/$xsd:anyURI (flake/p %)) s-flakes)
                 [assert* retract*]
-                (cond
-                  ;; just an IRI declaration, used internally - nothing to output
-                  (empty? non-iri-flakes)
-                  [assert retract]
-
+                (if (and (= 1 (count s-flakes))
+                         (= const/$rdfs:Class (->> s-flakes first flake/o))
+                         (= const/$rdf:type (->> s-flakes first flake/p)))
                   ;; we don't output auto-generated rdfs:Class definitions for classes
                   ;; (they are implied when used in rdf:type statements)
-                  (and (= 1 (count non-iri-flakes))
-                       (= const/$rdfs:Class (-> non-iri-flakes first flake/o))
-                       (= const/$rdf:type (-> non-iri-flakes first flake/p)))
                   [assert retract]
-
-                  :else
                   (let [{assert-flakes  true,
-                         retract-flakes false} (group-by flake/op non-iri-flakes)
+                         retract-flakes false} (group-by flake/op s-flakes)
                         s-assert  (when assert-flakes
                                     (-> (<? (subject-block assert-flakes db
                                                            id->iri ctx compact-fn))
