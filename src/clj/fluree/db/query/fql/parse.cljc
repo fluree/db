@@ -615,23 +615,31 @@
 
 (defn parse-pred-cmp
   [subj-cmp triples [pred values]]
-  (let [values*  (cond (= pred :type)
-                       ;; homogenize @type values so they have the same structure as other predicates
-                       (map #(do {:id %}) values)
+  (cond
+    (v/variable? pred)
+    (let [pred-cmp (parse-variable pred)]
+      (reduce (partial parse-obj-cmp subj-cmp pred-cmp nil)
+              triples
+              values))
 
-                       (= pred const/iri-rdf-type)
-                       (throw (ex-info (str (pr-str const/iri-rdf-type) " is not a valid predicate IRI."
-                                            " Please use the JSON-LD \"@type\" keyword instead.")
-                                       {:status 400 :error :db/invalid-predicate}))
-                       :else
-                       values)
-        pred-cmp (cond (v/variable? pred) (parse-variable pred)
-                       ;; we want the actual iri here, not the keyword
-                       (= pred :type)     (where/match-iri const/iri-type)
-                       :else              (where/match-iri pred))]
-    (reduce (partial parse-obj-cmp subj-cmp pred-cmp nil)
-            triples
-            values*)))
+    (= pred const/iri-rdf-type)
+    (throw (ex-info (str (pr-str const/iri-rdf-type) " is not a valid predicate IRI."
+                         " Please use the JSON-LD \"@type\" keyword instead.")
+                    {:status 400 :error :db/invalid-predicate}))
+
+    (= :type pred)
+    (let [values*  (map (fn [typ] {:id typ})
+                        values)
+          pred-cmp (where/match-iri const/iri-rdf-type)]
+      (reduce (partial parse-obj-cmp subj-cmp pred-cmp nil)
+              triples
+              values*))
+
+    :else
+    (let [pred-cmp (where/match-iri pred)]
+      (reduce (partial parse-obj-cmp subj-cmp pred-cmp nil)
+              triples
+              values))))
 
 (defn parse-subj-cmp
   [triples {:keys [id] :as node}]
