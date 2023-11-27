@@ -392,7 +392,7 @@
                                 :opts {:role "ex:userRole"
                                        :did alice-did}}))))))
 
-(deftest ^:pending ^:integration identity-equals-test
+(deftest ^:integration identity-equals-test
   (let [conn         @(fluree/connect {:method :memory})
         context      {"ex"     "http://example.org/"
                       "schema" "http://schema.org/"
