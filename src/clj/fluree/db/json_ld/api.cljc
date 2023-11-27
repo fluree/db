@@ -4,6 +4,7 @@
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
             [fluree.db.conn.remote :as remote-conn]
+            [fluree.json-ld :as json-ld]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.constants :as const]
@@ -302,7 +303,9 @@
   Returns promise"
   [db identity-map]
   (promise-wrap
-    (perm/wrap-policy db identity-map)))
+   (->> identity-map
+        perm/policy-identity
+        (perm/wrap-policy db))))
 
 
 (defn query

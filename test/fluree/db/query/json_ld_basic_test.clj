@@ -337,12 +337,12 @@
           alias  "faux-compact-iri-query"
           ledger @(fluree/create conn alias)
           db0    @(fluree/stage (fluree/db ledger)
-                                {"@context" "https://ns.flur.ee"
-                                 "insert"
-                                 [{"id"      "foo"
-                                   "ex:name" "Foo"}
-                                  {"id"      "foaf:bar"
-                                   "ex:name" "Bar"}]})
+                                 {"@context" "https://ns.flur.ee"
+                                  "insert"
+                                  [{"id"      "foo"
+                                    "ex:name" "Foo"}
+                                   {"id"      "foaf:bar"
+                                    "ex:name" "Bar"}]})
           _      @(fluree/commit! ledger db0)
           db1    (->> alias (fluree/load conn) deref fluree/db)]
 

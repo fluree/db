@@ -10,7 +10,6 @@
             [fluree.db.util.async :refer [<? go-try]]
             #?(:clj  [clojure.core.async :refer [go] :as async]
                :cljs [cljs.core.async :refer [go] :as async])
-            [clojure.string :as str]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.branch :as branch]
@@ -111,40 +110,6 @@
   (cond->> (get-in schema [:pred predicate property])
            (= :restrictCollection property) (dbproto/-c-prop this :partition)))
 
-(defn- jsonld-tag
-  "resolves a tags's value given a tag subject id; optionally shortening the
-  return value if it starts with the given predicate name"
-  ([this tag-id]
-   (go-try
-     (let [tag-pred-id 30]
-       (some-> (<? (query-range/index-range (dbproto/-rootdb this)
-                                            :spot = [tag-id tag-pred-id]))
-               first
-               flake/o))))
-  ([this tag-id pred]
-   (go-try
-     (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))
-           tag       (<? (dbproto/-tag this tag-id))]
-       (when (and pred-name tag)
-         (if (str/includes? tag ":")
-           (-> (str/split tag #":") second)
-           tag))))))
-
-(defn- jsonld-tag-id
-  ([this tag-name]
-   (go-try
-     (let [tag-pred-id const/$_tag:id]
-       (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
-               first
-               flake/s))))
-  ([this tag-name pred]
-   (go-try
-     (if (str/includes? tag-name "/")
-       (<? (dbproto/-tag-id this tag-name))
-       (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))]
-         (when pred-name
-           (<? (dbproto/-tag-id this (str pred-name ":" tag-name)))))))))
-
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
@@ -190,10 +155,6 @@
   (-p-prop [this property predicate] (jsonld-p-prop this property predicate))
   (-expand-iri [this compact-iri] (expand-iri this compact-iri))
   (-expand-iri [this compact-iri context] (expand-iri this compact-iri context))
-  (-tag [this tag-id] (jsonld-tag this tag-id))
-  (-tag [this tag-id pred] (jsonld-tag this tag-id pred))
-  (-tag-id [this tag-name] (jsonld-tag-id this tag-name))
-  (-tag-id [this tag-name pred] (jsonld-tag-id this tag-name pred))
   (-subid [this ident] (subid this ident {:strict? false :expand? true}))
   (-subid [this ident opts] (subid this ident opts))
   (-class-ids [this subject] (class-ids this subject))
