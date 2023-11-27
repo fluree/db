@@ -27,8 +27,8 @@
    "http://www.w3.org/ns/shacl#"                 5
    "http://www.w3.org/2002/07/owl#"              6
    "http://www.w3.org/2008/05/skos#"             7
-   "http://xmlns.com/foaf/0.1/"                  8
-   "http://schema.org/"                          0
+   "http://schema.org/"                          8
+   "http://xmlns.com/foaf/0.1/"                  9
    "https://www.wikidata.org/wiki/"              10
    "urn:uuid"                                    11
    "urn:isbn:"                                   12
@@ -68,25 +68,9 @@
         (decompose-by-char iri \: length)
         [nil iri])))
 
-(defn namespace->code
-  [db iri-ns]
-  (or (get default-namespaces iri-ns)
-      (-> db :namespaces (get iri-ns))))
-
-(defn code->namespace
-  [db ns-code]
-  (or (get default-namespace-codes ns-code)
-      (-> db :namespaces-codes (get ns-code))))
-
 (def name-code-xf
   (comp (partition-all 8)
         (map bytes/UTF8->long)))
-
-(defn name->codes
-  [nme]
-  (into []
-        name-code-xf
-        (bytes/string->UTF8 nme)))
 
 (defn append-name-codes
   [ns-sid nme]
@@ -107,12 +91,6 @@
 (defn get-name-codes
   [sid]
   (subvec sid 1))
-
-(defn get-namespace
-  [db sid]
-  (-> sid
-      get-ns-code
-      (as-> ns-code (code->namespace db ns-code))))
 
 (defn get-name
   [sid]
