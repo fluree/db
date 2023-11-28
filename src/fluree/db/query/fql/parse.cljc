@@ -244,15 +244,22 @@
     (parse-iri id context)))
 
 (defn parse-predicate
-  [p]
+  [p context]
   (if (v/variable? p)
     (parse-variable p)
-    (where/->predicate p)))
+    (let [[expanded {reverse :reverse}] (json-ld/details p context)]
+      (where/->predicate expanded reverse))))
 
 (def id-predicate-match
-  (parse-predicate const/iri-id))
+  (parse-predicate const/iri-id nil))
 
 (declare parse-statement parse-statements)
+
+(defn flip-reverse-pattern
+  [[s-mch p-mch o-mch :as pattern]]
+  (if (::where/reverse p-mch)
+    [o-mch p-mch s-mch]
+    pattern))
 
 (defn parse-object-map
   [s-mch p-mch o context]
@@ -268,7 +275,7 @@
             o-attrs (dissoc id-map const/iri-id)]
         ;; return a thunk wrapping the recursive call to preserve stack
         ;; space by delaying execution
-        #(into [[s-mch p-mch o-mch]]
+        #(into [(flip-reverse-pattern [s-mch p-mch o-mch])]
                (parse-statements o-mch o-attrs context))))))
 
 (defn parse-statement*
@@ -276,7 +283,7 @@
   (cond
     (v/variable? o)
     (let [o-mch (parse-variable o)]
-      [[s-mch p-mch o-mch]])
+      [(flip-reverse-pattern [s-mch p-mch o-mch])])
 
     (map? o)
     (parse-object-map s-mch p-mch o context)
@@ -288,11 +295,11 @@
 
     (type-pred-match? p-mch)
     (let [class-ref (parse-class o context)]
-      [(where/->pattern :class [s-mch p-mch class-ref])])
+      [(flip-reverse-pattern (where/->pattern :class [s-mch p-mch class-ref]))])
 
     :else
     (let [o-mch (where/anonymous-value o)]
-      [[s-mch p-mch o-mch]])))
+      [(flip-reverse-pattern [s-mch p-mch o-mch])])))
 
 (defn parse-statement
   [s-mch p-mch o context]
@@ -301,7 +308,7 @@
 (defn parse-statements*
   [s-mch attrs context]
   #(mapcat (fn [[p o]]
-             (let [p-mch (parse-predicate p)]
+             (let [p-mch (parse-predicate p context)]
                (parse-statement s-mch p-mch o context)))
            attrs))
 
@@ -323,7 +330,6 @@
 (defn parse-node-map
   [m context]
   (-> m
-      (expand-keys context)
       with-id
       (parse-id-map-pattern context)))
 

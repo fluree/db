@@ -45,3 +45,51 @@
                                  :selectOne {:ex/brian [:schema/name {:friended [:*]}]}})
                  deref
                  (update-in [:friended :ex/friend] set)))))))
+
+(deftest ^:integration reverse-preds-in-where-and-select
+  (let [conn   @(fluree/connect {:method :memory})
+        ledger @(fluree/create conn "reverse")
+        db0    (fluree/db ledger)
+
+        db1    @(fluree/stage db0 {"insert" [{"@id" "ex:dad"
+                                              "@type" "ex:Person"
+                                              "ex:name" "Dad"
+                                              "ex:child" {"@id" "ex:kid"}}
+                                             {"@id" "ex:mom"
+                                              "@type" "ex:Person"
+                                              "ex:name" "Mom"
+                                              "ex:child" {"@id" "ex:kid"}}
+                                             {"@id" "ex:kid"
+                                              "@type" "ex:Person"
+                                              "ex:name" "Kiddo"}
+                                             {"@id" "ex:school"
+                                              "@type" "ex:Organization"
+                                              "ex:student" "ex:kid"}]})]
+    (testing "select clause"
+      (is (= {"@id" "ex:kid",
+              "@type" "ex:Person"
+              "ex:name" "Kiddo",
+              "parent"
+              #{{"@id" "ex:mom", "ex:name" "Mom", "@type" "ex:Person" "ex:child" {"@id" "ex:kid"}}
+                {"@id" "ex:dad", "ex:name" "Dad", "@type" "ex:Person" "ex:child" {"@id" "ex:kid"}}}}
+             (-> @(fluree/query db1 {"@context" {"parent" {"@reverse" "ex:child"}}
+                                     "select" {"ex:kid" ["*" {"parent" ["*"]}]}})
+                 (first)
+                 (update "parent" set)))))
+    (testing "where clause"
+      (is (= [{"@id" "ex:kid"
+               "@type" "ex:Person"
+               "ex:name" "Kiddo"}]
+             @(fluree/query db1 {"@context" {"parent" {"@reverse" "ex:child"}}
+                                 "where" {"@id" "?s" "parent" "?x"}
+                                 "selectDistinct" {"?s" ["*"]}}))))
+
+    (testing "@type reverse"
+      (is (= #{"ex:Person" "ex:Organization"}
+             (set @(fluree/query db1 {"@context" {"isTypeObject" {"@reverse" "@type"}}
+                                      "where" {"@id" "?class" "isTypeObject" "?x"}
+                                      "selectDistinct" "?class"})))))
+    (testing "@type "
+      (is (= #{"ex:Person" "ex:Organization"}
+             (set @(fluree/query db1 {"where" {"@id" "?x" "@type" "?class"}
+                                      "selectDistinct" "?class"})))))))
