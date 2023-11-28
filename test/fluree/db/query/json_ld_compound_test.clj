@@ -152,8 +152,7 @@
 
 
       ;; checking s, p, o values all pulled correctly and all IRIs are resolved from sid integer & compacted
-      (is (= #{[:ex/cam :id "http://example.org/ns/cam"]
-               [:ex/cam :type :ex/User]
+      (is (= #{[:ex/cam :type :ex/User]
                [:ex/cam :schema/name "Cam"]
                [:ex/cam :schema/email "cam@example.org"]
                [:ex/cam :schema/age 34]
