@@ -68,87 +68,99 @@
             (recur r (assoc acc as result)))
           acc)))))
 
+(defn includes-id?
+  [{:keys [wildcard?] :as select-spec}]
+  (or wildcard?
+      (contains? select-spec const/iri-id)))
+
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
   [db cache context compact-fn fuel-vol max-fuel {:keys [wildcard? _id? depth reverse] :as select-spec} depth-i s-flakes]
   (go-try
     (when (not-empty s-flakes)
-      (loop [[p-flakes & r] (partition-by flake/p s-flakes)
-             acc            (if _id?
-                              {:_id (flake/s (first s-flakes))}
-                              {})]
-        (if p-flakes
-          (let [ff    (first p-flakes)
-                p     (flake/p ff)
-                iri   (iri/sid->iri p (:namespace-codes db))
-                list? (contains? (flake/m ff) :i)
-                spec  (or (get select-spec iri)
-                          (when wildcard?
-                            (or (get @cache iri)
-                                (wildcard-spec db cache compact-fn p)
-                                (<? (cache-sid->iri db cache compact-fn p)))))
-                p-iri (:as spec)
-                v     (cond
-                        (nil? spec)
-                        nil
+      (let [sid (->> s-flakes first flake/s)
+            iri (-> sid
+                    (iri/sid->iri (:namespace-codes db))
+                    compact-fn)]
+        (loop [[p-flakes & r] (partition-by flake/p s-flakes)
+               acc            (cond-> {}
+                                _id?
+                                (assoc :_id sid)
 
-                        ;; flake's .-o value is an IRI string, JSON-LD compact it before returning
-                        (iri? p)
-                        (-> p-flakes first flake/o compact-fn)
+                                (includes-id? select-spec)
+                                (assoc (compact-fn const/iri-id) iri))]
+          (if p-flakes
+            (let [ff    (first p-flakes)
+                  p     (flake/p ff)
+                  iri   (iri/sid->iri p (:namespace-codes db))
+                  list? (contains? (flake/m ff) :i)
+                  spec  (or (get select-spec iri)
+                            (when wildcard?
+                              (or (get @cache iri)
+                                  (wildcard-spec db cache compact-fn p)
+                                  (<? (cache-sid->iri db cache compact-fn p)))))
+                  p-iri (:as spec)
+                  v     (cond
+                          (nil? spec)
+                          nil
 
-                        ;; flake's .-o value is a rdf:type, resolve subject id to IRI then JSON-LD compact it
-                        (rdf-type? p)
-                        (loop [[type-id & rest-types] (map flake/o p-flakes)
-                               acc                    []]
-                          (if type-id
-                            (recur rest-types
-                                   (conj acc (:as (or (get @cache type-id)
-                                                      (<? (cache-sid->iri db cache compact-fn type-id))))))
-                            (if (= 1 (count acc))
-                              (first acc)
-                              acc)))
+                          ;; flake's .-o value is an IRI string, JSON-LD compact it before returning
+                          (iri? p)
+                          (-> p-flakes first flake/o compact-fn)
 
-                        :else ;; display all values
-                        (loop [[f & r] (if list?
-                                         (sort-by #(:i (flake/m %)) p-flakes)
-                                         p-flakes)
-                               acc     []]
-                          (if f
-                            (let [res (cond
-                                        (= const/$xsd:anyURI (flake/dt f))
-                                        (cond
-                                          ;; have a specified sub-selection (graph crawl)
-                                          (:spec spec)
-                                          (<? (crawl-ref-item db context compact-fn (flake/o f) (:spec spec) cache fuel-vol max-fuel (inc depth-i)))
+                          ;; flake's .-o value is a rdf:type, resolve subject id to IRI then JSON-LD compact it
+                          (rdf-type? p)
+                          (loop [[type-id & rest-types] (map flake/o p-flakes)
+                                 acc                    []]
+                            (if type-id
+                              (recur rest-types
+                                     (conj acc (:as (or (get @cache type-id)
+                                                        (<? (cache-sid->iri db cache compact-fn type-id))))))
+                              (if (= 1 (count acc))
+                                (first acc)
+                                acc)))
 
-                                          ;; requested graph crawl depth has not yet been reached
-                                          (< depth-i depth)
-                                          (<? (crawl-ref-item db context compact-fn (flake/o f) select-spec cache fuel-vol max-fuel (inc depth-i)))
+                          :else ;; display all values
+                          (loop [[f & r] (if list?
+                                           (sort-by #(:i (flake/m %)) p-flakes)
+                                           p-flakes)
+                                 acc     []]
+                            (if f
+                              (let [res (cond
+                                          (= const/$xsd:anyURI (flake/dt f))
+                                          (cond
+                                            ;; have a specified sub-selection (graph crawl)
+                                            (:spec spec)
+                                            (<? (crawl-ref-item db context compact-fn (flake/o f) (:spec spec) cache fuel-vol max-fuel (inc depth-i)))
 
-                                          ;; no sub-selection, just return {@id <iri>} for each ref iri
+                                            ;; requested graph crawl depth has not yet been reached
+                                            (< depth-i depth)
+                                            (<? (crawl-ref-item db context compact-fn (flake/o f) select-spec cache fuel-vol max-fuel (inc depth-i)))
+
+                                            ;; no sub-selection, just return {@id <iri>} for each ref iri
+                                            :else
+                                            ;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
+                                            (let [id-key   (:as (or (get @cache const/$id)
+                                                                    (wildcard-spec db cache compact-fn const/$id)
+                                                                    (<? (cache-sid->iri db cache compact-fn const/$id))))
+                                                  ns-codes (:namespace-codes db)
+                                                  c-iri    (-> f flake/o (iri/sid->iri ns-codes) compact-fn)]
+                                              {id-key c-iri}))
+
+                                          (= const/$rdf:json (flake/dt f))
+                                          (json/parse (flake/o f) false)
+
                                           :else
-                                          ;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
-                                          (let [id-key   (:as (or (get @cache const/$id)
-                                                                  (wildcard-spec db cache compact-fn const/$id)
-                                                                  (<? (cache-sid->iri db cache compact-fn const/$id))))
-                                                ns-codes (:namespace-codes db)
-                                                c-iri    (-> f flake/o (iri/sid->iri ns-codes) compact-fn)]
-                                            {id-key c-iri}))
-
-                                        (= const/$rdf:json (flake/dt f))
-                                        (json/parse (flake/o f) false)
-
-                                        :else
-                                        (flake/o f))]
-                              (recur r (conj acc res)))
-                            (if (and (= 1 (count acc))
-                                     (not (#{:list :set} (-> context (get p-iri) :container))))
-                              (first acc)
-                              acc))))]
-            (if (some? v)
-              (recur r (assoc acc p-iri v))
-              (recur r acc)))
-          (if reverse
-            (merge acc (<? (add-reverse-specs db cache context compact-fn fuel-vol max-fuel select-spec depth-i s-flakes)))
-            acc))))))
+                                          (flake/o f))]
+                                (recur r (conj acc res)))
+                              (if (and (= 1 (count acc))
+                                       (not (#{:list :set} (-> context (get p-iri) :container))))
+                                (first acc)
+                                acc))))]
+              (if (some? v)
+                (recur r (assoc acc p-iri v))
+                (recur r acc)))
+            (if reverse
+              (merge acc (<? (add-reverse-specs db cache context compact-fn fuel-vol max-fuel select-spec depth-i s-flakes)))
+              acc)))))))
