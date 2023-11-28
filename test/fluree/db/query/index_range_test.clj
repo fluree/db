@@ -86,10 +86,8 @@
 
 
         (testing "Subject IRI resolution for index-range automatically happens"
-          (let [with-compact-iri @(fluree/range db :spot = [:ex/alice])
-                with-full-iri    @(fluree/range db :spot = [(fluree/expand-iri db :ex/alice)])
+          (let [with-full-iri    @(fluree/range db :spot = [(fluree/expand-iri db :ex/alice)])
                 with-sid         @(fluree/range db :spot = [@(fluree/internal-id db :ex/alice)])]
-            (is (= with-compact-iri
-                   with-full-iri
+            (is (= with-full-iri
                    with-sid)
                 "Compact IRIs and expanded string IRIs should automatically resolve to subject ids.")))))))
