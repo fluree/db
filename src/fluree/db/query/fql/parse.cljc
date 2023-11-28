@@ -131,25 +131,6 @@
         f    (eval/compile code false)]
     (where/->var-filter var-name f)))
 
-(def ^:const default-recursion-depth 100)
-
-(defn recursion-predicate
-  "A predicate that ends in a '+', or a '+' with some integer afterwards is a recursion
-  predicate. e.g.: person/follows+3
-
-  Returns a two-tuple of predicate followed by # of times to recur.
-
-  If not a recursion predicate, returns nil."
-  [predicate context]
-  (when (or (string? predicate)
-            (keyword? predicate))
-    (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" (name predicate))]
-      [(json-ld/expand (keyword (namespace predicate) pred)
-                       context)
-       (if recur-n
-         (util/str->int recur-n)
-         default-recursion-depth)])))
-
 (defn parse-iri
   [x context]
   (-> x
