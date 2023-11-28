@@ -1,6 +1,7 @@
 (ns fluree.db.query.subject-crawl.reparse
   (:require [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             #?(:clj [fluree.db.query.exec.select]
                :cljs [fluree.db.query.exec.select :refer [SubgraphSelector]])
@@ -127,7 +128,11 @@
     {:type type
      :s (reparse-subject-component s)
      :p (reparse-predicate-component db p)
-     :o (assoc (reparse-component o) :datatype (where/get-datatype-sid o (:alias db)))}))
+     :o (-> o
+            reparse-component
+            (assoc :datatype (-> o
+                                 where/get-datatype-iri
+                                 (iri/iri->sid (:namespaces db)))))}))
 
 (defn simple-subject-merge-where
   "Revises where clause for simple-subject-crawl query to optimize processing.
