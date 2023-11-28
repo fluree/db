@@ -5,7 +5,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
-            [fluree.db.util.schema :as schema-util]))
+            [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -152,7 +152,7 @@
   [pred-map vocab-flakes]
   (let [new-pred-map  (reduce update-pred-map pred-map vocab-flakes)]
     (reduce-kv (fn [preds k v]
-                 (if (number? k)
+                 (if (iri/sid? k)
                    (assoc preds k v, (:iri v) v)
                    preds))
                {"@type" {:iri  "@type"
