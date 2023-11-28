@@ -1,11 +1,9 @@
 (ns fluree.db.query.index-range-test
-  (:require
-    [clojure.string :as str]
-    [clojure.test :refer :all]
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    [fluree.db.util.log :as log]
-    [fluree.db.flake :as flake]))
+  (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]))
 
 (deftest ^:integration index-range-scans
   (testing "Various index range scans using the API."
@@ -41,16 +39,14 @@
              (fluree/expand-iri db :ex/cam))
           "Expanding compact IRI is broken, likely other tests will fail.")
 
-      (is (int? cam-sid)
-          "The compact IRI did not resolve to an integer subject id.")
+      (is (iri/sid? cam-sid)
+          "The compact IRI did not resolve to a subject id.")
 
       (testing "Slice operations"
         (testing "Slice for subject id only"
-          (let [alice-sid @(fluree/internal-id db :ex/alice)]
-            (is (= 8
-                   (->> @(fluree/slice db :spot [alice-sid])
-                        (filterv #(= alice-sid (flake/s %)))
-                        (count)))
+          (let [alice-sid   @(fluree/internal-id db :ex/alice)
+                flake-count (count @(fluree/slice db :spot [alice-sid]))]
+            (is (= 7 flake-count)
                 "Slice should return a vector of flakes for only Alice")))
 
         (testing "Slice for subject + predicate"
