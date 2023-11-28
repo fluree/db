@@ -3,7 +3,8 @@
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.iri :as iri]))
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.constants :as const]))
 
 (deftest ^:integration index-range-scans
   (testing "Various index range scans using the API."
@@ -52,35 +53,35 @@
         (testing "Slice for subject + predicate"
           (let [alice-sid   @(fluree/internal-id db :ex/alice)
                 favNums-pid @(fluree/internal-id db :ex/favNums)]
-            (is (= [[alice-sid favNums-pid 9 8 -1 true nil]
-                    [alice-sid favNums-pid 42 8 -1 true nil]
-                    [alice-sid favNums-pid 76 8 -1 true nil]]
+            (is (= [[alice-sid favNums-pid 9 const/$xsd:long -1 true nil]
+                    [alice-sid favNums-pid 42 const/$xsd:long -1 true nil]
+                    [alice-sid favNums-pid 76 const/$xsd:long -1 true nil]]
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid])
-                        (mapv flake/Flake->parts)))
+                        (map flake/Flake->parts)))
                 "Slice should only return Alice's favNums (multi-cardinality)")))
 
         (testing "Slice for subject + predicate + value"
           (let [alice-sid   @(fluree/internal-id db :ex/alice)
                 favNums-pid @(fluree/internal-id db :ex/favNums)]
-            (is (= [[alice-sid favNums-pid 42 8 -1 true nil]]
+            (is (= [[alice-sid favNums-pid 42 const/$xsd:long -1 true nil]]
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid 42])
-                        (mapv flake/Flake->parts)))
+                        (map flake/Flake->parts)))
                 "Slice should only return the specified favNum value")))
 
         (testing "Slice for subject + predicate + value + datatype"
           (let [alice-sid   @(fluree/internal-id db :ex/alice)
                 favNums-pid @(fluree/internal-id db :ex/favNums)]
-            (is (= [[alice-sid favNums-pid 42 8 -1 true nil]]
-                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 8]])
-                        (mapv flake/Flake->parts)))
+            (is (= [[alice-sid favNums-pid 42 const/$xsd:long -1 true nil]]
+                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 const/$xsd:long]])
+                        (map flake/Flake->parts)))
                 "Slice should only return the specified favNum value with matching datatype")))
 
         (testing "Slice for subject + predicate + value + mismatch datatype"
           (let [alice-sid   @(fluree/internal-id db :ex/alice)
                 favNums-pid @(fluree/internal-id db :ex/favNums)]
             (is (= []
-                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 7]])
-                        (mapv flake/Flake->parts)))
+                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 const/$xsd:boolean]])
+                        (map flake/Flake->parts)))
                 "We specify a different datatype for the value, nothing should be returned")))
 
 
