@@ -47,18 +47,18 @@
 
       (is (= two-tuple-select-with-crawl
              two-tuple-select-with-crawl+var
-             [[50 {:id           :ex/brian,
-                   :type     :ex/User,
-                   :schema/name  "Brian",
-                   :schema/email "brian@example.org",
-                   :schema/age   50,
-                   :ex/favNums   7}]
-              [50 {:id           :ex/alice,
-                   :type     :ex/User,
+             [[50 {:id           :ex/alice,
+                   :type         :ex/User,
                    :schema/name  "Alice",
                    :schema/email "alice@example.org",
                    :schema/age   50,
-                   :ex/favNums   [9, 42, 76]}]]))
+                   :ex/favNums   [9, 42, 76]}]
+              [50 {:id           :ex/brian,
+                   :type         :ex/User,
+                   :schema/name  "Brian",
+                   :schema/email "brian@example.org",
+                   :schema/age   50,
+                   :ex/favNums   7}]]))
 
       ;; here we have pass-through variables (?name and ?age) which must get "passed through"
       ;; the last where statements into the select statement
@@ -69,8 +69,8 @@
                                            :ex/friend   {:schema/name  ?name
                                                          :schema/age   ?age
                                                          :schema/email ?email}}})
-             [["Brian" 50 "brian@example.org"]
-              ["Alice" 50 "alice@example.org"]])
+             [["Alice" 50 "alice@example.org"]
+              ["Brian" 50 "brian@example.org"]])
           "Prior where statement variables may not be passing through to select results")
 
       ;; same as prior query, but using selectOne
@@ -81,7 +81,7 @@
                                              :ex/friend   {:schema/name  ?name
                                                            :schema/age   ?age
                                                            :schema/email ?email}}})
-             ["Brian" 50 "brian@example.org"])
+             ["Alice" 50 "alice@example.org"])
           "selectOne should only return a single result, like (first ...)")
 
       ;; if mixing multi-cardinality results along with single cardinality, there
@@ -176,18 +176,18 @@
                :schema/age 34,
                :ex/favNums [5 10],
                :ex/friend
-               [{:id :ex/brian,
-                 :type :ex/User,
-                 :schema/name "Brian",
-                 :schema/email "brian@example.org",
-                 :schema/age 50,
-                 :ex/favNums 7}
-                {:id :ex/alice,
+               [{:id :ex/alice,
                  :type :ex/User,
                  :schema/name "Alice",
                  :schema/email "alice@example.org",
                  :schema/age 50,
-                 :ex/favNums [9 42 76]}]}]
+                 :ex/favNums [9 42 76]}
+                {:id :ex/brian,
+                 :type :ex/User,
+                 :schema/name "Brian",
+                 :schema/email "brian@example.org",
+                 :schema/age 50,
+                 :ex/favNums 7}]}]
              @(fluree/query db
                             '{:select {?s ["*" {:ex/friend ["*"]}]}
                               :where  {:id        ?s
