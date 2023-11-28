@@ -14,15 +14,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn- pred-id-strict
-  "Will throw if predicate doesn't exist."
-  [db p]
-  (when p
-    (or (dbproto/-p-prop db :id p)
-        (throw (ex-info (str "Invalid predicate, does not exist: " p)
-                        {:status 400, :error :db/invalid-predicate})))))
-
-
 (defn- coerce-predicate
   "If a predicate is provided as a string value, coerce to pid"
   [db pred]

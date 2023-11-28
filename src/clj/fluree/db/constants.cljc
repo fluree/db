@@ -36,6 +36,7 @@
 (def ^:const iri-updates (fluree-iri "updates"))
 (def ^:const iri-default-context (fluree-iri "defaultContext"))
 (def ^:const iri-ContextClass (fluree-iri "Context"))
+(def ^:const iri-context (fluree-iri "context"))
 (def ^:const iri-allow (fluree-iri "allow"))
 (def ^:const iri-equals (fluree-iri "equals"))
 (def ^:const iri-contains (fluree-iri "contains"))
@@ -173,8 +174,8 @@
 (def ^:const $sh:inversePath (iri/iri->sid "http://www.w3.org/ns/shacl#inversePath"))
 
 ;; fluree-specific
-(def ^:const $fluree:context 250)
-(def ^:const $fluree:targetClass 255)
+(def ^:const $fluree:context (iri/iri->sid iri-context))
+(def ^:const $fluree:targetClass (iri/iri->sid iri-target-class))
 
 ;; owl
 (def ^:const $owl:Class (iri/iri->sid "http://www.w3.org/2002/07/owl#Class"))
@@ -226,7 +227,4 @@
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
 
-
-(def ^:const $_tag:id 30)
-
-(def ^:const $fluree:default-context 150)
+(def ^:const $fluree:default-context (iri/iri->sid iri-default-context))

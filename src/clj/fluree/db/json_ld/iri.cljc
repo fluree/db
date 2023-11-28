@@ -5,6 +5,8 @@
             [clojure.set :refer [map-invert]]))
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
+(def ^:const f-did-ns "did:fluree:")
+(def ^:const f-commit-256-ns "fluree:commit:sha256:")
 (def ^:const fdb-256-ns "fluree:db:sha256:")
 (def ^:const f-mem-ns "fluree:memory://")
 (def ^:const f-file-ns "fluree:file://")
@@ -36,11 +38,13 @@
    "_:"                                          14
    f-ns                                          15
    fdb-256-ns                                    16
-   f-mem-ns                                      17
-   f-file-ns                                     18
-   f-ipfs-ns                                     19
-   f-s3-ns                                       20
-   f-ctx-ns                                      21})
+   f-did-ns                                      17
+   f-commit-256-ns                               18
+   f-mem-ns                                      19
+   f-file-ns                                     20
+   f-ipfs-ns                                     21
+   f-s3-ns                                       22
+   f-ctx-ns                                      23})
 
 
 (def default-namespace-codes
