@@ -181,3 +181,46 @@
           (is (= :db/policy-exception
                  (:error (ex-data update-name-other-role)))
               "Exception should be of type :db/policy-exception"))))))
+
+
+(deftest ^:integration root-read-only-policy
+  (let [conn          @(fluree/connect {:method :memory})
+        context       {"ex"     "http://example.org/"
+                       "schema" "http://schema.org/"
+                       "f"      "https://ns.flur.ee/ledger#"}
+        ledger        @(fluree/create conn "test/root-read")
+        root-read-did (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
+        db            @(fluree/stage (fluree/db ledger )
+                                     {"@context" context
+                                      "insert"   [{"@id"         "ex:betty"
+                                                   "@type"       "ex:Yeti"
+                                                   "schema:name" "Betty"
+                                                   "schema:age"  55}
+                                                  {"@id"         "ex:freddy"
+                                                   "@type"       "ex:Yeti"
+                                                   "schema:name" "Freddy"
+                                                   "schema:age"  1002}
+                                                  {"@id"         "ex:letty"
+                                                   "@type"       "ex:Yeti"
+                                                   "schema:name" "Leticia"
+                                                   "schema:age"  38}
+                                                  {"@id"    root-read-did
+                                                   "f:role" {"@id" "ex:rootRole"}}]})
+        db+policy     @(fluree/stage db {"@context" context
+                                         "insert"
+                                         {"@id"          "ex:rootPolicy"
+                                          "@type"        ["f:Policy"]
+                                          "f:targetNode" {"@id" "f:allNodes"}
+                                          "f:allow"      [{"@id"          "ex:rootAccessAllow"
+                                                           "f:targetRole" {"@id" "ex:rootRole"}
+                                                           "f:action"     [{"@id" "f:view"}]}]}})
+        update-yeti   @(fluree/stage db+policy {"@context" context
+                                                "insert"
+                                                {"@id"        "ex:betty",
+                                                 "schema:age" 56}}
+                                     {:did root-read-did})]
+    (is (util/exception? update-yeti)
+        "Should throw an exception, role is read-only")
+    (is (= :db/policy-exception
+           (:error (ex-data update-yeti)))
+        "Exception should be of type :db/policy-exception")))

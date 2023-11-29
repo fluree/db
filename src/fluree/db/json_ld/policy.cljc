@@ -306,7 +306,8 @@
                           ;; allow policy is restricted, therefore not 'root'
                           actions
                           (into actions (map #(get % "@id")
-                                             (get next-policy const/iri-action)))))
+                                             (-> (get next-policy const/iri-action)
+                                                 util/sequential)))))
                       #{} (get node-policy const/iri-allow))]
     (not-empty root-actions)))
 
