@@ -215,8 +215,19 @@
   (or id (generate-subject-var)))
 
 (defn with-id
-  [m]
-  (update m const/iri-id id-or-variable))
+  "Searches for the id key, expands it or adds a variable as a value."
+  [m context]
+  (let [[id-key id] (reduce-kv (fn [res p o]
+                                 (let [expanded (if (v/variable? p)
+                                                  p
+                                                  (json-ld/expand-iri p context))]
+                                   (when (= const/iri-id expanded)
+                                     (reduced [p o]))))
+                               nil m)]
+    (-> m
+        (dissoc id-key)
+        (assoc const/iri-id id)
+        (update const/iri-id id-or-variable))))
 
 (defn parse-subject
   [id context]
@@ -246,10 +257,12 @@
   [s-mch p-mch o context]
   (let [o* (expand-keys o context)]
     (if-let [v (get o* const/iri-value)]
+      ;; literal
       (let [attrs (dissoc o* const/iri-value)
             o-mch (parse-value-attributes v attrs)]
         [[s-mch p-mch o-mch]])
-      (let [id-map  (with-id o*)
+      ;; ref
+      (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
             o-mch   (-> id-map
                         (get const/iri-id)
                         (parse-subject context))
@@ -311,7 +324,7 @@
 (defn parse-node-map
   [m context]
   (-> m
-      with-id
+      (with-id context)
       (parse-id-map-pattern context)))
 
 (defmethod parse-pattern :node
