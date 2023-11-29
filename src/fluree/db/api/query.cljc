@@ -150,14 +150,15 @@
           {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
           ;;TODO: only using query context for opts, should be only context
           ;;once default-context is removed
-          q-ctx    (ctx-util/extract-supplied-context query*)
+          query** (update query* :opts assoc :context-type :string :meta true)
+          q-ctx    (ctx-util/extract-supplied-context query**)
           db*      (<? (restrict-db db t (assoc opts :context q-ctx)))
-          query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
+          query***  (update query** :opts dissoc   :meta :max-fuel ::util/track-fuel?)
           ctx      (ctx-util/extract db* query** opts)
           max-fuel (:max-fuel opts)]
       (if (::util/track-fuel? opts)
-        (<? (track-query db* ctx max-fuel query**))
-        (<? (fql/query db* ctx query**))))))
+        (<? (track-query db* ctx max-fuel query***))
+        (<? (fql/query db* ctx query***))))))
 
 (defn query-sparql
   [db query]

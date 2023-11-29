@@ -50,6 +50,8 @@
   channel which will eventually contain a single vector of results, or an
   exception if there was an error."
   [db fuel-tracker q]
+  ;; log the q value to stdout
+  (log/info "Query: " q)
   (go
     (let [error-ch  (async/chan)
           result-ch (->> (where/search db q fuel-tracker error-ch)
