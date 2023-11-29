@@ -260,7 +260,7 @@
       ;; literal
       (let [attrs (dissoc o* const/iri-value)
             o-mch (parse-value-attributes v attrs)]
-        [[s-mch p-mch o-mch]])
+        [(flip-reverse-pattern [s-mch p-mch o-mch])])
       ;; ref
       (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
             o-mch   (-> id-map
@@ -289,7 +289,7 @@
 
     (type-pred-match? p-mch)
     (let [class-ref (parse-class o context)]
-      [(flip-reverse-pattern (where/->pattern :class [s-mch p-mch class-ref]))])
+      [(where/->pattern :class (flip-reverse-pattern [s-mch p-mch class-ref]))])
 
     :else
     (let [o-mch (where/anonymous-value o)]
