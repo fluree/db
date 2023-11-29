@@ -19,15 +19,17 @@
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.validation :as v]))
+            [fluree.db.validation :as v] 
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn- history*
   [db query-map]
   (go-try
+    (log/info "History Query: " query-map)
    (let [{:keys [opts]} query-map
-         {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map)
+         {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map) 
          db*            (if-let [policy-identity (perm/policy-identity
                                                   ;;TODO only using query supplied context for policy opts,
                                                   ;;should be the only context operation once we have removed
