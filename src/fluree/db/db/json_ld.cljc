@@ -252,6 +252,9 @@
 (def identity-flake
   (flake/create const/$xsd:anyURI const/$xsd:anyURI const/iri-id const/$xsd:string 0 true nil))
 
+(def type-flake
+  (flake/create const/$rdf:type const/$xsd:anyURI "@type" const/$xsd:string 0 true nil))
+
 (defn create
   [{:keys [method alias conn] :as ledger} default-context context-type new-context?]
   (let [novelty       (new-novelty-map index/default-comparators)
@@ -291,4 +294,4 @@
                         :context-cache   (volatile! nil)
                         :new-context?    new-context?
                         :ecount          genesis-ecount})
-        (commit-data/update-novelty [identity-flake]))))
+        (commit-data/update-novelty [identity-flake type-flake]))))
