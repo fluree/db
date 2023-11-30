@@ -259,7 +259,7 @@
                                                  :assert  [{:ex/x "foo-1"
                                                             :ex/y "bar-1"
                                                             :id   :ex/alice}]
-                                                 :flakes  6
+                                                 :flakes  7
                                                  :retract []
                                                  :size    pos-int?
                                                  :t       1}
@@ -277,7 +277,7 @@
                                                          :assert   [{:ex/x "foo-cat"
                                                                      :ex/y "bar-cat"
                                                                      :id   :ex/alice}]
-                                                         :flakes   93
+                                                         :flakes   94
                                                          :previous {:id test-utils/db-id?}
                                                          :retract  [{:ex/x "foo-3"
                                                                      :ex/y "bar-3"
@@ -299,7 +299,7 @@
                                                          :assert   [{:ex/x "foo-cat"
                                                                      :ex/y "bar-cat"
                                                                      :id   :ex/cat}]
-                                                         :flakes   75
+                                                         :flakes   76
                                                          :previous {:id test-utils/db-id?}
                                                          :retract  []
                                                          :size     pos-int?
@@ -333,7 +333,7 @@
                                                     :assert   [{:ex/x "foo-cat"
                                                                 :ex/y "bar-cat"
                                                                 :id   :ex/cat}]
-                                                    :flakes   75
+                                                    :flakes   76
                                                     :previous {:id test-utils/db-id?}
                                                     :retract  []
                                                     :size     pos-int?
@@ -354,7 +354,7 @@
                                                   :assert   [{:ex/x "foo-3"
                                                               :ex/y "bar-3"
                                                               :id   :ex/alice}]
-                                                  :flakes   56
+                                                  :flakes   57
                                                   :previous {:id test-utils/db-id?}
                                                   :retract  [{:ex/x "foo-2"
                                                               :ex/y "bar-2"
@@ -377,7 +377,7 @@
                                                   :assert   [{:ex/x "foo-2"
                                                               :ex/y "bar-2"
                                                               :id   :ex/alice}]
-                                                  :flakes   38
+                                                  :flakes   39
                                                   :previous {:id test-utils/db-id?}
                                                   :retract  [{:ex/x "foo-1"
                                                               :ex/y "bar-1"
@@ -402,7 +402,7 @@
                                                  :assert   [{:ex/x "foo-cat"
                                                              :ex/y "bar-cat"
                                                              :id   :ex/cat}]
-                                                 :flakes   75
+                                                 :flakes   76
                                                  :previous {:id test-utils/db-id?}
                                                  :retract  []
                                                  :size     pos-int?
@@ -421,7 +421,7 @@
                                                  :assert   [{:ex/x "foo-cat"
                                                              :ex/y "bar-cat"
                                                              :id   :ex/alice}]
-                                                 :flakes   93
+                                                 :flakes   94
                                                  :previous {:id test-utils/db-id?}
                                                  :retract  [{:ex/x "foo-3"
                                                              :ex/y "bar-3"
@@ -447,7 +447,7 @@
                                                  :assert  [{:ex/x "foo-1"
                                                             :ex/y "bar-1"
                                                             :id   :ex/alice}]
-                                                 :flakes  6
+                                                 :flakes  7
                                                  :retract []
                                                  :size    pos-int?
                                                  :t       1}
@@ -471,7 +471,7 @@
                                                    :assert   [{:ex/x "foo-3"
                                                                :ex/y "bar-3"
                                                                :id   :ex/alice}]
-                                                   :flakes   56
+                                                   :flakes   57
                                                    :previous {:id test-utils/db-id?}
                                                    :retract  [{:ex/x "foo-2"
                                                                :ex/y "bar-2"
@@ -499,7 +499,7 @@
                                                    :assert   [{:ex/x "foo-cat"
                                                                :ex/y "bar-cat"
                                                                :id   :ex/alice}]
-                                                   :flakes   93
+                                                   :flakes   94
                                                    :previous {:id test-utils/db-id?}
                                                    :retract  [{:ex/x "foo-3"
                                                                :ex/y "bar-3"
@@ -585,7 +585,7 @@
                                                   :assert   [{:ex/x "foo-3"
                                                               :ex/y "bar-3"
                                                               :id   :ex/alice}]
-                                                  :flakes   57
+                                                  :flakes   58
                                                   :previous {:id test-utils/db-id?}
                                                   :retract  [{:ex/x "foo-2"
                                                               :ex/y "bar-2"
@@ -611,7 +611,7 @@
                                                   :assert   [{:ex/x "foo-cat"
                                                               :ex/y "bar-cat"
                                                               :id   :ex/alice}]
-                                                  :flakes   94
+                                                  :flakes   95
                                                   :previous {:id test-utils/db-id?}
                                                   :retract  [{:ex/x "foo-3"
                                                               :ex/y "bar-3"
@@ -679,7 +679,7 @@
                                                   :assert   [{:ex/x "foo-3"
                                                               :ex/y "bar-3"
                                                               :id   :ex/alice}]
-                                                  :flakes   56
+                                                  :flakes   57
                                                   :previous {:id test-utils/db-id?}
                                                   :retract  [{:ex/x "foo-2"
                                                               :ex/y "bar-2"
@@ -707,7 +707,7 @@
                                                   :assert   [{:ex/x "foo-cat"
                                                               :ex/y "bar-cat"
                                                               :id   :ex/alice}]
-                                                  :flakes   93
+                                                  :flakes   94
                                                   :previous {:id test-utils/db-id?}
                                                   :retract  [{:ex/x "foo-3"
                                                               :ex/y "bar-3"
@@ -788,7 +788,7 @@
                                                      :assert   [{:ex/x "foo-3"
                                                                  :ex/y "bar-3"
                                                                  :id   :ex/alice}]
-                                                     :flakes   60
+                                                     :flakes   61
                                                      :previous {:id test-utils/db-id?}
                                                      :retract  [{:ex/x "foo-2"
                                                                  :ex/y "bar-2"
@@ -816,7 +816,7 @@
                                                      :assert   [{:ex/x "foo-cat"
                                                                  :ex/y "bar-cat"
                                                                  :id   :ex/alice}]
-                                                     :flakes   99
+                                                     :flakes   100
                                                      :previous {:id test-utils/db-id?}
                                                      :retract  [{:ex/x "foo-3"
                                                                  :ex/y "bar-3"
