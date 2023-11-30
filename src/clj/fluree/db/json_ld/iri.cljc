@@ -1,8 +1,12 @@
 (ns fluree.db.json-ld.iri
   (:require [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]
             [fluree.db.util.bytes :as bytes]
             [clojure.string :as str]
-            [clojure.set :refer [map-invert]]))
+            [clojure.set :refer [map-invert]])
+  (:import (fluree.db SID)))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-did-ns "did:fluree:")
@@ -76,6 +80,12 @@
   (comp (partition-all 8)
         (map bytes/UTF8->long)))
 
+(defn name->codes
+  [nme]
+  (->> nme
+       bytes/string->UTF8
+       (into [] name-code-xf)))
+
 (defn append-name-codes
   [ns-sid nme]
   (into ns-sid
@@ -88,17 +98,59 @@
        (mapcat bytes/long->UTF8)
        bytes/UTF8->string))
 
+(defn ->sid
+  [ns-code name-codes]
+  (let [ns-int     (int ns-code)
+        name-longs (long-array name-codes)]
+    (SID. ns-int name-longs)))
+
 (defn get-ns-code
-  [sid]
-  (nth sid 0))
+  [^SID sid]
+  (.getNamespaceCode sid))
+
+(defn get-namespace
+  ([sid]
+   (get-namespace sid default-namespace-codes))
+  ([sid namespace-codes]
+   (let [ns-code (get-ns-code sid)]
+     (get namespace-codes ns-code))))
 
 (defn get-name-codes
-  [sid]
-  (subvec sid 1))
+  [^SID sid]
+  (into [] (.getNameCodes sid)))
 
 (defn get-name
   [sid]
   (->> sid get-name-codes codes->name))
+
+(defn deserialize-sid
+  [[ns-code nme]]
+  (->sid ns-code (name->codes nme)))
+
+(defn serialize-sid
+  [^SID sid]
+  ((juxt get-ns-code get-name) sid))
+
+#?(:clj (defmethod print-method SID [^SID sid ^java.io.Writer w]
+          (doto w
+            (.write "#SID ")
+            (.write (-> sid serialize-sid pr-str)))))
+
+#?(:clj (defmethod print-dup SID
+          [^SID sid ^java.io.Writer w]
+          (let [ns-code    (get-ns-code sid)
+                name-codes (get-name-codes sid)]
+            (.write w (str "#=" `(->sid ~ns-code ~name-codes))))))
+
+(defn sid?
+  [x]
+  (instance? SID x))
+
+(def ^:const min-sid
+  (->sid util/min-integer [util/min-long]))
+
+(def ^:const max-sid
+  (->sid util/max-integer [util/max-long]))
 
 (defn iri->sid
   "Converts a string iri into a vector of long integer codes. The first code
@@ -109,7 +161,8 @@
   ([iri namespaces]
    (let [[ns nme] (decompose iri)]
      (when-let [ns-code (get namespaces ns)]
-       (append-name-codes [ns-code] nme)))))
+       (let [name-codes (name->codes nme)]
+         (->sid ns-code name-codes))))))
 
 (defn next-namespace-code
   [namespaces]
@@ -134,27 +187,17 @@
                                        ns-map
                                        (let [new-ns-code (next-namespace-code ns-map)]
                                          (assoc ns-map ns new-ns-code)))))
-                           (get ns))]
-          (append-name-codes [ns-code] nme)))
+                           (get ns))
+              name-codes (name->codes nme)]
+          (->sid ns-code name-codes)))
+
       (get-namespaces [_]
         @namespaces))))
 
-(defn sid?
-  [x]
-  (vector? x))
-
-(def ^:const min-sid
-  [util/min-integer util/min-long])
-
-(def ^:const max-sid
-  [util/max-integer util/max-long])
-
 (defn sid->iri
-  "Converts a vector as would be returned by `iri->subid` back into a string iri."
+  "Converts an sid back into a string iri."
   ([sid]
    (sid->iri sid default-namespace-codes))
-  ([sid namespace-codes]
-   (-> sid
-       get-ns-code
-       (as-> ns-code (get namespace-codes ns-code))
-       (str (get-name sid)))))
+  ([^SID sid namespace-codes]
+   (str (get-namespace sid namespace-codes)
+        (get-name sid))))

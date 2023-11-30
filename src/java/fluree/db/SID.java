@@ -1,19 +1,42 @@
 package fluree.db;
 
-import clojure.lang.IPersistentVector;
+import java.lang.Comparable;
 
-public final class SID {
-    private SID() {}
+public final class SID implements Comparable {
+    final int namespaceCode;
+    final long[] nameCodes;
 
-    public static final long compare(IPersistentVector x, IPersistentVector y) {
-        final int xCount = x.count();
-        final int yCount = y.count();
+    public SID(int nsCode, long... nameCodes) {
+        this.namespaceCode = nsCode;
+        this.nameCodes = nameCodes;
+    }
 
-        for(int i = 0; i < xCount; i++) {
-            if(i < yCount) {
-                final Long xi = (Long) x.nth(i);
-                final Long yi = (Long) y.nth(i);
-                int c = Long.compare(xi, yi);
+    public int getNamespaceCode() {
+        return namespaceCode;
+    }
+
+    public long[] getNameCodes() {
+        return nameCodes;
+    }
+
+    public final int compareTo(Object o) {
+        SID that = (SID) o;
+        int nsComp = Integer.compare(this.getNamespaceCode(), that.getNamespaceCode());
+        if (nsComp != 0) {
+            return nsComp;
+        }
+
+        final long[] theseCodes = this.getNameCodes();
+        final int thisLength = theseCodes.length;
+
+        final long[] thoseCodes = that.getNameCodes();
+        final int thatLength = thoseCodes.length;
+
+        for(int i = 0; i < thisLength; i++) {
+            if(i < thatLength) {
+                final long thisI = theseCodes[i];
+                final long thatI = thoseCodes[i];
+                int c = Long.compare(thisI, thatI);
                 if (c != 0) {
                     return c;
                 }
@@ -22,10 +45,29 @@ public final class SID {
             }
         }
 
-        if (xCount < yCount) {
+        if (thisLength < thatLength) {
             return -1;
         } else {
             return 0;
         }
+    }
+
+    public final boolean equals(Object o) {
+        if (o instanceof SID) {
+            SID that = (SID) o;
+            return this.compareTo(that) == 0;
+        }
+        return false;
+    }
+
+    public final int hashCode() {
+        int hsh = this.getNamespaceCode();
+        final long[] nameCodes = this.getNameCodes();
+
+        for(int i = 0; i < nameCodes.length; i++) {
+            hsh += Long.hashCode(nameCodes[i]);
+        }
+
+        return hsh;
     }
 }
