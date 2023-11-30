@@ -170,7 +170,6 @@
                           (let [pred (second pattern)]
                             (and (= select-var (clause-subject-var pattern))
                                  (not (has-equivalent-properties? db pattern))
-                                 (not (::where/recur pred))
                                  (not (::where/fullText pred)))))) patterns)))))
 
 (defn re-parse-as-simple-subj-crawl

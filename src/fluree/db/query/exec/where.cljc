@@ -153,10 +153,9 @@
   "Build a pattern that already matches the explicit predicate value `value`."
   ([iri]
    (->iri-ref iri))
-  ([iri recur-n]
-   (-> iri
-       ->predicate
-       (assoc ::recur recur-n))))
+  ([iri reverse]
+   (cond-> (->predicate iri)
+     reverse (assoc ::reverse true))))
 
 (defn ->where-clause
   "Build a pattern that matches all the patterns in the supplied `patterns`

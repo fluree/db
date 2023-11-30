@@ -131,25 +131,6 @@
         f    (eval/compile code false)]
     (where/->var-filter var-name f)))
 
-(def ^:const default-recursion-depth 100)
-
-(defn recursion-predicate
-  "A predicate that ends in a '+', or a '+' with some integer afterwards is a recursion
-  predicate. e.g.: person/follows+3
-
-  Returns a two-tuple of predicate followed by # of times to recur.
-
-  If not a recursion predicate, returns nil."
-  [predicate context]
-  (when (or (string? predicate)
-            (keyword? predicate))
-    (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" (name predicate))]
-      [(json-ld/expand (keyword (namespace predicate) pred)
-                       context)
-       (if recur-n
-         (util/str->int recur-n)
-         default-recursion-depth)])))
-
 (defn parse-iri
   [x context]
   (-> x
@@ -234,8 +215,19 @@
   (or id (generate-subject-var)))
 
 (defn with-id
-  [m]
-  (update m const/iri-id id-or-variable))
+  "Searches for the id key, expands it or adds a variable as a value."
+  [m context]
+  (let [[id-key id] (reduce-kv (fn [res p o]
+                                 (let [expanded (if (v/variable? p)
+                                                  p
+                                                  (json-ld/expand-iri p context))]
+                                   (when (= const/iri-id expanded)
+                                     (reduced [p o]))))
+                               nil m)]
+    (-> m
+        (dissoc id-key)
+        (assoc const/iri-id id)
+        (update const/iri-id id-or-variable))))
 
 (defn parse-subject
   [id context]
@@ -244,31 +236,40 @@
     (parse-iri id context)))
 
 (defn parse-predicate
-  [p]
+  [p context]
   (if (v/variable? p)
     (parse-variable p)
-    (where/->predicate p)))
+    (let [[expanded {reverse :reverse}] (json-ld/details p context)]
+      (where/->predicate expanded reverse))))
 
 (def id-predicate-match
-  (parse-predicate const/iri-id))
+  (parse-predicate const/iri-id nil))
 
 (declare parse-statement parse-statements)
+
+(defn flip-reverse-pattern
+  [[s-mch p-mch o-mch :as pattern]]
+  (if (::where/reverse p-mch)
+    [o-mch p-mch s-mch]
+    pattern))
 
 (defn parse-object-map
   [s-mch p-mch o context]
   (let [o* (expand-keys o context)]
     (if-let [v (get o* const/iri-value)]
+      ;; literal
       (let [attrs (dissoc o* const/iri-value)
             o-mch (parse-value-attributes v attrs)]
-        [[s-mch p-mch o-mch]])
-      (let [id-map  (with-id o*)
+        [(flip-reverse-pattern [s-mch p-mch o-mch])])
+      ;; ref
+      (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
             o-mch   (-> id-map
                         (get const/iri-id)
                         (parse-subject context))
             o-attrs (dissoc id-map const/iri-id)]
         ;; return a thunk wrapping the recursive call to preserve stack
         ;; space by delaying execution
-        #(into [[s-mch p-mch o-mch]]
+        #(into [(flip-reverse-pattern [s-mch p-mch o-mch])]
                (parse-statements o-mch o-attrs context))))))
 
 (defn parse-statement*
@@ -276,7 +277,7 @@
   (cond
     (v/variable? o)
     (let [o-mch (parse-variable o)]
-      [[s-mch p-mch o-mch]])
+      [(flip-reverse-pattern [s-mch p-mch o-mch])])
 
     (map? o)
     (parse-object-map s-mch p-mch o context)
@@ -288,11 +289,11 @@
 
     (type-pred-match? p-mch)
     (let [class-ref (parse-class o context)]
-      [(where/->pattern :class [s-mch p-mch class-ref])])
+      [(where/->pattern :class (flip-reverse-pattern [s-mch p-mch class-ref]))])
 
     :else
     (let [o-mch (where/anonymous-value o)]
-      [[s-mch p-mch o-mch]])))
+      [(flip-reverse-pattern [s-mch p-mch o-mch])])))
 
 (defn parse-statement
   [s-mch p-mch o context]
@@ -301,7 +302,7 @@
 (defn parse-statements*
   [s-mch attrs context]
   #(mapcat (fn [[p o]]
-             (let [p-mch (parse-predicate p)]
+             (let [p-mch (parse-predicate p context)]
                (parse-statement s-mch p-mch o context)))
            attrs))
 
@@ -323,8 +324,7 @@
 (defn parse-node-map
   [m context]
   (-> m
-      (expand-keys context)
-      with-id
+      (with-id context)
       (parse-id-map-pattern context)))
 
 (defmethod parse-pattern :node
