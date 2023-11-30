@@ -81,8 +81,7 @@
               :else (recur r acc)))
           acc)))))
 
-;;TODO only does :class
-(defn group-policies-by-default
+(defn group-class-policies-by-default
   "Groups policies for the specified action (e.g. :f/view, :f/modify)
   and provided class subject ids by either :default or :property.
 
@@ -101,7 +100,7 @@
   "Returns true or false if the default policy allows, or denies access
   to the subject's flakes.
 
-  default-allow-policies is as output by group-policies-by-default which will
+  default-allow-policies is as output by group-class-policies-by-default which will
   be a two-tuple where the second position is the default policy map."
   [db flake default-allow-policies]
   (go-try
@@ -134,7 +133,7 @@
   (go-try
     (when-let [fflake (first flakes)]
       (let [class-ids      (<? (dbproto/-class-ids db (flake/s fflake)))
-            {defaults :default props :property} (group-policies-by-default
+            {defaults :default props :property} (group-class-policies-by-default
                                                  policy const/iri-view class-ids)
             ;; default-allow? will be the default for all flakes that don't have a property-specific policy
             default-allow? (<? (default-allow? db fflake defaults))]

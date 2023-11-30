@@ -60,7 +60,7 @@
                   {:keys [classes]} (get subj-mods' sid)
 
                   {defaults :default props :property}
-                  (validate/group-policies-by-default policy const/iri-modify
+                  (validate/group-class-policies-by-default policy const/iri-modify
                                                       classes)
 
                   default-allow? (<? (validate/default-allow? db-after fflake defaults))
