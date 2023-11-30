@@ -238,24 +238,16 @@
                    ["fluree:context:68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"
                     :f/address
                     "fluree:memory://68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"]
-                   ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
+                   ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6" :id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
+                   ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"
                     :id
-                    "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                   ["fluree:db:sha256:bbgtaymrau2iz3mcdpaifv6liqrvygzl7q57vvgqvifhdpgqyvxkz"
-                    :id
-                    "fluree:db:sha256:bbgtaymrau2iz3mcdpaifv6liqrvygzl7q57vvgqvifhdpgqyvxkz"]
-                   ["fluree:db:sha256:bbgtaymrau2iz3mcdpaifv6liqrvygzl7q57vvgqvifhdpgqyvxkz"
+                    "fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"]
+                   ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"
                     :f/address
-                    "fluree:memory://fb15dfb3f737fca3d90e62cbd9d6ced78c16194b40e58bea2e60c4205ea5300d"]
-                   ["fluree:db:sha256:bbgtaymrau2iz3mcdpaifv6liqrvygzl7q57vvgqvifhdpgqyvxkz"
-                    :f/flakes
-                    20]
-                   ["fluree:db:sha256:bbgtaymrau2iz3mcdpaifv6liqrvygzl7q57vvgqvifhdpgqyvxkz"
-                    :f/size
-                    1318]
-                   ["fluree:db:sha256:bbgtaymrau2iz3mcdpaifv6liqrvygzl7q57vvgqvifhdpgqyvxkz"
-                    :f/t
-                    1]
+                    "fluree:memory://eb42c9187ee0bddcc215c5d7ca829c1528a22bf8ee94f933affbe830b845030a"]
+                   ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw" :f/flakes 21]
+                   ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw" :f/size 1370]
+                   ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw" :f/t 1]
                    [:schema/email :id "http://schema.org/email"]
                    [:schema/name :id "http://schema.org/name"]
                    [:schema/age :id "http://schema.org/age"]
@@ -269,38 +261,28 @@
                    [:f/data :id "https://ns.flur.ee/ledger#data"]
                    [:f/address :id "https://ns.flur.ee/ledger#address"]
                    [:f/v :id "https://ns.flur.ee/ledger#v"]
-                   ["https://www.w3.org/2018/credentials#issuer"
-                    :id
-                    "https://www.w3.org/2018/credentials#issuer"]
+                   ["https://www.w3.org/2018/credentials#issuer" :id "https://www.w3.org/2018/credentials#issuer"]
                    [:f/time :id "https://ns.flur.ee/ledger#time"]
                    [:f/message :id "https://ns.flur.ee/ledger#message"]
                    [:f/previous :id "https://ns.flur.ee/ledger#previous"]
                    [:id :id "@id"]
-                   ["fluree:commit:sha256:bbmsdo3ljxjmhcjnfvr2pb4yshdgfgorsckbdc3bysnairyru4jb5"
+                   ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl"
                     :id
-                    "fluree:commit:sha256:bbmsdo3ljxjmhcjnfvr2pb4yshdgfgorsckbdc3bysnairyru4jb5"]
-                   ["fluree:commit:sha256:bbmsdo3ljxjmhcjnfvr2pb4yshdgfgorsckbdc3bysnairyru4jb5"
-                    :f/time
-                    720000]
-                   ["fluree:commit:sha256:bbmsdo3ljxjmhcjnfvr2pb4yshdgfgorsckbdc3bysnairyru4jb5"
+                    "fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl"]
+                   ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl" :f/time 720000]
+                   ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl"
                     "https://www.w3.org/2018/credentials#issuer"
                     "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                   ["fluree:commit:sha256:bbmsdo3ljxjmhcjnfvr2pb4yshdgfgorsckbdc3bysnairyru4jb5"
-                    :f/v
-                    0]
-                   ["fluree:commit:sha256:bbmsdo3ljxjmhcjnfvr2pb4yshdgfgorsckbdc3bysnairyru4jb5"
+                   ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl" :f/v 0]
+                   ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl"
                     :f/address
-                    "fluree:memory://308132a22e9a9c18a42718cf6be5b6fd031af3f79adb703b34b0148d389d9591"]
-                   ["fluree:commit:sha256:bbmsdo3ljxjmhcjnfvr2pb4yshdgfgorsckbdc3bysnairyru4jb5"
+                    "fluree:memory://907f04950bd8ab98c1c2ad532c50d24c111221a0f52a95df427382c73d6110ad"]
+                   ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl"
                     :f/data
-                    "fluree:db:sha256:bbgtaymrau2iz3mcdpaifv6liqrvygzl7q57vvgqvifhdpgqyvxkz"]
-                   ["fluree:commit:sha256:bbmsdo3ljxjmhcjnfvr2pb4yshdgfgorsckbdc3bysnairyru4jb5"
-                    :f/alias
-                    "query/everything"]
-                   ["fluree:commit:sha256:bbmsdo3ljxjmhcjnfvr2pb4yshdgfgorsckbdc3bysnairyru4jb5"
-                    :f/branch
-                    "main"]
-                   ["fluree:commit:sha256:bbmsdo3ljxjmhcjnfvr2pb4yshdgfgorsckbdc3bysnairyru4jb5"
+                    "fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"]
+                   ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl" :f/alias "query/everything"]
+                   ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl" :f/branch "main"]
+                   ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl"
                     :f/defaultContext
                     "fluree:context:68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"]}
                  (set result))

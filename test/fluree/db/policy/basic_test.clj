@@ -391,3 +391,60 @@
                                 "where" {"@id" "?s" "type" "ex:User"}
                                 :opts {:role "ex:userRole"
                                        :did alice-did}}))))))
+
+(deftest ^:integration root-read-only-policy
+  (let [conn          @(fluree/connect {:method :memory})
+        context       {"ex"     "http://example.org/"
+                       "schema" "http://schema.org/"
+                       "f"      "https://ns.flur.ee/ledger#"}
+        ledger        @(fluree/create conn "test/root-read")
+        root-read-did (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
+        db            @(fluree/stage (fluree/db ledger )
+                                     {"@context" context
+                                      "insert"   [{"@id"         "ex:betty"
+                                                   "@type"       "ex:Yeti"
+                                                   "schema:name" "Betty"
+                                                   "schema:age"  55}
+                                                  {"@id"         "ex:freddy"
+                                                   "@type"       "ex:Yeti"
+                                                   "schema:name" "Freddy"
+                                                   "schema:age"  1002}
+                                                  {"@id"         "ex:letty"
+                                                   "@type"       "ex:Yeti"
+                                                   "schema:name" "Leticia"
+                                                   "schema:age"  38}
+                                                  {"@id"    root-read-did
+                                                   "f:role" {"@id" "ex:rootRole"} }]})
+        db+policy     @(fluree/stage db {"@context" context
+                                         "insert"
+                                         {"@id"          "ex:rootPolicy"
+                                          "@type"        ["f:Policy"]
+                                          "f:targetNode" {"@id" "f:allNodes"}
+                                          "f:allow"      [{"@id"          "ex:rootAccessAllow"
+                                                           "f:targetRole" {"@id" "ex:rootRole"}
+                                                           "f:action"     [{"@id" "f:view"} ]}]}})]
+    (is (= [{"@id"         "http://example.org/betty"
+             "@type"       "http://example.org/Yeti"
+             "schema:age"  55
+             "schema:name" "Betty"}
+            {"@id"         "http://example.org/freddy"
+             "@type"       "http://example.org/Yeti"
+             "schema:age"  1002
+             "schema:name" "Freddy"}
+            {"@id"         "http://example.org/letty"
+             "@type"       "http://example.org/Yeti"
+             "schema:age"  38
+             "schema:name" "Leticia"}]
+           @(fluree/query db+policy {"@context" {"schema" "http://schema.org/"}
+                                     :where     {"schema:name" '?name
+                                                 "@id"         '?s}
+                                     :select    '{?s ["*"]}
+                                     :opts      {:did root-read-did}})))
+    (is (= []
+           @(fluree/query db+policy {"@context" {"schema" "http://schema.org/"}
+                                     :where     {"schema:name" '?name
+                                                 "@id"         '?s}
+                                     :select    '{?s ["*"]}
+                                     :opts      {:did  "not-a-did"
+                                                 :role "not-a-role"}}))
+        "Should not be able to see any data")))
