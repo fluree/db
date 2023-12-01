@@ -32,23 +32,24 @@
    "http://www.w3.org/2000/01/rdf-schema#"       4
    "http://www.w3.org/ns/shacl#"                 5
    "http://www.w3.org/2002/07/owl#"              6
-   "http://www.w3.org/2008/05/skos#"             7
-   "http://schema.org/"                          8
-   "http://xmlns.com/foaf/0.1/"                  9
-   "https://www.wikidata.org/wiki/"              10
-   "urn:uuid"                                    11
-   "urn:isbn:"                                   12
-   "urn:issn"                                    13
-   "_:"                                          14
-   f-ns                                          15
-   fdb-256-ns                                    16
-   f-did-ns                                      17
-   f-commit-256-ns                               18
-   f-mem-ns                                      19
-   f-file-ns                                     20
-   f-ipfs-ns                                     21
-   f-s3-ns                                       22
-   f-ctx-ns                                      23})
+   "https://www.w3.org/2018/credentials#"        7
+   f-ns                                          8
+   fdb-256-ns                                    9
+   f-did-ns                                      10
+   f-commit-256-ns                               11
+   f-mem-ns                                      12
+   f-file-ns                                     13
+   f-ipfs-ns                                     14
+   f-s3-ns                                       15
+   f-ctx-ns                                      16
+   "http://schema.org/"                          17
+   "https://www.wikidata.org/wiki/"              18
+   "http://xmlns.com/foaf/0.1/"                  19
+   "http://www.w3.org/2008/05/skos#"             20
+   "urn:uuid"                                    21
+   "urn:isbn:"                                   22
+   "urn:issn"                                    23
+   "_:"                                          24})
 
 
 (def default-namespace-codes
