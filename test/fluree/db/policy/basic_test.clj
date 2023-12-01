@@ -450,55 +450,165 @@
         "Should not be able to see any data")))
 
 (deftest ^:integration custom-query-policy-enforcement
-  (testing "Enforcement of policies that use custom `f:query`"
-    (let [conn     @(fluree/connect {:method :memory})
-          ledger    @(fluree/create conn "policy/a" )
-          alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
-          context   [test-utils/default-str-context {"ex" "http://example.com/"}]
-          db        @(fluree/stage
-                      (fluree/db ledger)
-                      {"@context" context
-                       "insert"
-                       [{"@id"              "ex:alice"
-                         "@type" "ex:User"}
-                        {"@id"              "ex:brian"
-                         "@type" "ex:User"
-                         "ex:confidential" true}
-                        {"@id"              "ex:andrew"
-                         "@type" "ex:User"
-                         "ex:confidential" false}
-                        {"@id"              "ex:cam"
-                         "@type" "ex:User"
-                         "ex:confidential" 12}
-                        {"@id"      alice-did
-                         "ex:user" {"id" "ex:alice"}
-                         "f:role"  {"id" "ex:publicRole"}}]})
-          db+policy        @(fluree/stage
-                             db
-                             {"@context" context
-                              "insert"
-                              {"@type" ["f:Policy"],
-                               "@id" "ex:confidentialUserPolicy"
-                               "f:targetNode" {"@id" "f:allNodes"},
-                               "f:allow"
-                               [{"@id" "ex:publicViewAllow",
-                                 "f:targetRole" {"@id" "ex:publicRole"},
-                                 "f:action" [{"@id" "f:view"}],
-                                 "f:query"
-                                 ;;TODO type of `f:query` should be in our custom ctx
-                                 {"@type" "f:queryType"
-                                  "@value"
-                                  ;;TODO: should be`@type` `@json`, instead of passing
-                                  ;;in string
-                                  (str
-                                   ;;TODO: update for `$this`-like behavior
-                                   {"select" [{"?s" ["_id" ]} "?isTrue"]
-                                    "where"
-                                    {"id" "?s" "ex:confidential" "?isTrue"}})}}]}})]
-      (testing "Enforcement on queries"
+  (let [conn      @(fluree/connect {:method :memory})
+        ledger    @(fluree/create conn "policy/a" )
+        alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
+        context   [test-utils/default-str-context {"ex" "http://example.com/"}]
+        db1       @(fluree/stage
+                    (fluree/db ledger)
+                    {"@context" context
+                     "insert"
+                     {"@context" context
+                      "insert"
+                      [{"@id"     "ex:alice"
+                        "ex:name" "Alice"
+                        "@type"   "ex:User"}
+                       {"@id"             "ex:brian"
+                        "@type"           "ex:User"
+                        "ex:name"         "Brian"
+                        "ex:confidential" true}
+                       {"@id"             "ex:andrew"
+                        "@type"           "ex:User"
+                        "ex:name"         "Andrew"
+                        "ex:confidential" false}
+                       {"@id"             "ex:cam"
+                        "@type"           "ex:User"
+                        "ex:name"         "Cam"
+                        "ex:confidential" 12}
+                       {"@id"             "ex:widget1"
+                        "@type"           "ex:Product"
+                        "ex:name"         "Secret widget"
+                        "ex:confidential" true}
+                       {"@id"             "ex:widget2"
+                        "ex:name"         "Public widget"
+                        "@type"           "ex:Product"
+                        "ex:confidential" false}
+                       {"@id"     alice-did
+                        "ex:user" {"id" "ex:alice"}
+                        "f:role"  {"id" "ex:publicRole"}}]}})]
+    (testing "Using `f:targetNode`"
+      (let [db+policy @(fluree/stage
+                        db1
+                        {"@context" context
+                         "insert"
+                         {"@type"        ["f:Policy"],
+                          "@id"          "ex:confidentialUserPolicy"
+                          "f:targetNode" {"@id" "f:allNodes"},
+                          "f:allow"
+                          [{"@id"          "ex:publicViewAllow",
+                            "f:targetRole" {"@id" "ex:publicRole"},
+                            "f:action"     [{"@id" "f:view"}],
+                            "f:query"
+                            ;;TODO type of `f:query` should be in our custom ctx
+                            {"@type" "f:queryType"
+                             "@value"
+                             ;;TODO: should be`@type` `@json`, instead of passing
+                             ;;in string
+                             (str
+                              {"select" [{"?s" ["_id" ]} "?isTrue"]
+                               "where"
+                               {"id" "?s" "ex:confidential" "?isTrue"}})}}]}})]
         (is (= #{["ex:alice"] ["ex:andrew"]}
                (into #{} @(fluree/query db+policy {"@context" context
-                                                   "select" ['?s]
-                                                   "where"  {"id"   '?s
-                                                             "type" "ex:User"}
-                                                   :opts {:role "http://example.com/publicRole"}}))))))))
+                                                   "select"   ['?s]
+                                                   "where"    {"id"   '?s
+                                                               "type" "ex:User"}
+                                                   :opts      {:role "ex:publicRole"}})))
+            "Should only return non-confidential `ex:User`s")
+        (is (= #{{"id"      "ex:alice"
+                  "type"    "ex:User"
+                  "ex:name" "Alice"}
+                 {"id"              "ex:andrew"
+                  "type"            "ex:User"
+                  "ex:name"         "Andrew"
+                  "ex:confidential" false}}
+               (into #{} @(fluree/query db+policy {"@context" context
+                                                   "select"   {"?s" ["*"]}
+                                                   "where"    {"id"   '?s
+                                                               "type" "ex:User"}
+                                                   :opts      {:role "ex:publicRole"}})))
+            "Should only return non-confidential `ex:User`s")
+        (is (= #{["ex:andrew" "Andrew" "ex:User"]
+                 ["ex:widget2" "Public widget" "ex:Product"]
+                 ["ex:alice" "Alice" "ex:User"]}
+               (into #{} @(fluree/query db+policy
+                                        {"@context" context
+                                         "select"   ["?s" "?name" "?type"]
+                                         "where"    [{"@id"     "?s"
+                                                      "type"    "?type"
+                                                      "ex:name" "?name"}]
+                                         :opts      {:role "ex:publicRole"}})))
+            "Should return results for all non-confidential subjects")))
+    (testing "using `f:query` with `f:targetClass`"
+      (let [db+policy @(fluree/stage
+                        db1
+                        {"@context" context
+                         "insert"
+                         {"@type"         ["f:Policy"],
+                          "f:targetClass" {"@id" "ex:User"}
+                          "f:allow"       [{"@id"          "ex:publicViewAllow",
+                                            "f:targetRole" {"@id" "ex:publicRole"},
+                                            "f:action"     [{"@id" "f:view"}],
+                                            "f:query"
+                                            {"@type" "f:queryType"
+                                             "@value"
+                                             ;;TODO use `@type` `@json` instead
+                                             (str {"select" [{"?s" ["_id" ]} "?isTrue"]
+                                                   "where"  {"id" "?s" "ex:confidential" "?isTrue"}})}}]}})]
+        (testing "Respects constraint of `f:targetClass`"
+          (is (= []
+                 @(fluree/query db+policy
+                                {"@context" context
+                                 "select"   ["?s"]
+                                 "where"    [{"@id"   "?s"
+                                              "@type" "ex:Product"}]
+                                 :opts      {:role "ex:publicRole"}}))
+              "Should not be able to see any `ex:Product`s")
+          (is (= #{["ex:andrew" "Andrew" "ex:User"] ["ex:alice" "Alice" "ex:User"]}
+                 (into #{} @(fluree/query db+policy
+                                          {"@context" context
+                                           "select"   ["?s" "?name" "?type"]
+                                           "where"    [{"@id"     "?s"
+                                                        "@type"   "?type"
+                                                        "ex:name" "?name"}]
+                                           :opts      {:role "ex:publicRole"}})))
+              "Should only return values for `ex:User`s which are not `ex:confidential`")))
+      (testing "using `f:query` inside of `f:property`"
+        (let [db+policy @(fluree/stage
+                          db1
+                          {"@context" context
+                           "insert"
+                           {"@type"         ["f:Policy"]
+                            "f:targetClass" {"@id" "ex:User"}
+                            "f:allow"       [{"@id"          "ex:publicViewAllow"
+                                              "f:targetRole" {"@id" "ex:publicRole"}
+                                              "f:action"     [{"@id" "f:view"}]}]
+                            "f:property"    [{"f:path"  {"@id" "ex:name"}
+                                              "f:allow" [{"@id"      "ex:nameViewRule"
+                                                          "f:action" [{"@id" "f:view"}]
+                                                          "f:query"
+                                                          {"@type" "f:queryType"
+                                                           "@value"
+                                                           (str {"select" [{"?s" ["_id" ]} "?isTrue"]
+                                                                 "where"  {"id" "?s" "ex:confidential" "?isTrue"}})}}]}]}})]
+          (is (= []
+                 @(fluree/query db+policy
+                                {"@context" context
+                                 "select"   ["?s"]
+                                 "where"    [{"@id"   "?s"
+                                              "@type" "ex:Product"}]
+                                 :opts      {:role "ex:publicRole"}}))
+              "Should not be able to see any `ex:Product`s")
+          (is (= #{["ex:brian" nil "ex:User"]
+                   ["ex:andrew" "Andrew" "ex:User"]
+                   ["ex:alice" "Alice" "ex:User"]
+                   ["ex:cam" nil "ex:User"]}
+                 (into #{} @(fluree/query db+policy
+                                          {"@context" context
+                                           "select"   ["?s" "?name" "?type"]
+                                           "where"    [{"@id"   "?s"
+                                                        "@type" "?type"}
+                                                       ["optional" {"ex:name" "?name"
+                                                                    "@id"     "?s"}]]
+                                           :opts      {:role "ex:publicRole"}})))
+              "Should only return names for non-confidential `ex:User`s"))))))

@@ -231,54 +231,186 @@
           ledger    @(fluree/create conn "policy/a" )
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           context   [test-utils/default-str-context {"ex" "http://example.com/"}]
-          db        @(fluree/stage
-                      (fluree/db ledger)
-                      {"@context" context
-                       "insert"
-                       [{"@id"              "ex:alice"
-                         "@type" "ex:User"}
-                        {"@id"              "ex:brian"
-                         "@type" "ex:User"
-                         "ex:confidential" true}
-                        {"@id"              "ex:andrew"
-                         "@type" "ex:User"
-                         "ex:confidential" false}
-                        {"@id"              "ex:cam"
-                         "@type" "ex:User"
-                         "ex:confidential" 12}
-                        {"@id"      alice-did
-                         "ex:user" {"id" "ex:alice"}
-                         "f:role"  {"id" "ex:publicRole"}}]})
-          db+policy        @(fluree/stage
-                             db
-                             {"@context" context
-                              "insert"
-                              {"@type" ["f:Policy"],
-                               "@id" "ex:confidentialUserPolicy"
-                               "f:targetNode" {"@id" "f:allNodes"},
-                               "f:allow"
-                               [{"@id" "ex:publicViewAllow",
-                                 "f:targetRole" {"@id" "ex:publicRole"},
-                                 "f:action" [{"@id" "f:modify"}]
-                                 "f:query"
-                                 ;;TODO type of `f:query` should be in our custom ctx
-                                 {"@type" "f:queryType"
-                                  "@value"
-                                  ;;TODO: should be`@type` `@json`, instead of passing
-                                  ;;in string
-                                  (str
-                                   ;;TODO: update for `$this`-like behavior
-                                   {"select" [{"?s" ["_id" ]} "?isTrue"]
-                                    "where"
-                                    {"id" "?s" "ex:confidential" "?isTrue"}})}}]}})]
-      (testing "policy forbids modification"
-        (let [public-update-confidential @(fluree/stage db+policy
-                                                        {"@context" context
-                                                         "insert"
-                                                         {"@id" "ex:brian"
-                                                          "schema:name" "Brian"}}
-                                                        {:role "ex:publicRole"})]
-          (is (util/exception? public-update-confidential))
-          (is (= :db/policy-exception
-                 (:error (ex-data public-update-confidential)))
-              "Exception should be of type :db/policy-exception"))))))
+          db1       @(fluree/stage
+                       (fluree/db ledger)
+                       {"@context" context
+                        "insert"
+                        {"@context" context
+                         "insert"
+                         [{"@id"     "ex:alice"
+                           "ex:name" "Alice"
+                           "@type"   "ex:User"}
+                          {"@id"             "ex:brian"
+                           "@type"           "ex:User"
+                           "ex:name"         "Brian"
+                           "ex:favColor"     "yellow"
+                           "ex:confidential" true}
+                          {"@id"             "ex:andrew"
+                           "@type"           "ex:User"
+                           "ex:name"         "Andrew"
+                           "ex:confidential" false}
+                          {"@id"             "ex:cam"
+                           "@type"           "ex:User"
+                           "ex:name"         "Cam"
+                           "ex:confidential" 12}
+                          {"@id"             "ex:widget1"
+                           "@type"           "ex:Product"
+                           "ex:name"         "Secret widget"
+                           "ex:confidential" true}
+                          {"@id"             "ex:widget2"
+                           "ex:name"         "Public widget"
+                           "@type"           "ex:Product"
+                           "ex:confidential" false}
+                          {"@id"     alice-did
+                           "ex:user" {"id" "ex:alice"}
+                           "f:role"  {"id" "ex:publicRole"}}]}})]
+      (testing "Using `f:targetNode`"
+        (let [db+policy @(fluree/stage
+                           db1
+                           {"@context" context
+                            "insert"
+                            {"@type"        ["f:Policy"],
+                             "@id"          "ex:confidentialUserPolicy"
+                             "f:targetNode" {"@id" "f:allNodes"},
+                             "f:allow"
+                             [{"@id"          "ex:publicViewAllow",
+                               "f:targetRole" {"@id" "ex:publicRole"},
+                               "f:action"     [{"@id" "f:modify"}]
+                               "f:query"
+                               ;;TODO type of `f:query` should be in our custom ctx
+                               {"@type" "f:queryType"
+                                "@value"
+                                ;;TODO: should be`@type` `@json`, instead of passing
+                                ;;in string
+                                (str
+                                 ;;TODO: update for `$this`-like behavior
+                                 {"select" [{"?s" ["_id" ]} "?isTrue"]
+                                  "where"
+                                  {"id" "?s" "ex:confidential" "?isTrue"}})}}]}})]
+          (testing "policy forbids modification"
+            (let [public-update-confidential @(fluree/stage db+policy
+                                                            {"@context" context
+                                                             "insert"
+                                                             {"@id"         "ex:brian"
+                                                              "schema:name" "Brian"}}
+                                                            {:role "ex:publicRole"})]
+              (is (util/exception? public-update-confidential))
+              (is (= :db/policy-exception
+                     (:error (ex-data public-update-confidential)))
+                  "Exception should be of type :db/policy-exception")))))
+      (testing "using `f:query` with `f:targetClass`"
+        (let [db+policy @(fluree/stage
+                          db1
+                          {"@context" context
+                           "insert"
+                           {"@type"         ["f:Policy"],
+                            "f:targetClass" {"@id" "ex:User"}
+                            "f:allow"       [{"@id"          "ex:publicViewAllow",
+                                              "f:targetRole" {"@id" "ex:publicRole"},
+                                              "f:action"     [{"@id" "f:view"}
+                                                              {"@id" "f:modify"}],
+                                              "f:query"
+                                              {"@type" "f:queryType"
+                                               "@value"
+                                               ;;TODO use `@type` `@json` instead
+                                               (str {"select" [{"?s" ["_id" ]} "?isTrue"]
+                                                     "where"  {"id" "?s" "ex:confidential" "?isTrue"}})}}]}})]
+          (testing "Respects constraint of `f:targetClass`"
+            (let [update-price @(fluree/stage db+policy
+                                              {"@context" context
+                                               "insert"   {"@id"          "ex:widget2"
+                                                           "schema:price" 99}}
+                                              {:role "ex:publicRole"})]
+              (is (util/exception? update-price)
+                  "Update should throw exception, role cannot modify `ex:Product`s")
+              (is (= :db/policy-exception
+                     (:error (ex-data update-price)))
+                  "Exception should be of type `:db/policy-exception`")))
+          (testing "query prohibits updating certain `ex:User`s"
+            (let [update-confidential-user @(fluree/stage db+policy
+                                                          {"@context" context
+                                                           "insert"   {"@id"         "ex:brian"
+                                                                       "ex:favColor" "blue"}}
+                                                          {:role "ex:publicRole"})]
+              (is (util/exception? update-confidential-user)
+                  "Update should throw exception, cannot modify protected user")
+              (is (= :db/policy-exception
+                     (:error (ex-data update-confidential-user)))
+                  "Exception should be of type `:db/policy-exception`")))
+          (let [update-public-user @(fluree/stage db+policy
+                                                  {"@context" context
+                                                   "insert"   {"@id"         "ex:alice"
+                                                               "ex:favColor" "green"}}
+                                                  {:role "ex:publicRole"})]
+            (is (= [["green"]]
+                   @(fluree/query update-public-user {"@context" context
+                                                      "select"   ["?color"]
+                                                      "where"    {"@id"         "ex:alice"
+                                                                  "ex:favColor" "?color"}})))))
+        (testing "using `f:query` inside of `f:property`"
+          (let [db+policy @(fluree/stage
+                            db1
+                            {"@context" context
+                             "insert"
+                             {"@type"         ["f:Policy"]
+                              "f:targetClass" {"@id" "ex:User"}
+                              "f:allow"       [{"@id"          "ex:publicViewAllow"
+                                                "f:targetRole" {"@id" "ex:publicRole"}
+                                                "f:action"     [{"@id" "f:view"}
+                                                                {"@id" "f:modify"}]}]
+                              "f:property"    [{"f:path"  {"@id" "ex:name"}
+                                                "f:allow" [{"@id"      "ex:nameChangeRule"
+                                                            "f:action" [{"@id" "f:view"}
+                                                                        {"@id" "f:modify"}]
+                                                            "f:query"
+                                                            {"@type" "f:queryType"
+                                                             "@value"
+                                                             (str {"select" [{"?s" ["_id" ]} "?isTrue"]
+                                                                   "where"  {"id" "?s" "ex:confidential" "?isTrue"}})}}]}]}})]
+            (testing "disallowed"
+              (let [update-price @(fluree/stage db+policy
+                                                {"@context" context
+                                                 "insert"   {"@id"          "ex:widget2"
+                                                             "schema:price" 99}}
+                                                {:role "ex:publicRole"})]
+                (is (util/exception? update-price)
+                    "Update should throw exception, role cannot modify `ex:Product`s")
+                (is (= :db/policy-exception
+                       (:error (ex-data update-price)))
+                    "Exception should be of type `:db/policy-exception`"))
+              (let [confidential-name-change @(fluree/stage db+policy
+                                                            {"@context" context
+                                                             "insert"   {"@id"     "ex:brian"
+                                                                         "ex:name" "Bob"}}
+                                                            {:role "ex:publicRole"})]
+                (is (util/exception? confidential-name-change)
+                    "Update should throw exception, role cannot modify names of confidential users")
+                (is (= :db/policy-exception
+                       (:error (ex-data confidential-name-change)))
+                    "Exception should be of type `:db/policy-exception`")))
+            (testing "allowed"
+              (let [confidential-color-change @(fluree/stage db+policy
+                                                             {"@context" context
+                                                              "insert"   {"@id"         "ex:brian"
+                                                                          "ex:favColor" "blue"}}
+                                                             {:role "ex:publicRole"})]
+                (is (= [["blue"] ["yellow"]]
+                       @(fluree/query confidential-color-change
+                                      {"@context" context
+                                       "select"   ["?color"]
+                                       "where"    {"id"          "ex:brian"
+                                                   "ex:favColor" "?color"}}))
+                    "transaction should succeed, property is not restricted"))
+              (let [public-name-change @(fluree/stage db+policy
+                                                      {"@context" context
+                                                       "delete"   {"@id"     "ex:alice"
+                                                                   "ex:name" "Alice"}
+                                                       "insert"   {"@id"     "ex:alice"
+                                                                   "ex:name" "Alicia"}}
+                                                      {:role "ex:publicRole"})]
+                (is (= [["Alicia"]]
+                       @(fluree/query public-name-change
+                                      {"@context" context
+                                       "select"   ["?name"]
+                                       "where"    {"id"      "ex:alice"
+                                                   "ex:name" "?name"}})))))))))))
