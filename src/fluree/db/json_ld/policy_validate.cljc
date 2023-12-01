@@ -156,9 +156,9 @@
                                                  query))
                                  (cache-store-value db cache-path)))
               forbidden-sids (->> q-result
-                                  ;;FIXME this assumes
-                                  ;;special test case where subject is extracted in query
-                                  ;;needs to support `$this`-like behavior instead
+                                  ;;TODO: when sids are deterministic,
+                                  ;;we won't expect queries with `:_id`
+                                  ;;anymore.
                                   (keep (fn [[id-map val]]
                                           (when val
                                             (:_id id-map))))
