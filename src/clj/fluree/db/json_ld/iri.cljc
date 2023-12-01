@@ -147,10 +147,10 @@
   (instance? SID x))
 
 (def ^:const min-sid
-  (->sid util/min-integer [util/min-long]))
+  (->sid util/min-integer [0x0000]))
 
 (def ^:const max-sid
-  (->sid util/max-integer [util/max-long]))
+  (->sid util/max-integer [0xFFFF]))
 
 (defn iri->sid
   "Converts a string iri into a vector of long integer codes. The first code
