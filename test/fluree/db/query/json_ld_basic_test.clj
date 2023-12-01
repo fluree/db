@@ -81,7 +81,22 @@
         (let [query-res @(fluree/query db '{:select {?s [:* {:schema/isBasedOn [:*]}]}
                                             :where  {:id   ?s
                                                      :type :schema/Movie}})]
-          (is (= [{:id                               :wiki/Q2875,
+          (is (= [{:id                               :wiki/Q91540,
+                   :type                             :schema/Movie,
+                   :schema/name                      "Back to the Future",
+                   :schema/disambiguatingDescription "1985 film by Robert Zemeckis",
+                   :schema/titleEIDR                 "10.5240/09A3-1F6E-3538-DF46-5C6F-I",
+                   :schema/followedBy                {:id :wiki/Q109331}}
+                  {:id                               :wiki/Q836821, :type :schema/Movie,
+                   :schema/name                      "The Hitchhiker's Guide to the Galaxy",
+                   :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
+                   :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+                   :schema/isBasedOn                 {:id            :wiki/Q3107329,
+                                                      :type          :schema/Book,
+                                                      :schema/name   "The Hitchhiker's Guide to the Galaxy",
+                                                      :schema/isbn   "0-330-25864-8",
+                                                      :schema/author {:id :wiki/Q42}}}
+                  {:id                               :wiki/Q2875,
                    :type                             :schema/Movie,
                    :schema/disambiguatingDescription "1939 film by Victor Fleming",
                    :schema/isBasedOn                 {:id            :wiki/Q2870,
@@ -99,22 +114,7 @@
                   {:id                :wiki/Q109331, :type :schema/Movie,
                    :schema/name       "Back to the Future Part II",
                    :schema/titleEIDR  "10.5240/5DA5-C386-2911-7E2B-1782-L",
-                   :schema/followedBy {:id :wiki/Q230552}}
-                  {:id                               :wiki/Q91540,
-                   :type                             :schema/Movie,
-                   :schema/name                      "Back to the Future",
-                   :schema/disambiguatingDescription "1985 film by Robert Zemeckis",
-                   :schema/titleEIDR                 "10.5240/09A3-1F6E-3538-DF46-5C6F-I",
-                   :schema/followedBy                {:id :wiki/Q109331}}
-                  {:id                               :wiki/Q836821, :type :schema/Movie,
-                   :schema/name                      "The Hitchhiker's Guide to the Galaxy",
-                   :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
-                   :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
-                   :schema/isBasedOn                 {:id            :wiki/Q3107329,
-                                                      :type          :schema/Book,
-                                                      :schema/name   "The Hitchhiker's Guide to the Galaxy",
-                                                      :schema/isbn   "0-330-25864-8",
-                                                      :schema/author {:id :wiki/Q42}}}]                                  ;; :id is a DID and will be unique per DB so exclude from comparison
+                   :schema/followedBy {:id :wiki/Q230552}}]                                  ;; :id is a DID and will be unique per DB so exclude from comparison
                  query-res)
               "Standard bootstrap data isn't matching."))))))
 
@@ -221,16 +221,8 @@
                :ex/last      "Jones"
                :schema/name  "Cam"
                :id           :ex/cam
-               :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
                :ex/favColor  "Blue"}
-              {:id           :ex/alice
-               :type         :ex/User
-               :schema/name  "Alice"
-               :ex/last      "Smith"
-               :schema/email "alice@example.org"
-               :schema/age   42
-               :ex/favNums   [9 42 76]
-               :ex/favColor  "Green"}
               {:id           :ex/brian
                :type         :ex/User
                :schema/name  "Brian"
@@ -238,7 +230,15 @@
                :schema/email "brian@example.org"
                :schema/age   50
                :ex/favColor  "Green"
-               :ex/favNums   7}]
+               :ex/favNums   7}
+              {:id           :ex/alice
+               :type         :ex/User
+               :schema/name  "Alice"
+               :ex/last      "Smith"
+               :schema/email "alice@example.org"
+               :schema/age   42
+               :ex/favNums   [9 42 76]
+               :ex/favColor  "Green"}]
              @(fluree/query db {:select {"?s" ["*"]}
                                 :where  {:id   "?s"
                                          :type :ex/User}}))))
@@ -261,16 +261,8 @@
                :ex/last      "Jones"
                :schema/name  "Cam"
                :id           :ex/cam
-               :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
                :ex/favColor  "Blue"}
-              {:id           :ex/alice
-               :type         :ex/User
-               :schema/name  "Alice"
-               :ex/last      "Smith"
-               :schema/email "alice@example.org"
-               :schema/age   42
-               :ex/favNums   [9 42 76]
-               :ex/favColor  "Green"}
               {:id           :ex/brian,
                :type         :ex/User,
                :ex/favNums   7,
@@ -278,7 +270,15 @@
                :schema/age   50,
                :ex/last      "Smith",
                :schema/email "brian@example.org",
-               :schema/name  "Brian"}]
+               :schema/name  "Brian"}
+              {:id           :ex/alice
+               :type         :ex/User
+               :schema/name  "Alice"
+               :ex/last      "Smith"
+               :schema/email "alice@example.org"
+               :schema/age   42
+               :ex/favNums   [9 42 76]
+               :ex/favColor  "Green"}]
              @(fluree/query db {:select {"?s" ["*"]}
                                 :where  {:id          "?s"
                                          :ex/favColor "?color"}})))
@@ -290,16 +290,16 @@
                :ex/last      "Jones"
                :schema/name  "Cam"
                :id           :ex/cam
-               :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
                :ex/favColor  "Blue"}
-              {:id           :ex/alice
-               :type         :ex/User
-               :schema/name  "Alice"
-               :ex/last      "Smith"
-               :schema/email "alice@example.org"
-               :schema/age   42
-               :ex/favNums   [9 42 76]
-               :ex/favColor  "Green"}]
+              {:id           :ex/brian,
+               :type         :ex/User,
+               :ex/favNums   7,
+               :ex/favColor  "Green",
+               :schema/age   50,
+               :ex/last      "Smith",
+               :schema/email "brian@example.org",
+               :schema/name  "Brian"}]
              @(fluree/query db {:select {"?s" ["*"]}
                                 :where  {:id          "?s"
                                          :ex/favColor "?color"}
