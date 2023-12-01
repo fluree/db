@@ -70,4 +70,8 @@ public final class SID implements Comparable {
 
         return hsh;
     }
+
+    public static final int compare(SID s1, SID s2) {
+        return s1.compareTo(s2);
+    }
 }
