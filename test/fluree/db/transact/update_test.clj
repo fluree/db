@@ -4,131 +4,123 @@
             [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration deleting-data
-  (testing "Deletions of entire subjects."
+  (testing "For ledgers with previously transacted data,"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "tx/delete"
                                  {:defaultContext
                                   ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
-                              (fluree/db ledger)
-                              {"@context" "https://ns.flur.ee"
-                               "insert"
-                               {:graph [{:id           :ex/alice
-                                         :type         :ex/User
-                                         :schema/name  "Alice"
-                                         :schema/email "alice@flur.ee"
-                                         :schema/age   42}
-                                        {:id          :ex/bob
-                                         :type        :ex/User
-                                         :schema/name "Bob"
-                                         :schema/age  22}
-                                        {:id           :ex/jane
-                                         :type         :ex/User
-                                         :schema/name  "Jane"
-                                         :schema/email "jane@flur.ee"
-                                         :schema/age   30}]}})
+                    (fluree/db ledger)
+                    {"@context" "https://ns.flur.ee"
+                     "insert"
+                     {:graph [{:id           :ex/alice
+                               :type         :ex/User
+                               :schema/name  "Alice"
+                               :schema/email "alice@flur.ee"
+                               :schema/age   42}
+                              {:id          :ex/bob
+                               :type        :ex/User
+                               :schema/name "Bob"
+                               :schema/age  22}
+                              {:id           :ex/jane
+                               :type         :ex/User
+                               :schema/name  "Jane"
+                               :schema/email "jane@flur.ee"
+                               :schema/age   30}]}})]
 
-          ;; delete everything for :ex/alice
-          db-subj-delete @(fluree/stage db
-                                         {"@context" "https://ns.flur.ee"
-                                          "where"    '{:id :ex/alice, "?p" "?o"}
-                                          "delete"   '{:id :ex/alice, "?p" "?o"}})
+      (testing "issuing retractions"
+        (testing "selecting any properties and values for a subject"
+          (let [db-subj-delete @(fluree/stage db
+                                              {"@context" "https://ns.flur.ee"
+                                               "where"    '{:id :ex/alice, "?p" "?o"}
+                                               "delete"   '{:id :ex/alice, "?p" "?o"}})]
+            (is (= @(fluree/query db-subj-delete
+                                  '{:select ?name
+                                    :where  {:schema/name ?name}})
+                   ["Bob" "Jane"])
+                "removes the entire subject")))
 
-          ;; delete any :schema/age values for :ex/bob
-          db-subj-pred-del @(fluree/stage db
-                                           '{"@context" "https://ns.flur.ee"
-                                             "delete"   {:id :ex/bob, :schema/age "?o"}
-                                             "where"    {:id :ex/bob, :schema/age "?o"}})
+        (testing "selecting any values for a specific property on a subject"
+          (let [db-subj-pred-del @(fluree/stage db
+                                                '{"@context" "https://ns.flur.ee"
+                                                  "delete"   {:id :ex/bob, :schema/age "?o"}
+                                                  "where"    {:id :ex/bob, :schema/age "?o"}})]
+            (is (= @(fluree/query db-subj-pred-del
+                                  '{:selectOne {:ex/bob [:*]}})
+                   {:id          :ex/bob,
+                    :type        :ex/User,
+                    :schema/name "Bob"})
+                "removes that property for that subject")))
 
-          ;; delete all subjects with a :schema/email predicate
-          db-all-preds @(fluree/stage db
-                                       '{"@context" "https://ns.flur.ee"
-                                         "delete"   {:id "?s", "?p" "?o"}
-                                         "where"    {:id           "?s"
-                                                     :schema/email "?x"
-                                                     "?p"          "?o"}})
+        (testing "selecting any subject with a specified property"
+          (let [db-all-preds @(fluree/stage db
+                                            '{"@context" "https://ns.flur.ee"
+                                              "delete"   {:id "?s", "?p" "?o"}
+                                              "where"    {:id           "?s"
+                                                          :schema/email "?x"
+                                                          "?p"          "?o"}})]
+            (is (= @(fluree/query db-all-preds
+                                  '{:select ?name
+                                    :where  {:schema/name ?name}})
+                   ["Bob"])
+                "deletes all subjects with that property")))
 
-          ;; delete all subjects where :schema/age = 30
-          db-age-delete @(fluree/stage db
-                                        '{"@context" "https://ns.flur.ee"
-                                          "delete"   {:id "?s", "?p" "?o"}
-                                          "where"    {:id         "?s"
-                                                      :schema/age 30
-                                                      "?p"        "?o"}})
+        (testing "selecting any subject with a specific value of a specified property"
+          (let [db-age-delete @(fluree/stage db
+                                             '{"@context" "https://ns.flur.ee"
+                                               "delete"   {:id "?s", "?p" "?o"}
+                                               "where"    {:id         "?s"
+                                                           :schema/age 30
+                                                           "?p"        "?o"}})]
+            (is (= @(fluree/query db-age-delete
+                                  '{:select ?name
+                                    :where  {:schema/name ?name}})
+                   ["Alice" "Bob"])
+                "deletes all subjects with that value for the specified property."))))
 
-          ;; Change Bob's age - but only if his age is still 22
-          db-update-bob @(fluree/stage db
-                                        '{"@context" "https://ns.flur.ee"
-                                          "delete"   {:id :ex/bob, :schema/age 22}
-                                          "insert"   {:id :ex/bob, :schema/age 23}
-                                          "where"    {:id :ex/bob, :schema/age 22}})
+      (testing "issuing updates"
+        (testing "specifying a matching current property value"
+          (let [db-update-bob @(fluree/stage db
+                                             '{"@context" "https://ns.flur.ee"
+                                               "delete"   {:id :ex/bob, :schema/age 22}
+                                               "insert"   {:id :ex/bob, :schema/age 23}
+                                               "where"    {:id :ex/bob, :schema/age 22}})]
+            (is (= [{:id          :ex/bob,
+                     :type        :ex/User,
+                     :schema/name "Bob"
+                     :schema/age  23}]
+                   @(fluree/query db-update-bob
+                                  '{:select {:ex/bob [:*]}}))
+                "changes the matched property to the new value.")))
 
-          ;; Shouldn't change Bob's age as the current age is not a match
-          db-update-bob2 @(fluree/stage db
-                                         '{"@context" "https://ns.flur.ee"
-                                           "delete"   {:id "?s" :schema/age 99}
-                                           "insert"   {:id "?s" :schema/age 23}
-                                           "where"    {:id "?s" :schema/age 99}})
+        (testing "specifying a property value that doesn't match"
+          (let [db-update-bob2 @(fluree/stage db
+                                              '{"@context" "https://ns.flur.ee"
+                                                "delete"   {:id "?s" :schema/age 99}
+                                                "insert"   {:id "?s" :schema/age 23}
+                                                "where"    {:id "?s" :schema/age 99}})]
+            (is (= [{:id          :ex/bob,
+                     :type        :ex/User,
+                     :schema/name "Bob"
+                     :schema/age  22}]
+                   @(fluree/query db-update-bob2
+                                  '{:select {:ex/bob [:*]}}))
+                "no changes are made")))
 
-          ;; change Jane's age regardless of its current value
-          db-update-jane @(fluree/stage db
-                                         '{"@context" "https://ns.flur.ee"
-                                           "delete"   {:id :ex/jane, :schema/age "?current-age"}
-                                           "insert"   {:id :ex/jane, :schema/age 31}
-                                           "where"    {:id :ex/jane, :schema/age "?current-age"}})]
-
-      (is (= @(fluree/query db-subj-delete
-                            '{:select ?name
-                              :where  {:schema/name ?name}})
-             ["Bob" "Jane"])
-          "Only Jane and Bob should be left in the db.")
-
-      (is (= @(fluree/query db-subj-pred-del
-                            '{:selectOne {:ex/bob [:*]}})
-             {:id          :ex/bob,
-              :type        :ex/User,
-              :schema/name "Bob"})
-          "Bob should no longer have an age property.")
-
-      (is (= @(fluree/query db-all-preds
-                            '{:select ?name
-                              :where  {:schema/name ?name}})
-             ["Bob"])
-          "Only Bob should be left, as he is the only one without an email.")
-
-      (is (= @(fluree/query db-age-delete
-                            '{:select ?name
-                              :where  {:schema/name ?name}})
-             ["Alice" "Bob"])
-          "Only Bob and Alice should be left in the db.")
-
-      (testing "Updating property value only if its current value is a match."
-        (is (= [{:id          :ex/bob,
-                 :type        :ex/User,
-                 :schema/name "Bob"
-                 :schema/age  23}]
-               @(fluree/query db-update-bob
-                              '{:select {:ex/bob [:*]}}))
-            "Bob's age should now be updated to 23 (from 22)."))
-
-      (testing "No update should happen if there is no match."
-        (is (= [{:id          :ex/bob,
-                 :type        :ex/User,
-                 :schema/name "Bob"
-                 :schema/age  22}]
-               @(fluree/query db-update-bob2
-                              '{:select {:ex/bob [:*]}}))
-            "Bob's age should have not been changed and still be 22."))
-
-      (testing "Replacing existing property value with new property value."
-        (is (= [{:id           :ex/jane,
-                 :type         :ex/User,
-                 :schema/name  "Jane"
-                 :schema/email "jane@flur.ee"
-                 :schema/age   31}]
-               @(fluree/query db-update-jane
-                              '{:select {:ex/jane [:*]}}))
-            "Jane's age should now be updated to 31 (from 30).")))))
+        (testing "selecting any value for a specific property on a specific subject"
+          (let [db-update-jane @(fluree/stage db
+                                              '{"@context" "https://ns.flur.ee"
+                                                "delete"   {:id :ex/jane, :schema/age "?current-age"}
+                                                "insert"   {:id :ex/jane, :schema/age 31}
+                                                "where"    {:id :ex/jane, :schema/age "?current-age"}})]
+            (is (= [{:id           :ex/jane,
+                     :type         :ex/User,
+                     :schema/name  "Jane"
+                     :schema/email "jane@flur.ee"
+                     :schema/age   31}]
+                   @(fluree/query db-update-jane
+                                  '{:select {:ex/jane [:*]}}))
+                "changes the value of that subject to the new value")))))))
 
 (deftest transaction-functions
   (let [conn   @(fluree/connect {:method :memory})
