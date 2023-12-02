@@ -6,7 +6,6 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.set :as set]
-            [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.core :as util :refer [try* catch*]]

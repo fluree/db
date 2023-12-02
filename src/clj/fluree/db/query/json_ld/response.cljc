@@ -16,7 +16,8 @@
 (defn cache-sid->iri
   [db cache compact-fn sid]
   (go-try
-    (when-let [iri (some-> sid (iri/sid->iri (:namespace-codes db)) compact-fn)]
+    (when-let [iri (or (some-> db :schema :pred (get sid) :iri compact-fn)
+                       (some-> sid (iri/sid->iri (:namespace-codes db)) compact-fn))]
       (vswap! cache assoc sid {:as iri})
       {:as iri})))
 
