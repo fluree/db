@@ -115,7 +115,7 @@
                :ex/last "Jones"
                :schema/name "Cam"
                :id :ex/cam
-               :ex/friend [{:id :ex/brian} {:id :ex/alice}]
+               :ex/friend [{:id :ex/alice} {:id :ex/brian}]
                :ex/favColor "Blue"}]
              @(fluree/query db {:select {"?s" ["*"]}
                                 :where  [{:id "?s", :ex/favColor "?color"}
