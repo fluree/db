@@ -1,7 +1,6 @@
 (ns fluree.db.transact.transact-test
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
-            [clojure.test :refer :all]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.test-utils :as test-utils]
@@ -40,17 +39,13 @@
              (ex-message stage-id-only)))
       (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
              (ex-message stage-empty-txn)))
-      (is (= {:flakes 5, :size 330, :indexed 0}
+      (is (= {:flakes 1, :size 50, :indexed 0}
              (:stats stage-empty-node))
           "empty nodes are allowed as long as there is other data, they are just noops")
-      (is (= #{[:ex/alice :id "http://example.org/ns/alice"]
-               [:ex/alice :schema/age 42]
-               [:schema/age :id "http://schema.org/age"]
-               [:id :id "@id"]
-               [:type :id "@type"]}
-             (set @(fluree/query db-ok '{:select [?s ?p ?o]
-                                         :where  {:id ?s
-                                                  ?p  ?o}}))))))
+      (is (= [[:ex/alice :schema/age 42]]
+             @(fluree/query db-ok '{:select [?s ?p ?o]
+                                    :where  {:id ?s
+                                             ?p  ?o}})))))
 
   (testing "Allow transacting `false` values"
     (let [conn    (test-utils/create-conn)
@@ -63,13 +58,9 @@
                       "insert"
                       {:id        :ex/alice
                        :ex/isCool false}})]
-      (is (= #{[:ex/alice :id "http://example.org/ns/alice"]
-               [:ex/alice :ex/isCool false]
-               [:ex/isCool :id "http://example.org/ns/isCool"]
-               [:id :id "@id"]
-               [:type :id "@type"]}
-             (set @(fluree/query db-bool '{:select [?s ?p ?o]
-                                           :where  {:id ?s, ?p ?o}}))))))
+      (is (= [[:ex/alice :ex/isCool false]]
+             @(fluree/query db-bool '{:select [?s ?p ?o]
+                                      :where  {:id ?s, ?p ?o}})))))
 
   (testing "mixed data types (ref & string) are handled correctly"
     (let [conn   (test-utils/create-conn)
