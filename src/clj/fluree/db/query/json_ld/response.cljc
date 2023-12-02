@@ -98,7 +98,7 @@
                   spec  (or (get select-spec iri)
                             (when wildcard?
                               (or (get @cache iri)
-                                  (wildcard-spec db cache compact-fn p)
+                                  (wildcard-spec db cache compact-fn iri)
                                   (<? (cache-sid->iri db cache compact-fn p)))))
                   p-iri (:as spec)
                   v     (cond
