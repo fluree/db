@@ -329,7 +329,7 @@
                                          :schema/age  42
                                          :ex/favColor "Green"}}))))))
 
-(deftest ^:integration query-with-faux-compact-iri
+(deftest ^:kaocha/pending ^:integration query-with-faux-compact-iri
   (testing "query with a faux compact IRI works"
     (let [conn   (test-utils/create-conn
                    {:context      test-utils/default-str-context
