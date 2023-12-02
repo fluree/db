@@ -115,32 +115,22 @@
                                :schema/email "jane@flur.ee"
                                :schema/age   30}]}})]
       (testing "Query that pulls entire database."
-        (is (= #{[:ex/jane :id "http://example.org/ns/jane"]
-                 [:ex/jane :type :ex/User]
-                 [:ex/jane :schema/name "Jane"]
-                 [:ex/jane :schema/email "jane@flur.ee"]
-                 [:ex/jane :schema/age 30]
-                 [:ex/bob :id "http://example.org/ns/bob"]
-                 [:ex/bob :type :ex/User]
-                 [:ex/bob :schema/name "Bob"]
-                 [:ex/bob :schema/age 22]
-                 [:ex/alice :id "http://example.org/ns/alice"]
-                 [:ex/alice :type :ex/User]
-                 [:ex/alice :schema/name "Alice"]
-                 [:ex/alice :schema/email "alice@flur.ee"]
-                 [:ex/alice :schema/age 42]
-                 [:schema/age :id "http://schema.org/age"]
-                 [:schema/email :id "http://schema.org/email"]
-                 [:schema/name :id "http://schema.org/name"]
-                 [:ex/User :id "http://example.org/ns/User"]
-                 [:type :id "@type"]
-                 [:id :id "@id"]}
-               (set @(fluree/query db {:select ['?s '?p '?o]
-                                       :where  {:id '?s
-                                                '?p '?o}})))
+        (is (= [[:ex/jane :type :ex/User]
+                [:ex/jane :schema/name "Jane"]
+                [:ex/jane :schema/email "jane@flur.ee"]
+                [:ex/jane :schema/age 30]
+                [:ex/bob :type :ex/User]
+                [:ex/bob :schema/name "Bob"]
+                [:ex/bob :schema/age 22]
+                [:ex/alice :type :ex/User]
+                [:ex/alice :schema/name "Alice"]
+                [:ex/alice :schema/email "alice@flur.ee"]
+                [:ex/alice :schema/age 42]]
+               @(fluree/query db {:select ['?s '?p '?o]
+                                  :where  {:id '?s
+                                           '?p '?o}}))
             "Entire database should be pulled.")
-        (is (= [{:id :id}
-                {:id :type}
+        (is (= [{:id :type}
                 {:id :ex/User}
                 {:id           :ex/alice,
                  :type         :ex/User,
@@ -217,58 +207,27 @@
         (let [db*    @(fluree/commit! ledger db)
               result @(fluree/query db* {:select ['?s '?p '?o]
                                          :where  {:id '?s, '?p '?o}})]
-          (is (= #{[:ex/jane :id "http://example.org/ns/jane"]
-                   [:ex/jane :type :ex/User]
+          (is (= #{[:ex/jane :type :ex/User]
                    [:ex/jane :schema/age 30]
                    [:ex/jane :schema/name "Jane"]
                    [:ex/jane :schema/email "jane@flur.ee"]
-                   [:ex/bob :id "http://example.org/ns/bob"]
                    [:ex/bob :type :ex/User]
                    [:ex/bob :schema/age 22]
                    [:ex/bob :schema/name "Bob"]
-                   [:ex/User :id "http://example.org/ns/User"]
-                   [:ex/alice :id "http://example.org/ns/alice"]
                    [:ex/alice :type :ex/User]
                    [:ex/alice :schema/age 42]
                    [:ex/alice :schema/name "Alice"]
                    [:ex/alice :schema/email "alice@flur.ee"]
                    ["fluree:context:68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"
-                    :id
-                    "fluree:context:68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"]
-                   ["fluree:context:68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"
                     :f/address
                     "fluree:memory://68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"]
                    ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6" :id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                   ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"
-                    :id
-                    "fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"]
                    ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"
                     :f/address
                     "fluree:memory://eb42c9187ee0bddcc215c5d7ca829c1528a22bf8ee94f933affbe830b845030a"]
                    ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw" :f/flakes 21]
                    ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw" :f/size 1370]
                    ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw" :f/t 1]
-                   [:schema/email :id "http://schema.org/email"]
-                   [:schema/name :id "http://schema.org/name"]
-                   [:schema/age :id "http://schema.org/age"]
-                   [:type :id "@type"]
-                   [:f/t :id "https://ns.flur.ee/ledger#t"]
-                   [:f/size :id "https://ns.flur.ee/ledger#size"]
-                   [:f/flakes :id "https://ns.flur.ee/ledger#flakes"]
-                   [:f/defaultContext :id "https://ns.flur.ee/ledger#defaultContext"]
-                   [:f/branch :id "https://ns.flur.ee/ledger#branch"]
-                   [:f/alias :id "https://ns.flur.ee/ledger#alias"]
-                   [:f/data :id "https://ns.flur.ee/ledger#data"]
-                   [:f/address :id "https://ns.flur.ee/ledger#address"]
-                   [:f/v :id "https://ns.flur.ee/ledger#v"]
-                   ["https://www.w3.org/2018/credentials#issuer" :id "https://www.w3.org/2018/credentials#issuer"]
-                   [:f/time :id "https://ns.flur.ee/ledger#time"]
-                   [:f/message :id "https://ns.flur.ee/ledger#message"]
-                   [:f/previous :id "https://ns.flur.ee/ledger#previous"]
-                   [:id :id "@id"]
-                   ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl"
-                    :id
-                    "fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl"]
                    ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl" :f/time 720000]
                    ["fluree:commit:sha256:bzi7qawok23j6feif5wiugabgczftca3jm44d6ko2tr2p7evf2zl"
                     "https://www.w3.org/2018/credentials#issuer"
