@@ -62,11 +62,11 @@
    Note that for multi-cardinality predicates, the prediate filters must pass for just one flake
   "
   [db first-s rest-where supplied-vars]
-  (loop [[{:keys [s p o] :as where-smt} & r] rest-where
+  (loop [[where-smt & r] rest-where
          required-p #{} ;; set of 'p' values that are going to be required for a subject to have
          filter-map {}] ;; key 'p' value, val is list of filtering fns
     (let [[s p o] where-smt
-          p*      (->> p ::where/iri (dbproto/-p-prop db :id))
+          p*      (-> p ::where/iri (iri/iri->sid (:namespaces db)))
           type (where/pattern-type where-smt)]
       (if where-smt
         (when (and (= :tuple type)
@@ -113,7 +113,7 @@
 (defn reparse-predicate-component
   [db pred]
   (if-let [p-iri (::where/iri pred)]
-    {:value (dbproto/-p-prop db :id p-iri)}
+    {:value (iri/iri->sid p-iri (:namespaces db))}
     (reparse-component pred)))
 
 (defn re-parse-pattern
