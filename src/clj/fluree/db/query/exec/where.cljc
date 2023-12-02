@@ -363,10 +363,11 @@
 (defn compute-datatype-sid
   [o-mch db]
   (let [db-alias (:alias db)
-        nses     (:namespaces db)
-        dt-iri   (::datatype-iri o-mch)]
-    (when-let [sid (iri/iri->sid dt-iri nses)]
-      (assoc-in o-mch [::datatype-sid db-alias] sid))))
+        nses     (:namespaces db)]
+    (if-let [dt-iri   (::datatype-iri o-mch)]
+      (when-let [sid (iri/iri->sid dt-iri nses)]
+        (assoc-in o-mch [::datatype-sid db-alias] sid))
+      o-mch)))
 
 (defn compute-sids
   [db [s p o]]
