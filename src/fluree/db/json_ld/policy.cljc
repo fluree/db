@@ -395,7 +395,7 @@
   [db policy nodes]
   (go-try
     (let [all-nodes?               (some #(= const/iri-all-nodes %) nodes)
-          nodes*                   (when all-nodes?
+          nodes*                   (if all-nodes?
                                      (non-allNodes nodes)
                                      nodes)
           root-actions             (when all-nodes?
