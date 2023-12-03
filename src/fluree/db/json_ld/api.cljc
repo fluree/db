@@ -301,11 +301,12 @@
   allows the permission attributes to be modified.
 
   Returns promise"
-  [db identity-map]
-  (promise-wrap
-   (->> identity-map
-        perm/policy-identity
-        (perm/wrap-policy db))))
+  ([db identity-map]
+   (wrap-policy db identity-map nil))
+  ([db identity-map context]
+   (promise-wrap
+     (let [policy-id (perm/parse-policy-identity identity-map context)]
+       (perm/wrap-policy db policy-id)))))
 
 
 (defn query

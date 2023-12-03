@@ -212,15 +212,8 @@
    (stage db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (go-try
-    (let [db* (if-let [policy-identity (perm/policy-identity
-                                        (-> parsed-opts
-                                            ;;TODO once we remove default-context,
-                                            ;;should only have one context, with no need
-                                            ;;to swap here
-                                            (assoc :context
-                                                   (:supplied-context parsed-opts))
-                                            (dissoc :supplied-context)))]
-                (<? (perm/wrap-policy db policy-identity))
+     (let [db* (if-let [policy-identity (perm/parse-policy-identity parsed-opts (:supplied-context parsed-opts))]
+                 (<? (perm/wrap-policy db policy-identity))
                  db)
            tx-state      (->tx-state db*)
 

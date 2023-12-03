@@ -28,12 +28,8 @@
   (go-try
    (let [{:keys [opts]} query-map
          {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map)
-         db*            (if-let [policy-identity (perm/policy-identity
-                                                  ;;TODO only using query supplied context for policy opts,
-                                                  ;;should be the only context operation once we have removed
-                                                  ;;default-context
-                                                  (assoc opts :context
-                                                         (ctx-util/extract-supplied-context parsed)))]
+         ctx (ctx-util/extract-supplied-context parsed)
+         db*            (if-let [policy-identity (perm/parse-policy-identity opts ctx)]
                           (<? (perm/wrap-policy db policy-identity))
                           db)
          ;; from and to are positive ints, need to convert to negative or fill in default values
@@ -112,9 +108,9 @@
     did (assoc :did did :issuer did)))
 
 (defn restrict-db
-  [db t opts]
+  [db t context opts]
   (go-try
-    (let [db*  (if-let [policy-identity (perm/policy-identity opts)]
+    (let [db*  (if-let [policy-identity (perm/parse-policy-identity opts context)]
                  (<? (perm/wrap-policy db policy-identity))
                  db)
           db** (-> (if t
@@ -151,7 +147,7 @@
           ;;TODO: only using query context for opts, should be only context
           ;;once default-context is removed
           q-ctx    (ctx-util/extract-supplied-context query*)
-          db*      (<? (restrict-db db t (assoc opts :context q-ctx)))
+          db*      (<? (restrict-db db t q-ctx opts))
           query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
           ctx      (ctx-util/extract db* query** opts)
           max-fuel (:max-fuel opts)]
@@ -190,20 +186,20 @@
       e)))
 
 (defn load-alias
-  [conn alias t opts]
+  [conn alias t context opts]
   (go-try
    (try*
      (let [address (<? (nameservice/primary-address conn alias nil))
            ledger  (<? (jld-ledger/load conn address))
            db      (ledger-proto/-db ledger)]
-       (<? (restrict-db db t opts)))
+       (<? (restrict-db db t context opts)))
      (catch* e
        (throw (contextualize-ledger-400-error
                (str "Error loading ledger " alias ": ")
                e))))))
 
 (defn load-aliases
-  [conn aliases global-t opts]
+  [conn aliases global-t context opts]
   (when (some? global-t)
     (try*
       (util/str->epoch-ms global-t)
@@ -218,21 +214,24 @@
           db-map      {}]
      (if alias
        ;; TODO: allow restricting federated dataset components individually by t
-       (let [db      (<? (load-alias conn alias global-t opts))
+       (let [db      (<? (load-alias conn alias global-t context opts))
              db-map* (assoc db-map alias db)]
          (recur r db-map*))
        db-map))))
 
 (defn load-dataset
-  [conn defaults named global-t opts]
+  [conn defaults named global-t context opts]
   (go-try
     (if (and (= (count defaults) 1)
              (empty? named))
       (let [alias (first defaults)]
-        (<? (load-alias conn alias global-t opts))) ; return an unwrapped db if the data set
-                                                    ; consists of one ledger
+        (<? (load-alias conn alias global-t context opts))) ; return an
+                                                            ; unwrapped db if
+                                                            ; the data set
+                                                            ; consists of one
+                                                            ; ledger
       (let [all-aliases  (->> defaults (concat named) distinct)
-            db-map       (<? (load-aliases conn all-aliases global-t opts))
+            db-map       (<? (load-aliases conn all-aliases global-t context opts))
             default-coll (-> db-map
                              (select-keys defaults)
                              vals)
@@ -250,8 +249,9 @@
           named-aliases   (some-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [ds          (<? (load-dataset conn default-aliases named-aliases t
-                                            (assoc  opts :context (ctx-util/extract-supplied-context query))))
+        (let [s-ctx       (ctx-util/extract-supplied-context query)
+              ds          (<? (load-dataset conn default-aliases named-aliases t
+                                            s-ctx opts))
               query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
               max-fuel    (:max-fuel opts)
               default-ctx (conn-proto/-default-context conn)

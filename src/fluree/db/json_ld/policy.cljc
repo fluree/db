@@ -490,9 +490,9 @@
          (throw e))))))
 
 
-(defn policy-identity
-  [{:keys [context] :as identity-map}]
-  (when-let [{:keys [role] :as identity} (-> identity-map
+(defn parse-policy-identity
+  [opts context]
+  (when-let [{:keys [role] :as identity} (-> opts
                                              (select-keys [:did :role :credential])
                                              not-empty)]
     (if (and role context)
