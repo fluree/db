@@ -176,46 +176,30 @@
           acc**)))))
 
 (defn- assert-node*
-  [{:keys [base-flakes db iri-cache next-pid ref-cache] :as assert-state} node]
+  [{:keys [base-flakes db ref-cache] :as assert-state} node]
   (go-try
     (loop [[[k v-maps] & r] node
            acc base-flakes]
       (if k
         (if (keyword? k)
           (recur r acc)
-          (let [existing-pid (<? (get-iri-sid k db iri-cache))
-                v-maps*      (util/sequential v-maps)
-                pid          (or existing-pid
-                                 (get jld-ledger/predefined-properties k)
-                                 (jld-ledger/generate-new-pid
-                                   k iri-cache next-pid (-> v-maps* first :id) ref-cache))
+          (let [v-maps*      (util/sequential v-maps)
+                pid          (iri/iri->sid k (:namespaces db))
                 acc*         (<? (assert-v-maps
-                                   (assoc assert-state :existing-pid existing-pid
-                                                       :pid pid, :k k, :acc acc)
+                                   (assoc assert-state :pid pid, :k k, :acc acc)
                                    v-maps*))]
             (recur r acc*)))
         acc))))
 
 (defn- get-type-assertions
-  [{:keys [db iri-cache next-pid sid t]} type]
+  [{:keys [db sid t]} type]
   (go-try
     (if type
       (loop [[type-item & r] type
              acc []]
         (if type-item
-          (let [existing-id (<? (get-iri-sid type-item db iri-cache))
-                type-id     (or existing-id
-                                (get jld-ledger/predefined-properties type-item)
-                                (jld-ledger/generate-new-pid type-item iri-cache
-                                                             next-pid nil nil))
-                type-flakes (when-not existing-id
-                              [(flake/create type-id const/$rdf:type
-                                             const/$rdfs:Class const/$xsd:anyURI
-                                             t true nil)])]
-            (recur r (cond-> (conj acc
-                                   (flake/create sid const/$rdf:type type-id
-                                                 const/$xsd:anyURI t true nil))
-                             type-flakes (into type-flakes))))
+          (let [type-id  (iri/iri->sid type-item (:namespaces db))]
+            (recur r  (conj acc (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t true nil))))
           acc))
       [])))
 
@@ -224,9 +208,7 @@
   (go-try
     (log/trace "assert-node:" node)
     (let [{:keys [id type]} node
-          existing-sid    (<? (get-iri-sid id db iri-cache))
-          sid             (or existing-sid
-                              (iri/iri->sid id (:namespaces db)))
+          sid             (iri/iri->sid id (:namespaces db))
           assert-state    {:db db, :iri-cache iri-cache, :id id
                            :ref-cache ref-cache, :sid sid, :t t}
           type-assertions (if (seq type)
