@@ -7,6 +7,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.context :as ctx-util]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.credential :as cred]
@@ -38,13 +39,14 @@
           s-ctx (some-> txn ctx-util/extract-supplied-context json-ld/parse-context)
           db*   (if-let [policy-identity (perm/parse-policy-identity parsed-opts* s-ctx)]
                   (<? (perm/wrap-policy db policy-identity))
-                  db)]
+                  db)
+          txn-context   (dbproto/-context db (:context parsed-opts))]
       (if (or maxFuel meta)
         (let [start-time   #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))
               fuel-tracker (fuel/tracker maxFuel)]
           (try*
-            (let [result (<? (tx/stage db* fuel-tracker expanded parsed-opts*))]
+            (let [result (<? (tx/stage db* txn-context fuel-tracker expanded parsed-opts*))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start-time)
@@ -54,7 +56,7 @@
                               {:time (util/response-time-formatted start-time)
                                :fuel (fuel/tally fuel-tracker)}
                               e)))))
-        (<? (tx/stage db* expanded parsed-opts*))))))
+        (<? (tx/stage db* txn-context expanded parsed-opts*))))))
 
 (defn transact!
   [conn txn]
