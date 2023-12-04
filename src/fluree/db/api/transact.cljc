@@ -10,7 +10,8 @@
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.ledger.proto :as ledger-proto]))
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.json-ld.policy :as perm]))
 
 (defn parse-opts
   [parsed-opts opts]
@@ -27,6 +28,7 @@
                                       (ctx-util/txn-context txn))
           expanded                (json-ld/expand (ctx-util/use-fluree-context txn))
           opts                    (util/get-first-value expanded const/iri-opts)
+
           parsed-opts             (cond-> parsed-opts
                                     did (assoc :did did)
                                     txn-context (assoc :context txn-context)
@@ -35,13 +37,16 @@
                                     ;;the `:context` key
                                     true (assoc :supplied-context (ctx-util/extract-supplied-context txn)))
 
-          {:keys [maxFuel meta] :as parsed-opts*} (parse-opts parsed-opts opts)]
+          {:keys [maxFuel meta] :as parsed-opts*} (parse-opts parsed-opts opts)
+          db* (if-let [policy-identity (perm/parse-policy-identity parsed-opts* (:supplied-context parsed-opts*))]
+                 (<? (perm/wrap-policy db policy-identity))
+                 db)]
       (if (or maxFuel meta)
         (let [start-time   #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))
               fuel-tracker (fuel/tracker maxFuel)]
           (try*
-            (let [result (<? (tx/stage db fuel-tracker expanded parsed-opts*))]
+            (let [result (<? (tx/stage db* fuel-tracker expanded parsed-opts*))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start-time)
@@ -51,7 +56,7 @@
                               {:time (util/response-time-formatted start-time)
                                :fuel (fuel/tally fuel-tracker)}
                               e)))))
-        (<? (tx/stage db expanded parsed-opts*))))))
+        (<? (tx/stage db* expanded parsed-opts*))))))
 
 (defn transact!
   [conn txn]

@@ -7,7 +7,6 @@
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.ledger :as jld-ledger]
-            [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.ledger.proto :as ledger-proto]
@@ -212,12 +211,8 @@
    (stage db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (go-try
-     (let [db* (if-let [policy-identity (perm/parse-policy-identity parsed-opts (:supplied-context parsed-opts))]
-                 (<? (perm/wrap-policy db policy-identity))
-                 db)
-           tx-state      (->tx-state db*)
-
-           txn-context   (dbproto/-context db* (:context parsed-opts))
+     (let [tx-state      (->tx-state db)
+           txn-context   (dbproto/-context db (:context parsed-opts))
            parsed-txn    (q-parse/parse-txn txn txn-context)
            flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
            fuel-error-ch (:error-ch fuel-tracker)
