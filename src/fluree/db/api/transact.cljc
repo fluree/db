@@ -31,16 +31,14 @@
 
           parsed-opts             (cond-> parsed-opts
                                     did (assoc :did did)
-                                    txn-context (assoc :context txn-context)
-                                    ;;TODO once we remove default-context, this supplied-context
-                                    ;;can just replace `txn-context` above as the value of
-                                    ;;the `:context` key
-                                    true (assoc :supplied-context (ctx-util/extract-supplied-context txn)))
+                                    txn-context (assoc :context txn-context))
 
           {:keys [maxFuel meta] :as parsed-opts*} (parse-opts parsed-opts opts)
-          db* (if-let [policy-identity (perm/parse-policy-identity parsed-opts* (:supplied-context parsed-opts*))]
-                 (<? (perm/wrap-policy db policy-identity))
-                 db)]
+
+          s-ctx (some-> txn ctx-util/extract-supplied-context json-ld/parse-context)
+          db*   (if-let [policy-identity (perm/parse-policy-identity parsed-opts* s-ctx)]
+                  (<? (perm/wrap-policy db policy-identity))
+                  db)]
       (if (or maxFuel meta)
         (let [start-time   #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))

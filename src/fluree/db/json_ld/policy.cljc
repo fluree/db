@@ -491,13 +491,15 @@
 
 
 (defn parse-policy-identity
-  [opts context]
-  (when-let [{:keys [role] :as identity} (-> opts
-                                             (select-keys [:did :role :credential])
-                                             not-empty)]
-    (if (and role context)
-      (update identity :role json-ld/expand-iri (json-ld/parse-context context))
-      identity)))
+  ([opts]
+   (parse-policy-identity opts nil))
+  ([opts context]
+   (when-let [{:keys [role] :as identity} (-> opts
+                                              (select-keys [:did :role :credential])
+                                              not-empty)]
+     (if (and role context)
+       (update identity :role json-ld/expand-iri context)
+       identity))))
 
 (defn role-sids-for-sid
   [db sid]

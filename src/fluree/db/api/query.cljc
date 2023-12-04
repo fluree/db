@@ -2,6 +2,7 @@
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.core.async :as async]
+            [fluree.json-ld :as json-ld]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.fuel :as fuel]
@@ -28,10 +29,11 @@
   (go-try
    (let [{:keys [opts]} query-map
          {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map)
-         ctx (ctx-util/extract-supplied-context parsed)
-         db*            (if-let [policy-identity (perm/parse-policy-identity opts ctx)]
-                          (<? (perm/wrap-policy db policy-identity))
-                          db)
+
+         ctx (some-> parsed ctx-util/extract-supplied-context json-ld/parse-context)
+         db* (if-let [policy-identity (perm/parse-policy-identity opts ctx)]
+               (<? (perm/wrap-policy db policy-identity))
+               db)
          ;; from and to are positive ints, need to convert to negative or fill in default values
          {:keys [from to at]} t
          [from-t to-t] (if at
@@ -146,7 +148,7 @@
           {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
           ;;TODO: only using query context for opts, should be only context
           ;;once default-context is removed
-          q-ctx    (ctx-util/extract-supplied-context query*)
+          q-ctx    (some-> query* ctx-util/extract-supplied-context json-ld/parse-context)
           db*      (<? (restrict-db db t q-ctx opts))
           query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
           ctx      (ctx-util/extract db* query** opts)
@@ -249,7 +251,7 @@
           named-aliases   (some-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [s-ctx       (ctx-util/extract-supplied-context query)
+        (let [s-ctx       (some-> query ctx-util/extract-supplied-context json-ld/parse-context)
               ds          (<? (load-dataset conn default-aliases named-aliases t
                                             s-ctx opts))
               query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
