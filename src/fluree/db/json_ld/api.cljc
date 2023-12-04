@@ -305,7 +305,8 @@
    (wrap-policy db identity-map nil))
   ([db identity-map context]
    (promise-wrap
-     (let [policy-id (perm/parse-policy-identity identity-map context)]
+     (let [parsed-ctx (json-ld/parse-context context)
+           policy-id  (perm/parse-policy-identity identity-map parsed-ctx)]
        (perm/wrap-policy db policy-id)))))
 
 
