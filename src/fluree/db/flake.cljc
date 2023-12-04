@@ -561,21 +561,21 @@
   (let [o      (o f)
         dt     (int (dt f))
         o-size (util/case+ dt
-                           const/$xsd:string (* 2 (count o))
-                           const/$xsd:anyURI 8
-                           const/$xsd:boolean 1
-                           const/$xsd:long 8
-                           const/$xsd:int 4
-                           const/$xsd:short 2
-                           const/$xsd:double 8
-                           const/$xsd:float 4
-                           const/$xsd:byte 1
+                 const/$xsd:string (* 2 (count o))
+                 const/$xsd:anyURI 8
+                 const/$xsd:boolean 1
+                 const/$xsd:long 8
+                 const/$xsd:int 4
+                 const/$xsd:short 2
+                 const/$xsd:double 8
+                 const/$xsd:float 4
+                 const/$xsd:byte 1
                  ;; else
-                           (if (number? o)
-                             8
-                             (if (string? o)
-                               (* 2 (count o))
-                               (* 2 (count (pr-str o))))))]
+                 (if (number? o)
+                   8
+                   (if (string? o)
+                     (* 2 (count o))
+                     (* 2 (count (pr-str o))))))]
     (cond-> (+ 42 o-size)
       (m f) (* 2 (count (pr-str (m f)))))))
 

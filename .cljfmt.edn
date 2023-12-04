@@ -5,4 +5,5 @@
  {assoc  [[:inner 0]] ; makes pairs indent under assoc instead of map arg
   go-try [[:block 0]] ; makes go-try indent like go
   try*   [[:block 0]] ; makes try* indent like try
-  catch* [[:block 1]]}} ; makes catch* indent like catch (but w/o exception type identifier)
+  catch* [[:block 1]] ; makes catch* indent like catch (but w/o exception type identifier)
+  case+  [[:block 1]]}} ; makes case+ indent like case
