@@ -1,17 +1,17 @@
 (ns fluree.db.query.subject-crawl.subject
   (:require [clojure.core.async :refer [<! >!] :as async]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.index :as index]
+            [fluree.db.permissions-validate :refer [filter-subject-flakes]]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.range :as query-range]
-            [fluree.db.constants :as const]
-            [fluree.db.index :as index]
-            [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.common :refer [result-af resolve-ident-vars
                                                           filter-subject]]
-            [fluree.db.permissions-validate :refer [filter-subject-flakes]]
-            [fluree.db.dbproto :as dbproto]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -63,7 +63,6 @@
           (async/close! port))
         (catch* e (async/put! error-ch e) (async/close! port) nil)))))
 
-
 (defn subjects-id-chan
   "For queries that specify _id as the predicate, we will have a
   single subject as a value."
@@ -86,7 +85,6 @@
                 (>! return-ch sid))))
       (async/close! return-ch))
     return-ch))
-
 
 (defn subj-crawl
   [{:keys [db error-ch f-where limit offset parallelism vars ident-vars

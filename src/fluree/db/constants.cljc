@@ -2,7 +2,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-
 ;; Version
 
 (def ^:const data_version 4)
@@ -98,7 +97,6 @@
 (def ^:const $_commit:time 55)
 (def ^:const $_commit:signer 57)
 
-
 (def ^:const $_ledger:alias 170)
 (def ^:const $_ledger:branch 171)
 (def ^:const $_ledger:context 172)
@@ -161,7 +159,6 @@
 (def ^:const $sh:minInclusive 239)
 (def ^:const $sh:maxExclusive 240)
 (def ^:const $sh:maxInclusive 241)
-
 
 ;;property pair constraints
 (def ^:const $sh:equals 242)
@@ -233,7 +230,6 @@
 (def ^:const $rdf:json 36)
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
-
 
 (def ^:const $_tag:id 30)
 

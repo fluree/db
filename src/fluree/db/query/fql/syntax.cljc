@@ -1,8 +1,8 @@
 (ns fluree.db.query.fql.syntax
   (:require [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.docs :as docs]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
-            [fluree.db.util.docs :as docs]
             [malli.core :as m]
             [malli.transform :as mt]))
 
@@ -209,9 +209,9 @@
 (defn coerce-modification
   [mdfn]
   (try*
-   (coerce-modification* mdfn)
-   (catch* e
-     (throw (ex-info "Invalid Ledger Modification"
-                     {:status  400
-                      :error   :db/invalid-query
-                      :reasons (humanize-error e)})))))
+    (coerce-modification* mdfn)
+    (catch* e
+      (throw (ex-info "Invalid Ledger Modification"
+                      {:status  400
+                       :error   :db/invalid-query
+                       :reasons (humanize-error e)})))))

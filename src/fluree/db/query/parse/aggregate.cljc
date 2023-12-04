@@ -1,6 +1,6 @@
 (ns fluree.db.query.parse.aggregate
-  (:require [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -22,10 +22,9 @@
                         {:status 400 :error :db/invalid-query})))
       res)
     (catch* e
-            (log/warn "Invalid query function attempted: " code-str " with error message: " (ex-message e))
-            (throw (ex-info (code-str "Invalid query function: " code-str)
-                            {:status 400 :error :db/invalid-query})))))
-
+      (log/warn "Invalid query function attempted: " code-str " with error message: " (ex-message e))
+      (throw (ex-info (code-str "Invalid query function: " code-str)
+                      {:status 400 :error :db/invalid-query})))))
 
 (def built-in-aggregates
   (letfn [(sum [coll] (reduce + 0 coll))
@@ -36,9 +35,9 @@
                   size  (count coll)
                   med   (bit-shift-right size 1)]
               (cond-> (nth terms med)
-                      (even? size)
-                      (-> (+ (nth terms (dec med)))
-                          (/ 2)))))
+                (even? size)
+                (-> (+ (nth terms (dec med)))
+                    (/ 2)))))
           (variance
             [coll]
             (let [mean (avg coll)
@@ -69,14 +68,14 @@
                                        (first coll) (next coll)))
                        ([n coll]
                         (vec
-                          (reduce (fn [acc x]
-                                    (cond
-                                      (< (count acc) n)
-                                      (sort compare (conj acc x))
-                                      (neg? (compare x (last acc)))
-                                      (sort compare (conj (butlast acc) x))
-                                      :else acc))
-                                  [] coll))))
+                         (reduce (fn [acc x]
+                                   (cond
+                                     (< (count acc) n)
+                                     (sort compare (conj acc x))
+                                     (neg? (compare x (last acc)))
+                                     (sort compare (conj (butlast acc) x))
+                                     :else acc))
+                                 [] coll))))
      'max            (fn
                        ([coll] (reduce (fn [acc x]
                                          (if (pos? (compare x acc))
@@ -84,14 +83,14 @@
                                        (first coll) (next coll)))
                        ([n coll]
                         (vec
-                          (reduce (fn [acc x]
-                                    (cond
-                                      (< (count acc) n)
-                                      (sort compare (conj acc x))
-                                      (pos? (compare x (first acc)))
-                                      (sort compare (conj (next acc) x))
-                                      :else acc))
-                                  [] coll))))
+                         (reduce (fn [acc x]
+                                   (cond
+                                     (< (count acc) n)
+                                     (sort compare (conj acc x))
+                                     (pos? (compare x (first acc)))
+                                     (sort compare (conj (next acc) x))
+                                     :else acc))
+                                 [] coll))))
      'rand           (fn
                        ([coll] (rand-nth coll))
                        ([n coll] (vec (repeatedly n #(rand-nth coll)))))
@@ -101,7 +100,6 @@
      'str            str
      'sum            sum
      'variance       variance}))
-
 
 (defn extract-aggregate-as
   "Returns as var symbol if 'as' function is used in an aggregate,
@@ -115,7 +113,6 @@
     (throw (ex-info (str "Invalid aggregate function using 'as': " (pr-str as-fn-parsed))
                     {:status 400 :error :db/invalid-query})))
   (last as-fn-parsed))
-
 
 (defn parse-aggregate*
   [fn-parsed fn-str as]
@@ -140,7 +137,7 @@
         [agg-fn variable] (let [distinct? (and (coll? var) (= (first var) 'distinct))
                                 variable  (if distinct? (second var) var)
                                 agg-fn    (if distinct? (fn [coll] (-> coll distinct agg-fn))
-                                                        agg-fn)]
+                                              agg-fn)]
                             [agg-fn variable])
         as'        (or as (symbol (str variable "-" fun)))]
     (when-not (and (symbol? variable)
@@ -151,7 +148,6 @@
      :as       as'
      :fn-str   fn-str
      :function agg-fn}))
-
 
 (defn parse-aggregate
   "Parses an aggregate function string and returns map with keys:

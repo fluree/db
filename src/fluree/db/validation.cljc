@@ -1,12 +1,12 @@
 (ns fluree.db.validation
-  (:require [fluree.db.constants :as const]
+  (:require [clojure.string :as str]
+            [clojure.walk :as walk]
+            [fluree.db.constants :as const]
             [fluree.db.util.core :refer [pred-ident?]]
             [fluree.db.util.docs :as docs]
             [malli.core :as m]
             [malli.error :as me]
-            [malli.util :as mu]
-            [clojure.string :as str]
-            [clojure.walk :as walk]))
+            [malli.util :as mu]))
 
 (defn iri?
   [v]
@@ -204,42 +204,42 @@
         provided-value    (or value full-value)]
     [top-level-message root-message direct-message
      (some->> provided-value
-             pr-str
-             (str "Provided: "))
+              pr-str
+              (str "Provided: "))
      docs-pointer-msg]))
 
 (defn top-level-fn-error
   [errors]
   (first (filter #(and (empty? (:in %))
-                    (= :fn (m/type (:schema %)))) errors)))
+                       (= :fn (m/type (:schema %)))) errors)))
 
 (def default-error-overrides
   {:errors
    (-> me/default-errors
        (assoc
-        ::m/missing-key
-        {:error/fn
-         (fn [{:keys [in]} _]
-           (let [k (-> in last name)]
-             (str "Query is missing a '" k "' clause. "
-                  "'" k "' is required in queries. "
-                  "See documentation here for details: "
-                  docs/error-codes-page "#query-missing-" k)))}
-        ::m/extra-key
-        {:error/fn
-         (fn [{:keys [in]} _]
-           (let [k (-> in last name)]
-             (str "Query contains an unknown key: '" k "'. "
-                  "See documentation here for more information on allowed query keys: "
-                  docs/error-codes-page "#query-unknown-key")))}
-        ::m/invalid-type
-        {:error/fn (fn [{:keys [schema value]} _]
-                     (if-let [expected-type (-> schema m/type)]
-                       (str "should be a " (case expected-type
-                                             (:map-of :map) "map"
-                                             (:cat :catn :sequential) "sequence"
-                                             :else (name type)))
-                       (str "type of " (pr-str value) " does not match expected type")))}))})
+         ::m/missing-key
+         {:error/fn
+          (fn [{:keys [in]} _]
+            (let [k (-> in last name)]
+              (str "Query is missing a '" k "' clause. "
+                   "'" k "' is required in queries. "
+                   "See documentation here for details: "
+                   docs/error-codes-page "#query-missing-" k)))}
+         ::m/extra-key
+         {:error/fn
+          (fn [{:keys [in]} _]
+            (let [k (-> in last name)]
+              (str "Query contains an unknown key: '" k "'. "
+                   "See documentation here for more information on allowed query keys: "
+                   docs/error-codes-page "#query-unknown-key")))}
+         ::m/invalid-type
+         {:error/fn (fn [{:keys [schema value]} _]
+                      (if-let [expected-type (-> schema m/type)]
+                        (str "should be a " (case expected-type
+                                              (:map-of :map) "map"
+                                              (:cat :catn :sequential) "sequence"
+                                              :else (name type)))
+                        (str "type of " (pr-str value) " does not match expected type")))}))})
 
 (defn format-explained-errors
   "Takes the output of `explain` and emits a string

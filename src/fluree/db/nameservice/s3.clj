@@ -1,8 +1,8 @@
 (ns fluree.db.nameservice.s3
-  (:require [fluree.db.nameservice.proto :as ns-proto]
-            [clojure.core.async :as async :refer [go <!]]
+  (:require [clojure.core.async :as async :refer [go <!]]
             [clojure.string :as str]
-            [fluree.db.method.s3.core :as s3]))
+            [fluree.db.method.s3.core :as s3]
+            [fluree.db.nameservice.proto :as ns-proto]))
 
 (set! *warn-on-reflection* true)
 
@@ -18,7 +18,7 @@
            :address))))
 
 (defrecord S3NameService
-  [s3-client s3-bucket s3-prefix sync?]
+           [s3-client s3-bucket s3-prefix sync?]
   ns-proto/iNameService
   (-lookup [_ ledger-alias]
     (go (s3/s3-address s3-bucket s3-prefix (<! (s3/read-address s3-client s3-bucket s3-prefix ledger-alias)))))
@@ -37,7 +37,6 @@
     (-> ledger-address (->> (s3/address-path s3-bucket s3-prefix)) (str/split #"/")
         (->> (drop-last 2) (str/join #"/"))))
   (-close [nameservice] true))
-
 
 (defn initialize
   [s3-client s3-bucket s3-prefix]

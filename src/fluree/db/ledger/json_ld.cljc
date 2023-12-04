@@ -1,27 +1,27 @@
 (ns fluree.db.ledger.json-ld
   (:require [clojure.core.async :as async]
-            [fluree.db.flake :as flake]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [clojure.string :as str]
+            [fluree.db.conn.core :refer [register-ledger release-ledger cached-ledger]]
             [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.constants :as const]
+            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.flake :as flake]
+            [fluree.db.index :as index]
+            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.json-ld.commit :as jld-commit]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.json-ld.reify :as jld-reify]
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.query.range :as query-range]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.json-ld.branch :as branch]
-            [fluree.db.db.json-ld :as jld-db]
-            [fluree.db.json-ld.commit :as jld-commit]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.constants :as const]
-            [fluree.db.json-ld.reify :as jld-reify]
-            [clojure.string :as str]
-            [fluree.db.indexer.proto :as idx-proto]
-            [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.context :as ctx-util]
-            [fluree.db.nameservice.proto :as ns-proto]
-            [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.conn.core :refer [register-ledger release-ledger cached-ledger]]
-            [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.index :as index]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [load]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -44,7 +44,7 @@
       (throw (ex-info (str "Invalid branch: " branch ".")
                       {:status 400 :error :db/invalid-branch})))
     (cond-> (branch/latest-db branch-meta)
-            context-type (assoc :context-type context-type))))
+      context-type (assoc :context-type context-type))))
 
 (defn db-update
   "Updates db, will throw if not next 't' from current db.
@@ -211,7 +211,6 @@
   (-default-context [ledger t] (default-context ledger t))
   (-close [ledger] (close-ledger ledger)))
 
-
 (defn normalize-alias
   "For a ledger alias, removes any preceding '/' or '#' if exists."
   [ledger-alias]
@@ -233,7 +232,6 @@
               db**         (<? (jld-reify/load-db db* commit-tuple true))]
           (recur r db**))
         db*))))
-
 
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
@@ -265,9 +263,9 @@
 
                             :else
                             (conn-proto/-new-indexer
-                              conn (util/without-nils
-                                     {:reindex-min-bytes reindex-min-bytes
-                                      :reindex-max-bytes reindex-max-bytes})))
+                             conn (util/without-nils
+                                   {:reindex-min-bytes reindex-min-bytes
+                                    :reindex-max-bytes reindex-max-bytes})))
           ledger-alias*   (normalize-alias ledger-alias)
           address         (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses    (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
@@ -275,22 +273,22 @@
           ;; map of all branches and where they are branched from
           branches        {branch (branch/new-branch-map nil ledger-alias* branch ns-addresses)}
           ledger          (map->JsonLDLedger
-                            {:id      (random-uuid)
-                             :did     did*
-                             :state   (atom {:closed?  false
-                                             :branches branches
-                                             :branch   branch
-                                             :graphs   {}
-                                             :push     {:complete {:t   0
-                                                                   :dag nil}
-                                                        :pending  {:t   0
-                                                                   :dag nil}}})
-                             :alias   ledger-alias*
-                             :address address
-                             :method  method-type
-                             :cache   (atom {})
-                             :indexer indexer
-                             :conn    conn})
+                           {:id      (random-uuid)
+                            :did     did*
+                            :state   (atom {:closed?  false
+                                            :branches branches
+                                            :branch   branch
+                                            :graphs   {}
+                                            :push     {:complete {:t   0
+                                                                  :dag nil}
+                                                       :pending  {:t   0
+                                                                  :dag nil}}})
+                            :alias   ledger-alias*
+                            :address address
+                            :method  method-type
+                            :cache   (atom {})
+                            :indexer indexer
+                            :conn    conn})
           db              (jld-db/create ledger default-context context-type* new-context?)]
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-db-update ledger db)

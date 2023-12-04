@@ -2,7 +2,6 @@
   (:refer-clojure :exclude [alias])
   (:require [fluree.db.util.core :as util]))
 
-
 (defrecord DataSet [named default active])
 
 (defn combine

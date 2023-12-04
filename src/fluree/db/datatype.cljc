@@ -1,11 +1,11 @@
 (ns fluree.db.datatype
-  (:require [fluree.db.constants :as const]
+  (:require #?(:clj  [fluree.db.util.clj-const :as uc]
+               :cljs [fluree.db.util.cljs-const :as uc])
+            [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]
-            [clojure.string :as str]
-            #?(:clj  [fluree.db.util.clj-const :as uc]
-               :cljs [fluree.db.util.cljs-const :as uc]))
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
                               LocalDateTime ZoneOffset)
                    (java.time.format DateTimeFormatter))))
@@ -49,7 +49,6 @@
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" const/$rdf:langString
    "@json"                                                 const/$rdf:json})
 
-
 (def iso8601-offset-pattern
   "(Z|(?:[+-][0-9]{2}:[0-9]{2}))?")
 
@@ -71,7 +70,7 @@
 (def iso8601-time-pattern
   (str #?(:clj  "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,9}))?"
           :cljs "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,3}))?")
-        iso8601-offset-pattern))
+       iso8601-offset-pattern))
 
 (def iso8601-time-re
   (re-pattern iso8601-time-pattern))
@@ -296,7 +295,7 @@
   (try*
     (json-ld/normalize-data value)
     (catch* e
-            (log/error e "Unable to normalize json" value))))
+      (log/error e "Unable to normalize json" value))))
 
 (defn- check-signed
   "Returns nil if required-type and n conflict in terms of signedness
@@ -309,7 +308,7 @@
       (if (>= 0 n) nil n)
 
       (const/$xsd:nonNegativeInteger const/$xsd:unsignedInt
-       const/$xsd:unsignedLong const/$xsd:unsignedByte const/$xsd:unsignedShort)
+                                     const/$xsd:unsignedLong const/$xsd:unsignedByte const/$xsd:unsignedShort)
       (if (> 0 n) nil n)
 
       const/$xsd:negativeInteger
@@ -365,8 +364,8 @@
     (coerce-float value)
 
     (const/$xsd:integer const/$xsd:int const/$xsd:unsignedInt
-     const/$xsd:nonPositiveInteger const/$xsd:positiveInteger
-     const/$xsd:nonNegativeInteger const/$xsd:negativeInteger)
+                        const/$xsd:nonPositiveInteger const/$xsd:positiveInteger
+                        const/$xsd:nonNegativeInteger const/$xsd:negativeInteger)
     (-> value coerce-integer (check-signed required-type))
 
     (const/$xsd:long const/$xsd:unsignedLong)

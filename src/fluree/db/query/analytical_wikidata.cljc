@@ -1,11 +1,11 @@
 (ns fluree.db.query.analytical-wikidata
   (:require
-    [clojure.string :as str]
-    [fluree.db.util.core :as util]
-    [fluree.db.util.xhttp :as xhttp]
-    [fluree.db.util.log :as log :include-macros true]
-    [clojure.core.async :as async]
-    [fluree.db.util.async :refer [<? go-try merge-into?]]))
+   [clojure.core.async :as async]
+   [clojure.string :as str]
+   [fluree.db.util.async :refer [<? go-try merge-into?]]
+   [fluree.db.util.core :as util]
+   [fluree.db.util.log :as log :include-macros true]
+   [fluree.db.util.xhttp :as xhttp]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -18,11 +18,11 @@
   i.e. VALUES (?name ?countryName) {(\"Vincent van Gogh\" \"Kingdom of the Netherlands\") (\"Edvard Munch\" \"Norway\")}"
   [vars values]
   (let [value-groups    (map
-                          (fn [value-group]
-                            (let [stringified  (map #(str "\"" % "\"") value-group)
-                                  joined-group (str/join " " stringified)]
-                              (str " ( " joined-group " ) ")))
-                          values)
+                         (fn [value-group]
+                           (let [stringified  (map #(str "\"" % "\"") value-group)
+                                 joined-group (str/join " " stringified)]
+                             (str " ( " joined-group " ) ")))
+                         values)
         value-group-str (str/join " " value-groups)]
     (str "VALUES ( " (str/join " " vars) " ) { " value-group-str " } ")))
 
@@ -33,7 +33,7 @@
     (if clause (if (= "$wd" (first clause))
                  (recur r (conj res clause))
                  res)
-               res)))
+        res)))
 
 (defn get-all-wd-optional-clauses
   [coll]
@@ -67,10 +67,10 @@
 (defn ad-hoc-clause-to-wikidata
   [clause optional?]
   (cond->> clause
-           (= "$wd" (first clause)) (drop 1)
-           true                     (str/join " ")
-           true                     (#(str % " ."))
-           optional?                (#(str "OPTIONAL {" % "}"))))
+    (= "$wd" (first clause)) (drop 1)
+    true                     (str/join " ")
+    true                     (#(str % " ."))
+    optional?                (#(str "OPTIONAL {" % "}"))))
 
 (defn parse-prefixes
   [prefixes]
@@ -109,7 +109,7 @@
           headers {"User-Agent"
                    ;(if (System/getProperty "java.version")
                    ;      (str "Java/" (System/getProperty "java.version"))
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36"
+                   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36"
                    ;)
                    "Accept" "application/sparql-results+json"}]
       (<? (xhttp/get url {:headers         headers
@@ -125,9 +125,9 @@
         (->> (second (first (second (second body))))
              (mapv (fn [item]
                      (reduce
-                       (fn [acc k-v]
-                         (assoc acc (key k-v) (:value (val k-v))))
-                       {} item))))))))
+                      (fn [acc k-v]
+                        (assoc acc (key k-v) (:value (val k-v))))
+                      {} item))))))))
 
 (defn wikiDataResp->tuples
   [wikidataRes vars]
@@ -140,7 +140,6 @@
     {:headers headers
      :vars    {}
      :tuples  tuples}))
-
 
 (defn get-wikidata-tuples
   [q-map clauses matching-vars matching-vals all-vars optional-clauses]

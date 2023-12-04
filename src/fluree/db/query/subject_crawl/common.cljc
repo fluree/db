@@ -1,11 +1,11 @@
 (ns fluree.db.query.subject-crawl.common
   (:require [clojure.core.async :refer [go >!] :as async]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.json-ld.response :as json-ld-resp]
-            [fluree.db.dbproto :as dbproto]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -19,9 +19,8 @@
             (>! port result)))
         (async/close! port)
         (catch* e
-                (log/error e "Error processing subject query result")
-                (>! error-ch e))))))
-
+          (log/error e "Error processing subject query result")
+          (>! error-ch e))))))
 
 (defn passes-filter?
   [filter-fn vars pred-flakes]
@@ -38,7 +37,6 @@
         (recur r-fns)
         false)
       true)))
-
 
 (defn filter-subject
   "Filters a set of flakes for a single subject and returns true if
@@ -60,7 +58,6 @@
       (when (empty? required-p)
         flakes))))
 
-
 (defn order-results
   "If order-by exists in query, orders final results.
   order-by is defined by a map with keys (see analytical-parse for code):
@@ -73,7 +70,7 @@
     (throw (ex-info "Ordering by a variable not supported in this type of query."
                     {:status 400 :error :db/invalid-query}))
     (let [sorted (cond-> (sort-by (fn [result] (get result predicate)) results)
-                         (= :desc order) reverse)]
+                   (= :desc order) reverse)]
       (into []
             (comp (drop offset)
                   (take limit))

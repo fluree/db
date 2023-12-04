@@ -1,8 +1,8 @@
 (ns fluree.db.query.fql-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
+            [fluree.db.conn.cache :as conn-cache]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.conn.cache :as conn-cache]))
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration grouping-test
   (testing "grouped queries"
@@ -198,20 +198,20 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "jobs")
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee"
-                                 {"ex"         "http://example.com/vocab/"
-                                  "occupation" {"@id"        "ex:occupation"
-                                                "@container" "@language"}}]
-                     "insert"   [{"@id"        "ex:frank"
-                                  "occupation" {"en" {"@value" "Ninja"}
-                                                "ja" "忍者"}}
-                                 {"@id"        "ex:bob"
-                                  "occupation" {"en" "Boss"
-                                                "fr" "Chef"}}
-                                 {"@id"        "ex:jack"
-                                  "occupation" {"en" {"@value" "Chef"}
-                                                "fr" {"@value" "Cuisinier"}}}]})]
+                   (fluree/db ledger)
+                   {"@context" ["https://ns.flur.ee"
+                                {"ex"         "http://example.com/vocab/"
+                                 "occupation" {"@id"        "ex:occupation"
+                                               "@container" "@language"}}]
+                    "insert"   [{"@id"        "ex:frank"
+                                 "occupation" {"en" {"@value" "Ninja"}
+                                               "ja" "忍者"}}
+                                {"@id"        "ex:bob"
+                                 "occupation" {"en" "Boss"
+                                               "fr" "Chef"}}
+                                {"@id"        "ex:jack"
+                                 "occupation" {"en" {"@value" "Chef"}
+                                               "fr" {"@value" "Cuisinier"}}}]})]
       (testing "with bound language tags"
         (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
                                       :select    [?job ?lang]
@@ -245,15 +245,15 @@
                                {:defaultContext
                                 ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
-                  (fluree/db ledger)
-                  {"@context" "https://ns.flur.ee"
-                   "insert"
-                   [{:id      :ex/homer
-                     :ex/name "Homer"
-                     :ex/age  36}
-                    {:id      :ex/bart
-                     :ex/name "Bart"
-                     :ex/age  "forever 10"}]})]
+                 (fluree/db ledger)
+                 {"@context" "https://ns.flur.ee"
+                  "insert"
+                  [{:id      :ex/homer
+                    :ex/name "Homer"
+                    :ex/age  36}
+                   {:id      :ex/bart
+                    :ex/name "Bart"
+                    :ex/age  "forever 10"}]})]
     (testing "including datatype in query results"
       (let [query   '{:select [?age ?dt]
                       :where  [{:ex/age ?age}
@@ -278,18 +278,18 @@
                                  "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
         ledger @(fluree/create conn "test/love")
         db     @(fluree/stage (fluree/db ledger)
-                               {"@context" "https://ns.flur.ee"
-                                "insert"
-                                [{"@id"                "ex:fluree",
-                                  "@type"              "schema:Organization",
-                                  "schema:description" "We ❤️ Data"}
-                                 {"@id"                "ex:w3c",
-                                  "@type"              "schema:Organization",
-                                  "schema:description" "We ❤️ Internet"}
-                                 {"@id"                "ex:mosquitos",
-                                  "@type"              "ex:Monster",
-                                  "schema:description" "We ❤️ Human Blood"}]}
-                               {})]
+                              {"@context" "https://ns.flur.ee"
+                               "insert"
+                               [{"@id"                "ex:fluree",
+                                 "@type"              "schema:Organization",
+                                 "schema:description" "We ❤️ Data"}
+                                {"@id"                "ex:w3c",
+                                 "@type"              "schema:Organization",
+                                 "schema:description" "We ❤️ Internet"}
+                                {"@id"                "ex:mosquitos",
+                                 "@type"              "ex:Monster",
+                                 "schema:description" "We ❤️ Human Blood"}]}
+                              {})]
     (testing "subject-object scans"
       (let [q '{:select [?s ?p ?o]
                 :where  [{"@id"                ?s
@@ -348,57 +348,57 @@
                                                                   "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
 
           authors @(fluree/create-with-txn conn
-                                            {"@context" ["https://ns.flur.ee" "" "https://schema.org"]
-                                             "ledger"   "test/authors"
-                                             "insert"   [{"@id"   "https://www.wikidata.org/wiki/Q42"
-                                                          "@type" "Person"
-                                                          "name"  "Douglas Adams"}
-                                                         {"@id"   "https://www.wikidata.org/wiki/Q173540"
-                                                          "@type" "Person"
-                                                          "name"  "Margaret Mitchell"}]})
+                                           {"@context" ["https://ns.flur.ee" "" "https://schema.org"]
+                                            "ledger"   "test/authors"
+                                            "insert"   [{"@id"   "https://www.wikidata.org/wiki/Q42"
+                                                         "@type" "Person"
+                                                         "name"  "Douglas Adams"}
+                                                        {"@id"   "https://www.wikidata.org/wiki/Q173540"
+                                                         "@type" "Person"
+                                                         "name"  "Margaret Mitchell"}]})
           books   @(fluree/create-with-txn conn
-                                            {"@context" ["https://ns.flur.ee" "" "https://schema.org"]
-                                             "ledger"   "test/books"
-                                             "insert"   [{"id"     "https://www.wikidata.org/wiki/Q3107329",
-                                                          "type"   ["Book"],
-                                                          "name"   "The Hitchhiker's Guide to the Galaxy",
-                                                          "isbn"   "0-330-25864-8",
-                                                          "author" {"@id" "https://www.wikidata.org/wiki/Q42"}}
-                                                         {"id"     "https://www.wikidata.org/wiki/Q2870",
-                                                          "type"   ["Book"],
-                                                          "name"   "Gone with the Wind",
-                                                          "isbn"   "0-582-41805-4",
-                                                          "author" {"@id" "https://www.wikidata.org/wiki/Q173540"}}]})
+                                           {"@context" ["https://ns.flur.ee" "" "https://schema.org"]
+                                            "ledger"   "test/books"
+                                            "insert"   [{"id"     "https://www.wikidata.org/wiki/Q3107329",
+                                                         "type"   ["Book"],
+                                                         "name"   "The Hitchhiker's Guide to the Galaxy",
+                                                         "isbn"   "0-330-25864-8",
+                                                         "author" {"@id" "https://www.wikidata.org/wiki/Q42"}}
+                                                        {"id"     "https://www.wikidata.org/wiki/Q2870",
+                                                         "type"   ["Book"],
+                                                         "name"   "Gone with the Wind",
+                                                         "isbn"   "0-582-41805-4",
+                                                         "author" {"@id" "https://www.wikidata.org/wiki/Q173540"}}]})
           movies  @(fluree/create-with-txn conn
-                                            {"@context" ["https://ns.flur.ee" "" "https://schema.org"]
-                                             "ledger"   "test/movies"
-                                             "insert"   [{"id"                        "https://www.wikidata.org/wiki/Q836821",
-                                                          "type"                      ["Movie"],
-                                                          "name"                      "The Hitchhiker's Guide to the Galaxy",
-                                                          "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
-                                                          "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
-                                                          "isBasedOn"                 {"id" "https://www.wikidata.org/wiki/Q3107329"}}
-                                                         {"id"                        "https://www.wikidata.org/wiki/Q91540",
-                                                          "type"                      ["Movie"],
-                                                          "name"                      "Back to the Future",
-                                                          "disambiguatingDescription" "1985 film by Robert Zemeckis",
-                                                          "titleEIDR"                 "10.5240/09A3-1F6E-3538-DF46-5C6F-I",
-                                                          "followedBy"                {"id"         "https://www.wikidata.org/wiki/Q109331"
-                                                                                       "type"       "Movie"
-                                                                                       "name"       "Back to the Future Part II"
-                                                                                       "titleEIDR"  "10.5240/5DA5-C386-2911-7E2B-1782-L"
-                                                                                       "followedBy" {"id" "https://www.wikidata.org/wiki/Q230552"}}}
-                                                         {"id"                        "https://www.wikidata.org/wiki/Q230552"
-                                                          "type"                      ["Movie"]
-                                                          "name"                      "Back to the Future Part III"
-                                                          "disambiguatingDescription" "1990 film by Robert Zemeckis"
-                                                          "titleEIDR"                 "10.5240/15F9-F913-FF25-8041-E798-O"}
-                                                         {"id"                        "https://www.wikidata.org/wiki/Q2875",
-                                                          "type"                      ["Movie"],
-                                                          "name"                      "Gone with the Wind",
-                                                          "disambiguatingDescription" "1939 film by Victor Fleming",
-                                                          "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
-                                                          "isBasedOn"                 {"id" "https://www.wikidata.org/wiki/Q2870"}}]})]
+                                           {"@context" ["https://ns.flur.ee" "" "https://schema.org"]
+                                            "ledger"   "test/movies"
+                                            "insert"   [{"id"                        "https://www.wikidata.org/wiki/Q836821",
+                                                         "type"                      ["Movie"],
+                                                         "name"                      "The Hitchhiker's Guide to the Galaxy",
+                                                         "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
+                                                         "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+                                                         "isBasedOn"                 {"id" "https://www.wikidata.org/wiki/Q3107329"}}
+                                                        {"id"                        "https://www.wikidata.org/wiki/Q91540",
+                                                         "type"                      ["Movie"],
+                                                         "name"                      "Back to the Future",
+                                                         "disambiguatingDescription" "1985 film by Robert Zemeckis",
+                                                         "titleEIDR"                 "10.5240/09A3-1F6E-3538-DF46-5C6F-I",
+                                                         "followedBy"                {"id"         "https://www.wikidata.org/wiki/Q109331"
+                                                                                      "type"       "Movie"
+                                                                                      "name"       "Back to the Future Part II"
+                                                                                      "titleEIDR"  "10.5240/5DA5-C386-2911-7E2B-1782-L"
+                                                                                      "followedBy" {"id" "https://www.wikidata.org/wiki/Q230552"}}}
+                                                        {"id"                        "https://www.wikidata.org/wiki/Q230552"
+                                                         "type"                      ["Movie"]
+                                                         "name"                      "Back to the Future Part III"
+                                                         "disambiguatingDescription" "1990 film by Robert Zemeckis"
+                                                         "titleEIDR"                 "10.5240/15F9-F913-FF25-8041-E798-O"}
+                                                        {"id"                        "https://www.wikidata.org/wiki/Q2875",
+                                                         "type"                      ["Movie"],
+                                                         "name"                      "Gone with the Wind",
+                                                         "disambiguatingDescription" "1939 film by Victor Fleming",
+                                                         "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
+                                                         "isBasedOn"                 {"id" "https://www.wikidata.org/wiki/Q2870"}}]})]
       (testing "with combined data sets"
         (let [q '{"@context" "https://schema.org"
                   :from      ["test/authors" "test/books" "test/movies"]

@@ -1,14 +1,14 @@
 (ns fluree.db.storage
-  (:require [fluree.db.serde.protocol :as serdeproto]
-            [fluree.db.flake :as flake]
+  (:require [clojure.core.async :refer [go <!] :as async]
             [clojure.string :as str]
-            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.flake :as flake]
             [fluree.db.index :as index]
-            [clojure.core.async :refer [go <!] :as async]
+            [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.conn.proto :as conn-proto]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -144,7 +144,6 @@
       (notify-new-index-file changes-ch data res)
       res)))
 
-
 (defn read-branch
   [{:keys [serializer] :as conn} key]
   (go-try
@@ -166,28 +165,26 @@
                                 {:status 500
                                  :error  :db/unexpected-error})))]
     (cond-> index-data
-            (:rhs index-data) (update :rhs flake/parts->Flake)
-            (:first index-data) (update :first flake/parts->Flake)
-            true (assoc :comparator cmp
-                        :ledger-alias ledger-alias
-                        :t t
-                        :leftmost? true))))
-
+      (:rhs index-data) (update :rhs flake/parts->Flake)
+      (:first index-data) (update :first flake/parts->Flake)
+      true (assoc :comparator cmp
+             :ledger-alias ledger-alias
+             :t t
+             :leftmost? true))))
 
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
   [conn blank-db root-data]
   (let [{:keys [t ecount stats preds]} root-data
         db* (assoc blank-db :t (- t)
-                            :preds preds
-                            :ecount ecount
-                            :stats (assoc stats :indexed t))]
+              :preds preds
+              :ecount ecount
+              :stats (assoc stats :indexed t))]
     (reduce
-      (fn [db idx]
-        (let [idx-root (reify-index-root conn db idx (get root-data idx))]
-          (assoc db idx idx-root)))
-      db* index/types)))
-
+     (fn [db idx]
+       (let [idx-root (reify-index-root conn db idx (get root-data idx))]
+         (assoc db idx idx-root)))
+     db* index/types)))
 
 (defn read-garbage
   "Returns garbage file data for a given index t."
@@ -197,7 +194,6 @@
           data (<? (conn-proto/-index-file-read conn key))]
       (when data
         (serdeproto/-deserialize-garbage (serde conn) data)))))
-
 
 (defn read-db-root
   "Returns all data for a db index root of a given t."
@@ -212,7 +208,6 @@
            data (<? (conn-proto/-index-file-read conn key))]
        (when data
          (serdeproto/-deserialize-db-root (serde conn) data))))))
-
 
 (defn reify-db
   "Reifies db at specified index point. If unable to read db-root at index,
@@ -273,13 +268,13 @@
            (async/put! return-ch
                        (assoc node k data)))
          (catch* e
-                 (log/error e "Error resolving index node")
-                 (when error-fn
-                   (try*
-                     (error-fn)
-                     (catch* e (log/error e "Error executing error-fn in resolve-index-node!"))))
-                 (async/put! return-ch e)
-                 (async/close! return-ch))))
+           (log/error e "Error resolving index node")
+           (when error-fn
+             (try*
+               (error-fn)
+               (catch* e (log/error e "Error executing error-fn in resolve-index-node!"))))
+           (async/put! return-ch e)
+           (async/close! return-ch))))
      return-ch)))
 
 (defn resolve-empty-leaf

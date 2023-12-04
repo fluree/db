@@ -1,7 +1,7 @@
 (ns fluree.db.query.misc-queries-test
   (:require [clojure.test :refer :all]
-            [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.json-ld.api :as fluree]
+            [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.util.core :as util]
             [test-with-files.tools :refer [with-tmp-dir]]))
 
@@ -10,18 +10,18 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/subid" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" "https://ns.flur.ee"
-                     "insert"
-                     {:graph [{:id          :ex/alice,
-                               :type        :ex/User,
-                               :schema/name "Alice"}
-                              {:id           :ex/bob,
-                               :type         :ex/User,
-                               :schema/name  "Bob"
-                               :ex/favArtist {:id          :ex/picasso
-                                              :schema/name "Picasso"}}]}})]
-      (is (->> @(fluree/query db {:select {'?s [:_id {:ex/favArtist [:_id ]}]}
+                   (fluree/db ledger)
+                   {"@context" "https://ns.flur.ee"
+                    "insert"
+                    {:graph [{:id          :ex/alice,
+                              :type        :ex/User,
+                              :schema/name "Alice"}
+                             {:id           :ex/bob,
+                              :type         :ex/User,
+                              :schema/name  "Bob"
+                              :ex/favArtist {:id          :ex/picasso
+                                             :schema/name "Picasso"}}]}})]
+      (is (->> @(fluree/query db {:select {'?s [:_id {:ex/favArtist [:_id]}]}
                                   :where  {:id '?s, :type :ex/User}})
                (reduce (fn [sids {:keys [_id] :as node}]
                          (cond-> (conj sids _id)
@@ -33,8 +33,8 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query-context" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
-                                                   "insert"   [{:id :ex/dan :ex/x 1}
-                                                               {:id :ex/wes :ex/x 2}]})]
+                                                  "insert"   [{:id :ex/dan :ex/x 1}
+                                                              {:id :ex/wes :ex/x 2}]})]
 
     @(fluree/commit! ledger db)
 
@@ -97,23 +97,23 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/everything" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" "https://ns.flur.ee"
-                     "insert"
-                     {:graph [{:id           :ex/alice,
-                               :type         :ex/User,
-                               :schema/name  "Alice"
-                               :schema/email "alice@flur.ee"
-                               :schema/age   42}
-                              {:id          :ex/bob,
-                               :type        :ex/User,
-                               :schema/name "Bob"
-                               :schema/age  22}
-                              {:id           :ex/jane,
-                               :type         :ex/User,
-                               :schema/name  "Jane"
-                               :schema/email "jane@flur.ee"
-                               :schema/age   30}]}})]
+                   (fluree/db ledger)
+                   {"@context" "https://ns.flur.ee"
+                    "insert"
+                    {:graph [{:id           :ex/alice,
+                              :type         :ex/User,
+                              :schema/name  "Alice"
+                              :schema/email "alice@flur.ee"
+                              :schema/age   42}
+                             {:id          :ex/bob,
+                              :type        :ex/User,
+                              :schema/name "Bob"
+                              :schema/age  22}
+                             {:id           :ex/jane,
+                              :type         :ex/User,
+                              :schema/name  "Jane"
+                              :schema/email "jane@flur.ee"
+                              :schema/age   30}]}})]
       (testing "Query that pulls entire database."
         (is (= #{[:ex/jane :id "http://example.org/ns/jane"]
                  [:ex/jane :type :ex/User]
@@ -314,26 +314,26 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/class" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
-                  (fluree/db ledger)
-                  {"@context" "https://ns.flur.ee"
-                   "insert"
-                   [{:id           :ex/alice,
-                     :type         :ex/User,
-                     :schema/name  "Alice"
-                     :schema/email "alice@flur.ee"
-                     :schema/age   42}
-                    {:id          :ex/bob,
-                     :type        :ex/User,
-                     :schema/name "Bob"
-                     :schema/age  22}
-                    {:id           :ex/jane,
-                     :type         :ex/User,
-                     :schema/name  "Jane"
-                     :schema/email "jane@flur.ee"
-                     :schema/age   30}
-                    {:id          :ex/dave
-                     :type        :ex/nonUser
-                     :schema/name "Dave"}]})]
+                 (fluree/db ledger)
+                 {"@context" "https://ns.flur.ee"
+                  "insert"
+                  [{:id           :ex/alice,
+                    :type         :ex/User,
+                    :schema/name  "Alice"
+                    :schema/email "alice@flur.ee"
+                    :schema/age   42}
+                   {:id          :ex/bob,
+                    :type        :ex/User,
+                    :schema/name "Bob"
+                    :schema/age  22}
+                   {:id           :ex/jane,
+                    :type         :ex/User,
+                    :schema/name  "Jane"
+                    :schema/email "jane@flur.ee"
+                    :schema/age   30}
+                   {:id          :ex/dave
+                    :type        :ex/nonUser
+                    :schema/name "Dave"}]})]
     (testing "type"
       (is (= [[:ex/User]]
              @(fluree/query db '{:select [?class]
@@ -346,15 +346,15 @@
                                       :where  {:id ?s, :type ?class}})))))
     (testing "shacl targetClass"
       (let [shacl-db @(fluree/stage
-                        (fluree/db ledger)
-                        {"@context" "https://ns.flur.ee"
-                         "insert"
-                         {:context        {:ex "http://example.org/ns/"}
-                          :id             :ex/UserShape,
-                          :type           [:sh/NodeShape],
-                          :sh/targetClass :ex/User
-                          :sh/property    [{:sh/path     :schema/name
-                                            :sh/datatype :xsd/string}]}})]
+                       (fluree/db ledger)
+                       {"@context" "https://ns.flur.ee"
+                        "insert"
+                        {:context        {:ex "http://example.org/ns/"}
+                         :id             :ex/UserShape,
+                         :type           [:sh/NodeShape],
+                         :sh/targetClass :ex/User
+                         :sh/property    [{:sh/path     :schema/name
+                                           :sh/datatype :xsd/string}]}})]
         (is (= [[:ex/User]]
                @(fluree/query shacl-db '{:select [?class]
                                          :where  {:id :ex/UserShape, :sh/targetClass ?class}})))))))
@@ -364,20 +364,20 @@
         ledger @(fluree/create conn "type-handling" {:defaultContext [test-utils/default-str-context {"ex" "http://example.org/ns/"}]})
         db0 (fluree/db ledger)
         db1 @(fluree/stage db0 {"@context" "https://ns.flur.ee"
-                                 "insert" [{"id" "ex:ace"
-                                            "type" "ex:Spade"}
-                                           {"id" "ex:king"
-                                            "type" "ex:Heart"}
-                                           {"id" "ex:queen"
-                                            "type" "ex:Heart"}
-                                           {"id" "ex:jack"
-                                            "type" "ex:Club"}]})
+                                "insert" [{"id" "ex:ace"
+                                           "type" "ex:Spade"}
+                                          {"id" "ex:king"
+                                           "type" "ex:Heart"}
+                                          {"id" "ex:queen"
+                                           "type" "ex:Heart"}
+                                          {"id" "ex:jack"
+                                           "type" "ex:Club"}]})
         db2 @(fluree/stage db1 {"@context" "https://ns.flur.ee"
-                                 "insert" [{"id" "ex:two"
-                                            "rdf:type" "ex:Diamond"}]})
+                                "insert" [{"id" "ex:two"
+                                           "rdf:type" "ex:Diamond"}]})
         db3 @(fluree/stage db1 {"@context" ["https://ns.flur.ee" "" {"rdf:type" "@type"}]
-                                 "insert" {"id" "ex:two"
-                                           "rdf:type" "ex:Diamond"}})]
+                                "insert" {"id" "ex:two"
+                                          "rdf:type" "ex:Diamond"}})]
     (is (= #{{"id" "ex:queen" "type" "ex:Heart"}
              {"id" "ex:king" "type" "ex:Heart"}}
            (set @(fluree/query db1 {"select" {"?s" ["*"]}

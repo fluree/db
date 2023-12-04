@@ -3,12 +3,12 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
-            [fluree.db.query.exec.select :as select]
-            [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.group :as group]
-            [fluree.db.query.exec.order :as order]
             [fluree.db.query.exec.having :as having]
+            [fluree.db.query.exec.order :as order]
+            [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.update :as update]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))

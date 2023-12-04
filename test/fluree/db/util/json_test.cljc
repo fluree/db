@@ -19,7 +19,6 @@
           (.getBytes encoding)
           (ByteArrayInputStream.)))))
 
-
 ;; General Comments
 ;; all java.lang.Float, java.lang.Double and java.math.BigDecimal values
 ;; are parsed as BigDecimals when cheshire's use-bigdecimals? is true.

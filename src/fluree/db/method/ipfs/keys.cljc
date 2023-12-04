@@ -1,7 +1,7 @@
 (ns fluree.db.method.ipfs.keys
   (:require [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.xhttp :as xhttp]
-            [fluree.db.util.log :as log :include-macros true])
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.xhttp :as xhttp])
   (:refer-clojure :exclude [list key]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -42,6 +42,4 @@
 
 (comment
   (clojure.core.async/<!! (list "http://127.0.0.1:5001/"))
-  (clojure.core.async/<!! (key "http://127.0.0.1:5001/" "k51qzi5uqu5dllaos3uy3sx0o8gw221tyaiu2qwmgdzy5lofij0us0h4ai41az"))
-
-  )
+  (clojure.core.async/<!! (key "http://127.0.0.1:5001/" "k51qzi5uqu5dllaos3uy3sx0o8gw221tyaiu2qwmgdzy5lofij0us0h4ai41az")))

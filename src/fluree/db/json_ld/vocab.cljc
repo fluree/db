@@ -15,10 +15,10 @@
   "In the schema map, we index properties by both integer :id and :iri for easy lookup of either."
   [properties]
   (reduce
-    (fn [acc prop-map]
-      (assoc acc (:id prop-map) prop-map
-                 (:iri prop-map) prop-map))
-    {} properties))
+   (fn [acc prop-map]
+     (assoc acc (:id prop-map) prop-map
+       (:iri prop-map) prop-map))
+   {} properties))
 
 (defn- recur-sub-classes
   "Once an initial parent->child relationship is established, recursively place
@@ -38,22 +38,21 @@
    "
   [pred-items]
   (let [subclass-map (reduce
-                       (fn [acc class]
-                         (if-let [parent-classes (:subclassOf class)]
-                           (reduce #(update %1 %2 conj (:id class)) acc parent-classes)
-                           acc))
-                       {} pred-items)]
+                      (fn [acc class]
+                        (if-let [parent-classes (:subclassOf class)]
+                          (reduce #(update %1 %2 conj (:id class)) acc parent-classes)
+                          acc))
+                      {} pred-items)]
     (reduce-kv
-      (fn [acc parent children]
-        (loop [[child & r] children
-               all-children (apply sorted-set children)]
-          (if (nil? child)
-            (assoc acc parent all-children)
-            (if-let [child-children (get subclass-map child)]
-              (recur (into child-children r) (into all-children child-children))
-              (recur r all-children)))))
-      {} subclass-map)))
-
+     (fn [acc parent children]
+       (loop [[child & r] children
+              all-children (apply sorted-set children)]
+         (if (nil? child)
+           (assoc acc parent all-children)
+           (if-let [child-children (get subclass-map child)]
+             (recur (into child-children r) (into all-children child-children))
+             (recur r all-children)))))
+     {} subclass-map)))
 
 (defn calc-subclass
   "Calculates subclass map for use with queries for rdf:type."
@@ -61,15 +60,14 @@
   (let [subclass-map (recur-sub-classes (vals property-maps))]
     ;; map subclasses for both subject-id and iri
     (reduce-kv
-      (fn [acc class-id subclasses]
-        (let [iri (get-in property-maps [class-id :iri])]
-          (assoc acc iri subclasses)))
-      subclass-map subclass-map)))
+     (fn [acc class-id subclasses]
+       (let [iri (get-in property-maps [class-id :iri])]
+         (assoc acc iri subclasses)))
+     subclass-map subclass-map)))
 
 (defn extract-ref-sids
   [property-maps]
   (into #{} (keep #(when (true? (:ref? %)) (:id %)) property-maps)))
-
 
 (def property-sids #{const/$rdf:Property
                      const/$owl:DatatypeProperty

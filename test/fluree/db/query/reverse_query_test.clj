@@ -1,28 +1,28 @@
 (ns fluree.db.query.reverse-query-test
   (:require
-    [clojure.test :refer :all]
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]))
+   [clojure.test :refer :all]
+   [fluree.db.json-ld.api :as fluree]
+   [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration context-reverse-test
   (testing "Test that the @reverse context values pulls select values back correctly."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/reverse" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" "https://ns.flur.ee"
-                     "insert"
-                     [{:id           :ex/brian
-                       :type         :ex/User
-                       :schema/name  "Brian"
-                       :ex/friend    [:ex/alice]}
-                      {:id           :ex/alice
-                       :type         :ex/User
-                       :schema/name  "Alice"}
-                      {:id           :ex/cam
-                       :type         :ex/User
-                       :schema/name  "Cam"
-                       :ex/friend    [:ex/brian :ex/alice]}]})]
+                   (fluree/db ledger)
+                   {"@context" "https://ns.flur.ee"
+                    "insert"
+                    [{:id           :ex/brian
+                      :type         :ex/User
+                      :schema/name  "Brian"
+                      :ex/friend    [:ex/alice]}
+                     {:id           :ex/alice
+                      :type         :ex/User
+                      :schema/name  "Alice"}
+                     {:id           :ex/cam
+                      :type         :ex/User
+                      :schema/name  "Cam"
+                      :ex/friend    [:ex/brian :ex/alice]}]})]
 
       (is (= @(fluree/query db '{:context   ["" {:friended {:reverse :ex/friend}}]
                                  :selectOne {:ex/brian [:schema/name :friended]}})
@@ -33,7 +33,6 @@
                                  :selectOne {:ex/alice [:schema/name :friended]}})
              {:schema/name "Alice"
               :friended    [:ex/cam :ex/brian]}))
-
 
       (is (= {:schema/name "Brian"
               :friended    {:id          :ex/cam

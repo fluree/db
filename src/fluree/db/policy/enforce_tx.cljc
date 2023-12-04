@@ -1,8 +1,8 @@
 (ns fluree.db.policy.enforce-tx
   (:require [fluree.db.constants :as const]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.permissions-validate :as validate]))
+            [fluree.db.permissions-validate :as validate]
+            [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -10,7 +10,6 @@
   "Returns true if policy has root modify permissions."
   [policy]
   (= {:root? true} (get policy const/iri-modify)))
-
 
 (defn- check-property-policies
   "Checks property policies, if they exist for a given flake's property and
@@ -42,7 +41,6 @@
                               {:status 400 :error :db/policy-exception}))))
           ;; passed all property policies, allow everything!
           true)))))
-
 
 (defn allowed?
   "Returns true if all policy enforcement passes, else exception related to

@@ -1,26 +1,26 @@
 (ns fluree.db.json-ld.api
-  (:require [clojure.string :as str]
-            [fluree.db.conn.ipfs :as ipfs-conn]
-            [fluree.db.conn.file :as file-conn]
-            [fluree.db.conn.memory :as memory-conn]
-            [fluree.db.conn.remote :as remote-conn]
-            [fluree.json-ld :as json-ld]
-            #?(:clj [fluree.db.conn.s3 :as s3-conn])
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.platform :as platform]
+  (:require #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [clojure.core.async :as async :refer [go <!]]
+            [clojure.string :as str]
             [fluree.db.api.query :as query-api]
             [fluree.db.api.transact :as transact-api]
-            [fluree.db.util.core :as util]
+            [fluree.db.conn.core :refer [notify-ledger]]
+            [fluree.db.conn.file :as file-conn]
+            [fluree.db.conn.ipfs :as ipfs-conn]
+            [fluree.db.conn.memory :as memory-conn]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.conn.remote :as remote-conn]
+            [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.util.log :as log]
-            [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.conn.core :refer [notify-ledger]]
-            [fluree.db.json-ld.policy :as perm])
+            [fluree.db.platform :as platform]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -38,12 +38,12 @@
        p)
      :cljs
      (js/Promise.
-       (fn [resolve reject]
-         (go
-           (let [res (<! port)]
-             (if (util/exception? res)
-               (reject res)
-               (resolve res))))))))
+      (fn [resolve reject]
+        (go
+          (let [res (<! port)]
+            (if (util/exception? res)
+              (reject res)
+              (resolve res))))))))
 
 ;; ledger operations
 
@@ -65,22 +65,22 @@
   [{:keys [method parallelism remote-servers] :as opts}]
   ;; TODO - do some validation
   (promise-wrap
-    (let [opts*   (assoc opts :parallelism (or parallelism 4))
-          method* (cond
-                    method (keyword method)
-                    remote-servers :remote
-                    :else (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
-                                          {:status 500 :error :db/invalid-configuration})))]
-      (case method*
-        :remote (remote-conn/connect opts*)
-        :ipfs (ipfs-conn/connect opts*)
-        :file (if platform/BROWSER
-                (throw (ex-info "File connection not supported in the browser" opts))
-                (file-conn/connect opts*))
-        :memory (memory-conn/connect opts*)
-        :s3     #?(:clj  (s3-conn/connect opts*)
-                   :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
-                                         {:status 400, :error :db/unsupported-operation})))))))
+   (let [opts*   (assoc opts :parallelism (or parallelism 4))
+         method* (cond
+                   method (keyword method)
+                   remote-servers :remote
+                   :else (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
+                                         {:status 500 :error :db/invalid-configuration})))]
+     (case method*
+       :remote (remote-conn/connect opts*)
+       :ipfs (ipfs-conn/connect opts*)
+       :file (if platform/BROWSER
+               (throw (ex-info "File connection not supported in the browser" opts))
+               (file-conn/connect opts*))
+       :memory (memory-conn/connect opts*)
+       :s3     #?(:clj  (s3-conn/connect opts*)
+                  :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
+                                        {:status 400, :error :db/unsupported-operation})))))))
 
 (defn connect-file
   [opts]
@@ -147,19 +147,19 @@
   connection-specific address first)."
   [conn alias-or-address]
   (promise-wrap
-    (jld-ledger/load conn alias-or-address)))
+   (jld-ledger/load conn alias-or-address)))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
   otherwise."
   [conn ledger-alias-or-address]
   (promise-wrap
-    (go
-      (let [address (if (address? ledger-alias-or-address)
-                      ledger-alias-or-address
-                      (<! (alias->address conn ledger-alias-or-address)))]
-        (log/debug "exists? - ledger address:" address)
-        (<! (nameservice/exists? conn address))))))
+   (go
+     (let [address (if (address? ledger-alias-or-address)
+                     ledger-alias-or-address
+                     (<! (alias->address conn ledger-alias-or-address)))]
+       (log/debug "exists? - ledger address:" address)
+       (<! (nameservice/exists? conn address))))))
 
 (defn default-context
   "Returns the current default context set on the db."
@@ -189,36 +189,28 @@
   If commit is for a future 't' value, will drop in-memory ledger for reload upon next request."
   [conn commit-map]
   (promise-wrap
-    (if (map? commit-map)
-      (notify-ledger conn commit-map)
-      (go
-        (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
-                 {:status 400 :error :db/invalid-commit-map})))))
-
+   (if (map? commit-map)
+     (notify-ledger conn commit-map)
+     (go
+       (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
+                {:status 400 :error :db/invalid-commit-map})))))
 
 (defn index
   "Performs indexing operation on the specified ledger"
   [ledger])
-
 
 ;; MAYBE CHALLENGE?
 (defn validate
   "Validates a ledger, checks block integrity along with signatures."
   [])
 
-
-
 (defn pull
   "Checks name service for ledger and pulls latest version locally."
   [])
 
-
-
 (defn combine
   "Combines multiple ledgers into a new, read-only ledger."
   [])
-
-
 
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
@@ -236,50 +228,42 @@
   distributed rules."
   ([ledger db]
    (promise-wrap
-     (ledger-proto/-commit! ledger db)))
+    (ledger-proto/-commit! ledger db)))
   ([ledger db opts]
    (promise-wrap
-     (ledger-proto/-commit! ledger db opts))))
+    (ledger-proto/-commit! ledger db opts))))
 
 (defn transact!
   [conn txn]
   (promise-wrap
-    (transact-api/transact! conn txn)))
+   (transact-api/transact! conn txn)))
 
 (defn create-with-txn
   [conn txn]
   (promise-wrap
-    (transact-api/create-with-txn conn txn)))
+   (transact-api/create-with-txn conn txn)))
 
 (defn status
   "Returns current status of ledger branch."
   ([ledger] (ledger-proto/-status ledger))
   ([ledger branch] (ledger-proto/-status ledger branch)))
 
-
 (defn push
   "Pushes all commits since last push to a name service, e.g. a Fluree Network, IPNS, DNS, Fluree Nexus.
   Depending on consensus requirements for a Fluree Network, will accept or reject push as newest update."
   [])
 
-
-
 (defn squash
   "Squashes multiple unpublished commits into a single unpublished commit"
   [])
-
-
 
 (defn merge
   "Merges changes from one branch into another branch."
   [])
 
-
-
 (defn branch
   "Creates a new branch of a given ledger"
   [])
-
 
 ;; db operations
 
@@ -293,7 +277,6 @@
                      {:status 500 :error :db/unexpected-error}))
      (ledger-proto/-db ledger opts))))
 
-
 (defn wrap-policy
   "Wraps a db object with specified permission attributes.
   When requesting a db from a ledger, permission attributes can
@@ -306,7 +289,6 @@
    (->> identity-map
         perm/policy-identity
         (perm/wrap-policy db))))
-
 
 (defn query
   "Queries a db value and returns a promise with the results."
@@ -336,16 +318,16 @@
   ;; TODO - assert index is valid index type
   ([db index test match]
    (promise-wrap
-     (query-range/index-range db index test match)))
+    (query-range/index-range db index test match)))
   ([db index start-test start-match end-test end-match]
    (promise-wrap
-     (query-range/index-range db index start-test start-match end-test end-match))))
+    (query-range/index-range db index start-test start-match end-test end-match))))
 
 (defn slice
   "Like range, but returns all flakes that match the supplied flake parts."
   [db index match]
   (promise-wrap
-    (query-range/index-range db index = match)))
+   (query-range/index-range db index = match)))
 
 (defn expand-iri
   "Expands given IRI with the default database context, or provided context."

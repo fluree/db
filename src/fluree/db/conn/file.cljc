@@ -1,25 +1,25 @@
 (ns fluree.db.conn.file
-  (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.util.async :refer [<? go-try]]
+  (:require #?(:clj [fluree.db.full-text :as full-text])
+            [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.util.context :as ctx-util]
-            [fluree.db.util.core :as util]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.index :as index]
-            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.core :as conn-core]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.storage :as storage]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
-            [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.util.filesystem :as fs]
-            [fluree.db.util.bytes :as bytes]
-            #?(:clj [fluree.db.full-text :as full-text])
-            [fluree.db.util.json :as json]
+            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
-            [fluree.db.ledger.proto :as ledger-proto])
+            [fluree.db.serde.json :refer [json-serde]]
+            [fluree.db.storage :as storage]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.bytes :as bytes]
+            [fluree.db.util.context :as ctx-util]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.filesystem :as fs]
+            [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -30,7 +30,6 @@
   (if (str/starts-with? path "//")
     (str "fluree:file:" path)
     (str "fluree:file://" path)))
-
 
 (defn address-path
   [address]
@@ -162,17 +161,17 @@
       (if (= :empty id)
         (storage/resolve-empty-node node)
         (conn-cache/lru-lookup
-          lru-cache-atom
-          cache-key
-          (fn [_]
-            (storage/resolve-index-node conn node
-                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key))))))))
+         lru-cache-atom
+         cache-key
+         (fn [_]
+           (storage/resolve-index-node conn node
+                                       (fn [] (conn-cache/lru-evict lru-cache-atom cache-key))))))))
 
   #?@(:clj
       [full-text/IndexConnection
        (open-storage [conn network dbid lang]
-         (throw (ex-info "File connection does not support full text operations."
-                         {:status 500 :error :db/unexpected-error})))]))
+                     (throw (ex-info "File connection does not support full text operations."
+                                     {:status 500 :error :db/unexpected-error})))]))
 
 #?(:cljs
    (extend-type FileConnection
@@ -226,7 +225,7 @@
           conn-id        (str (random-uuid))
           state          (conn-core/blank-state)
           nameservices*  (util/sequential
-                           (or nameservices (default-file-nameservice storage-path)))
+                          (or nameservices (default-file-nameservice storage-path)))
           cache-size     (conn-cache/memory->cache-size memory)
           lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans

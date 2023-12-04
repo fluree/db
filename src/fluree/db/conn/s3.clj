@@ -1,16 +1,16 @@
 (ns fluree.db.conn.s3
-  (:require [cognitect.aws.client.api :as aws]
-            [fluree.db.method.s3.core :as s3]
-            [fluree.db.nameservice.s3 :as ns-s3]
-            [clojure.core.async :as async :refer [go <!]]
+  (:require [clojure.core.async :as async :refer [go <!]]
+            [cognitect.aws.client.api :as aws]
             [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.conn.core :as conn-core]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.full-text :as full-text]
             [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.method.s3.core :as s3]
+            [fluree.db.nameservice.s3 :as ns-s3]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.util.context :as ctx-util]
@@ -21,7 +21,6 @@
   (:import (java.io Writer)))
 
 (set! *warn-on-reflection* true)
-
 
 (defn write-data
   [{:keys [s3-client s3-bucket s3-prefix] :as _conn} ledger data-type data]
@@ -71,7 +70,6 @@
   [{:keys [s3-client s3-bucket s3-prefix] :as _conn} index-address]
   (go (-> (s3/read-address s3-client s3-bucket s3-prefix index-address) <! (json/parse true))))
 
-
 (defrecord S3Connection [id s3-client s3-bucket s3-prefix memory state
                          ledger-defaults parallelism msg-in-ch msg-out-ch
                          lru-cache-atom nameservices]
@@ -115,15 +113,14 @@
         (conn-cache/lru-lookup lru-cache-atom cache-key
                                (fn [_]
                                  (storage/resolve-index-node
-                                   conn node
-                                   (fn [] (conn-cache/lru-evict lru-cache-atom
-                                                                cache-key))))))))
+                                  conn node
+                                  (fn [] (conn-cache/lru-evict lru-cache-atom
+                                                               cache-key))))))))
 
   full-text/IndexConnection
   (open-storage [_conn _network _dbid _lang]
     (throw (ex-info "S3 connection does not support full text operations."
                     {:status 400, :error :db/unsupported-operation}))))
-
 
 (defmethod print-method S3Connection [^S3Connection conn, ^Writer w]
   (.write w (str "#S3Connection "))
@@ -160,12 +157,12 @@
     :or   {serializer (json-serde)} :as _opts}]
   (go
     (let [aws-opts       (cond-> {:api :s3}
-                                 s3-endpoint (assoc :endpoint-override s3-endpoint))
+                           s3-endpoint (assoc :endpoint-override s3-endpoint))
           client         (aws/client aws-opts)
           conn-id        (str (random-uuid))
           state          (conn-core/blank-state)
           nameservices*  (util/sequential
-                           (or nameservices (default-S3-nameservice client s3-bucket s3-prefix)))
+                          (or nameservices (default-S3-nameservice client s3-bucket s3-prefix)))
           cache-size     (conn-cache/memory->cache-size memory)
           lru-cache-atom (or lru-cache-atom
                              (atom (conn-cache/create-lru-cache cache-size)))]

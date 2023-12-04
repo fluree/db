@@ -1,11 +1,11 @@
 (ns fluree.db.query.sparql
-  (:require #?(:clj [clojure.java.io :as io])
-            #?(:clj  [instaparse.core :as insta :refer [defparser]]
+  (:require #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
+            #?(:clj [clojure.java.io :as io])
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
+            [fluree.db.query.sparql2fql :refer [parsed->fql]]
             [fluree.db.util.docs :as docs]
-            [fluree.db.util.log :as log]
-            [fluree.db.query.sparql2fql :refer [parsed->fql]]))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

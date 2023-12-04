@@ -1,11 +1,11 @@
 (ns fluree.db.query.subject-crawl.reparse
-  (:require [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            #?(:clj [fluree.db.query.exec.select]
+  (:require #?(:clj [fluree.db.query.exec.select]
                :cljs [fluree.db.query.exec.select :refer [SubgraphSelector]])
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.dbproto :as dbproto])
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import [fluree.db.query.exec.select SubgraphSelector])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -77,18 +77,18 @@
 
                     ;;TODO: filters are not yet supported
                     #_#_filter
-                    (let [{:keys [params variable function]} filter]
-                      (if (= 1 (count params))
-                        (fn [flake _] (function (flake/o flake)))
-                        (fn [flake vars]
-                          (let [params (fill-fn-params params (flake/o flake) variable vars)]
-                            (log/debug (str "Calling query-filter fn: " ("fn-str" filter)
-                                            "with params: " params "."))
-                            (apply function params)))))
+                      (let [{:keys [params variable function]} filter]
+                        (if (= 1 (count params))
+                          (fn [flake _] (function (flake/o flake)))
+                          (fn [flake vars]
+                            (let [params (fill-fn-params params (flake/o flake) variable vars)]
+                              (log/debug (str "Calling query-filter fn: " ("fn-str" filter)
+                                              "with params: " params "."))
+                              (apply function params)))))
                     ;;TODO: vars are not yet supported
                     #_#_(and var (get supplied-vars var))
-                    (fn [flake vars]
-                      (= (flake/o flake) (get vars var))))]
+                      (fn [flake vars]
+                        (= (flake/o flake) (get vars var))))]
             (recur r
                    (conj required-p p*)
                    (if f
@@ -141,12 +141,12 @@
                             (clause-subject-var first-pattern))]
       (if (empty? rest-patterns)
         (assoc parsed-query
-               :where [reparsed-first-clause]
-               :strategy :simple-subject-crawl)
+          :where [reparsed-first-clause]
+          :strategy :simple-subject-crawl)
         (when-let [subj-filter-map (merge-wheres-to-filter db first-s rest-patterns vars)]
           (assoc parsed-query :where [reparsed-first-clause
                                       {:s-filter subj-filter-map}]
-                              :strategy :simple-subject-crawl))))))
+            :strategy :simple-subject-crawl))))))
 
 (defn has-equivalent-properties?
   [db pattern]

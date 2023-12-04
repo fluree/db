@@ -1,15 +1,15 @@
 (ns fluree.db.json-ld.policy
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy-validate :as validate]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.range :as query-range]
-            [fluree.db.flake :as flake]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -25,7 +25,6 @@
 ;;                   the particular request
 (def special-meaning-properties
   #{const/iri-$identity})
-
 
 (defn restricted-allow-rule?
   "Returns true if an allow rule contains restrictions (e.g. :f/equals or other restriction properties)."
@@ -78,12 +77,12 @@
                                                not-empty)]
                                       (when roles-policies
                                         (assoc prop-policy const/iri-allow
-                                                           roles-policies)))))
+                                          roles-policies)))))
                                  not-empty))]
        (when (or class-policies prop-policies)
          (cond-> policy
-                 class-policies (assoc const/iri-allow class-policies)
-                 prop-policies (assoc const/iri-property prop-policies)))))
+           class-policies (assoc const/iri-allow class-policies)
+           prop-policies (assoc const/iri-property prop-policies)))))
    all-policies))
 
 (defn policies-for-roles
@@ -112,7 +111,6 @@
   is the special property :f/$identity"
   [rule-def]
   (= const/iri-$identity (first rule-def)))
-
 
 (defn first-special-property
   "Equality paths will likely start out with a special property like :f/$identity
@@ -149,20 +147,19 @@
         (into [special-property] property-ids)
         property-ids))))
 
-
 (defmulti compile-allow-rule-fn
-          "Defined allow rules compile into different functions that accept both a db
+  "Defined allow rules compile into different functions that accept both a db
           and flake argument, and return truthy if flake is allowed. Different parse rules
           currently supported are listed with their respective defmethod keyword dispatch
           values.
 
           Rule parsing returns two-tuple of [async? fn], where async? is a boolean indicating
           if the fn will return an async chan which will require a take (<!) to get the value."
-          (fn [_ rule]
-            (cond
-              (contains? rule const/iri-equals) :f/equals
-              (contains? rule const/iri-contains) :f/contains
-              :else ::unrestricted-rule)))
+  (fn [_ rule]
+    (cond
+      (contains? rule const/iri-equals) :f/equals
+      (contains? rule const/iri-contains) :f/contains
+      :else ::unrestricted-rule)))
 
 (defmethod compile-allow-rule-fn :f/equals
   [db rule]
@@ -181,7 +178,6 @@
   ;; there are no conditions on the rule, which means explicitly allow
   (go-try
     [false (constantly true)]))
-
 
 (defn compile-property-policies
   "Returns a map with property ids as keys with two-tuple value of async? + policy function.
@@ -210,7 +206,6 @@
                              (get prop-policy const/iri-path) ". Only the last one encountered will be utilized.")))
             (recur r (assoc acc prop-sid fn-tuple)))
           acc)))))
-
 
 (defn compile-allow-rule
   "Compiles an allow rule, which will be associated with one or more actions.
@@ -283,7 +278,6 @@
           ;; return two-tuple of [full-key-seq updated-allow-rule-map]
           [ks* allow-rule*])))))
 
-
 (defn unrestricted-actions
   "A policy will be a 'root' (all access) policy if these 3 conditions apply:
    1) :f/targetNode value of :f/allNodes
@@ -311,14 +305,12 @@
                       #{} (get node-policy const/iri-allow))]
     (not-empty root-actions)))
 
-
 (defn non-allNodes
   "Removes :f/allNodes from list of nodes.
   Returns nil if no other nodes exist."
   [nodes]
   (not-empty
    (remove #(= const/iri-all-nodes %) nodes)))
-
 
 (defn remove-root-default-allow
   "Removes :f/allow top-level policies that have already been granted
@@ -379,7 +371,6 @@
               (into acc result))) [])
          <?)))
 
-
 (defn compile-node-policy
   "Compiles a node rule (where :f/targetNode is used).
 
@@ -419,9 +410,9 @@
           root-policies            (map (fn [root-action] [[root-action :root?] true]) root-actions*)]
 
       (cond-> []
-              root-policies (into root-policies)
-              default-restrictions (into default-restrictions)
-              property-restrictions (into property-restrictions)))))
+        root-policies (into root-policies)
+        default-restrictions (into default-restrictions)
+        property-restrictions (into property-restrictions)))))
 
 (defn compile-class-policy
   "Compiles a class rule (where :f/targetClass is used)"
@@ -435,7 +426,6 @@
                                   (<? (property-restrictions db default-key-seqs prop-policies)))]
       (concat default-restrictions property-restrictions))))
 
-
 (defn compile-policy
   [db policy]
   (go-try
@@ -444,9 +434,8 @@
           nodes   (some-> policy (get const/iri-target-node) util/sequential
                           (->> (mapv #(get % "@id"))))]
       (cond-> []
-              classes (into (<? (compile-class-policy db policy classes)))
-              nodes (into (<? (compile-node-policy db policy nodes)))))))
-
+        classes (into (<? (compile-class-policy db policy classes)))
+        nodes (into (<? (compile-node-policy db policy nodes)))))))
 
 (defn compile-policies
   "Compiles rules into a fn that returns truthy if, when given a flake, is allowed."
@@ -479,16 +468,15 @@
                                            policies))
             root-access?      (= compiled-policies
                                  {const/iri-view {:node {:root? true}}})]
-       (cond-> compiled-policies
-         root-access? (assoc-in [const/iri-view :root?] true)))
-     (catch* e
-       (if (= :db/invalid-query (:error (ex-data e)))
-         (throw (ex-info (str "There are no Fluree rules in the db, a policy-driven database cannot be retrieved. "
-                              "If you have created rules, make sure they are of @type f:Rule.")
-                         {:status 400
-                          :error  :db/invalid-policy}))
-         (throw e))))))
-
+        (cond-> compiled-policies
+          root-access? (assoc-in [const/iri-view :root?] true)))
+      (catch* e
+        (if (= :db/invalid-query (:error (ex-data e)))
+          (throw (ex-info (str "There are no Fluree rules in the db, a policy-driven database cannot be retrieved. "
+                               "If you have created rules, make sure they are of @type f:Rule.")
+                          {:status 400
+                           :error  :db/invalid-policy}))
+          (throw e))))))
 
 (defn policy-identity
   [{:keys [context] :as identity-map}]

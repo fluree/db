@@ -1,7 +1,7 @@
 (ns fluree.db.fuel
   (:require [clojure.core.async :as async :refer [put!]]
-            [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake]))
+            [fluree.db.flake :as flake]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

@@ -1,11 +1,11 @@
 (ns fluree.db.query.index-range-test
   (:require
-    [clojure.string :as str]
-    [clojure.test :refer :all]
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    [fluree.db.util.log :as log]
-    [fluree.db.flake :as flake]))
+   [clojure.string :as str]
+   [clojure.test :refer :all]
+   [fluree.db.flake :as flake]
+   [fluree.db.json-ld.api :as fluree]
+   [fluree.db.test-utils :as test-utils]
+   [fluree.db.util.log :as log]))
 
 (deftest ^:integration index-range-scans
   (testing "Various index range scans using the API."
@@ -13,28 +13,28 @@
           ledger  @(fluree/create conn "query/index-range"
                                   {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db      @(fluree/stage
-                     (fluree/db ledger)
-                     {"@context" "https://ns.flur.ee"
-                      "insert"
-                      [{:id           :ex/brian,
-                        :type         :ex/User,
-                        :schema/name  "Brian"
-                        :schema/email "brian@example.org"
-                        :schema/age   50
-                        :ex/favNums   7}
-                       {:id           :ex/alice,
-                        :type         :ex/User,
-                        :schema/name  "Alice"
-                        :schema/email "alice@example.org"
-                        :schema/age   50
-                        :ex/favNums   [42, 76, 9]}
-                       {:id           :ex/cam,
-                        :type         :ex/User,
-                        :schema/name  "Cam"
-                        :schema/email "cam@example.org"
-                        :schema/age   34
-                        :ex/favNums   [5, 10]
-                        :ex/friend    [:ex/brian :ex/alice]}]})
+                    (fluree/db ledger)
+                    {"@context" "https://ns.flur.ee"
+                     "insert"
+                     [{:id           :ex/brian,
+                       :type         :ex/User,
+                       :schema/name  "Brian"
+                       :schema/email "brian@example.org"
+                       :schema/age   50
+                       :ex/favNums   7}
+                      {:id           :ex/alice,
+                       :type         :ex/User,
+                       :schema/name  "Alice"
+                       :schema/email "alice@example.org"
+                       :schema/age   50
+                       :ex/favNums   [42, 76, 9]}
+                      {:id           :ex/cam,
+                       :type         :ex/User,
+                       :schema/name  "Cam"
+                       :schema/email "cam@example.org"
+                       :schema/age   34
+                       :ex/favNums   [5, 10]
+                       :ex/friend    [:ex/brian :ex/alice]}]})
           cam-sid @(fluree/internal-id db :ex/cam)]
 
       (is (= "http://example.org/ns/cam"
@@ -86,7 +86,6 @@
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 7]])
                         (mapv flake/Flake->parts)))
                 "We specify a different datatype for the value, nothing should be returned")))
-
 
         (testing "Subject IRI resolution for index-range automatically happens"
           (let [with-compact-iri @(fluree/range db :spot = [:ex/alice])

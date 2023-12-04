@@ -13,5 +13,5 @@
   (-register-commit-fn [indexer branch f] "Adds a function that will update/push a new commit with an updated index when provided the reindexed db as single arg")
   (-close [indexer]  "Shuts down indexer, removes all watches after notification.")
   (-status [indexer]  "Returns current status of reindexing.")
-  (-empty-novelty [indexer db] [indexer db t]"Returns db with emptied novelty, when 't' provided only empties novelty at or before 't'")
+  (-empty-novelty [indexer db] [indexer db t] "Returns db with emptied novelty, when 't' provided only empties novelty at or before 't'")
   (-reindex [indexer db]  "Executes a full reindex on db."))

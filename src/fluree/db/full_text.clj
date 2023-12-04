@@ -1,25 +1,25 @@
 (ns fluree.db.full-text
-  (:require [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.flake :as flake]
-            [fluree.db.full-text.block-registry :as block-registry]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [clojure.walk :refer [keywordize-keys]]
             [clucie.analysis :as lucene-analysis]
             [clucie.core :as lucene]
-            [clucie.store :as lucene-store])
+            [clucie.store :as lucene-store]
+            [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.full-text.block-registry :as block-registry])
   (:import (java.io Closeable)
            (org.apache.lucene.analysis Analyzer)
-           (org.apache.lucene.analysis.en EnglishAnalyzer)
-           (org.apache.lucene.analysis.cn.smart SmartChineseAnalyzer)
-           (org.apache.lucene.analysis.hi HindiAnalyzer)
-           (org.apache.lucene.analysis.es SpanishAnalyzer)
            (org.apache.lucene.analysis.ar ArabicAnalyzer)
-           (org.apache.lucene.analysis.id IndonesianAnalyzer)
-           (org.apache.lucene.analysis.ru RussianAnalyzer)
            (org.apache.lucene.analysis.bn BengaliAnalyzer)
            (org.apache.lucene.analysis.br BrazilianAnalyzer)
+           (org.apache.lucene.analysis.cn.smart SmartChineseAnalyzer)
+           (org.apache.lucene.analysis.en EnglishAnalyzer)
+           (org.apache.lucene.analysis.es SpanishAnalyzer)
            (org.apache.lucene.analysis.fr FrenchAnalyzer)
+           (org.apache.lucene.analysis.hi HindiAnalyzer)
+           (org.apache.lucene.analysis.id IndonesianAnalyzer)
+           (org.apache.lucene.analysis.ru RussianAnalyzer)
            (org.apache.lucene.index IndexWriter)
            (org.apache.lucene.store Directory)))
 

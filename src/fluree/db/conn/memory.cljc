@@ -1,20 +1,20 @@
 (ns fluree.db.conn.memory
-  (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.storage :as storage]
-            [fluree.db.index :as index]
-            [fluree.db.util.context :as ctx-util]
-            [fluree.db.nameservice.memory :as ns-memory]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log :include-macros true]
-            #?(:clj [fluree.db.full-text :as full-text])
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.platform :as platform]
+  (:require #?(:clj [fluree.db.full-text :as full-text])
+            [clojure.core.async :as async :refer [go]]
+            [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.core :as conn-core]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
-            [fluree.json-ld :as json-ld]
-            [fluree.crypto :as crypto])
+            [fluree.db.nameservice.memory :as ns-memory]
+            [fluree.db.platform :as platform]
+            [fluree.db.storage :as storage]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.context :as ctx-util]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -129,8 +129,8 @@
   #?@(:clj
       [full-text/IndexConnection
        (open-storage [conn network dbid lang]
-         (throw (ex-info "Memory connection does not support full text operations."
-                         {:status 500 :error :db/unexpected-error})))]))
+                     (throw (ex-info "Memory connection does not support full text operations."
+                                     {:status 500 :error :db/unexpected-error})))]))
 
 #?(:cljs
    (extend-type MemoryConnection
@@ -167,11 +167,11 @@
           data-atom       (atom {})
           state           (conn-core/blank-state)
           nameservices*   (util/sequential
-                            (or nameservices
-                                (default-memory-nameservice data-atom)))
+                           (or nameservices
+                               (default-memory-nameservice data-atom)))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
-                                                     cache-size)))]
+                                                    cache-size)))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
                               :data-atom       data-atom

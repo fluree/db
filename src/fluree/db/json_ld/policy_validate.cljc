@@ -1,16 +1,14 @@
 (ns fluree.db.json-ld.policy-validate
-  (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.async :refer [<? go-try]]
-            [clojure.core.async :as async]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.flake :as flake]
+  (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
 
-
 #?(:clj (set! *warn-on-reflection* true))
-
 
 (defn subids
   "Returns a vector of subids from the input collection as a single result async chan.
@@ -24,7 +22,6 @@
           next-res
           (recur r (conj acc (async/<! next-sid)))))
       acc)))
-
 
 (defn resolve-equals-rule
   "When using an equals rule, calculates a given path's value and stores in local cache.
@@ -103,7 +100,6 @@
       (log/warn (str "Policy f:equals only supports equals paths that start with f:$identity currently. "
                      "Ignoring provided rule: " rule))
       [false (constantly false)])))
-
 
 (defn resolve-contains-rule
   "When using a contains rule, calculates a given path's value and stores in local cache.

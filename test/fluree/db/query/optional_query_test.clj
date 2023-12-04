@@ -2,8 +2,8 @@
   (:require
    [clojure.string :as str]
    [clojure.test :refer :all]
-   [fluree.db.test-utils :as test-utils]
    [fluree.db.json-ld.api :as fluree]
+   [fluree.db.test-utils :as test-utils]
    [fluree.db.util.log :as log]))
 
 (deftest ^:integration optional-queries
@@ -11,23 +11,23 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/optional" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" "https://ns.flur.ee"
-                     "insert"
-                     [{:id          :ex/brian,
-                       :type        :ex/User,
-                       :schema/name "Brian"
-                       :ex/friend   [:ex/alice]}
-                      {:id           :ex/alice,
-                       :type         :ex/User,
-                       :ex/favColor  "Green"
-                       :schema/email "alice@flur.ee"
-                       :schema/name  "Alice"}
-                      {:id           :ex/cam,
-                       :type         :ex/User,
-                       :schema/name  "Cam"
-                       :schema/email "cam@flur.ee"
-                       :ex/friend    [:ex/brian :ex/alice]}]})]
+                   (fluree/db ledger)
+                   {"@context" "https://ns.flur.ee"
+                    "insert"
+                    [{:id          :ex/brian,
+                      :type        :ex/User,
+                      :schema/name "Brian"
+                      :ex/friend   [:ex/alice]}
+                     {:id           :ex/alice,
+                      :type         :ex/User,
+                      :ex/favColor  "Green"
+                      :schema/email "alice@flur.ee"
+                      :schema/name  "Alice"}
+                     {:id           :ex/cam,
+                      :type         :ex/User,
+                      :schema/name  "Cam"
+                      :schema/email "cam@flur.ee"
+                      :ex/friend    [:ex/brian :ex/alice]}]})]
 
       ;; basic single optional statement
       (is (= #{["Cam" nil]

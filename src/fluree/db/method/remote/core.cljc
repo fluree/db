@@ -1,10 +1,10 @@
 (ns fluree.db.method.remote.core
-  (:require [fluree.db.util.xhttp :as xhttp]
+  (:require [clojure.core.async :as async]
             [clojure.string :as str]
-            [clojure.core.async :as async]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.util.xhttp :as xhttp]))
 
 (def message-codes {:subscribe-ledger   1
                     :unsubscribe-ledger 2})
@@ -19,8 +19,8 @@
                                   connected-to
                                   (let [chosen-server (rand-nth servers)]
                                     (assoc ss :connected-to chosen-server
-                                              :secure? (str/starts-with? chosen-server "https")
-                                              :connected-at (util/current-time-millis))))))
+                                      :secure? (str/starts-with? chosen-server "https")
+                                      :connected-at (util/current-time-millis))))))
           :connected-to)))
 
 (defn remote-read
@@ -59,14 +59,13 @@
       ;; will return chan with socket object or exception
       (xhttp/try-socket url msg-in msg-out timeout close-fn)
       (catch* e
-              (log/warn "Exception establishing web socket: " (ex-message e))
-              (async/go e)))))
-
+        (log/warn "Exception establishing web socket: " (ex-message e))
+        (async/go e)))))
 
 (defn subscribed-ledger?
   [{:keys [server-state] :as _conn} ledger-id]
   (boolean
-    (get-in @server-state [:subscriptions ledger-id])))
+   (get-in @server-state [:subscriptions ledger-id])))
 
 (defn record-ledger-subscription
   [{:keys [server-state] :as _conn} ledger-id]
@@ -79,7 +78,7 @@
 (defn subscribe-ledger-msg
   [ledger-id]
   (json/stringify
-    [(:subscribe-ledger message-codes) ledger-id]))
+   [(:subscribe-ledger message-codes) ledger-id]))
 
 ;; TODO - remote subscriptions only partially implemented, for now
 ;; TODO - remote server will send all commits for all ledgers, but

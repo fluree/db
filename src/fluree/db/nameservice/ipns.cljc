@@ -1,10 +1,10 @@
 (ns fluree.db.nameservice.ipns
   (:require [clojure.string :as str]
-            [fluree.db.nameservice.proto :as ns-proto]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.method.ipfs.core :as ipfs]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
+            [fluree.db.nameservice.proto :as ns-proto]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -14,8 +14,8 @@
   [s]
   (when s
     (cond-> s
-            (str/ends-with? s "/") (subs 0 (dec (count s)))
-            (str/starts-with? s "/") (subs 1))))
+      (str/ends-with? s "/") (subs 0 (dec (count s)))
+      (str/starts-with? s "/") (subs 1))))
 
 (defn address-parts
   "Returns three-tuple of ipfs/ipns (protocol), address, and ledger alias(directory)
@@ -28,18 +28,17 @@
   (when-let [[_ proto address db] (re-find #"^fluree:([^:]+)://([^/]+)(/.+)?$" address)]
     [proto address (trim-slashes db)]))
 
-
 (defn address-exists?
   [ipfs-endpoint ledger-address]
   (go-try
     (log/debug "Checking for existence of ledger" ledger-address)
     (boolean
-      (when-let [[proto address ledger] (address-parts ledger-address)]
-        (let [ipfs-addr (if (= "ipns" proto)
-                          (str "/ipns/" address)
-                          address)
-              ledgers   (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
-          (contains? ledgers ledger))))))
+     (when-let [[proto address ledger] (address-parts ledger-address)]
+       (let [ipfs-addr (if (= "ipns" proto)
+                         (str "/ipns/" address)
+                         address)
+             ledgers   (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
+         (contains? ledgers ledger))))))
 
 (defn lookup-address
   "Given IPNS address, performs lookup and returns latest ledger address."
@@ -64,7 +63,7 @@
       (str "fluree:ipns://" base-address "/" ledger-alias))))
 
 (defrecord IpnsNameService
-  [ipfs-endpoint ipns-key base-address sync?]
+           [ipfs-endpoint ipns-key base-address sync?]
   ns-proto/iNameService
   (-lookup [_ ledger-alias] (lookup-address ipfs-endpoint ledger-alias nil))
   (-lookup [_ ledger-alias opts] (lookup-address ipfs-endpoint ledger-alias opts))

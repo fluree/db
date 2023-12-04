@@ -1,10 +1,10 @@
 (ns fluree.db.json-ld.ledger
-  (:require [fluree.json-ld :as json-ld]
-            [fluree.db.flake :as flake]
+  (:require [clojure.set :as set]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
+            [fluree.db.flake :as flake]
             [fluree.db.util.core :as util]
-            [clojure.set :as set]))
+            [fluree.json-ld :as json-ld]))
 
 ;; methods to link/trace back a ledger and return flakes
 #?(:clj (set! *warn-on-reflection* true))
@@ -14,7 +14,6 @@
                            "http://www.w3.org/2002/07/owl#Class"
                            "http://www.w3.org/2002/07/owl#ObjectProperty"
                            "http://www.w3.org/2002/07/owl#DatatypeProperty"})
-
 
 (defn class-or-property?
   [{:keys [type] :as _node}]
@@ -104,11 +103,11 @@
   generated from a context"
   [compact-fn]
   (reduce-kv
-    (fn [acc sid iri]
-      (let [compacted-iri (json-ld/compact iri compact-fn)]
-        (assoc acc sid compacted-iri)))
-    {}
-    predefined-sids))
+   (fn [acc sid iri]
+     (let [compacted-iri (json-ld/compact iri compact-fn)]
+       (assoc acc sid compacted-iri)))
+   {}
+   predefined-sids))
 
 (defn last-pid
   [db]
@@ -157,11 +156,11 @@
   assign the lower range of subject ids."
   [{:keys [id] :as node} referring-pid iris next-pid next-sid]
   (let [new-sid (or
-                  (get predefined-properties id)
-                  (if (or (class-or-property? node)
-                          (contains? predicate-refs referring-pid))
-                    (next-pid)
-                    (next-sid)))]
+                 (get predefined-properties id)
+                 (if (or (class-or-property? node)
+                         (contains? predicate-refs referring-pid))
+                   (next-pid)
+                   (next-sid)))]
     (vswap! iris assoc id new-sid)
     new-sid))
 

@@ -1,12 +1,11 @@
 (ns fluree.db.json-ld.credential-test
-  (:require [fluree.db.json-ld.credential :as cred]
-            [clojure.core.async :as async]
-            #?(:clj [clojure.test :as t :refer [deftest testing is]]
+  (:require #?(:clj [clojure.test :as t :refer [deftest testing is]]
                :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])
+            [clojure.core.async :as async]
+            [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.did :as did]))
-
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.test-utils :as test-utils]))
 
 (def kp
   {:public "03b160698617e3b4cd621afd96c0591e33824cb9753ab2f1dace567884b4e242b0"
@@ -122,7 +121,7 @@
                                                    "insert"  {"@id" "ct:open" "ct:foo" "bar"}})
            root-user {"id" (:id auth) "ct:name" "Daniel" "f:role" {"id" "role:cool"} "ct:favnums" [1 2 3]}
            pleb-user {"id" (:id pleb-auth) "ct:name" "Plebian" "f:role" [{"id" "role:notcool"}
-                                                                         { "id" "role:irrelevant"}]}
+                                                                         {"id" "role:irrelevant"}]}
            policy    {"id"           "rootPolicy"
                       "type"         "f:Policy"
                       "f:targetNode" {"id" "f:allNodes"}
@@ -196,6 +195,4 @@
 (comment
   #?(:cljs
 
-     (cljs.test/run-tests))
-
-  ,)
+     (cljs.test/run-tests)))

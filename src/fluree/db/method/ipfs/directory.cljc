@@ -1,11 +1,11 @@
 (ns fluree.db.method.ipfs.directory
-  (:require [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
             [clojure.string :as str]
+            [fluree.db.method.ipfs.xhttp :as ipfs]
+            [fluree.db.util.async :refer [<? go-try channel?]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.xhttp :as xhttp]
-            [fluree.db.method.ipfs.xhttp :as ipfs]))
+            [fluree.db.util.xhttp :as xhttp]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -13,7 +13,6 @@
 
 ;; maintains current state tree for IPNS
 (def ipns-state (atom {}))
-
 
 (defn generate-dag
   "Generates a dag directory file given list/vector of items to add in the file
@@ -80,7 +79,6 @@
           parent-cid     (<? (write-dag! ipfs-endpoint (vals (:child dag-map**))))]
       (assoc dag-map** :hash parent-cid))))
 
-
 (defn dag-map
   "Returns a nested map of a directory-dag containing the key of
   the file/directory name and values of maps with keys:
@@ -104,7 +102,6 @@
                                                      :hash hash
                                                      :size size}))))
            acc))))))
-
 
 (defn flatten-dag
   "Flattens our dag representation returning a list of two-tuples as:
@@ -133,7 +130,6 @@
       (->> (flatten-dag child nil)
            (into {})))))
 
-
 ;; TODO - probably makes sense to have a queue for updates, and apply multiple pending updates simultaneously under the same IPNS address
 (defn refresh-state
   "Updates the ipns state map with latest directory + hashes.
@@ -151,11 +147,6 @@
        (swap! ipns-state-atom assoc ipns-address dag-map*)
        dag-map*))))
 
-
-
-
-
-
 (comment
 
   ;; - IPFS connection
@@ -164,12 +155,11 @@
   ;; ------- DB
 
   (async/<!!
-    (refresh-state "http://127.0.0.1:5001/" "bafybeibtk2qwvuvbawhcgrktkgbdfnor4qzxitk4ct5mfwmvbaao53awou"))
+   (refresh-state "http://127.0.0.1:5001/" "bafybeibtk2qwvuvbawhcgrktkgbdfnor4qzxitk4ct5mfwmvbaao53awou"))
   (async/<!!
-    (list-all "http://127.0.0.1:5001/" "bafybeibtk2qwvuvbawhcgrktkgbdfnor4qzxitk4ct5mfwmvbaao53awou"))
+   (list-all "http://127.0.0.1:5001/" "bafybeibtk2qwvuvbawhcgrktkgbdfnor4qzxitk4ct5mfwmvbaao53awou"))
   (async/<!!
-    (list-all "http://127.0.0.1:5001/" "/ipns/k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2"))
-
+   (list-all "http://127.0.0.1:5001/" "/ipns/k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2"))
 
   (async/<!! (dag-map "http://127.0.0.1:5001/" "bafybeibtk2qwvuvbawhcgrktkgbdfnor4qzxitk4ct5mfwmvbaao53awou"))
 
@@ -180,7 +170,6 @@
   (-> (async/<!! (dag-map "http://127.0.0.1:5001/" "bafybeic67u4q3a2lxp4g4jebdfoc7ij754nho3x3ybv5wgetzl5zh7zqdy"))
       (update-directory! "http://127.0.0.1:5001/" "hi/another" "Qmbjig3cZbUUufWqCEFzyCppqdnmQj3RoDjJWomnqYGy1f" 42)
       async/<!!)
-
 
   (async/<!! (dag-map "http://127.0.0.1:5001/" "bafybeifkhfrz7xycwf7k522lzr42iwtn6wqfqlkijz6mis6iznitmaxk24"))
 
@@ -195,30 +184,21 @@
 
   (def file-name "Qmbjig3cZbUUufWqCEFzyCppqdnmQj3RoDjJWomnqYGy1f")
 
-
-  ;; directory "beep"
+;; directory "beep"
   (async/<!!
-    (generate-dag "http://127.0.0.1:5001/"
-                  [{:name "beep"
-                    :size 21
-                    :hash "Qmbjig3cZbUUufWqCEFzyCppqdnmQj3RoDjJWomnqYGy1f"}
-                   {:name "yo"
-                    :size 42
-                    :hash "Qmbjig3cZbUUufWqCEFzyCppqdnmQj3RoDjJWomnqYGy1f"}]))
+   (generate-dag "http://127.0.0.1:5001/"
+                 [{:name "beep"
+                   :size 21
+                   :hash "Qmbjig3cZbUUufWqCEFzyCppqdnmQj3RoDjJWomnqYGy1f"}
+                  {:name "yo"
+                   :size 42
+                   :hash "Qmbjig3cZbUUufWqCEFzyCppqdnmQj3RoDjJWomnqYGy1f"}]))
 
   ;; parent of beep - include cid of prior item
   (async/<!!
-    (generate-dag "http://127.0.0.1:5001/"
-                  [{:name "hi"
-                    :size 0
-                    :hash "bafybeiboadn2xgaolncuhx6xclnvk72wqbuuwi3fwnu2kmlvbnxxh5vpau"}]))
+   (generate-dag "http://127.0.0.1:5001/"
+                 [{:name "hi"
+                   :size 0
+                   :hash "bafybeiboadn2xgaolncuhx6xclnvk72wqbuuwi3fwnu2kmlvbnxxh5vpau"}]))
 
-
-
-
-
-
-
-  #_(add-directory "http://127.0.0.1:5001/" {"foo" "bar"})
-
-  )
+  #_(add-directory "http://127.0.0.1:5001/" {"foo" "bar"}))

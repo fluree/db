@@ -21,7 +21,7 @@
                        (.close ^Closeable in)
                        (String. (.toByteArray out))))]
       (cond-> resp
-              body-str (assoc :Body body-str)))))
+        body-str (assoc :Body body-str)))))
 
 (defn read-s3-data
   [s3-client s3-bucket s3-prefix path]
@@ -54,11 +54,11 @@
                      path
                      (str s3-prefix "/" path))
          req       (cond-> base-req
-                           (not= full-path "/") (assoc-in [:request :Prefix]
-                                                          full-path)
-                           continuation-token (assoc-in
-                                                [:request :ContinuationToken]
-                                                continuation-token))]
+                     (not= full-path "/") (assoc-in [:request :Prefix]
+                                                    full-path)
+                     continuation-token (assoc-in
+                                         [:request :ContinuationToken]
+                                         continuation-token))]
      (log/debug "s3-list* req:" req)
      (aws/invoke-async s3-client req)
      ch)))
@@ -70,12 +70,12 @@
   [s3-client s3-bucket s3-prefix path]
   (let [ch (async/chan 1)]
     (go-loop [results (<! (s3-list* s3-client s3-bucket s3-prefix path))]
-             (>! ch results)
-             (let [truncated?         (:IsTruncated results)
-                   continuation-token (:NextContinuationToken results)]
-               (if truncated?
-                 (recur (<! (s3-list* s3-client s3-bucket s3-prefix path continuation-token)))
-                 (async/close! ch))))
+      (>! ch results)
+      (let [truncated?         (:IsTruncated results)
+            continuation-token (:NextContinuationToken results)]
+        (if truncated?
+          (recur (<! (s3-list* s3-client s3-bucket s3-prefix path continuation-token)))
+          (async/close! ch))))
     ch))
 
 (defn s3-key-exists?

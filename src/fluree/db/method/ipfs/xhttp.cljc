@@ -1,8 +1,8 @@
 (ns fluree.db.method.ipfs.xhttp
   (:require [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.xhttp :as xhttp]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log :include-macros true])
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.xhttp :as xhttp])
   (:refer-clojure :exclude [cat]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -19,7 +19,6 @@
                      (assoc acc Name Id))
                    {})))))
 
-
 (defn ls
   "Performs ipfs directory list. Returns vector of directory items.
   If a directory item is a sub-directory, :type will = 1.
@@ -32,13 +31,13 @@
                        first
                        :Links)]
       (mapv
-        (fn [{:keys [Name Hash Size Type Target]}]
-          {:name   Name
-           :hash   Hash
-           :size   Size
-           :type   Type
-           :target Target})
-        nodes))))
+       (fn [{:keys [Name Hash Size Type Target]}]
+         {:name   Name
+          :hash   Hash
+          :size   Size
+          :type   Type
+          :target Target})
+       nodes))))
 
 (defn add
   "Adds payload data to IPFS.
@@ -65,7 +64,6 @@
   (let [url (str ipfs-endpoint "api/v0/cat?arg=" block-id)]
     (xhttp/post-json url nil {:keywordize-keys keywordize-keys?})))
 
-
 (defn publish
   "Publishes ipfs-cid to IPNS server using specified IPNS address key.
   Returns core async channel with response."
@@ -73,8 +71,8 @@
   (log/debug "Publishing IPNS update for key:" key "with IPFS CID:" ipfs-cid)
   (go-try
     (let [endpoint (cond-> (str ipfs-endpoint "api/v0/name/publish?")
-                           key (str "key=" key "&")
-                           true (str "arg=" ipfs-cid))
+                     key (str "key=" key "&")
+                     true (str "arg=" ipfs-cid))
           {:keys [Name Value] :as res} (<? (xhttp/post-json endpoint nil {:request-timeout 200000}))]
       (log/debug "IPNS publish complete with response: " res)
       {:name  Name
@@ -84,11 +82,10 @@
   [ipfs-endpoint ipns-key]
   (go-try
     (let [endpoint (cond-> (str ipfs-endpoint "api/v0/name/resolve?")
-                           ipns-key (str "arg=" ipns-key))
+                     ipns-key (str "arg=" ipns-key))
           {:keys [Path] :as res} (<? (xhttp/post-json endpoint nil {:request-timeout 200000}))]
       (log/debug "IPNS name resolve complete with response: " res)
       Path)))
-
 
 (comment
   (def ipfs-endpoint "http://127.0.0.1:5001/")
@@ -107,27 +104,24 @@
   (async/go
     (println (async/<! (add ipfs-endpoint "Twas brillig"))))
 
-
   (async/go
     (println (async/<! (publish ipfs-endpoint "Twas brillig"))))
 
+  (clojure.core.async/<!!
+   (cat "http://127.0.0.1:5001/" "/ipfs/QmXh2W5GPnocpiyFYtQKu4cPLDSwdDELYRTyZkhMSKx7vj"))
 
   (clojure.core.async/<!!
-    (cat "http://127.0.0.1:5001/" "/ipfs/QmXh2W5GPnocpiyFYtQKu4cPLDSwdDELYRTyZkhMSKx7vj"))
+   (publish "http://127.0.0.1:5001/" "/ipfs/QmPTXAvmWrmcbqAPxY82N6nRcLUyEWP51UZVtq15CDMVYs" "Fluree1"))
 
   (clojure.core.async/<!!
-    (publish "http://127.0.0.1:5001/" "/ipfs/QmPTXAvmWrmcbqAPxY82N6nRcLUyEWP51UZVtq15CDMVYs" "Fluree1"))
+   (xhttp/post-json "http://127.0.0.1:5001/api/v0/cat?arg=/ipns/k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2" nil {:keywordize-keys false}))
 
   (clojure.core.async/<!!
-    (xhttp/post-json "http://127.0.0.1:5001/api/v0/cat?arg=/ipns/k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2" nil {:keywordize-keys false}))
+   (xhttp/post-json "http://127.0.0.1:5001/api/v0/ls?arg=k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2" nil nil))
 
   (clojure.core.async/<!!
-    (xhttp/post-json "http://127.0.0.1:5001/api/v0/ls?arg=k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2" nil nil))
-
-
-  (clojure.core.async/<!!
-    (ls "http://127.0.0.1:5001/" "/ipns/k51qzi5uqu5dllaos3uy3sx0o8gw221tyaiu2qwmgdzy5lofij0us0h4ai41az"))
+   (ls "http://127.0.0.1:5001/" "/ipns/k51qzi5uqu5dllaos3uy3sx0o8gw221tyaiu2qwmgdzy5lofij0us0h4ai41az"))
 
   (clojure.core.async/<!!
-    (add "http://127.0.0.1:5001/" {:hi "there" :im "blahhere"})))
+   (add "http://127.0.0.1:5001/" {:hi "there" :im "blahhere"})))
 

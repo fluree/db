@@ -1,12 +1,12 @@
 (ns fluree.db.query.json-ld.response
-  (:require [fluree.db.util.async :refer [<? go-try merge-into?]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.flake :as flake]
-            [fluree.db.constants :as const]
+  (:require [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.async :refer [<? go-try merge-into?]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log :include-macros true]))
 
 ;; handles :select response map for JSON-LD based queries
 

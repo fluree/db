@@ -1,7 +1,7 @@
 (ns fluree.db.query.subclass-test
   (:require [clojure.test :refer :all]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]))
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest subclass-test
   (testing "Subclass queries work."

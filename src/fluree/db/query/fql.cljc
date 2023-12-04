@@ -1,11 +1,11 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! go]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.context :as ctx-util]
-            [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
-            [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.exec :as exec]
-            [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]])
+            [fluree.db.query.fql.parse :as parse]
+            [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
+            [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
+            [fluree.db.util.context :as ctx-util]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 

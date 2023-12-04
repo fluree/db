@@ -1,17 +1,17 @@
 (ns fluree.db.query.exec.where
-  (:require [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async :refer [<! >! go take! put!]]
+  (:require [clojure.core.async :as async :refer [<! >! go take! put!]]
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.index :as index]
+            [fluree.db.json-ld.ledger :as ledger]
+            [fluree.db.query.dataset :as dataset]
+            [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.datatype :as datatype]
-            [fluree.db.query.dataset :as dataset]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]
-            [fluree.db.json-ld.ledger :as ledger])
+            [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (clojure.lang MapEntry))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -166,7 +166,7 @@
    {::patterns patterns})
   ([patterns filters]
    (cond-> (->where-clause patterns)
-           (seq filters) (assoc ::filters filters))))
+     (seq filters) (assoc ::filters filters))))
 
 (defn pattern-type
   [pattern]
@@ -250,8 +250,8 @@
               (match-iri matched iri)
               matched))
           (catch* e
-                  (log/error e "Error looking up iri")
-                  (>! error-ch e)))))
+            (log/error e "Error looking up iri")
+            (>! error-ch e)))))
 
 (defn match-predicate-iri
   [db matched]
@@ -325,8 +325,8 @@
 
          idx         (try* (index/for-components s p o o-dt)
                            (catch* e
-                                   (log/error e "Error resolving flake range")
-                                   (async/put! error-ch e)))
+                             (log/error e "Error resolving flake range")
+                             (async/put! error-ch e)))
          idx-root    (get db idx)
          novelty     (get-in db [:novelty idx])
          [o* o-fn*]  (augment-object-fn idx s p o o-fn alias)
@@ -364,7 +364,6 @@
      (-> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
          (->> (query-range/filter-authorized db start-flake end-flake error-ch))))))
 
-
 (defn resolve-subject-sid
   [db error-ch s-mch]
   (go (try*
@@ -373,8 +372,8 @@
           (when-let [sid (<? (dbproto/-subid db s-iri {:expand? false}))]
             (match-sid s-mch db-alias sid)))
         (catch* e
-                (log/error e "Error resolving subject id")
-                (>! error-ch e)))))
+          (log/error e "Error resolving subject id")
+          (>! error-ch e)))))
 
 (defn resolve-predicate-sid
   [db p-mch]
@@ -402,7 +401,6 @@
                      o)]
       (when (and (some? s*) (some? p*) (some? o*))
         [s* p* o*]))))
-
 
 (defn get-equivalent-properties
   [db prop]
@@ -508,14 +506,14 @@
                          o)]
         (if (and (some? s*) (some? p*) (some? o*))
           (let
-              [cls        (get-sid o* db-alias)
-               sub-obj    (dissoc o* ::sids ::iri)
-               class-objs (into [o*]
-                                (comp (map (fn [cls]
-                                             (match-sid sub-obj db-alias cls)))
-                                      (remove nil?))
-                                (dbproto/-class-prop db :subclasses cls))
-               class-ch   (async/to-chan! class-objs)]
+           [cls        (get-sid o* db-alias)
+            sub-obj    (dissoc o* ::sids ::iri)
+            class-objs (into [o*]
+                             (comp (map (fn [cls]
+                                          (match-sid sub-obj db-alias cls)))
+                                   (remove nil?))
+                             (dbproto/-class-prop db :subclasses cls))
+            class-ch   (async/to-chan! class-objs)]
             (async/pipeline-async 2
                                   flake-ch
                                   (fn [class-obj ch]

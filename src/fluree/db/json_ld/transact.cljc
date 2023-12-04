@@ -12,10 +12,10 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.policy.enforce-tx :as policy]
-            [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
@@ -155,18 +155,18 @@
                                  (<? (shacl/targetobject-shapes db-before referring-pids)))
                 shacl-shapes   (into class-shapes s-pred-shapes)]
             (recur r (reduce
-                       (fn [subj-mods o-pred-shape]
-                         (let [target-os (->> (get pid->ref-flakes (:target-objects-of o-pred-shape))
-                                              (mapv flake/o))]
-                           (reduce (fn [subj-mods target-o]
-                                     (update-in subj-mods [target-o :shacl] (fnil conj []) o-pred-shape))
-                                   subj-mods
-                                   target-os)))
-                       (-> subj-mods
-                           (assoc-in [sid :new?] (boolean new-subject?))
-                           (update-in [sid :classes] (fnil into []) classes)
-                           (update-in [sid :shacl] (fnil into []) shacl-shapes))
-                       o-pred-shapes)))
+                      (fn [subj-mods o-pred-shape]
+                        (let [target-os (->> (get pid->ref-flakes (:target-objects-of o-pred-shape))
+                                             (mapv flake/o))]
+                          (reduce (fn [subj-mods target-o]
+                                    (update-in subj-mods [target-o :shacl] (fnil conj []) o-pred-shape))
+                                  subj-mods
+                                  target-os)))
+                      (-> subj-mods
+                          (assoc-in [sid :new?] (boolean new-subject?))
+                          (update-in [sid :classes] (fnil into []) classes)
+                          (update-in [sid :shacl] (fnil into []) shacl-shapes))
+                      o-pred-shapes)))
           subj-mods)))))
 
 (defn final-db
@@ -212,15 +212,15 @@
    (stage db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (go-try
-    (let [db* (if-let [policy-identity (perm/policy-identity
-                                        (-> parsed-opts
+     (let [db* (if-let [policy-identity (perm/policy-identity
+                                         (-> parsed-opts
                                             ;;TODO once we remove default-context,
                                             ;;should only have one context, with no need
                                             ;;to swap here
-                                            (assoc :context
-                                                   (:supplied-context parsed-opts))
-                                            (dissoc :supplied-context)))]
-                (<? (perm/wrap-policy db policy-identity))
+                                             (assoc :context
+                                               (:supplied-context parsed-opts))
+                                             (dissoc :supplied-context)))]
+                 (<? (perm/wrap-policy db policy-identity))
                  db)
            tx-state      (->tx-state db*)
 

@@ -1,14 +1,14 @@
 (ns fluree.db.indexer.default
-  (:require [fluree.db.indexer.proto :as idx-proto]
-            [fluree.db.index :as index]
-            [fluree.db.storage :as storage]
-            [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [clojure.core.async :as async]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log :include-macros true]
+  (:require [clojure.core.async :as async]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.commit-data :as commit-data]))
+            [fluree.db.flake :as flake]
+            [fluree.db.index :as index]
+            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.storage :as storage]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]))
 
 ;; default indexer
 
@@ -73,8 +73,8 @@
       (try*
         (watch-fn (assoc event-data :watch-id watch-id))
         (catch* e
-                (log/warn "Closing index watch function due to exception: " (ex-message e))
-                (remove-watch-event state-atom watch-id))))))
+          (log/warn "Closing index watch function due to exception: " (ex-message e))
+          (remove-watch-event state-atom watch-id))))))
 
 (defn format-watch-event
   "This ensures consistent formatting of watch events."
@@ -123,10 +123,10 @@
                             (if (= tempid (:tempid indexing))
                               (let [indexed* (-> indexing
                                                  (assoc :id (:id commit-idx)
-                                                        :address (:address commit-idx))
+                                                   :address (:address commit-idx))
                                                  (assoc-in [:status :stop] (util/current-time-iso)))]
                                 (assoc branch-state :indexed indexed*
-                                                    :indexing nil))
+                                  :indexing nil))
                               (do
                                 (log/warn (str "Index unlocked request for tempid: " tempid
                                                "unsuccessful because current indexing map is: " indexing
@@ -222,8 +222,8 @@
           (let [subrange  (flake/subrange flakes >= cur-first)
                 last-leaf (-> leaf
                               (assoc :flakes subrange
-                                     :first cur-first
-                                     :rhs rhs)
+                                :first cur-first
+                                :rhs rhs)
                               (dissoc :id :leftmost?))]
             (conj leaves last-leaf))
           (let [new-size (-> f flake/size-flake (+ cur-size) long)]
@@ -231,10 +231,10 @@
               (let [subrange (flake/subrange flakes >= cur-first < f)
                     new-leaf (-> leaf
                                  (assoc :flakes subrange
-                                        :first cur-first
-                                        :rhs f
-                                        :leftmost? (and (empty? leaves)
-                                                        leftmost?))
+                                   :first cur-first
+                                   :rhs f
+                                   :leftmost? (and (empty? leaves)
+                                                   leftmost?))
                                  (dissoc :id))]
                 (recur r 0 f (conj leaves new-leaf)))
               (recur r new-size cur-first leaves))))))
@@ -334,11 +334,11 @@
   Takes original node, and map of temp left ids to final leaf ids for updating children."
   [temp->final-ids {:keys [children] :as branch-node}]
   (let [children* (reduce-kv
-                    (fn [acc k v]
-                      (if-let [updated-id (get temp->final-ids (:id v))]
-                        (assoc acc k (assoc v :id updated-id))
-                        acc))
-                    children children)]
+                   (fn [acc k v]
+                     (if-let [updated-id (get temp->final-ids (:id v))]
+                       (assoc acc k (assoc v :id updated-id))
+                       acc))
+                   children children)]
     (assoc branch-node :children children*)))
 
 (defn write-node
@@ -357,10 +357,9 @@
                    (storage/write-branch db idx changes-ch)
                    <?)))
         (catch* e
-                (log/error e
-                           "Error writing novel index node:" display-node)
-                (async/>! error-ch e))))))
-
+          (log/error e
+                     "Error writing novel index node:" display-node)
+          (async/>! error-ch e))))))
 
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
@@ -370,15 +369,14 @@
       (if (index/resolved? node)
         (let [written-node (async/<! (write-node db idx node error-ch changes-ch (:updated-ids stats)))
               stats*       (cond-> stats
-                                   (not= old-id :empty) (update :garbage conj old-id)
-                                   true (update :novel inc)
-                                   true (assoc-in [:updated-ids (:id node)] (:id written-node)))]
+                             (not= old-id :empty) (update :garbage conj old-id)
+                             true (update :novel inc)
+                             true (assoc-in [:updated-ids (:id node)] (:id written-node)))]
           (recur stats*
                  written-node))
         (recur (update stats :unchanged inc)
                node))
       (assoc stats :root (index/unresolve last-node)))))
-
 
 (defn refresh-index
   [{:keys [conn] :as db} changes-ch error-ch {::keys [idx t novelty remove-preds root]}]
@@ -400,14 +398,12 @@
      ::t            t
      ::remove-preds remove-preds}))
 
-
 (defn tally
   [db-status {:keys [idx root garbage] :as _tally-data}]
   (-> db-status
       (update :db assoc idx root)
       (update :indexes conj idx)
       (update :garbage into garbage)))
-
 
 (defn refresh-all
   ([db error-ch]
@@ -430,9 +426,9 @@
   "Returns a map of each index type's root index address"
   [db]
   (reduce
-    (fn [acc index-type]
-      (assoc acc index-type (-> db (get index-type) :id)))
-    {} index/types))
+   (fn [acc index-type]
+     (assoc acc index-type (-> db (get index-type) :id)))
+   {} index/types))
 
 (defn refresh
   [indexer
@@ -486,8 +482,8 @@
 (defn push-index-event
   [indexer event-type event-meta]
   (idx-proto/-push-event
-    indexer
-    (format-watch-event event-type event-meta)))
+   indexer
+   (format-watch-event event-type event-meta)))
 
 (defn do-index
   "Performs an index operation and returns a promise-channel of the latest db once complete"
@@ -505,7 +501,7 @@
             ;; in case event listener wanted final indexed db, put on established port
             (when (fn? update-commit-fn)
               (let [result (async/<!
-                             (update-commit-fn indexed-db))]
+                            (update-commit-fn indexed-db))]
                 (when (util/exception? result)
                   (log/error result "Exception updating commit with new index: " (ex-message result))
                   (throw result))
@@ -517,12 +513,11 @@
             ;; remove update-commit-fn as we don't want downstream processes being able to do this
             (push-index-event indexer :index-end (dissoc index-state* :update-commit-fn)))
           (catch* e
-                  (log/error e "Error encountered creating index for db: " db ". "
-                             "Indexing stopped."))))
+            (log/error e "Error encountered creating index for db: " db ". "
+                       "Indexing stopped."))))
       (when changes-ch ;; if we don't have a lock, nothing to index so close changes-ch if it exists
         (async/close! changes-ch)))
     port))
-
 
 (defn status
   [{:keys [state-atom] :as _indexer}]
@@ -561,8 +556,6 @@
   [state-atom branch f]
   (swap! state-atom assoc-in [:commit-fn branch] f))
 
-
-
 (defrecord IndexerDefault [reindex-min-bytes reindex-max-bytes state-atom]
   idx-proto/iIndex
   (-index? [_ db] (novelty-min? reindex-min-bytes db))
@@ -579,28 +572,26 @@
   (-empty-novelty [_ db t] (empty-novelty db t))
   (-reindex [indexer db] :TODO))
 
-
 (defn new-state-atom
   []
   (atom
-    {:watchers {}                                           ;; map of watcher ids to fns
+   {:watchers {}                                           ;; map of watcher ids to fns
      ;; for each branch, can have separate indexing jobs
-     :branch   {:main {:indexing {:tempid nil               ;; running indexing job
-                                  :t      nil
-                                  :chan   nil
-                                  :status nil}
+    :branch   {:main {:indexing {:tempid nil               ;; running indexing job
+                                 :t      nil
+                                 :chan   nil
+                                 :status nil}
                        ;; last completed indexing job
-                       :indexed  {:id      nil
-                                  :address nil
-                                  :t       nil
-                                  :garbage #{}}
+                      :indexed  {:id      nil
+                                 :address nil
+                                 :t       nil
+                                 :garbage #{}}
                        ;; queued indexing job, will be executed once current job completes
-                       :queued   {:db     nil               ;; holds ref to latest db asked to index
-                                  :id     nil
-                                  :t      nil
-                                  :chan   nil
-                                  :status nil}}}}))
-
+                      :queued   {:db     nil               ;; holds ref to latest db asked to index
+                                 :id     nil
+                                 :t      nil
+                                 :chan   nil
+                                 :status nil}}}}))
 
 (defn create
   "Creates a new indexer."

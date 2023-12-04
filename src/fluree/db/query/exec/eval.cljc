@@ -1,16 +1,16 @@
 (ns fluree.db.query.exec.eval
   (:refer-clojure :exclude [compile rand concat replace max min
                             #?(:clj ratio? :cljs uuid)])
-  (:require [fluree.db.query.exec.group :as group]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.util.log :as log]
+  (:require [clojure.math]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
-            [clojure.math]
-            [fluree.db.datatype :as datatype]
             [fluree.crypto :as crypto]
-            [fluree.db.constants :as const])
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.query.exec.group :as group]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.log :as log])
   #?(:clj (:import (java.time Instant OffsetDateTime LocalDateTime))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -38,9 +38,9 @@
         size  (count coll)
         med   (bit-shift-right size 1)
         res   (cond-> (nth terms med)
-                      (even? size)
-                      (-> (+ (nth terms (dec med)))
-                          (/ 2)))]
+                (even? size)
+                (-> (+ (nth terms (dec med)))
+                    (/ 2)))]
     (if (ratio? res)
       (double res)
       res)))
@@ -299,13 +299,11 @@
      ;; rdf term fns
      uuid struuid isNumeric isBlank str})
 
-
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
 
 (def qualified-symbols
-  '{
-    !              fluree.db.query.exec.eval/!
+  '{!              fluree.db.query.exec.eval/!
     ||             fluree.db.query.exec.eval/||
     &&             fluree.db.query.exec.eval/&&
     abs            clojure.core/abs
@@ -356,7 +354,6 @@
     str            fluree.db.query.exec.eval/sparql-str
     max            fluree.db.query.exec.eval/max
     min            fluree.db.query.exec.eval/min})
-
 
 (defn as*
   [val var]

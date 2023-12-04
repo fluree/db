@@ -1,12 +1,11 @@
 (ns fluree.db.query.analytical-filter
-  (:require [fluree.db.util.core :as util]
+  (:require #?(:cljs [cljs.reader])
             [clojure.string :as str]
-            [fluree.db.util.log :as log :include-macros true]
-            #?(:cljs [cljs.reader]))
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (java.time Instant))))
 
 #?(:clj (set! *warn-on-reflection* true))
-
 
 ;; Change all filter functions to be: https://www.w3.org/TR/sparql11-query/#SparqlOps
 ;; https://docs.data.world/tutorials/sparql/list-of-sparql-filter-functions.html
@@ -37,7 +36,6 @@
    "strEnds"    'fluree.db.query.analytical-filter/strEnds
    "re-find"    're-find
    "re-pattern" 're-pattern})
-
 
 (defn !
   [x]
@@ -151,8 +149,8 @@
 (defn extract-combined-filter
   [filter-maps]
   (some->> filter-maps
-      (map :function)
-      (apply every-pred)))
+           (map :function)
+           (apply every-pred)))
 
 (defmacro coalesce
   "Evaluates args in order. The result of the first arg not to return error gets returned."
@@ -176,7 +174,6 @@
 ;    "F"
 ;  ) AS ?result
 ;)
-
 
 (defn filter-row
   [headers clause fil]

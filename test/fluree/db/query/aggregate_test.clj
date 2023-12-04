@@ -1,7 +1,7 @@
 (ns fluree.db.query.aggregate-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
+            [fluree.db.test-utils :as test-utils]
             [fluree.db.util.log :as log]))
 
 (deftest ^:integration aggregates-test

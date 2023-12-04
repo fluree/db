@@ -1,13 +1,13 @@
 (ns fluree.db.json-ld.credential
-  (:require [alphabase.core :as alphabase]
-            [fluree.db.util.async :refer [go-try]]
+  (:require #?(:cljs [cljs.core.async.interop :refer-macros [<p!]])
+            [alphabase.core :as alphabase]
             [clojure.string :as str]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.crypto :as crypto]
+            [fluree.db.did :as did]
+            [fluree.db.util.async :refer [go-try]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.json-ld :as json-ld]
-            #?(:cljs [cljs.core.async.interop :refer-macros [<p!]])
-            [fluree.json-ld.processor.api :as jld-processor]
-            [fluree.db.did :as did]))
+            [fluree.json-ld.processor.api :as jld-processor]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -18,18 +18,15 @@
    "b64"  false
    "crit" ["b64"]})
 
-
 (def jws-header-json (json-ld/normalize-data jws-header {:algorithm :basic
                                                          :format    :application/json}))
 
 (def jws-header-b64 (alphabase/base-to-base jws-header-json :string :base64url))
 
-
 (defn serialize-jws
   "Serialize a JWS according to the JOSE specification, compact form."
   [signature]
   (str jws-header-b64 ".." signature))
-
 
 (defn deserialize-jws
   "Deserialize a compact JWS into its component parts"
@@ -38,7 +35,6 @@
     {:header    (alphabase/base-to-base header :base64url :string)
      :payload   (alphabase/base-to-base payload :base64url :string)
      :signature (alphabase/base-to-base sig :base64url :hex)}))
-
 
 (defn sign
   "Given a payload and a signing key, returns a JOSE JSON Web Signature."

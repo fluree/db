@@ -1,18 +1,18 @@
 (ns fluree.db.conn.ipfs
-  (:require [fluree.db.storage :as storage]
-            [fluree.db.index :as index]
-            [fluree.db.util.context :as ctx-util]
-            #?(:clj [fluree.db.full-text :as full-text])
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.method.ipfs.core :as ipfs]
-            [fluree.db.util.async :refer [<? go-try]]
+  (:require #?(:clj [fluree.db.full-text :as full-text])
             [clojure.core.async :as async :refer [go <! chan]]
+            [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.core :as conn-core]
-            [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.method.ipfs.keys :as ipfs-keys]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
-            [fluree.db.conn.cache :as conn-cache])
+            [fluree.db.method.ipfs.core :as ipfs]
+            [fluree.db.method.ipfs.keys :as ipfs-keys]
+            [fluree.db.serde.json :refer [json-serde]]
+            [fluree.db.storage :as storage]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.context :as ctx-util]
+            [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -72,17 +72,17 @@
       (if (= :empty id)
         (storage/resolve-empty-node node)
         (conn-cache/lru-lookup
-          lru-cache-atom
-          cache-key
-          (fn [_]
-            (storage/resolve-index-node conn node
-                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key))))))))
+         lru-cache-atom
+         cache-key
+         (fn [_]
+           (storage/resolve-index-node conn node
+                                       (fn [] (conn-cache/lru-evict lru-cache-atom cache-key))))))))
 
   #?@(:clj
       [full-text/IndexConnection
        (open-storage [conn network dbid lang]
-         (throw (ex-info "IPFS connection does not support full text operations."
-                         {:status 500 :error :db/unexpected-error})))]))
+                     (throw (ex-info "IPFS connection does not support full text operations."
+                                     {:status 500 :error :db/unexpected-error})))]))
 
 #?(:cljs
    (extend-type IPFSConnection
@@ -125,7 +125,6 @@
        :context-type context-type
        :did          did
        :indexer      new-indexer-fn})))
-
 
 (defn connect
   "Creates a new IPFS connection."

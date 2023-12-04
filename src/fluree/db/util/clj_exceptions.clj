@@ -5,10 +5,10 @@
 
 (defmacro try* [& body]
   (let [try-body       (remove #(and
-                                  (list? %)
-                                  (or
-                                    (= 'catch* (first %))
-                                    (= 'finally (first %))))
+                                 (list? %)
+                                 (or
+                                  (= 'catch* (first %))
+                                  (= 'finally (first %))))
                                body)
         [catch err & catch-body] (find-clause 'catch* body)
         finally-clause (find-clause 'finally body)

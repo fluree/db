@@ -1,15 +1,15 @@
 (ns fluree.db.query.exec.update
-  (:require [fluree.db.flake :as flake]
-            [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.util.core :refer [try* catch*]]
-            [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.log :as log]
-            [clojure.core.async :as async :refer [<! >! go]]
+  (:require [clojure.core.async :as async :refer [<! >! go]]
             [clojure.string :as str]
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
             [fluree.db.json-ld.ledger :as jld-ledger]
-            [fluree.db.datatype :as datatype]))
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.log :as log]))
 
 (defn iri-mapping?
   [flake]
@@ -36,8 +36,8 @@
                         retract-flakes-ch)
             (async/close! retract-flakes-ch)))
         (catch* e
-                (log/error e "Error retracting triple")
-                (>! error-ch e))))
+          (log/error e "Error retracting triple")
+          (>! error-ch e))))
     retract-flakes-ch))
 
 (defn retract-clause

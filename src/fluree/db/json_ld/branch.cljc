@@ -1,7 +1,7 @@
 (ns fluree.db.json-ld.branch
-  (:require [fluree.db.util.core :as util]
+  (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.dbproto :as dbproto]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true])
 
   (:refer-clojure :exclude [name]))
@@ -63,7 +63,7 @@
     (let [db* (dbproto/-index-update db index)]
       (-> branch-data
           (assoc :t db-t
-                 :latest-db db*)))
+            :latest-db db*)))
     (throw (ex-info (str "Unable to create new DB version on ledger, latest 't' value is: "
                          t " however new db t value is: " db-t ".")
                     {:status 500 :error :db/invalid-time}))))
@@ -106,7 +106,7 @@
     (-> branch-data
         (update-db db*)
         (assoc :commit (:commit db*)
-               :commit-db db*))))
+          :commit-db db*))))
 
 (defn latest-db
   "Returns latest db from branch data"

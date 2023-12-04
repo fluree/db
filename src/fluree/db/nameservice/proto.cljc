@@ -1,7 +1,6 @@
 (ns fluree.db.nameservice.proto
   (:refer-clojure :exclude [-lookup]))
 
-
 (defprotocol iNameService
   (-lookup [nameservice ledger-alias] [nameservice ledger-alias opts] "Performs lookup operation on ledger alias and returns map of latest commit and other metadata")
   (-push [nameservice commit-data] "Pushes new commit to nameservice.")

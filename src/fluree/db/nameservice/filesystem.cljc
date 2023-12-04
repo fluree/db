@@ -1,10 +1,10 @@
 (ns fluree.db.nameservice.filesystem
-  (:require [fluree.db.nameservice.proto :as ns-proto]
-            [fluree.db.util.filesystem :as fs]
-            [fluree.db.util.bytes :as bytes]
-            [clojure.core.async :as async :refer [go]]
-            [fluree.db.util.async :refer [<? go-try]]
+  (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
+            [fluree.db.nameservice.proto :as ns-proto]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.bytes :as bytes]
+            [fluree.db.util.filesystem :as fs]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -60,15 +60,13 @@
                p)
        :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
 
-
 (defn lookup
   [local-path ledger-alias {:keys [branch] :or {branch "main"} :as _opts}]
   (go-try
     (file-address (read-address local-path ledger-alias))))
 
-
 (defrecord FileNameService
-  [local-path sync?]
+           [local-path sync?]
   ns-proto/iNameService
   (-lookup [_ ledger-alias] (lookup local-path ledger-alias nil))
   (-lookup [_ ledger-alias opts] (lookup local-path ledger-alias opts))
@@ -87,7 +85,6 @@
         (->> (drop-last 2) ; branch-name, head
              (str/join #"/"))))
   (-close [nameservice] true))
-
 
 (defn initialize
   [path]

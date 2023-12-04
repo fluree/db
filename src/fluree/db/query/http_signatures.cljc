@@ -1,9 +1,9 @@
 (ns fluree.db.query.http-signatures
-  (:require [fluree.crypto :as crypto]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
+            [fluree.crypto :as crypto]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.json :as json])
+            [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (java.time ZoneOffset ZonedDateTime)
                    (java.time.format DateTimeFormatter)
                    (java.net URL))))
@@ -30,15 +30,14 @@
                            (throw (ex-info (str "Signing string component " k " is not present.")
                                            {:status 401 :error :db/invalid-auth}))))]
     (->> (reduce
-           (fn [acc k]
-             (if (= "(request-target)" k)
-               (conj acc (str "(request-target): "
-                              (str/lower-case (name (get-or-throw val-map "method")))
-                              " " (str/lower-case (get-or-throw val-map "path"))))
-               (conj acc (str k ": " (get-or-throw val-map k)))))
-           [] ks)
+          (fn [acc k]
+            (if (= "(request-target)" k)
+              (conj acc (str "(request-target): "
+                             (str/lower-case (name (get-or-throw val-map "method")))
+                             " " (str/lower-case (get-or-throw val-map "path"))))
+              (conj acc (str k ": " (get-or-throw val-map k)))))
+          [] ks)
          (str/join "\n"))))
-
 
 (defn verify-signature-header*
   [req sig-header-str]
@@ -57,7 +56,7 @@
                                          :error  :db/invalid-auth}))))
         sig-parts   (str/split (get sig-map "headers" "") #" ")
         sign-string (generate-signing-string (assoc headers "method" request-method
-                                                            "path" uri)
+                                               "path" uri)
                                              sig-parts)
         signature   (get sig-map "signature")
         authority   (crypto/account-id-from-message sign-string signature)
@@ -71,7 +70,6 @@
      :signed    sign-string
      :signature signature}))
 
-
 (defn verify-signature-header
   "Verifies signed http request. If signature header does not exist,
   returns nil. If it exists and is valid, returns the authid associated
@@ -80,7 +78,6 @@
   (when-let [sig-header-str (get (:headers req) "signature")]
     (log/trace "Verifying http signature header:" sig-header-str)
     (verify-signature-header* req sig-header-str)))
-
 
 (defn verify-digest
   "If a message digest is present, verifies it."
@@ -103,7 +100,6 @@
                           {:status 401 :error :db/invalid-auth}))
           req))
       req)))
-
 
 (defn sign-request
   "Signs http request by creating required headers and using supplied private key.
@@ -131,11 +127,10 @@
          ;; we put "Date" in the sig header because browsers will not allow a Date header
          sig-header       (str "keyId=\"" auth "\",headers=\"" sign-headers-str "\",algorithm=\"ecdsa-sha256\",signature=\"" sig "\",date=\"" date "\"")
          headers*         (util/without-nils
-                            (merge headers {"Digest"        digest
-                                            "X-Fluree-Date" date
-                                            "Signature"     sig-header}))]
+                           (merge headers {"Digest"        digest
+                                           "X-Fluree-Date" date
+                                           "Signature"     sig-header}))]
      (assoc request :headers headers*))))
-
 
 (defn verify-request*
   "Returns auth record from separated request parts."
@@ -147,9 +142,8 @@
    (-> req
        verify-digest
        (assoc :request-method method
-              :uri uri)
+         :uri uri)
        verify-signature-header)))
-
 
 (defn verify-request
   "Returns map of auth and authority from request."
@@ -157,8 +151,6 @@
   (-> request
       verify-digest
       verify-signature-header))
-
-
 
 (comment
 
@@ -173,7 +165,6 @@
 
   (def signed-request
     (sign-request :post "http://localhost:8090/fdb/test/permissions/query" myrequest "78f2ee93ef8008a270ffad949799462474f44c1ee8b29f07ec4fe1ae965b92c"))
-
 
   signed-request
 

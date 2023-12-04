@@ -1,9 +1,9 @@
 (ns fluree.db.nameservice.remote
-  (:require [fluree.db.nameservice.proto :as ns-proto]
+  (:require [clojure.core.async :as async :refer [go go-loop]]
             [fluree.db.method.remote.core :as remote]
-            [clojure.core.async :as async :refer [go go-loop]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
@@ -20,7 +20,7 @@
   [state server-state ledger-address]
   (go-try
     (boolean
-      (<? (remote-lookup state server-state ledger-address nil)))))
+     (<? (remote-lookup state server-state ledger-address nil)))))
 
 (defn monitor-socket-messages
   [{:keys [conn-state msg-in] :as _remote-ns} websocket]
@@ -35,7 +35,7 @@
             (try*
               (callback parsed-msg)
               (catch* e
-                      (log/error "Subscription callback for ledger: " ledger " failed with error: " e)))
+                (log/error "Subscription callback for ledger: " ledger " failed with error: " e)))
             (log/warn "No callback registered for ledger: " ledger))
           (recur))
         (do
@@ -58,7 +58,6 @@
           (monitor-socket-messages remote-ns ws)
           ws)))))
 
-
 (defn subscribe
   [ns-state ledger-alias callback]
   (if (fn? callback)
@@ -73,7 +72,7 @@
   (swap! ns-state update :subscription dissoc ledger-alias))
 
 (defrecord RemoteNameService
-  [conn-state server-state sync? msg-in msg-out]
+           [conn-state server-state sync? msg-in msg-out]
   ns-proto/iNameService
   (-lookup [_ ledger-alias] (remote-lookup conn-state server-state ledger-alias nil))
   (-lookup [_ ledger-alias opts] (remote-lookup conn-state server-state ledger-alias opts))

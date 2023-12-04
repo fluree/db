@@ -2,7 +2,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-
 (defprotocol StorageSerializer
   (-serialize-db-root [this db-root] "Serializes the database index root.")
   (-deserialize-db-root [this db-root] "Deserializes the database index root.")

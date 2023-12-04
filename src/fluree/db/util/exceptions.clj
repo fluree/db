@@ -4,7 +4,7 @@
 
 (defn find-clause [clause body]
   (some #(when (and
-                 (list? %)
-                 (= clause (first %)))
+                (list? %)
+                (= clause (first %)))
            %)
         body))

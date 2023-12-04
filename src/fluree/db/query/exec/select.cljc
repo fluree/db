@@ -4,6 +4,7 @@
   (:refer-clojure :exclude [format])
   (:require [clojure.core.async :as async :refer [<! >! chan go go-loop]]
             [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.exec.eval :as-alias eval]
             [fluree.db.query.exec.where :as where]
@@ -11,10 +12,9 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :refer [catch* try*]]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.datatype :as datatype]
-            [fluree.db.util.json :as json]))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -34,8 +34,8 @@
     (let [v (where/get-value match)]
       (try* (json/parse v false)
             (catch* e
-                    (log/error e "Error displaying json:" v)
-                    (>! error-ch e))))))
+              (log/error e "Error displaying json:" v)
+              (>! error-ch e))))))
 
 (defmethod display const/$xsd:anyURI
   [match db iri-cache compact error-ch]
@@ -49,14 +49,14 @@
                     (vswap! iri-cache assoc v {:as iri})
                     iri)
                   (catch* e
-                          (log/error e "Error displaying iri:" v)
-                          (>! error-ch e))))))))
+                    (log/error e "Error displaying iri:" v)
+                    (>! error-ch e))))))))
 
 (defprotocol ValueSelector
   (implicit-grouping? [this]
-   "Returns true if this selector should have its values grouped together.")
+    "Returns true if this selector should have its values grouped together.")
   (format-value [fmt db iri-cache context compact error-ch solution]
-   "Formats a where search solution (map of pattern matches) by extracting and displaying relevant pattern matches."))
+    "Formats a where search solution (map of pattern matches) by extracting and displaying relevant pattern matches."))
 
 ;; This exists because many different types of data structures in :select
 ;; clauses get implicit-grouping? called on them. So this defaults them to false.
@@ -88,19 +88,19 @@
   ValueSelector
   (implicit-grouping? [_] false)
   (format-value
-   [_ db iri-cache _context compact error-ch solution]
-   (go-loop [ks        (keys solution)
-             formatted {}]
-     (let [k          (first ks)
-           fv         (-> solution
-                          (get k)
-                          (display db iri-cache compact error-ch)
-                          <!)
-           formatted' (assoc formatted k fv)
-           next-ks    (rest ks)]
-         (if (seq next-ks)
-           (recur next-ks formatted')
-           formatted')))))
+    [_ db iri-cache _context compact error-ch solution]
+    (go-loop [ks        (keys solution)
+              formatted {}]
+      (let [k          (first ks)
+            fv         (-> solution
+                           (get k)
+                           (display db iri-cache compact error-ch)
+                           <!)
+            formatted' (assoc formatted k fv)
+            next-ks    (rest ks)]
+        (if (seq next-ks)
+          (recur next-ks formatted')
+          formatted')))))
 
 (def wildcard-selector
   "Returns a selector that extracts and formats every bound value bound in the
@@ -165,8 +165,8 @@
               ;; TODO: Replace these nils with fuel values when we turn fuel back on
               (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))))
         (catch* e
-                (log/error e "Error formatting subgraph for subject:" subj)
-                (>! error-ch e))))))
+          (log/error e "Error formatting subgraph for subject:" subj)
+          (>! error-ch e))))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied

@@ -1,23 +1,23 @@
 (ns fluree.db.json-ld.commit
-  (:require [fluree.json-ld :as json-ld]
-            [fluree.crypto :as crypto]
-            [fluree.db.serde.json :as serde-json]
-            [fluree.db.flake :as flake]
-            [fluree.db.constants :as const]
-            [fluree.db.json-ld.ledger :as jld-ledger]
-            [fluree.db.util.core :as util :refer [vswap!]]
-            [fluree.db.json-ld.credential :as cred]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.json-ld.branch :as branch]
-            [fluree.db.util.async :refer [<? go-try]]
-            #?(:clj  [clojure.core.async :as async]
+  (:require #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
-            [fluree.db.indexer.proto :as idx-proto]
-            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.crypto :as crypto]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.json-ld.ledger :as jld-ledger]
+            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.util.log :as log :include-macros true])
+            [fluree.db.serde.json :as serde-json]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [vswap!]]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -51,17 +51,17 @@
                                                      compact-fn))}
                                (if (nil? all-refs?) true all-refs?)]
                               [{"@value" (serde-json/serialize-flake-value
-                                           (flake/o p-flake)
-                                           pdt)} false])
+                                          (flake/o p-flake)
+                                          pdt)} false])
             obj*      (cond-> obj
                         list? (assoc :i (-> p-flake flake/m :i))
                         (contains? serde-json/time-types pdt)
                         ;;need to retain the `@type` for times
                         ;;so they will be coerced correctly when loading
                         (assoc "@type"
-                               (<? (get-s-iri pdt
-                                              db iri-map
-                                              compact-fn))))
+                          (<? (get-s-iri pdt
+                                         db iri-map
+                                         compact-fn))))
             next-acc' (conj acc' obj*)]
         (if (seq r')
           (recur r' all-refs? next-acc')
@@ -89,9 +89,9 @@
             handle-all-refs (partial set-refs-type-in-ctx ctx p-iri)
             objs*           (cond-> objs
                                     ;; next line is for compatibility with json-ld/parse-type's expectations; should maybe revisit
-                                    (and all-refs? (not list?)) handle-all-refs
-                                    list? handle-list-values
-                                    (= 1 (count objs)) first)
+                              (and all-refs? (not list?)) handle-all-refs
+                              list? handle-list-values
+                              (= 1 (count objs)) first)
             next-acc        (assoc acc p-iri objs*)]
         (if (seq r)
           (recur r next-acc)
@@ -143,21 +143,19 @@
                                                            id->iri ctx compact-fn))
                                         (assoc id-key s-iri)))]
                     [(cond-> assert
-                             s-assert (conj s-assert))
+                       s-assert (conj s-assert))
                      (cond-> retract
-                             s-retract (conj s-retract))]))]
+                       s-retract (conj s-retract))]))]
             (recur r assert* retract*))
           {:refs-ctx (dissoc @ctx type-key) ; @type will be marked as @type: @id, which is implied
            :assert   assert
            :retract  retract
            :flakes   flakes})))))
 
-
 (defn- did-from-private
   [private-key]
   (let [acct-id (crypto/account-id-from-private private-key)]
     (str "did:fluree:" acct-id)))
-
 
 (defn stringify-context
   "Contexts that use clojure keywords will not translate into valid JSON for
@@ -167,16 +165,16 @@
     (mapv stringify-context context)
     (if (map? context)
       (reduce-kv
-        (fn [acc k v]
-          (let [k* (if (keyword? k)
-                     (name k)
-                     k)
-                v* (if (and (map? v)
-                            (not (contains? v :id)))
-                     (stringify-context v)
-                     v)]
-            (assoc acc k* v*)))
-        {} context)
+       (fn [acc k v]
+         (let [k* (if (keyword? k)
+                    (name k)
+                    k)
+               v* (if (and (map? v)
+                           (not (contains? v :id)))
+                    (stringify-context v)
+                    v)]
+           (assoc acc k* v*)))
+       {} context)
       context)))
 
 (defn- enrich-commit-opts
@@ -222,7 +220,6 @@
      :index-files-ch index-files-ch ;; optional async chan passed in which will stream out all new index files created (for consensus)
      :stats          stats}))
 
-
 (defn db-json->db-id
   [payload]
   (->> (crypto/sha2-256 payload :base32)
@@ -264,18 +261,18 @@
           assert-key  (compact const/iri-assert)
           retract-key (compact const/iri-retract)
           refs-ctx*   (cond-> refs-ctx
-                              prev-dbid (assoc-in [prev-db-key "@type"] "@id")
-                              (seq assert) (assoc-in [assert-key "@container"] "@graph")
-                              (seq retract) (assoc-in [retract-key "@container"] "@graph"))
+                        prev-dbid (assoc-in [prev-db-key "@type"] "@id")
+                        (seq assert) (assoc-in [assert-key "@container"] "@graph")
+                        (seq retract) (assoc-in [retract-key "@container"] "@graph"))
           db-json     (cond-> {id-key                nil ;; comes from hash later
                                type-key              [(compact const/iri-DB)]
                                (compact const/iri-t) t
                                (compact const/iri-v) v}
-                              prev-dbid (assoc prev-db-key prev-dbid)
-                              (seq assert) (assoc assert-key assert)
-                              (seq retract) (assoc retract-key retract)
-                              (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
-                              (:size stats) (assoc (compact const/iri-size) (:size stats)))
+                        prev-dbid (assoc prev-db-key prev-dbid)
+                        (seq assert) (assoc assert-key assert)
+                        (seq retract) (assoc retract-key retract)
+                        (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
+                        (:size stats) (assoc (compact const/iri-size) (:size stats)))
           ;; TODO - this is re-normalized below, can try to do it just once
           dbid        (db-json->db-id (json-ld/normalize-data db-json))
           db-json*    (-> db-json
@@ -291,11 +288,11 @@
   [{:keys [conn ledger default-context] :as _db} commit]
   (go-try
     (let [{:keys [hash address] :as context-res} (<? (conn-proto/-ctx-write
-                                                       conn ledger default-context))
+                                                      conn ledger default-context))
           commit* (assoc commit :defaultContext
-                                {:id      (str "fluree:context:" hash)
-                                 :type    const/iri-Context
-                                 :address address})]
+                    {:id      (str "fluree:context:" hash)
+                     :type    const/iri-Context
+                     :address address})]
       [commit* context-res])))
 
 (defn do-commit+push
@@ -320,13 +317,13 @@
           commit-res    (<? (conn-proto/-c-write conn ledger signed-commit)) ;; write commit credential
           new-commit*** (commit-data/update-commit-address new-commit** (:address commit-res))
           db*           (assoc db :commit new-commit***
-                                  :new-context? false)
+                          :new-context? false)
           db**          (if new-t?
                           (<? (commit-data/add-commit-flakes (:prev-commit db) db*))
                           db*)
           db***         (ledger-proto/-commit-update ledger branch db**)
           push-res      (<? (nameservice/push! conn (assoc new-commit*** :meta commit-res
-                                                                         :ledger-state state)))]
+                                                      :ledger-state state)))]
       {:commit-res  commit-res
        :context-res context-res
        :push-res    push-res
@@ -358,7 +355,6 @@
     ;; call indexing process with update-commit-fn to push out an updated commit once complete
     (idx-proto/-index indexer db {:update-commit update-fn
                                   :changes-ch    changes-ch})))
-
 
 (defn commit
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject

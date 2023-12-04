@@ -1,11 +1,11 @@
 (ns fluree.db.test-utils
-  (:require [clojure.set :as set]
+  (:require #?@(:cljs [[clojure.core.async :refer [go go-loop]]
+                       [clojure.core.async.interop :refer [<p!]]])
+            [clojure.set :as set]
             [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
-            #?@(:cljs [[clojure.core.async :refer [go go-loop]]
-                       [clojure.core.async.interop :refer [<p!]]])))
+            [fluree.db.util.log :as log]))
 
 (def default-context
   {:id     "@id"
@@ -160,22 +160,22 @@
   do it for you. In CLJS it will not retry and will return a core.async chan."
   [pwrapped max-attempts & [retry-on-false?]]
   (#?(:clj loop :cljs go-loop) [attempt 0]
-    (let [res' (try*
-                (let [res (#?(:clj deref :cljs <p!) (pwrapped))]
-                  (if (util/exception? res)
-                    (throw res)
-                    res))
-                (catch* e e))]
-      (if (= (inc attempt) max-attempts)
-        (if (util/exception? res')
-          (throw res')
-          res')
-        (if (or (util/exception? res')
-                (and retry-on-false? (false? res')))
-          (do
-            #?(:clj (Thread/sleep 100))
-            (recur (inc attempt)))
-          res')))))
+                               (let [res' (try*
+                                            (let [res (#?(:clj deref :cljs <p!) (pwrapped))]
+                                              (if (util/exception? res)
+                                                (throw res)
+                                                res))
+                                            (catch* e e))]
+                                 (if (= (inc attempt) max-attempts)
+                                   (if (util/exception? res')
+                                     (throw res')
+                                     res')
+                                   (if (or (util/exception? res')
+                                           (and retry-on-false? (false? res')))
+                                     (do
+                                       #?(:clj (Thread/sleep 100))
+                                       (recur (inc attempt)))
+                                     res')))))
 
 (defn retry-load
   "Retry loading a ledger until it loads or max-attempts. Hopefully not needed

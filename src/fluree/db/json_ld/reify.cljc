@@ -1,18 +1,18 @@
 (ns fluree.db.json-ld.reify
-  (:require [fluree.json-ld :as json-ld]
-            [fluree.db.flake :as flake]
+  (:require [fluree.db.conn.proto :as conn-proto]
             [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.index :as index]
+            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.storage :as storage]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.index :as index]
-            [fluree.db.datatype :as datatype]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.json-ld :as json-ld]))
 
 ;; generates a db/ledger from persisted data
 #?(:clj (set! *warn-on-reflection* true))
@@ -38,8 +38,8 @@
     false
 
     (and
-      (contains? mapx :set)
-      (= #{:set :idx} (set (keys mapx))))
+     (contains? mapx :set)
+     (= #{:set :idx} (set (keys mapx))))
     false
 
     :else
@@ -56,7 +56,6 @@
         (vswap! iris assoc iri sid)
         sid))))
 
-
 (defn get-vocab-flakes
   [flakes]
   (flake/subrange flakes
@@ -72,9 +71,9 @@
         (if type-item
           (let [type-id (or (<? (get-iri-sid type-item db iri-cache))
                             (throw (ex-info
-                                     (str "Retractions specifies an @type that does not exist: "
-                                          type-item)
-                                     {:status 400 :error :db/invalid-commit})))]
+                                    (str "Retractions specifies an @type that does not exist: "
+                                         type-item)
+                                    {:status 400 :error :db/invalid-commit})))]
             (recur r (conj acc (flake/create sid const/$rdf:type type-id
                                              const/$xsd:anyURI t false nil))))
           acc))
@@ -157,34 +156,34 @@
       (let [ref-id (:id v-map)
             meta   (when list-members? {:i (-> v-map :idx last)})
             acc**
-                   (cond->
-                     (cond
-                       (and ref-id (node? v-map))
-                       (let [existing-sid (<? (get-iri-sid ref-id db iri-cache))
-                             ref-sid      (or existing-sid
-                                              (jld-ledger/generate-new-sid
-                                                v-map pid iri-cache next-pid next-sid))
-                             new-flake    (flake/create sid pid ref-sid
-                                                        const/$xsd:anyURI t true meta)]
-                         (log/trace "creating ref flake:" new-flake)
-                         (cond-> (conj acc* new-flake)
-                                 (nil? existing-sid) (conj
-                                                       (flake/create ref-sid const/$xsd:anyURI
-                                                                     ref-id
-                                                                     const/$xsd:string
-                                                                     t true nil))))
-                       (list-value? v-map)
-                       (let [list-vals (:list v-map)]
-                         (<? (assert-v-maps (assoc assert-state :list-members? true) list-vals)))
+            (cond->
+             (cond
+               (and ref-id (node? v-map))
+               (let [existing-sid (<? (get-iri-sid ref-id db iri-cache))
+                     ref-sid      (or existing-sid
+                                      (jld-ledger/generate-new-sid
+                                       v-map pid iri-cache next-pid next-sid))
+                     new-flake    (flake/create sid pid ref-sid
+                                                const/$xsd:anyURI t true meta)]
+                 (log/trace "creating ref flake:" new-flake)
+                 (cond-> (conj acc* new-flake)
+                   (nil? existing-sid) (conj
+                                        (flake/create ref-sid const/$xsd:anyURI
+                                                      ref-id
+                                                      const/$xsd:string
+                                                      t true nil))))
+               (list-value? v-map)
+               (let [list-vals (:list v-map)]
+                 (<? (assert-v-maps (assoc assert-state :list-members? true) list-vals)))
 
-                       :else (let [[value dt] (datatype/from-expanded v-map nil)
-                                   new-flake (flake/create sid pid value dt t true meta)]
-                               (log/trace "creating value flake:" new-flake)
-                               (conj acc* new-flake)))
+               :else (let [[value dt] (datatype/from-expanded v-map nil)
+                           new-flake (flake/create sid pid value dt t true meta)]
+                       (log/trace "creating value flake:" new-flake)
+                       (conj acc* new-flake)))
 
-                     (nil? existing-pid) (conj (flake/create pid const/$xsd:anyURI k
-                                                             const/$xsd:string t true
-                                                             nil)))]
+              (nil? existing-pid) (conj (flake/create pid const/$xsd:anyURI k
+                                                      const/$xsd:string t true
+                                                      nil)))]
         (if (seq r-v-maps)
           (recur r-v-maps acc**)
           acc**)))))
@@ -202,11 +201,11 @@
                 pid          (or existing-pid
                                  (get jld-ledger/predefined-properties k)
                                  (jld-ledger/generate-new-pid
-                                   k iri-cache next-pid (-> v-maps* first :id) ref-cache))
+                                  k iri-cache next-pid (-> v-maps* first :id) ref-cache))
                 acc*         (<? (assert-v-maps
-                                   (assoc assert-state :existing-pid existing-pid
-                                                       :pid pid, :k k, :acc acc)
-                                   v-maps*))]
+                                  (assoc assert-state :existing-pid existing-pid
+                                    :pid pid, :k k, :acc acc)
+                                  v-maps*))]
             (recur r acc*)))
         acc))))
 
@@ -231,7 +230,7 @@
             (recur r (cond-> (conj acc
                                    (flake/create sid const/$rdf:type type-id
                                                  const/$xsd:anyURI t true nil))
-                             type-flakes (into type-flakes))))
+                       type-flakes (into type-flakes))))
           acc))
       [])))
 
@@ -288,8 +287,8 @@
 (defn commit-error
   [message commit-data]
   (throw
-    (ex-info message
-             {:status 400, :error :db/invalid-commit, :commit commit-data})))
+   (ex-info message
+            {:status 400, :error :db/invalid-commit, :commit commit-data})))
 
 (defn db-t
   "Returns 't' value from commit data."
@@ -297,7 +296,7 @@
   (let [db-t (get-first-value db-data const/iri-t)]
     (when-not (pos-int? db-t)
       (commit-error
-        (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
+       (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
     db-t))
 
 (defn enrich-values
@@ -313,12 +312,12 @@
 (defn enrich-node
   [id->node node]
   (reduce-kv
-    (fn [updated-node k v]
-      (assoc updated-node k (cond (= :id k)         v
-                                  (:list (first v)) [{:list (enrich-values id->node (:list (first v)))}]
-                                  :else             (enrich-values id->node v))))
-    {}
-    node))
+   (fn [updated-node k v]
+     (assoc updated-node k (cond (= :id k)         v
+                                 (:list (first v)) [{:list (enrich-values id->node (:list (first v)))}]
+                                 :else             (enrich-values id->node v))))
+   {}
+   node))
 
 (defn enrich-assertion-values
   "`asserts` is a json-ld flattened (ish) sequence of nodes. In order to properly generate
@@ -446,7 +445,7 @@
                                (commit-data/message-flakes t-new message))
           default-ctx-flakes (when defaultContext
                                (<? (commit-data/default-ctx-flakes
-                                     db t-new next-sid defaultContext)))
+                                    db t-new next-sid defaultContext)))
           all-flakes         (-> db
                                  (get-in [:novelty :spot])
                                  empty
@@ -454,7 +453,7 @@
                                  (into retract-flakes)
                                  (into flakes)
                                  (cond->
-                                   prev-commit-flakes
+                                  prev-commit-flakes
                                    (into prev-commit-flakes)
                                    prev-db-flakes
                                    (into prev-db-flakes)
@@ -467,13 +466,12 @@
                                    (= -1 t-new)
                                    (into commit-data/commit-schema-flakes)))
           ecount*            (assoc ecount const/$_predicate pid
-                                           const/$_default sid
-                                           const/$_shard @last-sid)]
+                               const/$_default sid
+                               const/$_shard @last-sid)]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
       (merge-flakes (assoc db :ecount ecount*) t-new @refs-cache all-flakes))))
-
 
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
@@ -516,7 +514,6 @@
           (let [commit-tuple (<? (read-commit conn prev-commit-addr))]
             (recur commit-tuple commit-t commit-tuples*)))))))
 
-
 (defn load-db
   [{:keys [ledger] :as db} latest-commit-tuple merged-db?]
   (go-try
@@ -528,7 +525,6 @@
           (let [new-db (<? (merge-commit conn db* merged-db? commit-tuple))]
             (recur r new-db))
           db*)))))
-
 
 (defn load-db-idx
   [{:keys [ledger] :as db} latest-commit commit-address merged-db?]

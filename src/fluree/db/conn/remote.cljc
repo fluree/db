@@ -1,23 +1,23 @@
 (ns fluree.db.conn.remote
   (:require [clojure.core.async :as async :refer [go chan]]
-            [fluree.db.storage :as storage]
-            [fluree.db.index :as index]
-            [fluree.db.util.context :as ctx-util]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.serde.json :refer [json-serde]]
+            [clojure.string :as str]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.core :as conn-core]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.index :as index]
+            [fluree.db.indexer.default :as idx-default]
             [fluree.db.method.remote.core :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
-            [fluree.db.indexer.default :as idx-default]
-            [clojure.string :as str])
+            [fluree.db.serde.json :refer [json-serde]]
+            [fluree.db.storage :as storage]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.context :as ctx-util]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (java.io Writer))))
 
 (defn close
-   [id state]
+  [id state]
   (log/info "Closing remote connection" id)
   (swap! state assoc :closed? true))
 
@@ -61,11 +61,11 @@
       (if (= :empty id)
         (storage/resolve-empty-node node)
         (conn-cache/lru-lookup
-          lru-cache-atom
-          cache-key
-          (fn [_]
-            (storage/resolve-index-node conn node
-                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
+         lru-cache-atom
+         cache-key
+         (fn [_]
+           (storage/resolve-index-node conn node
+                                       (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
 
 #?(:cljs
    (extend-type RemoteConnection
@@ -93,7 +93,6 @@
   [server-state state-atom]
   (ns-remote/initialize server-state state-atom))
 
-
 (defn connect
   "Creates a new memory connection."
   [{:keys [parallelism lru-cache-atom memory defaults servers serializer nameservices]
@@ -107,13 +106,13 @@
           conn-id         (str (random-uuid))
           state           (conn-core/blank-state)
           nameservices*   (util/sequential
-                            (or nameservices
+                           (or nameservices
                                 ;; if default ns, and returns exception, throw - connection fails
                                 ;; (likely due to unreachable server with websocket request)
-                                (<? (default-remote-nameservice server-state state))))
+                               (<? (default-remote-nameservice server-state state))))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
-                                                     cache-size)))]
+                                                    cache-size)))]
       (map->RemoteConnection {:id              conn-id
                               :server-state    server-state
                               :state           state

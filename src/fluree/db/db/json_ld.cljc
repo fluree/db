@@ -1,22 +1,22 @@
 (ns fluree.db.db.json-ld
-  (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.query.fql :as fql]
-            [fluree.db.index :as index]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.constants :as const]
-            [fluree.db.flake :as flake]
-            [fluree.db.util.async :refer [<? go-try]]
-            #?(:clj  [clojure.core.async :refer [go] :as async]
+  (:require #?(:clj  [clojure.core.async :refer [go] :as async]
                :cljs [cljs.core.async :refer [go] :as async])
-            [fluree.json-ld :as json-ld]
-            [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.json-ld.branch :as branch]
-            [fluree.db.json-ld.transact :as jld-transact]
+            [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.index :as index]
             [fluree.db.indexer.proto :as idx-proto]
-            [fluree.db.util.log :as log]
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.json-ld.transact :as jld-transact]
+            [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.query.fql :as fql]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
-            [fluree.db.json-ld.commit-data :as commit-data])
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -25,7 +25,6 @@
   "Base policy (permissions) map that will give access to all flakes."
   {const/iri-view   {:root? true}
    const/iri-modify {:root? true}})
-
 
 (defn lookup-id
   "Returns subject id or nil if no match."
@@ -56,7 +55,6 @@
     (when (string? iri*)
       (go-try
         (<? (lookup-id db iri*))))))
-
 
 (defn subid
   "Returns subject ID of ident as async promise channel.
@@ -104,10 +102,10 @@
             (async/close! return-chan)))
 
         (catch* e
-                (async/put! return-chan
-                            (ex-info (str "Error looking up subject id: " (pr-str ident))
-                                     {:status 400 :error :db/invalid-subject}
-                                     e)))))
+          (async/put! return-chan
+                      (ex-info (str "Error looking up subject id: " (pr-str ident))
+                               {:status 400 :error :db/invalid-subject}
+                               e)))))
     return-chan))
 
 (defn class-ids
@@ -145,7 +143,7 @@
              :txSpecDoc :restrictTag :retractDuplicates :subclassOf :new?} property)
           (str "Invalid predicate property: " (pr-str property)))
   (cond->> (get-in schema [:pred predicate property])
-           (= :restrictCollection property) (dbproto/-c-prop this :partition)))
+    (= :restrictCollection property) (dbproto/-c-prop this :partition)))
 
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
@@ -158,11 +156,11 @@
     (if newer-index?
       (-> db
           (assoc :commit (assoc commit :index commit-index)
-                 :novelty* (idx-proto/-empty-novelty (:indexer ledger) db (- index-t))
-                 :spot spot
-                 :post post
-                 :opst opst
-                 :tspo tspo)
+            :novelty* (idx-proto/-empty-novelty (:indexer ledger) db (- index-t))
+            :spot spot
+            :post post
+            :opst opst
+            :tspo tspo)
           (assoc-in [:stats :indexed] index-t))
       db)))
 
@@ -173,8 +171,8 @@
                              (ctx-util/mapify-context (dbproto/-default-context db)) ;; allows 'extending' existing default context using empty string ""
                              (ctx-util/stringify-context))]
     (assoc db :default-context default-context*
-              :context-cache (volatile! {})
-              :new-context? true)))
+      :context-cache (volatile! {})
+      :new-context? true)))
 
 ;; ================ end Jsonld record support fns ============================
 
@@ -231,11 +229,11 @@
 (defn new-novelty-map
   [comparators]
   (reduce
-    (fn [m idx]
-      (assoc m idx (-> comparators
-                       (get idx)
-                       flake/sorted-set-by)))
-    {:size 0} index/types))
+   (fn [m idx]
+     (assoc m idx (-> comparators
+                      (get idx)
+                      flake/sorted-set-by)))
+   {:size 0} index/types))
 
 (def genesis-ecount {const/$_predicate  (flake/->sid const/$_predicate 1000)
                      const/$_collection (flake/->sid const/$_collection 19)

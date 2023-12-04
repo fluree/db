@@ -1,7 +1,7 @@
 (ns fluree.db.query.property-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
+            [fluree.db.test-utils :as test-utils]
             [test-with-files.tools :refer [with-tmp-dir] :as twf]))
 
 (deftest ^:integration equivalent-properties-test
@@ -17,23 +17,23 @@
           db      (-> ledger
                       (fluree/db)
                       (fluree/stage {"@context" ["https://ns.flur.ee" context]
-                                      "insert"   [{"@id"   "vocab1:givenName"
-                                                   "@type" "rdf:Property"}
-                                                  {"@id"                    "vocab2:firstName"
-                                                   "@type"                  "rdf:Property"
-                                                   "owl:equivalentProperty" {"@id" "vocab1:givenName"}}
-                                                  {"@id"                    "vocab3:prenom"
-                                                   "@type"                  "rdf:Property"
-                                                   "owl:equivalentProperty" {"@id" "vocab2:firstName"}}]})
+                                     "insert"   [{"@id"   "vocab1:givenName"
+                                                  "@type" "rdf:Property"}
+                                                 {"@id"                    "vocab2:firstName"
+                                                  "@type"                  "rdf:Property"
+                                                  "owl:equivalentProperty" {"@id" "vocab1:givenName"}}
+                                                 {"@id"                    "vocab3:prenom"
+                                                  "@type"                  "rdf:Property"
+                                                  "owl:equivalentProperty" {"@id" "vocab2:firstName"}}]})
                       deref
                       (fluree/stage {"@context" ["https://ns.flur.ee" context]
-                                      "insert"   [{"@id"              "ex:brian"
-                                                   "ex:age"           50
-                                                   "vocab1:givenName" "Brian"}
-                                                  {"@id"              "ex:ben"
-                                                   "vocab2:firstName" "Ben"}
-                                                  {"@id"           "ex:francois"
-                                                   "vocab3:prenom" "Francois"}]})
+                                     "insert"   [{"@id"              "ex:brian"
+                                                  "ex:age"           50
+                                                  "vocab1:givenName" "Brian"}
+                                                 {"@id"              "ex:ben"
+                                                  "vocab2:firstName" "Ben"}
+                                                 {"@id"           "ex:francois"
+                                                  "vocab3:prenom" "Francois"}]})
                       deref)]
       (testing "querying for the property defined to be equivalent"
         (is (= #{["Brian"] ["Ben"] ["Francois"]}
@@ -78,22 +78,22 @@
           ledger @(fluree/create conn "propertypathstest" {:defaultContext [test-utils/default-str-context {"ex" "http://example.com/"}]})
           db0    (fluree/db ledger)
           db1    @(fluree/stage db0 {"@context" "https://ns.flur.ee"
-                                      "insert" [{"@id"            "ex:unlabeled-pred"
-                                                 "ex:description" "created as a subject first"}
-                                                {"@id"            "ex:labeled-pred"
-                                                 "@type"          "rdf:Property"
-                                                 "ex:description" "created as a subject first, labelled as Property"}]})
+                                     "insert" [{"@id"            "ex:unlabeled-pred"
+                                                "ex:description" "created as a subject first"}
+                                               {"@id"            "ex:labeled-pred"
+                                                "@type"          "rdf:Property"
+                                                "ex:description" "created as a subject first, labelled as Property"}]})
           db2    @(fluree/stage db1 {"@context" "https://ns.flur.ee"
-                                      "insert" [{"@id"               "ex:subject-as-predicate"
-                                                 "ex:labeled-pred"   "labeled"
-                                                 "ex:unlabeled-pred" "unlabeled"
-                                                 "ex:new-pred"       {"@id"               "ex:nested"
-                                                                      "ex:unlabeled-pred" "unlabeled-nested"}}]})
+                                     "insert" [{"@id"               "ex:subject-as-predicate"
+                                                "ex:labeled-pred"   "labeled"
+                                                "ex:unlabeled-pred" "unlabeled"
+                                                "ex:new-pred"       {"@id"               "ex:nested"
+                                                                     "ex:unlabeled-pred" "unlabeled-nested"}}]})
           db3    @(fluree/stage db1 {"@context" "https://ns.flur.ee"
-                                      "insert" [{"@id"               "ex:subject-as-predicate"
-                                                 "ex:labeled-pred"   "labeled"
-                                                 "ex:unlabeled-pred" {"@id"               "ex:nested"
-                                                                      "ex:unlabeled-pred" "unlabeled-nested"}}]})]
+                                     "insert" [{"@id"               "ex:subject-as-predicate"
+                                                "ex:labeled-pred"   "labeled"
+                                                "ex:unlabeled-pred" {"@id"               "ex:nested"
+                                                                     "ex:unlabeled-pred" "unlabeled-nested"}}]})]
       (is (= [{"id"                "ex:subject-as-predicate"
                "ex:new-pred"       {"id" "ex:nested"}
                "ex:labeled-pred"   "labeled"
@@ -151,35 +151,34 @@
                                      ["" {"ex"  "http://example.com/"
                                           "owl" "http://www.w3.org/2002/07/owl#"}]})
           db0       (->> @(fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
-                                                             "insert"   {"ex:new" true}})
+                                                            "insert"   {"ex:new" true}})
                          (fluree/commit! ledger)
                          (deref))
 
-
           db1 @(fluree/transact!
-                 conn {"ledger"   ledger-id
-                       "@context" "https://ns.flur.ee"
-                       "insert"
-                       [{"@id"                    "ex:givenName"
-                         "@type"                  "rdf:Property"
-                         "owl:equivalentProperty" {"@id"   "ex:firstName"
-                                                   "@type" "rdf:Property"}
-                         "ex:preds"               {"@list" [{"@id"   "ex:cool"
-                                                             "@type" "rdf:Property"}
-                                                            {"@id"   "ex:fool"
-                                                             "@type" "rdf:Property"}]}}]})
+                conn {"ledger"   ledger-id
+                      "@context" "https://ns.flur.ee"
+                      "insert"
+                      [{"@id"                    "ex:givenName"
+                        "@type"                  "rdf:Property"
+                        "owl:equivalentProperty" {"@id"   "ex:firstName"
+                                                  "@type" "rdf:Property"}
+                        "ex:preds"               {"@list" [{"@id"   "ex:cool"
+                                                            "@type" "rdf:Property"}
+                                                           {"@id"   "ex:fool"
+                                                            "@type" "rdf:Property"}]}}]})
 
           db2    @(fluree/transact!
-                    conn {"ledger"   ledger-id
-                          "@context" "https://ns.flur.ee"
-                          "insert"   [{"@id"          "ex:andrew"
-                                       "ex:firstName" "Andrew"
-                                       "ex:age"       35}
-                                      {"@id"          "ex:dan"
-                                       "ex:givenName" "Dan"}
-                                      {"@id"     "ex:other"
-                                       "ex:fool" false
-                                       "ex:cool" true}]})
+                   conn {"ledger"   ledger-id
+                         "@context" "https://ns.flur.ee"
+                         "insert"   [{"@id"          "ex:andrew"
+                                      "ex:firstName" "Andrew"
+                                      "ex:age"       35}
+                                     {"@id"          "ex:dan"
+                                      "ex:givenName" "Dan"}
+                                     {"@id"     "ex:other"
+                                      "ex:fool" false
+                                      "ex:cool" true}]})
           loaded @(fluree/load conn ledger-id)
           dbl    (fluree/db loaded)]
       (testing "before load"

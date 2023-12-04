@@ -1,16 +1,15 @@
 (ns fluree.db.conn.core
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [try* catch* get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.ledger.proto :as ledger-proto]))
+            [fluree.json-ld :as json-ld]))
 
 ;; state machine for connections
 
 #?(:clj (set! *warn-on-reflection* true))
-
 
 (comment
   ;; state machine looks like this:
@@ -20,24 +19,21 @@
                         :branches {}
                         :branch   {}}}
 
-
    :await  {:msg-id :async-res-ch} ;; map of msg-ids to response chans for messages awaiting responses
    :stats  {}}) ;; any stats about the connection itself
-
 
 (defn blank-state
   "Returns top-level state for connection"
   []
   (atom
-    {:ledger  {}
-     :await   {}
-     :stats   {}
-     :closed? false}))
+   {:ledger  {}
+    :await   {}
+    :stats   {}
+    :closed? false}))
 
 (defn mark-closed
   [{:keys [state] :as conn}]
   (swap! state assoc :closed? true))
-
 
 (defn await-response
   "Returns a promise-channel that will contain eventual response for an outgoing message."

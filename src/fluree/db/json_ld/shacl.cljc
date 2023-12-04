@@ -1,35 +1,32 @@
 (ns fluree.db.json-ld.shacl
-  (:require [fluree.db.util.async :refer [<? go-try]]
-            #?(:clj  [fluree.db.util.clj-const :as uc]
+  (:require #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc])
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
-            [fluree.db.query.range :as query-range]
+            [clojure.core.async :as async]
+            [clojure.set :as set]
+            [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [clojure.string :as str]
-            [clojure.set :as set]
-            [clojure.core.async :as async])
+            [fluree.db.query.range :as query-range]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log])
   #?(:clj (:import (java.util.regex Pattern))))
 
 (comment
  ;; a raw SHACL shape looks something like this:
- {:id             :ex/UserShape,
-  :type       [:sh/NodeShape],
-  :sh/targetClass {:id :ex/User},
-  :sh/property    [{:id          "_:f211106232533000",
-                    :sh/path     {:id :schema/name},
-                    :sh/minCount 1,
-                    :sh/maxCount 1,
-                    :sh/datatype {:id :xsd/string}}
-                   {:id          "_:f211106232533002",
-                    :sh/path     {:id :schema/email},
-                    :sh/minCount 1,
-                    :sh/maxCount 1,
-                    :sh/nodeKind {:id :sh/IRI}}]})
-
-
-
+  {:id             :ex/UserShape,
+   :type       [:sh/NodeShape],
+   :sh/targetClass {:id :ex/User},
+   :sh/property    [{:id          "_:f211106232533000",
+                     :sh/path     {:id :schema/name},
+                     :sh/minCount 1,
+                     :sh/maxCount 1,
+                     :sh/datatype {:id :xsd/string}}
+                    {:id          "_:f211106232533002",
+                     :sh/path     {:id :schema/email},
+                     :sh/minCount 1,
+                     :sh/maxCount 1,
+                     :sh/nodeKind {:id :sh/IRI}}]})
 
 ;; property min & max
 ;; -- if new, can just make sure for each property between min and max
@@ -43,7 +40,6 @@
 ;; sh:closed true
 ;; - have a set of allowed and reject if not in the list
 ;; - set includes all properties from above + ignoredProperties
-
 
 (defn apply-flake-changes
   [existing-flakes changed-flakes]
@@ -95,7 +91,6 @@
        [true]
        [false (str/join "; " err-msgs)]))))
 
-
 (defn validate-string-properties
   "String-based constraint components specify conditions on the string representation of values,
   as defined the SPARQL `str` function. See:
@@ -136,7 +131,6 @@
                         flake-results     [min-length-result max-length-result pattern-result]]
                     (coalesce-validation-results flake-results logical-constraint)))]
     (coalesce-validation-results results)))
-
 
 (defn validate-count-properties
   [{:keys [min-count max-count logical-constraint] :as _p-shape} p-flakes]
@@ -190,7 +184,6 @@
                              [true (str "sh:not sh:datatype: every datatype must not be " datatype)]
                              [false (str "sh:datatype: every datatype must be " datatype)]))]
     (coalesce-validation-results [in-results has-value-results datatype-results] logical-constraint)))
-
 
 (defn validate-nodekind-constraint
   [db {:keys [node-kind logical-constraint] :as _p-shape} p-flakes]
@@ -490,7 +483,7 @@
   [db {:keys [property validated-properties] :as shape} s-flakes pid->p-flakes]
   (go-try
     (let [sid (flake/s (first s-flakes))]
-      (log/trace "validate-shape" sid shape )
+      (log/trace "validate-shape" sid shape)
       (loop [[{:keys [path rhs-property qualified-value-shape] :as p-shape} & r] property
              q-shapes             []
              validated-properties validated-properties
@@ -514,7 +507,7 @@
                      validated-properties)
                    (conj results res)))
 
-          (let [ ;; check qualifed shape constraints
+          (let [;; check qualifed shape constraints
                 q-results (<? (validate-q-shapes db q-shapes sid pid->p-flakes))
                 ;; check node shape
                 closed-results (validate-closed-constraint shape pid->p-flakes validated-properties)]
@@ -742,7 +735,6 @@
      :cljs (if (#{"i" "m" "s"} flag)
              flag
              "")))
-
 
 (defn build-pattern
   "Builds regex pattern out of input string

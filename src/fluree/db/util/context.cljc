@@ -1,9 +1,9 @@
 (ns fluree.db.util.context
   (:require [clojure.string :as str]
-            [fluree.json-ld :as json-ld]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :as util]
-            [fluree.db.constants :as const]))
+            [fluree.json-ld :as json-ld]))
 
 ;; handles some default context merging.
 
@@ -43,7 +43,6 @@
       (throw (ex-info (str "Invalid context provided: " context)
                       {:status 400
                        :error  :db/invalid-context})))))
-
 
 (defn stringify-context-key
   [k]
@@ -101,16 +100,15 @@
   (when context
     (if (map? context)
       (reduce-kv
-        (fn [acc k v]
-          (let [k* (stringify-context-key k)
-                v* (stringify-context-val v)]
-            (assoc acc k* v*)))
-        {}
-        context)
+       (fn [acc k v]
+         (let [k* (stringify-context-key k)
+               v* (stringify-context-val v)]
+           (assoc acc k* v*)))
+       {}
+       context)
       (throw (ex-info (str "stringify-context called on a context that is not a map: " context)
                       {:status 400
                        :error  :db/invalid-context})))))
-
 
 (defn keywordize-context
   "Keywordizes a mapified context. Changes all keys to a keyword, unless they start with '@'
@@ -120,28 +118,28 @@
   (when context
     (if (map? context)
       (reduce-kv
-        (fn [acc k v]
-          (cond
-            (not (string? k))
-            (throw (ex-info (str "Context key expected to be a string, instead got: " k)
-                            {:status 400
-                             :error  :db/invalid-context}))
+       (fn [acc k v]
+         (cond
+           (not (string? k))
+           (throw (ex-info (str "Context key expected to be a string, instead got: " k)
+                           {:status 400
+                            :error  :db/invalid-context}))
 
-            (str/starts-with? k "@")
-            (assoc acc k v)
+           (str/starts-with? k "@")
+           (assoc acc k v)
 
-            (str/includes? k ":")
-            (let [parts (str/split k #":")]
-              (if (not= 2 (count parts))
-                (throw (ex-info (str "Context key appears to be invalid: " k)
-                                {:status 400
-                                 :error  :db/invalid-context}))
-                (assoc acc (keyword (first parts) (second parts)) v)))
+           (str/includes? k ":")
+           (let [parts (str/split k #":")]
+             (if (not= 2 (count parts))
+               (throw (ex-info (str "Context key appears to be invalid: " k)
+                               {:status 400
+                                :error  :db/invalid-context}))
+               (assoc acc (keyword (first parts) (second parts)) v)))
 
-            :else
-            (assoc acc (keyword k) v)))
-        {}
-        context)
+           :else
+           (assoc acc (keyword k) v)))
+       {}
+       context)
       (throw (ex-info (str "keywordize-context called on a context that is not a map: " context)
                       {:status 400
                        :error  :db/invalid-context})))))
@@ -200,9 +198,9 @@
   [txn]
   (let [supplied-context (when (or (contains? txn :context)
                                    (contains? txn "@context"))
-                              (->> (get txn "@context" (:context txn))
-                                   (util/sequential)
-                                   (remove #{"https://ns.flur.ee"})))]
+                           (->> (get txn "@context" (:context txn))
+                                (util/sequential)
+                                (remove #{"https://ns.flur.ee"})))]
 
     (if (seq supplied-context)
       supplied-context

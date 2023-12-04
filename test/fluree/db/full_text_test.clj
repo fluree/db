@@ -89,7 +89,7 @@
                     (.commit wrtr)
                     (let [subject-under-test (full-text/get-subject idx subj-id)]
                       (is (= bio-update (get subject-under-test
-                                              (pid->keyword bio-pred-id)))
+                                             (pid->keyword bio-pred-id)))
                           "the updated predicate can be retrieved")
                       (is (= handle (get subject-under-test
                                          (pid->keyword handle-pred-id)))

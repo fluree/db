@@ -1,7 +1,7 @@
 (ns fluree.db.nameservice.memory
-  (:require [fluree.db.nameservice.proto :as ns-proto]
-            [clojure.core.async :as async :refer [go]]
+  (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
+            [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.platform :as platform]
             [fluree.db.util.log :as log]))
 
@@ -76,7 +76,7 @@
   (go (memory-address (str ledger-alias "/" (name branch) "/head"))))
 
 (defrecord MemoryNameService
-  [state-atom sync?]
+           [state-atom sync?]
   ns-proto/iNameService
   (-lookup [_ ledger-alias] (lookup state-atom ledger-alias nil))
   (-lookup [_ ledger-alias opts] (lookup state-atom ledger-alias opts))
@@ -94,7 +94,6 @@
         (->> (drop 2)
              (str/join "/"))))
   (-close [nameservice] (reset! state-atom {})))
-
 
 (defn initialize
   [state-atom]

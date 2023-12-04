@@ -1,16 +1,16 @@
 (ns fluree.db.api.transact
   (:require [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
+            [fluree.db.json-ld.credential :as cred]
             [fluree.db.json-ld.transact :as tx]
             [fluree.db.ledger.json-ld :as jld-ledger]
+            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.context :as ctx-util]
+            [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.json-ld.credential :as cred]
-            [fluree.db.ledger.proto :as ledger-proto]))
+            [fluree.json-ld :as json-ld]))
 
 (defn parse-opts
   [parsed-opts opts]

@@ -4,9 +4,9 @@
        :cljs [[cljs.test :refer-macros [deftest is testing async]]
               [clojure.core.async :refer [go <!]]
               [clojure.core.async.interop :refer [<p!]]])
+   [fluree.db.json-ld.api :as fluree]
    [fluree.db.query.sparql :as sparql]
-   [fluree.db.test-utils :as test-utils]
-   [fluree.db.json-ld.api :as fluree])
+   [fluree.db.test-utils :as test-utils])
   #?(:clj (:import (clojure.lang ExceptionInfo))))
 
 (deftest parse-select
@@ -329,20 +329,20 @@
                       "person:handle"   "dankeshön"
                       "person:fullName" "Ferris Bueller"}]]
     #?(#_#_:cljs
-       (async done
-         (go
-          (let [conn   (<! (test-utils/create-conn {:context-type :string}))
-                ledger (<p! (fluree/create conn "people"))
-                db     (<p! (fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
-                                                               "insert" people-data}))]
-            (testing "basic query works"
-              (let [query   "SELECT ?person ?fullName
+         (async done
+                (go
+                  (let [conn   (<! (test-utils/create-conn {:context-type :string}))
+                        ledger (<p! (fluree/create conn "people"))
+                        db     (<p! (fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
+                                                                      "insert" people-data}))]
+                    (testing "basic query works"
+                      (let [query   "SELECT ?person ?fullName
                              WHERE {?person person:handle \"jdoe\".
                                     ?person person:fullName ?fullName.}"
-                    results (<p! (fluree/query db query {:format :sparql}))]
-                (is (= [["ex:jdoe" "Jane Doe"]]
-                       results))
-                (done))))))
+                            results (<p! (fluree/query db query {:format :sparql}))]
+                        (is (= [["ex:jdoe" "Jane Doe"]]
+                               results))
+                        (done))))))
 
        :clj
        (let [conn @(fluree/connect {:method :memory
@@ -355,7 +355,7 @@
                       deref
                       fluree/db
                       (fluree/stage {"@context" "https://ns.flur.ee"
-                                      "insert" people-data})
+                                     "insert" people-data})
                       deref)]
          (testing "keyword context-type throws an error"
            (let [kw-conn @(fluree/connect {:method   :memory
@@ -545,7 +545,7 @@
                            "http://example.org/book/title" "The Hitchhiker's Guide to the Galaxy"}]]
            (testing "BASE IRI gets prefixed onto relative IRIs"
              (let [book-db @(fluree/stage db {"@context" "https://ns.flur.ee"
-                                               "insert" book-data})
+                                              "insert" book-data})
                    query   "BASE <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book <title> ?title.}"
@@ -555,7 +555,7 @@
                       results))))
            (testing "PREFIX declarations go into the context"
              (let [book-db @(fluree/stage db {"@context" "https://ns.flur.ee"
-                                               "insert" book-data})
+                                              "insert" book-data})
                    query   "PREFIX book: <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book book:title ?title.}"

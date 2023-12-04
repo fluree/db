@@ -1,14 +1,14 @@
 (ns fluree.db.json-ld.commit-data
   (:require [fluree.crypto :as crypto]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.util.core :as util :refer [get-first get-first-value]]
-            [fluree.json-ld :as json-ld]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.log :as log]
-            [fluree.db.constants :as const]))
+            [fluree.json-ld :as json-ld]))
 
 (comment
   ;; commit map - this map is what gets recorded in a few places:
@@ -54,7 +54,6 @@
               :opst    "fluree:ipfs://opst"
               :tspo    "fluree:ipfs://tspo"}})
 
-
 (def json-ld-base-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
   [["@context" "https://ns.flur.ee/ledger/v1"]
@@ -85,7 +84,6 @@
   [["id" :id]
    ["type" ["DB"]]
    ["address" :address]])
-
 
 (def json-ld-data-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
@@ -208,18 +206,17 @@
              :defaultContext (-> default-ctx
                                  (select-keys [:id :type])
                                  (assoc :address ctx-address))}
-            ns (assoc :ns (->> ns
-                               util/sequential
-                               (mapv (fn [namespace] {:id (:id namespace)}))))
-            index (assoc :index {:id      (:id index)
-                                 :address (get-first-value index const/iri-address)
-                                 :data    (parse-db-data (get-first index const/iri-data))
-                                 :spot    spot
-                                 :post    post
-                                 :opst    opst
-                                 :tspo    tspo})
-            issuer (assoc :issuer {:id (:id issuer)}))))
-
+      ns (assoc :ns (->> ns
+                         util/sequential
+                         (mapv (fn [namespace] {:id (:id namespace)}))))
+      index (assoc :index {:id      (:id index)
+                           :address (get-first-value index const/iri-address)
+                           :data    (parse-db-data (get-first index const/iri-data))
+                           :spot    spot
+                           :post    post
+                           :opst    opst
+                           :tspo    tspo})
+      issuer (assoc :issuer {:id (:id issuer)}))))
 
 (defn update-commit-id
   "Once a commit id is known (by hashing json-ld version of commit), update
@@ -249,7 +246,6 @@
         commit-map* (update-commit-id commit commit-id)
         jld*        (assoc jld "id" commit-id)]
     [commit-map* jld*]))
-
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
@@ -318,7 +314,7 @@
            :address db-address ;; address to locate db
            :flakes  flakes
            :size    size}
-          (not-empty prev-data) (assoc :previous prev-data)))
+    (not-empty prev-data) (assoc :previous prev-data)))
 
 (defn data
   "Given a commit map, returns them most recent data map."
@@ -343,13 +339,13 @@
         commit      (-> old-commit
                         (dissoc :id :address :data :issuer :time :message :tag :prev-commit)
                         (assoc :address ""
-                               :data data-commit
-                               :time (util/current-time-iso)))]
+                          :data data-commit
+                          :time (util/current-time-iso)))]
     (cond-> commit
-            issuer (assoc :issuer {:id issuer})
-            prev-commit (assoc :previous prev-commit)
-            message (assoc :message message)
-            tag (assoc :tag tag))))
+      issuer (assoc :issuer {:id issuer})
+      prev-commit (assoc :previous prev-commit)
+      message (assoc :message message)
+      tag (assoc :tag tag))))
 
 (defn ref?
   [f]
@@ -370,11 +366,11 @@
    (let [ref-add     (ref-flakes add)
          ref-rem     (ref-flakes rem)
          flake-count (cond-> 0
-                             add (+ (count add))
-                             rem (- (count rem)))
+                       add (+ (count add))
+                       rem (- (count rem)))
          flake-size  (cond-> 0
-                             add (+ (flake/size-bytes add))
-                             rem (- (flake/size-bytes rem)))]
+                       add (+ (flake/size-bytes add))
+                       rem (- (flake/size-bytes rem)))]
      (-> db
          (update-in [:novelty :spot] flake/revise add rem)
          (update-in [:novelty :post] flake/revise add rem)
@@ -411,15 +407,15 @@
   (let [tt-id   (random-uuid)
         indexes [:spot :post :opst :tspo]]
     (-> (reduce
-          (fn [db* idx]
-            (let [{:keys [children] :as node} (get db* idx)
-                  children* (reduce-kv
-                              (fn [children* k v]
-                                (assoc children* k (assoc v :tt-id tt-id)))
-                              (empty children) children)]
-              (assoc db* idx (assoc node :tt-id tt-id
-                                         :children children*))))
-          db indexes)
+         (fn [db* idx]
+           (let [{:keys [children] :as node} (get db* idx)
+                 children* (reduce-kv
+                            (fn [children* k v]
+                              (assoc children* k (assoc v :tt-id tt-id)))
+                            (empty children) children)]
+             (assoc db* idx (assoc node :tt-id tt-id
+                              :children children*))))
+         db indexes)
         (assoc :tt-id tt-id))))
 
 (defn add-commit-schema-flakes
@@ -531,7 +527,6 @@
          (flake/create new-default-ctx-id const/$_address address
                        const/$xsd:string t true nil)]))))
 
-
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
   [prev-commit {:keys [commit] :as db}]
@@ -559,11 +554,11 @@
           default-ctx-flakes (when defaultContext
                                (<? (default-ctx-flakes db t next-sid defaultContext)))
           commit-flakes      (cond-> base-flakes
-                                     prev-commit-flakes (into prev-commit-flakes)
-                                     prev-db-flakes (into prev-db-flakes)
-                                     issuer-flakes (into issuer-flakes)
-                                     message-flakes (into message-flakes)
-                                     default-ctx-flakes (into default-ctx-flakes))]
+                               prev-commit-flakes (into prev-commit-flakes)
+                               prev-db-flakes (into prev-db-flakes)
+                               issuer-flakes (into issuer-flakes)
+                               message-flakes (into message-flakes)
+                               default-ctx-flakes (into default-ctx-flakes))]
       (-> db
           (assoc-in [:ecount const/$_shard] @last-sid)
           (cond-> (= 1 db-t) add-commit-schema-flakes)

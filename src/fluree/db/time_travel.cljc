@@ -4,8 +4,8 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try into?]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
@@ -25,9 +25,9 @@
           flakes         (-> db
                              dbproto/-rootdb
                              (query-range/index-range
-                               :post
-                               > [const/$_commit:time start]
-                               < [const/$_commit:time end])
+                              :post
+                              > [const/$_commit:time start]
+                              < [const/$_commit:time end])
                              <?)]
       (log/debug "datetime->t index-range:" (pr-str flakes))
       (if (empty? flakes)

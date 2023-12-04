@@ -1,11 +1,11 @@
 (ns fluree.db.serde.json
-  (:require  [fluree.db.constants :as const]
+  (:require  #?(:clj  [fluree.db.util.clj-const :as uc]
+                :cljs [fluree.db.util.cljs-const :as uc])
+             [fluree.db.constants :as const]
              [fluree.db.datatype :as datatype]
-             [fluree.db.serde.protocol :as serdeproto]
              [fluree.db.flake :as flake]
-             [fluree.db.util.core :as util]
-             #?(:clj  [fluree.db.util.clj-const :as uc]
-                :cljs [fluree.db.util.cljs-const :as uc]))
+             [fluree.db.serde.protocol :as serdeproto]
+             [fluree.db.util.core :as util])
   #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
                               LocalDateTime ZoneOffset)
                    (java.time.format DateTimeFormatter))))
@@ -22,28 +22,27 @@
     (-> flake-vec
         (update 2 (fn [val]
                     #?(:clj (datatype/coerce val flake-time-dt)
-                       :cljs (js/Date. val))) )
+                       :cljs (js/Date. val))))
         (flake/parts->Flake))
     (flake/parts->Flake flake-vec)))
-
 
 (defn- deserialize-child-node
   "Turns :first and :rhs into flakes"
   [child-node]
   (assoc child-node
-         :first (some-> child-node :first deserialize-flake)
-         :rhs   (some-> child-node :rhs deserialize-flake)))
+    :first (some-> child-node :first deserialize-flake)
+    :rhs   (some-> child-node :rhs deserialize-flake)))
 
 (defn- deserialize-ecount
   "Converts ecount from keywordized keys back to integers."
   [ecount]
   (reduce-kv
-    (fn [acc k v]
-      (if (keyword? k)
-        (assoc acc (-> k name util/str->int) v)
-        (throw (ex-info (str "Expected serialized ecount values to be keywords, instead found: " ecount)
-                        {:status 500 :error :db/invalid-index}))))
-    {} ecount))
+   (fn [acc k v]
+     (if (keyword? k)
+       (assoc acc (-> k name util/str->int) v)
+       (throw (ex-info (str "Expected serialized ecount values to be keywords, instead found: " ecount)
+                       {:status 500 :error :db/invalid-index}))))
+   {} ecount))
 
 (defn- deserialize-db-root
   "Assumes all data comes in as keywordized JSON.
@@ -52,18 +51,17 @@
   [db-root]
   (let [{:keys [spot post opst tspo ecount]} db-root]
     (assoc db-root
-           :ecount (deserialize-ecount ecount)
-           :spot   (deserialize-child-node spot)
-           :post   (deserialize-child-node post)
-           :opst   (deserialize-child-node opst)
-           :tspo   (deserialize-child-node tspo))))
-
+      :ecount (deserialize-ecount ecount)
+      :spot   (deserialize-child-node spot)
+      :post   (deserialize-child-node post)
+      :opst   (deserialize-child-node opst)
+      :tspo   (deserialize-child-node tspo))))
 
 (defn- deserialize-branch-node
   [branch]
   (assoc branch :children (mapv deserialize-child-node (:children branch))
-         :rhs (some-> (:rhs branch)
-                      (deserialize-flake))))
+    :rhs (some-> (:rhs branch)
+                 (deserialize-flake))))
 
 (defn- deserialize-leaf-node
   [leaf]
@@ -111,25 +109,24 @@
   types into seq."
   [m]
   (reduce-kv
-    (fn [acc k v]
-      (assoc acc (name k) (if (flake/flake? v)
-                            (serialize-flake v)
-                            v)))
-    {} m))
-
+   (fn [acc k v]
+     (assoc acc (name k) (if (flake/flake? v)
+                           (serialize-flake v)
+                           v)))
+   {} m))
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
   (-serialize-db-root [_ db-root]
     (reduce-kv
-      (fn [acc k v]
-        (assoc acc (name k)
-                   (case k
-                     :stats (util/stringify-keys v)
-                     (:spot :post :opst :tspo) (stringify-child v)
+     (fn [acc k v]
+       (assoc acc (name k)
+         (case k
+           :stats (util/stringify-keys v)
+           (:spot :post :opst :tspo) (stringify-child v)
                      ;; else
-                     v)))
-      {} db-root))
+           v)))
+     {} db-root))
   (-deserialize-db-root [_ db-root]
     (deserialize-db-root db-root))
   (-serialize-branch [_ {:keys [children] :as _branch}]
@@ -144,7 +141,6 @@
     (util/stringify-keys garbage))
   (-deserialize-garbage [_ garbage]
     (deserialize-garbage garbage)))
-
 
 (defn json-serde
   "Returns a JSON serializer / deserializer"

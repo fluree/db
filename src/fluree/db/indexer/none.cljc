@@ -10,7 +10,6 @@
   (throw (ex-info (str "IndexerNone cannot " ex-message-append)
                   {:status 500 :error :db/unexpected-error})))
 
-
 (defrecord IndexerNone []
   idx-proto/iIndex
   (-index? [_ db] false)
@@ -23,7 +22,6 @@
   (-close [indexer] true)
   (-status [indexer] (not-supported! "index status!"))
   (-reindex [indexer db] (not-supported! "reindex!")))
-
 
 (defn create
   []

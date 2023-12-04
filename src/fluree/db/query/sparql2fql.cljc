@@ -1,11 +1,11 @@
 (ns fluree.db.query.sparql2fql
-  (:require [fluree.db.util.docs :as docs]
+  (:require [#?(:clj clojure.edn :cljs cljs.reader) :as edn]
+            #?(:cljs [cljs.tools.reader :refer [read-string]])
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
-            [clojure.string :as str]
-            [#?(:clj clojure.edn :cljs cljs.reader) :as edn]
-            [fluree.db.util.log :as log :include-macros true]
             [clojure.set :as set]
-            #?(:cljs [cljs.tools.reader :refer [read-string]])))
+            [clojure.string :as str]
+            [fluree.db.util.docs :as docs]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -72,7 +72,6 @@
 (defn handle-boolean-literal
   [bool-lit]
   (read-string bool-lit))
-
 
 (defn handle-data-block-value-or-graph-term
   [data-block-value]
@@ -144,7 +143,7 @@
 
     ;; Multiple clauses
     :ObjectList (map #(hash-map "@id" subject, predicate (handle-object (second %)))
-                      (rest object))))
+                     (rest object))))
 
 (defn handle-path-primary
   "Returns a predicate.
@@ -477,7 +476,6 @@
   [optional]
   [:optional (first (mapv handle-where-clause optional))])
 
-
 (defn handle-graph-pattern-not-triples
   "BNF -- GroupOrUnionGraphPattern | OptionalGraphPattern | MinusGraphPattern | GraphGraphPattern | ServiceGraphPattern | Filter | Bind | InlineData"
   [not-triples]
@@ -541,7 +539,6 @@
         (throw (ex-info (str "Ordering by a constraint not currently supported. Provided: " order-condition)
                         {:status 400
                          :error  :db/invalid-query}))))
-
 
 (defn handle-having-condition
   [having-condition]
@@ -654,7 +651,7 @@
               :Prologue
               (let [prologue (rest top-level)]
                 (assoc-if (seq prologue)
-                  query :context (handle-prologue prologue)))
+                          query :context (handle-prologue prologue)))
 
               :Modifiers
               (when valid-modifiers?

@@ -1,12 +1,12 @@
 (ns fluree.db.method.ipfs.core
   (:refer-clojure :exclude [read])
-  (:require [fluree.db.method.ipfs.xhttp :as ipfs]
-            [fluree.db.util.async :refer [<? go-try]]
-            [clojure.string :as str]
-            [fluree.json-ld :as json-ld]
+  (:require [clojure.string :as str]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.method.ipfs.keys :as ipfs-key]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.method.ipfs.xhttp :as ipfs]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -21,12 +21,12 @@
           {:keys [name] :as res} (<? (ipfs/add ipfs-endpoint json))]
       (when-not name
         (throw
-          (ex-info
-            (str "IPFS publish error, unable to retrieve IPFS name. Response object: "
-                 res)
-            {:status 500 :error :db/push-ipfs})))
+         (ex-info
+          (str "IPFS publish error, unable to retrieve IPFS name. Response object: "
+               res)
+          {:status 500 :error :db/push-ipfs})))
       (assoc res :address (str "fluree:ipfs://" name)
-                 :json json))))
+        :json json))))
 
 (defn read
   "Reads either IPFS or IPNS docs. Reads JSON only, returning clojure map with
@@ -52,7 +52,6 @@
   (let [[_ ipns-address relative-address] (re-find #"^fluree:ipns://([^/]+)/(.+)$" address)]
     {:ipns-address     ipns-address
      :relative-address relative-address}))
-
 
 (defn push!
   "Publishes ledger metadata document (ledger root) to IPFS and recursively updates any
@@ -88,6 +87,6 @@
                                                            {:t t :dag (:hash updated-dir-map)}
                                                            complete)]
                                            (assoc m :pending pending*
-                                                    :complete complete*))))
+                                             :complete complete*))))
 
       updated-dir-map)))

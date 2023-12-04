@@ -1,12 +1,11 @@
 (ns fluree.db.permissions-validate
   (:require [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
 
 (defn allow-flake?
   "Returns one of:
@@ -38,7 +37,6 @@
                 (recur r)))
           false)))))
 
-
 (defn group-property-policies
   "Returns a map of property policies grouped by property-id (pid).
   For each pid key, returns a vector containing only the function tuples (not entire policy map) of
@@ -48,7 +46,6 @@
   (reduce (fn [acc [pid policy-m]]
             (assoc acc pid (conj (get acc pid []) (:function policy-m))))
           {} property-policies))
-
 
 (defn- evaluate-subject-properties
   [db property-policies default-allow? flakes]
@@ -112,7 +109,6 @@
             (recur r)))
         ;; always default to false! (deny)
         false))))
-
 
 (defn filter-subject-flakes
   "Takes multiple flakes for the *same* subject and optimizes evaluation

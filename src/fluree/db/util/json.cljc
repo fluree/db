@@ -1,14 +1,14 @@
 (ns fluree.db.util.json
   (:require #?(:clj [cheshire.core :as cjson])
-            #?(:clj [cheshire.parse :as cparse])
             #?(:clj [cheshire.generate :refer [add-encoder encode-seq remove-encoder]])
+            #?(:clj [cheshire.parse :as cparse])
             #?(:clj [fluree.db.flake])
             #?(:cljs [goog.object :as gobject])
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
             [fluree.db.util.bytes :as butil]
             [fluree.db.util.core :as cutil]
-            [fluree.db.util.log :as log]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.flake :as flake])
+            [fluree.db.util.log :as log])
   #?(:clj
      (:import (fluree.db.flake Flake)
               (java.io ByteArrayInputStream)
@@ -27,8 +27,8 @@
      [enable]
      (if enable
        (add-encoder java.math.BigDecimal
-                     (fn [n ^JsonGenerator jsonGenerator]
-                       (.writeString jsonGenerator (str n))))
+                    (fn [n ^JsonGenerator jsonGenerator]
+                      (.writeString jsonGenerator (str n))))
        (remove-encoder java.math.BigDecimal))))
 
 ;;https://purelyfunctional.tv/mini-guide/json-serialization-api-clojure/
@@ -80,7 +80,6 @@
                 (js/JSON.parse)
                 (js->clj :keywordize-keys keywordize-keys?)))))
 
-
 #?(:cljs
    (defn stringify-preserve-namespace
      [x]
@@ -91,11 +90,9 @@
   #?(:clj  (cjson/encode x)
      :cljs (js/JSON.stringify (clj->js x))))
 
-
 (defn stringify-UTF8
   [x]
   (butil/string->UTF8 (stringify x)))
-
 
 (defn parse-json-flakes
   [db flakes]
@@ -105,7 +102,6 @@
           (update % :o parse)
           %)
        flakes))
-
 
 (defn- valid-coordinates?
   "Given a sequence of coordinates, ensure that, for the given depth:

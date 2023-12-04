@@ -1,20 +1,20 @@
 (ns fluree.db.query.history
   (:require [clojure.core.async :as async :refer [go >! <!]]
-            [fluree.db.query.fql.syntax :as syntax]
-            [malli.core :as m]
-            [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
+            [fluree.db.db.json-ld :as jld-db]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.index :as index]
+            [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.json-ld.response :as json-ld-resp]
+            [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.db.json-ld :as jld-db]
-            [fluree.db.validation :as v]))
+            [fluree.db.validation :as v]
+            [fluree.json-ld :as json-ld]
+            [malli.core :as m]))
 
 (defn history-query-schema
   "Returns schema for history queries, with any extra key/value pairs `extra-kvs`
@@ -28,60 +28,59 @@
     (fn [{:keys [history commit-details t]}]
       (or (string? history) (keyword? history) (seq history) commit-details))]
    (into
-     [:map
-      [:history {:optional true}
-       [:orn {:error/message
-              "Value of \"history\" must be a subject, or a vector containing one or more of subject, predicate, object"}
-        [:subject {:error/message "Invalid iri"} ::iri]
-        [:flake
-         [:or {:error/message "Must provide a tuple of one more more iris"}
-          [:catn
-           [:s ::iri]]
-          [:catn
-           [:s [:maybe ::iri]]
-           [:p ::iri]]
-          [:catn
-           [:s [:maybe ::iri]]
-           [:p ::iri]
-           [:o [:not :nil]]]]]]]
-      [:commit-details {:optional true
-                        :error/message "Invalid value of \"commit-details\" key"} :boolean]
-      [:context {:optional true} ::context]
-      [:opts {:optional true} [:map-of :keyword :any]]
-      [:t
-       [:and
-        [:map-of {:error/message "Value of \"t\" must be a map"} :keyword :any]
-        [:map
-         [:from {:optional true}
-          [:or {:error/message "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
-           [:= :latest]
-           [:int {:min 0
-                  :error/message "Must be a positive value"}]
-           [:re datatype/iso8601-datetime-re]]]
-         [:to {:optional true}
-          [:or {:error/message "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
-           [:=  :latest]
-           [:int {:min 0
-                  :error/message "Must be a positive value"}]
-           [:re datatype/iso8601-datetime-re]]]
-         [:at {:optional true}
-          [:or {:error/message "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
-           [:= :latest]
-           [:int {:min 0
-                  :error/message "Must be a positive value"}]
-           [:re datatype/iso8601-datetime-re]]]]
-        [:fn {:error/message "Must provide: either \"from\" or \"to\", or the key \"at\" "}
-         (fn [{:keys [from to at]}]
+    [:map
+     [:history {:optional true}
+      [:orn {:error/message
+             "Value of \"history\" must be a subject, or a vector containing one or more of subject, predicate, object"}
+       [:subject {:error/message "Invalid iri"} ::iri]
+       [:flake
+        [:or {:error/message "Must provide a tuple of one more more iris"}
+         [:catn
+          [:s ::iri]]
+         [:catn
+          [:s [:maybe ::iri]]
+          [:p ::iri]]
+         [:catn
+          [:s [:maybe ::iri]]
+          [:p ::iri]
+          [:o [:not :nil]]]]]]]
+     [:commit-details {:optional true
+                       :error/message "Invalid value of \"commit-details\" key"} :boolean]
+     [:context {:optional true} ::context]
+     [:opts {:optional true} [:map-of :keyword :any]]
+     [:t
+      [:and
+       [:map-of {:error/message "Value of \"t\" must be a map"} :keyword :any]
+       [:map
+        [:from {:optional true}
+         [:or {:error/message "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+          [:= :latest]
+          [:int {:min 0
+                 :error/message "Must be a positive value"}]
+          [:re datatype/iso8601-datetime-re]]]
+        [:to {:optional true}
+         [:or {:error/message "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+          [:=  :latest]
+          [:int {:min 0
+                 :error/message "Must be a positive value"}]
+          [:re datatype/iso8601-datetime-re]]]
+        [:at {:optional true}
+         [:or {:error/message "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+          [:= :latest]
+          [:int {:min 0
+                 :error/message "Must be a positive value"}]
+          [:re datatype/iso8601-datetime-re]]]]
+       [:fn {:error/message "Must provide: either \"from\" or \"to\", or the key \"at\" "}
+        (fn [{:keys [from to at]}]
            ;; if you have :at, you cannot have :from or :to
-           (if at
-             (not (or from to))
-             (or from to)))]
-        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value"}
-         (fn [{:keys [from to]}] (if (and (number? from) (number? to))
-                                   (<= from to)
-                                   true))]]]]
-     extra-kvs)])
-
+          (if at
+            (not (or from to))
+            (or from to)))]
+       [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value"}
+        (fn [{:keys [from to]}] (if (and (number? from) (number? to))
+                                  (<= from to)
+                                  true))]]]]
+    extra-kvs)])
 
 (def registry
   (merge
@@ -129,15 +128,15 @@
   [db cache context compact fuel error-ch s-flakes]
   (go
     (try*
-     (let [json-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
-                                               {:wildcard? true, :depth 0}
-                                               0 s-flakes)]
-       (-> (<? json-chan)
+      (let [json-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
+                                                {:wildcard? true, :depth 0}
+                                                0 s-flakes)]
+        (-> (<? json-chan)
            ;; add the id in case the iri flake isn't present in s-flakes
-           (assoc :id (json-ld/compact (<? (dbproto/-iri db (flake/s (first s-flakes)))) compact))))
-     (catch* e
-       (log/error e "Error transforming s-flakes.")
-       (>! error-ch e)))))
+            (assoc :id (json-ld/compact (<? (dbproto/-iri db (flake/s (first s-flakes)))) compact))))
+      (catch* e
+        (log/error e "Error transforming s-flakes.")
+        (>! error-ch e)))))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
@@ -190,28 +189,28 @@
      (fn [t-flakes ch]
        (-> (go
              (try*
-              (let [{assert-flakes  true
-                     retract-flakes false} (group-by flake/op t-flakes)
+               (let [{assert-flakes  true
+                      retract-flakes false} (group-by flake/op t-flakes)
 
-                    t        (- (flake/t (first t-flakes)))
+                     t        (- (flake/t (first t-flakes)))
 
-                    asserts  (->> assert-flakes
-                                  (t-flakes->json-ld db context compact cache
-                                   fuel error-ch)
-                                  (async/into [])
-                                  <!)
+                     asserts  (->> assert-flakes
+                                   (t-flakes->json-ld db context compact cache
+                                                      fuel error-ch)
+                                   (async/into [])
+                                   <!)
 
-                    retracts (->> retract-flakes
-                                  (t-flakes->json-ld db context compact cache
-                                   fuel error-ch)
-                                  (async/into [])
-                                  <!)]
-                {t-key       t
-                 assert-key  asserts
-                 retract-key retracts})
-              (catch* e
-                (log/error e "Error converting history flakes.")
-                (>! error-ch e))))
+                     retracts (->> retract-flakes
+                                   (t-flakes->json-ld db context compact cache
+                                                      fuel error-ch)
+                                   (async/into [])
+                                   <!)]
+                 {t-key       t
+                  assert-key  asserts
+                  retract-key retracts})
+               (catch* e
+                 (log/error e "Error converting history flakes.")
+                 (>! error-ch e))))
 
            (async/pipe ch)))
      t-flakes-ch)
@@ -275,55 +274,55 @@
   [db context compact cache fuel error-ch t-flakes]
   (go
     (try*
-     (let [default-ctx-sid     (some #(when (= const/$_ledger:context (flake/p %))
-                                        (flake/o %))
-                                     t-flakes)
-           commit-meta?        (partial commit-metadata-flake? default-ctx-sid)
-           {commit-wrapper-flakes :commit-wrapper
-            commit-meta-flakes    :commit-meta
-            assert-flakes         :assert-flakes
-            retract-flakes        :retract-flakes}
-           (group-by (fn [f]
-                       (cond
-                         (commit-wrapper-flake? f) :commit-wrapper
-                         (commit-meta? f) :commit-meta
-                         (and (flake/op f) (not (extra-data-flake? f))
-                              (not= default-ctx-sid (flake/s f))) :assert-flakes
-                         (and (not (flake/op f)) (not (extra-data-flake? f))) :retract-flakes
-                         :else :ignore-flakes))
-                     t-flakes)
-           commit-wrapper-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
-                                                         {:wildcard? true, :depth 0}
-                                                         0 commit-wrapper-flakes)
+      (let [default-ctx-sid     (some #(when (= const/$_ledger:context (flake/p %))
+                                         (flake/o %))
+                                      t-flakes)
+            commit-meta?        (partial commit-metadata-flake? default-ctx-sid)
+            {commit-wrapper-flakes :commit-wrapper
+             commit-meta-flakes    :commit-meta
+             assert-flakes         :assert-flakes
+             retract-flakes        :retract-flakes}
+            (group-by (fn [f]
+                        (cond
+                          (commit-wrapper-flake? f) :commit-wrapper
+                          (commit-meta? f) :commit-meta
+                          (and (flake/op f) (not (extra-data-flake? f))
+                               (not= default-ctx-sid (flake/s f))) :assert-flakes
+                          (and (not (flake/op f)) (not (extra-data-flake? f))) :retract-flakes
+                          :else :ignore-flakes))
+                      t-flakes)
+            commit-wrapper-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
+                                                          {:wildcard? true, :depth 0}
+                                                          0 commit-wrapper-flakes)
 
-           commit-meta-chan    (json-ld-resp/flakes->res db cache context compact fuel 1000000
-                                                         {:wildcard? true, :depth 0}
-                                                         0 commit-meta-flakes)
+            commit-meta-chan    (json-ld-resp/flakes->res db cache context compact fuel 1000000
+                                                          {:wildcard? true, :depth 0}
+                                                          0 commit-meta-flakes)
 
-           commit-wrapper      (<? commit-wrapper-chan)
-           commit-meta         (<? commit-meta-chan)
-           asserts             (->> assert-flakes
-                                    (t-flakes->json-ld db context compact cache
-                                                       fuel error-ch)
-                                    (async/into [])
-                                    <!)
-           retracts            (->> retract-flakes
-                                    (t-flakes->json-ld db context compact cache
-                                                       fuel error-ch)
-                                    (async/into [])
-                                    <!)
+            commit-wrapper      (<? commit-wrapper-chan)
+            commit-meta         (<? commit-meta-chan)
+            asserts             (->> assert-flakes
+                                     (t-flakes->json-ld db context compact cache
+                                                        fuel error-ch)
+                                     (async/into [])
+                                     <!)
+            retracts            (->> retract-flakes
+                                     (t-flakes->json-ld db context compact cache
+                                                        fuel error-ch)
+                                     (async/into [])
+                                     <!)
 
-           assert-key          (json-ld/compact const/iri-assert compact)
-           retract-key         (json-ld/compact const/iri-retract compact)
-           data-key            (json-ld/compact const/iri-data compact)
-           commit-key          (json-ld/compact const/iri-commit compact)]
-       (-> {commit-key commit-wrapper}
-           (assoc-in [commit-key data-key] commit-meta)
-           (assoc-in [commit-key data-key assert-key] asserts)
-           (assoc-in [commit-key data-key retract-key] retracts)))
-     (catch* e
-       (log/error e "Error converting commit flakes.")
-       (>! error-ch e)))))
+            assert-key          (json-ld/compact const/iri-assert compact)
+            retract-key         (json-ld/compact const/iri-retract compact)
+            data-key            (json-ld/compact const/iri-data compact)
+            commit-key          (json-ld/compact const/iri-commit compact)]
+        (-> {commit-key commit-wrapper}
+            (assoc-in [commit-key data-key] commit-meta)
+            (assoc-in [commit-key data-key assert-key] asserts)
+            (assoc-in [commit-key data-key retract-key] retracts)))
+      (catch* e
+        (log/error e "Error converting commit flakes.")
+        (>! error-ch e)))))
 
 (defn commit-flakes->json-ld
   "Create a collection of commit maps."

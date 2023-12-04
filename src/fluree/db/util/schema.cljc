@@ -1,7 +1,7 @@
 (ns fluree.db.util.schema
-  (:require [fluree.db.flake :as flake]
-            [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]))
+  (:require [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

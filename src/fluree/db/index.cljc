@@ -1,13 +1,13 @@
 (ns fluree.db.index
   (:refer-clojure :exclude [resolve])
-  (:require [fluree.db.constants :as const]
-            [fluree.db.flake :as flake]
-            #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
+  (:require #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
                :cljs [cljs.core.async :refer [chan go <! >!] :as async])
+            [fluree.db.conn.cache :as conn-cache]
+            [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.cache :as conn-cache]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 (def default-comparators
   "Map of default index comparators for the five index types"
@@ -250,8 +250,8 @@
       (-> resolved
           (dissoc :t)
           (assoc :from-t from-t
-                 :to-t   to-t
-                 :flakes  flakes)))))
+            :to-t   to-t
+            :flakes  flakes)))))
 
 (defrecord TRangeResolver [node-resolver novelty from-t to-t]
   Resolver
@@ -266,10 +266,10 @@
     (if (branch? node)
       (resolve node-resolver node)
       (conn-cache/lru-lookup
-        lru-cache-atom
-        [::t-range id tempid tt-id from-t to-t]
-        (fn [_]
-          (resolve-t-range node-resolver node novelty from-t to-t))))))
+       lru-cache-atom
+       [::t-range id tempid tt-id from-t to-t]
+       (fn [_]
+         (resolve-t-range node-resolver node novelty from-t to-t))))))
 
 (defn history-t-range
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
@@ -290,17 +290,17 @@
     (if (branch? node)
       (resolve node-resolver node)
       (conn-cache/lru-lookup
-        lru-cache-atom
-        [::history-t-range id tempid tt-id from-t to-t]
-        (fn [_]
-          (go-try
-            (let [resolved (<? (resolve node-resolver node))
-                  flakes   (history-t-range resolved novelty from-t to-t)]
-              (-> resolved
-                  (dissoc :t)
-                  (assoc :from-t from-t
-                         :to-t   to-t
-                         :flakes  flakes)))))))))
+       lru-cache-atom
+       [::history-t-range id tempid tt-id from-t to-t]
+       (fn [_]
+         (go-try
+           (let [resolved (<? (resolve node-resolver node))
+                 flakes   (history-t-range resolved novelty from-t to-t)]
+             (-> resolved
+                 (dissoc :t)
+                 (assoc :from-t from-t
+                   :to-t   to-t
+                   :flakes  flakes)))))))))
 
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from
