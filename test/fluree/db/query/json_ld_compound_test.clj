@@ -1,16 +1,17 @@
 (ns fluree.db.query.json-ld-compound-test
-  (:require
-    [clojure.test :refer :all]
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]))
+  (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration simple-compound-queries
   (testing "Simple compound queries."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/compounda" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          ledger @(fluree/create conn "query/compounda")
           db     @(fluree/stage
                     (fluree/db ledger)
-                    {"@context" "https://ns.flur.ee"
+                    {"@context" ["https://ns.flur.ee"
+                                 test-utils/default-context
+                                 {:ex "http://example.org/ns/"}]
                      "insert"
                      [{:id           :ex/brian,
                        :type         :ex/User,
@@ -33,17 +34,21 @@
                        :ex/friend    [:ex/brian :ex/alice]}]})
 
           two-tuple-select-with-crawl
-          @(fluree/query db '{:select [?age {?f [:*]}]
-                              :where  {:schema/name "Cam"
+          @(fluree/query db {:context [test-utils/default-context
+                                       {:ex "http://example.org/ns/"}]
+                             :select '[?age {?f [:*]}]
+                             :where  '{:schema/name "Cam"
                                        :ex/friend   {:id         ?f
                                                      :schema/age ?age}}})
 
           two-tuple-select-with-crawl+var
-          @(fluree/query db '{:select  [?age {?f [:*]}]
-                              :where   {:schema/name ?name
+          @(fluree/query db {:context [test-utils/default-context
+                                       {:ex "http://example.org/ns/"}]
+                             :select  '[?age {?f [:*]}]
+                             :where   '{:schema/name ?name
                                         :ex/friend   {:id         ?f
                                                       :schema/age ?age}}
-                              :values  [?name ["Cam"]]})]
+                             :values  '[?name ["Cam"]]})]
 
       (is (= two-tuple-select-with-crawl
              two-tuple-select-with-crawl+var
@@ -161,11 +166,12 @@
                [:ex/cam :ex/favNums 10]
                [:ex/cam :ex/friend :ex/brian]
                [:ex/cam :ex/friend :ex/alice]}
-             (set @(fluree/query db
-                                 '{:select [?s ?p ?o]
-                                   :where  {:id         ?s
-                                            :schema/age 34
-                                            ?p          ?o}})))
+             (set @(fluree/query db {:context [test-utils/default-context
+                                               {:ex "http://example.org/ns/"}]
+                                     :select '[?s ?p ?o]
+                                     :where  '{:id         ?s
+                                               :schema/age 34
+                                               ?p          ?o}})))
           "IRIs are resolved from subj ids, whether s, p, or o vals.")
 
       ;; checking object-subject joins
@@ -188,8 +194,9 @@
                  :schema/email "alice@example.org",
                  :schema/age 50,
                  :ex/favNums [9 42 76]}]}]
-             @(fluree/query db
-                            '{:select {?s ["*" {:ex/friend ["*"]}]}
-                              :where  {:id        ?s
-                                       :ex/friend {:schema/name "Alice"}}}))
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select '{?s ["*" {:ex/friend ["*"]}]}
+                                :where  '{:id        ?s
+                                          :ex/friend {:schema/name "Alice"}}}))
           "Subjects appearing as objects should be referenceable."))))
