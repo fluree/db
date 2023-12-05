@@ -1,17 +1,17 @@
 (ns fluree.db.query.exec.where
-  (:require [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async :refer [<! >! go take! put!]]
+  (:require [clojure.core.async :as async :refer [<! >! go take! put!]]
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.index :as index]
+            [fluree.db.json-ld.ledger :as ledger]
+            [fluree.db.query.dataset :as dataset]
+            [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.datatype :as datatype]
-            [fluree.db.query.dataset :as dataset]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]
-            [fluree.db.json-ld.ledger :as ledger])
+            [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (clojure.lang MapEntry))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -166,7 +166,7 @@
    {::patterns patterns})
   ([patterns filters]
    (cond-> (->where-clause patterns)
-           (seq filters) (assoc ::filters filters))))
+     (seq filters) (assoc ::filters filters))))
 
 (defn pattern-type
   [pattern]
@@ -364,7 +364,6 @@
      (-> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
          (->> (query-range/filter-authorized db start-flake end-flake error-ch))))))
 
-
 (defn resolve-subject-sid
   [db error-ch s-mch]
   (go (try*
@@ -402,7 +401,6 @@
                      o)]
       (when (and (some? s*) (some? p*) (some? o*))
         [s* p* o*]))))
-
 
 (defn get-equivalent-properties
   [db prop]
@@ -507,19 +505,20 @@
                          (resolve-predicate-sid db o)
                          o)]
         (if (and (some? s*) (some? p*) (some? o*))
-          (let
-              [cls        (get-sid o* db-alias)
-               sub-obj    (dissoc o* ::sids ::iri)
-               class-objs (into [o*]
-                                (comp (map (fn [cls]
-                                             (match-sid sub-obj db-alias cls)))
-                                      (remove nil?))
-                                (dbproto/-class-prop db :subclasses cls))
-               class-ch   (async/to-chan! class-objs)]
+          (let [cls        (get-sid o* db-alias)
+                sub-obj    (dissoc o* ::sids ::iri)
+                class-objs (into [o*]
+                                 (comp (map (fn [cls]
+                                              (match-sid sub-obj db-alias cls)))
+                                       (remove nil?))
+                                 (dbproto/-class-prop db :subclasses cls))
+                class-ch   (async/to-chan! class-objs)]
             (async/pipeline-async 2
                                   flake-ch
                                   (fn [class-obj ch]
-                                    (-> (resolve-flake-range db fuel-tracker error-ch [s* p* class-obj])
+                                    (-> db
+                                        (resolve-flake-range
+                                         fuel-tracker error-ch [s* p* class-obj])
                                         (async/pipe ch)))
                                   class-ch))
           (async/close! flake-ch)))))
@@ -640,8 +639,8 @@
         ;; Iteration: mark that a solution was processed, and pass it to the supplied
         ;; reducing fn.
         ([result solution]
-         (do (vreset! solutions? true)
-             (rf result solution)))
+         (vreset! solutions? true)
+         (rf result solution))
 
         ;; Termination: if no other solutions were processed, then process the
         ;; default-solution with the supplied reducing fn before terminating it;
