@@ -73,10 +73,8 @@
     :tspo txn-max-match))
 
 (defn resolve-subid
-  "Expands an IRI @id for a subject and returns the index's subject-id integer (sid).
-
-  Only called when integer or nil is not provided, so can assume always have a compact
-  or full IRI as either a keyword or string."
+  "Returns the subject-id integer (sid) corresponding to `id`. `id` must be a
+  fully expanded IRI or an integer subject id."
   [db id]
   (dbproto/-subid db id))
 
