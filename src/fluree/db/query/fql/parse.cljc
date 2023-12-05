@@ -27,6 +27,14 @@
   [x]
   (some-> x parse-var-name where/unmatched-var))
 
+(defn- parse-variable-if-allowed
+  [allowed-vars x]
+  (if (->> x symbol (contains? allowed-vars))
+    (parse-variable x)
+    (throw
+     (ex-info (str "variable " x " is not bound in where nor values clause")
+              {:status 400, :error :db/invalid-transaction}))))
+
 (defn parse-value-binding
   [vars vals]
   (let [var-matches (mapv parse-variable vars)
@@ -218,7 +226,7 @@
 (defn with-id
   "Searches for the id key, expands it or adds a variable as a value."
   [m context]
-  (let [[id-key id] (reduce-kv (fn [res p o]
+  (let [[id-key id] (reduce-kv (fn [_res p o]
                                  (let [expanded (if (v/variable? p)
                                                   p
                                                   (json-ld/expand-iri p context))]
@@ -585,12 +593,13 @@
 
 (declare parse-subj-cmp)
 (defn parse-obj-cmp
-  [bnode-counter subj-cmp pred-cmp m triples
+  [bnode-counter allowed-vars subj-cmp pred-cmp m triples
    {:keys [list id value type language] :as v-map}]
   (cond
     list
     (reduce (fn [triples [i list-item]]
-              (parse-obj-cmp bnode-counter subj-cmp pred-cmp {:i i} triples list-item))
+              (parse-obj-cmp bnode-counter allowed-vars subj-cmp pred-cmp {:i i}
+                             triples list-item))
             triples
             (map vector (range) list))
 
@@ -598,14 +607,14 @@
     (some? value)
     (let [m*      (cond-> m language (assoc :lang language))
           obj-cmp (if (v/variable? value)
-                    (parse-variable value)
+                    (parse-variable-if-allowed allowed-vars value)
                     (where/anonymous-value value type m*))]
       (conj triples [subj-cmp pred-cmp obj-cmp]))
 
     ;; ref object
     :else
     (let [ref-obj (if (v/variable? id)
-                    (parse-variable id)
+                    (parse-variable-if-allowed allowed-vars id)
                     (where/match-iri
                      (if (nil? id)
                        (temp-bnode-id bnode-counter)
@@ -617,11 +626,11 @@
                     ;; project newly created bnode-id into v-map
                     (assoc v-map :id (where/get-iri ref-cmp))
                     v-map)]
-      (conj (parse-subj-cmp bnode-counter triples v-map*)
+      (conj (parse-subj-cmp bnode-counter allowed-vars triples v-map*)
             [subj-cmp pred-cmp ref-cmp]))))
 
 (defn parse-pred-cmp
-  [bnode-counter subj-cmp triples [pred values]]
+  [bnode-counter allowed-vars subj-cmp triples [pred values]]
   (let [values*  (cond (= pred :type)
                        ;; homogenize @type values so they have the same structure as other predicates
                        (map #(do {:id %}) values)
@@ -632,29 +641,30 @@
                                        {:status 400 :error :db/invalid-predicate}))
                        :else
                        values)
-        pred-cmp (cond (v/variable? pred) (parse-variable pred)
+        pred-cmp (cond (v/variable? pred) (parse-variable-if-allowed
+                                           allowed-vars pred)
                        ;; we want the actual iri here, not the keyword
                        (= pred :type)     (where/match-iri const/iri-type)
                        :else              (where/match-iri pred))]
-    (reduce (partial parse-obj-cmp bnode-counter subj-cmp pred-cmp
+    (reduce (partial parse-obj-cmp bnode-counter allowed-vars subj-cmp pred-cmp
                      nil)
             triples
             values*)))
 
 (defn parse-subj-cmp
-  [bnode-counter triples {:keys [id] :as node}]
-  (let [subj-cmp (cond (v/variable? id) (parse-variable id)
+  [bnode-counter allowed-vars triples {:keys [id] :as node}]
+  (let [subj-cmp (cond (v/variable? id) (parse-variable-if-allowed allowed-vars id)
                        (nil? id)        (where/match-iri (temp-bnode-id bnode-counter))
                        :else            (where/match-iri id))]
-    (reduce (partial parse-pred-cmp bnode-counter subj-cmp)
+    (reduce (partial parse-pred-cmp bnode-counter allowed-vars subj-cmp)
             triples
             (dissoc node :id :idx))))
 
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
-  [expanded]
+  [expanded allowed-vars]
   (let [bnode-counter (volatile! 0)]
-    (reduce (partial parse-subj-cmp bnode-counter)
+    (reduce (partial parse-subj-cmp bnode-counter allowed-vars)
             []
             expanded)))
 
@@ -664,15 +674,16 @@
         [vars values] (parse-values vals-map)
         where-map     {:where (util/get-first-value txn const/iri-where)}
         where         (parse-where where-map vars context)
+        bound-vars    (-> where where/bound-variables (into vars))
 
         delete (-> (util/get-first-value txn const/iri-delete)
                    (json-ld/expand context)
-                   (util/sequential)
-                   (parse-triples))
+                   util/sequential
+                   (parse-triples bound-vars))
         insert (-> (util/get-first-value txn const/iri-insert)
                    (json-ld/expand context)
-                   (util/sequential)
-                   (parse-triples))]
+                   util/sequential
+                   (parse-triples bound-vars))]
     (when (and (empty? insert) (empty? delete))
       (throw (ex-info (str "Invalid transaction, insert or delete clause must contain nodes with objects.")
                       {:status 400 :error :db/invalid-transaction})))

@@ -706,3 +706,12 @@
                             initial-solution-ch)
       (async/pipe initial-solution-ch out-ch))
     out-ch))
+
+(defn bound-variables
+  [where]
+  (cond
+    (nil? where) #{}
+    (sequential? where) (into #{} (mapcat bound-variables) where)
+    (map? where) (if (contains? where ::var)
+                   #{(::var where)}
+                   (into #{} (mapcat bound-variables) where))))
