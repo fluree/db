@@ -147,9 +147,9 @@
                                           "delete"   []
                                           "where"    [{"id"         "ex:hash-fns"
                                                        "ex:message" "?message"}
-                                                    ["bind"
-                                                     "?sha256" "(sha256 ?message)"
-                                                     "?sha512" "(sha512 ?message)"]]
+                                                      ["bind"
+                                                       "?sha256" "(sha256 ?message)"
+                                                       "?sha512" "(sha512 ?message)"]]
                                           "insert"   {"id"        "ex:hash-fns"
                                                       "ex:sha256" "?sha256"
                                                       "ex:sha512" "?sha512"}}))]
@@ -172,16 +172,16 @@
                                                        "ex:localdatetime"  "?localdatetime"
                                                        "ex:offsetdatetime" "?offsetdatetime"
                                                        "ex:utcdatetime"    "?utcdatetime"}
-                                                    ["bind"
-                                                     "?now" "(now)"
-                                                     "?year" "(year ?localdatetime)"
-                                                     "?month" "(month ?localdatetime)"
-                                                     "?day" "(day ?localdatetime)"
-                                                     "?hours" "(hours ?localdatetime)"
-                                                     "?minutes" "(minutes ?localdatetime)"
-                                                     "?seconds" "(seconds ?localdatetime)"
-                                                     "?tz1" "(tz ?utcdatetime)"
-                                                     "?tz2" "(tz ?offsetdatetime)"]]
+                                                      ["bind"
+                                                       "?now" "(now)"
+                                                       "?year" "(year ?localdatetime)"
+                                                       "?month" "(month ?localdatetime)"
+                                                       "?day" "(day ?localdatetime)"
+                                                       "?hours" "(hours ?localdatetime)"
+                                                       "?minutes" "(minutes ?localdatetime)"
+                                                       "?seconds" "(seconds ?localdatetime)"
+                                                       "?tz1" "(tz ?utcdatetime)"
+                                                       "?tz2" "(tz ?offsetdatetime)"]]
                                           "insert"   [{"id"         "?s"
                                                        "ex:now"     "?now"
                                                        "ex:year"    "?year"
@@ -220,12 +220,12 @@
                                                      "ex:pos-int" "?pos-int"
                                                      "ex:neg-int" "?neg-int"
                                                      "ex:decimal" "?decimal"}
-                                                  ["bind"
-                                                   "?abs" "(abs ?neg-int)"
-                                                   "?round" "(round ?decimal)"
-                                                   "?ceil" "(ceil ?decimal)"
-                                                   "?floor" "(floor ?decimal)"
-                                                   "?rand" "(rand)"]]
+                                                    ["bind"
+                                                     "?abs" "(abs ?neg-int)"
+                                                     "?round" "(round ?decimal)"
+                                                     "?ceil" "(ceil ?decimal)"
+                                                     "?floor" "(floor ?decimal)"
+                                                     "?rand" "(rand)"]]
                                         "insert"   {"id"       "?s"
                                                     "ex:abs"   "?abs"
                                                     "ex:round" "?round"
@@ -257,19 +257,19 @@
                         (fluree/stage {"@context" "https://ns.flur.ee"
                                         "where"    [{"id"      "?s"
                                                      "ex:text" "?text"}
-                                                  ["bind"
-                                                   "?strlen" "(strLen ?text)"
-                                                   "?sub1" "(subStr ?text 5)"
-                                                   "?sub2" "(subStr ?text 1 4)"
-                                                   "?upcased" "(ucase ?text)"
-                                                   "?downcased" "(lcase ?text)"
-                                                   "?a-start" "(strStarts ?text \"x\")"
-                                                   "?a-end" "(strEnds ?text \"x\")"
-                                                   "?contains" "(contains ?text \"x\")"
-                                                   "?strBefore" "(strBefore ?text \"bcd\")"
-                                                   "?strAfter" "(strAfter ?text \"bcd\")"
-                                                   "?concatted" "(concat ?text \" \" \"STR1 \" \"STR2\")"
-                                                   "?matched" "(regex ?text \"^Abc\")"]]
+                                                    ["bind"
+                                                     "?strlen" "(strLen ?text)"
+                                                     "?sub1" "(subStr ?text 5)"
+                                                     "?sub2" "(subStr ?text 1 4)"
+                                                     "?upcased" "(ucase ?text)"
+                                                     "?downcased" "(lcase ?text)"
+                                                     "?a-start" "(strStarts ?text \"x\")"
+                                                     "?a-end" "(strEnds ?text \"x\")"
+                                                     "?contains" "(contains ?text \"x\")"
+                                                     "?strBefore" "(strBefore ?text \"bcd\")"
+                                                     "?strAfter" "(strAfter ?text \"bcd\")"
+                                                     "?concatted" "(concat ?text \" \" \"STR1 \" \"STR2\")"
+                                                     "?matched" "(regex ?text \"^Abc\")"]]
                                         "insert"   [{"id"           "?s"
                                                      "ex:strStarts" "?a-start"
                                                      "ex:strEnds"   "?a-end"
@@ -323,14 +323,14 @@
                                                        "ex:text"   "?text"
                                                        "ex:number" "?num"
                                                        "ex:ref"    "?r"}
-                                                    ["bind"
-                                                     "?str" "(str ?num)"
-                                                     "?uuid" "(uuid)"
-                                                     "?struuid" "(struuid)"
-                                                     "?isBlank" "(isBlank ?s)"
-                                                     "?isNotBlank" "(isBlank ?num)"
-                                                     "?isnum" "(isNumeric ?num)"
-                                                     "?isNotNum" "(isNumeric ?text)"]]
+                                                      ["bind"
+                                                       "?str" "(str ?num)"
+                                                       "?uuid" "(uuid)"
+                                                       "?struuid" "(struuid)"
+                                                       "?isBlank" "(isBlank ?s)"
+                                                       "?isNotBlank" "(isBlank ?num)"
+                                                       "?isnum" "(isNumeric ?num)"
+                                                       "?isNotNum" "(isNumeric ?text)"]]
                                           "insert"   [{"id"              "?s"
                                                        "ex:uuid"         "?uuid"
                                                        "ex:struuid"      "?struuid"
@@ -375,7 +375,7 @@
                                                           "ex:text" "Abcdefg"}]})
                         (fluree/stage {"@context" "https://ns.flur.ee"
                                         "where"    [{"id" "?s", "ex:text" "?text"}
-                                                  ["bind" "?bound" "(bound ?text)"]]
+                                                    ["bind" "?bound" "(bound ?text)"]]
                                         "insert"   {"id" "?s", "ex:bound" "?bound"}
                                         "values"   ["?s" ["ex:functional-fns"]]}))]
         (is (= {"ex:bound" true}
@@ -399,13 +399,13 @@
                                                         "ex:text" "Abcdefg"}]})
             parse-err @(fluree/stage db2 {"@context" "https://ns.flur.ee"
                                            "where"    [{"id" "?s", "ex:text" "?text"}
-                                                     ["bind" "?err" "(foo ?text)"]]
+                                                       ["bind" "?err" "(foo ?text)"]]
                                            "insert"   {"id" "?s", "ex:text" "?err"}
                                            "values"   ["?s" ["ex:error"]]})
 
             run-err @(fluree/stage db2 {"@context" "https://ns.flur.ee"
                                          "where"    [{"id" "?s", "ex:text" "?text"}
-                                                   ["bind" "?err" "(abs ?text)"]]
+                                                     ["bind" "?err" "(abs ?text)"]]
                                          "insert"   {"id" "?s", "ex:error" "?err"}
                                          "values"   ["?s" ["ex:error"]]})]
         (is (= "Query function references illegal symbol: foo"
@@ -436,18 +436,18 @@
         ledger-id "test/love"
         ledger    @(fluree/create conn ledger-id)
         love      @(fluree/stage (fluree/db ledger)
-                                  {"@context" "https://ns.flur.ee"
-                                   "insert"
-                                   [{"@id"                "ex:fluree",
-                                     "@type"              "schema:Organization",
-                                     "schema:description" "We ❤️ Data"}
-                                    {"@id"                "ex:w3c",
-                                     "@type"              "schema:Organization",
-                                     "schema:description" "We ❤️ Internet"}
-                                    {"@id"                "ex:mosquitos",
-                                     "@type"              "ex:Monster",
-                                     "schema:description" "We ❤️ Human Blood"}]}
-                                  {})
+                                 {"@context" "https://ns.flur.ee"
+                                  "insert"
+                                  [{"@id"                "ex:fluree",
+                                    "@type"              "schema:Organization",
+                                    "schema:description" "We ❤️ Data"}
+                                   {"@id"                "ex:w3c",
+                                    "@type"              "schema:Organization",
+                                    "schema:description" "We ❤️ Internet"}
+                                   {"@id"                "ex:mosquitos",
+                                    "@type"              "ex:Monster",
+                                    "schema:description" "We ❤️ Human Blood"}]}
+                                 {})
         db1       @(fluree/commit! ledger love)]
     (testing "before deletion"
       (let [q       '{:select [?s ?p ?o]
