@@ -1,23 +1,24 @@
 (ns fluree.db.query.fql.parse
-  (:require [fluree.db.query.exec.eval :as eval]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.query.exec.update :as update]
-            [fluree.db.query.exec.select :as select]
-            [fluree.db.datatype :as datatype]
-            [fluree.db.query.fql.syntax :as syntax]
+  (:require #?(:cljs [cljs.reader :refer [read-string]])
             [clojure.set :as set]
             [clojure.walk :refer [postwalk]]
-            [fluree.json-ld :as json-ld]
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.query.exec.eval :as eval]
+            [fluree.db.query.exec.select :as select]
+            [fluree.db.query.exec.update :as update]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.validation :as v]
-            [fluree.db.constants :as const]
-            #?(:cljs [cljs.reader :refer [read-string]])))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn parse-var-name
-  "Returns a `x` as a symbol if `x` is a valid '?variable'."
+  "Returns x as a symbol if x is a valid variable, or nil otherwise. A valid
+  variable is a string, symbol, or keyword whose name starts with '?'."
   [x]
   (when (v/variable? x)
     (symbol x)))
@@ -317,7 +318,7 @@
                   (parse-subject context))
         attrs (dissoc m const/iri-id)]
     (if (empty? attrs)
-      (let[o-mch (-> s-mch ::where/iri where/anonymous-value)]
+      (let [o-mch (-> s-mch ::where/iri where/anonymous-value)]
         [[s-mch id-predicate-match o-mch]])
       (parse-statements s-mch attrs context))))
 
@@ -388,35 +389,35 @@
 (defn expand-selection
   [selection depth context]
   (reduce
-    (fn [acc select-item]
-      (cond
-        (map? select-item)
-        (let [[k v]  (first select-item)
-              iri    (json-ld/expand-iri k context)
-              spec   {:iri iri}
-              depth* (if (zero? depth)
-                       0
-                       (dec depth))
-              spec*  (-> spec
-                         (assoc :spec (expand-selection v depth* context)
-                                :as k))]
-          (if (reverse? context k)
-            (assoc-in acc [:reverse iri] spec*)
-            (assoc acc iri spec*)))
+   (fn [acc select-item]
+     (cond
+       (map? select-item)
+       (let [[k v]  (first select-item)
+             iri    (json-ld/expand-iri k context)
+             spec   {:iri iri}
+             depth* (if (zero? depth)
+                      0
+                      (dec depth))
+             spec*  (-> spec
+                        (assoc :spec (expand-selection v depth* context)
+                          :as k))]
+         (if (reverse? context k)
+           (assoc-in acc [:reverse iri] spec*)
+           (assoc acc iri spec*)))
 
-        (#{"*" :* '*} select-item)
-        (assoc acc :wildcard? true)
+       (#{"*" :* '*} select-item)
+       (assoc acc :wildcard? true)
 
-        (#{"_id" :_id} select-item)
-        (assoc acc :_id? true)
+       (#{"_id" :_id} select-item)
+       (assoc acc :_id? true)
 
-        :else
-        (let [iri  (json-ld/expand-iri select-item context)
-              spec {:iri iri, :as select-item}]
-          (if (reverse? context select-item)
-            (assoc-in acc [:reverse iri] spec)
-            (assoc acc iri spec)))))
-    {:depth depth} selection))
+       :else
+       (let [iri  (json-ld/expand-iri select-item context)
+             spec {:iri iri, :as select-item}]
+         (if (reverse? context select-item)
+           (assoc-in acc [:reverse iri] spec)
+           (assoc acc iri spec)))))
+   {:depth depth} selection))
 
 (defn parse-select-map
   [sm depth context]
@@ -521,7 +522,7 @@
         ordering (parse-ordering q)]
     (-> q
         (assoc :context context
-               :where where)
+          :where where)
         (cond-> (seq values) (assoc :values values)
                 grouping (assoc :group-by grouping)
                 ordering (assoc :order-by ordering))
@@ -543,22 +544,33 @@
        (mapcat (fn [m]
                  (parse-node-map m context)))))
 
+(defn- assoc-values
+  [mdfn values]
+  (if (seq values)
+    (assoc mdfn :values values)
+    mdfn))
+
+(defn- assoc-delete
+  [mdfn context]
+  (if (update/retract? mdfn)
+    (update mdfn :delete parse-update-clause context)
+    mdfn))
+
+(defn- assoc-insert
+  [mdfn context]
+  (if (update/insert? mdfn)
+    (update mdfn :insert parse-update-clause context)
+    mdfn))
+
 (defn parse-ledger-update
   [mdfn context]
   (let [[vars values] (parse-values mdfn)
-        where   (parse-where mdfn vars context)]
-    (-> mdfn
-        (assoc :context context
-               :where where)
-        (cond-> (seq values) (assoc :values values))
-        (as-> mod
-            (if (update/retract? mod)
-              (update mod :delete parse-update-clause context)
-              mod))
-        (as-> mod
-            (if (update/insert? mod)
-              (update mod :insert parse-update-clause context)
-              mod)))))
+        where (parse-where mdfn vars context)
+        mdfn* (assoc mdfn :context context :where where)]
+    (-> mdfn*
+        (assoc-values values)
+        (assoc-delete context)
+        (assoc-insert context))))
 
 (defn parse-modification
   [json-ld context]
@@ -575,7 +587,6 @@
 (defn parse-obj-cmp
   [bnode-counter subj-cmp pred-cmp m triples
    {:keys [list id value type language] :as v-map}]
-  (log/trace "parse-obj-cmp v-map:" v-map)
   (cond
     list
     (reduce (fn [triples [i list-item]]
@@ -625,7 +636,8 @@
                        ;; we want the actual iri here, not the keyword
                        (= pred :type)     (where/match-iri const/iri-type)
                        :else              (where/match-iri pred))]
-    (reduce (partial parse-obj-cmp bnode-counter subj-cmp pred-cmp nil)
+    (reduce (partial parse-obj-cmp bnode-counter subj-cmp pred-cmp
+                     nil)
             triples
             values*)))
 
