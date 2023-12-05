@@ -1,8 +1,7 @@
 (ns fluree.db.query.aggregate-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+            [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration aggregates-test
   (testing "aggregate queries"
@@ -21,9 +20,9 @@
                  subject)
               "aggregates bindings within each group")))
       (testing "with implicit grouping"
-        (let [qry     '{:context test-utils/default-context
-                        :select  [(count ?name)]
-                        :where   {:schema/name ?name}}
+        (let [qry     {:context test-utils/default-context
+                       :select  '[(count ?name)]
+                       :where   '{:schema/name ?name}}
               subject @(fluree/query db qry)]
           (is (= [[4]] subject)
               "aggregates bindings for all results"))))))
