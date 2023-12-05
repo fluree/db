@@ -1,6 +1,6 @@
 (ns fluree.db.transact.transact-test
   (:require [clojure.java.io :as io]
-            [clojure.test :refer :all]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.test-utils :as test-utils]
@@ -15,26 +15,26 @@
           db0    (fluree/db ledger)
 
           stage-id-only    @(fluree/stage
-                              db0
-                              {"@context" "https://ns.flur.ee"
-                               "insert"   {:id :ex/alice}})
+                             db0
+                             {"@context" "https://ns.flur.ee"
+                              "insert"   {:id :ex/alice}})
           stage-empty-txn  @(fluree/stage
-                              db0
-                              {"@context" "https://ns.flur.ee"
-                               "insert"   {}})
+                             db0
+                             {"@context" "https://ns.flur.ee"
+                              "insert"   {}})
           stage-empty-node @(fluree/stage
-                              db0
-                              {"@context" "https://ns.flur.ee"
-                               "insert"
-                               [{:id         :ex/alice
-                                 :schema/age 42}
-                                {}]})
+                             db0
+                             {"@context" "https://ns.flur.ee"
+                              "insert"
+                              [{:id         :ex/alice
+                                :schema/age 42}
+                               {}]})
           db-ok            @(fluree/stage
-                              db0
-                              {"@context" "https://ns.flur.ee"
-                               "insert"
-                               {:id         :ex/alice
-                                :schema/age 42}})]
+                             db0
+                             {"@context" "https://ns.flur.ee"
+                              "insert"
+                              {:id         :ex/alice
+                               :schema/age 42}})]
       (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
              (ex-message stage-id-only)))
       (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
@@ -57,11 +57,11 @@
                                   {:defaultContext
                                    ["" {:ex "http://example.org/ns/"}]})
           db-bool @(fluree/stage
-                     (fluree/db ledger)
-                     {"@context" "https://ns.flur.ee"
-                      "insert"
-                      {:id        :ex/alice
-                       :ex/isCool false}})]
+                    (fluree/db ledger)
+                    {"@context" "https://ns.flur.ee"
+                     "insert"
+                     {:id        :ex/alice
+                      :ex/isCool false}})]
       (is (= #{[:ex/alice :id "http://example.org/ns/alice"]
                [:ex/alice :ex/isCool false]
                [:ex/isCool :id "http://example.org/ns/isCool"]
@@ -193,21 +193,21 @@
                                              :f/targetRole :ex/userRole
                                              :f/action     [:f/view]}]}]
           db-data-first   @(fluree/stage
-                             (fluree/db ledger)
-                             {"@context" "https://ns.flur.ee"
-                              "insert" (into data policy)})
+                            (fluree/db ledger)
+                            {"@context" "https://ns.flur.ee"
+                             "insert" (into data policy)})
           db-policy-first @(fluree/stage
-                             (fluree/db ledger)
-                             {"@context" "https://ns.flur.ee"
-                              "insert" (into policy data)})
+                            (fluree/db ledger)
+                            {"@context" "https://ns.flur.ee"
+                             "insert" (into policy data)})
           user-query      '{:select {?s [:*]}
-                            :where  {:id ?s, :type :ex/User}}]
-      (let [users #{{:id :ex/john, :type :ex/User, :schema/name "John"}
-                    {:id :ex/alice, :type :ex/User, :schema/name "Alice"}}]
-        (is (= users
-               (set @(fluree/query db-data-first user-query))))
-        (is (= users
-               (set @(fluree/query db-policy-first user-query))))))))
+                            :where  {:id ?s, :type :ex/User}}
+          users #{{:id :ex/john, :type :ex/User, :schema/name "John"}
+                  {:id :ex/alice, :type :ex/User, :schema/name "Alice"}}]
+      (is (= users
+             (set @(fluree/query db-data-first user-query))))
+      (is (= users
+             (set @(fluree/query db-policy-first user-query)))))))
 
 (deftest ^:integration transact-large-dataset-test
   (with-tmp-dir storage-path
@@ -224,12 +224,12 @@
                                      ["" {"ex" "https://example.com/"}]})
             db      (fluree/db ledger)
             db0     @(fluree/stage db {"@context" "https://ns.flur.ee"
-                                        "insert"   shacl})
+                                       "insert"   shacl})
             _       (assert (not (util/exception? db0)))
             db1     @(fluree/commit! ledger db0)
             _       (assert (not (util/exception? db1)))
             db2     @(fluree/stage db0 {"@context" "https://ns.flur.ee"
-                                         "insert"   movies})
+                                        "insert"   movies})
             _       (assert (not (util/exception? db2)))
             query   {"select" "?title"
                      "where"  {"@id"      "?m"
@@ -283,7 +283,7 @@
                   :foo/bar     "foo"
                   :schema/name "Alice"}}
                (set @(fluree/query db (assoc user-query
-                                             :context ["" {:foo "http://foo.com/"}])))))))
+                                        :context ["" {:foo "http://foo.com/"}])))))))
     (testing "Aliased @id are correctly identified"
       (let [txn {"@context" ["https://ns.flur.ee"
                              ""
@@ -302,8 +302,8 @@
                   :foo/bar          "foo"
                   :schema/givenName "Alicia"}}
                (set @(fluree/query db (assoc user-query
-                                             :context ["" {:foo "http://foo.com/"
-                                                           :bar "http://bar.com/"}])))))))
+                                        :context ["" {:foo "http://foo.com/"
+                                                      :bar "http://bar.com/"}])))))))
     (testing "@context inside node is correctly handled"
       (let [txn {"@context" ["https://ns.flur.ee"
                              ""
@@ -324,9 +324,9 @@
                   :quux/corge       "grault"
                   :foo/bar          "foo"}}
                (set @(fluree/query db (assoc user-query
-                                             :context ["" {:foo  "http://foo.com/"
-                                                           :bar  "http://bar.com/"
-                                                           :quux "http://quux.com/"}])))))))
+                                        :context ["" {:foo  "http://foo.com/"
+                                                      :bar  "http://bar.com/"
+                                                      :quux "http://quux.com/"}])))))))
     (testing "conn default context is inherited when requested (and not o/w)"
       (let [txn1 {"@context" "https://ns.flur.ee"
                   "ledger"   ledger-name
@@ -350,7 +350,6 @@
         (is (= "Invalid transaction, missing required key: ledger."
                (ex-message @(fluree/transact! conn txn))))))))
 
-
 (deftest ^:integration base-and-vocab-test
   (testing "@base & @vocab work w/ stage"
     (let [conn        @(fluree/connect {:method :memory})
@@ -366,7 +365,7 @@
           ledger      @(fluree/create conn ledger-name)
           db0         (fluree/db ledger)
           db1         @(fluree/stage db0 {"@context" "https://ns.flur.ee"
-                                           "insert"  txn})]
+                                          "insert"  txn})]
       (is (= [{"@id"                              "http://example.org/nessie"
                "@type"                            "http://example.org/terms/SeaMonster"
                "http://example.org/terms/isScary" false}]
@@ -404,19 +403,19 @@
                                                                   {"ex" "http://example.org/ns/"}]})
           db0    (fluree/db ledger)
           db1    @(fluree/stage
-                    db0
-                    {"@context" "https://ns.flur.ee"
-                     "insert"
-                     [{"@id"     "ex:alice"
-                       "@type"   "ex:Person"
-                       "ex:json" {"@type"  "@json"
-                                  "@value" {"json" "data"
-                                            "is"   ["cool" "right?" 1 false 1.0]}}}
-                      {"@id"     "ex:bob"
-                       "@type"   "ex:Person"
-                       "ex:json" {"@type"  "@json"
-                                  "@value" {:edn "data"
-                                            :is  ["cool" "right?" 1 false 1.0]}}}]})]
+                   db0
+                   {"@context" "https://ns.flur.ee"
+                    "insert"
+                    [{"@id"     "ex:alice"
+                      "@type"   "ex:Person"
+                      "ex:json" {"@type"  "@json"
+                                 "@value" {"json" "data"
+                                           "is"   ["cool" "right?" 1 false 1.0]}}}
+                     {"@id"     "ex:bob"
+                      "@type"   "ex:Person"
+                      "ex:json" {"@type"  "@json"
+                                 "@value" {:edn "data"
+                                           :is  ["cool" "right?" 1 false 1.0]}}}]})]
       (is (= #{{"id"     "ex:bob"
                 "type"   "ex:Person"
                 "ex:json" {":edn" "data", ":is" ["cool" "right?" 1 false 1]}}
@@ -439,15 +438,15 @@
         db0    (fluree/db ledger)
 
         db1 @(fluree/stage db0 {"@context" "https://ns.flur.ee"
-                                 "insert"   [{"@id" "ex:andrew" "schema:name" "Andrew"}]})
+                                "insert"   [{"@id" "ex:andrew" "schema:name" "Andrew"}]})
 
         db2 @(fluree/stage db1 {"@context" "https://ns.flur.ee"
-                                 "where"    {"@id"                "ex:andrew"
-                                             "schema:description" "?o"}
-                                 "delete"   {"@id"                "ex:andrew"
-                                             "schema:description" "?o"}
-                                 "insert"   {"@id"                "ex:andrew"
-                                             "schema:description" "He's great!"}})]
+                                "where"    {"@id"                "ex:andrew"
+                                            "schema:description" "?o"}
+                                "delete"   {"@id"                "ex:andrew"
+                                            "schema:description" "?o"}
+                                "insert"   {"@id"                "ex:andrew"
+                                            "schema:description" "He's great!"}})]
     (is (= {"@id"                "ex:andrew"
             "schema:name"        "Andrew"
             "schema:description" "He's great!"}
@@ -467,21 +466,20 @@
 
         db0 (fluree/db ledger)
         db1 @(fluree/stage db0 {"@context" "https://ns.flur.ee"
-                                 "ledger"   ledger-id
-                                 "insert"   {"@id"            "ex:NodeShape/Yeti"
-                                             "@type"          "sh:NodeShape"
-                                             "sh:targetClass" {"@id" "ex:Yeti"}
-                                             "sh:property"    [{"@id"         "ex:PropertyShape/age"
-                                                                "sh:path"     {"@id" "schema:age"}
-                                                                "sh:datatype" {"@id" "xsd:integer"}}]}})
-
+                                "ledger"   ledger-id
+                                "insert"   {"@id"            "ex:NodeShape/Yeti"
+                                            "@type"          "sh:NodeShape"
+                                            "sh:targetClass" {"@id" "ex:Yeti"}
+                                            "sh:property"    [{"@id"         "ex:PropertyShape/age"
+                                                               "sh:path"     {"@id" "schema:age"}
+                                                               "sh:datatype" {"@id" "xsd:integer"}}]}})
 
         db2 @(fluree/stage db1 {"@context" "https://ns.flur.ee"
-                                 "ledger"   ledger-id
-                                 "insert"   {"@id"         "ex:freddy"
-                                             "@type"       "ex:Yeti"
-                                             "schema:name" "Freddy"
-                                             "schema:age"  8}})
+                                "ledger"   ledger-id
+                                "insert"   {"@id"         "ex:freddy"
+                                            "@type"       "ex:Yeti"
+                                            "schema:name" "Freddy"
+                                            "schema:age"  8}})
 
         _ @(fluree/commit! ledger db2)
         loaded @(fluree/load conn ledger-id)
