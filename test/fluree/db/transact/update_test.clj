@@ -325,6 +325,7 @@
                                                        "ex:ref"    "?r"}
                                                       ["bind"
                                                        "?str" "(str ?num)"
+                                                       "?str2" "(str ?text)"
                                                        "?uuid" "(uuid)"
                                                        "?struuid" "(struuid)"
                                                        "?isBlank" "(isBlank ?s)"
@@ -340,56 +341,61 @@
                                                        "ex:isBlank"      "?isBlank"
                                                        "ex:isNotBlank"   "?isNotBlank"}]
                                           "values"   ["?s" ["ex:rdf-term-fns"]]}))]
-          (is (= {"ex:str"          "1"
+          (is (= {"ex:str"          ["1" "Abcdefg"]
                   "ex:uuid"         "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"
                   "ex:struuid"      "34bdb25f-9fae-419b-9c50-203b5f306e47",
                   "ex:isBlank"      false
                   "ex:isNotBlank"   false
                   "ex:isNumeric"    true
                   "ex:isNotNumeric" false}
-                 @(fluree/query @updated {"selectOne" {"ex:rdf-term-fns" ["ex:isIRI" "ex:isURI" "ex:isLiteral"
-                                                                          "ex:lang" "ex:datatype" "ex:IRI" "ex:bnode" "ex:strdt" "ex:strLang"
-                                                                          "ex:isBlank"
-                                                                          "ex:isNotBlank"
-                                                                          "ex:isNumeric"
-                                                                          "ex:isNotNumeric"
-                                                                          "ex:str"
-                                                                          "ex:uuid"
-                                                                          "ex:struuid"]}}))))))
+                 @(fluree/query
+                   @updated
+                   {"selectOne"
+                    {"ex:rdf-term-fns" ["ex:isIRI" "ex:isURI" "ex:isLiteral"
+                                        "ex:lang" "ex:datatype" "ex:IRI"
+                                        "ex:bnode" "ex:strdt" "ex:strLang"
+                                        "ex:isBlank" "ex:isNotBlank"
+                                        "ex:isNumeric" "ex:isNotNumeric"
+                                        "ex:str" "ex:uuid" "ex:struuid"]}}))))))
 
     (testing "functional forms"
-      (let [updated (-> @(fluree/stage db1 {"@context" "https://ns.flur.ee"
-                                             "insert"   [{"id"               "ex:create-predicates"
-                                                          "ex:bound"         0
-                                                          "ex:if"            0
-                                                          "ex:coalesce"      0
-                                                          "ex:not-exists"    0
-                                                          "ex:exists"        0
-                                                          "ex:logical-or"    0
-                                                          "ex:logical-and"   0
-                                                          "ex:rdfterm-equal" 0
-                                                          "ex:sameTerm"      0
-                                                          "ex:in"            0
-                                                          "ex:not-in"        0}
-                                                         {"id"      "ex:functional-fns"
-                                                          "ex:text" "Abcdefg"}]})
-                        (fluree/stage {"@context" "https://ns.flur.ee"
-                                        "where"    [{"id" "?s", "ex:text" "?text"}
-                                                    ["bind" "?bound" "(bound ?text)"]]
-                                        "insert"   {"id" "?s", "ex:bound" "?bound"}
-                                        "values"   ["?s" ["ex:functional-fns"]]}))]
+      (let [updated (-> @(fluree/stage
+                          db1
+                          {"@context" "https://ns.flur.ee"
+                            "insert"   [{"id"               "ex:create-predicates"
+                                         "ex:bound"         0
+                                         "ex:if"            0
+                                         "ex:coalesce"      0
+                                         "ex:not-exists"    0
+                                         "ex:exists"        0
+                                         "ex:logical-or"    0
+                                         "ex:logical-and"   0
+                                         "ex:rdfterm-equal" 0
+                                         "ex:sameTerm"      0
+                                         "ex:in"            0
+                                         "ex:not-in"        0}
+                                        {"id"      "ex:functional-fns"
+                                         "ex:text" "Abcdefg"}]})
+                        (fluree/stage
+                         {"@context" "https://ns.flur.ee"
+                           "where"    [{"id" "?s", "ex:text" "?text"}
+                                       ["bind" "?bound" "(bound ?text)"]]
+                           "insert"   {"id" "?s", "ex:bound" "?bound"}
+                           "values"   ["?s" ["ex:functional-fns"]]}))]
         (is (= {"ex:bound" true}
-               @(fluree/query @updated {"selectOne" {"ex:functional-fns" ["ex:bound"
-                                                                          "ex:if"
-                                                                          "ex:coalesce"
-                                                                          "ex:not-exists"
-                                                                          "ex:exists"
-                                                                          "ex:logical-or"
-                                                                          "ex:logical-and"
-                                                                          "ex:rdfterm-equal"
-                                                                          "ex:sameTerm"
-                                                                          "ex:in"
-                                                                          "ex:not-in"]}})))))
+               @(fluree/query
+                 @updated
+                 {"selectOne" {"ex:functional-fns" ["ex:bound"
+                                                    "ex:if"
+                                                    "ex:coalesce"
+                                                    "ex:not-exists"
+                                                    "ex:exists"
+                                                    "ex:logical-or"
+                                                    "ex:logical-and"
+                                                    "ex:rdfterm-equal"
+                                                    "ex:sameTerm"
+                                                    "ex:in"
+                                                    "ex:not-in"]}})))))
     (testing "error handling"
       (let [db2       @(fluree/stage db1 {"@context" "https://ns.flur.ee"
                                            "insert"   [{"id"       "ex:create-predicates"
@@ -402,12 +408,11 @@
                                                        ["bind" "?err" "(foo ?text)"]]
                                            "insert"   {"id" "?s", "ex:text" "?err"}
                                            "values"   ["?s" ["ex:error"]]})
-
-            run-err @(fluree/stage db2 {"@context" "https://ns.flur.ee"
-                                         "where"    [{"id" "?s", "ex:text" "?text"}
-                                                     ["bind" "?err" "(abs ?text)"]]
-                                         "insert"   {"id" "?s", "ex:error" "?err"}
-                                         "values"   ["?s" ["ex:error"]]})]
+            _run-err @(fluree/stage db2 {"@context" "https://ns.flur.ee"
+                                          "where"    [{"id" "?s", "ex:text" "?text"}
+                                                      ["bind" "?err" "(abs ?text)"]]
+                                          "insert"   {"id" "?s", "ex:error" "?err"}
+                                          "values"   ["?s" ["ex:error"]]})]
         (is (= "Query function references illegal symbol: foo"
                (-> parse-err
                    Throwable->map
