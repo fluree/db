@@ -18,18 +18,15 @@
    "b64"  false
    "crit" ["b64"]})
 
-
 (def jws-header-json (json-ld/normalize-data jws-header {:algorithm :basic
                                                          :format    :application/json}))
 
 (def jws-header-b64 (alphabase/base-to-base jws-header-json :string :base64url))
 
-
 (defn serialize-jws
   "Serialize a JWS according to the JOSE specification, compact form."
   [signature]
   (str jws-header-b64 ".." signature))
-
 
 (defn deserialize-jws
   "Deserialize a compact JWS into its component parts"
@@ -38,7 +35,6 @@
     {:header    (alphabase/base-to-base header :base64url :string)
      :payload   (alphabase/base-to-base payload :base64url :string)
      :signature (alphabase/base-to-base sig :base64url :hex)}))
-
 
 (defn sign
   "Given a payload and a signing key, returns a JOSE JSON Web Signature."
@@ -62,23 +58,23 @@
    (generate credential-subject private (did/private->did-map private)))
   ([credential-subject private did]
    (go-try
-     (let [canonicalized #?(:clj (jld-processor/canonize credential-subject)
-                            :cljs (<p! (jld-processor/canonize credential-subject)))
+    (let [canonicalized #?(:clj (jld-processor/canonize credential-subject)
+                           :cljs (<p! (jld-processor/canonize credential-subject)))
 
            ;; TODO: assert this once our credential subjects are proper json-ld
            ;; _ (when (= "" canonicalized) (throw (ex-info "Unsupported credential subject" {:credential-subject credential-subject})))
 
-           did-key (did/encode-did-key (:public did))
-           proof (create-proof (crypto/sha2-256 canonicalized)
-                               did-key
-                               private)]
-       {"@context"          "https://www.w3.org/2018/credentials/v1"
-        "id"                ""
-        "type"              ["VerifiableCredential" "CommitProof"]
-        "issuer"            (:id did)
-        "issuanceDate"      (util/current-time-iso)
-        "credentialSubject" credential-subject
-        "proof"             proof}))))
+          did-key (did/encode-did-key (:public did))
+          proof (create-proof (crypto/sha2-256 canonicalized)
+                              did-key
+                              private)]
+      {"@context"          "https://www.w3.org/2018/credentials/v1"
+       "id"                ""
+       "type"              ["VerifiableCredential" "CommitProof"]
+       "issuer"            (:id did)
+       "issuanceDate"      (util/current-time-iso)
+       "credentialSubject" credential-subject
+       "proof"             proof}))))
 
 (defn verify
   "Takes a credential and returns the credential subject and signing did if it
@@ -86,27 +82,27 @@
   an exception will be thrown."
   [credential]
   (go-try
-    (when-let [jws (get-in credential ["proof" "jws"])]
-      (let [subject (get credential "credentialSubject")
-            {:keys [header signature]} (deserialize-jws jws)
+   (when-let [jws (get-in credential ["proof" "jws"])]
+     (let [subject (get credential "credentialSubject")
+           {:keys [header signature]} (deserialize-jws jws)
 
-            signing-input #?(:clj (-> (jld-processor/canonize subject)
-                                      (crypto/sha2-256))
-                             :cljs (<p! (-> (jld-processor/canonize subject)
-                                            (.then (fn [res] (crypto/sha2-256 res))))))
+           signing-input #?(:clj (-> (jld-processor/canonize subject)
+                                     (crypto/sha2-256))
+                            :cljs (<p! (-> (jld-processor/canonize subject)
+                                           (.then (fn [res] (crypto/sha2-256 res))))))
 
-            proof-did     (get-in credential ["proof" "verificationMethod"])
-            pubkey        (did/decode-did-key proof-did)
-            id            (crypto/account-id-from-public pubkey)
-            auth-did      (did/auth-id->did id)]
-        (when (not= jws-header-json header)
-          (throw (ex-info "Unsupported jws header in credential."
-                          {:error :credential/unknown-signing-algorithm
-                           :supported-header jws-header-json
-                           :header header
-                           :credential credential})))
+           proof-did     (get-in credential ["proof" "verificationMethod"])
+           pubkey        (did/decode-did-key proof-did)
+           id            (crypto/account-id-from-public pubkey)
+           auth-did      (did/auth-id->did id)]
+       (when (not= jws-header-json header)
+         (throw (ex-info "Unsupported jws header in credential."
+                         {:error :credential/unknown-signing-algorithm
+                          :supported-header jws-header-json
+                          :header header
+                          :credential credential})))
 
-        (when (not (crypto/verify-signature pubkey signing-input signature))
-          (throw (ex-info "Verification failed." {:error :credential/invalid-signature :credential credential})))
+       (when (not (crypto/verify-signature pubkey signing-input signature))
+         (throw (ex-info "Verification failed." {:error :credential/invalid-signature :credential credential})))
         ;; everything is good
-        {:subject subject :did auth-did}))))
+       {:subject subject :did auth-did}))))
