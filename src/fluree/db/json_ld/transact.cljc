@@ -171,7 +171,7 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [new-flakes {:keys [stage-update? db-before iri->sid policy t] :as tx-state}]
+  [new-flakes {:keys [stage-update? db-before iri->sid policy t] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
@@ -179,17 +179,17 @@
 
           {:keys [last-pid last-sid]} @iri->sid
 
-          db-after  (-> db-before
-                        (update :ecount assoc const/$_predicate last-pid)
-                        (update :ecount assoc const/$_default last-sid)
-                        (assoc :policy policy) ;; re-apply policy to db-after
-                        (assoc :t t)
-                        (commit-data/update-novelty add remove)
-                        (commit-data/add-tt-id)
-                        (vocab/hydrate-schema add))]
-      {:add add :remove remove :db-after db-after})))
+          db-after (-> db-before
+                       (update :ecount assoc const/$_predicate last-pid)
+                       (update :ecount assoc const/$_default last-sid)
+                       (assoc :policy policy) ;; re-apply policy to db-after
+                       (assoc :t t)
+                       (commit-data/update-novelty add remove)
+                       (commit-data/add-tt-id)
+                       (vocab/hydrate-schema add))]
+      {:add add, :remove remove, :db-after db-after})))
 
-(defn flakes->final-db2
+(defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
   along with performing any final validation and policy enforcement."
   [tx-state flakes]
@@ -219,4 +219,4 @@
            [flakes]      (alts! chans :priority true)]
        (when (util/exception? flakes)
          (throw flakes))
-       (<? (flakes->final-db2 tx-state flakes))))))
+       (<? (flakes->final-db tx-state flakes))))))
