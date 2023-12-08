@@ -429,3 +429,53 @@
                   ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
                  @(fluree/query-connection conn q))
               "returns unified results from each component ledger"))))))
+
+
+(deftest ^:integration query-for-stored-fql-queries
+  (let [conn      @(fluree/connect {:method :memory})
+        context   [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        ledger-id "test/query-queries"
+        ledger    @(fluree/create conn ledger-id)
+        db        @(fluree/stage (fluree/db ledger)
+                                 {"@context" context
+                                  "insert"
+                                  [{"@id" "ex:publicViewAllow"
+                                    "f:query"
+                                    {"@type"  "f:queryType"
+                                     "@value" (str
+                                               {"select" [{"?s" ["_id" ]} "?isTrue"]
+                                                "where"
+                                                {"id" "?s" "ex:confidential" "?isTrue"}})}}]})
+        context2  [test-utils/default-str-context {"foo" "http://example.org/ns/"}]]
+    (is (= [[{"select" [{"?s" ["_id" ]} "?isTrue"]
+              "where"
+              [{"id" "?s" "foo:confidential" "?isTrue"}]}]]
+           @(fluree/query db
+                          {"@context" context2
+                           "select"   ["?query" ]
+                           "where"    {"@id"     "foo:publicViewAllow"
+                                       "f:query" "?query"}}))
+        "should return query, compacted with provided context"))
+  (let [conn      @(fluree/connect {:method :memory})
+        context   [test-utils/default-context {:ex "http://example.org/ns/"}]
+        ledger-id "test/query-queries"
+        ledger    @(fluree/create conn ledger-id)
+        db        @(fluree/stage (fluree/db ledger)
+                                 {"@context" context
+                                  "insert"
+                                  [{:id :ex/publicViewAllow
+                                    :f/query
+                                    {"@type"  :f/queryType
+                                     "@value" (str
+                                               {:select [{'?s [:_id]} '?isTrue]
+                                                :where  {:id              '?s
+                                                         :ex/confidential '?isTrue}})}}]})
+        context2  [test-utils/default-context {:foo "http://example.org/ns/"}]]
+    (is (= [[{"select" [{"?s" [:_id]} "?isTrue"],
+              "where"  [{:id "?s", :foo/confidential "?isTrue"}]}]]
+           @(fluree/query db
+                          {"@context" context2
+                           :select    ["?query"]
+                           :where     {:id      :foo/publicViewAllow
+                                       :f/query "?query"}}))
+        "should return query, compacted with provided context")))

@@ -175,6 +175,34 @@
     (key pattern)
     :tuple))
 
+(defn unparse-component
+  [component compact-fn]
+  (or (some-> component ::iri compact-fn)
+      (some-> (::var component) str)
+      (::val component)))
+
+;;TODO handle non-:tuple patterns, other cases
+(defn unparse-node
+  [[s patterns :as node] select-vars compact-fn]
+  (let [id (compact-fn "@id")
+        unparsed-s (unparse-component s compact-fn)]
+    (if-let [s-var (::var s)]
+      (let [init (if (contains? select-vars s-var)
+                   (assoc {} id unparsed-s)
+                   ;;s-var was a placeholder gensym
+                   {})]
+        (reduce (fn [where-map [_s p o]]
+                  (assoc where-map (unparse-component p compact-fn)
+                         (unparse-component o compact-fn)))
+                init
+                patterns)))))
+
+(defn unparse-patterns
+  [patterns select-vars compact-fn]
+  (let [by-subject (group-by first patterns)]
+    (into [] (map #(unparse-node % select-vars compact-fn))
+          by-subject)))
+
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
    `db` that are compatible with the initial solution `solution` and matches the

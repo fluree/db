@@ -52,6 +52,29 @@
                           (log/error e "Error displaying iri:" v)
                           (>! error-ch e))))))))
 
+(defprotocol Unparse
+  (unparse-selector [_ _]))
+
+(defn get-select-vars
+  [selector]
+  (or (:subj selector)
+      (:var selector)))
+
+(defmethod display const/$fluree:queryType
+  [match db iri-cache compact error-ch]
+  (go (let [v (where/get-value match)
+            {:keys [select where context]} v
+            select-vars (if (= 1 (count select))
+                          (into #{} (get-select-vars select))
+                          (into #{} (map get-select-vars) select))
+            select* (if (= 1 (count select))
+                      (unparse-selector select compact)
+                      (mapv #(unparse-selector % compact) select))
+            where* (where/unparse-patterns (::where/patterns where) select-vars compact)]
+        (-> {}
+            (assoc "select" select*)
+            (assoc "where" where*)))))
+
 (defprotocol ValueSelector
   (implicit-grouping? [this]
    "Returns true if this selector should have its values grouped together.")
@@ -68,6 +91,7 @@
 (defprotocol SolutionModifier
   (update-solution [this solution]))
 
+
 (defrecord VariableSelector [var]
   ValueSelector
   (implicit-grouping? [_] false)
@@ -76,7 +100,9 @@
     (log/trace "VariableSelector format-value var:" var "solution:" solution)
     (-> solution
         (get var)
-        (display db iri-cache compact error-ch))))
+        (display db iri-cache compact error-ch)))
+  Unparse
+  (unparse-selector [_ _] (str var)))
 
 (defn variable-selector
   "Returns a selector that extracts and formats a value bound to the specified
@@ -100,7 +126,9 @@
            next-ks    (rest ks)]
          (if (seq next-ks)
            (recur next-ks formatted')
-           formatted')))))
+           formatted'))))
+  Unparse
+  (unparse-selector [_ _] "*"))
 
 (def wildcard-selector
   "Returns a selector that extracts and formats every bound value bound in the
@@ -115,7 +143,10 @@
     (go (try* (agg-fn solution)
               (catch* e
                 (log/error e "Error applying aggregate selector")
-                (>! error-ch e))))))
+                (>! error-ch e)))))
+  ;;TODO
+  Unparse
+  (unparse-selector [_selector _] _selector))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
@@ -142,7 +173,10 @@
     [_ _ _ _ _ _ solution]
     (log/trace "AsSelector format-value solution:" solution)
     (go (let [match (get solution bind-var)]
-          (where/get-value match)))))
+          (where/get-value match))))
+  ;;TODO
+  Unparse
+  (unparse-selector [_selector _] _selector))
 
 (defn as-selector
   [as-fn bind-var aggregate?]
@@ -166,7 +200,17 @@
               (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))))
         (catch* e
                 (log/error e "Error formatting subgraph for subject:" subj)
-                (>! error-ch e))))))
+                (>! error-ch e)))))
+  Unparse
+  (unparse-selector [_ compact-fn]
+    (let [{:keys [wildcard? _id?]} spec]
+      (if (or _id? wildcard?)
+        (assoc {} (str subj) selection)
+        (let [selected-iris (keep #(get-in spec
+                                           [% :iri])
+                                  (keys
+                                   (dissoc spec :depth)))]
+          (assoc {} (str subj) (mapv compact-fn selected-iris)))))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied
