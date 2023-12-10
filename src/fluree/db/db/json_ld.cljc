@@ -27,14 +27,6 @@
    const/iri-modify {:root? true}})
 
 
-(defn lookup-id
-  "Returns subject id or nil if no match."
-  [db iri]
-  (go-try
-    (some-> (<? (query-range/index-range db :post = [const/$xsd:anyURI iri]))
-            first
-            flake/s)))
-
 (defn expand-iri
   "Expands an IRI from the db's context."
   ([db iri]
@@ -45,23 +37,17 @@
      (json-ld/expand-iri iri (dbproto/-context db provided-context :string)))))
 
 (defn iri->sid
-  "Returns subject id or nil if no match.
-
-  iri can be compact iri in string or keyword form."
-  [db iri {:keys [expand?]}]
-  (let [iri* (if expand?
-               (expand-iri db iri)
-               iri)]
-    ;; string? necessary because expand-iri will return original iri if not matched, and could be a keyword
-    (when (string? iri*)
-      (go-try
-        (<? (lookup-id db iri*))))))
-
+  "Returns subject id or nil if no match."
+  [db iri]
+  (go-try
+    (some-> (<? (query-range/index-range db :post = [const/$xsd:anyURI iri]))
+            first
+            flake/s)))
 
 (defn subid
   "Returns subject ID of ident as async promise channel.
   Closes channel (nil) if doesn't exist, or if strict? is true, will return exception."
-  [db ident {:keys [strict?] :as opts}]
+  [db ident {:keys [strict?]}]
   (let [return-chan (async/promise-chan)]
     (go
       (try*
@@ -71,11 +57,11 @@
 
                         ;; assume iri
                         (string? ident)
-                        (<? (iri->sid db ident opts))
+                        (<? (iri->sid db ident))
 
                         ;; assume iri that needs to be expanded (should we allow this, or should it be expanded before getting this far?)
                         (keyword? ident)
-                        (<? (iri->sid db ident opts))
+                        (<? (iri->sid db ident))
 
                         ;; TODO - should we validate this is an ident predicate? This will return first result of any indexed value
                         (util/pred-ident? ident)
