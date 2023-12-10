@@ -143,22 +143,21 @@
 
 (deftest ^:integration nested-properties
   (with-tmp-dir storage-path
-    (let [conn      @(fluree/connect {:method   :file, :storage-path storage-path
-                                      :defaults {:context test-utils/default-str-context}})
+    (let [conn      @(fluree/connect {:method :file, :storage-path storage-path})
           ledger-id "bugproperty-iri"
-          ledger    @(fluree/create conn ledger-id
-                                    {:defaultContext
-                                     ["" {"ex"  "http://example.com/"
-                                          "owl" "http://www.w3.org/2002/07/owl#"}]})
-          db0       (->> @(fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
-                                                             "insert"   {"ex:new" true}})
+          context   [test-utils/default-str-context
+                     {"ex"  "http://example.com/"
+                      "owl" "http://www.w3.org/2002/07/owl#"}]
+          ledger    @(fluree/create conn ledger-id)
+          db0       (->> @(fluree/stage (fluree/db ledger) {"@context" ["https://ns.flur.ee" context]
+                                                            "insert"   {"ex:new" true}})
                          (fluree/commit! ledger)
                          (deref))
 
 
           db1 @(fluree/transact!
                  conn {"ledger"   ledger-id
-                       "@context" "https://ns.flur.ee"
+                       "@context" ["https://ns.flur.ee" context]
                        "insert"
                        [{"@id"                    "ex:givenName"
                          "@type"                  "rdf:Property"
@@ -171,7 +170,7 @@
 
           db2    @(fluree/transact!
                     conn {"ledger"   ledger-id
-                          "@context" "https://ns.flur.ee"
+                          "@context" ["https://ns.flur.ee" context]
                           "insert"   [{"@id"          "ex:andrew"
                                        "ex:firstName" "Andrew"
                                        "ex:age"       35}
@@ -185,31 +184,37 @@
       (testing "before load"
         (is (= #{{"id" "ex:dan", "ex:givenName" "Dan"}
                  {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}}
-               (set @(fluree/query db2 {"select" {"?s" ["*"]}
-                                        "where"  {"@id" "?s", "ex:givenName" "?o"}}))))
+               (set @(fluree/query db2 {"@context" context
+                                        "select"   {"?s" ["*"]}
+                                        "where"    {"@id" "?s", "ex:givenName" "?o"}}))))
         (is (= #{{"id" "ex:dan", "ex:givenName" "Dan"}
                  {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}}
-               (set @(fluree/query db2 {"select" {"?s" ["*"]}
-                                        "where"  {"@id" "?s", "ex:firstName" "?o"}}))))
+               (set @(fluree/query db2 {"@context" context
+                                        "select"   {"?s" ["*"]}
+                                        "where"    {"@id" "?s", "ex:firstName" "?o"}}))))
         (is (= [["ex:other" true false]]
-               @(fluree/query db2 {"select" ["?s" "?cool" "?fool"]
-                                   "where"  {"@id"     "?s",
-                                             "ex:cool" "?cool"
-                                             "ex:fool" "?fool"}}))
+               @(fluree/query db2 {"@context" context
+                                   "select"   ["?s" "?cool" "?fool"]
+                                   "where"    {"@id"     "?s",
+                                               "ex:cool" "?cool"
+                                               "ex:fool" "?fool"}}))
             "handle list values"))
       (testing "after load"
         (is (= #{{"id" "ex:dan", "ex:givenName" "Dan"}
                  {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}}
-               (set @(fluree/query dbl {"select" {"?s" ["*"]}
-                                        "where"  {"@id" "?s", "ex:givenName" "?o"}}))))
+               (set @(fluree/query dbl {"@context" context
+                                        "select"   {"?s" ["*"]}
+                                        "where"    {"@id" "?s", "ex:givenName" "?o"}}))))
         (is (= #{{"id" "ex:dan", "ex:givenName" "Dan"}
                  {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}}
-               (set @(fluree/query dbl {"select" {"?s" ["*"]}
-                                        "where"  {"@id" "?s", "ex:firstName" "?o"}}))))
+               (set @(fluree/query dbl {"@context" context
+                                        "select"   {"?s" ["*"]}
+                                        "where"    {"@id" "?s", "ex:firstName" "?o"}}))))
 
         (is (= [["ex:other" true false]]
-               @(fluree/query dbl {"select" ["?s" "?cool" "?fool"]
-                                   "where"  {"@id"     "?s"
-                                             "ex:cool" "?cool"
-                                             "ex:fool" "?fool"}}))
+               @(fluree/query dbl {"@context" context
+                                   "select"   ["?s" "?cool" "?fool"]
+                                   "where"    {"@id"     "?s"
+                                               "ex:cool" "?cool"
+                                               "ex:fool" "?fool"}}))
             "handle list values")))))

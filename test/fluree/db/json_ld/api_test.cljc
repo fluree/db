@@ -378,11 +378,7 @@
          (is (= target-t (:t loaded-db)))))
 
      (testing "can load a memory ledger with multi-cardinality predicates"
-       (let [conn         @(fluree/connect
-                             {:method :memory
-                              :defaults
-                              {:context      test-utils/default-context
-                               :context-type :keyword}})
+       (let [conn         @(fluree/connect {:method :memory})
              ledger-alias "load-from-memory-test-multi-card"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
