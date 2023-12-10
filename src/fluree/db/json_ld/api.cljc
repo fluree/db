@@ -349,10 +349,9 @@
 
 (defn expand-iri
   "Expands given IRI with the default database context, or provided context."
-  ([db compact-iri]
-   (dbproto/-expand-iri db compact-iri))
-  ([db compact-iri context]
-   (dbproto/-expand-iri db compact-iri context)))
+  ([context compact-iri]
+   (json-ld/expand-iri compact-iri
+                       (json-ld/parse-context context))))
 
 (defn internal-id
   "Returns the internal Fluree integer id for a given IRI.
