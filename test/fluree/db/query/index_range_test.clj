@@ -1,20 +1,17 @@
 (ns fluree.db.query.index-range-test
-  (:require
-    [clojure.string :as str]
-    [clojure.test :refer :all]
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    [fluree.db.util.log :as log]
-    [fluree.db.flake :as flake]))
+  (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.flake :as flake]))
 
 (deftest ^:integration index-range-scans
   (testing "Various index range scans using the API."
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "query/index-range"
-                                  {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          ledger  @(fluree/create conn "query/index-range")
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db      @(fluree/stage
                      (fluree/db ledger)
-                     {"@context" "https://ns.flur.ee"
+                     {"@context" ["https://ns.flur.ee" context]
                       "insert"
                       [{:id           :ex/brian,
                         :type         :ex/User,
@@ -35,10 +32,11 @@
                         :schema/age   34
                         :ex/favNums   [5, 10]
                         :ex/friend    [:ex/brian :ex/alice]}]})
-          cam-sid @(fluree/internal-id db :ex/cam)]
+          cam-iri (fluree/expand-iri context :ex/cam)
+          cam-sid @(fluree/internal-id db cam-iri)]
 
       (is (= "http://example.org/ns/cam"
-             (fluree/expand-iri db :ex/cam))
+             cam-iri)
           "Expanding compact IRI is broken, likely other tests will fail.")
 
       (is (int? cam-sid)
@@ -46,7 +44,8 @@
 
       (testing "Slice operations"
         (testing "Slice for subject id only"
-          (let [alice-sid @(fluree/internal-id db :ex/alice)]
+          (let [alice-iri (fluree/expand-iri context :ex/alice)
+                alice-sid @(fluree/internal-id db alice-iri)]
             (is (= 8
                    (->> @(fluree/slice db :spot [alice-sid])
                         (filterv #(= alice-sid (flake/s %)))
@@ -54,8 +53,10 @@
                 "Slice should return a vector of flakes for only Alice")))
 
         (testing "Slice for subject + predicate"
-          (let [alice-sid   @(fluree/internal-id db :ex/alice)
-                favNums-pid @(fluree/internal-id db :ex/favNums)]
+          (let [alice-iri   (fluree/expand-iri context :ex/alice)
+                alice-sid   @(fluree/internal-id db alice-iri)
+                favNums-iri (fluree/expand-iri context :ex/favNums)
+                favNums-pid @(fluree/internal-id db favNums-iri)]
             (is (= [[alice-sid favNums-pid 9 8 -1 true nil]
                     [alice-sid favNums-pid 42 8 -1 true nil]
                     [alice-sid favNums-pid 76 8 -1 true nil]]
@@ -64,35 +65,31 @@
                 "Slice should only return Alice's favNums (multi-cardinality)")))
 
         (testing "Slice for subject + predicate + value"
-          (let [alice-sid   @(fluree/internal-id db :ex/alice)
-                favNums-pid @(fluree/internal-id db :ex/favNums)]
+          (let [alice-iri   (fluree/expand-iri context :ex/alice)
+                alice-sid   @(fluree/internal-id db alice-iri)
+                favNums-iri (fluree/expand-iri context :ex/favNums)
+                favNums-pid @(fluree/internal-id db favNums-iri)]
             (is (= [[alice-sid favNums-pid 42 8 -1 true nil]]
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid 42])
                         (mapv flake/Flake->parts)))
                 "Slice should only return the specified favNum value")))
 
         (testing "Slice for subject + predicate + value + datatype"
-          (let [alice-sid   @(fluree/internal-id db :ex/alice)
-                favNums-pid @(fluree/internal-id db :ex/favNums)]
+          (let [alice-iri   (fluree/expand-iri context :ex/alice)
+                alice-sid   @(fluree/internal-id db alice-iri)
+                favNums-iri (fluree/expand-iri context :ex/favNums)
+                favNums-pid @(fluree/internal-id db favNums-iri)]
             (is (= [[alice-sid favNums-pid 42 8 -1 true nil]]
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 8]])
                         (mapv flake/Flake->parts)))
                 "Slice should only return the specified favNum value with matching datatype")))
 
         (testing "Slice for subject + predicate + value + mismatch datatype"
-          (let [alice-sid   @(fluree/internal-id db :ex/alice)
-                favNums-pid @(fluree/internal-id db :ex/favNums)]
+          (let [alice-iri   (fluree/expand-iri context :ex/alice)
+                alice-sid   @(fluree/internal-id db alice-iri)
+                favNums-iri (fluree/expand-iri context :ex/favNums)
+                favNums-pid @(fluree/internal-id db favNums-iri)]
             (is (= []
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 7]])
                         (mapv flake/Flake->parts)))
-                "We specify a different datatype for the value, nothing should be returned")))
-
-
-        (testing "Subject IRI resolution for index-range automatically happens"
-          (let [with-compact-iri @(fluree/range db :spot = [:ex/alice])
-                with-full-iri    @(fluree/range db :spot = [(fluree/expand-iri db :ex/alice)])
-                with-sid         @(fluree/range db :spot = [@(fluree/internal-id db :ex/alice)])]
-            (is (= with-compact-iri
-                   with-full-iri
-                   with-sid)
-                "Compact IRIs and expanded string IRIs should automatically resolve to subject ids.")))))))
+                "We specify a different datatype for the value, nothing should be returned")))))))
