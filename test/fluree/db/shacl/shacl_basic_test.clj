@@ -1640,8 +1640,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn   @(fluree/connect {:method :memory})
-          ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
-                                                                           {"ex" "http://example.com/"}]})
+          ledger @(fluree/create conn "shape-constaints")
           db0    (fluree/db ledger)
 
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
