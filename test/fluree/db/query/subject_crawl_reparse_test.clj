@@ -5,17 +5,21 @@
    [fluree.db.json-ld.api :as fluree]
    [fluree.db.query.fql.parse :as parse]
    [fluree.db.query.subject-crawl.reparse :as reparse]
-   [fluree.db.dbproto :as dbproto]))
+   [fluree.db.dbproto :as dbproto]
+   [fluree.json-ld :as json-ld]))
 
 (deftest test-reparse-as-ssc
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/parse" {:defaultContext ["" {:ex "http://example.org/ns/"
-                                                                        :owl "http://www.w3.org/2002/07/owl#"
-                                                                        :vocab1 "http://vocab1.example.org"
-                                                                        :vocab2 "http://vocab2.example.org"}]})
+        context [test-utils/default-context
+                 {:ex "http://example.org/ns/"
+                  :owl "http://www.w3.org/2002/07/owl#"
+                  :vocab1 "http://vocab1.example.org"
+                  :vocab2 "http://vocab2.example.org"}]
+        ledger @(fluree/create conn "query/parse")
         db     @(fluree/stage
                   (fluree/db ledger)
-                  {"@context" "https://ns.flur.ee"
+                  {"@context" ["https://ns.flur.ee"
+                               context]
                    "insert"
                    [{:id           :vocab1/credential
                      :type         :rdf/Property}
@@ -45,7 +49,7 @@
                      :schema/age   34
                      :ex/favNums   [5, 10]
                      :ex/friend    [:ex/brian :ex/alice]}]})
-        context  (dbproto/-context db)
+        context (json-ld/parse-context context)
         ssc-q1-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
                                                      :where  {:id "?s", :schema/name "Alice"}}
                                                      context)
