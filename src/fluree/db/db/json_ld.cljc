@@ -26,16 +26,6 @@
   {const/iri-view   {:root? true}
    const/iri-modify {:root? true}})
 
-
-(defn expand-iri
-  "Expands an IRI from the db's context."
-  ([db iri]
-   (expand-iri db iri ::dbproto/default-context))
-  ([db iri provided-context]
-   (if (keyword? iri)
-     (json-ld/expand-iri iri (dbproto/-context db provided-context :keyword))
-     (json-ld/expand-iri iri (dbproto/-context db provided-context :string)))))
-
 (defn iri->sid
   "Returns subject id or nil if no match."
   [db iri]
