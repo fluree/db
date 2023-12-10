@@ -1,11 +1,10 @@
 (ns fluree.db.policy.parsing-test
-  (:require
-   [clojure.test :refer :all]
-   [fluree.db.constants :as const]
-   [fluree.db.test-utils :as test-utils]
-   [fluree.db.json-ld.api :as fluree]
-   [fluree.db.did :as did]
-   [fluree.db.json-ld.policy :as policy]))
+  (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.constants :as const]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.did :as did]
+            [fluree.db.json-ld.policy :as policy]))
 
 ;; tests to ensure policy enforcement parsing is accurate
 
@@ -46,13 +45,14 @@
 (deftest ^:integration policy-enforcement
   (testing "Testing query policy returns correctly."
     (let [conn         (test-utils/create-conn)
-          ledger       @(fluree/create conn "policy-parse/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          ledger       @(fluree/create conn "policy-parse/a")
+          context      [test-utils/default-context {:ex "http://example.org/ns/"}]
           root-did     (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did    (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           customer-did (:id (did/private->did-map "854358f6cb3a78ff81febe0786010d6e22839ea6bd52e03365a728d7b693b5a0"))
           db           @(fluree/stage
                           (fluree/db ledger)
-                          {"@context" "https://ns.flur.ee"
+                          {"@context" ["https://ns.flur.ee" context]
                            "insert"
                            [ ;; assign root-did to :ex/rootRole
                             {:id     root-did
@@ -87,10 +87,13 @@
                                                          :f/equals     {:list [:f/$identity :ex/user]}}]}]}]})]
 
       (testing "Policy map for classes and props within classes is properly formed"
-        (let [sid-User      @(fluree/internal-id db :ex/User)
-              sid-ssn       @(fluree/internal-id db :schema/ssn)
+        (let [iri-user      (fluree/expand-iri context :ex/User)
+              sid-User      @(fluree/internal-id db iri-user)
+              iri-ssn       (fluree/expand-iri context :schema/ssn)
+              sid-ssn       @(fluree/internal-id db iri-ssn)
               sid-alice-did @(fluree/internal-id db alice-did)
-              sid-userRole  @(fluree/internal-id db :ex/userRole)
+              iri-userRole  (fluree/expand-iri context :ex/userRole)
+              sid-userRole  @(fluree/internal-id db iri-userRole)
               policy-alice  (-> @(fluree/promise-wrap (policy/policy-map db sid-alice-did #{sid-userRole} nil))
                                 replace-policy-fns)]
           (is (= {const/iri-modify
@@ -119,7 +122,8 @@
               "Policies for only :ex/userRole should return")))
       (testing "Root policy contains {:root? true} for each applicable :f/action"
         (let [sid-root-did @(fluree/internal-id db root-did)
-              sid-rootRole @(fluree/internal-id db :ex/rootRole)
+              iri-rootRole (fluree/expand-iri context :ex/rootRole)
+              sid-rootRole @(fluree/internal-id db iri-rootRole)
               policy-root  (-> @(fluree/promise-wrap (policy/policy-map db sid-root-did #{sid-rootRole} nil))
                                replace-policy-fns)]
           (is (= {"https://ns.flur.ee/ledger#modify" {:root? true}
@@ -129,12 +133,12 @@
                  policy-root))))))
   (testing "Testing query policy with strings"
     (let [conn     (test-utils/create-conn)
-          ledger   @(fluree/create conn "policy-parse/a" {:defaultContext ["" {"ex" "http://example.org/ns/"}]
-                                                          :context-type   :string})
+          ledger   @(fluree/create conn "policy-parse/a")
+          context  [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
           root-did (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           db       @(fluree/stage
                       (fluree/db ledger)
-                      {"@context" "https://ns.flur.ee"
+                      {"@context" ["https://ns.flur.ee" context]
                        "insert"
                        [{"id"     root-did
                          "f:role" {"id" "ex:rootRole"}}
@@ -146,7 +150,8 @@
                                           "f:action"     [{"id" "f:view"} {"id" "f:modify"}]}]}]})]
       (testing "Root policy contains {:root? true} for each applicable :f/action"
         (let [sid-root-did @(fluree/internal-id db root-did)
-              sid-rootRole @(fluree/internal-id db :ex/rootRole)
+              iri-rootRole (fluree/expand-iri context "ex:rootRole")
+              sid-rootRole @(fluree/internal-id db iri-rootRole)
               policy-root  (-> @(fluree/promise-wrap (policy/policy-map db sid-root-did #{sid-rootRole} nil))
                                replace-policy-fns)]
           (is (= {"https://ns.flur.ee/ledger#modify" {:root? true}
