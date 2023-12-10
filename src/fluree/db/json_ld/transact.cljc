@@ -1,6 +1,9 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [go alts!]]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
+            [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
@@ -207,12 +210,17 @@
           dbproto/-rootdb))))
 
 (defn stage
-  ([db ctx txn parsed-opts]
-   (stage db ctx nil txn parsed-opts))
-  ([db ctx fuel-tracker txn parsed-opts]
+  ([db txn parsed-opts]
+   (stage db nil txn parsed-opts))
+  ([db fuel-tracker txn parsed-opts]
    (go-try
-     (let [tx-state      (->tx-state db)
+     (let [ctx           (dbproto/-context db (:context parsed-opts))
+           s-ctx         (:supplied-context parsed-opts)
            parsed-txn    (q-parse/parse-txn txn ctx)
+           db*           (if-let [policy-identity (perm/parse-policy-identity parsed-opts s-ctx)]
+                           (<? (perm/wrap-policy db policy-identity))
+                           db)
+           tx-state      (->tx-state db*)
            flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
            fuel-error-ch (:error-ch fuel-tracker)
            chans         (remove nil? [fuel-error-ch flakes-ch])
