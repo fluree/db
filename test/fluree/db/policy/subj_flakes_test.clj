@@ -72,9 +72,9 @@
                                                           :f/action     [:f/view]
                                                           :f/equals     {:list [:f/$identity :ex/user]}}]}]}]})
           ;; get a group of flakes that we know will have different permissions for different users.
-          john-flakes   @(fluree/range db+policy :spot = [:ex/john])
-          alice-flakes  @(fluree/range db+policy :spot = [(fluree/expand-iri db+policy :ex/alice)])
-          widget-flakes @(fluree/range db+policy :spot = [(fluree/expand-iri db+policy :ex/widget)])
+          john-flakes   @(fluree/range db+policy :spot = [(fluree/expand-iri context :ex/john)])
+          alice-flakes  @(fluree/range db+policy :spot = [(fluree/expand-iri context :ex/alice)])
+          widget-flakes @(fluree/range db+policy :spot = [(fluree/expand-iri context :ex/widget)])
 
           alice-db @(fluree/wrap-policy db+policy
                                         {:did  alice-did, :role :ex/userRole}
