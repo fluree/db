@@ -383,6 +383,7 @@
                                                       "ex:ref"    "?r"}
                                                      ["bind"
                                                       "?str" "(str ?num)"
+                                                      "?str2" "(str ?text)"
                                                       "?uuid" "(uuid)"
                                                       "?struuid" "(struuid)"
                                                       "?isBlank" "(isBlank ?s)"
@@ -398,7 +399,7 @@
                                                       "ex:isBlank"      "?isBlank"
                                                       "ex:isNotBlank"   "?isNotBlank"}]
                                          "values"   ["?s" ["ex:rdf-term-fns"]]}))]
-          (is (= {"ex:str"          "1"
+          (is (= {"ex:str"          ["1" "Abcdefg"]
                   "ex:uuid"         "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"
                   "ex:struuid"      "34bdb25f-9fae-419b-9c50-203b5f306e47",
                   "ex:isBlank"      false
