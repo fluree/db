@@ -361,6 +361,4 @@
   Returns promise"
   [db iri]
   (promise-wrap
-   (->> iri
-        (expand-iri db)
-        (dbproto/-subid db))))
+    (dbproto/-subid db iri)))
