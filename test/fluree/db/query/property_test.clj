@@ -74,37 +74,40 @@
 
 (deftest ^:integration subjects-as-predicates
   (testing "predicate iri-cache loookups"
-    (let [conn   @(fluree/connect {:method :memory})
-          ledger @(fluree/create conn "propertypathstest" {:defaultContext [test-utils/default-str-context {"ex" "http://example.com/"}]})
-          db0    (fluree/db ledger)
-          db1    @(fluree/stage db0 {"@context" "https://ns.flur.ee"
-                                      "insert" [{"@id"            "ex:unlabeled-pred"
-                                                 "ex:description" "created as a subject first"}
-                                                {"@id"            "ex:labeled-pred"
-                                                 "@type"          "rdf:Property"
-                                                 "ex:description" "created as a subject first, labelled as Property"}]})
-          db2    @(fluree/stage db1 {"@context" "https://ns.flur.ee"
-                                      "insert" [{"@id"               "ex:subject-as-predicate"
-                                                 "ex:labeled-pred"   "labeled"
-                                                 "ex:unlabeled-pred" "unlabeled"
-                                                 "ex:new-pred"       {"@id"               "ex:nested"
-                                                                      "ex:unlabeled-pred" "unlabeled-nested"}}]})
-          db3    @(fluree/stage db1 {"@context" "https://ns.flur.ee"
-                                      "insert" [{"@id"               "ex:subject-as-predicate"
-                                                 "ex:labeled-pred"   "labeled"
-                                                 "ex:unlabeled-pred" {"@id"               "ex:nested"
-                                                                      "ex:unlabeled-pred" "unlabeled-nested"}}]})]
+    (let [conn    @(fluree/connect {:method :memory})
+          ledger  @(fluree/create conn "propertypathstest")
+          db0     (fluree/db ledger)
+          context [test-utils/default-str-context {"ex" "http://example.com/"}]
+          db1     @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+                                      "insert"   [{"@id"            "ex:unlabeled-pred"
+                                                   "ex:description" "created as a subject first"}
+                                                  {"@id"            "ex:labeled-pred"
+                                                   "@type"          "rdf:Property"
+                                                   "ex:description" "created as a subject first, labelled as Property"}]})
+          db2     @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                      "insert"   [{"@id"               "ex:subject-as-predicate"
+                                                   "ex:labeled-pred"   "labeled"
+                                                   "ex:unlabeled-pred" "unlabeled"
+                                                   "ex:new-pred"       {"@id"               "ex:nested"
+                                                                        "ex:unlabeled-pred" "unlabeled-nested"}}]})
+          db3     @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                      "insert"   [{"@id"               "ex:subject-as-predicate"
+                                                   "ex:labeled-pred"   "labeled"
+                                                   "ex:unlabeled-pred" {"@id"               "ex:nested"
+                                                                        "ex:unlabeled-pred" "unlabeled-nested"}}]})]
       (is (= [{"id"                "ex:subject-as-predicate"
                "ex:new-pred"       {"id" "ex:nested"}
                "ex:labeled-pred"   "labeled"
                "ex:unlabeled-pred" "unlabeled"}]
-             @(fluree/query db2 {"select" {"ex:subject-as-predicate" ["*"]}}))
+             @(fluree/query db2 {"@context" context
+                                 "select"   {"ex:subject-as-predicate" ["*"]}}))
           "via subgraph selector")
 
       (is (= #{["id"] ["ex:labeled-pred"] ["ex:new-pred"] ["ex:unlabeled-pred"]}
-             (set @(fluree/query db2 {"select" ["?p"]
-                                      "where"  {"@id" "ex:subject-as-predicate"
-                                                "?p"  "?o"}})))
+             (set @(fluree/query db2 {"@context" context
+                                      "select"   ["?p"]
+                                      "where"    {"@id" "ex:subject-as-predicate"
+                                                  "?p"  "?o"}})))
           "via variable selector")
       (is (= #{["id" {"id"                "ex:subject-as-predicate",
                       "ex:labeled-pred"   "labeled",
@@ -122,9 +125,10 @@
                                      "ex:labeled-pred"   "labeled",
                                      "ex:new-pred"       {"id" "ex:nested"},
                                      "ex:unlabeled-pred" "unlabeled"}]}
-             (set @(fluree/query db2 {"select" ["?p" {"ex:subject-as-predicate" ["*"]}]
-                                      "where"  {"@id" "ex:subject-as-predicate"
-                                                "?p"  "?o"}})))
+             (set @(fluree/query db2 {"@context" context
+                                      "select"   ["?p" {"ex:subject-as-predicate" ["*"]}]
+                                      "where"    {"@id" "ex:subject-as-predicate"
+                                                  "?p"  "?o"}})))
           "via variable+subgraph selector")
 
       (is (= [{"id" "ex:nested"
@@ -133,11 +137,11 @@
                 "ex:labeled-pred"   "labeled"
                 "ex:new-pred"       {"id" "ex:nested"}
                 "ex:unlabeled-pred" "unlabeled"}}]
-             @(fluree/query db2 {"@context" ["" {"ex:reversed-pred" {"@reverse" "ex:new-pred"}}]
+             @(fluree/query db2 {"@context" [context {"ex:reversed-pred" {"@reverse" "ex:new-pred"}}]
                                  "select"   {"ex:nested" ["id" {"ex:reversed-pred" ["*"]}]}}))
           "via reverse crawl")
       (is (= [{"id" "ex:nested", "ex:reversed-pred" "ex:subject-as-predicate"}]
-             @(fluree/query db2 {"@context" ["" {"ex:reversed-pred" {"@reverse" "ex:unlabeled-pred"}}]
+             @(fluree/query db2 {"@context" [context {"ex:reversed-pred" {"@reverse" "ex:unlabeled-pred"}}]
                                  "select"   {"ex:nested" ["id" "ex:reversed-pred"]}}))
           "via reverse no subgraph"))))
 
