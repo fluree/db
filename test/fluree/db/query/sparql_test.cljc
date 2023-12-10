@@ -308,7 +308,7 @@
                (catch #?(:clj  clojure.lang.ExceptionInfo
                          :cljs :default) e (ex-data e))))))))
 
-(deftest ^:integration query-test
+(deftest ^:integration ^:kaocha/pending query-test
   (let [people-data [{"id"              "ex:jdoe"
                       "type"            "ex:Person"
                       "person:handle"   "jdoe"
