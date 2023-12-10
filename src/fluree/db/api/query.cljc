@@ -56,7 +56,7 @@
          error-ch       (async/chan)]
      (if history
        ;; filter flakes for history pattern
-       (let [[pattern idx] (<? (history/history-pattern db* context history))
+       (let [[pattern idx] (<? (history/history-pattern db* parsed-context history))
              flake-slice-ch       (query-range/time-range db* idx = pattern {:from-t from-t :to-t to-t})
              flake-ch             (async/chan 1 cat)
 

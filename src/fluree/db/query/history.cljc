@@ -229,9 +229,9 @@
                             {:s parsed-query}
                             parsed-query)
 
-          [s p o] [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) {:strict? true})))
-                   (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) {:strict? true})))
-                   (when o (jld-db/expand-iri db o context))]
+          [s p o] [(when s (<? (dbproto/-subid db (json-ld/expand-iri s context) {:strict? true})))
+                   (when p (<? (dbproto/-subid db (json-ld/expand-iri p context) {:strict? true})))
+                   (when o (json-ld/expand-iri o context))]
 
           idx     (index/for-components s p o nil)
           pattern (case idx
