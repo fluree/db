@@ -189,8 +189,6 @@
       (get @(:subclasses schema) class)
       (get-in schema [:pred class property])))
   (-p-prop [this property predicate] (jsonld-p-prop this property predicate))
-  (-expand-iri [this compact-iri] (expand-iri this compact-iri))
-  (-expand-iri [this compact-iri context] (expand-iri this compact-iri context))
   (-subid [this ident] (subid this ident {:strict? false :expand? true}))
   (-subid [this ident opts] (subid this ident opts))
   (-class-ids [this subject] (class-ids this subject))

@@ -6,7 +6,6 @@
   (-c-prop [db property collection] "Returns schema property for a collection.")
   (-p-prop [db property predicate] "Returns the property specified for the given predicate.")
   (-class-prop [db property class] "Return class properties")
-  (-expand-iri [db iri] [db iri context])
   ;; following return async chans
   (-subid [db ident] [db ident strict?] "Returns subject ID if exists, else nil")
   (-class-ids [db subject-id] "For the provided subject-id (long int), returns a list of class subject ids it is a member of (long ints)")
