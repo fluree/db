@@ -359,47 +359,47 @@
                                               :did  alice-did}})))))))
 
 (deftest ^:integration missing-type
-  (let [conn @(fluree/connect {:method :memory})
-        ledger @(fluree/create conn "policy" {:defaultContext [test-utils/default-str-context
-                                                               {"ex" "http://example.com/"}]})
-        db0 (fluree/db ledger)
+  (let [conn      @(fluree/connect {:method :memory})
+        ledger    @(fluree/create conn "policy")
+        db0       (fluree/db ledger)
+        context   [test-utils/default-str-context {"ex" "http://example.com/"}]
+        alice-did "did:fluree:Tf6i5oh2ssYNRpxxUM2zea1Yo7x4uRqyTeU"
 
-        alice-did    "did:fluree:Tf6i5oh2ssYNRpxxUM2zea1Yo7x4uRqyTeU"
-
-        db1 @(fluree/stage db0 {"@context" "https://ns.flur.ee"
-                                 "insert" [{"id" "ex:alice"
-                                            "type" "ex:User"
-                                            "ex:secret" "alice's secret"}
-                                           {"id" "ex:bob"
-                                            "type" "ex:User"
-                                            "ex:secret" "bob's secret"}
-                                           {"id" "ex:UserPolicy"
-                                            "type" ["f:Policy"]
-                                            "f:targetClass" {"id" "ex:User"}
-                                            "f:allow"
-                                            [{"id" "ex:globalViewAllow"
-                                              "f:targetRole" {"id" "ex:userRole"}
-                                              "f:action" [{"id" "f:view"}]}]
-                                            "f:property"
-                                            [{"f:path" {"id" "ex:secret"}
-                                              "f:allow"
-                                              [{"id" "ex:secretsRule"
-                                                "f:targetRole" {"id" "ex:userRole"}
-                                                "f:action" [{"id" "f:view"}
-                                                            {"id" "f:modify"}]
-                                                "f:equals" {"@list"
-                                                            [{"id" "f:$identity"}
-                                                             {"id" "ex:User"}]}}]}]}
-                                           {"id" alice-did
-                                            "ex:User" {"id" "ex:alice"}
-                                            "f:role" {"id" "ex:userRole"}}]})]
+        db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+                                "insert"   [{"id"        "ex:alice"
+                                             "type"      "ex:User"
+                                             "ex:secret" "alice's secret"}
+                                            {"id"        "ex:bob"
+                                             "type"      "ex:User"
+                                             "ex:secret" "bob's secret"}
+                                            {"id"            "ex:UserPolicy"
+                                             "type"          ["f:Policy"]
+                                             "f:targetClass" {"id" "ex:User"}
+                                             "f:allow"
+                                             [{"id"           "ex:globalViewAllow"
+                                               "f:targetRole" {"id" "ex:userRole"}
+                                               "f:action"     [{"id" "f:view"}]}]
+                                             "f:property"
+                                             [{"f:path" {"id" "ex:secret"}
+                                               "f:allow"
+                                               [{"id"           "ex:secretsRule"
+                                                 "f:targetRole" {"id" "ex:userRole"}
+                                                 "f:action"     [{"id" "f:view"}
+                                                                 {"id" "f:modify"}]
+                                                 "f:equals"     {"@list"
+                                                                 [{"id" "f:$identity"}
+                                                                  {"id" "ex:User"}]}}]}]}
+                                            {"id"      alice-did
+                                             "ex:User" {"id" "ex:alice"}
+                                             "f:role"  {"id" "ex:userRole"}}]})]
     (is (= #{{"id" "ex:alice", "type" "ex:User", "ex:secret" "alice's secret"}
              {"id" "ex:bob", "type" "ex:User"}}
            (set @(fluree/query db1
-                               {"select" {"?s" ["*"]}
-                                "where" {"@id" "?s" "type" "ex:User"}
-                                :opts {:role "ex:userRole"
-                                       :did alice-did}}))))))
+                               {"@context" context
+                                "select"   {"?s" ["*"]}
+                                "where"    {"@id" "?s" "type" "ex:User"}
+                                :opts      {:role "ex:userRole"
+                                            :did  alice-did}}))))))
 
 (deftest ^:integration root-read-only-policy
   (let [conn          @(fluree/connect {:method :memory})
