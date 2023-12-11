@@ -47,7 +47,8 @@
     (testing "current query"
       (is (= [{:id   :ex/dan
                :ex/x 1}]
-             @(fluree/query db {:context {:ex "http://example.org/ns/"}
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
                                 :select  {:ex/dan [:*]}}))
           "default context")
       (is (= [{:id    :foo/dan
