@@ -7,7 +7,6 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.context :as ctx-util]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.credential :as cred]

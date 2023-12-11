@@ -151,7 +151,7 @@
           q-ctx    (some-> query* ctx-util/extract-supplied-context json-ld/parse-context)
           db*      (<? (restrict-db db t q-ctx opts))
           query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
-          ctx      (ctx-util/extract db* query** opts)
+          ctx      (ctx-util/extract query**)
           max-fuel (:max-fuel opts)]
       (if (::util/track-fuel? opts)
         (<? (track-query db* ctx max-fuel query**))
