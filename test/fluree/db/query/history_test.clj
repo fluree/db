@@ -1,6 +1,5 @@
 (ns fluree.db.query.history-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util]
@@ -289,7 +288,6 @@
                            :f/address        test-utils/address?
                            :f/alias          "committest"
                            :f/branch         "main"
-                           :f/defaultContext {:id test-utils/context-id?}
                            :f/data           #:f{:address test-utils/address?
                                                  :assert  [{:ex/x "foo-1"
                                                             :ex/y "bar-1"
@@ -309,7 +307,6 @@
                                    :f/address        test-utils/address?
                                    :f/alias          "committest"
                                    :f/branch         "main"
-                                   :f/defaultContext {:id test-utils/context-id?}
                                    :f/data           #:f{:address  test-utils/address?
                                                          :assert   [{:ex/x "foo-cat"
                                                                      :ex/y "bar-cat"
@@ -331,7 +328,6 @@
                                    :f/address        test-utils/address?
                                    :f/alias          "committest"
                                    :f/branch         "main"
-                                   :f/defaultContext {:id test-utils/context-id?}
                                    :f/data           #:f{:address  test-utils/address?
                                                          :assert   [{:ex/x "foo-cat"
                                                                      :ex/y "bar-cat"
@@ -370,7 +366,6 @@
                               :f/address        test-utils/address?
                               :f/alias          "committest"
                               :f/branch         "main"
-                              :f/defaultContext {:id test-utils/context-id?}
                               :f/data           #:f{:address  test-utils/address?
                                                     :assert   [{:ex/x "foo-cat"
                                                                 :ex/y "bar-cat"
@@ -391,7 +386,6 @@
                             :f/address        test-utils/address?
                             :f/alias          "committest"
                             :f/branch         "main"
-                            :f/defaultContext {:id test-utils/context-id?}
                             :f/data           #:f{:address  test-utils/address?
                                                   :assert   [{:ex/x "foo-3"
                                                               :ex/y "bar-3"
@@ -414,7 +408,6 @@
                             :f/address        test-utils/address?
                             :f/alias          "committest"
                             :f/branch         "main"
-                            :f/defaultContext {:id test-utils/context-id?}
                             :f/data           #:f{:address  test-utils/address?
                                                   :assert   [{:ex/x "foo-2"
                                                               :ex/y "bar-2"
@@ -439,7 +432,6 @@
                            :f/address        test-utils/address?
                            :f/alias          "committest"
                            :f/branch         "main"
-                           :f/defaultContext {:id test-utils/context-id?}
                            :f/data           #:f{:address  test-utils/address?
                                                  :assert   [{:ex/x "foo-cat"
                                                              :ex/y "bar-cat"
@@ -458,7 +450,6 @@
                            :f/address        test-utils/address?
                            :f/alias          "committest"
                            :f/branch         "main"
-                           :f/defaultContext {:id test-utils/context-id?}
                            :f/data           #:f{:address  test-utils/address?
                                                  :assert   [{:ex/x "foo-cat"
                                                              :ex/y "bar-cat"
@@ -486,7 +477,6 @@
                            :f/address        test-utils/address?
                            :f/alias          "committest"
                            :f/branch         "main"
-                           :f/defaultContext {:id test-utils/context-id?}
                            :f/data           #:f{:address test-utils/address?
                                                  :assert  [{:ex/x "foo-1"
                                                             :ex/y "bar-1"
@@ -512,7 +502,6 @@
                              :f/address        test-utils/address?
                              :f/alias          "committest"
                              :f/branch         "main"
-                             :f/defaultContext {:id test-utils/context-id?}
                              :f/data           #:f{:address  test-utils/address?
                                                    :assert   [{:ex/x "foo-3"
                                                                :ex/y "bar-3"
@@ -540,7 +529,6 @@
                              :f/address        test-utils/address?
                              :f/alias          "committest"
                              :f/branch         "main"
-                             :f/defaultContext {:id test-utils/context-id?}
                              :f/data           #:f{:address  test-utils/address?
                                                    :assert   [{:ex/x "foo-cat"
                                                                :ex/y "bar-cat"
@@ -630,7 +618,6 @@
                    :commit  {:f/address        test-utils/address?
                              :f/alias          ledger-name
                              :f/branch         "main"
-                             :f/defaultContext {:id test-utils/context-id?}
                              :f/data           #:f{:address  test-utils/address?
                                                    :assert   [{:ex/x "foo-3"
                                                                :ex/y "bar-3"
@@ -656,7 +643,6 @@
                    :commit  {:f/address        test-utils/address?
                              :f/alias          ledger-name
                              :f/branch         "main"
-                             :f/defaultContext {:id test-utils/context-id?}
                              :f/data           #:f{:address  test-utils/address?
                                                    :assert   [{:ex/x "foo-cat"
                                                                :ex/y "bar-cat"
@@ -724,7 +710,6 @@
                              :f/address        test-utils/address?
                              :f/alias          ledger-name
                              :f/branch         "main"
-                             :f/defaultContext {:id test-utils/context-id?}
                              :f/data           #:f{:address  test-utils/address?
                                                    :assert   [{:ex/x "foo-3"
                                                                :ex/y "bar-3"
@@ -752,7 +737,6 @@
                              :f/address        test-utils/address?
                              :f/alias          ledger-name
                              :f/branch         "main"
-                             :f/defaultContext {:id test-utils/context-id?}
                              :f/data           #:f{:address  test-utils/address?
                                                    :assert   [{:ex/x "foo-cat"
                                                                :ex/y "bar-cat"
@@ -833,7 +817,6 @@
                                :f/address        test-utils/address?
                                :f/alias          ledger-name
                                :f/branch         "main"
-                               :f/defaultContext {:id test-utils/context-id?}
                                :f/data           #:f{:address  test-utils/address?
                                                      :assert   [{:ex/x "foo-3"
                                                                  :ex/y "bar-3"
@@ -861,7 +844,6 @@
                                :f/address        test-utils/address?
                                :f/alias          ledger-name
                                :f/branch         "main"
-                               :f/defaultContext {:id test-utils/context-id?}
                                :f/data           #:f{:address  test-utils/address?
                                                      :assert   [{:ex/x "foo-cat"
                                                                  :ex/y "bar-cat"
