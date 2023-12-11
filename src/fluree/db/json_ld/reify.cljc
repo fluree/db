@@ -559,13 +559,3 @@
             (let [new-db (<? (merge-commit conn db* merged-db? commit-tuple))]
               (recur r new-db))
             db*))))))
-
-(defn load-default-context
-  "Loads the default context from the given conn's storage using the given address.
-  Returns a core.async channel with the context map."
-  [conn address]
-  (go-try
-    (log/debug "loading default context from storage w/ address:" address)
-    (->> address
-         (conn-proto/-ctx-read conn)
-         <?)))

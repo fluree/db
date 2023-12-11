@@ -35,12 +35,6 @@
   (-method [_] :remote)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-default-context [_] (:context ledger-defaults))
-  (-default-context [_ context-type] (let [ctx (:context ledger-defaults)]
-                                       (if (= :keyword context-type)
-                                         (ctx-util/keywordize-context ctx)
-                                         ctx)))
-  (-context-type [_] (:context-type ledger-defaults))
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      (log/warn "-msg-in: " msg)

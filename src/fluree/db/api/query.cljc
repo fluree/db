@@ -145,8 +145,6 @@
     (let [{query :subject, did :did}  (or (<? (cred/verify query))
                                           {:subject query})
           {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
-          ;;TODO: only using query context for opts, should be only context
-          ;;once default-context is removed
           q-ctx    (some-> query* ctx-util/extract-supplied-context json-ld/parse-context)
           db*      (<? (restrict-db db t q-ctx opts))
           query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
@@ -158,12 +156,6 @@
 
 (defn query-sparql
   [db query]
-  (let [context-type (dbproto/-context-type db)]
-    (when-not (= :string context-type)
-      (throw (ex-info (str "SPARQL queries require context-type to be :string. "
-                           "This db's context-type is " context-type)
-                      {:status 400
-                       :error  :db/invalid-db}))))
   (go-try
     (let [fql (sparql/->fql query)]
       (<? (query-fql db fql)))))
@@ -255,11 +247,7 @@
                                             s-ctx opts))
               query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
               max-fuel    (:max-fuel opts)
-              default-ctx (conn-proto/-default-context conn)
-              q-ctx       (ctx-util/get-context query**)
-              ctx-type    (or (:context-type opts)
-                              (conn-proto/-context-type conn))
-              ctx         (ctx-util/retrieve-context default-ctx q-ctx ctx-type)]
+              ctx         (ctx-util/extract query**)]
 
           (if (::util/track-fuel? opts)
             (<? (track-query ds ctx max-fuel query**))

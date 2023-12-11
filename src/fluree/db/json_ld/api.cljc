@@ -161,25 +161,6 @@
         (log/debug "exists? - ledger address:" address)
         (<! (nameservice/exists? conn address))))))
 
-(defn default-context
-  "Returns the current default context set on the db."
-  [db]
-  (dbproto/-default-context db))
-
-(defn default-context-at-t
-  [ledger t]
-  (promise-wrap (ledger-proto/-default-context ledger t)))
-
-(defn update-default-context
-  "Updates the default context on a given database.
-  Currently, the updated default context will only be
-  written with a new commit, which requires staging
-  changed data.
-
-  Returns an updated db."
-  [db default-context]
-  (dbproto/-default-context-update db default-context))
-
 (defn notify
   "Notifies the connection with a new commit map (parsed JSON commit with string keys).
 

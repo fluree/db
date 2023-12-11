@@ -191,9 +191,7 @@
         data        (get-first commit-json-ld const/iri-data)
         ns          (get-first commit-json-ld const/iri-ns)
 
-        index       (get-first commit-json-ld const/iri-index)
-        default-ctx (get-first commit-json-ld const/iri-default-context)
-        ctx-address (get-first-value default-ctx const/iri-address)]
+        index       (get-first commit-json-ld const/iri-index)]
     (cond-> {:id             id
              :address        address
              :v              v
@@ -204,10 +202,7 @@
              :tag            (mapv :value tags)
              :previous       {:id      (:id prev-commit)
                               :address (get-first-value prev-commit const/iri-address)}
-             :data           (parse-db-data data)
-             :defaultContext (-> default-ctx
-                                 (select-keys [:id :type])
-                                 (assoc :address ctx-address))}
+             :data           (parse-db-data data)}
             ns (assoc :ns (->> ns
                                util/sequential
                                (mapv (fn [namespace] {:id (:id namespace)}))))
@@ -391,7 +386,6 @@
 
     (flake/create const/$_ledger:alias const/$xsd:anyURI const/iri-alias const/$xsd:string -1 true nil)
     (flake/create const/$_ledger:branch const/$xsd:anyURI const/iri-branch const/$xsd:string -1 true nil)
-    (flake/create const/$_ledger:context const/$xsd:anyURI const/iri-default-context const/$xsd:string -1 true nil)
 
     (flake/create const/$_commit:signer const/$xsd:anyURI const/iri-issuer const/$xsd:string -1 true nil)
     (flake/create const/$_commit:message const/$xsd:anyURI const/iri-message const/$xsd:string -1 true nil)
