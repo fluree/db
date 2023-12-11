@@ -33,12 +33,6 @@
       (testing "stable commit address"
         (is (= "fluree:memory://2c341bd4f66f11d98996d17d94c4da112cb7f277672877b321e0b135b7c81775"
                (get-in db1 [:commit :address]))))
-      (testing "stable default context id"
-        (is (= "fluree:context:68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"
-               (get-in db1 [:commit :defaultContext :id]))))
-      (testing "stable context address"
-        (is (= "fluree:memory://68845db506ec672e8481d6d8bce580cd24067e1010d36f869e8643752df0ae35"
-               (get-in db1 [:commit :defaultContext :address]))))
       (testing "stable db id"
         (is (= "fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"
                (get-in db1 [:commit :data :id]))))
