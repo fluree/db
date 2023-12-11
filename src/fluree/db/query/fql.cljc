@@ -38,13 +38,13 @@
 
 (defn query
   "Returns core async channel with results or exception"
-  ([db ctx query-map]
-   (query db ctx nil query-map))
-  ([db ctx fuel-tracker query-map]
+  ([db query-map]
+   (query db nil query-map))
+  ([db fuel-tracker query-map]
    (if (cache? query-map)
      (cache-query db query-map)
      (let [q   (try*
-                 (let [parsed (parse/parse-query query-map ctx)]
+                 (let [parsed (parse/parse-query query-map)]
                    (or (re-parse-as-simple-subj-crawl parsed db)
                        parsed))
                  (catch* e e))

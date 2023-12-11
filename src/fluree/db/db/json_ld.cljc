@@ -161,8 +161,7 @@
   (-iri [this subject-id] (iri this subject-id identity))
   (-iri [this subject-id compact-fn] (iri this subject-id compact-fn))
   (-query [this query-map]
-    (let [ctx      (ctx-util/extract query-map)]
-      (fql/query this ctx query-map)))
+    (fql/query this query-map))
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
   (-stage [db fuel-tracker json-ld opts] (jld-transact/stage db fuel-tracker json-ld opts))
