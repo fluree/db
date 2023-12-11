@@ -76,11 +76,9 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [{:keys [context did context-type] :as _defaults}]
+  [{:keys [did] :as _defaults}]
   (go
-    {:context      (ctx-util/stringify-context context)
-     :context-type context-type
-     :did          did}))
+    {:did did}))
 
 (defn default-remote-nameservice
   "Returns remote nameservice or will throw if generates an exception."

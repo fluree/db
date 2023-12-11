@@ -141,11 +141,9 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [{:keys [context did context-type] :as _defaults}]
+  [{:keys [did] :as _defaults}]
   (async/go
-    {:context      (ctx-util/stringify-context context)
-     :context-type context-type
-     :did          did}))
+    {:did did}))
 
 (defn default-memory-nameservice
   "Returns memory nameservice"
