@@ -51,12 +51,11 @@
                                 (number? to) (- to)
                                 (nil? to) (:t db*))])
 
-         context        (ctx-util/get-context parsed)
-         parsed-context (dbproto/-context db context (:context-type opts))
+         context        (ctx-util/extract parsed)
          error-ch       (async/chan)]
      (if history
        ;; filter flakes for history pattern
-       (let [[pattern idx] (<? (history/history-pattern db* parsed-context history))
+       (let [[pattern idx] (<? (history/history-pattern db* context history))
              flake-slice-ch       (query-range/time-range db* idx = pattern {:from-t from-t :to-t to-t})
              flake-ch             (async/chan 1 cat)
 
@@ -64,12 +63,12 @@
 
              flakes               (async/<! (async/into [] flake-ch))
 
-             history-results-chan (history/history-flakes->json-ld db* parsed-context error-ch flakes)]
+             history-results-chan (history/history-flakes->json-ld db* context error-ch flakes)]
 
          (if commit-details
            ;; annotate with commit details
            (async/alt!
-            (async/into [] (history/add-commit-details db* parsed-context error-ch history-results-chan))
+            (async/into [] (history/add-commit-details db* context error-ch history-results-chan))
             ([result] result)
             error-ch ([e] e))
 
@@ -80,7 +79,7 @@
 
        ;; just commits over a range of time
        (let [flake-slice-ch    (query-range/time-range db* :tspo = [] {:from-t from-t :to-t to-t})
-             commit-results-ch (history/commit-flakes->json-ld db* parsed-context error-ch flake-slice-ch)]
+             commit-results-ch (history/commit-flakes->json-ld db* context error-ch flake-slice-ch)]
          (async/alt!
           (async/into [] commit-results-ch) ([result] result)
           error-ch ([e] e)))))))

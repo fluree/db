@@ -171,17 +171,12 @@
   (-iri [this subject-id] (iri this subject-id identity))
   (-iri [this subject-id compact-fn] (iri this subject-id compact-fn))
   (-query [this query-map]
-    (let [ctx-type (-> query-map :opts :context-type)
-          q-ctx    (ctx-util/get-context query-map)
-          ctx      (dbproto/-context this q-ctx ctx-type)]
+    (let [ctx      (ctx-util/extract query-map)]
       (fql/query this ctx query-map)))
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
   (-stage [db fuel-tracker json-ld opts] (jld-transact/stage db fuel-tracker json-ld opts))
   (-index-update [db commit-index] (index-update db commit-index))
-  (-context [_] (ctx-util/retrieve-context default-context context-cache ::dbproto/default-context context-type))
-  (-context [_ context] (ctx-util/retrieve-context default-context context-cache context context-type))
-  (-context [_ context type] (ctx-util/retrieve-context default-context context-cache context (or type context-type)))
   (-default-context [_] default-context)
   (-default-context-update [db default-context] (default-context-update db default-context))
   (-context-type [_] context-type))

@@ -28,7 +28,6 @@
           s-ctx                   (some-> txn
                                           ctx-util/extract-supplied-context
                                           json-ld/parse-context)
-          _                       (log/info "s-ctx:" s-ctx)
 
           expanded            (json-ld/expand (ctx-util/use-fluree-context txn))
           txn-opts            (util/get-first-value expanded const/iri-opts)

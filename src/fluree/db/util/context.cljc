@@ -204,9 +204,8 @@
                                    (util/sequential)
                                    (remove #{"https://ns.flur.ee"})))]
 
-    (if (seq supplied-context)
-      supplied-context
-      ::dbproto/default-context)))
+    (when (seq supplied-context)
+      (json-ld/parse-context supplied-context))))
 
 (defn use-fluree-context
   "Clobber the top-level context and use the fluree context. This is only intended to be

@@ -214,7 +214,7 @@
    (stage db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (go-try
-     (let [ctx           (dbproto/-context db (:context parsed-opts))
+     (let [ctx           (:context parsed-opts)
            s-ctx         (:supplied-context parsed-opts)
            parsed-txn    (q-parse/parse-txn txn ctx)
            db*           (if-let [policy-identity (perm/parse-policy-identity parsed-opts s-ctx)]
