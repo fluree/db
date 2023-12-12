@@ -252,10 +252,7 @@
 
   These are flakes that we insert which describe
   the data, but are not part of the data asserted
-  by the user.
-
-  Any :f/address flakes whose sids match filtered-sid will be ignored. This was
-  added to handle defaultContext :f/address flakes."
+  by the user."
   [f]
   (let [pred (flake/p f)]
     (or (#{const/$_commitdata:t

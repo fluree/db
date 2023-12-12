@@ -8,8 +8,6 @@ test("expect all flureenjs functions to be defined", () => {
     "connect",
     "create",
     "db",
-    "defaultContext",
-    "defaultContextAtT",
     "exists",
     "load",
     "query",
@@ -19,7 +17,7 @@ test("expect all flureenjs functions to be defined", () => {
   ]);
 });
 
-test("expect conn, ledger, stage, commit, defaultContext, and query to work", async () => {
+test("expect conn, ledger, stage, commit, and query to work", async () => {
 
   const defaultCtx = {
     id: "@id",
@@ -36,7 +34,6 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
   const conn = await flureenjs.connect({
     method: "memory",
     defaults: {
-      context: defaultCtx,
       did: {
         id: "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
         public:
@@ -53,19 +50,17 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
 
   const db1 = await flureenjs.stage(db, {
     insert: {
+      "@context": defaultCtx,
       id: "ex:john",
       "@type": "ex:User",
       "schema:name": "John"
     }
   });
 
-  const dc = flureenjs.defaultContext(db1);
-
-  expect(dc).toStrictEqual(defaultCtx);
-
   const results = await flureenjs.query(
     db1,
     {
+      "@context": defaultCtx,
       select: { "?s": ["*"] },
       where: {
         "id": "?s",
@@ -89,7 +84,7 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
   const contextResults = await flureenjs.query(
     db1,
     {
-      "@context": ["", { "flhubee": "http://schema.org/name" }],
+      "@context": [defaultCtx, { "flhubee": "http://schema.org/name" }],
       select: { "?s": ["*"] },
       where: {
         "id": "?s",
@@ -111,6 +106,7 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
 
   const db2 = await flureenjs.stage(db, {
     insert: {
+      "@context": defaultCtx,
       "@id": "uniqueId",
       foo: "foo",
       bar: "bar",
@@ -121,7 +117,7 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
   //  await flureenjs.commit(db);
 
   const results2 = await flureenjs.query(db2, {
-    "@context": ["", { b: "fake:iri/" }],
+    "@context": [defaultCtx, { b: "fake:iri/" }],
     select: { "uniqueId": ["*"] },
   });
 
