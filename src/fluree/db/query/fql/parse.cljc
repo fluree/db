@@ -377,7 +377,7 @@
 
 (defn parse-fn
   [f]
-  (-> f parse-code eval/compile select/aggregate-selector))
+  (-> f parse-code eval/compile (select/aggregate-selector f)))
 
 (defn reverse?
   [context k]

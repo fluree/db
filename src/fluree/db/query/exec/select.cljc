@@ -10,7 +10,7 @@
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.core :refer [catch* try*]]
+            [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
             [fluree.db.datatype :as datatype]
@@ -63,17 +63,13 @@
 (defmethod display const/$fluree:queryType
   [match db iri-cache compact error-ch]
   (go (let [v (where/get-value match)
-            {:keys [select where context]} v
-            select-vars (if (= 1 (count select))
-                          (into #{} (get-select-vars select))
-                          (into #{} (map get-select-vars) select))
-            select* (if (= 1 (count select))
-                      (unparse-selector select compact)
-                      (mapv #(unparse-selector % compact) select))
+            {:keys [select where context group-by]} v
+            select-seq (util/sequential select)
+            select-vars (into #{} (map get-select-vars) select-seq)
+            select* (mapv #(unparse-selector % compact) select-seq)
             where* (where/unparse-patterns (::where/patterns where) select-vars compact)]
-        (-> {}
-            (assoc "select" select*)
-            (assoc "where" where*)))))
+        (cond-> (assoc {} "select" select* "where" where*)
+           group-by (assoc "group-by" (mapv str group-by))))))
 
 (defprotocol ValueSelector
   (implicit-grouping? [this]
@@ -135,7 +131,7 @@
   where clause."
   (->WildcardSelector))
 
-(defrecord AggregateSelector [agg-fn]
+(defrecord AggregateSelector [agg-fn fn-syntax]
   ValueSelector
   (implicit-grouping? [_] true)
   (format-value
@@ -144,17 +140,21 @@
               (catch* e
                 (log/error e "Error applying aggregate selector")
                 (>! error-ch e)))))
-  ;;TODO
   Unparse
-  (unparse-selector [_selector _] _selector))
+  (unparse-selector [_ _]
+    (let [[fn-name var] fn-syntax]
+      (list fn-name (str var)))))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
   variables referenced in the supplied `agg-function` from a where solution,
   formats each item in the group, and processes the formatted group with the
-  supplied `agg-function` to generate the final aggregated result for display."
-  [agg-function]
-  (->AggregateSelector agg-function))
+  supplied `agg-function` to generate the final aggregated result for display.
+
+  The `fn-syntax` field contains the original, un-compiled fn call, which is
+  used when unparsing/formatting stored queries."
+  [agg-function fn-syntax]
+  (->AggregateSelector agg-function fn-syntax))
 
 (defrecord AsSelector [as-fn bind-var aggregate?]
   SolutionModifier

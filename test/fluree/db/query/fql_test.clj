@@ -478,4 +478,28 @@
                            :select    ["?query"]
                            :where     {:id      :foo/publicViewAllow
                                        :f/query "?query"}}))
-        "should return query, compacted with provided context")))
+        "should return query, compacted with provided context"))
+  (let [conn @(fluree/connect {:method :memory})
+        context [test-utils/default-context {:ex "http://example.org/ns/"}]
+        ledger-id "test/query-queries"
+        ledger @(fluree/create conn ledger-id)
+        db @(fluree/stage (fluree/db ledger)
+                          {"@context" context
+                           "insert" [{:id :ex/aggQuery1
+                                      :f/query {:type :f/queryType
+                                                :value
+                                                (str '{:select   [?name (count ?favNums)]
+                                                       :where    {:schema/name ?name
+                                                                  :ex/favNums  ?favNums}
+                                                       :group-by ?name})}}]})
+        context2 [test-utils/default-context {:foo "http://example.org/ns/"}]]
+    (is (= [[{"select" ["?name" '(count "?favNums")],
+              "where" [{:schema/name "?name"
+                        :foo/favNums "?favNums"}]
+              "group-by" ["?name"]}]]
+           @(fluree/query db
+                          {"@context"  context2
+                           :select ["?query"]
+                           :where {:id :foo/aggQuery1
+                                   :f/query "?query"}})))))
+
