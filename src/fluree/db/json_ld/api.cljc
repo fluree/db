@@ -6,8 +6,6 @@
             [fluree.db.conn.remote :as remote-conn]
             [fluree.json-ld :as json-ld]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
@@ -54,9 +52,8 @@
   Multiple connections to same endpoint will share underlying network connection.
 
   Options include:
-    - did - (optional) DiD information to use, if storing blocks as verifiable credentials,
+    - did - (optional) DId information to use, if storing blocks as verifiable credentials,
             or issuing queries against a permissioned database.
-    - context - (optional) Default @context map to use for ledgers formed with this connection.
     - write - (optional) Function to use for all writes, if empty will store in memory until a commit is performed
     - read - (optional) Function to use for reads of persisted blocks/data
     - commit - (optional) Function to use to write commits. If persistence desired, this must be defined
@@ -90,15 +87,13 @@
   "Forms an ipfs connection using default settings.
   - server - (optional) IPFS http api server endpoint, defaults to http://127.0.0.1:5001/
   - profile - (optional) IPFS stored profile to use.
-  - did - (optional) DiD information to use, if storing blocks as verifiable credentials
-  - context - (optional) Default @context map to use for ledgers formed with this connection."
+  - did - (optional) DId information to use, if storing blocks as verifiable credentials"
   [opts]
   (connect (assoc opts :method :ipfs)))
 
 (defn connect-memory
   "Forms an in-memory connection using default settings.
-  - did - (optional) DiD information to use, if storing blocks as verifiable credentials
-  - context - (optional) Default @context map to use for ledgers formed with this connection."
+  - did - (optional) DId information to use, if storing blocks as verifiable credentials"
   [opts]
   (connect (assoc opts :method :memory)))
 
@@ -125,8 +120,7 @@
     graph which can be referenced by name.
 
   Options map (opts) can include:
-  - did - DiD information to use, if storing blocks as verifiable credentials
-  - defaultContext - Default @context map to use for ledgers formed with this connection"
+  - did - DId information to use, if storing blocks as verifiable credentials"
   ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
