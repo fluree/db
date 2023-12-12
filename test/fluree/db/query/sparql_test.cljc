@@ -349,9 +349,7 @@
                                     :defaults {:context-type :string
                                                :context test-utils/default-str-context}})
              db   (-> conn
-                      (fluree/create "people"
-                                     {:defaultContext
-                                      ["" {"person" "http://example.org/Person#"}]})
+                      (fluree/create "people")
                       deref
                       fluree/db
                       (fluree/stage {"@context" ["https://ns.flur.ee"

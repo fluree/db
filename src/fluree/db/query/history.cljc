@@ -256,14 +256,13 @@
 
   Any :f/address flakes whose sids match filtered-sid will be ignored. This was
   added to handle defaultContext :f/address flakes."
-  [filtered-sid f]
+  [f]
   (let [pred (flake/p f)]
     (or (#{const/$_commitdata:t
            const/$_commitdata:size
            const/$_previous
            const/$_commitdata:flakes} pred)
-        (and (= const/$_address pred)
-             (not= filtered-sid (flake/s f))))))
+        (= const/$_address pred))))
 
 (defn extra-data-flake?
   [f]
@@ -278,7 +277,6 @@
      (let [default-ctx-sid     (some #(when (= const/$_ledger:context (flake/p %))
                                         (flake/o %))
                                      t-flakes)
-           commit-meta?        (partial commit-metadata-flake? default-ctx-sid)
            {commit-wrapper-flakes :commit-wrapper
             commit-meta-flakes    :commit-meta
             assert-flakes         :assert-flakes
@@ -286,7 +284,7 @@
            (group-by (fn [f]
                        (cond
                          (commit-wrapper-flake? f) :commit-wrapper
-                         (commit-meta? f) :commit-meta
+                         (commit-metadata-flake? f) :commit-meta
                          (and (flake/op f) (not (extra-data-flake? f))
                               (not= default-ctx-sid (flake/s f))) :assert-flakes
                          (and (not (flake/op f)) (not (extra-data-flake? f))) :retract-flakes

@@ -406,26 +406,26 @@
   respective indexes and returns updated db"
   [conn {:keys [ecount t] :as db} merged-db? [commit _proof]]
   (go-try
-    (let [iri-cache          (volatile! {})
-          refs-cache         (volatile! (-> db :schema :refs))
-          db-address         (-> commit
-                                 (get-first const/iri-data)
-                                 (get-first-value const/iri-address))
-          db-data            (<? (read-db conn db-address))
-          t-new              (- (db-t db-data))
-          _                  (when (and (not= t-new (dec t))
-                                        (not merged-db?)) ;; when including multiple dbs, t values will get reused.
-                               (throw (ex-info (str "Cannot merge commit with t " (- t-new) " into db of t " (- t) ".")
-                                               {:status 500 :error :db/invalid-commit})))
-          assert             (db-assert db-data)
-          retract            (db-retract db-data)
-          retract-flakes     (<? (retract-flakes db retract t-new iri-cache))
+    (let [iri-cache                (volatile! {})
+          refs-cache               (volatile! (-> db :schema :refs))
+          db-address               (-> commit
+                                       (get-first const/iri-data)
+                                       (get-first-value const/iri-address))
+          db-data                  (<? (read-db conn db-address))
+          t-new                    (- (db-t db-data))
+          _                        (when (and (not= t-new (dec t))
+                                              (not merged-db?)) ;; when including multiple dbs, t values will get reused.
+                                     (throw (ex-info (str "Cannot merge commit with t " (- t-new) " into db of t " (- t) ".")
+                                                     {:status 500 :error :db/invalid-commit})))
+          assert                   (db-assert db-data)
+          retract                  (db-retract db-data)
+          retract-flakes           (<? (retract-flakes db retract t-new iri-cache))
           {:keys [flakes pid sid]} (<? (assert-flakes db assert t-new iri-cache refs-cache))
 
-          {:keys [previous issuer message defaultContext] :as commit-metadata}
+          {:keys [previous issuer message] :as commit-metadata}
           (commit-data/json-ld->map commit db)
 
-          [prev-commit _] (some->> previous :address (read-commit conn) <?)
+          [prev-commit _]    (some->> previous :address (read-commit conn) <?)
           last-sid           (volatile! (jld-ledger/last-commit-sid db))
           next-sid           (fn [] (vswap! last-sid inc))
           db-sid             (next-sid)
@@ -444,9 +444,6 @@
                                                               issuer-iri)))
           message-flakes     (when message
                                (commit-data/message-flakes t-new message))
-          default-ctx-flakes (when defaultContext
-                               (<? (commit-data/default-ctx-flakes
-                                     db t-new next-sid defaultContext)))
           all-flakes         (-> db
                                  (get-in [:novelty :spot])
                                  empty
@@ -454,21 +451,14 @@
                                  (into retract-flakes)
                                  (into flakes)
                                  (cond->
-                                   prev-commit-flakes
-                                   (into prev-commit-flakes)
-                                   prev-db-flakes
-                                   (into prev-db-flakes)
-                                   issuer-flakes
-                                   (into issuer-flakes)
-                                   message-flakes
-                                   (into message-flakes)
-                                   default-ctx-flakes
-                                   (into default-ctx-flakes)
-                                   (= -1 t-new)
-                                   (into commit-data/commit-schema-flakes)))
+                                     prev-commit-flakes (into prev-commit-flakes)
+                                     prev-db-flakes (into prev-db-flakes)
+                                     issuer-flakes  (into issuer-flakes)
+                                     message-flakes (into message-flakes)
+                                     (= -1 t-new)   (into commit-data/commit-schema-flakes)))
           ecount*            (assoc ecount const/$_predicate pid
-                                           const/$_default sid
-                                           const/$_shard @last-sid)]
+                                    const/$_default sid
+                                    const/$_shard @last-sid)]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))

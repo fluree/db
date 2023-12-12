@@ -263,19 +263,22 @@
   used to determine whether there is a match. Returns true if all pred fns
   return true and all literal values match or false otherwise."
   [expected actual]
-  (or (= expected actual)
-      (cond
-        (fn? expected)
-        (expected actual)
+  (let [result (or (= expected actual)
+                   (cond
+                     (fn? expected)
+                     (expected actual)
 
-        (and (map? expected) (map? actual))
-        (every? (fn [k]
-                  (pred-match? (get expected k) (get actual k)))
-                (set (concat (keys actual) (keys expected))))
+                     (and (map? expected) (map? actual))
+                     (every? (fn [k]
+                               (pred-match? (get expected k) (get actual k)))
+                             (set (concat (keys actual) (keys expected))))
 
-        (and (coll? expected) (coll? actual))
-        (every? (fn [[e a]]
-                  (pred-match? e a))
-                (zipmap expected actual))
+                     (and (coll? expected) (coll? actual))
+                     (every? (fn [[e a]]
+                               (pred-match? e a))
+                             (zipmap expected actual))
 
-        :else false)))
+                     :else false))]
+    (when-not result
+      (log/info "pred-match failed:" expected actual))
+    result))

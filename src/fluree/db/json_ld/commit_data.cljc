@@ -71,8 +71,8 @@
    ["previous" :previous] ;; refer to :prev-commit template
    ["data" :data] ;; refer to :data template
    ["ns" :ns] ;; refer to :ns template
-   ["index" :index] ;; refer to :index template
-   ["defaultContext" :defaultContext]]) ;; refer to :defaultContext template
+   ["index" :index]]) ;; refer to :index template
+
 
 (def json-ld-prev-commit-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
@@ -148,7 +148,7 @@
   that exist in both the commit-map and the json-ld template,
   except for some defaults (like rdf:type) which are not in
   our internal commit map, but are part of json-ld."
-  [{:keys [previous data ns index issuer defaultContext] :as commit-map}]
+  [{:keys [previous data ns index issuer] :as commit-map}]
   (let [prev-data   (when (not-empty (:previous data))
                       (merge-template (:previous data) json-ld-prev-data-template))
         commit-map* (assoc commit-map
@@ -158,8 +158,7 @@
                       :ns (mapv #(merge-template % json-ld-ns-template) ns)
                       :index (-> (merge-template (:data index) json-ld-data-template) ;; index has an embedded db map
                                  (#(assoc index :data %))
-                                 (merge-template json-ld-index-template))
-                      :defaultContext (merge-template defaultContext json-ld-default-ctx-template))]
+                                 (merge-template json-ld-index-template)))]
     (merge-template commit-map* json-ld-base-template)))
 
 (defn parse-db-data
@@ -505,26 +504,6 @@
   [t message]
   [(flake/create t const/$_commit:message message const/$xsd:string t true nil)])
 
-(defn default-ctx-flakes
-  "Builds and returns a channel containing the default context flakes for the
-  given db, t, next-sid, and defaultContext. next-sid should be a zero-arity fn
-  that returns the next subject id to use if the defaultContext doesn't already
-  exist in the db and that updates some internal state to reflect that this one
-  is now used. It will only be called if needed. Used when committing to an
-  in-memory ledger value and when reifying a ledger from storage on load."
-  [db t next-sid {:keys [id address] :as _defaultContext}]
-  (go-try
-    (if-let [default-ctx-id (<? (dbproto/-subid db id))]
-      [(flake/create t const/$_ledger:context default-ctx-id const/$xsd:anyURI t
-                     true nil)]
-      (let [new-default-ctx-id (next-sid)]
-        [(flake/create t const/$_ledger:context new-default-ctx-id
-                       const/$xsd:anyURI t true nil)
-         (flake/create new-default-ctx-id const/$xsd:anyURI id const/$xsd:string t
-                       true nil)
-         (flake/create new-default-ctx-id const/$_address address
-                       const/$xsd:string t true nil)]))))
-
 
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
@@ -533,7 +512,7 @@
     (let [last-sid           (volatile! (jld-ledger/last-commit-sid db))
           next-sid           (fn [] (vswap! last-sid inc))
 
-          {:keys [data defaultContext issuer message]} commit
+          {:keys [data issuer message]} commit
           {db-t :t} data
 
           {previous-id :id prev-data :data} prev-commit
@@ -550,14 +529,11 @@
                                (<? (issuer-flakes db t next-sid issuer-iri)))
           message-flakes     (when message
                                (message-flakes t message))
-          default-ctx-flakes (when defaultContext
-                               (<? (default-ctx-flakes db t next-sid defaultContext)))
           commit-flakes      (cond-> base-flakes
                                      prev-commit-flakes (into prev-commit-flakes)
                                      prev-db-flakes (into prev-db-flakes)
                                      issuer-flakes (into issuer-flakes)
-                                     message-flakes (into message-flakes)
-                                     default-ctx-flakes (into default-ctx-flakes))]
+                                     message-flakes (into message-flakes))]
       (-> db
           (assoc-in [:ecount const/$_shard] @last-sid)
           (cond-> (= 1 db-t) add-commit-schema-flakes)
