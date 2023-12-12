@@ -1,13 +1,14 @@
 (ns fluree.db.json-ld.credential
   (:require [alphabase.core :as alphabase]
-            [fluree.db.util.async :refer [go-try]]
             [clojure.string :as str]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.crypto :as crypto]
-            [fluree.json-ld :as json-ld]
             #?(:cljs [cljs.core.async.interop :refer-macros [<p!]])
-            [fluree.json-ld.processor.api :as jld-processor]
-            [fluree.db.did :as did]))
+            [fluree.crypto :as crypto]
+            [fluree.db.did :as did]
+            [fluree.db.util.async :refer [go-try]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.json :as json]
+            [fluree.json-ld :as json-ld]
+            [fluree.json-ld.processor.api :as jld-processor]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -76,7 +77,7 @@
        "credentialSubject" credential-subject
        "proof"             proof}))))
 
-(defn verify
+(defn verify-credential
   "Takes a credential and returns the credential subject and signing did if it
   verifies. If credential does not have a jws returns nil. If the credential is invalid
   an exception will be thrown."
@@ -106,3 +107,16 @@
          (throw (ex-info "Verification failed." {:error :credential/invalid-signature :credential credential})))
         ;; everything is good
        {:subject subject :did auth-did}))))
+
+(defn verify-jws
+  [jws]
+  (let [{:keys [payload pubkey]} (crypto/verify-jws jws)
+        id                       (crypto/account-id-from-public pubkey)
+        auth-did                 (did/auth-id->did id)]
+    {:subject (json/parse payload false) :did auth-did}))
+
+(defn verify
+  [auth-claim]
+  (if (string? auth-claim)
+    (go-try (verify-jws auth-claim))
+    (verify-credential auth-claim)))
