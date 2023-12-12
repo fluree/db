@@ -145,6 +145,10 @@
     (let [{query :subject, did :did}  (or (<? (cred/verify query))
                                           {:subject query})
           {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
+
+          ;; TODO: extracting query context here for policy only to do it later
+          ;; while parsing the query. We need to consolidate both policy and
+          ;; query parsing while cleaning up the query api call stack.
           q-ctx    (ctx-util/extract query*)
           db*      (<? (restrict-db db t q-ctx opts))
           query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
