@@ -1,13 +1,15 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [go alts!]]
             [clojure.set :refer [map-invert]]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
+            [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.ledger.proto :as ledger-proto]
@@ -173,7 +175,7 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [namespaces new-flakes {:keys [stage-update? db-before policy t] :as tx-state}]
+  [namespaces new-flakes {:keys [stage-update? db-before policy t] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
@@ -209,20 +211,13 @@
    (stage db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (go-try
-    (let [db* (if-let [policy-identity (perm/policy-identity
-                                        (-> parsed-opts
-                                            ;;TODO once we remove default-context,
-                                            ;;should only have one context, with no need
-                                            ;;to swap here
-                                            (assoc :context
-                                                   (:supplied-context parsed-opts))
-                                            (dissoc :supplied-context)))]
-                (<? (perm/wrap-policy db policy-identity))
-                 db)
+     (let [ctx           (:context parsed-opts)
+           s-ctx         (:supplied-context parsed-opts)
+           parsed-txn    (q-parse/parse-txn txn ctx)
+           db*           (if-let [policy-identity (perm/parse-policy-identity parsed-opts s-ctx)]
+                           (<? (perm/wrap-policy db policy-identity))
+                           db)
            tx-state      (->tx-state db*)
-
-           txn-context   (dbproto/-context db* (:context parsed-opts))
-           parsed-txn    (q-parse/parse-txn txn txn-context)
            flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
            fuel-error-ch (:error-ch fuel-tracker)
            chans         (remove nil? [fuel-error-ch flakes-ch])

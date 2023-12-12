@@ -88,10 +88,8 @@
           "http://www.w3.org/ns/shacl#qualifiedMaxCount"        const/$sh:qualifiedMaxCount
           "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint" const/$sh:qualifiedValueShapesDisjoint
           ;; fluree
-          "https://ns.flur.ee/ledger#context"                   const/$fluree:context
           const/iri-role                                        const/$_role
-          const/iri-target-class                                const/$fluree:targetClass
-          const/iri-default-context                             const/$fluree:default-context}))
+          const/iri-target-class                                const/$fluree:targetClass}))
 
 (def class-or-property-sid
   (into #{} (map predefined-properties class+property-iris)))

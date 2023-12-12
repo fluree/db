@@ -34,9 +34,6 @@
 (def ^:const iri-message (fluree-iri "message"))
 (def ^:const iri-tag (fluree-iri "tag"))
 (def ^:const iri-updates (fluree-iri "updates"))
-(def ^:const iri-default-context (fluree-iri "defaultContext"))
-(def ^:const iri-ContextClass (fluree-iri "Context"))
-(def ^:const iri-context (fluree-iri "context"))
 (def ^:const iri-allow (fluree-iri "allow"))
 (def ^:const iri-equals (fluree-iri "equals"))
 (def ^:const iri-contains (fluree-iri "contains"))
@@ -92,7 +89,6 @@
 (def ^:const $_commit:signer (iri/iri->sid iri-issuer))
 (def ^:const $_ledger:alias (iri/iri->sid iri-alias))
 (def ^:const $_ledger:branch (iri/iri->sid iri-branch))
-(def ^:const $_ledger:context (iri/iri->sid iri-default-context))
 
 (def ^:const $_commit:data (iri/iri->sid iri-data))
 (def ^:const $_commitdata:flakes (iri/iri->sid iri-flakes))
@@ -174,7 +170,6 @@
 (def ^:const $sh:inversePath (iri/iri->sid "http://www.w3.org/ns/shacl#inversePath"))
 
 ;; fluree-specific
-(def ^:const $fluree:context (iri/iri->sid iri-context))
 (def ^:const $fluree:targetClass (iri/iri->sid iri-target-class))
 
 ;; owl
@@ -226,5 +221,3 @@
 (def ^:const $rdf:json (iri/iri->sid "http://www.w3.org/2001/XMLSchema#json"))
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
-
-(def ^:const $fluree:default-context (iri/iri->sid iri-default-context))

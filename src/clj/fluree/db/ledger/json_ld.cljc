@@ -100,32 +100,6 @@
         db*   (or db (ledger-proto/-db ledger (:branch opts*)))]
     (jld-commit/commit ledger db* opts*)))
 
-(defn default-context
-  "Returns default context at t (should be an ISO datetime string or an integer
-  t value)"
-  [ledger t]
-  (go-try
-    (let [latest-db (db ledger nil)
-          t*        (cond
-                      (string? t) (<? (time-travel/datetime->t latest-db t))
-                      (pos-int? t) (- t)
-                      (neg-int? t) t)
-          dc-sid    (-> latest-db
-                        (query-range/index-range :spot =
-                                                 [t* const/$_ledger:context]
-                                                 {:flake-limit 1})
-                        <?
-                        first
-                        flake/o)
-          dc-addr   (-> latest-db
-                        (query-range/index-range :spot =
-                                                 [dc-sid const/$_address]
-                                                 {:flake-limit 1})
-                        <?
-                        first
-                        flake/o)
-          db-conn   (:conn latest-db)]
-      (<? (jld-reify/load-default-context db-conn dc-addr)))))
 
 (defn close-ledger
   "Shuts down ledger and resources."
@@ -208,7 +182,6 @@
   (-did [_] did)
   (-alias [_] alias)
   (-address [_] address)
-  (-default-context [ledger t] (default-context ledger t))
   (-close [ledger] (close-ledger ledger)))
 
 
@@ -239,59 +212,54 @@
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [defaultContext context-type did branch indexer include
-                  reindex-min-bytes reindex-max-bytes new-context?]
-           :or   {branch       :main
-                  new-context? true}} opts
-          default-context (if defaultContext
-                            (-> defaultContext
-                                (ctx-util/mapify-context (conn-proto/-default-context conn))
-                                (ctx-util/stringify-context))
-                            (conn-proto/-default-context conn))
-          context-type*   (or context-type (-> conn :ledger-defaults :context-type))
-          did*            (if did
-                            (if (map? did)
-                              did
-                              {:id did})
-                            (conn-proto/-did conn))
-          indexer         (cond
-                            (satisfies? idx-proto/iIndex indexer)
-                            indexer
+    (let [{:keys [did branch indexer include reindex-min-bytes
+                  reindex-max-bytes]
+           :or   {branch :main}}
+          opts
 
-                            indexer
-                            (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
-                                                 "Provided: " indexer)
-                                            {:status 400 :error :db/invalid-indexer}))
+          did*    (if did
+                    (if (map? did)
+                      did
+                      {:id did})
+                    (conn-proto/-did conn))
+          indexer (cond
+                    (satisfies? idx-proto/iIndex indexer)
+                    indexer
 
-                            :else
-                            (conn-proto/-new-indexer
-                              conn (util/without-nils
-                                     {:reindex-min-bytes reindex-min-bytes
-                                      :reindex-max-bytes reindex-max-bytes})))
-          ledger-alias*   (normalize-alias ledger-alias)
-          address         (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
-          ns-addresses    (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
-          method-type     (conn-proto/-method conn)
+                    indexer
+                    (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
+                                         "Provided: " indexer)
+                                    {:status 400 :error :db/invalid-indexer}))
+
+                    :else
+                    (conn-proto/-new-indexer
+                      conn (util/without-nils
+                             {:reindex-min-bytes reindex-min-bytes
+                              :reindex-max-bytes reindex-max-bytes})))
+          ledger-alias* (normalize-alias ledger-alias)
+          address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
+          ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
+          method-type   (conn-proto/-method conn)
           ;; map of all branches and where they are branched from
-          branches        {branch (branch/new-branch-map nil ledger-alias* branch ns-addresses)}
-          ledger          (map->JsonLDLedger
-                            {:id      (random-uuid)
-                             :did     did*
-                             :state   (atom {:closed?  false
-                                             :branches branches
-                                             :branch   branch
-                                             :graphs   {}
-                                             :push     {:complete {:t   0
-                                                                   :dag nil}
-                                                        :pending  {:t   0
-                                                                   :dag nil}}})
-                             :alias   ledger-alias*
-                             :address address
-                             :method  method-type
-                             :cache   (atom {})
-                             :indexer indexer
-                             :conn    conn})
-          db              (jld-db/create ledger default-context context-type* new-context?)]
+          branches      {branch (branch/new-branch-map nil ledger-alias* branch ns-addresses)}
+          ledger        (map->JsonLDLedger
+                          {:id      (random-uuid)
+                           :did     did*
+                           :state   (atom {:closed?  false
+                                           :branches branches
+                                           :branch   branch
+                                           :graphs   {}
+                                           :push     {:complete {:t   0
+                                                                 :dag nil}
+                                                      :pending  {:t   0
+                                                                 :dag nil}}})
+                           :alias   ledger-alias*
+                           :address address
+                           :method  method-type
+                           :cache   (atom {})
+                           :indexer indexer
+                           :conn    conn})
+          db            (jld-db/create ledger)]
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-db-update ledger db)
       (when include
@@ -346,15 +314,8 @@
           _            (log/debug "load commit:" commit)
           ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
-          default-ctx  (-> commit
-                           (get-first const/iri-default-context)
-                           (get-first-value const/iri-address)
-                           (->> (jld-reify/load-default-context conn))
-                           <?)
           ledger       (<? (create* conn ledger-alias {:branch         branch
-                                                       :id             commit-addr
-                                                       :defaultContext default-ctx
-                                                       :new-context?   false}))
+                                                       :id             commit-addr}))
           db           (ledger-proto/-db ledger)
           db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
       (ledger-proto/-commit-update ledger branch db*)

@@ -363,23 +363,23 @@
   respective indexes and returns updated db"
   [conn {:keys [alias ecount t] :as db} merged-db? [commit _proof]]
   (go-try
-    (let [iri-cache          (volatile! {})
-          refs-cache         (volatile! (-> db :schema :refs))
-          db-address         (-> commit
-                                 (get-first const/iri-data)
-                                 (get-first-value const/iri-address))
-          db-data            (<? (read-db conn db-address))
-          t-new              (- (db-t db-data))
-          _                  (when (and (not= t-new (dec t))
-                                        (not merged-db?)) ;; when including multiple dbs, t values will get reused.
-                               (throw (ex-info (str "Cannot merge commit with t " (- t-new) " into db of t " (- t) ".")
-                                               {:status 500 :error :db/invalid-commit})))
-          assert             (db-assert db-data)
-          retract            (db-retract db-data)
-          retract-flakes     (<? (retract-flakes db retract t-new iri-cache))
+    (let [iri-cache                (volatile! {})
+          refs-cache               (volatile! (-> db :schema :refs))
+          db-address               (-> commit
+                                       (get-first const/iri-data)
+                                       (get-first-value const/iri-address))
+          db-data                  (<? (read-db conn db-address))
+          t-new                    (- (db-t db-data))
+          _                        (when (and (not= t-new (dec t))
+                                              (not merged-db?)) ;; when including multiple dbs, t values will get reused.
+                                     (throw (ex-info (str "Cannot merge commit with t " (- t-new) " into db of t " (- t) ".")
+                                                     {:status 500 :error :db/invalid-commit})))
+          assert                   (db-assert db-data)
+          retract                  (db-retract db-data)
+          retract-flakes           (<? (retract-flakes db retract t-new iri-cache))
           {:keys [flakes pid sid]} (<? (assert-flakes db assert t-new iri-cache refs-cache))
 
-          {:keys [previous issuer message defaultContext] :as commit-metadata}
+          {:keys [previous issuer message] :as commit-metadata}
           (commit-data/json-ld->map commit db)
 
           [prev-commit _] (some->> previous :address (read-commit conn) <?)
@@ -398,9 +398,6 @@
                                (<? (commit-data/issuer-flakes db t-new issuer-iri)))
           message-flakes     (when message
                                (commit-data/message-flakes t-new message))
-          default-ctx-flakes (when defaultContext
-                               (<? (commit-data/default-ctx-flakes
-                                     db t-new defaultContext)))
           all-flakes         (-> db
                                  (get-in [:novelty :spot])
                                  empty
@@ -408,16 +405,10 @@
                                  (into retract-flakes)
                                  (into flakes)
                                  (cond->
-                                   prev-commit-flakes
-                                   (into prev-commit-flakes)
-                                   prev-db-flakes
-                                   (into prev-db-flakes)
-                                   issuer-flakes
-                                   (into issuer-flakes)
-                                   message-flakes
-                                   (into message-flakes)
-                                   default-ctx-flakes
-                                   (into default-ctx-flakes)))
+                                     prev-commit-flakes (into prev-commit-flakes)
+                                     prev-db-flakes (into prev-db-flakes)
+                                     issuer-flakes  (into issuer-flakes)
+                                     message-flakes (into message-flakes)))
           ecount*            (assoc ecount
                                     const/$_predicate pid
                                     const/$_default sid)]
@@ -511,13 +502,3 @@
             (let [new-db (<? (merge-commit conn db* merged-db? commit-tuple))]
               (recur r new-db))
             db*))))))
-
-(defn load-default-context
-  "Loads the default context from the given conn's storage using the given address.
-  Returns a core.async channel with the context map."
-  [conn address]
-  (go-try
-    (log/debug "loading default context from storage w/ address:" address)
-    (->> address
-         (conn-proto/-ctx-read conn)
-         <?)))

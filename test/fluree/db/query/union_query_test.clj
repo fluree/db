@@ -1,16 +1,17 @@
 (ns fluree.db.query.union-query-test
-  (:require
-    [clojure.test :refer :all]
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]))
+  (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration union-queries
   (testing "Testing various 'union' query clauses."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/union" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          ledger @(fluree/create conn "query/union")
           db     @(fluree/stage
                     (fluree/db ledger)
-                    {"@context" "https://ns.flur.ee"
+                    {"@context" ["https://ns.flur.ee"
+                                 test-utils/default-context
+                                 {:ex "http://example.org/ns/"}]
                      "insert"
                      [{:id           :ex/brian,
                        :type         :ex/User,
@@ -40,37 +41,43 @@
                        :ex/friend   [:ex/brian :ex/alice]}]})]
 
       ;; basic combine :schema/email and :ex/email into same result variable
-      (is (= @(fluree/query db {:select ['?name '?email]
-                                :where  [{:id          '?s
-                                          :type        :ex/User
-                                          :schema/name '?name}
-                                         [:union
-                                          {:id '?s, :ex/email '?email}
-                                          {:id '?s, :schema/email '?email}]]})
+      (is (= @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  ['?name '?email]
+                                :where   [{:id          '?s
+                                           :type        :ex/User
+                                           :schema/name '?name}
+                                          [:union
+                                           {:id '?s, :ex/email '?email}
+                                           {:id '?s, :schema/email '?email}]]})
              [["Cam" "cam@example.org"]
               ["Alice" "alice@example.org"]
               ["Brian" "brian@example.org"]])
           "Emails for all 3 users should return, even though some are :schema/email and others :ex/email")
 
       ;; basic union that uses different variables for output
-      (is (= [[:ex/cam "cam@example.org" nil]
-              [:ex/brian nil "brian@example.org"]
-              [:ex/alice nil "alice@example.org"]]
-             @(fluree/query db {:select ['?s '?email1 '?email2]
-                                :where  [{:id '?s, :type :ex/User}
-                                         [:union
-                                          {:id '?s, :ex/email '?email1}
-                                          {:id '?s, :schema/email '?email2}]]}))
+      (is (= @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  ['?s '?email1 '?email2]
+                                :where   [{:id '?s, :type :ex/User}
+                                          [:union
+                                           {:id '?s, :ex/email '?email1}
+                                           {:id '?s, :schema/email '?email2}]]})
+             [[:ex/cam "cam@example.org" nil]
+              [:ex/alice nil "alice@example.org"]
+              [:ex/brian nil "brian@example.org"]])
           "Emails for all 3 users should return, but wil each using their own var and nils for others")
 
       ;; basic union that uses different variables for output and has a passthrough variable
-      (is (= @(fluree/query db {:select ['?name '?email1 '?email2]
-                                :where  [{:id '?s
-                                          :type :ex/User
-                                          :schema/name '?name}
-                                         [:union
-                                          {:id '?s, :ex/email '?email1}
-                                          {:id '?s, :schema/email '?email2}]]})
+      (is (= @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  ['?name '?email1 '?email2]
+                                :where   [{:id          '?s
+                                           :type        :ex/User
+                                           :schema/name '?name}
+                                          [:union
+                                           {:id '?s, :ex/email '?email1}
+                                           {:id '?s, :schema/email '?email2}]]})
              [["Cam" "cam@example.org" nil]
               ["Alice" nil "alice@example.org"]
               ["Brian" nil "brian@example.org"]])

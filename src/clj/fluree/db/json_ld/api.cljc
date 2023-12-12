@@ -6,8 +6,6 @@
             [fluree.db.conn.remote :as remote-conn]
             [fluree.json-ld :as json-ld]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
@@ -54,9 +52,8 @@
   Multiple connections to same endpoint will share underlying network connection.
 
   Options include:
-    - did - (optional) DiD information to use, if storing blocks as verifiable credentials,
+    - did - (optional) DId information to use, if storing blocks as verifiable credentials,
             or issuing queries against a permissioned database.
-    - context - (optional) Default @context map to use for ledgers formed with this connection.
     - write - (optional) Function to use for all writes, if empty will store in memory until a commit is performed
     - read - (optional) Function to use for reads of persisted blocks/data
     - commit - (optional) Function to use to write commits. If persistence desired, this must be defined
@@ -90,15 +87,13 @@
   "Forms an ipfs connection using default settings.
   - server - (optional) IPFS http api server endpoint, defaults to http://127.0.0.1:5001/
   - profile - (optional) IPFS stored profile to use.
-  - did - (optional) DiD information to use, if storing blocks as verifiable credentials
-  - context - (optional) Default @context map to use for ledgers formed with this connection."
+  - did - (optional) DId information to use, if storing blocks as verifiable credentials"
   [opts]
   (connect (assoc opts :method :ipfs)))
 
 (defn connect-memory
   "Forms an in-memory connection using default settings.
-  - did - (optional) DiD information to use, if storing blocks as verifiable credentials
-  - context - (optional) Default @context map to use for ledgers formed with this connection."
+  - did - (optional) DId information to use, if storing blocks as verifiable credentials"
   [opts]
   (connect (assoc opts :method :memory)))
 
@@ -125,8 +120,7 @@
     graph which can be referenced by name.
 
   Options map (opts) can include:
-  - did - DiD information to use, if storing blocks as verifiable credentials
-  - defaultContext - Default @context map to use for ledgers formed with this connection"
+  - did - DId information to use, if storing blocks as verifiable credentials"
   ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
@@ -161,25 +155,6 @@
         (log/debug "exists? - ledger address:" address)
         (<! (nameservice/exists? conn address))))))
 
-(defn default-context
-  "Returns the current default context set on the db."
-  [db]
-  (dbproto/-default-context db))
-
-(defn default-context-at-t
-  [ledger t]
-  (promise-wrap (ledger-proto/-default-context ledger t)))
-
-(defn update-default-context
-  "Updates the default context on a given database.
-  Currently, the updated default context will only be
-  written with a new commit, which requires staging
-  changed data.
-
-  Returns an updated db."
-  [db default-context]
-  (dbproto/-default-context-update db default-context))
-
 (defn notify
   "Notifies the connection with a new commit map (parsed JSON commit with string keys).
 
@@ -207,17 +182,14 @@
   [])
 
 
-
 (defn pull
   "Checks name service for ledger and pulls latest version locally."
   [])
 
 
-
 (defn combine
   "Combines multiple ledgers into a new, read-only ledger."
   [])
-
 
 
 (defn stage
@@ -226,6 +198,7 @@
   ([db json-ld opts]
    (let [result-ch (transact-api/stage db json-ld opts)]
      (promise-wrap result-ch))))
+
 
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
@@ -301,11 +274,13 @@
   allows the permission attributes to be modified.
 
   Returns promise"
-  [db identity-map]
-  (promise-wrap
-   (->> identity-map
-        perm/policy-identity
-        (perm/wrap-policy db))))
+  ([db identity-map]
+   (wrap-policy db identity-map nil))
+  ([db identity-map context]
+   (promise-wrap
+     (let [parsed-ctx (json-ld/parse-context context)
+           policy-id  (perm/parse-policy-identity identity-map parsed-ctx)]
+       (perm/wrap-policy db policy-id)))))
 
 
 (defn query
@@ -349,10 +324,9 @@
 
 (defn expand-iri
   "Expands given IRI with the default database context, or provided context."
-  ([db compact-iri]
-   (dbproto/-expand-iri db compact-iri))
-  ([db compact-iri context]
-   (dbproto/-expand-iri db compact-iri context)))
+  ([context compact-iri]
+   (json-ld/expand-iri compact-iri
+                       (json-ld/parse-context context))))
 
 (defn internal-id
   "Returns the internal Fluree integer id for a given IRI.
@@ -362,6 +336,4 @@
   Returns promise"
   [db iri]
   (promise-wrap
-   (->> iri
-        (expand-iri db)
-        (dbproto/-subid db))))
+    (dbproto/-subid db iri)))

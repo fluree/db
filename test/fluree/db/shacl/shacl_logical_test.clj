@@ -8,14 +8,14 @@
 (deftest ^:integration shacl-not-test
   (testing "shacl basic not constraint works"
     (let [conn             (test-utils/create-conn)
-          ledger           @(fluree/create conn "shacl/a"
-                                           {:defaultContext
-                                            ["" {:ex "http://example.org/ns/"}]})
-          user-query       {:select {'?s [:*]}
-                            :where  {:id '?s, :type :ex/User}}
+          ledger           @(fluree/create conn "shacl/a")
+          context          [test-utils/default-context {:ex "http://example.org/ns/"}]
+          user-query       {:context context
+                            :select  {'?s [:*]}
+                            :where   {:id '?s, :type :ex/User}}
           db               @(fluree/stage
                               (fluree/db ledger)
-                              {"@context" "https://ns.flur.ee"
+                              {"@context" ["https://ns.flur.ee" context]
                                "insert"
                                {:id             :ex/UserShape
                                 :type           [:sh/NodeShape]
@@ -30,7 +30,7 @@
                                                   :sh/datatype :xsd/string}]}})
           db-ok            @(fluree/stage
                               db
-                              {"@context" "https://ns.flur.ee"
+                              {"@context" ["https://ns.flur.ee" context]
                                "insert"
                                {:id              :ex/john,
                                 :type            [:ex/User],
@@ -39,7 +39,7 @@
           db-company-name  (try
                              @(fluree/stage
                                 db
-                                {"@context" "https://ns.flur.ee"
+                                {"@context" ["https://ns.flur.ee" context]
                                  "insert"
                                  {:id                 :ex/john,
                                   :type               [:ex/User],
@@ -49,7 +49,7 @@
           db-two-names     (try
                              @(fluree/stage
                                 db
-                                {"@context" "https://ns.flur.ee"
+                                {"@context" ["https://ns.flur.ee" context]
                                  "insert"
                                  {:id                 :ex/john,
                                   :type               [:ex/User],
@@ -59,7 +59,7 @@
           db-callsign-name (try
                              @(fluree/stage
                                 db
-                                {"@context" "https://ns.flur.ee"
+                                {"@context" ["https://ns.flur.ee" context]
                                  "insert"
                                  {:id              :ex/john
                                   :type            [:ex/User]
@@ -85,14 +85,14 @@
 
   (testing "shacl not w/ value ranges works"
     (let [conn         (test-utils/create-conn)
-          ledger       @(fluree/create conn "shacl/a"
-                                       {:defaultContext
-                                        ["" {:ex "http://example.org/ns/"}]})
-          user-query   {:select {'?s [:*]}
+          ledger       @(fluree/create conn "shacl/a")
+          context          [test-utils/default-context {:ex "http://example.org/ns/"}]
+          user-query   {:context context
+                        :select {'?s [:*]}
                         :where  {:id '?s, :type :ex/User}}
           db           @(fluree/stage
                           (fluree/db ledger)
-                          {"@context" "https://ns.flur.ee"
+                          {"@context" ["https://ns.flur.ee" context]
                            "insert"
                            {:id             :ex/UserShape
                             :type           [:sh/NodeShape]
@@ -107,7 +107,7 @@
                                               :sh/datatype :xsd/long}]}})
           db-ok        @(fluree/stage
                           db
-                          {"@context" "https://ns.flur.ee"
+                          {"@context" ["https://ns.flur.ee" context]
                            "insert"
                            {:id              :ex/john,
                             :type            [:ex/User],
@@ -117,7 +117,7 @@
                             :schema/favNums  [9004 9008 9015 9016 9023 9042]}})
           db-too-old   @(fluree/stage
                           db
-                          {"@context" "https://ns.flur.ee"
+                          {"@context" ["https://ns.flur.ee" context]
                            "insert"
                            {:id                 :ex/john,
                             :type               [:ex/User],
@@ -126,7 +126,7 @@
                             :schema/age         131}})
           db-too-low   @(fluree/stage
                           db
-                          {"@context" "https://ns.flur.ee"
+                          {"@context" ["https://ns.flur.ee" context]
                            "insert"
                            {:id                 :ex/john,
                             :type               [:ex/User],
@@ -136,7 +136,7 @@
                             :schema/favNums     [4 8 15 16 23 42]}})
           db-two-probs @(fluree/stage
                           db
-                          {"@context" "https://ns.flur.ee"
+                          {"@context" ["https://ns.flur.ee" context]
                            "insert"
                            {:id              :ex/john
                             :type            [:ex/User]
@@ -166,14 +166,14 @@
 
   (testing "shacl not w/ string constraints works"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/str"
-                                     {:defaultContext
-                                      ["" {:ex "http://example.org/ns/"}]})
-          user-query {:select {'?s [:*]}
+          ledger     @(fluree/create conn "shacl/str")
+          context          [test-utils/default-context {:ex "http://example.org/ns/"}]
+          user-query {:context context
+                      :select {'?s [:*]}
                       :where  {:id '?s, :type :ex/User}}
           db         @(fluree/stage
                         (fluree/db ledger)
-                        {"@context" "https://ns.flur.ee"
+                        {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id             :ex/UserShape
                           :type           [:sh/NodeShape]
@@ -186,14 +186,14 @@
                                             :sh/pattern "hello.*"}]}})
           db-ok-name @(fluree/stage
                         db
-                        {"@context" "https://ns.flur.ee"
+                        {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id          :ex/jean-claude
                           :type        :ex/User,
                           :schema/name "Jean-Claude"}})
           db-ok-tag  @(fluree/stage
                         db
-                        {"@context" "https://ns.flur.ee"
+                        {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id     :ex/al,
                           :type   :ex/User,
@@ -201,14 +201,14 @@
 
           db-ok-greeting        @(fluree/stage
                                    db
-                                   {"@context" "https://ns.flur.ee"
+                                   {"@context" ["https://ns.flur.ee" context]
                                     "insert"
                                     {:id          :ex/al,
                                      :type        :ex/User,
                                      :ex/greeting "HOWDY"}})
           db-name-too-short     (try @(fluree/stage
                                         db
-                                        {"@context" "https://ns.flur.ee"
+                                        {"@context" ["https://ns.flur.ee" context]
                                          "insert"
                                          {:id          :ex/john,
                                           :type        [:ex/User],
@@ -216,7 +216,7 @@
                                      (catch Exception e e))
           db-tag-too-long       (try @(fluree/stage
                                         db
-                                        {"@context" "https://ns.flur.ee"
+                                        {"@context" ["https://ns.flur.ee" context]
                                          "insert"
                                          {:id     :ex/john,
                                           :type   [:ex/User],
@@ -224,7 +224,7 @@
                                      (catch Exception e e))
           db-greeting-incorrect (try @(fluree/stage
                                         db
-                                        {"@context" "https://ns.flur.ee"
+                                        {"@context" ["https://ns.flur.ee" context]
                                          "insert"
                                          {:id          :ex/john,
                                           :type        [:ex/User],

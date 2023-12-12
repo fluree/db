@@ -6,10 +6,12 @@
 (deftest ^:integration simple-compound-queries
   (testing "Simple compound queries."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/compounda" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          ledger @(fluree/create conn "query/compounda")
           db     @(fluree/stage
                     (fluree/db ledger)
-                    {"@context" "https://ns.flur.ee"
+                    {"@context" ["https://ns.flur.ee"
+                                 test-utils/default-context
+                                 {:ex "http://example.org/ns/"}]
                      "insert"
                      [{:id           :ex/brian,
                        :type         :ex/User,
@@ -32,32 +34,36 @@
                        :ex/friend    [:ex/brian :ex/alice]}]})
 
           two-tuple-select-with-crawl
-          @(fluree/query db '{:select [?age {?f [:*]}]
-                              :where  {:schema/name "Cam"
+          @(fluree/query db {:context [test-utils/default-context
+                                       {:ex "http://example.org/ns/"}]
+                             :select '[?age {?f [:*]}]
+                             :where  '{:schema/name "Cam"
                                        :ex/friend   {:id         ?f
                                                      :schema/age ?age}}})
 
           two-tuple-select-with-crawl+var
-          @(fluree/query db '{:select  [?age {?f [:*]}]
-                              :where   {:schema/name ?name
+          @(fluree/query db {:context [test-utils/default-context
+                                       {:ex "http://example.org/ns/"}]
+                             :select  '[?age {?f [:*]}]
+                             :where   '{:schema/name ?name
                                         :ex/friend   {:id         ?f
                                                       :schema/age ?age}}
-                              :values  [?name ["Cam"]]})]
+                             :values  '[?name ["Cam"]]})]
 
       (is (= two-tuple-select-with-crawl
              two-tuple-select-with-crawl+var
-             [[50 {:id           :ex/alice,
-                   :type         :ex/User,
-                   :schema/name  "Alice",
-                   :schema/email "alice@example.org",
-                   :schema/age   50,
-                   :ex/favNums   [9, 42, 76]}]
-              [50 {:id           :ex/brian,
-                   :type         :ex/User,
+             [[50 {:id           :ex/brian,
+                   :type     :ex/User,
                    :schema/name  "Brian",
                    :schema/email "brian@example.org",
                    :schema/age   50,
-                   :ex/favNums   7}]]))
+                   :ex/favNums   7}]
+              [50 {:id           :ex/alice,
+                   :type     :ex/User,
+                   :schema/name  "Alice",
+                   :schema/email "alice@example.org",
+                   :schema/age   50,
+                   :ex/favNums   [9, 42, 76]}]]))
 
       ;; here we have pass-through variables (?name and ?age) which must get "passed through"
       ;; the last where statements into the select statement
@@ -68,8 +74,8 @@
                                            :ex/friend   {:schema/name  ?name
                                                          :schema/age   ?age
                                                          :schema/email ?email}}})
-             [["Alice" 50 "alice@example.org"]
-              ["Brian" 50 "brian@example.org"]])
+             [["Brian" 50 "brian@example.org"]
+              ["Alice" 50 "alice@example.org"]])
           "Prior where statement variables may not be passing through to select results")
 
       ;; same as prior query, but using selectOne
@@ -80,7 +86,7 @@
                                              :ex/friend   {:schema/name  ?name
                                                            :schema/age   ?age
                                                            :schema/email ?email}}})
-             ["Alice" 50 "alice@example.org"])
+             ["Brian" 50 "brian@example.org"])
           "selectOne should only return a single result, like (first ...)")
 
       ;; if mixing multi-cardinality results along with single cardinality, there
@@ -151,7 +157,8 @@
 
 
       ;; checking s, p, o values all pulled correctly and all IRIs are resolved from sid integer & compacted
-      (is (= #{[:ex/cam :type :ex/User]
+      (is (= #{[:ex/cam :id "http://example.org/ns/cam"]
+               [:ex/cam :type :ex/User]
                [:ex/cam :schema/name "Cam"]
                [:ex/cam :schema/email "cam@example.org"]
                [:ex/cam :schema/age 34]
@@ -159,11 +166,12 @@
                [:ex/cam :ex/favNums 10]
                [:ex/cam :ex/friend :ex/brian]
                [:ex/cam :ex/friend :ex/alice]}
-             (set @(fluree/query db
-                                 '{:select [?s ?p ?o]
-                                   :where  {:id         ?s
-                                            :schema/age 34
-                                            ?p          ?o}})))
+             (set @(fluree/query db {:context [test-utils/default-context
+                                               {:ex "http://example.org/ns/"}]
+                                     :select '[?s ?p ?o]
+                                     :where  '{:id         ?s
+                                               :schema/age 34
+                                               ?p          ?o}})))
           "IRIs are resolved from subj ids, whether s, p, or o vals.")
 
       ;; checking object-subject joins
@@ -174,20 +182,21 @@
                :schema/age 34,
                :ex/favNums [5 10],
                :ex/friend
-               [{:id :ex/alice,
-                 :type :ex/User,
-                 :schema/name "Alice",
-                 :schema/email "alice@example.org",
-                 :schema/age 50,
-                 :ex/favNums [9 42 76]}
-                {:id :ex/brian,
+               [{:id :ex/brian,
                  :type :ex/User,
                  :schema/name "Brian",
                  :schema/email "brian@example.org",
                  :schema/age 50,
-                 :ex/favNums 7}]}]
-             @(fluree/query db
-                            '{:select {?s ["*" {:ex/friend ["*"]}]}
-                              :where  {:id        ?s
-                                       :ex/friend {:schema/name "Alice"}}}))
+                 :ex/favNums 7}
+                {:id :ex/alice,
+                 :type :ex/User,
+                 :schema/name "Alice",
+                 :schema/email "alice@example.org",
+                 :schema/age 50,
+                 :ex/favNums [9 42 76]}]}]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select '{?s ["*" {:ex/friend ["*"]}]}
+                                :where  '{:id        ?s
+                                          :ex/friend {:schema/name "Alice"}}}))
           "Subjects appearing as objects should be referenceable."))))

@@ -19,29 +19,30 @@
           opts))
 
 (defn stage
-  [db txn parsed-opts]
+  [db txn opts]
   (go-try
     (let [{txn :subject did :did} (or (<? (cred/verify txn))
                                       {:subject txn})
-          txn-context             (or (:context parsed-opts)
+          txn-context             (or (:context opts)
                                       (ctx-util/txn-context txn))
-          expanded                (json-ld/expand (ctx-util/use-fluree-context txn))
-          opts                    (util/get-first-value expanded const/iri-opts)
-          parsed-opts             (cond-> parsed-opts
-                                    did (assoc :did did)
-                                    txn-context (assoc :context txn-context)
-                                    ;;TODO once we remove default-context, this supplied-context
-                                    ;;can just replace `txn-context` above as the value of
-                                    ;;the `:context` key
-                                    true (assoc :supplied-context (ctx-util/extract-supplied-context txn)))
+          s-ctx                   (some-> txn
+                                          ctx-util/extract-supplied-context
+                                          json-ld/parse-context)
 
-          {:keys [maxFuel meta] :as parsed-opts*} (parse-opts parsed-opts opts)]
+          expanded            (json-ld/expand (ctx-util/use-fluree-context txn))
+          txn-opts            (util/get-first-value expanded const/iri-opts)
+          {:keys [maxFuel meta]
+           :as   parsed-opts} (cond-> opts
+                                did         (assoc :did did)
+                                txn-context (assoc :context txn-context)
+                                s-ctx       (assoc :supplied-context s-ctx)
+                                true        (parse-opts txn-opts))]
       (if (or maxFuel meta)
         (let [start-time   #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))
               fuel-tracker (fuel/tracker maxFuel)]
           (try*
-            (let [result (<? (tx/stage db fuel-tracker expanded parsed-opts*))]
+            (let [result (<? (tx/stage db fuel-tracker expanded parsed-opts))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start-time)
@@ -51,7 +52,7 @@
                               {:time (util/response-time-formatted start-time)
                                :fuel (fuel/tally fuel-tracker)}
                               e)))))
-        (<? (tx/stage db expanded parsed-opts*))))))
+        (<? (tx/stage db expanded parsed-opts))))))
 
 (defn transact!
   [conn txn]

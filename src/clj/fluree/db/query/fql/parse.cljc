@@ -1,23 +1,24 @@
 (ns fluree.db.query.fql.parse
-  (:require [fluree.db.query.exec.eval :as eval]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.query.exec.update :as update]
-            [fluree.db.query.exec.select :as select]
-            [fluree.db.datatype :as datatype]
-            [fluree.db.query.fql.syntax :as syntax]
+  (:require #?(:cljs [cljs.reader :refer [read-string]])
             [clojure.set :as set]
             [clojure.walk :refer [postwalk]]
-            [fluree.json-ld :as json-ld]
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.query.exec.eval :as eval]
+            [fluree.db.query.exec.select :as select]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.util.context :as context]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.validation :as v]
-            [fluree.db.constants :as const]
-            #?(:cljs [cljs.reader :refer [read-string]])))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn parse-var-name
-  "Returns a `x` as a symbol if `x` is a valid '?variable'."
+  "Returns x as a symbol if x is a valid variable, or nil otherwise. A valid
+  variable is a string, symbol, or keyword whose name starts with '?'."
   [x]
   (when (v/variable? x)
     (symbol x)))
@@ -25,6 +26,14 @@
 (defn parse-variable
   [x]
   (some-> x parse-var-name where/unmatched-var))
+
+(defn- parse-variable-if-allowed
+  [allowed-vars x]
+  (if (->> x symbol (contains? allowed-vars))
+    (parse-variable x)
+    (throw
+     (ex-info (str "variable " x " is not bound in where nor values clause")
+              {:status 400, :error :db/invalid-transaction}))))
 
 (defn parse-value-binding
   [vars vals]
@@ -131,25 +140,6 @@
         f    (eval/compile code false)]
     (where/->var-filter var-name f)))
 
-(def ^:const default-recursion-depth 100)
-
-(defn recursion-predicate
-  "A predicate that ends in a '+', or a '+' with some integer afterwards is a recursion
-  predicate. e.g.: person/follows+3
-
-  Returns a two-tuple of predicate followed by # of times to recur.
-
-  If not a recursion predicate, returns nil."
-  [predicate context]
-  (when (or (string? predicate)
-            (keyword? predicate))
-    (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" (name predicate))]
-      [(json-ld/expand (keyword (namespace predicate) pred)
-                       context)
-       (if recur-n
-         (util/str->int recur-n)
-         default-recursion-depth)])))
-
 (defn parse-iri
   [x context]
   (-> x
@@ -234,8 +224,19 @@
   (or id (generate-subject-var)))
 
 (defn with-id
-  [m]
-  (update m const/iri-id id-or-variable))
+  "Searches for the id key, expands it or adds a variable as a value."
+  [m context]
+  (let [[id-key id] (reduce-kv (fn [_res p o]
+                                 (let [expanded (if (v/variable? p)
+                                                  p
+                                                  (json-ld/expand-iri p context))]
+                                   (when (= const/iri-id expanded)
+                                     (reduced [p o]))))
+                               nil m)]
+    (-> m
+        (dissoc id-key)
+        (assoc const/iri-id id)
+        (update const/iri-id id-or-variable))))
 
 (defn parse-subject
   [id context]
@@ -244,33 +245,42 @@
     (parse-iri id context)))
 
 (defn parse-predicate
-  [p]
+  [p context]
   (if (v/variable? p)
     (parse-variable p)
-    (if (contains? type-pred-iris p)
-      (where/->predicate const/iri-rdf-type)
-      (where/->predicate p))))
+    (let [[expanded {reverse :reverse}] (json-ld/details p context)]
+      (if (contains? type-pred-iris expanded)
+        (where/->predicate const/iri-rdf-type reverse)
+        (where/->predicate expanded reverse)))))
 
 (def id-predicate-match
-  (parse-predicate const/iri-id))
+  (parse-predicate const/iri-id nil))
 
 (declare parse-statement parse-statements)
+
+(defn flip-reverse-pattern
+  [[s-mch p-mch o-mch :as pattern]]
+  (if (::where/reverse p-mch)
+    [o-mch p-mch s-mch]
+    pattern))
 
 (defn parse-object-map
   [s-mch p-mch o context]
   (let [o* (expand-keys o context)]
     (if-let [v (get o* const/iri-value)]
+      ;; literal
       (let [attrs (dissoc o* const/iri-value)
             o-mch (parse-value-attributes v attrs)]
-        [[s-mch p-mch o-mch]])
-      (let [id-map  (with-id o*)
+        [(flip-reverse-pattern [s-mch p-mch o-mch])])
+      ;; ref
+      (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
             o-mch   (-> id-map
                         (get const/iri-id)
                         (parse-subject context))
             o-attrs (dissoc id-map const/iri-id)]
         ;; return a thunk wrapping the recursive call to preserve stack
         ;; space by delaying execution
-        #(into [[s-mch p-mch o-mch]]
+        #(into [(flip-reverse-pattern [s-mch p-mch o-mch])]
                (parse-statements o-mch o-attrs context))))))
 
 (defn parse-statement*
@@ -278,7 +288,7 @@
   (cond
     (v/variable? o)
     (let [o-mch (parse-variable o)]
-      [[s-mch p-mch o-mch]])
+      [(flip-reverse-pattern [s-mch p-mch o-mch])])
 
     (map? o)
     (parse-object-map s-mch p-mch o context)
@@ -290,11 +300,11 @@
 
     (type-pred-match? p-mch)
     (let [class-ref (parse-class o context)]
-      [(where/->pattern :class [s-mch p-mch class-ref])])
+      [(where/->pattern :class (flip-reverse-pattern [s-mch p-mch class-ref]))])
 
     :else
     (let [o-mch (where/anonymous-value o)]
-      [[s-mch p-mch o-mch]])))
+      [(flip-reverse-pattern [s-mch p-mch o-mch])])))
 
 (defn parse-statement
   [s-mch p-mch o context]
@@ -303,7 +313,7 @@
 (defn parse-statements*
   [s-mch attrs context]
   #(mapcat (fn [[p o]]
-             (let [p-mch (parse-predicate p)]
+             (let [p-mch (parse-predicate p context)]
                (parse-statement s-mch p-mch o context)))
            attrs))
 
@@ -325,8 +335,7 @@
 (defn parse-node-map
   [m context]
   (-> m
-      (expand-keys context)
-      with-id
+      (with-id context)
       (parse-id-map-pattern context)))
 
 (defmethod parse-pattern :node
@@ -390,35 +399,35 @@
 (defn expand-selection
   [selection depth context]
   (reduce
-    (fn [acc select-item]
-      (cond
-        (map? select-item)
-        (let [[k v]  (first select-item)
-              iri    (json-ld/expand-iri k context)
-              spec   {:iri iri}
-              depth* (if (zero? depth)
-                       0
-                       (dec depth))
-              spec*  (-> spec
-                         (assoc :spec (expand-selection v depth* context)
-                                :as k))]
-          (if (reverse? context k)
-            (assoc-in acc [:reverse iri] spec*)
-            (assoc acc iri spec*)))
+   (fn [acc select-item]
+     (cond
+       (map? select-item)
+       (let [[k v]  (first select-item)
+             iri    (json-ld/expand-iri k context)
+             spec   {:iri iri}
+             depth* (if (zero? depth)
+                      0
+                      (dec depth))
+             spec*  (-> spec
+                        (assoc :spec (expand-selection v depth* context)
+                          :as k))]
+         (if (reverse? context k)
+           (assoc-in acc [:reverse iri] spec*)
+           (assoc acc iri spec*)))
 
-        (#{"*" :* '*} select-item)
-        (assoc acc :wildcard? true)
+       (#{"*" :* '*} select-item)
+       (assoc acc :wildcard? true)
 
-        (#{"_id" :_id} select-item)
-        (assoc acc :_id? true)
+       (#{"_id" :_id} select-item)
+       (assoc acc :_id? true)
 
-        :else
-        (let [iri  (json-ld/expand-iri select-item context)
-              spec {:iri iri, :as select-item}]
-          (if (reverse? context select-item)
-            (assoc-in acc [:reverse iri] spec)
-            (assoc acc iri spec)))))
-    {:depth depth} selection))
+       :else
+       (let [iri  (json-ld/expand-iri select-item context)
+             spec {:iri iri, :as select-item}]
+         (if (reverse? context select-item)
+           (assoc-in acc [:reverse iri] spec)
+           (assoc acc iri spec)))))
+   {:depth depth} selection))
 
 (defn parse-select-map
   [sm depth context]
@@ -516,14 +525,15 @@
     q))
 
 (defn parse-analytical-query
-  [q context]
-  (let [[vars values] (parse-values q)
-        where    (parse-where q vars context)
-        grouping (parse-grouping q)
-        ordering (parse-ordering q)]
+  [q]
+  (let [context       (context/extract q)
+        [vars values] (parse-values q)
+        where         (parse-where q vars context)
+        grouping      (parse-grouping q)
+        ordering      (parse-ordering q)]
     (-> q
         (assoc :context context
-               :where where)
+          :where where)
         (cond-> (seq values) (assoc :values values)
                 grouping (assoc :group-by grouping)
                 ordering (assoc :order-by ordering))
@@ -532,41 +542,9 @@
         parse-fuel)))
 
 (defn parse-query
-  [q context]
+  [q]
   (log/trace "parse-query" q)
-  (-> q
-      syntax/coerce-query
-      (parse-analytical-query context)))
-
-(defn parse-update-clause
-  [clause context]
-  (->> clause
-       util/sequential
-       (mapcat (fn [m]
-                 (parse-node-map m context)))))
-
-(defn parse-ledger-update
-  [mdfn context]
-  (let [[vars values] (parse-values mdfn)
-        where   (parse-where mdfn vars context)]
-    (-> mdfn
-        (assoc :context context
-               :where where)
-        (cond-> (seq values) (assoc :values values))
-        (as-> mod
-            (if (update/retract? mod)
-              (update mod :delete parse-update-clause context)
-              mod))
-        (as-> mod
-            (if (update/insert? mod)
-              (update mod :insert parse-update-clause context)
-              mod)))))
-
-(defn parse-modification
-  [json-ld context]
-  (-> json-ld
-      syntax/coerce-modification
-      (parse-ledger-update context)))
+  (-> q syntax/coerce-query parse-analytical-query))
 
 (def blank-node-prefix
   "_:fdb")
@@ -579,11 +557,11 @@
 
 (declare parse-subj-cmp)
 (defn parse-obj-cmp
-  [subj-cmp pred-cmp m triples
+  [allowed-vars subj-cmp pred-cmp m triples
    {:keys [list id value type language] :as v-map}]
   (cond list
         (reduce (fn [triples [i list-item]]
-                  (parse-obj-cmp subj-cmp pred-cmp {:i i} triples list-item))
+                  (parse-obj-cmp allowed-vars subj-cmp pred-cmp {:i i} triples list-item))
                 triples
                 (map vector (range) list))
 
@@ -592,14 +570,14 @@
     (let [m*      (cond-> m
                     language (assoc :lang language))
           obj-cmp (if (v/variable? value)
-                    (parse-variable value)
+                    (parse-variable-if-allowed allowed-vars value)
                     (where/anonymous-value value type m*))]
       (conj triples [subj-cmp pred-cmp obj-cmp]))
 
     ;; ref object
     :else
     (let [ref-obj (if (v/variable? id)
-                    (parse-variable id)
+                    (parse-variable-if-allowed allowed-vars id)
                     (where/match-iri
                      (if (nil? id)
                        (new-blank-node-id)
@@ -611,15 +589,15 @@
                     ;; project newly created bnode-id into v-map
                     (assoc v-map :id (where/get-iri ref-cmp))
                     v-map)]
-      (conj (parse-subj-cmp triples v-map*)
+      (conj (parse-subj-cmp allowed-vars triples v-map*)
             [subj-cmp pred-cmp ref-cmp]))))
 
 (defn parse-pred-cmp
-  [subj-cmp triples [pred values]]
+  [allowed-vars subj-cmp triples [pred values]]
   (cond
     (v/variable? pred)
-    (let [pred-cmp (parse-variable pred)]
-      (reduce (partial parse-obj-cmp subj-cmp pred-cmp nil)
+    (let [pred-cmp (parse-variable-if-allowed allowed-vars pred)]
+      (reduce (partial parse-obj-cmp allowed-vars subj-cmp pred-cmp nil)
               triples
               values))
 
@@ -632,29 +610,29 @@
     (let [values*  (map (fn [typ] {:id typ})
                         values)
           pred-cmp (where/match-iri const/iri-rdf-type)]
-      (reduce (partial parse-obj-cmp subj-cmp pred-cmp nil)
+      (reduce (partial parse-obj-cmp allowed-vars subj-cmp pred-cmp nil)
               triples
               values*))
 
     :else
     (let [pred-cmp (where/match-iri pred)]
-      (reduce (partial parse-obj-cmp subj-cmp pred-cmp nil)
+      (reduce (partial parse-obj-cmp allowed-vars subj-cmp pred-cmp nil)
               triples
               values))))
 
 (defn parse-subj-cmp
-  [triples {:keys [id] :as node}]
-  (let [subj-cmp (cond (v/variable? id) (parse-variable id)
+  [allowed-vars triples {:keys [id] :as node}]
+  (let [subj-cmp (cond (v/variable? id) (parse-variable-if-allowed allowed-vars id)
                        (nil? id)        (where/match-iri (new-blank-node-id))
                        :else            (where/match-iri id))]
-    (reduce (partial parse-pred-cmp subj-cmp)
+    (reduce (partial parse-pred-cmp allowed-vars subj-cmp)
             triples
             (dissoc node :id :idx))))
 
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
-  [expanded]
-  (reduce (partial parse-subj-cmp)
+  [allowed-vars expanded]
+  (reduce (partial parse-subj-cmp allowed-vars)
           []
           expanded))
 
@@ -664,14 +642,15 @@
         [vars values] (parse-values vals-map)
         where-map     {:where (util/get-first-value txn const/iri-where)}
         where         (parse-where where-map vars context)
+        bound-vars    (-> where where/bound-variables (into vars))
         delete-clause (-> txn
                           (util/get-first-value const/iri-delete)
                           (json-ld/expand context))
-        delete        (->> delete-clause util/sequential parse-triples)
+        delete        (->> delete-clause util/sequential (parse-triples bound-vars))
         insert-clause (-> txn
                           (util/get-first-value const/iri-insert)
                           (json-ld/expand context))
-        insert        (->> insert-clause util/sequential parse-triples)]
+        insert        (->> insert-clause util/sequential (parse-triples bound-vars))]
     (when (and (empty? insert) (empty? delete))
       (throw (ex-info (str "Invalid transaction, insert or delete clause must contain nodes with objects.")
                       {:status 400 :error :db/invalid-transaction})))

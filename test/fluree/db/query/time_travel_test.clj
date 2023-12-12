@@ -10,9 +10,11 @@
     (let [conn   (test-utils/create-conn)
           ledger (test-utils/load-movies conn)
           db     (fluree/db ledger)
-          movies @(fluree/query db '{:select {?s [:*]}
-                                     :where  {:id ?s, :type :schema/Movie}
-                                     :t      2})]
+          movies @(fluree/query db {:context [test-utils/default-context
+                                              {:ex "http://example.org/ns/"}]
+                                    :select  '{?s [:*]}
+                                    :where   '{:id ?s, :type :schema/Movie}
+                                    :t       2})]
       (is (= 3 (count movies)))
       (is (every? #{"The Hitchhiker's Guide to the Galaxy"
                     "Back to the Future"
@@ -22,17 +24,14 @@
 (deftest query-with-iso8601-string-t-value-test
   (testing "only gets results from before that time"
     (let [;conn         (test-utils/create-conn) ; doesn't work see comment below
-          conn                   @(fluree/connect {:method :memory
-                                                   :defaults
-                                                   {:context      test-utils/default-context
-                                                    :context-type :keyword}})
+          conn                   @(fluree/connect {:method :memory})
           ;; if the :did default below is present on the conn
           ;; (as it is w/ test-utils/create-conn)
           ;; then the tests below fail at the last check
           ;; b/c they can't see the last movie transacted
           ;; when queried by ISO-8601 string ONLY
           ;; (o/w it shows up just fine)
-          ;:did (fluree.db.did/private->did-map test-utils/default-private-key)}})
+                                        ;:did (fluree.db.did/private->did-map test-utils/default-private-key)}})
           start-iso              "2022-10-05T00:00:00Z"
           start                  (util/str->epoch-ms start-iso)
           three-loaded-millis    (+ start 60000)
@@ -54,8 +53,10 @@
                                    (fn []
                                      (let [db1 @(fluree/stage
                                                   (fluree/db ledger)
-                                                  {"@context" "https://ns.flur.ee"
-                                                   "insert" (first test-utils/movies)})]
+                                                  {"@context" ["https://ns.flur.ee"
+                                                               test-utils/default-context
+                                                               {:ex "http://example.org/ns/"}]
+                                                   "insert"   (first test-utils/movies)})]
                                        @(fluree/commit! ledger db1))))
           _                      (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] three-loaded-millis)
@@ -64,8 +65,10 @@
                                    (fn []
                                      (let [db2 @(fluree/stage
                                                   (fluree/db ledger)
-                                                  {"@context" "https://ns.flur.ee"
-                                                   "insert" (second test-utils/movies)})]
+                                                  {"@context" ["https://ns.flur.ee"
+                                                               test-utils/default-context
+                                                               {:ex "http://example.org/ns/"}]
+                                                   "insert"   (second test-utils/movies)})]
                                        @(fluree/commit! ledger db2))))
           _                      (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] all-loaded-millis)
@@ -74,20 +77,23 @@
                                    (fn []
                                      (let [db3 @(fluree/stage
                                                   (fluree/db ledger)
-                                                  {"@context" "https://ns.flur.ee"
-                                                   "insert" (nth test-utils/movies 2)})]
+                                                  {"@context" ["https://ns.flur.ee"
+                                                               test-utils/default-context
+                                                               {:ex "http://example.org/ns/"}]
+                                                   "insert"   (nth test-utils/movies 2)})]
                                        @(fluree/commit! ledger db3))))
           db                     (fluree/db ledger)
-          base-query             '{:select {?s [:*]}
-                                   :where  {:id ?s, :type :schema/Movie}}
+          base-query             {:context test-utils/default-context
+                                  :select  '{?s [:*]}
+                                  :where   '{:id ?s, :type :schema/Movie}}
           one-movie              @(fluree/query db (assoc base-query
-                                                     :t after-one-loaded-iso))
+                                                          :t after-one-loaded-iso))
           three-movies           @(fluree/query db (assoc base-query
-                                                     :t after-three-loaded-iso))
+                                                          :t after-three-loaded-iso))
           all-movies             @(fluree/query db (assoc base-query
-                                                     :t after-all-loaded-iso))
+                                                          :t after-all-loaded-iso))
           too-early              @(fluree/query db (assoc base-query
-                                                     :t too-early-iso))]
+                                                          :t too-early-iso))]
       (is (= 1 (count one-movie)))
       (is (= 3 (count three-movies)))
       (is (= 4 (count all-movies)))
@@ -99,66 +105,70 @@
     (let [t1         "2023-11-04T00:00:00Z"
           query-time "2023-11-05T00:00:00Z"
           t2         "2023-11-06T00:00:00Z"
-          conn       @(fluree/connect {:method :memory
-                                       :defaults
-                                       {:context      {"id"     "@id",
-                                                       "type"   "@type",
-                                                       "ex"     "http://example.org/",
-                                                       "f"      "https://ns.flur.ee/ledger#",
-                                                       "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-                                                       "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
-                                                       "schema" "http://schema.org/",
-                                                       "xsd"    "http://www.w3.org/2001/XMLSchema#"}
-                                        :context-type :string}})
+          conn       @(fluree/connect {:method :memory})
+          context    {"id"     "@id",
+                      "type"   "@type",
+                      "ex"     "http://example.org/",
+                      "f"      "https://ns.flur.ee/ledger#",
+                      "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                      "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                      "schema" "http://schema.org/",
+                      "xsd"    "http://www.w3.org/2001/XMLSchema#"}
 
           ledger1 (with-redefs [util/current-time-iso (fn [] t1)]
                     @(fluree/create-with-txn conn
-                                              {"@context" "https://ns.flur.ee"
-                                               "ledger"   "test/time1"
-                                               "insert"   [{"@id"     "ex:time-test"
-                                                            "@type"   "ex:foo"
-                                                            "ex:time" 1}]}))
+                                             {"@context" ["https://ns.flur.ee"
+                                                          context]
+                                              "ledger"   "test/time1"
+                                              "insert"   [{"@id"     "ex:time-test"
+                                                           "@type"   "ex:foo"
+                                                           "ex:time" 1}]}))
           ledger2 (with-redefs [util/current-time-iso (fn [] t1)]
                     @(fluree/create-with-txn conn
-                                              {"@context" "https://ns.flur.ee"
-                                               "ledger"   "test/time2"
-                                               "insert"   [{"@id"   "ex:time-test"
-                                                            "ex:p1" "value1"}
-                                                           {"@id"   "ex:foo"
-                                                            "ex:p2" "t1"}]}))
-          _       (with-redefs [util/current-time-iso (fn [] t2)]
-                    @(fluree/transact! conn {"@context" "https://ns.flur.ee"
-                                              "ledger"   "test/time1"
+                                             {"@context" ["https://ns.flur.ee"
+                                                          context]
+                                              "ledger"   "test/time2"
                                               "insert"   [{"@id"   "ex:time-test"
+                                                           "ex:p1" "value1"}
+                                                          {"@id"   "ex:foo"
+                                                           "ex:p2" "t1"}]}))
+          _       (with-redefs [util/current-time-iso (fn [] t2)]
+                    @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
+                                                         context]
+                                             "ledger"   "test/time1"
+                                             "insert"   [{"@id"     "ex:time-test"
                                                           "ex:time" 2}]}))
           _       (with-redefs [util/current-time-iso (fn [] t2)]
                     @(fluree/transact! conn
-                                        {"@context" "https://ns.flur.ee"
-                                         "ledger"   "test/time2"
-                                         "insert"   [{"@id"   "ex:time-test"
-                                                      "ex:p1" "value2"}
-                                                     {"@id"   "ex:foo"
-                                                      "ex:p2" "t2"}]}))]
+                                       {"@context" "https://ns.flur.ee"
+                                        "ledger"   "test/time2"
+                                        "insert"   [{"@id"   "ex:time-test"
+                                                     "ex:p1" "value2"}
+                                                    {"@id"   "ex:foo"
+                                                     "ex:p2" "t2"}]}))]
       (testing "Single ledger"
-        (let [q '{:from   "test/time1"
-                  :select {"ex:time-test" ["*"]}
-                  :t      1}]
+        (let [q {:context context
+                 :from    "test/time1"
+                 :select  {"ex:time-test" ["*"]}
+                 :t       1}]
           (is (= [{"id"      "ex:time-test"
                    "type"    "ex:foo"
                    "ex:time" 1}]
                  @(fluree/query-connection conn q))
               "should return only results for `t` of `1`"))
-        (let [q {:from   "test/time1"
-                 :select {"ex:time-test" ["*"]}
-                 :t      query-time}]
+        (let [q {:context context
+                 :from    "test/time1"
+                 :select  {"ex:time-test" ["*"]}
+                 :t       query-time}]
           (is (= [{"id"      "ex:time-test"
                    "type"    "ex:foo"
                    "ex:time" 1}]
                  @(fluree/query-connection conn q))
               "should return only results for `t` of `1`"))
-        (let [q            '{:from   "test/time1"
-                             :select {"ex:time-test" ["*"]}
-                             :t      "1988-05-30T12:40:44.823Z"}
+        (let [q            {:context context
+                            :from    "test/time1"
+                            :select  {"ex:time-test" ["*"]}
+                            :t       "1988-05-30T12:40:44.823Z"}
               invalid-time (try @(fluree/query-connection conn q)
                                 (catch Exception e e))]
 
@@ -170,17 +180,19 @@
                              "test/time1")
               "message should report which ledger has an error")))
       (testing "Across multiple ledgers"
-        (let [q {:from   ["test/time1" "test/time2"]
-                 :select '[?p1 ?time]
-                 :where  '{"@id"     "ex:time-test"
-                           "ex:p1"   ?p1
-                           "ex:time" ?time}
-                 :t      query-time}]
+        (let [q {:context context
+                 :from    ["test/time1" "test/time2"]
+                 :select  '[?p1 ?time]
+                 :where   '{"@id"     "ex:time-test"
+                            "ex:p1"   ?p1
+                            "ex:time" ?time}
+                 :t       query-time}]
           (is (= [["value1" 1]]
                  @(fluree/query-connection conn q))
               "should return results for first commit from both ledgers"))
         (testing "from-named"
-          (let [q {:from-named ["test/time1" "test/time2"]
+          (let [q {:context    context
+                   :from-named ["test/time1" "test/time2"]
                    :select     '[?p2 ?time]
                    :where      '[[:graph "test/time1" {"@id"     "ex:time-test"
                                                        "ex:time" ?time}]
@@ -193,18 +205,20 @@
         (testing "Not all ledgers have data for given `t`"
           (with-redefs [util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
             (let [ledger-valid @(fluree/create-with-txn conn
-                                                         {"@context" "https://ns.flur.ee"
-                                                          "ledger"   "test/time-before"
-                                                          "insert"   [{"@id"   "ex:time-test"
-                                                                       "ex:p1" "value"}]})]
-              (let [q            '{:from   ["test/time1" "test/time-before"]
-                                   :select [?p1 ?time]
-                                   :where  {"@id"     "ex:time-test"
-                                            "ex:p1"   ?p1
-                                            "ex:time" ?time}
-                                   ;;`t` is valid for "ledger-valid",
-                                   ;;but not "test/time1"
-                                   :t      "1988-05-30T12:40:44.823Z"}
+                                                        {"@context" ["https://ns.flur.ee"
+                                                                     context]
+                                                         "ledger"   "test/time-before"
+                                                         "insert"   [{"@id"   "ex:time-test"
+                                                                      "ex:p1" "value"}]})]
+              (let [q            {:context context
+                                  :from    ["test/time1" "test/time-before"]
+                                  :select  '[?p1 ?time]
+                                  :where   '{"@id"     "ex:time-test"
+                                             "ex:p1"   ?p1
+                                             "ex:time" ?time}
+                                  ;;`t` is valid for "ledger-valid",
+                                  ;;but not "test/time1"
+                                  :t       "1988-05-30T12:40:44.823Z"}
                     invalid-time (try @(fluree/query-connection conn q)
                                       (catch Exception e e))]
                 (is (util/exception? invalid-time))
@@ -216,12 +230,13 @@
                     "message should report which ledger has an error")))))
         (testing "Federated queries must use wall-clock time as global `t` value"
           (with-redefs [util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
-            (let [q            '{:from   ["test/time1" "test/time-before"]
-                                 :select [?p1 ?time]
-                                 :where  {"@id"     "ex:time-test"
-                                          "ex:p1"   ?p1
-                                          "ex:time" ?time}
-                                 :t      1}
+            (let [q            {:context context
+                                :from    ["test/time1" "test/time-before"]
+                                :select  '[?p1 ?time]
+                                :where   '{"@id"     "ex:time-test"
+                                           "ex:p1"   ?p1
+                                           "ex:time" ?time}
+                                :t       1}
                   invalid-time (try @(fluree/query-connection conn q)
                                     (catch Exception e e))]
               (is (util/exception? invalid-time))

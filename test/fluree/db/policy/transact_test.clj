@@ -1,15 +1,13 @@
 (ns fluree.db.policy.transact-test
-  (:require
-    [clojure.test :refer :all]
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    [fluree.db.did :as did]
-    [fluree.db.util.core :as util]))
+  (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.did :as did]
+            [fluree.db.util.core :as util]))
 
 (deftest ^:integration policy-enforcement
   (testing "Testing basic policy enforcement."
-    (let [conn      @(fluree/connect {:method :memory
-                                      :defaults {:context-type :keyword}})
+    (let [conn      @(fluree/connect {:method :memory})
           context   [test-utils/default-context {:ex "http://example.org/ns/"}]
           ledger    @(fluree/create conn "policy/tx-a")
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))

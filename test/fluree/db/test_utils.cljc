@@ -1,6 +1,5 @@
 (ns fluree.db.test-utils
-  (:require [clojure.set :as set]
-            [fluree.db.did :as did]
+  (:require [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
@@ -114,20 +113,18 @@
 (defn create-conn
   ([]
    (create-conn {}))
-  ([{:keys [context did context-type]
-     :or   {context      default-context
-            context-type :keyword
-            did          (did/private->did-map default-private-key)}}]
-   (let [conn-p (fluree/connect-memory {:defaults {:context      context
-                                                   :context-type context-type
-                                                   :did          did}})]
+  ([{:keys [did]
+     :or   {did (did/private->did-map default-private-key)}}]
+   (let [conn-p (fluree/connect-memory {:defaults {:did did}})]
      #?(:clj @conn-p :cljs (go (<p! conn-p))))))
 
 (defn load-movies
   [conn]
   (let [ledger @(fluree/create conn "test/movies")]
     (doseq [movie movies]
-      (let [staged @(fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee" "insert" movie})]
+      (let [staged @(fluree/stage (fluree/db ledger) {"@context" ["https://ns.flur.ee"
+                                                                  default-str-context]
+                                                      "insert" movie})]
         @(fluree/commit! ledger staged
                          {:message (str "Commit " (get movie "name"))
                           :push?   true})))
@@ -135,17 +132,18 @@
 
 (defn load-people
   [conn]
-  (#?(:clj do :cljs go)
-   (let [ledger-p (fluree/create conn "test/people"
-                                 {:defaultContext
-                                  ["" {:ex "http://example.org/ns/"}]})
-         ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
-         staged-p (fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee" "insert" people})
-         staged   #?(:clj @staged-p :cljs (<p! staged-p))
-         commit-p (fluree/commit! ledger staged {:message "Adding people"
-                                                 :push? true})]
-     #?(:clj @commit-p :cljs (<p! commit-p))
-     ledger)))
+  (#?(:clj do, :cljs go)
+    (let [ledger-p (fluree/create conn "test/people")
+          ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
+          staged-p (fluree/stage (fluree/db ledger) {"@context" ["https://ns.flur.ee"
+                                                                 default-context
+                                                                 {:ex "http://example.org/ns/"}]
+                                                     "insert" people})
+          staged   #?(:clj @staged-p, :cljs (<p! staged-p))
+          commit-p (fluree/commit! ledger staged {:message "Adding people"
+                                                  :push? true})]
+      #?(:clj @commit-p, :cljs (<p! commit-p))
+      ledger)))
 
 (defn transact
   ([ledger data]
@@ -159,9 +157,9 @@
   retrying promise-wrapped API fns. Do not deref the return value, this will
   do it for you. In CLJS it will not retry and will return a core.async chan."
   [pwrapped max-attempts & [retry-on-false?]]
-  (#?(:clj loop :cljs go-loop) [attempt 0]
+  (#?(:clj loop, :cljs go-loop) [attempt 0]
     (let [res' (try*
-                (let [res (#?(:clj deref :cljs <p!) (pwrapped))]
+                (let [res (#?(:clj deref, :cljs <p!) (pwrapped))]
                   (if (util/exception? res)
                     (throw res)
                     res))
@@ -265,16 +263,22 @@
   used to determine whether there is a match. Returns true if all pred fns
   return true and all literal values match or false otherwise."
   [expected actual]
-  (or (= expected actual)
-      (cond
-        (fn? expected)
-        (expected actual)
+  (let [result (or (= expected actual)
+                   (cond
+                     (fn? expected)
+                     (expected actual)
 
-        (and (map? expected) (map? actual))
-        (every? (fn [k] (pred-match? (get expected k) (get actual k)))
-                (set/union (keys actual) (keys expected)))
+                     (and (map? expected) (map? actual))
+                     (every? (fn [k]
+                               (pred-match? (get expected k) (get actual k)))
+                             (set (concat (keys actual) (keys expected))))
 
-        (and (coll? expected) (coll? actual))
-        (every? (fn [[e a]] (pred-match? e a)) (zipmap expected actual))
+                     (and (coll? expected) (coll? actual))
+                     (every? (fn [[e a]]
+                               (pred-match? e a))
+                             (zipmap expected actual))
 
-        :else false)))
+                     :else false))]
+    (when-not result
+      (log/info "pred-match failed:" expected actual))
+    result))

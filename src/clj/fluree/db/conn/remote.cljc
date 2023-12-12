@@ -35,12 +35,6 @@
   (-method [_] :remote)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-default-context [_] (:context ledger-defaults))
-  (-default-context [_ context-type] (let [ctx (:context ledger-defaults)]
-                                       (if (= :keyword context-type)
-                                         (ctx-util/keywordize-context ctx)
-                                         ctx)))
-  (-context-type [_] (:context-type ledger-defaults))
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      (log/warn "-msg-in: " msg)
@@ -82,11 +76,9 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [{:keys [context did context-type] :as _defaults}]
+  [{:keys [did] :as _defaults}]
   (go
-    {:context      (ctx-util/stringify-context context)
-     :context-type context-type
-     :did          did}))
+    {:did did}))
 
 (defn default-remote-nameservice
   "Returns remote nameservice or will throw if generates an exception."

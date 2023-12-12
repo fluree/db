@@ -165,10 +165,9 @@
   "Build a pattern that already matches the explicit predicate value `value`."
   ([iri]
    (->iri-ref iri))
-  ([iri recur-n]
-   (-> iri
-       ->predicate
-       (assoc ::recur recur-n))))
+  ([iri reverse]
+   (cond-> (->predicate iri)
+     reverse (assoc ::reverse true))))
 
 (defn ->where-clause
   "Build a pattern that matches all the patterns in the supplied `patterns`
@@ -179,7 +178,7 @@
    {::patterns patterns})
   ([patterns filters]
    (cond-> (->where-clause patterns)
-           (seq filters) (assoc ::filters filters))))
+     (seq filters) (assoc ::filters filters))))
 
 (defn pattern-type
   [pattern]
@@ -312,8 +311,8 @@
 
          idx         (try* (index/for-components s p o o-dt)
                            (catch* e
-                                   (log/error e "Error resolving flake range")
-                                   (async/put! error-ch e)))
+                             (log/error e "Error resolving flake range")
+                             (async/put! error-ch e)))
          idx-root    (get db idx)
          novelty     (get-in db [:novelty idx])
          [o* o-fn*]  (augment-object-fn idx s p o o-fn alias)
@@ -572,8 +571,8 @@
         ;; Iteration: mark that a solution was processed, and pass it to the supplied
         ;; reducing fn.
         ([result solution]
-         (do (vreset! solutions? true)
-             (rf result solution)))
+         (vreset! solutions? true)
+         (rf result solution))
 
         ;; Termination: if no other solutions were processed, then process the
         ;; default-solution with the supplied reducing fn before terminating it;
@@ -639,3 +638,12 @@
                             initial-solution-ch)
       (async/pipe initial-solution-ch out-ch))
     out-ch))
+
+(defn bound-variables
+  [where]
+  (cond
+    (nil? where) #{}
+    (sequential? where) (into #{} (mapcat bound-variables) where)
+    (map? where) (if (contains? where ::var)
+                   #{(::var where)}
+                   (into #{} (mapcat bound-variables) where))))

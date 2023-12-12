@@ -43,12 +43,6 @@
   (-method [_] :ipfs)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-default-context [_] (:context ledger-defaults))
-  (-default-context [_ context-type] (let [ctx (:context ledger-defaults)]
-                                       (if (= :keyword context-type)
-                                         (ctx-util/keywordize-context ctx)
-                                         ctx)))
-  (-context-type [_] (:context-type ledger-defaults))
   (-new-indexer [_ opts] ;; default new ledger indexer
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
@@ -112,12 +106,10 @@
         (throw (ex-info (str "IPNS publishing appears to have an issue. No corresponding ipns address found for key: "
                              ipns-default-key)
                         {:status 400 :error :db/ipfs-keys})))
-      {:ipns         {:key     ipns-default-key
-                      :address ipns-default-address}
-       :context      (ctx-util/stringify-context context)
-       :context-type context-type
-       :did          did
-       :indexer      new-indexer-fn})))
+      {:ipns    {:key     ipns-default-key
+                 :address ipns-default-address}
+       :did     did
+       :indexer new-indexer-fn})))
 
 
 (defn connect
