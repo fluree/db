@@ -2,7 +2,9 @@
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.flake :as flake]))
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.flake :as flake]
+            [fluree.db.constants :as const]))
 
 (deftest ^:integration index-range-scans
   (testing "Various index range scans using the API."
@@ -39,14 +41,14 @@
              cam-iri)
           "Expanding compact IRI is broken, likely other tests will fail.")
 
-      (is (int? cam-sid)
+      (is (iri/sid? cam-sid)
           "The compact IRI did not resolve to an integer subject id.")
 
       (testing "Slice operations"
         (testing "Slice for subject id only"
           (let [alice-iri (fluree/expand-iri context :ex/alice)
                 alice-sid @(fluree/internal-id db alice-iri)]
-            (is (= 8
+            (is (= 7
                    (->> @(fluree/slice db :spot [alice-sid])
                         (filterv #(= alice-sid (flake/s %)))
                         (count)))
@@ -57,9 +59,9 @@
                 alice-sid   @(fluree/internal-id db alice-iri)
                 favNums-iri (fluree/expand-iri context :ex/favNums)
                 favNums-pid @(fluree/internal-id db favNums-iri)]
-            (is (= [[alice-sid favNums-pid 9 8 -1 true nil]
-                    [alice-sid favNums-pid 42 8 -1 true nil]
-                    [alice-sid favNums-pid 76 8 -1 true nil]]
+            (is (= [[alice-sid favNums-pid 9 const/$xsd:long -1 true nil]
+                    [alice-sid favNums-pid 42 const/$xsd:long -1 true nil]
+                    [alice-sid favNums-pid 76 const/$xsd:long -1 true nil]]
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid])
                         (mapv flake/Flake->parts)))
                 "Slice should only return Alice's favNums (multi-cardinality)")))
@@ -69,7 +71,7 @@
                 alice-sid   @(fluree/internal-id db alice-iri)
                 favNums-iri (fluree/expand-iri context :ex/favNums)
                 favNums-pid @(fluree/internal-id db favNums-iri)]
-            (is (= [[alice-sid favNums-pid 42 8 -1 true nil]]
+            (is (= [[alice-sid favNums-pid 42 const/$xsd:long -1 true nil]]
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid 42])
                         (mapv flake/Flake->parts)))
                 "Slice should only return the specified favNum value")))
@@ -79,8 +81,8 @@
                 alice-sid   @(fluree/internal-id db alice-iri)
                 favNums-iri (fluree/expand-iri context :ex/favNums)
                 favNums-pid @(fluree/internal-id db favNums-iri)]
-            (is (= [[alice-sid favNums-pid 42 8 -1 true nil]]
-                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 8]])
+            (is (= [[alice-sid favNums-pid 42 const/$xsd:long -1 true nil]]
+                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 const/$xsd:long]])
                         (mapv flake/Flake->parts)))
                 "Slice should only return the specified favNum value with matching datatype")))
 
@@ -90,6 +92,6 @@
                 favNums-iri (fluree/expand-iri context :ex/favNums)
                 favNums-pid @(fluree/internal-id db favNums-iri)]
             (is (= []
-                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 7]])
+                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 const/$xsd:string]])
                         (mapv flake/Flake->parts)))
                 "We specify a different datatype for the value, nothing should be returned")))))))
