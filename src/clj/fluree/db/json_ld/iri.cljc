@@ -26,7 +26,8 @@
 (def default-namespaces
   "iri namespace mapping. 0 signifies relative iris. 1-100 are reserved; user
   supplied namespaces start at 101."
-  {"@"                                           1
+  {""                                            0
+   "@"                                           1
    "http://www.w3.org/2001/XMLSchema#"           2
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#" 3
    "http://www.w3.org/2000/01/rdf-schema#"       4
@@ -75,7 +76,7 @@
         (decompose-by-char iri \? length)
         (decompose-by-char iri \/ length)
         (decompose-by-char iri \: length)
-        [nil iri])))
+        ["" iri])))
 
 (def name-code-xf
   (comp (partition-all 8)
