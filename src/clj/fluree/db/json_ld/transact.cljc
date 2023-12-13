@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async :refer [go alts!]]
             [clojure.set :refer [map-invert]]
             [fluree.db.constants :as const]
+            [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
