@@ -99,12 +99,6 @@
   (-method [_] :memory)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-default-context [_] (:context ledger-defaults))
-  (-default-context [_ context-type] (let [ctx (:context ledger-defaults)]
-                                       (if (= :keyword context-type)
-                                         (ctx-util/keywordize-context ctx)
-                                         ctx)))
-  (-context-type [_] (:context-type ledger-defaults))
   (-new-indexer [_ opts] (idx-default/create opts)) ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
@@ -147,11 +141,9 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [{:keys [context did context-type] :as _defaults}]
+  [{:keys [did] :as _defaults}]
   (async/go
-    {:context      (ctx-util/stringify-context context)
-     :context-type context-type
-     :did          did}))
+    {:did did}))
 
 (defn default-memory-nameservice
   "Returns memory nameservice"

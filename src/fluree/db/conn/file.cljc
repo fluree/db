@@ -138,12 +138,6 @@
   (-method [_] :file)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-default-context [_] (:context ledger-defaults))
-  (-default-context [_ context-type] (let [ctx (:context ledger-defaults)]
-                                       (if (= :keyword context-type)
-                                         (ctx-util/keywordize-context ctx)
-                                         ctx)))
-  (-context-type [_] (:context-type ledger-defaults))
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
@@ -194,22 +188,20 @@
     s))
 
 (defn ledger-defaults
-  [{:keys [context context-type did indexer]}]
-  {:context      (ctx-util/stringify-context context)
-   :context-type context-type
-   :did          did
-   :indexer      (cond
-                   (fn? indexer)
-                   indexer
+  [{:keys [did indexer]}]
+  {:did     did
+   :indexer (cond
+              (fn? indexer)
+              indexer
 
-                   (or (map? indexer) (nil? indexer))
-                   (fn [opts]
-                     (idx-default/create (merge indexer opts)))
+              (or (map? indexer) (nil? indexer))
+              (fn [opts]
+                (idx-default/create (merge indexer opts)))
 
-                   :else
-                   (throw (ex-info (str "Expected an indexer constructor fn or "
-                                        "default indexer options map. Provided: " indexer)
-                                   {:status 400 :error :db/invalid-file-connection})))})
+              :else
+              (throw (ex-info (str "Expected an indexer constructor fn or "
+                                   "default indexer options map. Provided: " indexer)
+                              {:status 400 :error :db/invalid-file-connection})))})
 
 (defn default-file-nameservice
   "Returns file nameservice or will throw if storage-path generates an exception."

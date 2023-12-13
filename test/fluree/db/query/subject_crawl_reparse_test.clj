@@ -1,21 +1,22 @@
 (ns fluree.db.query.subject-crawl-reparse-test
-  (:require
-   [clojure.test :refer :all]
-   [fluree.db.test-utils :as test-utils]
-   [fluree.db.json-ld.api :as fluree]
-   [fluree.db.query.fql.parse :as parse]
-   [fluree.db.query.subject-crawl.reparse :as reparse]
-   [fluree.db.dbproto :as dbproto]))
+  (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.query.fql.parse :as parse]
+            [fluree.db.query.subject-crawl.reparse :as reparse]))
 
 (deftest test-reparse-as-ssc
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/parse" {:defaultContext ["" {:ex "http://example.org/ns/"
-                                                                        :owl "http://www.w3.org/2002/07/owl#"
-                                                                        :vocab1 "http://vocab1.example.org"
-                                                                        :vocab2 "http://vocab2.example.org"}]})
+        context [test-utils/default-context
+                 {:ex "http://example.org/ns/"
+                  :owl "http://www.w3.org/2002/07/owl#"
+                  :vocab1 "http://vocab1.example.org"
+                  :vocab2 "http://vocab2.example.org"}]
+        ledger @(fluree/create conn "query/parse")
         db     @(fluree/stage
                   (fluree/db ledger)
-                  {"@context" "https://ns.flur.ee"
+                  {"@context" ["https://ns.flur.ee"
+                               context]
                    "insert"
                    [{:id           :vocab1/credential
                      :type         :rdf/Property}
@@ -45,50 +46,48 @@
                      :schema/age   34
                      :ex/favNums   [5, 10]
                      :ex/friend    [:ex/brian :ex/alice]}]})
-        context  (dbproto/-context db)
-        ssc-q1-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
-                                                     :where  {:id "?s", :schema/name "Alice"}}
-                                                     context)
-        ssc-q2-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
+        ssc-q1-parsed (parse/parse-analytical-query {:context context
+                                                     :select {"?s" ["*"]}
+                                                     :where  {:id "?s", :schema/name "Alice"}})
+        ssc-q2-parsed (parse/parse-analytical-query {:context context
+                                                     :select {"?s" ["*"]}
                                                      :where  {:id "?s"
                                                               :schema/age 50
-                                                              :ex/favColor "Blue"}}
-                                                     context)
-        not-ssc-parsed (parse/parse-analytical-query {:select  ['?name '?age '?email]
+                                                              :ex/favColor "Blue"}})
+        not-ssc-parsed (parse/parse-analytical-query {:context context
+                                                      :select  ['?name '?age '?email]
                                                       :where  {:schema/name "Cam"
                                                                :ex/friend {:schema/name '?name
                                                                            :schema/age '?age
-                                                                           :schema/email '?email}
- }}
-                                                      context)
-        order-group-parsed (parse/parse-analytical-query {:select   ['?name '?favNums]
+                                                                           :schema/email '?email}}})
+        order-group-parsed (parse/parse-analytical-query {:context context
+                                                          :select   ['?name '?favNums]
                                                           :where    {:schema/name '?name
                                                                      :ex/favNums '?favNums}
                                                            :group-by '?name
-                                                           :order-by '?name}
-                                                          context)
-        vars-query-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
+                                                          :order-by '?name})
+        vars-query-parsed (parse/parse-analytical-query {:context context
+                                                         :select {"?s" ["*"]}
                                                          :where  {:id "?s", :schema/name '?name}
-                                                         :values ['?name ["Alice"]]}
-                                                         context)
-        s+p+o-parsed (parse/parse-analytical-query {:select {"?s" [:*]}
-                                                    :where  {:id "?s", "?p" "?o"}}
-                                                   context)
-        s+p+o2-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
+                                                         :values ['?name ["Alice"]]})
+        s+p+o-parsed (parse/parse-analytical-query {:context context
+                                                    :select {"?s" [:*]}
+                                                    :where  {:id "?s", "?p" "?o"}})
+        s+p+o2-parsed (parse/parse-analytical-query {:context context
+                                                     :select {'?s ["*"]}
                                                      :where {:id '?s
                                                              :schema/age 50
-                                                             '?p '?o}}
-                                                    context)
-        s+p+o3-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
+                                                             '?p '?o}})
+        s+p+o3-parsed (parse/parse-analytical-query {:context context
+                                                     :select {'?s ["*"]}
                                                      :where {:id '?s
                                                              '?p '?o
-                                                             :schema/age 50}}
-                                                    context)
-        equivalent-property-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
+                                                             :schema/age 50}})
+        equivalent-property-parsed (parse/parse-analytical-query {:context context
+                                                                  :select {'?s ["*"]}
                                                                   :where {:id '?s
                                                                           :schema/name '?name
-                                                                          :vocab1/credential '?credential}}
-                                                                 context)]
+                                                                          :vocab1/credential '?credential}})]
     (testing "simple-subject-crawl?"
       (is (= true
              (reparse/simple-subject-crawl? ssc-q1-parsed db)))

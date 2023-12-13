@@ -1,7 +1,6 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.exec :as exec]
@@ -39,13 +38,13 @@
 
 (defn query
   "Returns core async channel with results or exception"
-  ([db ctx query-map]
-   (query db ctx nil query-map))
-  ([db ctx fuel-tracker query-map]
+  ([db query-map]
+   (query db nil query-map))
+  ([db fuel-tracker query-map]
    (if (cache? query-map)
      (cache-query db query-map)
      (let [q   (try*
-                 (let [parsed (parse/parse-query query-map ctx)]
+                 (let [parsed (parse/parse-query query-map)]
                    (or (re-parse-as-simple-subj-crawl parsed db)
                        parsed))
                  (catch* e e))

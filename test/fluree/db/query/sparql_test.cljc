@@ -349,37 +349,25 @@
                                     :defaults {:context-type :string
                                                :context test-utils/default-str-context}})
              db   (-> conn
-                      (fluree/create "people"
-                                     {:defaultContext
-                                      ["" {"person" "http://example.org/Person#"}]})
+                      (fluree/create "people")
                       deref
                       fluree/db
-                      (fluree/stage {"@context" "https://ns.flur.ee"
+                      (fluree/stage {"@context" ["https://ns.flur.ee"
+                                                 test-utils/default-str-context
+                                                 {"person" "http://example.org/Person#"}]
                                       "insert" people-data})
                       deref)]
-         (testing "keyword context-type throws an error"
-           (let [kw-conn @(fluree/connect {:method   :memory
-                                           :defaults {:context-type :keyword}})
-                 kw-db   (-> kw-conn
-                             (fluree/create "people"
-                                            {:defaultContext
-                                             {:person "http://example.org/Person#"}})
-                             deref
-                             fluree/db)
-                 query "SELECT ?person ?fullName
-                        WHERE {?person person:handle \"jdoe\".
-                               ?person person:fullName ?fullName.}"]
-             (is (thrown-with-msg? ExceptionInfo #"require context-type to be :string"
-                                   @(fluree/query kw-db query {:format :sparql})))))
          (testing "basic query works"
-           (let [query   "SELECT ?person ?fullName
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT ?person ?fullName
                           WHERE {?person person:handle \"jdoe\".
                                  ?person person:fullName ?fullName.}"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [["ex:jdoe" "Jane Doe"]]
                     results))))
          (testing "basic wildcard query works"
-           (let [query   "SELECT *
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT *
                           WHERE {?person person:handle ?handle;
                                          person:favNums ?favNums.}"
                  results @(fluree/query db query {:format :sparql})]
@@ -397,7 +385,8 @@
                       [{?favNums 99, ?handle "jdoe", ?person "ex:jdoe"}]]
                     results))))
          (testing "basic wildcard query w/ grouping works"
-           (let [query   "SELECT *
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT *
                           WHERE {?person person:handle ?handle;
                                          person:favNums ?favNums.}
                           GROUP BY ?person ?handle"
@@ -407,7 +396,8 @@
                       [{?favNums [3 7 42 99], ?handle "jdoe", ?person "ex:jdoe"}]]
                     results))))
          (testing "basic query w/ OPTIONAL works"
-           (let [query   "SELECT ?person ?favNums
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT ?person ?favNums
                           WHERE {?person person:handle ?handle.
                                  OPTIONAL{?person person:favNums ?favNums.}}"
                  results @(fluree/query db query {:format :sparql})]
@@ -426,7 +416,8 @@
                      ["ex:jdoe" 99]]
                     results))))
          (testing "basic query w/ GROUP BY & OPTIONAL works"
-           (let [query   "SELECT ?person ?favNums
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT ?person ?favNums
                           WHERE {?person person:handle ?handle.
                                  OPTIONAL{?person person:favNums ?favNums.}}
                           GROUP BY ?person"
@@ -437,7 +428,8 @@
                      ["ex:jdoe" [3 7 42 99]]]
                     results))))
          (testing "basic query w/ omitted subjects works"
-           (let [query   "SELECT ?person ?fullName ?favNums
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT ?person ?fullName ?favNums
                           WHERE {?person person:handle \"jdoe\";
                                          person:fullName ?fullName;
                                          person:favNums ?favNums.}"
@@ -448,7 +440,8 @@
                      ["ex:jdoe" "Jane Doe" 99]]
                     results))))
          (testing "scalar fn query works"
-           (let [query   "SELECT (SHA512(?handle) AS ?handleHash)
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (SHA512(?handle) AS ?handleHash)
                           WHERE {?person person:handle ?handle.}"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [["f162b1f2b3a824f459164fe40ffc24a019993058061ca1bf90eca98a4652f98ccaa5f17496be3da45ce30a1f79f45d82d8b8b532c264d4455babc1359aaa461d"]
@@ -458,27 +451,31 @@
                     results))))
          (testing "aggregate fn query works"
            ;; Select the bound var after the AS to make sure it is bound to the result
-           (let [query   "SELECT (AVG(?favNums) AS ?avgFav) ?avgFav
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (AVG(?favNums) AS ?avgFav) ?avgFav
                           WHERE {?person person:favNums ?favNums.}"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [[17.66666666666667 17.66666666666667]]
                     results))))
          (testing "aggregate fn w/ GROUP BY query works"
-           (let [query   "SELECT (AVG(?favNums) AS ?avgFav)
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (AVG(?favNums) AS ?avgFav)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [[5.428571428571429] [37.75] [23]]
                     results))))
          (testing "aggregate fn w/ GROUP BY ... HAVING query works"
-           (let [query   "SELECT (AVG(?favNums) AS ?avgFav)
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (AVG(?favNums) AS ?avgFav)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person HAVING(AVG(?favNums) > 10)"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [[37.75] [23]]
                     results))))
          (testing "multi-arg fn query works"
-           (let [query   "SELECT (CONCAT(?handle, '-', ?fullName) AS ?hfn)
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (CONCAT(?handle, '-', ?fullName) AS ?hfn)
                           WHERE {?person person:handle ?handle.
                                  ?person person:fullName ?fullName.}"
                  results @(fluree/query db query {:format :sparql})]
@@ -488,13 +485,15 @@
                      ["jdoe-Jane Doe"]]
                     results))))
          (testing "multiple AS selections query works"
-           (let [query   "SELECT (AVG(?favNums) AS ?avgFav) (CEIL(?avgFav) AS ?caf)
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (AVG(?favNums) AS ?avgFav) (CEIL(?avgFav) AS ?caf)
                           WHERE {?person person:favNums ?favNums.}"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [[17.66666666666667 18]]
                     results))))
          (testing "mix of bindings and variables in SELECT query works"
-           (let [query   "SELECT ?favNums (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT ?favNums (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
                           WHERE  {?person person:handle ?handle.
                                   ?person person:favNums ?favNums.}
                           GROUP BY ?person ?handle"
@@ -504,34 +503,39 @@
                      [[3 7 42 99] 37.75 "ex:jdoe" "jdoe" 99]]
                     results))))
          (testing "COUNT query works"
-           (let [query   "SELECT (COUNT(?favNums) AS ?numFavs)
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (COUNT(?favNums) AS ?numFavs)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [[7] [4] [1]]
                     results))))
          (testing "SAMPLE query works"
-           (let [query   "SELECT (SAMPLE(?favNums) AS ?favNum)
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (SAMPLE(?favNums) AS ?favNum)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"
                  results @(fluree/query db query {:format :sparql})]
              (is (every? #(-> % first integer?) results))))
          (testing "SUM query works"
-           (let [query   "SELECT (SUM(?favNums) AS ?favNum)
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (SUM(?favNums) AS ?favNum)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [[38] [151] [23]]
                     results))))
          (testing "ORDER BY ASC query works"
-           (let [query   "SELECT ?handle
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT ?handle
                           WHERE {?person person:handle ?handle.}
                           ORDER BY ASC(?handle)"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [["bbob"] ["dankeshön"] ["jbob"] ["jdoe"]]
                     results))))
          (testing "ORDER BY DESC query works"
-           (let [query   "SELECT ?handle
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT ?handle
                           WHERE {?person person:handle ?handle.}
                           ORDER BY DESC(?handle)"
                  results @(fluree/query db query {:format :sparql})]
@@ -544,7 +548,9 @@
                            "type"                          "http://example.org/Book"
                            "http://example.org/book/title" "The Hitchhiker's Guide to the Galaxy"}]]
            (testing "BASE IRI gets prefixed onto relative IRIs"
-             (let [book-db @(fluree/stage db {"@context" "https://ns.flur.ee"
+             (let [book-db @(fluree/stage db {"@context" ["https://ns.flur.ee"
+                                                          test-utils/default-str-context
+                                                          {"person" "http://example.org/Person#"}]
                                                "insert" book-data})
                    query   "BASE <http://example.org/book/>
                             SELECT ?book ?title
@@ -554,7 +560,9 @@
                        ["2" "The Hitchhiker's Guide to the Galaxy"]]
                       results))))
            (testing "PREFIX declarations go into the context"
-             (let [book-db @(fluree/stage db {"@context" "https://ns.flur.ee"
+             (let [book-db @(fluree/stage db {"@context" ["https://ns.flur.ee"
+                                                          test-utils/default-str-context
+                                                          {"person" "http://example.org/Person#"}]
                                                "insert" book-data})
                    query   "PREFIX book: <http://example.org/book/>
                             SELECT ?book ?title

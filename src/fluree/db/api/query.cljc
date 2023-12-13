@@ -2,8 +2,6 @@
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.core.async :as async]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
@@ -28,14 +26,11 @@
   (go-try
    (let [{:keys [opts]} query-map
          {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map)
-         db*            (if-let [policy-identity (perm/policy-identity
-                                                  ;;TODO only using query supplied context for policy opts,
-                                                  ;;should be the only context operation once we have removed
-                                                  ;;default-context
-                                                  (assoc opts :context
-                                                         (ctx-util/extract-supplied-context parsed)))]
-                          (<? (perm/wrap-policy db policy-identity))
-                          db)
+
+         ctx (ctx-util/extract parsed)
+         db* (if-let [policy-identity (perm/parse-policy-identity opts ctx)]
+               (<? (perm/wrap-policy db policy-identity))
+               db)
          ;; from and to are positive ints, need to convert to negative or fill in default values
          {:keys [from to at]} t
          [from-t to-t] (if at
@@ -53,8 +48,7 @@
                                 (number? to) (- to)
                                 (nil? to) (:t db*))])
 
-         context        (ctx-util/get-context parsed)
-         parsed-context (dbproto/-context db context (:context-type opts))
+         context        (ctx-util/extract parsed)
          error-ch       (async/chan)]
      (if history
        ;; filter flakes for history pattern
@@ -66,12 +60,12 @@
 
              flakes               (async/<! (async/into [] flake-ch))
 
-             history-results-chan (history/history-flakes->json-ld db* parsed-context error-ch flakes)]
+             history-results-chan (history/history-flakes->json-ld db* context error-ch flakes)]
 
          (if commit-details
            ;; annotate with commit details
            (async/alt!
-            (async/into [] (history/add-commit-details db* parsed-context error-ch history-results-chan))
+            (async/into [] (history/add-commit-details db* context error-ch history-results-chan))
             ([result] result)
             error-ch ([e] e))
 
@@ -82,7 +76,7 @@
 
        ;; just commits over a range of time
        (let [flake-slice-ch    (query-range/time-range db* :tspo = [] {:from-t from-t :to-t to-t})
-             commit-results-ch (history/commit-flakes->json-ld db* parsed-context error-ch flake-slice-ch)]
+             commit-results-ch (history/commit-flakes->json-ld db* context error-ch flake-slice-ch)]
          (async/alt!
           (async/into [] commit-results-ch) ([result] result)
           error-ch ([e] e)))))))
@@ -112,9 +106,9 @@
     did (assoc :did did :issuer did)))
 
 (defn restrict-db
-  [db t opts]
+  [db t context opts]
   (go-try
-    (let [db*  (if-let [policy-identity (perm/policy-identity opts)]
+    (let [db*  (if-let [policy-identity (perm/parse-policy-identity opts context)]
                  (<? (perm/wrap-policy db policy-identity))
                  db)
           db** (-> (if t
@@ -123,12 +117,12 @@
       (assoc-in db** [:policy :cache] (atom {})))))
 
 (defn track-query
-  [db ctx max-fuel query]
+  [db max-fuel query]
   (go-try
     (let [start        #?(:clj  (System/nanoTime)
                           :cljs (util/current-time-millis))
           fuel-tracker (fuel/tracker max-fuel)]
-      (try* (let [result (<? (fql/query db ctx fuel-tracker query))]
+      (try* (let [result (<? (fql/query db fuel-tracker query))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start)
@@ -148,25 +142,20 @@
     (let [{query :subject, did :did}  (or (<? (cred/verify query))
                                           {:subject query})
           {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
-          ;;TODO: only using query context for opts, should be only context
-          ;;once default-context is removed
-          q-ctx    (ctx-util/extract-supplied-context query*)
-          db*      (<? (restrict-db db t (assoc opts :context q-ctx)))
+
+          ;; TODO: extracting query context here for policy only to do it later
+          ;; while parsing the query. We need to consolidate both policy and
+          ;; query parsing while cleaning up the query api call stack.
+          q-ctx    (ctx-util/extract query*)
+          db*      (<? (restrict-db db t q-ctx opts))
           query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
-          ctx      (ctx-util/extract db* query** opts)
           max-fuel (:max-fuel opts)]
       (if (::util/track-fuel? opts)
-        (<? (track-query db* ctx max-fuel query**))
-        (<? (fql/query db* ctx query**))))))
+        (<? (track-query db* max-fuel query**))
+        (<? (fql/query db* query**))))))
 
 (defn query-sparql
   [db query]
-  (let [context-type (dbproto/-context-type db)]
-    (when-not (= :string context-type)
-      (throw (ex-info (str "SPARQL queries require context-type to be :string. "
-                           "This db's context-type is " context-type)
-                      {:status 400
-                       :error  :db/invalid-db}))))
   (go-try
     (let [fql (sparql/->fql query)]
       (<? (query-fql db fql)))))
@@ -190,20 +179,20 @@
       e)))
 
 (defn load-alias
-  [conn alias t opts]
+  [conn alias t context opts]
   (go-try
    (try*
      (let [address (<? (nameservice/primary-address conn alias nil))
            ledger  (<? (jld-ledger/load conn address))
            db      (ledger-proto/-db ledger)]
-       (<? (restrict-db db t opts)))
+       (<? (restrict-db db t context opts)))
      (catch* e
        (throw (contextualize-ledger-400-error
                (str "Error loading ledger " alias ": ")
                e))))))
 
 (defn load-aliases
-  [conn aliases global-t opts]
+  [conn aliases global-t context opts]
   (when (some? global-t)
     (try*
       (util/str->epoch-ms global-t)
@@ -218,21 +207,24 @@
           db-map      {}]
      (if alias
        ;; TODO: allow restricting federated dataset components individually by t
-       (let [db      (<? (load-alias conn alias global-t opts))
+       (let [db      (<? (load-alias conn alias global-t context opts))
              db-map* (assoc db-map alias db)]
          (recur r db-map*))
        db-map))))
 
 (defn load-dataset
-  [conn defaults named global-t opts]
+  [conn defaults named global-t context opts]
   (go-try
     (if (and (= (count defaults) 1)
              (empty? named))
       (let [alias (first defaults)]
-        (<? (load-alias conn alias global-t opts))) ; return an unwrapped db if the data set
-                                                    ; consists of one ledger
+        (<? (load-alias conn alias global-t context opts))) ; return an
+                                                            ; unwrapped db if
+                                                            ; the data set
+                                                            ; consists of one
+                                                            ; ledger
       (let [all-aliases  (->> defaults (concat named) distinct)
-            db-map       (<? (load-aliases conn all-aliases global-t opts))
+            db-map       (<? (load-aliases conn all-aliases global-t context opts))
             default-coll (-> db-map
                              (select-keys defaults)
                              vals)
@@ -250,19 +242,14 @@
           named-aliases   (some-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [ds          (<? (load-dataset conn default-aliases named-aliases t
-                                            (assoc  opts :context (ctx-util/extract-supplied-context query))))
+        (let [s-ctx       (ctx-util/extract query)
+              ds          (<? (load-dataset conn default-aliases named-aliases t
+                                            s-ctx opts))
               query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
-              max-fuel    (:max-fuel opts)
-              default-ctx (conn-proto/-default-context conn)
-              q-ctx       (ctx-util/get-context query**)
-              ctx-type    (or (:context-type opts)
-                              (conn-proto/-context-type conn))
-              ctx         (ctx-util/retrieve-context default-ctx q-ctx ctx-type)]
-
+              max-fuel    (:max-fuel opts)]
           (if (::util/track-fuel? opts)
-            (<? (track-query ds ctx max-fuel query**))
-            (<? (fql/query ds ctx query**))))
+            (<? (track-query ds max-fuel query**))
+            (<? (fql/query ds query**))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))
 

@@ -1,5 +1,5 @@
 (ns fluree.db.transact.retraction-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]))
 
@@ -9,9 +9,10 @@
           ledger         @(fluree/create conn "tx/retract")
           db             @(fluree/stage
                             (fluree/db ledger)
-                            {"@context" "https://ns.flur.ee"
+                            {"@context" ["https://ns.flur.ee"]
                              "insert"
-                             {:context ["" {:ex "http://example.org/ns/"}]
+                             {:context [test-utils/default-context
+                                        {:ex "http://example.org/ns/"}]
                               :graph   [{:id          :ex/alice,
                                          :type        :ex/User,
                                          :schema/name "Alice"
@@ -29,13 +30,15 @@
                             db
                             {"@context" "https://ns.flur.ee"
                              "delete"
-                             {:context    ["" {:ex "http://example.org/ns/"}]
+                             {:context    [test-utils/default-context
+                                           {:ex "http://example.org/ns/"}]
                               :id         :ex/alice,
                               :schema/age 42}})]
       (is (= [{:id           :ex/alice,
                :type     :ex/User,
                :schema/name  "Alice"}]
              @(fluree/query db-age-retract
-                            '{:context ["" {:ex "http://example.org/ns/"}],
-                              :select {:ex/alice [:*]}}))
+                            {:context [test-utils/default-context
+                                       {:ex "http://example.org/ns/"}],
+                             :select {:ex/alice [:*]}}))
           "Alice should no longer have an age property"))))

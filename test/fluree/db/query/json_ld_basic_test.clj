@@ -1,15 +1,17 @@
 (ns fluree.db.query.json-ld-basic-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration json-ld-basic-query
   (testing "json-ld"
-    (let [conn   (test-utils/create-conn)
-          movies (test-utils/load-movies conn)
-          db     (fluree/db movies)]
+    (let [conn    (test-utils/create-conn)
+          movies  (test-utils/load-movies conn)
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]
+          db      (fluree/db movies)]
       (testing "basic wildcard single subject query"
-        (let [q         '{:select {:wiki/Q836821 [:*]}}
+        (let [q         {:context context
+                         :select  {:wiki/Q836821 [:*]}}
               query-res @(fluree/query db q)]
           (is (= [{:id                               :wiki/Q836821,
                    :type                             :schema/Movie,
@@ -20,13 +22,16 @@
                  query-res)
               "Basic select * is working will context normalization")))
       (testing "basic single subject query with explicit field selection"
-        (let [query-res @(fluree/query db '{:select {:wiki/Q836821 [:id :schema/name]}})]
+        (let [query-res @(fluree/query db {:context context
+                                           :select  {:wiki/Q836821 [:id :schema/name]}})]
           (is (= [{:id :wiki/Q836821, :schema/name "The Hitchhiker's Guide to the Galaxy"}] query-res))))
       (testing "basic single subject query with selectOne"
-        (let [query-res @(fluree/query db '{:selectOne {:wiki/Q836821 [:id :schema/name]}})]
+        (let [query-res @(fluree/query db {:context   context
+                                           :selectOne {:wiki/Q836821 [:id :schema/name]}})]
           (is (= {:id :wiki/Q836821, :schema/name "The Hitchhiker's Guide to the Galaxy"} query-res))))
       (testing "basic single subject query with graph crawl"
-        (let [query-res @(fluree/query db '{:selectOne {:wiki/Q836821 [:* {:schema/isBasedOn [:*]}]}})]
+        (let [query-res @(fluree/query db {:context   context
+                                           :selectOne {:wiki/Q836821 [:* {:schema/isBasedOn [:*]}]}})]
           (is (= {:id                               :wiki/Q836821,
                   :type                             :schema/Movie,
                   :schema/name                      "The Hitchhiker's Guide to the Galaxy",
@@ -40,47 +45,51 @@
                  query-res))))
       (testing "basic single subject query using depth graph crawl"
         (testing "using only wildcard"
-          (let [query-res @(fluree/query db '{:selectOne {:wiki/Q836821 [:*]}
-                                              :depth 3})]
+          (let [query-res @(fluree/query db {:context   context
+                                             :selectOne {:wiki/Q836821 [:*]}
+                                             :depth     3})]
             (is (= {:id                               :wiki/Q836821,
                     :type                             :schema/Movie,
                     :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                     :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                     :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
                     :schema/isBasedOn                 {:id            :wiki/Q3107329,
-                                                       :type      :schema/Book,
+                                                       :type          :schema/Book,
                                                        :schema/name   "The Hitchhiker's Guide to the Galaxy",
                                                        :schema/isbn   "0-330-25864-8",
                                                        :schema/author {:id          :wiki/Q42,
-                                                                       :type    :schema/Person,
+                                                                       :type        :schema/Person,
                                                                        :schema/name "Douglas Adams"}}}
                    query-res))))
         (testing "using graph sub-selection"
-          (let [query-res @(fluree/query db '{:selectOne {:wiki/Q836821 [:* {:schema/isBasedOn [:*]}]}
-                                              :depth 3})]
+          (let [query-res @(fluree/query db {:context   context
+                                             :selectOne {:wiki/Q836821 [:* {:schema/isBasedOn [:*]}]}
+                                             :depth     3})]
             (is (= {:id                               :wiki/Q836821,
                     :type                             :schema/Movie,
                     :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                     :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                     :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
                     :schema/isBasedOn                 {:id            :wiki/Q3107329,
-                                                       :type      :schema/Book,
+                                                       :type          :schema/Book,
                                                        :schema/name   "The Hitchhiker's Guide to the Galaxy",
                                                        :schema/isbn   "0-330-25864-8",
                                                        :schema/author {:id          :wiki/Q42,
-                                                                       :type    :schema/Person,
+                                                                       :type        :schema/Person,
                                                                        :schema/name "Douglas Adams"}}}
                    query-res))))))))
 
 (deftest ^:integration json-ld-rdf-type-query
   (testing "json-ld rdf type queries"
-    (let [conn   (test-utils/create-conn)
-          movies (test-utils/load-movies conn)
-          db     (fluree/db movies)]
+    (let [conn    (test-utils/create-conn)
+          movies  (test-utils/load-movies conn)
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]
+          db      (fluree/db movies)]
       (testing "basic analytical RFD type query"
-        (let [query-res @(fluree/query db '{:select {?s [:* {:schema/isBasedOn [:*]}]}
-                                            :where  {:id   ?s
-                                                     :type :schema/Movie}})]
+        (let [query-res @(fluree/query db {:context context
+                                           :select  '{?s [:* {:schema/isBasedOn [:*]}]}
+                                           :where   '{:id   ?s
+                                                      :type :schema/Movie}})]
           (is (= [{:id                               :wiki/Q2875,
                    :type                             :schema/Movie,
                    :schema/disambiguatingDescription "1939 film by Victor Fleming",
@@ -121,78 +130,78 @@
 
 (deftest ^:integration json-ld-list-order-preservation
   (testing "json-ld @container @list option"
-    (let [conn   (test-utils/create-conn)
-          movies (test-utils/load-movies conn)]
+    (let [conn    (test-utils/create-conn)
+          movies  (test-utils/load-movies conn)
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]]
       (testing "define @list container in context"
         (let [db        @(fluree/stage (fluree/db movies)
-                                        {"@context" "https://ns.flur.ee"
-                                         "insert"
-                                         {:context {:id      "@id"
-                                                    :ex      "http://example.org/ns#"
-                                                    :ex/list {"@container" "@list"}}
-                                          :id      "list-test"
-                                          :ex/list [42 2 88 1]}})
-              query-res @(fluree/query db '{:context   ["" {:ex "http://example.org/ns#"}]
-                                            :selectOne {"list-test" [:*]}})]
+                                       {"@context" ["https://ns.flur.ee" context]
+                                        "insert"
+                                        {:context {:id      "@id"
+                                                   :ex/list {"@container" "@list"}}
+                                         :id      "list-test"
+                                         :ex/list [42 2 88 1]}})
+              query-res @(fluree/query db {:context   context
+                                           :selectOne {"list-test" [:*]}})]
           (is (= {:id      "list-test"
                   :ex/list [42 2 88 1]}
                  query-res)
               "Order of query result is different from transaction.")))
       (testing "define @list directly on subject"
         (let [db        @(fluree/stage (fluree/db movies)
-                                        {"@context" "https://ns.flur.ee"
-                                         "insert"
-                                         {:context {:id      "@id"
-                                                    :ex      "http://example.org/ns#"}
-                                          :id      "list-test2"
-                                          :ex/list {"@list" [42 2 88 1]}}})
-              query-res @(fluree/query db '{:context   ["" {:ex "http://example.org/ns#"}],
-                                            :selectOne {"list-test2" [:*]},})]
+                                       {"@context" ["https://ns.flur.ee" context]
+                                        "insert"
+                                        {:context {:id "@id"}
+                                         :id      "list-test2"
+                                         :ex/list {"@list" [42 2 88 1]}}})
+              query-res @(fluree/query db {:context   context,
+                                           :selectOne {"list-test2" [:*]},})]
           (is (= {:id      "list-test2"
                   :ex/list [42 2 88 1]}
                  query-res)
               "Order of query result is different from transaction."))))))
 
 (deftest ^:integration simple-subject-crawl-test
-  (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/simple-subject-crawl" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-        db     @(fluree/stage
-                  (fluree/db ledger)
-                  {"@context" "https://ns.flur.ee"
-                   "insert"
-                   [{:id           :ex/brian,
-                     :type         :ex/User,
-                     :schema/name  "Brian"
-                     :ex/last      "Smith"
-                     :schema/email "brian@example.org"
-                     :schema/age   50
-                     :ex/favColor  "Green"
-                     :ex/favNums   7}
-                    {:id           :ex/alice,
-                     :type         :ex/User,
-                     :schema/name  "Alice"
-                     :ex/last      "Smith"
-                     :schema/email "alice@example.org"
-                     :ex/favColor  "Green"
-                     :schema/age   42
-                     :ex/favNums   [42, 76, 9]}
-                    {:id           :ex/cam,
-                     :type         :ex/User,
-                     :schema/name  "Cam"
-                     :ex/last      "Jones"
-                     :schema/email "cam@example.org"
-                     :schema/age   34
-                     :ex/favColor  "Blue"
-                     :ex/favNums   [5, 10]
-                     :ex/friend    [:ex/brian :ex/alice]}
-                    {:id           :ex/david,
-                     :type         :ex/User,
-                     :schema/name  "David"
-                     :ex/last      "Jones"
-                     :schema/email "david@example.org"
-                     :schema/age   46
-                     :ex/favNums   [15 70]
-                     :ex/friend    [:ex/cam]}]})]
+  (let [conn    (test-utils/create-conn)
+        ledger  @(fluree/create conn "query/simple-subject-crawl")
+        context [test-utils/default-context {:ex "http://example.org/ns/"}]
+        db      @(fluree/stage
+                   (fluree/db ledger)
+                   {"@context" ["https://ns.flur.ee" context]
+                    "insert"
+                    [{:id           :ex/brian,
+                      :type         :ex/User,
+                      :schema/name  "Brian"
+                      :ex/last      "Smith"
+                      :schema/email "brian@example.org"
+                      :schema/age   50
+                      :ex/favColor  "Green"
+                      :ex/favNums   7}
+                     {:id           :ex/alice,
+                      :type         :ex/User,
+                      :schema/name  "Alice"
+                      :ex/last      "Smith"
+                      :schema/email "alice@example.org"
+                      :ex/favColor  "Green"
+                      :schema/age   42
+                      :ex/favNums   [42, 76, 9]}
+                     {:id           :ex/cam,
+                      :type         :ex/User,
+                      :schema/name  "Cam"
+                      :ex/last      "Jones"
+                      :schema/email "cam@example.org"
+                      :schema/age   34
+                      :ex/favColor  "Blue"
+                      :ex/favNums   [5, 10]
+                      :ex/friend    [:ex/brian :ex/alice]}
+                     {:id           :ex/david,
+                      :type         :ex/User,
+                      :schema/name  "David"
+                      :ex/last      "Jones"
+                      :schema/email "david@example.org"
+                      :schema/age   46
+                      :ex/favNums   [15 70]
+                      :ex/friend    [:ex/cam]}]})]
     (testing "direct id"
       ;;TODO not getting reparsed as ssc
       (is (= [{:id           :ex/brian,
@@ -203,7 +212,8 @@
                :schema/age   50
                :ex/favColor  "Green"
                :ex/favNums   7}]
-             @(fluree/query db {:select {:ex/brian ["*"]}}))))
+             @(fluree/query db {:context context
+                                :select  {:ex/brian ["*"]}}))))
     ;;TODO not getting reparsed as ssc
     (testing "iri from `where`"
       (is (= [{:id           :ex/david
@@ -239,9 +249,10 @@
                :schema/age   50
                :ex/favColor  "Green"
                :ex/favNums   7}]
-             @(fluree/query db {:select {"?s" ["*"]}
-                                :where  {:id   "?s"
-                                         :type :ex/User}}))))
+             @(fluree/query db {:context context
+                                :select  {"?s" ["*"]}
+                                :where   {:id   "?s"
+                                          :type :ex/User}}))))
     (testing "tuple"
       (is (= [{:id           :ex/alice
                :type         :ex/User
@@ -251,9 +262,10 @@
                :schema/age   42
                :ex/favNums   [9 42 76]
                :ex/favColor  "Green"}]
-             @(fluree/query db {:select {"?s" ["*"]}
-                                :where  {:id          "?s"
-                                         :schema/name "Alice"}})))
+             @(fluree/query db {:context context
+                                :select  {"?s" ["*"]}
+                                :where   {:id          "?s"
+                                          :schema/name "Alice"}})))
       (is (= [{:type         :ex/User
                :schema/email "cam@example.org"
                :ex/favNums   [5 10]
@@ -279,9 +291,10 @@
                :ex/last      "Smith",
                :schema/email "brian@example.org",
                :schema/name  "Brian"}]
-             @(fluree/query db {:select {"?s" ["*"]}
-                                :where  {:id          "?s"
-                                         :ex/favColor "?color"}})))
+             @(fluree/query db {:context context
+                                :select  {"?s" ["*"]}
+                                :where   {:id          "?s"
+                                          :ex/favColor "?color"}})))
 
       (is (= [{:type         :ex/User
                :schema/email "cam@example.org"
@@ -300,10 +313,11 @@
                :schema/age   42
                :ex/favNums   [9 42 76]
                :ex/favColor  "Green"}]
-             @(fluree/query db {:select {"?s" ["*"]}
-                                :where  {:id          "?s"
-                                         :ex/favColor "?color"}
-                                :limit  2})))
+             @(fluree/query db {:context context
+                                :select  {"?s" ["*"]}
+                                :where   {:id          "?s"
+                                          :ex/favColor "?color"}
+                                :limit   2})))
 
       (is (= [{:id           :ex/alice
                :type         :ex/User
@@ -313,9 +327,10 @@
                :schema/age   42
                :ex/favNums   [9 42 76]
                :ex/favColor  "Green"}]
-             @(fluree/query db {:select {"?s" ["*"]}
-                                :where  {:id         "?s"
-                                         :schema/age 42}})))
+             @(fluree/query db {:context context
+                                :select  {"?s" ["*"]}
+                                :where   {:id         "?s"
+                                          :schema/age 42}})))
       (is (= [{:id           :ex/alice,
                :type         :ex/User,
                :ex/favNums   [9 42 76],
@@ -324,31 +339,33 @@
                :ex/last      "Smith",
                :schema/email "alice@example.org",
                :schema/name  "Alice"}]
-             @(fluree/query db {:select {"?s" ["*"]}
-                                :where  {:id          "?s"
-                                         :schema/age  42
-                                         :ex/favColor "Green"}}))))))
+             @(fluree/query db {:context context
+                                :select  {"?s" ["*"]}
+                                :where   {:id          "?s"
+                                          :schema/age  42
+                                          :ex/favColor "Green"}}))))))
 
 (deftest ^:integration query-with-faux-compact-iri
   (testing "query with a faux compact IRI works"
-    (let [conn   (test-utils/create-conn
-                  {:context      test-utils/default-str-context
-                   :context-type :string})
+    (let [conn   (test-utils/create-conn)
           alias  "faux-compact-iri-query"
           ledger @(fluree/create conn alias)
           db0    @(fluree/stage (fluree/db ledger)
-                                 {"@context" "https://ns.flur.ee"
-                                  "insert"
-                                  [{"id"      "foo"
-                                    "ex:name" "Foo"}
-                                   {"id"      "foaf:bar"
-                                    "ex:name" "Bar"}]})
+                                {"@context" ["https://ns.flur.ee"
+                                             test-utils/default-str-context]
+                                 "insert"
+                                 [{"id"      "foo"
+                                   "ex:name" "Foo"}
+                                  {"id"      "foaf:bar"
+                                   "ex:name" "Bar"}]})
           _      @(fluree/commit! ledger db0)
           db1    (->> alias (fluree/load conn) deref fluree/db)]
 
       (is (= [["foaf:bar" "Bar"] ["foo" "Foo"]]
-             @(fluree/query db1 {"select"   ["?f" "?n"]
-                                 "where"    {"id"     "?f"
+             @(fluree/query db1 {"@context" test-utils/default-str-context
+                                 "select"   ["?f" "?n"]
+                                 "where"    {"id"      "?f"
                                              "ex:name" "?n"}})))
       (is (= [{"id" "foo", "ex:name" "Foo"}]
-             @(fluree/query db1 {"select" {"foo" ["*"]}}))))))
+             @(fluree/query db1 {"@context" test-utils/default-str-context
+                                 "select"   {"foo" ["*"]}}))))))

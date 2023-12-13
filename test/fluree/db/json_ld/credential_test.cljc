@@ -113,13 +113,12 @@
 
 #?(:clj
    (deftest ^:integration cred-wrapped-transactions-and-queries
-     (let [conn   @(fluree/connect {:method :memory})
-           ledger @(fluree/create conn "credentialtest" {:defaultContext
-                                                         [test-utils/default-str-context
-                                                          {"ct" "ledger:credentialtest/"}]})
-
-           db0       @(test-utils/transact ledger {"@context" "https://ns.flur.ee"
-                                                   "insert"  {"@id" "ct:open" "ct:foo" "bar"}})
+     (let [conn      @(fluree/connect {:method :memory})
+           ledger    @(fluree/create conn "credentialtest")
+           context   (merge test-utils/default-str-context
+                            {"ct" "ledger:credentialtest/"})
+           db0       @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
+                                                   "insert"   {"@id" "ct:open" "ct:foo" "bar"}})
            root-user {"id" (:id auth) "ct:name" "Daniel" "f:role" {"id" "role:cool"} "ct:favnums" [1 2 3]}
            pleb-user {"id" (:id pleb-auth) "ct:name" "Plebian" "f:role" [{"id" "role:notcool"}
                                                                          { "id" "role:irrelevant"}]}
@@ -130,27 +129,30 @@
                                        "f:action"     [{"id" "f:view"} {"id" "f:modify"}]}]}
            tx        [root-user pleb-user policy]
            ;; can't use credentials until after an identity with a role has been created
-           db1       @(test-utils/transact ledger {"@context" "https://ns.flur.ee"
-                                                   "insert"  tx})
+           db1       @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
+                                                   "insert"   tx})
 
-           mdfn {"@context" "https://ns.flur.ee"
-                 "delete" {"@id"     "?s"
-                           "ct:name"    "Daniel"
-                           "ct:favnums" 1}
-                 "insert" {"@id"     "?s"
-                           "ct:name"    "D"
-                           "ct:favnums" [4 5 6]}
-                 "where"  {"@id" "?s"}
-                 "values" ["?s" [(:id auth)]]}
+           mdfn {"@context" ["https://ns.flur.ee" context]
+                 "delete"   {"@id"        "?s"
+                             "ct:name"    "Daniel"
+                             "ct:favnums" 1}
+                 "insert"   {"@id"        "?s"
+                             "ct:name"    "D"
+                             "ct:favnums" [4 5 6]}
+                 "where"    {"@id" "?s"}
+                 "values"   ["?s" [(:id auth)]]}
 
            db2 @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
 
-           query {"select" {(:id auth) ["*"]}}]
+           query {"@context" context
+                  "select"   {(:id auth) ["*"]}}]
        (is (= [{"id" "ct:open", "ct:foo" "bar"}]
-              @(fluree/query db0 {"select" {"ct:open" ["*"]}}))
+              @(fluree/query db0 {"@context" context
+                                  "select"   {"ct:open" ["*"]}}))
            "can see everything when no identity is asserted")
        (is (= "Applying policy without a role is not yet supported."
-              (-> @(fluree/query db0 (async/<!! (cred/generate {"select" {"open" ["*"]}}
+              (-> @(fluree/query db0 (async/<!! (cred/generate {"@context" context
+                                                                "select"   {"open" ["*"]}}
                                                                (:private auth))))
                   (Throwable->map)
                   :cause))
@@ -164,10 +166,10 @@
        (is (= []
               @(fluree/query (fluree/db ledger) (async/<!! (cred/generate query (:private pleb-auth)))))
            "query credential w/ policy forbidding access")
-       (is (= [{"id"      (:id auth)
+       (is (= [{"id"         (:id auth)
                 "ct:name"    "D"
                 "ct:favnums" [2 3 4 5 6]
-                "f:role"  {"id" "role:cool"}}]
+                "f:role"     {"id" "role:cool"}}]
               @(fluree/query db2 (async/<!! (cred/generate query (:private auth)))))
            "query credential w/ policy allowing access")
 
@@ -175,17 +177,20 @@
               @(fluree/query db2 (async/<!! (cred/generate query (:private other-auth)))))
            "query credential w/ no roles")
        (is (= [{"f:t"       2,
-                "f:assert"  [{"id" (:id auth)
-                              "ct:name" "Daniel"
+                "f:assert"  [{"id"         (:id auth)
+                              "ct:name"    "Daniel"
                               "ct:favnums" [1 2 3],
-                              :id (:id auth)
-                              "f:role" {"id" "role:cool"}}],
+                              :id          (:id auth)
+                              "f:role"     {"id" "role:cool"}}],
                 "f:retract" []}
 
                {"f:t"       3,
                 "f:assert"  [{"ct:name" "D", "ct:favnums" [4 5 6], :id (:id auth)}],
                 "f:retract" [{"ct:name" "Daniel", "ct:favnums" 1, :id (:id auth)}]}]
-              @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private auth)))))
+              @(fluree/history ledger (async/<!! (cred/generate {:context context
+                                                                 :history (:id auth)
+                                                                 :t {:from 1}}
+                                                                (:private auth)))))
            "history query credential - allowing access")
        (is (= "Subject identity does not exist: \"did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh\""
               (-> @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private pleb-auth))))

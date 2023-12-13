@@ -229,9 +229,9 @@
                             {:s parsed-query}
                             parsed-query)
 
-          [s p o] [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) {:strict? true})))
-                   (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) {:strict? true})))
-                   (when o (jld-db/expand-iri db o context))]
+          [s p o] [(when s (<? (dbproto/-subid db (json-ld/expand-iri s context) {:strict? true})))
+                   (when p (<? (dbproto/-subid db (json-ld/expand-iri p context) {:strict? true})))
+                   (when o (json-ld/expand-iri o context))]
 
           idx     (index/for-components s p o nil)
           pattern (case idx
@@ -252,18 +252,14 @@
 
   These are flakes that we insert which describe
   the data, but are not part of the data asserted
-  by the user.
-
-  Any :f/address flakes whose sids match filtered-sid will be ignored. This was
-  added to handle defaultContext :f/address flakes."
-  [filtered-sid f]
+  by the user."
+  [f]
   (let [pred (flake/p f)]
     (or (#{const/$_commitdata:t
            const/$_commitdata:size
            const/$_previous
            const/$_commitdata:flakes} pred)
-        (and (= const/$_address pred)
-             (not= filtered-sid (flake/s f))))))
+        (= const/$_address pred))))
 
 (defn extra-data-flake?
   [f]
@@ -278,7 +274,6 @@
      (let [default-ctx-sid     (some #(when (= const/$_ledger:context (flake/p %))
                                         (flake/o %))
                                      t-flakes)
-           commit-meta?        (partial commit-metadata-flake? default-ctx-sid)
            {commit-wrapper-flakes :commit-wrapper
             commit-meta-flakes    :commit-meta
             assert-flakes         :assert-flakes
@@ -286,7 +281,7 @@
            (group-by (fn [f]
                        (cond
                          (commit-wrapper-flake? f) :commit-wrapper
-                         (commit-meta? f) :commit-meta
+                         (commit-metadata-flake? f) :commit-meta
                          (and (flake/op f) (not (extra-data-flake? f))
                               (not= default-ctx-sid (flake/s f))) :assert-flakes
                          (and (not (flake/op f)) (not (extra-data-flake? f))) :retract-flakes

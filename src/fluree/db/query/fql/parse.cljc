@@ -6,9 +6,9 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.select :as select]
-            [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.util.context :as context]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.validation :as v]
@@ -523,11 +523,12 @@
     q))
 
 (defn parse-analytical-query
-  [q context]
-  (let [[vars values] (parse-values q)
-        where    (parse-where q vars context)
-        grouping (parse-grouping q)
-        ordering (parse-ordering q)]
+  [q]
+  (let [context       (context/extract q)
+        [vars values] (parse-values q)
+        where         (parse-where q vars context)
+        grouping      (parse-grouping q)
+        ordering      (parse-ordering q)]
     (-> q
         (assoc :context context
           :where where)
@@ -539,52 +540,9 @@
         parse-fuel)))
 
 (defn parse-query
-  [q context]
+  [q]
   (log/trace "parse-query" q)
-  (-> q
-      syntax/coerce-query
-      (parse-analytical-query context)))
-
-(defn parse-update-clause
-  [clause context]
-  (->> clause
-       util/sequential
-       (mapcat (fn [m]
-                 (parse-node-map m context)))))
-
-(defn- assoc-values
-  [mdfn values]
-  (if (seq values)
-    (assoc mdfn :values values)
-    mdfn))
-
-(defn- assoc-delete
-  [mdfn context]
-  (if (update/retract? mdfn)
-    (update mdfn :delete parse-update-clause context)
-    mdfn))
-
-(defn- assoc-insert
-  [mdfn context]
-  (if (update/insert? mdfn)
-    (update mdfn :insert parse-update-clause context)
-    mdfn))
-
-(defn parse-ledger-update
-  [mdfn context]
-  (let [[vars values] (parse-values mdfn)
-        where (parse-where mdfn vars context)
-        mdfn* (assoc mdfn :context context :where where)]
-    (-> mdfn*
-        (assoc-values values)
-        (assoc-delete context)
-        (assoc-insert context))))
-
-(defn parse-modification
-  [json-ld context]
-  (-> json-ld
-      syntax/coerce-modification
-      (parse-ledger-update context)))
+  (-> q syntax/coerce-query parse-analytical-query))
 
 (defn temp-bnode-id
   "Generate a temporary bnode id. This will get replaced during flake creation when a sid is generated."

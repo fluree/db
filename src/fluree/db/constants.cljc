@@ -33,7 +33,6 @@
 (def ^:const iri-message "https://ns.flur.ee/ledger#message")
 (def ^:const iri-tag "https://ns.flur.ee/ledger#tag")
 (def ^:const iri-updates "https://ns.flur.ee/ledger#updates")
-(def ^:const iri-default-context "https://ns.flur.ee/ledger#defaultContext")
 (def ^:const iri-Context "https://ns.flur.ee/ledger#Context")
 (def ^:const iri-allow "https://ns.flur.ee/ledger#allow")
 (def ^:const iri-equals "https://ns.flur.ee/ledger#equals")
@@ -236,5 +235,3 @@
 
 
 (def ^:const $_tag:id 30)
-
-(def ^:const $fluree:default-context 150)

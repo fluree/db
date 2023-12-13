@@ -57,15 +57,6 @@
     (.then (fluree/query db (assoc-in query* [:opts :context-type] :string))
            (fn [result] (clj->js result)))))
 
-(defn ^:export defaultContext
-  [db]
-  (-> db fluree/default-context clj->js))
-
-(defn ^:export defaultContextAtT
-  [ledger t]
-  (.then (fluree/default-context-at-t ledger t)
-         (fn [result] (clj->js result))))
-
 (log/set-level! :warning)
 
 (defn ^:export setLogging

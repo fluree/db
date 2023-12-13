@@ -1,13 +1,12 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [go alts!]]
             [fluree.db.constants :as const]
+            [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.ledger :as jld-ledger]
-            [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.ledger.proto :as ledger-proto]
@@ -18,7 +17,6 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -172,7 +170,7 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [new-flakes {:keys [stage-update? db-before iri->sid policy t] :as tx-state}]
+  [new-flakes {:keys [stage-update? db-before iri->sid policy t] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
@@ -180,17 +178,17 @@
 
           {:keys [last-pid last-sid]} @iri->sid
 
-          db-after  (-> db-before
-                        (update :ecount assoc const/$_predicate last-pid)
-                        (update :ecount assoc const/$_default last-sid)
-                        (assoc :policy policy) ;; re-apply policy to db-after
-                        (assoc :t t)
-                        (commit-data/update-novelty add remove)
-                        (commit-data/add-tt-id)
-                        (vocab/hydrate-schema add))]
-      {:add add :remove remove :db-after db-after})))
+          db-after (-> db-before
+                       (update :ecount assoc const/$_predicate last-pid)
+                       (update :ecount assoc const/$_default last-sid)
+                       (assoc :policy policy) ;; re-apply policy to db-after
+                       (assoc :t t)
+                       (commit-data/update-novelty add remove)
+                       (commit-data/add-tt-id)
+                       (vocab/hydrate-schema add))]
+      {:add add, :remove remove, :db-after db-after})))
 
-(defn flakes->final-db2
+(defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
   along with performing any final validation and policy enforcement."
   [tx-state flakes]
@@ -212,24 +210,16 @@
    (stage db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (go-try
-    (let [db* (if-let [policy-identity (perm/policy-identity
-                                        (-> parsed-opts
-                                            ;;TODO once we remove default-context,
-                                            ;;should only have one context, with no need
-                                            ;;to swap here
-                                            (assoc :context
-                                                   (:supplied-context parsed-opts))
-                                            (dissoc :supplied-context)))]
-                (<? (perm/wrap-policy db policy-identity))
-                db)
+     (let [ctx           (:context parsed-opts)
+           parsed-txn    (q-parse/parse-txn txn ctx)
+           db*           (if-let [policy-identity (perm/parse-policy-identity parsed-opts ctx)]
+                           (<? (perm/wrap-policy db policy-identity))
+                           db)
            tx-state      (->tx-state db*)
-
-           txn-context   (dbproto/-context db* (:context parsed-opts))
-           parsed-txn    (q-parse/parse-txn txn txn-context)
            flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
            fuel-error-ch (:error-ch fuel-tracker)
            chans         (remove nil? [fuel-error-ch flakes-ch])
            [flakes]      (alts! chans :priority true)]
        (when (util/exception? flakes)
          (throw flakes))
-       (<? (flakes->final-db2 tx-state flakes))))))
+       (<? (flakes->final-db tx-state flakes))))))

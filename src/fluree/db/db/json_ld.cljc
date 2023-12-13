@@ -26,8 +26,7 @@
   {const/iri-view   {:root? true}
    const/iri-modify {:root? true}})
 
-
-(defn lookup-id
+(defn iri->sid
   "Returns subject id or nil if no match."
   [db iri]
   (go-try
@@ -35,33 +34,10 @@
             first
             flake/s)))
 
-(defn expand-iri
-  "Expands an IRI from the db's context."
-  ([db iri]
-   (expand-iri db iri ::dbproto/default-context))
-  ([db iri provided-context]
-   (if (keyword? iri)
-     (json-ld/expand-iri iri (dbproto/-context db provided-context :keyword))
-     (json-ld/expand-iri iri (dbproto/-context db provided-context :string)))))
-
-(defn iri->sid
-  "Returns subject id or nil if no match.
-
-  iri can be compact iri in string or keyword form."
-  [db iri {:keys [expand?]}]
-  (let [iri* (if expand?
-               (expand-iri db iri)
-               iri)]
-    ;; string? necessary because expand-iri will return original iri if not matched, and could be a keyword
-    (when (string? iri*)
-      (go-try
-        (<? (lookup-id db iri*))))))
-
-
 (defn subid
   "Returns subject ID of ident as async promise channel.
   Closes channel (nil) if doesn't exist, or if strict? is true, will return exception."
-  [db ident {:keys [strict?] :as opts}]
+  [db ident {:keys [strict?]}]
   (let [return-chan (async/promise-chan)]
     (go
       (try*
@@ -71,11 +47,11 @@
 
                         ;; assume iri
                         (string? ident)
-                        (<? (iri->sid db ident opts))
+                        (<? (iri->sid db ident))
 
                         ;; assume iri that needs to be expanded (should we allow this, or should it be expanded before getting this far?)
                         (keyword? ident)
-                        (<? (iri->sid db ident opts))
+                        (<? (iri->sid db ident))
 
                         ;; TODO - should we validate this is an ident predicate? This will return first result of any indexed value
                         (util/pred-ident? ident)
@@ -166,21 +142,11 @@
           (assoc-in [:stats :indexed] index-t))
       db)))
 
-(defn default-context-update
-  "Updates default context, so on next commit it will get written in the commit file."
-  [db default-context]
-  (let [default-context* (-> default-context
-                             (ctx-util/mapify-context (dbproto/-default-context db)) ;; allows 'extending' existing default context using empty string ""
-                             (ctx-util/stringify-context))]
-    (assoc db :default-context default-context*
-              :context-cache (volatile! {})
-              :new-context? true)))
-
 ;; ================ end Jsonld record support fns ============================
 
 (defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot post
                      opst tspo schema comparators novelty policy ecount
-                     default-context context-type context-cache new-context?]
+                     context-cache]
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
   (-c-prop [this property collection] (jsonld-c-prop this property collection))
@@ -189,28 +155,17 @@
       (get @(:subclasses schema) class)
       (get-in schema [:pred class property])))
   (-p-prop [this property predicate] (jsonld-p-prop this property predicate))
-  (-expand-iri [this compact-iri] (expand-iri this compact-iri))
-  (-expand-iri [this compact-iri context] (expand-iri this compact-iri context))
   (-subid [this ident] (subid this ident {:strict? false :expand? true}))
   (-subid [this ident opts] (subid this ident opts))
   (-class-ids [this subject] (class-ids this subject))
   (-iri [this subject-id] (iri this subject-id identity))
   (-iri [this subject-id compact-fn] (iri this subject-id compact-fn))
   (-query [this query-map]
-    (let [ctx-type (-> query-map :opts :context-type)
-          q-ctx    (ctx-util/get-context query-map)
-          ctx      (dbproto/-context this q-ctx ctx-type)]
-      (fql/query this ctx query-map)))
+    (fql/query this query-map))
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
   (-stage [db fuel-tracker json-ld opts] (jld-transact/stage db fuel-tracker json-ld opts))
-  (-index-update [db commit-index] (index-update db commit-index))
-  (-context [_] (ctx-util/retrieve-context default-context context-cache ::dbproto/default-context context-type))
-  (-context [_ context] (ctx-util/retrieve-context default-context context-cache context context-type))
-  (-context [_ context type] (ctx-util/retrieve-context default-context context-cache context (or type context-type)))
-  (-default-context [_] default-context)
-  (-default-context-update [db default-context] (default-context-update db default-context))
-  (-context-type [_] context-type))
+  (-index-update [db commit-index] (index-update db commit-index)))
 
 #?(:cljs
    (extend-type JsonLdDb
@@ -256,7 +211,7 @@
   (flake/create const/$rdf:type const/$xsd:anyURI "@type" const/$xsd:string 0 true nil))
 
 (defn create
-  [{:keys [method alias conn] :as ledger} default-context context-type new-context?]
+  [{:keys [method alias conn] :as ledger}]
   (let [novelty       (new-novelty-map index/default-comparators)
         {spot-cmp :spot
          post-cmp :post
@@ -269,10 +224,7 @@
         tspo          (index/empty-branch alias tspo-cmp)
         stats         {:flakes 0, :size 0, :indexed 0}
         schema        (vocab/base-schema)
-        branch        (branch/branch-meta ledger)
-        context-type* (if (not= :keyword context-type)
-                        :string
-                        context-type)]
+        branch        (branch/branch-meta ledger)]
     (-> (map->JsonLdDb {:ledger          ledger
                         :conn            conn
                         :alias           alias
@@ -289,9 +241,6 @@
                         :comparators     index/default-comparators
                         :novelty         novelty
                         :policy          root-policy-map
-                        :default-context default-context
-                        :context-type    context-type*
                         :context-cache   (volatile! nil)
-                        :new-context?    new-context?
                         :ecount          genesis-ecount})
         (commit-data/update-novelty [identity-flake type-flake]))))

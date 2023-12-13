@@ -1,17 +1,15 @@
 (ns fluree.db.policy.basic-test
-  (:require
-   [clojure.test :refer :all]
-   [fluree.db.test-utils :as test-utils]
-   [fluree.db.json-ld.api :as fluree]
-   [fluree.db.did :as did]
-   [fluree.db.util.core :as util]
-   [clojure.string :as str]))
+  (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.did :as did]
+            [fluree.db.util.core :as util]
+            [clojure.string :as str]))
 
 
 (deftest ^:integration query-policy-enforcement
   (testing "Testing basic policy enforcement on queries."
-    (let [conn      @(fluree/connect {:method :memory
-                                      :defaults {:context-type :keyword}})
+    (let [conn      @(fluree/connect {:method :memory})
           context   [test-utils/default-context {:ex "http://example.org/ns/"}]
           ledger    @(fluree/create conn "policy/a")
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
@@ -70,10 +68,10 @@
                                                       :f/targetRole :ex/userRole
                                                       :f/action     [:f/view]
                                                       :f/equals     {:list [:f/$identity :ex/user]}}]}]}]})]
-      (let [root-wrapped-db            @(fluree/wrap-policy
-                                         db+policy {:did  root-did
-                                                    :role :ex/rootRole
-                                                    :context context})
+      (let [root-wrapped-db            @(fluree/wrap-policy db+policy
+                                                            {:did  root-did
+                                                             :role :ex/rootRole}
+                                                            context)
             double-policy-query-result @(fluree/query
                                          root-wrapped-db
                                          {:context context
@@ -288,18 +286,17 @@
   (testing "policies should work w/o an explicit f -> https://ns.flur.ee/ledger# context term"
     (let [conn        (test-utils/create-conn)
           ledger-name (str "policy-without-f-context-term-" (random-uuid))
-          ledger      @(fluree/create conn ledger-name
-                                      {:defaultContext
-                                       {:id     "@id"
-                                        :type   "@type"
-                                        :list   "@list"
-                                        :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-                                        :schema "http://schema.org/"
-                                        :ex     "http://example.org/ns/"}})
+          ledger      @(fluree/create conn ledger-name)
           alice-did   "did:fluree:Tf6i5oh2ssYNRpxxUM2zea1Yo7x4uRqyTeU"
           db          @(fluree/stage
                          (fluree/db ledger)
-                         {"@context" "https://ns.flur.ee"
+                         {"@context" ["https://ns.flur.ee"
+                                      {:id     "@id"
+                                       :type   "@type"
+                                       :list   "@list"
+                                       :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                                       :schema "http://schema.org/"
+                                       :ex     "http://example.org/ns/"}]
                           "insert"
                           [{:id          :ex/alice,
                             :type        :ex/User,
@@ -317,7 +314,13 @@
                             :ex/secret            "this is overpriced"}]})
           db          @(fluree/stage
                          db
-                         {"@context" "https://ns.flur.ee"
+                         {"@context" ["https://ns.flur.ee"
+                                      {:id     "@id"
+                                       :type   "@type"
+                                       :list   "@list"
+                                       :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                                       :schema "http://schema.org/"
+                                       :ex     "http://example.org/ns/"}]
                           "insert"
                           [{:id                              alice-did
                             :ex/user                         :ex/alice
@@ -343,54 +346,60 @@
       (is (= #{{:id :ex/bob, :type :ex/User, :schema/name "Bob"}
                {:id          :ex/alice, :type :ex/User, :ex/secret "alice's secret"
                 :schema/name "Alice"}}
-             (set @(fluree/query db {:where  '{:id   ?s
+             (set @(fluree/query db {:context {:id     "@id"
+                                               :type   "@type"
+                                               :list   "@list"
+                                               :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                                               :schema "http://schema.org/"
+                                               :ex     "http://example.org/ns/"}
+                                     :where  '{:id   ?s
                                                :type :ex/User}
                                      :select '{?s [:*]}
                                      :opts   {:role :ex/userRole
                                               :did  alice-did}})))))))
 
 (deftest ^:integration missing-type
-  (let [conn @(fluree/connect {:method :memory})
-        ledger @(fluree/create conn "policy" {:defaultContext [test-utils/default-str-context
-                                                               {"ex" "http://example.com/"}]})
-        db0 (fluree/db ledger)
+  (let [conn      @(fluree/connect {:method :memory})
+        ledger    @(fluree/create conn "policy")
+        db0       (fluree/db ledger)
+        context   [test-utils/default-str-context {"ex" "http://example.com/"}]
+        alice-did "did:fluree:Tf6i5oh2ssYNRpxxUM2zea1Yo7x4uRqyTeU"
 
-        alice-did    "did:fluree:Tf6i5oh2ssYNRpxxUM2zea1Yo7x4uRqyTeU"
-
-        db1 @(fluree/stage db0 {"@context" "https://ns.flur.ee"
-                                 "insert" [{"id" "ex:alice"
-                                            "type" "ex:User"
-                                            "ex:secret" "alice's secret"}
-                                           {"id" "ex:bob"
-                                            "type" "ex:User"
-                                            "ex:secret" "bob's secret"}
-                                           {"id" "ex:UserPolicy"
-                                            "type" ["f:Policy"]
-                                            "f:targetClass" {"id" "ex:User"}
-                                            "f:allow"
-                                            [{"id" "ex:globalViewAllow"
-                                              "f:targetRole" {"id" "ex:userRole"}
-                                              "f:action" [{"id" "f:view"}]}]
-                                            "f:property"
-                                            [{"f:path" {"id" "ex:secret"}
-                                              "f:allow"
-                                              [{"id" "ex:secretsRule"
-                                                "f:targetRole" {"id" "ex:userRole"}
-                                                "f:action" [{"id" "f:view"}
-                                                            {"id" "f:modify"}]
-                                                "f:equals" {"@list"
-                                                            [{"id" "f:$identity"}
-                                                             {"id" "ex:User"}]}}]}]}
-                                           {"id" alice-did
-                                            "ex:User" {"id" "ex:alice"}
-                                            "f:role" {"id" "ex:userRole"}}]})]
+        db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+                                "insert"   [{"id"        "ex:alice"
+                                             "type"      "ex:User"
+                                             "ex:secret" "alice's secret"}
+                                            {"id"        "ex:bob"
+                                             "type"      "ex:User"
+                                             "ex:secret" "bob's secret"}
+                                            {"id"            "ex:UserPolicy"
+                                             "type"          ["f:Policy"]
+                                             "f:targetClass" {"id" "ex:User"}
+                                             "f:allow"
+                                             [{"id"           "ex:globalViewAllow"
+                                               "f:targetRole" {"id" "ex:userRole"}
+                                               "f:action"     [{"id" "f:view"}]}]
+                                             "f:property"
+                                             [{"f:path" {"id" "ex:secret"}
+                                               "f:allow"
+                                               [{"id"           "ex:secretsRule"
+                                                 "f:targetRole" {"id" "ex:userRole"}
+                                                 "f:action"     [{"id" "f:view"}
+                                                                 {"id" "f:modify"}]
+                                                 "f:equals"     {"@list"
+                                                                 [{"id" "f:$identity"}
+                                                                  {"id" "ex:User"}]}}]}]}
+                                            {"id"      alice-did
+                                             "ex:User" {"id" "ex:alice"}
+                                             "f:role"  {"id" "ex:userRole"}}]})]
     (is (= #{{"id" "ex:alice", "type" "ex:User", "ex:secret" "alice's secret"}
              {"id" "ex:bob", "type" "ex:User"}}
            (set @(fluree/query db1
-                               {"select" {"?s" ["*"]}
-                                "where" {"@id" "?s" "type" "ex:User"}
-                                :opts {:role "ex:userRole"
-                                       :did alice-did}}))))))
+                               {"@context" context
+                                "select"   {"?s" ["*"]}
+                                "where"    {"@id" "?s" "type" "ex:User"}
+                                :opts      {:role "ex:userRole"
+                                            :did  alice-did}}))))))
 
 (deftest ^:integration root-read-only-policy
   (let [conn          @(fluree/connect {:method :memory})
