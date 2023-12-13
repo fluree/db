@@ -4,18 +4,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn txn-context
-  "Remove the fluree context from the supplied context."
-  [txn]
-  (let [supplied-context (when (or (contains? txn :context)
-                                   (contains? txn "@context"))
-                              (->> (get txn "@context" (:context txn))
-                                   (util/sequential)
-                                   (remove #{"https://ns.flur.ee"})))]
-
-    (when (seq supplied-context)
-      (json-ld/parse-context supplied-context))))
-
 (defn use-fluree-context
   "Clobber the top-level context and use the fluree context. This is only intended to be
   use for the initial expansion of the top-level document, where all the keys should be
@@ -30,6 +18,15 @@
   [jsonld]
   (cond (contains? jsonld :context) (:context jsonld)
         (contains? jsonld "@context") (get jsonld "@context")))
+
+(defn txn-context
+  "Remove the fluree context from the supplied context."
+  [txn]
+  (when-let [ctx (extract-supplied-context txn)]
+    (->> ctx
+         util/sequential
+         (remove #{"https://ns.flur.ee"})
+         json-ld/parse-context)))
 
 (defn extract
   [jsonld]

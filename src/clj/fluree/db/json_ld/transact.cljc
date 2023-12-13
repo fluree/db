@@ -1,13 +1,10 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [go alts!]]
             [clojure.set :refer [map-invert]]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.shacl :as shacl]
@@ -212,9 +209,8 @@
   ([db fuel-tracker txn parsed-opts]
    (go-try
      (let [ctx           (:context parsed-opts)
-           s-ctx         (:supplied-context parsed-opts)
            parsed-txn    (q-parse/parse-txn txn ctx)
-           db*           (if-let [policy-identity (perm/parse-policy-identity parsed-opts s-ctx)]
+           db*           (if-let [policy-identity (perm/parse-policy-identity parsed-opts ctx)]
                            (<? (perm/wrap-policy db policy-identity))
                            db)
            tx-state      (->tx-state db*)
