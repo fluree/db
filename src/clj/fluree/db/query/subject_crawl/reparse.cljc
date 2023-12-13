@@ -65,10 +65,10 @@
   (loop [[where-smt & r] rest-where
          required-p #{} ;; set of 'p' values that are going to be required for a subject to have
          filter-map {}] ;; key 'p' value, val is list of filtering fns
-    (let [[s p o] where-smt
-          p*      (-> p ::where/iri (iri/iri->sid (:namespaces db)))
-          type (where/pattern-type where-smt)]
-      (if where-smt
+    (if where-smt
+      (let [[s p o] where-smt
+            p*      (-> p ::where/iri (iri/iri->sid (:namespaces db)))
+            type (where/pattern-type where-smt)]
         (when (and (= :tuple type)
                    (= first-s (clause-subject-var where-smt)))
           (let [{::where/keys [val var]} o
@@ -94,8 +94,8 @@
                    (conj required-p p*)
                    (if f
                      (update filter-map p* util/conjv f)
-                     filter-map))))
-        (assoc filter-map :required-p required-p)))))
+                     filter-map)))))
+      (assoc filter-map :required-p required-p))))
 
 (defn reparse-component
   [component]
