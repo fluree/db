@@ -25,9 +25,6 @@
                                       {:subject txn})
           txn-context             (or (:context opts)
                                       (ctx-util/txn-context txn))
-          s-ctx                   (some-> txn
-                                          ctx-util/extract-supplied-context
-                                          json-ld/parse-context)
 
           expanded            (json-ld/expand (ctx-util/use-fluree-context txn))
           txn-opts            (util/get-first-value expanded const/iri-opts)
@@ -35,7 +32,6 @@
            :as   parsed-opts} (cond-> opts
                                 did         (assoc :did did)
                                 txn-context (assoc :context txn-context)
-                                s-ctx       (assoc :supplied-context s-ctx)
                                 true        (parse-opts txn-opts))]
       (if (or maxFuel meta)
         (let [start-time   #?(:clj  (System/nanoTime)

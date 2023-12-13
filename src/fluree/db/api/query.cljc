@@ -2,9 +2,6 @@
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.core.async :as async]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
@@ -30,7 +27,7 @@
    (let [{:keys [opts]} query-map
          {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map)
 
-         ctx (some-> parsed ctx-util/extract-supplied-context json-ld/parse-context)
+         ctx (ctx-util/extract parsed)
          db* (if-let [policy-identity (perm/parse-policy-identity opts ctx)]
                (<? (perm/wrap-policy db policy-identity))
                db)
