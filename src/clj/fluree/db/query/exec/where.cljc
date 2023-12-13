@@ -307,7 +307,7 @@
          o    (or (get-value o-mch)
                   (get-sid o-mch alias))
          o-fn (::fn o-mch)
-         o-dt (-> o-mch get-datatype-iri (iri/iri->sid namespaces))
+         o-dt (some-> o-mch get-datatype-iri (iri/iri->sid namespaces))
 
          idx         (try* (index/for-components s p o o-dt)
                            (catch* e

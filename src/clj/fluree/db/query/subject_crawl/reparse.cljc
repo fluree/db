@@ -130,9 +130,9 @@
      :p (reparse-predicate-component db p)
      :o (-> o
             reparse-component
-            (assoc :datatype (-> o
-                                 where/get-datatype-iri
-                                 (iri/iri->sid (:namespaces db)))))}))
+            (assoc :datatype (some-> o
+                                     where/get-datatype-iri
+                                     (iri/iri->sid (:namespaces db)))))}))
 
 (defn simple-subject-merge-where
   "Revises where clause for simple-subject-crawl query to optimize processing.
