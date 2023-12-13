@@ -3,7 +3,7 @@
             [clojure.java.io :as io]
             [clojure.tools.namespace.repl :as tn :refer [refresh refresh-all]]
             [clojure.core.async :as async]
-
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.did :as did]
             [fluree.db.util.async :refer [<? <?? go-try merge-into?]]
             [fluree.db.flake :as flake]
