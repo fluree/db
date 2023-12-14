@@ -135,7 +135,7 @@
                                                    0 s-flakes))
             sid      (->> s-flakes first flake/s)
             ns-codes (:namespace-codes db)
-            iri      (iri/sid->iri sid ns-codes)]
+            iri      (-> sid (iri/sid->iri ns-codes) compact)]
         ;; add the id in case the iri flake isn't present in s-flakes
         (assoc json :id iri))
       (catch* e
