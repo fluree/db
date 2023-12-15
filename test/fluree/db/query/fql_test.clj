@@ -501,5 +501,21 @@
                           {"@context"  context2
                            :select ["?query"]
                            :where {:id :foo/aggQuery1
-                                   :f/query "?query"}})))))
+                                   :f/query "?query"}})))
+    (let [db2 @(fluree/stage db
+                             {"@context" context
+                              "insert"
+                              [{:id :ex/aggQuery2
+                                :f/query
+                                {:type :f/queryType
+                                 :value
+                                 (str '{:select [(count ?name)]
+                                        :where  {:schema/name ?name}})}}]})]
+      (is (= [[{"select" ['(count "?name")]
+                "where" [{:schema/name "?name"}]}]]
+             @(fluree/query db2 {"@context" context2
+                                 :select ["?query"]
+                                 :where {:id :foo/aggQuery2
+                                         :f/query "?query"}}))))))
+
 
