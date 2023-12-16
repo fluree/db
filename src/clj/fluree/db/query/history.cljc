@@ -248,7 +248,8 @@
   data from the outer wrapper of a commit
   (eg commit message, time, v)"
   [f]
-  (= (flake/s f) (flake/t f)))
+  (let [t-sid (-> f flake/t iri/t->sid)]
+    (= (flake/s f) t-sid)))
 
 (defn commit-metadata-flake?
   "Returns `true` if a flake is part of commit metadata.
@@ -388,11 +389,11 @@
                 flake-slices-ch            (query-range/time-range
                                             db :tspo = []
                                             {:from-t from-t, :to-t to-t})
-                consecutive-commit-details (->> flake-slices-ch
-                                                (commit-flakes->json-ld
-                                                 db context error-ch)
-                                                (async/into [])
-                                                <?)]
+                consecutive-commit-details (<! (->> flake-slices-ch
+                                                    (commit-flakes->json-ld
+                                                      db context error-ch)
+                                                    (async/into [])))]
+            (log/info "chunk:" chunk)
             (map into chunk consecutive-commit-details)))
         ch))
      chunked-ch)

@@ -260,7 +260,6 @@
           ledger  @(fluree/create conn "committest")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
 
-
           db1 @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
                                             "insert"   {:id   :ex/alice
                                                         :ex/x "foo-1"
