@@ -315,7 +315,7 @@
 (defn data
   "Given a commit map, returns them most recent data map."
   [commit]
-  (-> commit :data))
+  (:data commit))
 
 (defn data-id
   "Given a commit, returns the id of the most recent (previous) data id"
@@ -402,7 +402,7 @@
   a ledger from storage on load."
   [{:keys [address alias branch data id time v] :as _commit} t db-sid]
   (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data
-        t-sid (-> t - iri/fluree-iri iri/iri->sid)]
+        t-sid (iri/t->sid t)]
     [;; commit flakes
      ;; address
      (flake/create t-sid const/$_address address const/$xsd:string t true nil)

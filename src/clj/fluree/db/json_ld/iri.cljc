@@ -9,6 +9,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
+(def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")
 (def ^:const f-did-ns "did:fluree:")
 (def ^:const f-commit-256-ns "fluree:commit:sha256:")
 (def ^:const fdb-256-ns "fluree:db:sha256:")
@@ -18,10 +19,6 @@
 (def ^:const f-s3-ns "fluree:s3://")
 (def ^:const f-ctx-ns "fluree:context:")
 
-
-(defn fluree-iri
-  [nme]
-  (str f-ns nme))
 
 (def default-namespaces
   "iri namespace mapping. 0 signifies relative iris. 1-100 are reserved; user
@@ -35,22 +32,23 @@
    "http://www.w3.org/2002/07/owl#"              6
    "https://www.w3.org/2018/credentials#"        7
    f-ns                                          8
-   fdb-256-ns                                    9
-   f-did-ns                                      10
-   f-commit-256-ns                               11
-   f-mem-ns                                      12
-   f-file-ns                                     13
-   f-ipfs-ns                                     14
-   f-s3-ns                                       15
-   f-ctx-ns                                      16
-   "http://schema.org/"                          17
-   "https://www.wikidata.org/wiki/"              18
-   "http://xmlns.com/foaf/0.1/"                  19
-   "http://www.w3.org/2008/05/skos#"             20
-   "urn:uuid"                                    21
-   "urn:isbn:"                                   22
-   "urn:issn"                                    23
-   "_:"                                          24})
+   f-t-ns                                        9
+   fdb-256-ns                                    10
+   f-did-ns                                      11
+   f-commit-256-ns                               12
+   f-mem-ns                                      13
+   f-file-ns                                     14
+   f-ipfs-ns                                     15
+   f-s3-ns                                       16
+   f-ctx-ns                                      17
+   "http://schema.org/"                          18
+   "https://www.wikidata.org/wiki/"              19
+   "http://xmlns.com/foaf/0.1/"                  20
+   "http://www.w3.org/2008/05/skos#"             21
+   "urn:uuid"                                    22
+   "urn:isbn:"                                   23
+   "urn:issn"                                    24
+   "_:"                                          25})
 
 
 (def default-namespace-codes
@@ -203,3 +201,15 @@
   ([^SID sid namespace-codes]
    (str (get-namespace sid namespace-codes)
         (get-name sid))))
+
+(defn fluree-iri
+  [nme]
+  (str f-ns nme))
+
+(defn tx-iri
+  [t]
+  (str f-t-ns (- t)))
+
+(defn t->sid
+  [t]
+  (-> t tx-iri iri->sid))
