@@ -283,8 +283,7 @@
                                     {:message "meow"})]
       (testing "at time t"
         (is (pred-match?
-              [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
-                           {:id test-utils/did?}
+              [{:f/commit {"https://www.w3.org/2018/credentials#issuer" {:id test-utils/did?}
                            :f/address        test-utils/address?
                            :f/alias          "committest"
                            :f/branch         "main"

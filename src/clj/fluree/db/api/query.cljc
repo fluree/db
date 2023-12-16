@@ -8,6 +8,7 @@
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.dataset :as dataset]
             [fluree.db.query.fql :as fql]
+            [fluree.db.util.log :as log]
             [fluree.db.query.history :as history]
             [fluree.db.query.range :as query-range]
             [fluree.db.query.sparql :as sparql]
@@ -64,22 +65,21 @@
 
          (if commit-details
            ;; annotate with commit details
-           (async/alt!
-            (async/into [] (history/add-commit-details db* context error-ch history-results-chan))
-            ([result] result)
-            error-ch ([e] e))
+           (async/alt! (async/into [] (history/add-commit-details db* context error-ch history-results-chan))
+                       ([result] result)
+                       error-ch ([e] e))
 
            ;; we're already done
-           (async/alt!
-            (async/into [] history-results-chan) ([result] result)
-            error-ch ([e] e))))
+           (async/alt! (async/into [] history-results-chan)
+                       ([result] result)
+                       error-ch ([e] e))))
 
        ;; just commits over a range of time
        (let [flake-slice-ch    (query-range/time-range db* :tspo = [] {:from-t from-t :to-t to-t})
              commit-results-ch (history/commit-flakes->json-ld db* context error-ch flake-slice-ch)]
-         (async/alt!
-          (async/into [] commit-results-ch) ([result] result)
-          error-ch ([e] e)))))))
+         (async/alt! (async/into [] commit-results-ch)
+                     ([result] result)
+                     error-ch ([e] e)))))))
 
 (defn history
   "Return a summary of the changes over time, optionally with the full commit details included."
@@ -97,7 +97,8 @@
                                    (v/format-explained-errors nil))
                                {:status  400
                                 :error   :db/invalid-query}))))
-         history-query (cond-> coerced-query did (assoc-in [:opts :did] did))]
+         history-query (cond-> coerced-query
+                         did (assoc-in [:opts :did] did))]
      (<? (history* db history-query)))))
 
 (defn sanitize-query-options
