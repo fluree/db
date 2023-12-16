@@ -214,7 +214,7 @@
   [s]
   (let [result (and (string? s) (re-matches did-regex s))]
     (when-not result
-      (log/trace "did? falsey result from:" s))
+      (log/warn "did? falsey result from:" s))
     result))
 
 (def addr-regex
@@ -224,7 +224,7 @@
   [s]
   (let [result (and (string? s) (re-matches addr-regex s))]
     (when-not result
-      (log/trace "address? falsey result from:" s))
+      (log/warn "address? falsey result from:" s))
     result))
 
 (def context-id-regex
@@ -234,7 +234,7 @@
   [s]
   (let [result (and (string? s) (re-matches context-id-regex s))]
     (when-not result
-      (log/trace "context-id? falsey result from:" s))
+      (log/warn "context-id? falsey result from:" s))
     result))
 
 (def db-id-regex
@@ -244,7 +244,7 @@
   [s]
   (let [result (and (string? s) (re-matches db-id-regex s))]
     (when-not result
-      (log/trace "db-id? falsey result from:" s))
+      (log/warn "db-id? falsey result from:" s))
     result))
 
 (def commit-id-regex
@@ -254,7 +254,7 @@
   [s]
   (let [result (and (string? s) (re-matches commit-id-regex s))]
     (when-not result
-      (log/trace "commit-id? falsey result from:" s))
+      (log/warn "commit-id? falsey result from:" s))
     result))
 
 (defn pred-match?
