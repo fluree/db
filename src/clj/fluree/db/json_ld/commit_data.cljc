@@ -434,7 +434,7 @@
   load."
   [db t previous-id]
   (go-try
-    (let [t-sid    (-> t - iri/fluree-iri iri/iri->sid)
+    (let [t-sid    (iri/t->sid t)
           prev-sid (<? (dbproto/-subid db previous-id))]
       [(flake/create t-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
 
@@ -457,7 +457,7 @@
   ledger value and when reifying a ledger from storage on load."
   [db t issuer-iri]
   (go-try
-    (let [t-sid (-> t - iri/fluree-iri iri/iri->sid)]
+    (let [t-sid (iri/t->sid t)]
       (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
         ;; create reference to existing issuer
         [(flake/create t-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true
@@ -472,7 +472,7 @@
   Used when committing to an in-memory ledger value and when reifying a ledger
   from storage on load."
   [t message]
-  (let [t-sid (-> t - iri/fluree-iri iri/iri->sid)]
+  (let [t-sid (iri/t->sid t)]
     [(flake/create t-sid const/$_commit:message message const/$xsd:string t true nil)]))
 
 
