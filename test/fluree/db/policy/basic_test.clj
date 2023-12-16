@@ -1,10 +1,12 @@
 (ns fluree.db.policy.basic-test
-  (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [fluree.crypto :as crypto]
             [fluree.db.did :as did]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
-            [clojure.string :as str]))
+            [fluree.db.util.json :as json]))
 
 
 (deftest ^:integration query-policy-enforcement
@@ -457,3 +459,114 @@
                                      :opts      {:did  "not-a-did"
                                                  :role "not-a-role"}}))
         "Should not be able to see any data")))
+
+(deftest ^:integration jws
+  (let [conn    @(fluree/connect {:method :memory})
+        context {"ex"     "http://example.org/"
+                 "schema" "http://schema.org/"
+                 "f"      "https://ns.flur.ee/ledger#"}
+        ledger  @(fluree/create conn "test/root-read")
+
+        pleb-privkey "bb854f7ae267234235d57b2dff87359771cf75a76bc17a418102a48147d29ba7",
+        pleb-did     (:id (did/private->did-map pleb-privkey))
+        root-privkey "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
+        root-did     (:id (did/private->did-map root-privkey))
+        db           @(fluree/stage (fluree/db ledger )
+                                    {"@context" context
+                                     "insert"   [{"@id"         "ex:betty"
+                                                  "@type"       "ex:Yeti"
+                                                  "schema:name" "Betty"
+                                                  "schema:age"  55}
+                                                 {"@id"         "ex:freddy"
+                                                  "@type"       "ex:Yeti"
+                                                  "schema:name" "Freddy"
+                                                  "schema:age"  1002}
+                                                 {"@id"         "ex:letty"
+                                                  "@type"       "ex:Yeti"
+                                                  "schema:name" "Leticia"
+                                                  "schema:age"  38}
+                                                 {"@id"    root-did
+                                                  "f:role" {"@id" "ex:rootRole"}}
+                                                 {"@id"    pleb-did
+                                                  "f:role" {"@id" "ex:plebRole"}}]})
+        db+policy    @(fluree/stage db {"@context" context
+                                        "insert"
+                                        {"@id"          "ex:rootPolicy"
+                                         "@type"        ["f:Policy"]
+                                         "f:targetNode" {"@id" "f:allNodes"}
+                                         "f:allow"      [{"@id"          "ex:rootAccessAllow"
+                                                          "f:targetRole" {"@id" "ex:rootRole"}
+                                                          "f:action"     [{"@id" "f:view"}
+                                                                          {"@id" "f:modify"}]}
+                                                         {"@id"          "ex:plebReadAllow"
+                                                          "f:targetRole" {"@id" "ex:plebRole"}
+                                                          "f:action"     [{"@id" "f:view"}]}]}})]
+
+
+    (testing "root jws"
+      (let [db1 @(fluree/stage db+policy (crypto/create-jws
+                                           (json/stringify
+                                             {"@context" context
+                                              "insert"
+                                              {"@id"         "ex:spaghetti"
+                                               "@type"       "ex:Yeti"
+                                               "schema:name" "Spaghetti"
+                                               "schema:age"  150}})
+                                           root-privkey))]
+        (is (= [{"@id"         "ex:betty"
+                 "@type"       "ex:Yeti"
+                 "schema:age"  55
+                 "schema:name" "Betty"}
+                {"@id"         "ex:freddy"
+                 "@type"       "ex:Yeti"
+                 "schema:age"  1002
+                 "schema:name" "Freddy"}
+                {"@id"         "ex:letty"
+                 "@type"       "ex:Yeti"
+                 "schema:age"  38
+                 "schema:name" "Leticia"}
+                {"@id"         "ex:spaghetti"
+                 "@type"       "ex:Yeti"
+                 "schema:name" "Spaghetti"
+                 "schema:age"  150}]
+               @(fluree/query db1 (crypto/create-jws
+                                    (json/stringify
+                                      {"@context" context
+                                       :where     {"schema:name" '?name
+                                                   "@id"         '?s}
+                                       :select    '{?s ["*"]}})
+                                    root-privkey)))
+            "transaction and query succeeded")))
+    (testing "pleb jws"
+      (let [db-err @(fluree/stage db+policy (crypto/create-jws
+                                           (json/stringify
+                                             {"@context" context
+                                              "insert"
+                                              {"@id"         "ex:confetti"
+                                               "@type"       "ex:Yeti"
+                                               "schema:name" "Confetti"
+                                               "schema:age"  15}})
+                                           pleb-privkey))]
+        (is (= "Policy enforcement prevents modification."
+               (ex-message db-err))
+            "transaction failed")
+        (is (= [{"@id"         "ex:betty"
+                 "@type"       "ex:Yeti"
+                 "schema:age"  55
+                 "schema:name" "Betty"}
+                {"@id"         "ex:freddy"
+                 "@type"       "ex:Yeti"
+                 "schema:age"  1002
+                 "schema:name" "Freddy"}
+                {"@id"         "ex:letty"
+                 "@type"       "ex:Yeti"
+                 "schema:age"  38
+                 "schema:name" "Leticia"}]
+               @(fluree/query db+policy (crypto/create-jws
+                                          (json/stringify
+                                            {"@context" context
+                                             :where {"schema:name" '?name
+                                                     "@id" '?s}
+                                             :select '{?s ["*"]}})
+                                          pleb-privkey)))
+            "query succeeded")))))
