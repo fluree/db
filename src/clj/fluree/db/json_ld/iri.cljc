@@ -19,6 +19,14 @@
 (def ^:const f-s3-ns "fluree:s3://")
 (def ^:const f-ctx-ns "fluree:context:")
 
+(def json-iri-keywords
+  {"@type" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+   "@json" "http://www.w3.org/2001/XMLSchema#json"})
+
+(defn normailze
+  [iri]
+  (or (get json-iri-keywords iri)
+      iri))
 
 (def default-namespaces
   "iri namespace mapping. 0 signifies relative iris. 1-100 are reserved; user
@@ -160,7 +168,7 @@
   ([iri]
    (iri->sid iri default-namespaces))
   ([iri namespaces]
-   (let [[ns nme] (decompose iri)]
+   (let [[ns nme] (-> iri normailze decompose)]
      (when-let [ns-code (get namespaces ns)]
        (let [name-codes (name->codes nme)]
          (->sid ns-code name-codes))))))
