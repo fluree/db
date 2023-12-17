@@ -4,6 +4,7 @@
             [clojure.walk :refer [postwalk]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
@@ -556,6 +557,14 @@
   (str blank-node-prefix (random-uuid)))
 
 (declare parse-subj-cmp)
+
+(defn parse-object-value
+  [v datatype metadata]
+  (let [datatype* (iri/normalize datatype)
+        dt-sid    (iri/iri->sid datatype*)
+        v*        (datatype/coerce v dt-sid)]
+    (where/anonymous-value v* datatype* metadata)))
+
 (defn parse-obj-cmp
   [allowed-vars subj-cmp pred-cmp m triples
    {:keys [list id value type language] :as v-map}]
@@ -571,7 +580,7 @@
                     language (assoc :lang language))
           obj-cmp (if (v/variable? value)
                     (parse-variable-if-allowed allowed-vars value)
-                    (where/anonymous-value value type m*))]
+                    (parse-object-value value type m*))]
       (conj triples [subj-cmp pred-cmp obj-cmp]))
 
     ;; ref object

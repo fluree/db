@@ -23,7 +23,7 @@
   {"@type" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
    "@json" "http://www.w3.org/2001/XMLSchema#json"})
 
-(defn normailze
+(defn normalize
   [iri]
   (or (get json-iri-keywords iri)
       iri))
@@ -168,7 +168,7 @@
   ([iri]
    (iri->sid iri default-namespaces))
   ([iri namespaces]
-   (let [[ns nme] (-> iri normailze decompose)]
+   (let [[ns nme] (-> iri normalize decompose)]
      (when-let [ns-code (get namespaces ns)]
        (let [name-codes (name->codes nme)]
          (->sid ns-code name-codes))))))
