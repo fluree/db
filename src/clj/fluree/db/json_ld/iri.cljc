@@ -68,13 +68,14 @@
 
 (defn decompose
   [iri]
-  (let [length (count iri)]
-    (or (decompose-by-char iri \@ length)
-        (decompose-by-char iri \# length)
-        (decompose-by-char iri \? length)
-        (decompose-by-char iri \/ length)
-        (decompose-by-char iri \: length)
-        ["" iri])))
+  (when iri
+    (let [length (count iri)]
+      (or (decompose-by-char iri \@ length)
+          (decompose-by-char iri \# length)
+          (decompose-by-char iri \? length)
+          (decompose-by-char iri \/ length)
+          (decompose-by-char iri \: length)
+          ["" iri]))))
 
 (def name-code-xf
   (comp (partition-all 8)
