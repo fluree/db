@@ -128,7 +128,7 @@
                :ex/last      "Jones"
                :schema/name  "Cam"
                :id           :ex/cam
-               :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
                :ex/favColor  "Blue"}]
              @(fluree/query db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]

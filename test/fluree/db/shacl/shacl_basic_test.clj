@@ -761,13 +761,13 @@
               "Exception, because :schema/age is above the maximum")
           (is (= "SHACL PropertyShape exception - sh:maxInclusive: value 101 is either non-numeric or higher than maximum of 100."
                  (ex-message db-too-high)))
-          (is (= @(fluree/query db-ok2 user-query)
-                 [{:id         :ex/alice
+          (is (= [{:id         :ex/brian
                    :type       :ex/User
-                   :schema/age 100}
-                  {:id         :ex/brian
+                   :schema/age 1}
+                  {:id         :ex/alice
                    :type       :ex/User
-                   :schema/age 1}]))))
+                   :schema/age 100}]
+                 @(fluree/query db-ok2 user-query)))))
       (testing "non-numeric values"
         (let [db         @(fluree/stage
                             (fluree/db ledger)

@@ -103,11 +103,11 @@
                                  "select"   {"ex:subject-as-predicate" ["*"]}}))
           "via subgraph selector")
 
-      (is (= #{["id"] ["ex:labeled-pred"] ["ex:new-pred"] ["ex:unlabeled-pred"]}
-             (set @(fluree/query db2 {"@context" context
-                                      "select"   ["?p"]
-                                      "where"    {"@id" "ex:subject-as-predicate"
-                                                  "?p"  "?o"}})))
+      (is (= [["ex:labeled-pred"] ["ex:new-pred"] ["ex:unlabeled-pred"]]
+             @(fluree/query db2 {"@context" context
+                                 "select"   ["?p"]
+                                 "where"    {"@id" "ex:subject-as-predicate"
+                                             "?p"  "?o"}}))
           "via variable selector")
       (is (= #{["id" {"id"                "ex:subject-as-predicate",
                       "ex:labeled-pred"   "labeled",
