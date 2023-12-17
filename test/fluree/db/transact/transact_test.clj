@@ -47,19 +47,15 @@
              (ex-message stage-id-only)))
       (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
              (ex-message stage-empty-txn)))
-      (is (= {:flakes 5, :size 330, :indexed 0}
+      (is (= {:flakes 1, :size 50, :indexed 0}
              (:stats stage-empty-node))
           "empty nodes are allowed as long as there is other data, they are just noops")
-      (is (= #{[:ex/alice :id "http://example.org/ns/alice"]
-               [:ex/alice :schema/age 42]
-               [:schema/age :id "http://schema.org/age"]
-               [:id :id "@id"]
-               [:type :id "@type"]}
-             (set @(fluree/query db-ok {:context [test-utils/default-context
-                                                  {:ex "http://example.org/ns/"}]
-                                        :select  '[?s ?p ?o]
-                                        :where   '{:id ?s
-                                                   ?p  ?o}}))))))
+      (is (= [[:ex/alice :schema/age 42]]
+             @(fluree/query db-ok {:context [test-utils/default-context
+                                             {:ex "http://example.org/ns/"}]
+                                   :select  '[?s ?p ?o]
+                                   :where   '{:id ?s
+                                              ?p  ?o}})))))
 
   (testing "Allow transacting `false` values"
     (let [conn    (test-utils/create-conn)
@@ -72,11 +68,7 @@
                       "insert"
                       {:id        :ex/alice
                        :ex/isCool false}})]
-      (is (= #{[:ex/alice :id "http://example.org/ns/alice"]
-               [:ex/alice :ex/isCool false]
-               [:ex/isCool :id "http://example.org/ns/isCool"]
-               [:id :id "@id"]
-               [:type :id "@type"]}
+      (is (= [[:ex/alice :ex/isCool false]]
              (set @(fluree/query db-bool {:context [test-utils/default-context
                                                     {:ex "http://example.org/ns/"}]
                                           :select  '[?s ?p ?o]
