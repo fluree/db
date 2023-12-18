@@ -744,7 +744,7 @@
              (testing "queries returning metadata"
                (let [query* (assoc-in query [:opts :meta] true)
                      sut    @(fluree/query db query*)]
-                 (is (= (dec flake-total) (:fuel sut))
+                 (is (= flake-total (:fuel sut))
                      "Reports that all flakes were traversed"))))
            (testing "short-circuits if request fuel exhausted"
              (let [query   {:context test-utils/default-context
@@ -1025,7 +1025,7 @@
                                                          "schema:givenName" "?name"}})))
            "equivalentProperty annotations work")
 
-       (is (= 148
+       (is (= 72
               (-> @(fluree/history ledger {:context        test-utils/default-str-context
                                            :commit-details true
                                            :t              {:from :latest}})
@@ -1033,7 +1033,7 @@
                   (get "f:commit")
                   (get "f:data")
                   (get "f:flakes"))))
-       (is (= 148
+       (is (= 72
               (-> @(fluree/history loaded {:context        test-utils/default-str-context
                                            :commit-details true
                                            :t              {:from :latest}})
