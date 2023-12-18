@@ -13,22 +13,24 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-;; if these keys exist in the policy's :f/allow definition, there exist specific logic rules
-;; that need to get enforced (e.g. as opposed to generically allowing an entire Class, members
-;; will need to get evaluated for specific criteria)
 (def restriction-properties
+  "If these keys exist in the policy's :f/allow definition, there exist specific
+  logic rules that need to get enforced (e.g. as opposed to generically allowing
+  an entire Class, members will need to get evaluated for specific criteria)."
   #{const/iri-equals const/iri-contains})
 
-;; These special IRIs (today only one) get replaced with an actual value in the context of the
-;; request.
-;;  - :f/$identity - gets replaced with the subject ID of the identity (DID) that signed
-;;                   the particular request
 (def special-meaning-properties
+  "These special IRIs (today only one) get replaced with an actual value in the
+  context of the request.
+
+  - :f/$identity - gets replaced with the subject ID of the identity (DID) that
+                   signed the particular request"
   #{const/iri-$identity})
 
 
 (defn restricted-allow-rule?
-  "Returns true if an allow rule contains restrictions (e.g. :f/equals or other restriction properties)."
+  "Returns true if an allow rule contains restrictions (e.g. :f/equals or other
+  restriction properties)."
   [allow-rule]
   (->> (keys allow-rule)
        (some restriction-properties)))

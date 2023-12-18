@@ -1,12 +1,11 @@
 (ns fluree.db.policy.parsing-test
+  "Tests to ensure policy enforcement parsing is accurate"
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.constants :as const]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.did :as did]
             [fluree.db.json-ld.policy :as policy]))
-
-;; tests to ensure policy enforcement parsing is accurate
 
 (def non-policy-keys #{:ident :roles :root? :cache})
 

@@ -57,7 +57,8 @@
       (loop [[flake & r] flakes
              acc []]
         (if flake
-          (let [p-policies (->> flake flake/p (get policies-by-pid))]
+          (let [p          (flake/p flake)
+                p-policies (get policies-by-pid p)]
             (cond
               p-policies (let [allow? (loop [[[async? f] & r] p-policies]
                                         ;; return first truthy response, else false
