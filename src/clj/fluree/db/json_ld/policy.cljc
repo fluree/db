@@ -506,7 +506,7 @@
 (defn role-sids-for-sid
   [db sid]
   (go-try
-    (->> (<? (query-range/index-range db :spot = [sid const/$_role] {:flake-xf (map flake/o)}))
+    (->> (<? (query-range/index-range db :spot = [sid const/$f:role] {:flake-xf (map flake/o)}))
          (into #{}))))
 
 (defn wrap-policy

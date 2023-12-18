@@ -221,3 +221,5 @@
 (def ^:const $rdf:json (iri/iri->sid "http://www.w3.org/2001/XMLSchema#json"))
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
+
+(def ^:const $f:role (iri/iri->sid iri-role))
