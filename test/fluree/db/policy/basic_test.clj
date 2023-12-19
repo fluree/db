@@ -4,7 +4,7 @@
             [fluree.crypto :as crypto]
             [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
+            [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]))
 
@@ -88,50 +88,50 @@
                            "Policy already in place")))
 
       ;; root can see all user data
-      (is (= [{:id               :ex/john,
-               :type             :ex/User,
-               :schema/name      "John",
-               :schema/email     "john@flur.ee",
-               :schema/birthDate "2021-08-17",
-               :schema/ssn       "888-88-8888"}
-              {:id               :ex/alice,
-               :type             :ex/User,
-               :schema/name      "Alice",
-               :schema/email     "alice@flur.ee",
-               :schema/birthDate "2022-08-17",
-               :schema/ssn       "111-11-1111",
-               :ex/location      {:id         "_:f211106232532993",
-                                  :ex/state   "NC",
-                                  :ex/country "USA"}}]
-             @(fluree/query db+policy {:context context
-                                       :select {'?s [:* {:ex/location [:*]}]}
-                                       :where  {:id   '?s
-                                                :type :ex/User}
-                                       :opts   {:did  root-did
-                                                :role :ex/rootRole}}))
+      (is (pred-match? [{:id               :ex/john,
+                         :type             :ex/User,
+                         :schema/name      "John",
+                         :schema/email     "john@flur.ee",
+                         :schema/birthDate "2021-08-17",
+                         :schema/ssn       "888-88-8888"}
+                        {:id               :ex/alice,
+                         :type             :ex/User,
+                         :schema/name      "Alice",
+                         :schema/email     "alice@flur.ee",
+                         :schema/birthDate "2022-08-17",
+                         :schema/ssn       "111-11-1111",
+                         :ex/location      {:id         test-utils/blank-node-id?,
+                                            :ex/state   "NC",
+                                            :ex/country "USA"}}]
+                       @(fluree/query db+policy {:context context
+                                                 :select {'?s [:* {:ex/location [:*]}]}
+                                                 :where  {:id   '?s
+                                                          :type :ex/User}
+                                                 :opts   {:did  root-did
+                                                          :role :ex/rootRole}}))
           "Both user records + all attributes should show")
 
-      (is (= [{:id               :ex/john,
-               :type             :ex/User,
-               :schema/name      "John",
-               :schema/email     "john@flur.ee",
-               :schema/birthDate "2021-08-17",
-               :schema/ssn       "888-88-8888"}
-              {:id               :ex/alice,
-               :type             :ex/User,
-               :schema/name      "Alice",
-               :schema/email     "alice@flur.ee",
-               :schema/birthDate "2022-08-17",
-               :schema/ssn       "111-11-1111",
-               :ex/location      {:id         "_:f211106232532993",
-                                  :ex/state   "NC",
-                                  :ex/country "USA"}}]
-             @(fluree/query db+policy {:context context
-                                       :select {'?s [:* {:ex/location [:*]}]}
-                                       :where  {:id   '?s
-                                                :type :ex/User}
-                                       :opts   {:did  root-did
-                                                :role :ex/rootRole}}))
+      (is (pred-match? [{:id               :ex/john,
+                         :type             :ex/User,
+                         :schema/name      "John",
+                         :schema/email     "john@flur.ee",
+                         :schema/birthDate "2021-08-17",
+                         :schema/ssn       "888-88-8888"}
+                        {:id               :ex/alice,
+                         :type             :ex/User,
+                         :schema/name      "Alice",
+                         :schema/email     "alice@flur.ee",
+                         :schema/birthDate "2022-08-17",
+                         :schema/ssn       "111-11-1111",
+                         :ex/location      {:id         test-utils/blank-node-id?,
+                                            :ex/state   "NC",
+                                            :ex/country "USA"}}]
+                       @(fluree/query db+policy {:context context
+                                                 :select {'?s [:* {:ex/location [:*]}]}
+                                                 :where  {:id   '?s
+                                                          :type :ex/User}
+                                                 :opts   {:did  root-did
+                                                          :role :ex/rootRole}}))
           "Both user records + all attributes should show")
 
       ;; root role can see all product data, without identity

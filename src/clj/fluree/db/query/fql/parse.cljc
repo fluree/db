@@ -548,7 +548,7 @@
   (-> q syntax/coerce-query parse-analytical-query))
 
 (def blank-node-prefix
-  "_:fdb")
+  "_:fdb-")
 
 (defn new-blank-node-id
   "Generate a temporary blank-node id. This will get replaced during flake creation

@@ -3,8 +3,10 @@
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
+            [fluree.db.query.fql.parse :as parse]
             #?@(:cljs [[clojure.core.async :refer [go go-loop]]
-                       [clojure.core.async.interop :refer [<p!]]])))
+                       [clojure.core.async.interop :refer [<p!]]])
+            [clojure.string :as str]))
 
 (def default-context
   {:id     "@id"
@@ -256,6 +258,10 @@
     (when-not result
       (log/warn "commit-id? falsey result from:" s))
     result))
+
+(defn blank-node-id?
+  [s]
+  (str/starts-with? s parse/blank-node-prefix))
 
 (defn pred-match?
   "Does a deep compare of expected and actual map values but any predicate fns
