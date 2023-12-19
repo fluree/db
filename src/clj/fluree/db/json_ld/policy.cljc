@@ -65,23 +65,23 @@
   "Filters all rules into only those that apply to the given roles."
   [roles all-policies]
   (keep
-   (fn [policy]
-     (let [class-policies (allowed-for-roles policy roles)
+    (fn [policy]
+      (let [class-policies (allowed-for-roles policy roles)
 
-           ;; each explicit property can have multiple :f/allow targeting different roles
-           ;; We only want :f/allow that target provided roles, and only want properties
-           ;; returned tht contain at least one relevant :f/allow
-           prop-policies (->> (get policy const/iri-property)
-                              util/sequential
-                              (keep (fn [prop-policy]
-                                      (when-let [roles-policies (allowed-for-roles prop-policy roles)]
-                                        (assoc prop-policy const/iri-allow roles-policies))))
-                              not-empty)]
-       (when (or class-policies prop-policies)
-         (cond-> policy
-           class-policies (assoc const/iri-allow class-policies)
-           prop-policies  (assoc const/iri-property prop-policies)))))
-   all-policies))
+            ;; each explicit property can have multiple :f/allow targeting different roles
+            ;; We only want :f/allow that target provided roles, and only want properties
+            ;; returned tht contain at least one relevant :f/allow
+            prop-policies (->> (get policy const/iri-property)
+                               util/sequential
+                               (keep (fn [prop-policy]
+                                       (when-let [roles-policies (allowed-for-roles prop-policy roles)]
+                                         (assoc prop-policy const/iri-allow roles-policies))))
+                               not-empty)]
+        (when (or class-policies prop-policies)
+          (cond-> policy
+            class-policies (assoc const/iri-allow class-policies)
+            prop-policies  (assoc const/iri-property prop-policies)))))
+    all-policies))
 
 (defn policies-for-roles
   "Returns all the rules for the provided roles as compiled functions"
