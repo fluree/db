@@ -5,6 +5,7 @@
             [fluree.db.query.exec.select :as select]
             [fluree.db.datatype :as datatype]
             [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.query.fql.serialize :as q-serialize]
             [clojure.set :as set]
             [clojure.walk :refer [postwalk]]
             [fluree.json-ld :as json-ld]
@@ -625,12 +626,13 @@
                                            parsed-q (try* (-> q
                                                               read-string
                                                               (parse-query ctx))
-                                                          ;;TODO propagate underlying error
                                                           (catch* e  (log/warn e "Invalid query " q)
                                                                   (throw (ex-info (str "Invalid query provided as value of : "
-                                                                                       const/iri-query ": " q)
-                                                                                  {:status 400 :error :db/invalid-query}))))]
-                                       (assoc-in values [0 :value] parsed-q))
+                                                                                       const/iri-query ": " q "\n Caused by: "
+                                                                                       (ex-message e))
+                                                                                  {:status 400 :error :db/invalid-query}))))
+                                           serialized-query (q-serialize/map->SerializedQuery parsed-q)]
+                                       (assoc-in values [0 :value] serialized-query))
                                      (throw (ex-info (str "Invalid value for " const/iri-query ": "
                                                           "Must be exactly one query, provided: "
                                                           values)
