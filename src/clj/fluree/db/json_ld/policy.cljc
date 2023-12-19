@@ -417,9 +417,9 @@
           root-policies            (map (fn [root-action] [[root-action :root?] true]) root-actions*)]
 
       (cond-> []
-              root-policies (into root-policies)
-              default-restrictions (into default-restrictions)
-              property-restrictions (into property-restrictions)))))
+        root-policies (into root-policies)
+        default-restrictions (into default-restrictions)
+        property-restrictions (into property-restrictions)))))
 
 (defn compile-class-policy
   "Compiles a class rule (where :f/targetClass is used)"
@@ -472,7 +472,6 @@
             ;; TODO - query for all rules is very cacheable - but cache must be cleared when any new tx updates a rule
             ;; TODO - (easier said than done, as they are nested nodes whose top node is the only one required to have a specific class type)
             role-policies (<? (policies-for-roles db policies))
-            _ (log/info "role-policies:" role-policies)
             compiled-policies (->> (<? (compile-policies db role-policies))
                                    (reduce (fn [acc [ks m]]
                                              (assoc-in acc ks m))
@@ -524,9 +523,8 @@
   wraps specified policy permissions"
   [{:keys [policy] :as db} {:keys [did role credential]}]
   (go-try
-    (let [roles (or (some->> role util/sequential)
+    (let [roles (or (some->> role util/sequential set)
                     (and did (<? (roles-for-did db did))))]
-      (log/info "roles:" roles)
       (cond
         (or (:ident policy) (:roles policy))
         (throw (ex-info (str "Policy already in place for this db. "
