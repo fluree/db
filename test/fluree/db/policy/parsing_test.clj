@@ -2,7 +2,7 @@
   "Tests to ensure policy enforcement parsing is accurate"
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.constants :as const]
-            [fluree.db.test-utils :as test-utils]
+            [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.did :as did]
             [fluree.db.json-ld.policy :as policy]))
@@ -91,29 +91,29 @@
               iri-userRole  (fluree/expand-iri context :ex/userRole)
               policy-alice  (-> @(fluree/promise-wrap (policy/policy-map db alice-did #{iri-userRole} nil))
                                 replace-policy-fns)]
-          (is (= {const/iri-modify
-                  {:class
-                   {iri-User {:default {const/iri-equals      [{"@id" const/iri-$identity}
-                                                               {"@id" "http://example.org/ns/user"}]
-                                        const/iri-target-role {"@id" iri-userRole}
-                                        :function             [true
-                                                               ::replaced-policy-function]
-                                        "@id"                 "_:f211106232533008"}}}}
-                  const/iri-view
-                  {:class
-                   {iri-User {iri-ssn  {const/iri-equals      [{"@id" const/iri-$identity}
-                                                               {"@id" "http://example.org/ns/user"}]
-                                        const/iri-target-role {"@id" iri-userRole}
-                                        :function             [true
-                                                               ::replaced-policy-function]
-                                        "@id"                 "http://example.org/ns/ssnViewRule"}
-                              :default {const/iri-target-role {"@id" iri-userRole}
-                                        :function             [false
-                                                               ::replaced-policy-function]
-                                        "@id"                 "http://example.org/ns/globalViewAllow"}}}}
-                  :ident alice-did
-                  :roles #{iri-userRole}}
-                 policy-alice)
+          (is (pred-match? {const/iri-modify
+                            {:class
+                             {iri-User {:default {const/iri-equals      [{"@id" const/iri-$identity}
+                                                                         {"@id" "http://example.org/ns/user"}]
+                                                  const/iri-target-role {"@id" iri-userRole}
+                                                  :function             [true
+                                                                         ::replaced-policy-function]
+                                                  "@id"                 test-utils/blank-node-id?}}}}
+                            const/iri-view
+                            {:class
+                             {iri-User {iri-ssn  {const/iri-equals      [{"@id" const/iri-$identity}
+                                                                         {"@id" "http://example.org/ns/user"}]
+                                                  const/iri-target-role {"@id" iri-userRole}
+                                                  :function             [true
+                                                                         ::replaced-policy-function]
+                                                  "@id"                 "http://example.org/ns/ssnViewRule"}
+                                        :default {const/iri-target-role {"@id" iri-userRole}
+                                                  :function             [false
+                                                                         ::replaced-policy-function]
+                                                  "@id"                 "http://example.org/ns/globalViewAllow"}}}}
+                            :ident alice-did
+                            :roles #{iri-userRole}}
+                           policy-alice)
               "Policies for only :ex/userRole should return")))
       (testing "Root policy contains {:root? true} for each applicable :f/action"
         (let [iri-rootRole (fluree/expand-iri context :ex/rootRole)
