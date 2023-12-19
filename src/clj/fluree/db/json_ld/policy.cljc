@@ -91,18 +91,6 @@
     (let [all-rules (<? (all-policies db))]
       (policies-for-roles* roles all-rules))))
 
-(defn subids
-  "Returns a vector of subids from the input collection as a single result async chan.
-  If any exception occurs during resolution, returns the error immediately."
-  [db subjects]
-  (async/go-loop [[next-sid & r] (map #(dbproto/-subid db %) subjects)
-                  acc #{}]
-    (if next-sid
-      (let [next-res (async/<! next-sid)]
-        (if (util/exception? next-res)
-          next-res
-          (recur r (conj acc (async/<! next-sid)))))
-      acc)))
 
 (defn ident-first?
   "Returns true if first part of a comparison rule (e.g. :f/equals or :f/contains)
@@ -132,19 +120,8 @@
   "For comparison rules that use a property path (e.g. :f/equals or :f/contains)
   returns the property path pids (excluding the special :f/$identity property if used).
   in vector form."
-  [db rule-type rule]
-  (go-try
-    (let [property-path    (->> (get rule rule-type) condense-property-path)
-          special-property (first-special-property property-path)
-          ;; convert path to property-ids so we don't need to lookup keywords with each fn call
-          property-ids     (->> (if special-property
-                                  (rest property-path)
-                                  property-path)
-                                (subids db)
-                                <?)]
-      (if special-property
-        (into [special-property] property-ids)
-        property-ids))))
+  [rule rule-type]
+  (->> (get rule rule-type) condense-property-path))
 
 
 (defmulti compile-allow-rule-fn
@@ -165,7 +142,7 @@
 (defmethod compile-allow-rule-fn :f/equals
   [db rule]
   (go-try
-    (let [resolved-path (<? (property-path db const/iri-equals rule))]
+    (let [resolved-path (property-path rule const/iri-equals)]
       (validate/generate-equals-fn rule resolved-path))))
 
 (defmethod compile-allow-rule-fn :f/contains
@@ -201,12 +178,12 @@
                                ;; TODO --- the wrapping fn would have to look for async fns and use <?/<! takes (and itself be async as applicable)
                                (<? (compile-allow-rule-fn db (first allow-spec))))
                              (<? (compile-allow-rule-fn db allow-spec))) ;; returns two-tuple of [async? validation-fn]
-                prop-sid   (<? (dbproto/-subid db (get-in prop-policy [const/iri-path "@id"])))]
+                prop       (get-in prop-policy [const/iri-path "@id"])]
             ;; TODO - if multiple rules target the same path we need to concatenate them and should use an 'or' condition
-            (when (get acc prop-sid)
+            (when (get acc prop)
               (log/warn (str "Multiple policy rules in the same class target the same property: "
                              (get prop-policy const/iri-path) ". Only the last one encountered will be utilized.")))
-            (recur r (assoc acc prop-sid fn-tuple)))
+            (recur r (assoc acc prop fn-tuple)))
           acc)))))
 
 
@@ -250,29 +227,36 @@
           ;; return two-tuple of [full-key-seq updated-allow-rule-map]
           [ks* allow-rule*])))))
 
+(defn get-allow-rule
+  [prop-policy]
+  (let [rule (get prop-policy const/iri-allow)]
+    ;; TODO - Multiple conditions existing for a single role/property is probably a valid use case but uncommon.
+    ;; TODO --- they should be treated as an -OR- condition and could be wrapped into a single fn.
+    ;; TODO --- the wrapping fn would have to look for async fns and use <?/<! takes (and itself be async as applicable)
+    (if (sequential? rule)
+      (do (when (> (count rule) 1)
+            (log/warn  "Multiple role policies for same property is not currently allowed. Using only first "
+                       "allow specification in policy:" prop-policy "."))
+          (first rule))
+      rule)))
+
 (defn compile-prop-policy
   [db default-key-seqs prop-policy]
   (go-try
-    (let [allow-rule  (get prop-policy const/iri-allow)
-          fn-tuple    (if (sequential? allow-rule)
-                        (do
-                          (log/warn (str "Multiple role policies for same property is not currently allowed. Using only first "
-                                         "allow specification in policy: " prop-policy "."))
-                          ;; TODO - Multiple conditions existing for a single role/property is probably a valid use case but uncommon.
-                          ;; TODO --- they should be treated as an -OR- condition and could be wrapped into a single fn.
-                          ;; TODO --- the wrapping fn would have to look for async fns and use <?/<! takes (and itself be async as applicable)
-                          (<? (compile-allow-rule-fn db (first allow-rule))))
-                        (<? (compile-allow-rule-fn db allow-rule))) ;; returns two-tuple of [async? validation-fn]
+    (let [allow-rule  (get-allow-rule prop-policy)
+          fn-tuple    (<? (compile-allow-rule-fn db allow-rule)) ; returns two-tuple of [async? validation-fn]
           _           (when-not (get-in prop-policy [const/iri-path "@id"]) (log/warn "NO :f/path PATH! FOR:  " prop-policy))
-          prop-sid    (<? (dbproto/-subid db (get-in prop-policy [const/iri-path "@id"])))
+          prop        (get-in prop-policy [const/iri-path "@id"])
           actions     (-> allow-rule (get const/iri-action) util/sequential
                           (->> (map #(get % "@id"))))
           allow-rule* (-> allow-rule
-                          ;; remove :f/action as we end up keying the rule *per-action* in the final policy map, don't want confusion if this hangs around that it is used
+                          ;; remove :f/action as we end up keying the rule
+                          ;; *per-action* in the final policy map, don't want
+                          ;; confusion if this hangs around that it is used
                           (dissoc const/iri-action)
                           ;; associate our compiled function to the existing allow-rule map
                           (assoc :function fn-tuple))
-          prop-ks     (map #(conj % prop-sid) default-key-seqs)]
+          prop-ks     (map #(conj % prop) default-key-seqs)]
       (for [policy-key-seq prop-ks
             action         actions]
         ;; for every policy-key-seqs (key sequence that can be used with (assoc-in m <ks-here> ...))
@@ -401,9 +385,9 @@
           non-root-policy          (if root-actions ;; if there was a root policy defined, remove default allows that contain it
                                      (remove-root-default-allow policy root-actions)
                                      policy)
-          node-sids                (when nodes* ;; if this policy was only to define root, this will be empty - so no need to create async chans
-                                     (<? (subids db nodes*)))
-          default-key-seqs         (map (fn [node-sid] [:node node-sid]) node-sids)
+          default-key-seqs         (map (fn [node]
+                                          [:node node])
+                                        nodes*)
           ;; the default restrictions will exist only for non-root policies defined for :f/allow
           default-restrictions     (when-let [default-allow (some-> (get non-root-policy const/iri-allow) util/sequential)]
                                      (<? (default-allow-restrictions db default-key-seqs default-allow)))
@@ -425,8 +409,7 @@
   "Compiles a class rule (where :f/targetClass is used)"
   [db policy classes]
   (go-try
-    (let [class-sids            (<? (subids db classes))
-          default-key-seqs      (map #(vector :class %) class-sids)
+    (let [default-key-seqs      (map #(vector :class %) classes)
           default-restrictions  (when-let [default-allow (some-> (get policy const/iri-allow) util/sequential)]
                                   (<? (default-allow-restrictions db default-key-seqs default-allow)))
           property-restrictions (when-let [prop-policies (some-> (get policy const/iri-property) util/sequential)]

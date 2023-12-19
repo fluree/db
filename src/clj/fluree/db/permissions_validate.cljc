@@ -3,6 +3,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -16,18 +17,22 @@
 
   Note this should only be called if the db is permissioned, don't call if the
   root user as the results will not come back correctly."
-  [{:keys [policy] :as db} flake]
+  [{:keys [policy namespace-codes] :as db} flake]
   (go-try
-    (let [s         (flake/s flake)
-          p         (flake/p flake)
-          class-ids (or (get @(:cache policy) s)
-                        (let [classes (<? (dbproto/-class-ids db (flake/s flake)))]
-                          ;; note, classes will return empty list if none found ()
-                          (swap! (:cache policy) assoc s classes)
-                          classes))
-          fns       (keep #(or (get-in policy [const/iri-view :class % p :function])
-                               (get-in policy [const/iri-view :class % :default :function]))
-                          class-ids)]
+    (let [s-iri   (-> flake flake/s (iri/sid->iri namespace-codes))
+          p-iri   (-> flake flake/p (iri/sid->iri namespace-codes))
+          classes (or (get @(:cache policy) s-iri)
+                      (let [class-sids (<? (dbproto/-class-ids db (flake/s flake)))
+                            class-iris (map (fn [c]
+                                              (iri/sid->iri c namespace-codes))
+                                            class-sids)]
+                        ;; note, classes will return empty list if none found ()
+                        (swap! (:cache policy) assoc s-iri class-iris)
+                        class-iris))
+          fns     (keep #(or (get-in policy [const/iri-view :class % p-iri :function])
+                             (get-in policy [const/iri-view :class % :default :function]))
+                        classes)]
+      (log/info "fns:" fns)
       (loop [[[async? f] & r] fns]
         ;; return first truthy response, else false
         (if f
