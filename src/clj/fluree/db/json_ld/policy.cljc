@@ -9,7 +9,8 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.range :as query-range]
-            [fluree.db.flake :as flake]))
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -41,51 +42,45 @@
     ;; TODO - once supported, use context to always return :f/allow
     ;; and :f/property as vectors so we don't need to coerce downstream
     (<? (fql/query db nil {:select {'?s [:*
-                                         {const/iri-type [:_id]}
-                                         {const/iri-allow [:* {const/iri-target-role
-                                                               [:_id]}]}
+                                         {const/iri-allow [:*]}
                                          {const/iri-property
-                                          [:* {const/iri-allow
-                                               [:* {const/iri-target-role [:_id]}]}]}]}
+                                          [:*
+                                           {const/iri-allow [:*]}]}]}
                            :where  {const/iri-id   '?s
                                     const/iri-type const/iri-policy}}))))
+
+(defn contains-target-role?
+  [roles policy]
+  (let [target-role (get-in policy [const/iri-target-role const/iri-id])]
+    (contains? roles target-role)))
+
+(defn allowed-for-roles
+  [policy roles]
+  (->> (get policy const/iri-allow)
+       util/sequential
+       (filter (partial contains-target-role? roles))
+       not-empty))
 
 (defn policies-for-roles*
   "Filters all rules into only those that apply to the given roles."
   [roles all-policies]
   (keep
    (fn [policy]
-     (let [class-policies (->> (get policy const/iri-allow)
-                               util/sequential
-                               (filter #(-> %
-                                            (get-in [const/iri-target-role :_id])
-                                            roles))
-                               not-empty)
-           prop-policies  (when-let [all-prop-policies (get policy const/iri-property)]
-                            ;; each explicit property can have multiple :f/allow targeting different roles
-                            ;; We only want :f/allow that target provided roles, and only want properties
-                            ;; returned tht contain at least one relevant :f/allow
-                            (->> all-prop-policies
-                                 util/sequential
-                                 (filter
-                                  (fn [prop-policy]
-                                    (let [roles-policies
-                                          (->> (get prop-policy const/iri-allow)
-                                               util/sequential
-                                               (filter
-                                                #(-> %
-                                                     (get-in
-                                                      [const/iri-target-role :_id])
-                                                     roles))
-                                               not-empty)]
-                                      (when roles-policies
-                                        (assoc prop-policy const/iri-allow
-                                                           roles-policies)))))
-                                 not-empty))]
+     (let [class-policies (allowed-for-roles policy roles)
+
+           ;; each explicit property can have multiple :f/allow targeting different roles
+           ;; We only want :f/allow that target provided roles, and only want properties
+           ;; returned tht contain at least one relevant :f/allow
+           prop-policies (->> (get policy const/iri-property)
+                              util/sequential
+                              (keep (fn [prop-policy]
+                                      (when-let [roles-policies (allowed-for-roles prop-policy roles)]
+                                        (assoc prop-policy const/iri-allow roles-policies))))
+                              not-empty)]
        (when (or class-policies prop-policies)
          (cond-> policy
-                 class-policies (assoc const/iri-allow class-policies)
-                 prop-policies (assoc const/iri-property prop-policies)))))
+           class-policies (assoc const/iri-allow class-policies)
+           prop-policies  (assoc const/iri-property prop-policies)))))
    all-policies))
 
 (defn policies-for-roles
@@ -153,18 +148,19 @@
 
 
 (defmulti compile-allow-rule-fn
-          "Defined allow rules compile into different functions that accept both a db
-          and flake argument, and return truthy if flake is allowed. Different parse rules
-          currently supported are listed with their respective defmethod keyword dispatch
-          values.
+  "Defined allow rules compile into different functions that accept both a db and
+  flake argument, and return truthy if flake is allowed. Different parse rules
+  currently supported are listed with their respective defmethod keyword
+  dispatch values.
 
-          Rule parsing returns two-tuple of [async? fn], where async? is a boolean indicating
-          if the fn will return an async chan which will require a take (<!) to get the value."
-          (fn [_ rule]
-            (cond
-              (contains? rule const/iri-equals) :f/equals
-              (contains? rule const/iri-contains) :f/contains
-              :else ::unrestricted-rule)))
+  Rule parsing returns two-tuple of [async? fn], where async? is a boolean
+  indicating if the fn will return an async chan which will require a take (<!)
+  to get the value."
+  (fn [_ rule]
+    (cond
+      (contains? rule const/iri-equals) :f/equals
+      (contains? rule const/iri-contains) :f/contains
+      :else ::unrestricted-rule)))
 
 (defmethod compile-allow-rule-fn :f/equals
   [db rule]
@@ -372,7 +368,7 @@
   [db base-key-seq prop-policies]
   (go-try
     (->> prop-policies
-         (map #(compile-prop-policy db base-key-seq %))
+         (map (partial compile-prop-policy db base-key-seq))
          async/merge
          (async/reduce
           (fn [acc result]
@@ -441,13 +437,15 @@
 (defn compile-policy
   [db policy]
   (go-try
-    (let [classes (some-> policy (get const/iri-target-class) util/sequential
-                          (->> (mapv #(get % "@id"))))
-          nodes   (some-> policy (get const/iri-target-node) util/sequential
-                          (->> (mapv #(get % "@id"))))]
+    (let [classes (some->> (get policy const/iri-target-class)
+                           util/sequential
+                           (mapv #(get % "@id")))
+          nodes   (some->> (get policy const/iri-target-node)
+                           util/sequential
+                           (mapv #(get % "@id")))]
       (cond-> []
-              classes (into (<? (compile-class-policy db policy classes)))
-              nodes (into (<? (compile-node-policy db policy nodes)))))))
+        classes (into (<? (compile-class-policy db policy classes)))
+        nodes (into (<? (compile-node-policy db policy nodes)))))))
 
 
 (defn compile-policies
@@ -455,7 +453,7 @@
   [db policies]
   ;; TODO - if multiple rules target the same class, we need to 'or' the rules together.
   (->> policies
-       (map #(compile-policy db %))
+       (map (partial compile-policy db))
        async/merge
        (async/reduce (fn [acc compiled-policy]
                        (if (util/exception? compiled-policy)
@@ -464,17 +462,17 @@
 
 (defn policy-map
   "perm-action is a set of the action(s) being filtered for."
-  [db did-sid role-sids credential]
+  [db did roles credential]
   (async/go
     (try*
-      (let [policies {:ident did-sid
-                      :roles role-sids
+      (let [policies {:ident did
+                      :roles roles
                       :cache (atom {})}
 
             ;; TODO - query for all rules is very cacheable - but cache must be cleared when any new tx updates a rule
             ;; TODO - (easier said than done, as they are nested nodes whose top node is the only one required to have a specific class type)
             role-policies (<? (policies-for-roles db policies))
-
+            _ (log/info "role-policies:" role-policies)
             compiled-policies (->> (<? (compile-policies db role-policies))
                                    (reduce (fn [acc [ks m]]
                                              (assoc-in acc ks m))
@@ -509,14 +507,26 @@
     (->> (<? (query-range/index-range db :spot = [sid const/$f:role] {:flake-xf (map flake/o)}))
          (into #{}))))
 
+(defn roles-for-did
+  [db did]
+  (go-try
+    (let [ns-codes (:namespace-codes db)
+          did-sid  (iri/iri->sid did (:namespaces db))]
+      (into #{}
+            (<? (query-range/index-range db :spot = [did-sid const/$f:role]
+                                         {:flake-xf (comp (map flake/o)
+                                                          (distinct)
+                                                          (map (fn [sid]
+                                                                 (iri/sid->iri sid ns-codes))))}))))))
+
 (defn wrap-policy
   "Given a db object and a map containing the identity,
   wraps specified policy permissions"
   [{:keys [policy] :as db} {:keys [did role credential]}]
   (go-try
-    (let [did-sid (and did (<? (dbproto/-subid db did)))
-          role-sids (or (and role (<? (subids db (util/sequential role))))
-                        (and did-sid (<? (role-sids-for-sid db did-sid))))]
+    (let [roles (or (some->> role util/sequential)
+                    (and did (<? (roles-for-did db did))))]
+      (log/info "roles:" roles)
       (cond
         (or (:ident policy) (:roles policy))
         (throw (ex-info (str "Policy already in place for this db. "
@@ -525,10 +535,10 @@
                         {:status 400
                          :error  :db/policy-exception}))
 
-        (empty? role-sids)
+        (empty? roles)
         (throw (ex-info "Applying policy without a role is not yet supported."
                         {:status 400
                          :error  :db/policy-exception}))
 
         :else
-        (assoc db :policy (<? (policy-map db did-sid role-sids credential)))))))
+        (assoc db :policy (<? (policy-map db did roles credential)))))))
