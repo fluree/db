@@ -4,6 +4,7 @@
             [clojure.core.async :as async]
             [fluree.db.query.range :as query-range]
             [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
@@ -32,14 +33,16 @@
   Equals should return a single value result. If anywhere along the path multiple results
   are returned, it will choose the first one and log out a warning that equals is being
   used with data that is not compliant (prefer f:contains)."
-  [{:keys [policy] :as db} path-pids equals-rule]
+  [{:keys [policy] :as db} path equals-rule]
   (go-try
     (let [{:keys [cache ident]} policy
-          db-root (dbproto/-rootdb db)]
-      (loop [[next-pid & r] path-pids
-             last-result ident]
-        (if next-pid
-          (let [next-res (<? (query-range/index-range db-root :spot = [last-result next-pid]))
+          db-root (dbproto/-rootdb db)
+          nses    (:namespaces db-root)]
+      (loop [[next-iri & r] path
+             last-result    ident]
+        (if next-iri
+          (let [next-pid (iri/iri->sid next-iri nses)
+                next-res (<? (query-range/index-range db-root :spot = [last-result next-pid]))
                 ;; in case of mixed data types, take the first IRI result - unless we
                 ;; are at the end of the path in which case take the first value regardless
                 next-val (some #(when (= const/$xsd:anyURI (flake/dt %))

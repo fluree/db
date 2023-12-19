@@ -32,7 +32,6 @@
           fns     (keep #(or (get-in policy [const/iri-view :class % p-iri :function])
                              (get-in policy [const/iri-view :class % :default :function]))
                         classes)]
-      (log/info "fns:" fns)
       (loop [[[async? f] & r] fns]
         ;; return first truthy response, else false
         (if f
