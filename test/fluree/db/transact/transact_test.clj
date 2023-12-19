@@ -69,10 +69,10 @@
                       {:id        :ex/alice
                        :ex/isCool false}})]
       (is (= [[:ex/alice :ex/isCool false]]
-             (set @(fluree/query db-bool {:context [test-utils/default-context
-                                                    {:ex "http://example.org/ns/"}]
-                                          :select  '[?s ?p ?o]
-                                          :where   '{:id ?s, ?p ?o}}))))))
+             @(fluree/query db-bool {:context [test-utils/default-context
+                                               {:ex "http://example.org/ns/"}]
+                                     :select  '[?s ?p ?o]
+                                     :where   '{:id ?s, ?p ?o}})))))
 
   (testing "mixed data types (ref & string) are handled correctly"
     (let [conn   (test-utils/create-conn)
