@@ -56,8 +56,9 @@
                    (some-> o-mch
                            where/get-datatype-iri
                            (as-> dt-iri (iri/generate-sid sid-gen dt-iri)))
-                   (datatype/infer v))]
-        (flake/create sid pid v dt t true m)))))
+                   (datatype/infer v))
+            v* (datatype/coerce-value v dt)]
+        (flake/create sid pid v* dt t true m)))))
 
 
 (defn insert
