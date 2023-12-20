@@ -60,7 +60,9 @@
                     (safe-compare (count (:optional w1-by-type))
                                   (count (:optional w2-by-type)))
                     (safe-compare (count (:union w1-by-type))
-                                  (count (:union w2-by-type))))))))))
+                                  (count (:union w2-by-type)))
+                    (safe-compare (count (:bind w1-by-type))
+                                  (count (:bind w2-by-type))))))))))
 
 (defn get-select-key
   [q]
