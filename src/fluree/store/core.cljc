@@ -2,19 +2,13 @@
   (:refer-clojure :exclude [read])
   (:require [fluree.store.proto :as store-proto]
             [fluree.store.file :as file-store]
+            [fluree.store.localstorage :as localstorage-store]
             [fluree.store.memory :as mem-store]
             [malli.core :as m]))
 
 (def BaseConfig
   [:map
-   [:store/method [:enum :memory :file :ipfs :s3 :remote]]])
-
-(def MemoryConfig
-  [:and
-   BaseConfig
-   [:map
-    [:store/method [:enum :memory]]
-    [:memory-store/storage-atom {:optional true} :any]]])
+   [:store/method [:enum :memory :localstorage :file :ipfs :s3 :remote]]])
 
 (def FileConfig
   [:and
@@ -23,10 +17,24 @@
     [:store/method [:enum :file]]
     [:file-store/storage-path :string]]])
 
+(def LocalStorageConfig
+  [:and
+   BaseConfig
+   [:map
+    [:store/method [:enum :localstorage]]]])
+
+(def MemoryConfig
+  [:and
+   BaseConfig
+   [:map
+    [:store/method [:enum :memory]]
+    [:memory-store/storage-atom {:optional true} :any]]])
+
 (def StoreConfig
   [:or
-   MemoryConfig
-   FileConfig])
+   FileConfig
+   LocalStorageConfig
+   MemoryConfig])
 
 (defn start
   [{:keys [:store/method] :as config}]
@@ -35,8 +43,10 @@
                     {:error  config-error
                      :config config}))
     (case method
-      :memory (mem-store/create-memory-store config)
-      :file   (file-store/create-file-store config)
+      :file         (file-store/create-file-store config)
+      :localstorage (localstorage-store/create-localstorage-store config)
+      :memory       (mem-store/create-memory-store config)
+
       (throw (ex-info (str "No Store implementation for :store/method: " (pr-str method))
                       config)))))
 

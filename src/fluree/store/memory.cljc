@@ -1,11 +1,14 @@
 (ns fluree.store.memory
   (:refer-clojure :exclude [read])
   (:require [fluree.store.proto :as store-proto]
-            [fluree.crypto :as crypto]))
+            [fluree.crypto :as crypto]
+            [fluree.store.util :as store-util]))
 
 (defn memory-write
   [storage-atom k v {:keys [content-address?]}]
-  (let [hashable (pr-str v)
+  (let [hashable (if (store-util/hashable? v)
+                   v
+                   (pr-str v))
         hash     (crypto/sha2-256 hashable)
         k*       (if content-address?
                    (str k hash)
