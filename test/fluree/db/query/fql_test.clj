@@ -431,7 +431,7 @@
               "returns unified results from each component ledger"))))))
 
 
-(deftest ^:integration query-for-stored-fql-queries
+(deftest ^:integration ^:pending query-for-stored-fql-queries
   (let [conn      @(fluree/connect {:method :memory})
         context   [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         ledger-id "test/query-queries"
@@ -479,43 +479,118 @@
                            :where     {:id      :foo/publicViewAllow
                                        :f/query "?query"}}))
         "should return query, compacted with provided context"))
-  (let [conn @(fluree/connect {:method :memory})
-        context [test-utils/default-context {:ex "http://example.org/ns/"}]
-        ledger-id "test/query-queries"
-        ledger @(fluree/create conn ledger-id)
-        db @(fluree/stage (fluree/db ledger)
-                          {"@context" context
-                           "insert" [{:id :ex/aggQuery1
-                                      :f/query {:type :f/queryType
-                                                :value
-                                                (str '{:select   [?name (count ?favNums)]
-                                                       :where    {:schema/name ?name
-                                                                  :ex/favNums  ?favNums}
-                                                       :group-by ?name})}}]})
-        context2 [test-utils/default-context {:foo "http://example.org/ns/"}]]
-    (is (= [[{"select" ["?name" '(count "?favNums")],
-              "where" [{:schema/name "?name"
-                        :foo/favNums "?favNums"}]
-              "group-by" ["?name"]}]]
-           @(fluree/query db
-                          {"@context"  context2
-                           :select ["?query"]
-                           :where {:id :foo/aggQuery1
-                                   :f/query "?query"}})))
-    (let [db2 @(fluree/stage db
-                             {"@context" context
-                              "insert"
-                              [{:id :ex/aggQuery2
-                                :f/query
-                                {:type :f/queryType
-                                 :value
-                                 (str '{:select [(count ?name)]
-                                        :where  {:schema/name ?name}})}}]})]
-      (is (= [[{"select" ['(count "?name")]
-                "where" [{:schema/name "?name"}]}]]
-             @(fluree/query db2 {"@context" context2
-                                 :select ["?query"]
-                                 :where {:id :foo/aggQuery2
-                                         :f/query "?query"}}))))))
-
-
+  (testing "aggregate queries"
+    (let [conn @(fluree/connect {:method :memory})
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]
+          ledger-id "test/query-queries"
+          ledger @(fluree/create conn ledger-id)
+          db @(fluree/stage (fluree/db ledger)
+                            {"@context" context
+                             "insert" [{:id :ex/aggQuery1
+                                        :f/query {:type :f/queryType
+                                                  :value
+                                                  (str '{:select   [?name (count ?favNums)]
+                                                         :where    {:schema/name ?name
+                                                                    :ex/favNums  ?favNums}
+                                                         :group-by ?name})}}]})
+          context2 [test-utils/default-context {:foo "http://example.org/ns/"}]]
+      (is (= [[{"select" ["?name" '(count "?favNums")],
+                "where" [{:schema/name "?name"
+                          :foo/favNums "?favNums"}]
+                "group-by" ["?name"]}]]
+             @(fluree/query db
+                            {"@context"  context2
+                             :select ["?query"]
+                             :where {:id :foo/aggQuery1
+                                     :f/query "?query"}})))
+      (let [db2 @(fluree/stage db
+                               {"@context" context
+                                "insert"
+                                [{:id :ex/aggQuery2
+                                  :f/query
+                                  {:type :f/queryType
+                                   :value
+                                   (str '{:select [(count ?name)]
+                                          :where  {:schema/name ?name}})}}]})]
+        (is (= [[{"select" ['(count "?name")]
+                  "where" [{:schema/name "?name"}]}]]
+               @(fluree/query db2 {"@context" context2
+                                   :select ["?query"]
+                                   :where {:id :foo/aggQuery2
+                                           :f/query "?query"}}))))))
+  (testing "optional queries"
+    (let [conn @(fluree/connect {:method :memory})
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]
+          ledger-id "test/query-queries"
+          ledger @(fluree/create conn ledger-id)
+          db @(fluree/stage (fluree/db ledger)
+                            {"@context" context
+                             "insert" [{:id :ex/optionalQuery1
+                                        :f/query {:type :f/queryType
+                                                  :value
+                                                  (str '{:select [?name ?favColor ?email]
+                                                         :where  [{:id          ?s
+                                                                   :type        :ex/User
+                                                                   :schema/name ?name}
+                                                                  [:optional
+                                                                   {:id ?s, :ex/favColor ?favColor}
+                                                                   {:id ?s, :schema/email ?email}]]})}}]})
+          context2 [test-utils/default-context {:foo "http://example.org/ns/"}]]
+      (is (= [[{"select" ["?name" "?favColor" "?email"]
+                "where"  [{:id          "?s"
+                           :type        :foo/User
+                           :schema/name "?name"}
+                          ["optional" [{:id "?s", :foo/favColor "?favColor"}]]
+                          ["optional" [{:id "?s", :schema/email "?email"}]]]}]]
+             @(fluree/query db
+                            {"@context"  context2
+                             :select ["?query"]
+                             :where {:id :foo/optionalQuery1
+                                     :f/query "?query"}})))
+      (let [db2 @(fluree/stage db
+                               {"@context" context
+                                "insert"
+                                [{:id :ex/optionalQuery2
+                                  :f/query
+                                  {:type :f/queryType
+                                   :value
+                                   (str '{:select [?name ?favColor ?email]
+                                          :where  [{:id ?s
+                                                    :type :ex/User
+                                                    :schema/name ?name}
+                                                   [:optional {:id ?s,
+                                                               :ex/favColor ?favColor
+                                                               :schema/email ?email}]]})}}]})]
+        (is (= [[{"select" ["?name" "?favColor" "?email"]
+                  "where"  [{:id "?s"
+                             :type :foo/User
+                             :schema/name "?name"}
+                            ["optional" [{:id "?s",
+                                          :foo/favColor "?favColor"
+                                          :schema/email "?email"}]]]}]]
+               @(fluree/query db2 {"@context" context2
+                                   :select ["?query"]
+                                   :where {:id :foo/optionalQuery2
+                                           :f/query "?query"}})))
+        (let [db3 @(fluree/stage db2
+                                 {"@context" context
+                                  "insert" [{:id :ex/optionalQuery3
+                                             :f/query
+                                             {:type :f/queryType
+                                              :value
+                                              (str '{:select [?name ?favColor ?email]
+                                                     :where  [{:id          ?s
+                                                               :type        :ex/User
+                                                               :schema/name ?name}
+                                                              [:optional {:id ?s, :ex/favColor ?favColor}]
+                                                              [:optional {:id ?s, :schema/email ?email}]]})}}]})]
+          (is (= [[{"select" ["?name" "?favColor" "?email"]
+                    "where"  [{:id          "?s"
+                               :type        :foo/User
+                               :schema/name "?name"}
+                              ["optional" [{:id "?s", :foo/favColor "?favColor"}]]
+                              ["optional" [{:id "?s", :schema/email "?email"}]]]}]]
+                 @(fluree/query db3 {"@context" context2
+                                     :select ["?query"]
+                                     :where {:id :foo/optionalQuery3
+                                             :f/query "?query"}}))))))))

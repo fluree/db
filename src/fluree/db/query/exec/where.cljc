@@ -181,28 +181,42 @@
       (some-> (::var component) str)
       (::val component)))
 
-;;TODO handle non-:tuple patterns, other cases
 (defn unparse-node
   [[s patterns :as node] select-vars compact-fn]
   (let [id (compact-fn "@id")
         unparsed-s (unparse-component s compact-fn)]
     (if-let [s-var (::var s)]
-      (let [init (if (contains? select-vars s-var)
-                   (assoc {} id unparsed-s)
-                   ;;s-var was a placeholder gensym
-                   {})]
+      ;;TODO: prune out gensym'd placeholder subjects?
+      (let [init (assoc {} id unparsed-s)]
+        ;;TODO is s-val a thing?
         (reduce (fn [where-map [_s p o]]
                   (assoc where-map (unparse-component p compact-fn)
                          (unparse-component o compact-fn)))
                 init
                 patterns)))))
 
-(defn unparse-patterns
+(defn unparse-nonrecursive-patterns
   [patterns select-vars compact-fn]
   (let [by-subject (group-by first patterns)]
     (into [] (map #(unparse-node % select-vars compact-fn))
           by-subject)))
 
+(declare unparse-patterns)
+
+(defn unparse-recursive-patterns
+  [recursive-patterns select-vars compact-fn]
+  (mapv (fn [[typ {::keys [patterns]}]]
+          [(name typ) (unparse-patterns patterns select-vars compact-fn)])
+        recursive-patterns))
+
+(defn unparse-patterns
+  [patterns select-vars compact-fn]
+  (let [{:keys [class tuple optional union _bind]} (group-by pattern-type patterns)
+        ;;TODO bind patterns
+        nonrecursive-patterns (into tuple (map second class))
+        recursive-patterns (into optional union)]
+    (into (unparse-nonrecursive-patterns nonrecursive-patterns select-vars compact-fn)
+          (unparse-recursive-patterns recursive-patterns select-vars compact-fn))))
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
    `db` that are compatible with the initial solution `solution` and matches the
