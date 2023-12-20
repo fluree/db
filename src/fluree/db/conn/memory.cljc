@@ -14,7 +14,8 @@
             [fluree.db.conn.core :as conn-core]
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
-            [fluree.crypto :as crypto])
+            [fluree.crypto :as crypto]
+            [fluree.store.core :as store])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -35,13 +36,12 @@
                     {:status 500 :error :db/invalid-db}))))
 
 (defn- write-data!
-  [data-atom data]
+  [store data]
   (let [json (json-ld/normalize-data data)
-        hash (crypto/sha2-256-normalize json)
-        path hash]
-    #?(:cljs (when platform/BROWSER
-               (.setItem js/localStorage hash json)))
-    (swap! data-atom assoc hash data)
+        hash (crypto/sha2-256 json)
+        {path :k
+         size :size}
+        (store/write store hash data)]
     {:name    hash
      :hash    hash
      :json    json
@@ -49,49 +49,47 @@
      :address (memory-address path)}))
 
 (defn write-commit!
-  [data-atom commit-data]
-  (write-data! data-atom commit-data))
+  [store commit-data]
+  (write-data! store commit-data))
 
 (defn- read-address
-  [data-atom address]
+  [store address]
   (let [addr-path (address-path address)]
-    #?(:clj  (get @data-atom addr-path)
-       :cljs (or (get @data-atom addr-path)
-                 (and platform/BROWSER (.getItem js/localStorage addr-path))))))
+    (store/read store addr-path)))
 
 (defn- read-data
-  [data-atom address]
-  (let [data (read-address data-atom address)]
+  [store address]
+  (let [data (read-address store address)]
     #?(:cljs (if (and platform/BROWSER (string? data))
                (js->clj (.parse js/JSON data))
                data)
        :clj  data)))
 
 (defn read-commit
-  [data-atom address]
-  (read-data data-atom address))
+  [store address]
+  (read-data store address))
 
 (defn write-context!
-  [data-atom context-data]
-  (write-data! data-atom context-data))
+  [store context-data]
+  (write-data! store context-data))
 
 (defn read-context
-  [data-atom context-key]
-  (read-data data-atom context-key))
+  [store context-key]
+  (read-data store context-key))
 
 (defn close
   [id state]
   (log/info "Closing memory connection" id)
   (swap! state assoc :closed? true))
 
-(defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom
+(defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom store
                              parallelism msg-in-ch msg-out-ch nameservices data-atom]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key] (go (read-commit data-atom commit-key)))
-  (-c-write [_ _ledger commit-data] (go (write-commit! data-atom commit-data)))
-  (-ctx-write [_ _ledger context-data] (go (write-context! data-atom context-data)))
-  (-ctx-read [_ context-key] (go (read-context data-atom context-key)))
+  (-c-read [_ commit-key] (go (read-commit store commit-key)))
+  (-c-write [_ _ledger commit-data] (go (write-commit! store commit-data)))
+  (-ctx-write [_ _ledger context-data] (go (write-context! store context-data)))
+  (-ctx-read [_ context-key] (go (read-context store context-key)))
 
   conn-proto/iConnection
   (-close [_] (close id state))
@@ -147,26 +145,25 @@
 
 (defn default-memory-nameservice
   "Returns memory nameservice"
-  [data-atom]
-  (ns-memory/initialize data-atom))
+  [store]
+  (ns-memory/initialize store))
 
 (defn connect
   "Creates a new memory connection."
-  [{:keys [parallelism lru-cache-atom memory defaults nameservices]}]
+  [{:keys [parallelism lru-cache-atom memory defaults nameservices store]}]
   (go-try
     (let [ledger-defaults (<? (ledger-defaults defaults))
           conn-id         (str (random-uuid))
-          data-atom       (atom {})
           state           (conn-core/blank-state)
           nameservices*   (util/sequential
                             (or nameservices
-                                (default-memory-nameservice data-atom)))
+                                (default-memory-nameservice store)))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
-                              :data-atom       data-atom
+                              :store           store
                               :parallelism     parallelism
                               :msg-in-ch       (async/chan)
                               :msg-out-ch      (async/chan)
