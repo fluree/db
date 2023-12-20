@@ -540,8 +540,8 @@
                 "where"  [{:id          "?s"
                            :type        :foo/User
                            :schema/name "?name"}
-                          ["optional" [{:id "?s", :foo/favColor "?favColor"}]]
-                          ["optional" [{:id "?s", :schema/email "?email"}]]]}]]
+                          ["optional" {:id "?s", :foo/favColor "?favColor"}]
+                          ["optional" {:id "?s", :schema/email "?email"}]]}]]
              @(fluree/query db
                             {"@context"  context2
                              :select ["?query"]
@@ -565,9 +565,9 @@
                   "where"  [{:id "?s"
                              :type :foo/User
                              :schema/name "?name"}
-                            ["optional" [{:id "?s",
-                                          :foo/favColor "?favColor"
-                                          :schema/email "?email"}]]]}]]
+                            ["optional" {:id "?s",
+                                         :foo/favColor "?favColor"
+                                         :schema/email "?email"}]]}]]
                @(fluree/query db2 {"@context" context2
                                    :select ["?query"]
                                    :where {:id :foo/optionalQuery2
@@ -588,9 +588,64 @@
                     "where"  [{:id          "?s"
                                :type        :foo/User
                                :schema/name "?name"}
-                              ["optional" [{:id "?s", :foo/favColor "?favColor"}]]
-                              ["optional" [{:id "?s", :schema/email "?email"}]]]}]]
+                              ["optional" {:id "?s", :foo/favColor "?favColor"}]
+                              ["optional" {:id "?s", :schema/email "?email"}]]}]]
                  @(fluree/query db3 {"@context" context2
                                      :select ["?query"]
                                      :where {:id :foo/optionalQuery3
-                                             :f/query "?query"}}))))))))
+                                             :f/query "?query"}})))))))
+  (testing "union queries"
+    (let [conn @(fluree/connect {:method :memory})
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]
+          ledger-id "test/query-queries"
+          ledger @(fluree/create conn ledger-id)
+          db @(fluree/stage (fluree/db ledger)
+                            {"@context" context
+                             "insert" [{:id :ex/unionQuery1
+                                        :f/query {:type :f/queryType
+                                                  :value
+                                                  (str {:select ['?name '?email1 '?email2]
+                                                        :where  [{:id '?s
+                                                                  :type :ex/User
+                                                                  :schema/name '?name}
+                                                                 [:union
+                                                                  {:id '?s, :ex/email '?email1}
+                                                                  {:id '?s, :schema/email '?email2}]]})}}]})
+          context2 [test-utils/default-context {:foo "http://example.org/ns/"}]]
+      (is (= [[{"select" ["?name" "?email1" "?email2"]
+                "where"  [{:id          "?s"
+                           :type        :foo/User
+                           :schema/name "?name"}
+                          ["union"
+                           {:id "?s", :foo/email "?email1"}
+                           {:id "?s", :schema/email "?email2"}]]}]]
+             @(fluree/query db
+                            {"@context"  context2
+                             :select ["?query"]
+                             :where {:id :foo/unionQuery1
+                                     :f/query "?query"}})))
+      (let [db2 @(fluree/stage db
+                               {"@context" context
+                                "insert"
+                                [{:id :ex/unionQuery2
+                                  :f/query
+                                  {:type :f/queryType
+                                   :value
+                                   (str {:select ['?name '?email]
+                                         :where  [{:id          '?s
+                                                   :type        :ex/User
+                                                   :schema/name '?name}
+                                                  [:union
+                                                   {:id '?s, :ex/email '?email}
+                                                   {:id '?s, :schema/email '?email}]]})}}]})]
+        (is (= [[{"select" ["?name" "?email"]
+                  "where"  [{:id          "?s"
+                             :type        :foo/User
+                             :schema/name "?name"}
+                            ["union"
+                             {:id "?s", :foo/email "?email"}
+                             {:id "?s", :schema/email "?email"}]]}]]
+               @(fluree/query db2 {"@context" context2
+                                   :select ["?query"]
+                                   :where {:id :foo/unionQuery2
+                                           :f/query "?query"}})))))))
