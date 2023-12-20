@@ -393,7 +393,6 @@
                                                     (commit-flakes->json-ld
                                                       db context error-ch)
                                                     (async/into [])))]
-            (log/info "chunk:" chunk)
             (map into chunk consecutive-commit-details)))
         ch))
      chunked-ch)
