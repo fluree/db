@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [go alts!]]
             [clojure.set :refer [map-invert]]
+            [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.policy :as perm]
@@ -33,15 +34,13 @@
              remaining-subj-mods subj-mods']
         (if s-flakes
           (let [sid (flake/s (first s-flakes))
-                {:keys [new? classes shacl]} (get subj-mods' sid)]
+                {:keys [classes shacl]} (get subj-mods' sid)]
             (when shacl
               (let [shacl*    (mapv (fn [shape]
                                       (update shape :validated-properties (fnil into #{})
                                               (get shape->validated-properties (:id shape))))
                                     shacl)
-                    s-flakes* (if new?
-                                s-flakes
-                                (<? (query-range/index-range root-db :spot = [sid])))]
+                    s-flakes* (<? (query-range/index-range root-db :spot = [sid]))]
                 (<? (shacl/validate-target shacl* root-db s-flakes*))))
             (recur r (into all-classes classes) (dissoc remaining-subj-mods sid)))
           ;; There may be subjects who need to have rules checked due to the addition
@@ -123,31 +122,28 @@
       (loop [[s-flakes & r] (partition-by flake/s new-flakes)
              subj-mods      {}]
         (if s-flakes
-          (let [sid            (flake/s (first s-flakes))
-                new-subject?   (first s-flakes)
-                new-classes    (into #{}
-                                     (comp
-                                       (filter #(= const/$rdf:type (flake/p %)))
-                                       (map flake/o))
-                                     s-flakes)
-                classes        (if new-subject?
-                                 new-classes
-                                 (into new-classes
-                                       (<? (query-range/index-range db-before :spot = [sid const/$rdf:type]
-                                                                    {:flake-xf (map flake/o)}))))
-                class-shapes   (<? (shacl/class-shapes db-before classes))
+          (let [sid              (flake/s (first s-flakes))
+                new-classes      (into #{}
+                                       (comp
+                                         (filter #(= const/$rdf:type (flake/p %)))
+                                         (map flake/o))
+                                       s-flakes)
+                existing-classes (<? (query-range/index-range db-before :spot = [sid const/$rdf:type]
+                                                              {:flake-xf (map flake/o)}))
+                classes          (into new-classes existing-classes)
+                class-shapes     (<? (shacl/class-shapes db-before classes))
                 ;; these target objects in s-flakes
-                pid->ref-flakes (when has-target-objects-of-shapes
-                                  (group-by flake/p s-flakes))
-                o-pred-shapes   (when (seq pid->ref-flakes)
-                                  (<? (shacl/targetobject-shapes db-before (keys pid->ref-flakes))))
+                pid->ref-flakes  (when has-target-objects-of-shapes
+                                   (group-by flake/p s-flakes))
+                o-pred-shapes    (when (seq pid->ref-flakes)
+                                   (<? (shacl/targetobject-shapes db-before (keys pid->ref-flakes))))
                 ;; these target subjects in s-flakes
-                referring-pids (when has-target-objects-of-shapes
-                                 (<? (query-range/index-range db-before :opst = [sid]
-                                                              {:flake-xf (map flake/p)})))
-                s-pred-shapes  (when (seq referring-pids)
-                                 (<? (shacl/targetobject-shapes db-before referring-pids)))
-                shacl-shapes   (into class-shapes s-pred-shapes)]
+                referring-pids   (when has-target-objects-of-shapes
+                                   (<? (query-range/index-range db-before :opst = [sid]
+                                                                {:flake-xf (map flake/p)})))
+                s-pred-shapes    (when (seq referring-pids)
+                                   (<? (shacl/targetobject-shapes db-before referring-pids)))
+                shacl-shapes     (into class-shapes s-pred-shapes)]
             (recur r (reduce
                        (fn [subj-mods o-pred-shape]
                          (let [target-os (->> (get pid->ref-flakes (:target-objects-of o-pred-shape))
@@ -157,7 +153,6 @@
                                    subj-mods
                                    target-os)))
                        (-> subj-mods
-                           (assoc-in [sid :new?] (boolean new-subject?))
                            (update-in [sid :classes] (fnil into []) classes)
                            (update-in [sid :shacl] (fnil into []) shacl-shapes))
                        o-pred-shapes)))
