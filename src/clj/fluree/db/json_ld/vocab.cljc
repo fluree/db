@@ -254,6 +254,14 @@
                   vfs)))
             (or ref-flakes #{}) all-flakes)))
 
+(defn descending
+  [x y]
+  (compare y x))
+
+(defn list-index
+  [f]
+  (-> f flake/op :i))
+
 (defn pred-dt-constraints
   "Collect any shacl datatype constraints and the predicates they apply to."
   [new-flakes]
@@ -261,14 +269,14 @@
          res []]
     (if s-flakes
       (if-let [dt-constraints (->> s-flakes
-                                   (filterv #(= const/$sh:datatype (flake/p %)))
-                                   (mapv #(flake/o %))
-                                   (first))]
+                                   (filter #(= const/$sh:datatype (flake/p %)))
+                                   (map flake/o)
+                                   first)]
         (let [path (->> s-flakes
-                        (filterv #(= const/$sh:path (flake/p %)))
-                        (sort-by #(:i (flake/m %)))
-                        (mapv #(flake/o %))
-                        (last))]
+                        (filter #(= const/$sh:path (flake/p %)))
+                        (sort-by list-index descending)
+                        (map flake/o)
+                        first)]
           (recur r (conj res [path dt-constraints])))
         (recur r res))
       res)))
