@@ -51,8 +51,10 @@
                       config)))))
 
 (defn write
-  [store k v opts]
-  (store-proto/write store k v opts))
+  ([store k v]
+   (store-proto/write store k v nil))
+  ([store k v opts]
+   (store-proto/write store k v opts)))
 
 (defn read
   [store k]

@@ -8,16 +8,17 @@
 (defn localstorage-write
   [k v {:keys [content-address?]}]
   #?(:cljs
-     (let [hash     (if (store-util/hashable? v)
-                      (crypto/sha2-256 v)
-                      (crypto/sha2-256 (json-ld/normalize-data v)))
+     (let [hashable (if (store-util/hashable? v)
+                      v
+                      (json-ld/normalize-data v))
+           hash     (crypto/sha2-256 hashable)
            k*       (if content-address?
                       (str k hash)
                       k)]
        (.setItem js/localStorage k* v)
        {:k k*
         :hash hash
-        :size (count v)})))
+        :size (count hashable)})))
 
 (defn localstorage-read
   [k]

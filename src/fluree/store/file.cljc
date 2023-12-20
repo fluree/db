@@ -20,8 +20,8 @@
         path (str (fs/local-path storage-path) "/" k)]
     (fs/write-file path v)
     {:k    k*
-     :size 0
-     :hash hash}))
+     :hash hash
+     :size (count v)}))
 
 (defn file-read
   [storage-path k]
