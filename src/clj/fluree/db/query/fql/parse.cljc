@@ -1,6 +1,7 @@
 (ns fluree.db.query.fql.parse
   (:require #?(:cljs [cljs.reader :refer [read-string]])
             [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
@@ -548,13 +549,15 @@
   (-> q syntax/coerce-query parse-analytical-query))
 
 (def blank-node-prefix
-  "_:fdb-")
+  "_:fdb")
 
 (defn new-blank-node-id
   "Generate a temporary blank-node id. This will get replaced during flake creation
   when a sid is generated."
   []
-  (str blank-node-prefix (random-uuid)))
+  (let [now (util/current-time-millis)
+        suf (rand-int 100000)]
+    (str/join "-" [blank-node-prefix now suf] )))
 
 (declare parse-subj-cmp)
 
