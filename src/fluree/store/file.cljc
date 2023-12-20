@@ -1,13 +1,14 @@
 (ns fluree.store.file
   (:refer-clojure :exclude [read])
-  (:require [fluree.store.proto :as store-proto]
-            [fluree.crypto :as crypto]
-            [fluree.db.util.filesystem :as fs]))
+  (:require [fluree.crypto :as crypto]
+            [fluree.db.util.filesystem :as fs]
+            [fluree.store.proto :as store-proto]
+            [fluree.store.util :as store-util]))
 
 (defn file-write
   [storage-path k v {:keys [content-address?] :as opts}]
-  (when (not (bytes? v))
-    (throw (ex-info "Must serialize v to bytes before writing to FileStore."
+  (when (not (store-util/hashable? v))
+    (throw (ex-info "Must serialize v before writing to FileStore."
                     {:storage-path storage-path
                      :k            k
                      :v            v
