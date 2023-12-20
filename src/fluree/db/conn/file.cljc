@@ -19,7 +19,8 @@
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
-            [fluree.db.ledger.proto :as ledger-proto])
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.store.core :as store])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -37,25 +38,20 @@
   (let [[_ _ path] (str/split address #":")]
     path))
 
-(defn address-full-path
-  [{:keys [storage-path] :as _conn} address]
-  (str (fs/local-path storage-path) "/" (address-path address)))
-
 (defn address-path-exists?
   [conn address]
-  (let [full-path (address-full-path conn address)]
-    (fs/exists? full-path)))
+  (store/exists? (:store conn) (address-path address)))
 
 (defn read-address
   [conn address]
-  (->> address (address-full-path conn) fs/read-file))
+  (store/read (:store conn) (address-path address)))
 
 (defn read-commit
   [conn address]
   (json/parse (read-address conn address) false))
 
 (defn- write-data
-  [{:keys [storage-path] :as _conn} ledger data-type data]
+  [{:keys [store] :as _conn} ledger data-type data]
   (let [alias      (ledger-proto/-alias ledger)
         branch     (name (:name (ledger-proto/-branch ledger)))
         json       (if (string? data)
@@ -68,9 +64,8 @@
                         (when branch (str "/" branch))
                         (str "/" type-dir "/")
                         hash ".json")
-        write-path (str (fs/local-path storage-path) "/" path)]
-    (log/debug (str "Writing " (name data-type) " at " write-path))
-    (fs/write-file write-path bytes)
+        ;; TODO: build migration to remove .json suffix so we can use :content-address? true
+        {:keys [k hash v]} (store/write store path bytes)]
     {:name    hash
      :hash    hash
      :json    json
@@ -91,15 +86,13 @@
 
 (defn push
   "Just write to a different directory?"
-  [{:keys [storage-path] :as _conn} publish-address {commit-address :address}]
-  (let [local-path  (fs/local-path storage-path)
-        commit-path (address-path commit-address)
+  [{:keys [store] :as _conn} publish-address {commit-address :address}]
+  (let [commit-path (address-path commit-address)
         head-path   (address-path publish-address)
-        write-path  (str local-path "/" head-path)
 
         work        (fn [complete]
-                      (log/debug (str "Updating head at " write-path " to " commit-path "."))
-                      (fs/write-file write-path (bytes/string->UTF8 commit-path))
+                      (log/debug (str "Updating head at " head-path " to " commit-path "."))
+                      (store/write store head-path (bytes/string->UTF8 commit-path))
                       (complete (file-address head-path)))]
     #?(:clj  (let [p (promise)]
                (future (work (partial deliver p)))
@@ -115,7 +108,7 @@
   (log/info "Closing file connection" id)
   (swap! state assoc :closed? true))
 
-(defrecord FileConnection [id state ledger-defaults parallelism msg-in-ch
+(defrecord FileConnection [id state ledger-defaults parallelism msg-in-ch store
                            nameservices serializer msg-out-ch lru-cache-atom]
 
   conn-proto/iStorage
@@ -205,25 +198,23 @@
 
 (defn default-file-nameservice
   "Returns file nameservice or will throw if storage-path generates an exception."
-  [storage-path]
-  (ns-filesystem/initialize storage-path))
+  [store]
+  (ns-filesystem/initialize store))
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism storage-path lru-cache-atom memory serializer nameservices]
-    :or {serializer (json-serde)
-         storage-path "data/ledger"} :as _opts}]
+  [{:keys [defaults parallelism store lru-cache-atom memory serializer nameservices]
+    :or {serializer (json-serde)} :as _opts}]
   (go
-    (let [storage-path   (trim-last-slash storage-path)
-          conn-id        (str (random-uuid))
+    (let [conn-id        (str (random-uuid))
           state          (conn-core/blank-state)
           nameservices*  (util/sequential
-                           (or nameservices (default-file-nameservice storage-path)))
+                           (or nameservices (default-file-nameservice store)))
           cache-size     (conn-cache/memory->cache-size memory)
           lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id              conn-id
-                            :storage-path    storage-path
+                            :store           store
                             :ledger-defaults (ledger-defaults defaults)
                             :serializer      serializer
                             :parallelism     parallelism
