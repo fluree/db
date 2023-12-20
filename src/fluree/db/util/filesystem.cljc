@@ -78,6 +78,22 @@
                             "code"    (.-code e)
                             "path"    (.-path e)})))))))
 
+(defn delete-file
+  "Delete the file at `path`."
+  [path]
+  #?(:clj
+     (try
+       (io/delete-file (io/file path))
+       :deleted
+       (catch Exception e
+         (log/error e (str "Failed to delete file: " path))))
+     :cljs
+     (try
+       (fs/unlinkSync path)
+       :deleted
+       (catch :default e
+         (log/error e (str "Failed to delete file: " path))))))
+
 (defn exists?
   [path]
   #?(:clj  (->> path io/file .exists)
