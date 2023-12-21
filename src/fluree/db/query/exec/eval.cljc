@@ -449,8 +449,7 @@
   [code var]
   (let [f        (compile code)
         soln-sym 'solution]
-    (with-meta (eval `(fn [~soln-sym ~var]
-                        (-> ~soln-sym
-                            (assoc (quote ~var) ~var)
-                            ~f)))
-      {:fn code})))
+    (eval `(fn [~soln-sym ~var]
+             (-> ~soln-sym
+                 (assoc (quote ~var) ~var)
+                 ~f)))))

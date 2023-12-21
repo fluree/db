@@ -123,14 +123,14 @@
                                       {:status 400 :error :db/invalid-query})))
         var-name  (find-filtered-var code-vars vars)
         f         (eval/compile-filter code var-name)]
-    (where/->var-filter var-name f)))
+    (where/->var-filter var-name f code)))
 
 (defn parse-bind-function
   "Evals and returns bind function."
   [var-name fn-code]
   (let [code (parse-code fn-code)
         f    (eval/compile code false)]
-    (where/->var-filter var-name f)))
+    (where/->var-filter var-name f code)))
 
 (def ^:const default-recursion-depth 100)
 

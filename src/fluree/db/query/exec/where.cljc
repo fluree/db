@@ -128,11 +128,13 @@
 
 (defn ->var-filter
   "Build a query function specification for the variable `var` out of the
-  parsed function `f`."
-  [var f]
+  parsed function `f`.
+
+  Retains the fn source code for serialization/deserialization purposes."
+  [var f source-code]
   (-> var
       unmatched-var
-      (assoc ::fn f)))
+      (assoc ::fn f ::fn-source (str source-code))))
 
 (defn lang-matcher
   "Return a function that returns true if the language metadata of a matched
@@ -225,13 +227,10 @@
 (defn unparse-bind
   [bind-patterns select-vars compact-fn]
   (mapv (fn [[_typ bind-map]]
-          (let [{::keys [var fn]} (-> bind-map
-                                      vals
-                                      first)]
-            ["bind" (str var) (-> fn
-                                  meta
-                                  :fn
-                                  str)]))
+          (let [{::keys [var fn-source] :as fn-map} (-> bind-map
+                                                        vals
+                                                        first)]
+            ["bind" (str var) fn-source]))
         bind-patterns))
 
 (defn unparse-patterns
