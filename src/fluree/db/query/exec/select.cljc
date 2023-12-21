@@ -142,8 +142,7 @@
                 (>! error-ch e)))))
   Unparse
   (unparse-selector [_ _]
-    (let [[fn-name var] fn-syntax]
-      (list fn-name (str var)))))
+    (str fn-syntax)))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified

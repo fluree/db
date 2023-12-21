@@ -494,7 +494,7 @@
                                                                     :ex/favNums  ?favNums}
                                                          :group-by ?name})}}]})
           context2 [test-utils/default-context {:foo "http://example.org/ns/"}]]
-      (is (= [[{"select" ["?name" '(count "?favNums")],
+      (is (= [[{"select" ["?name" "(count ?favNums)"],
                 "where" [{:schema/name "?name"
                           :foo/favNums "?favNums"}]
                 "group-by" ["?name"]}]]
@@ -512,7 +512,7 @@
                                    :value
                                    (str '{:select [(count ?name)]
                                           :where  {:schema/name ?name}})}}]})]
-        (is (= [[{"select" ['(count "?name")]
+        (is (= [[{"select" ["(count ?name)"]
                   "where" [{:schema/name "?name"}]}]]
                @(fluree/query db2 {"@context" context2
                                    :select ["?query"]
