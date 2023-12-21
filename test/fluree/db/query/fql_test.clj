@@ -675,4 +675,29 @@
                             {"@context"  context
                              :select ["?query"]
                              :where {:id :ex/bindQuery1
-                                     :f/query "?query"}}))))))
+                                     :f/query "?query"}})))
+      (let [db2 @(fluree/stage db
+                               {"@context" context
+                                "insert" [{:id :ex/bindQuery2
+                                           :f/query {:type :f/queryType
+                                                     :value
+                                                     (str
+                                                      '{:select   [?firstLetterOfName ?name ?canVote]
+                                                        :where    [{:schema/age  ?age
+                                                                    :schema/name ?name}
+                                                                   [:bind
+                                                                    ?firstLetterOfName (subStr ?name 1 1)
+                                                                    ?canVote           (>= ?age 18)]]
+                                                        :order-by ?name})}}]})]
+        (is (= [[{"select" ["?firstLetterOfName" "?name" "?canVote"],
+                  "where"
+                  [{:schema/age "?age", :schema/name "?name"}
+                   ["bind"
+                    "?firstLetterOfName" "(subStr ?name 1 1)"
+                    "?canVote" "(>= ?age 18)"]]
+                  "orderBy" "?name"}]]
+               @(fluree/query db2
+                              {"@context"  context
+                               :select ["?query"]
+                               :where {:id :ex/bindQuery2
+                                       :f/query "?query"}}))) ))))

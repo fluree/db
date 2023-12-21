@@ -227,11 +227,14 @@
 (defn unparse-bind
   [bind-patterns select-vars compact-fn]
   (mapv (fn [[_typ bind-map]]
-          (let [{::keys [var fn-source] :as fn-map} (-> bind-map
-                                                        vals
-                                                        first)]
-            ["bind" (str var) fn-source]))
+          (into ["bind"]
+                (into []
+                      (mapcat (fn [[_var fn-map]]
+                                (let [{::keys [var fn-source]} fn-map]
+                                  [(str var) fn-source]))
+                              bind-map))))
         bind-patterns))
+
 
 (defn unparse-patterns
   [patterns select-vars compact-fn]
