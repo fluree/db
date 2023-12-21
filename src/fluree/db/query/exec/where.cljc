@@ -222,15 +222,27 @@
                       disjuncts)))
         union-patterns))
 
+(defn unparse-bind
+  [bind-patterns select-vars compact-fn]
+  (mapv (fn [[_typ bind-map]]
+          (let [{::keys [var fn]} (-> bind-map
+                                      vals
+                                      first)]
+            ["bind" (str var) (-> fn
+                                  meta
+                                  :fn
+                                  str)]))
+        bind-patterns))
+
 (defn unparse-patterns
   [patterns select-vars compact-fn]
-  (let [{:keys [class tuple optional union _bind]} (group-by pattern-type patterns)
-        ;;TODO bind patterns
+  (let [{:keys [class tuple optional union bind]} (group-by pattern-type patterns)
         nonrecursive-patterns (into tuple (map second class))]
     (into []
           (concat (unparse-nonrecursive-patterns nonrecursive-patterns select-vars compact-fn)
                   (unparse-optional optional select-vars compact-fn)
-                  (unparse-union union select-vars compact-fn)))))
+                  (unparse-union union select-vars compact-fn)
+                  (unparse-bind bind select-vars compact-fn)))))
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
    `db` that are compatible with the initial solution `solution` and matches the

@@ -443,13 +443,15 @@
                            (let ~bdg
                              ~qualified-code))]
      (log/debug "compiled fn:" fn-code)
-     (eval fn-code))))
+     (with-meta (eval fn-code)
+       {:fn code}))))
 
 (defn compile-filter
   [code var]
   (let [f        (compile code)
         soln-sym 'solution]
-    (eval `(fn [~soln-sym ~var]
-             (-> ~soln-sym
-                 (assoc (quote ~var) ~var)
-                 ~f)))))
+    (with-meta (eval `(fn [~soln-sym ~var]
+                        (-> ~soln-sym
+                            (assoc (quote ~var) ~var)
+                            ~f)))
+      {:fn code})))

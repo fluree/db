@@ -648,4 +648,31 @@
                @(fluree/query db2 {"@context" context2
                                    :select ["?query"]
                                    :where {:id :foo/unionQuery2
-                                           :f/query "?query"}})))))))
+                                           :f/query "?query"}}))))))
+  (testing "bind, order-by"
+    (let [conn @(fluree/connect {:method :memory})
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]
+          ledger-id "test/query-queries"
+          ledger @(fluree/create conn ledger-id)
+          db @(fluree/stage (fluree/db ledger)
+                            {"@context" context
+                             "insert" [{:id :ex/bindQuery1
+                                        :f/query {:type :f/queryType
+                                                  :value
+                                                  (str '{:select [?firstLetterOfName ?name ?decadesOld]
+                                                         :where  [{:schema/age  ?age
+                                                                   :schema/name ?name}
+                                                                  [:bind ?decadesOld (quot ?age 10)]
+                                                                  [:bind ?firstLetterOfName (subStr ?name 1 1)]]
+                                                         :order-by ?firstLetterOfName})}}]})]
+      (is (= [["select" ["?firstLetterOfName" "?name" "?decadesOld"]
+               "where"  [{:schema/age  "?age"
+                          :schema/name "?name"}
+                         ["bind" "?decadesOld" "(quot ?age 10)"]
+                         ["bind" "?firstLetterOfName" "(subStr ?name 1 1)"]]
+               "orderBy" "?firstLetterOfName"]]
+             @(fluree/query db
+                            {"@context"  context
+                             :select ["?query"]
+                             :where {:id :ex/bindQuery1
+                                     :f/query "?query"}}))))))
