@@ -665,12 +665,12 @@
                                                                   [:bind ?decadesOld (quot ?age 10)]
                                                                   [:bind ?firstLetterOfName (subStr ?name 1 1)]]
                                                          :order-by ?firstLetterOfName})}}]})]
-      (is (= [["select" ["?firstLetterOfName" "?name" "?decadesOld"]
-               "where"  [{:schema/age  "?age"
-                          :schema/name "?name"}
-                         ["bind" "?decadesOld" "(quot ?age 10)"]
-                         ["bind" "?firstLetterOfName" "(subStr ?name 1 1)"]]
-               "orderBy" "?firstLetterOfName"]]
+      (is (= [[{"select" ["?firstLetterOfName" "?name" "?decadesOld"]
+                "where"  [{:schema/age  "?age"
+                           :schema/name "?name"}
+                          ["bind" "?decadesOld" "(quot ?age 10)"]
+                          ["bind" "?firstLetterOfName" "(subStr ?name 1 1)"]]
+                "orderBy" "?firstLetterOfName"}]]
              @(fluree/query db
                             {"@context"  context
                              :select ["?query"]
