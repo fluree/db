@@ -443,8 +443,7 @@
                            (let ~bdg
                              ~qualified-code))]
      (log/debug "compiled fn:" fn-code)
-     (with-meta (eval fn-code)
-       {:fn code}))))
+     (eval fn-code))))
 
 (defn compile-filter
   [code var]
