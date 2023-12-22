@@ -1,6 +1,5 @@
 (ns fluree.db.query.range
-  (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]
+  (:require [fluree.db.constants :as const]
             [fluree.db.index :as index]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
@@ -18,7 +17,7 @@
   "If a predicate is provided as a string value, coerce to pid"
   [db pred]
   (if (string? pred)
-    (or (dbproto/-p-prop db :id pred)
+    (or (iri/iri->sid pred (:namespaces db))
         (throw (ex-info (str "Invalid predicate, does not exist: " pred)
                         {:status 400, :error :db/invalid-predicate})))
     pred))

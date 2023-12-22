@@ -101,9 +101,10 @@
   [db flakes]
   (log/debug "parse-json-flakes flakes:" flakes)
   ;; TODO: Should we cache these predicate id -> type mappings?
-  (map #(if (= :json (->> % flake/p (dbproto/-p-prop db :type)))
-          (update % :o parse)
-          %)
+  (map (fn [f]
+         (if (= :json (dbproto/-p-prop db :type (flake/p f)))
+           (update f :o parse)
+           f))
        flakes))
 
 
@@ -181,4 +182,3 @@
       (stringify)
       (parse)
       (valid-geojson?)))
-
