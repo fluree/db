@@ -80,11 +80,9 @@
   (if (= sid const/$rdf:type)
     {:id    sid ; rdf:type is predefined, so flakes to build map won't be present.
      :class false
-     :idx?  true
      :ref?  true}
     {:id                 sid
      :class              true ; default
-     :idx?               true
      :ref?               false ; could go from false->true if defined in vocab but hasn't been used yet
      :subclassOf         #{}
      :equivalentProperty #{}}))
@@ -157,7 +155,6 @@
                    preds))
                {"@type" {:iri  "@type"
                          :ref? true
-                         :idx? true
                          :id   const/$rdf:type}}
                new-pred-map)))
 
@@ -192,11 +189,9 @@
               "_default"   {:name "_default" :id 11 :sid nil}}
         pred (map-pred-id+iri [{:iri  "@type"
                                 :ref? true
-                                :idx? true
                                 :id   const/$rdf:type}
                                {:iri  "http://www.w3.org/2000/01/rdf-schema#Class"
                                 :ref? true
-                                :idx? true
                                 :id   const/$rdfs:Class}])]
     {:t           0
      :refs        #{}

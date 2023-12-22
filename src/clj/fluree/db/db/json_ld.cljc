@@ -94,7 +94,7 @@
     (get-in schema [:coll collection property])))
 
 (defn- jsonld-p-prop [{:keys [schema] :as this} property predicate]
-  (assert (#{:name :id :iri :type :ref? :idx? :unique :multi :index :upsert :datatype
+  (assert (#{:name :id :iri :type :ref? :unique :multi :index :upsert :datatype
              :component :noHistory :restrictCollection :spec :specDoc :txSpec
              :txSpecDoc :restrictTag :retractDuplicates :subclassOf :new?} property)
           (str "Invalid predicate property: " (pr-str property)))
