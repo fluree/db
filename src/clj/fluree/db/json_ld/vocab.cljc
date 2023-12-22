@@ -162,22 +162,12 @@
   [{:keys [pred] :as schema}]
   (assoc schema :subclasses (delay (calc-subclass pred))))
 
-(defn update-with*
+(defn update-with
   [schema t vocab-flakes]
   (-> schema
       (assoc :t t)
       (update :pred with-vocab-flakes vocab-flakes)
       refresh-subclasses))
-
-(defn update-with
-  "When creating a new db from a transaction, merge new schema changes
-  into existing schema of previous db."
-  [schema db-t new-refs vocab-flakes]
-  (if (empty? vocab-flakes)
-    schema
-    (-> schema
-        (update :refs into new-refs)
-        (update-with* db-t vocab-flakes))))
 
 (defn base-schema
   []
@@ -285,9 +275,8 @@
 
 (defn build-schema
   [vocab-flakes t]
-  (let [base-schema (base-schema)
-        schema      (update-with* base-schema t vocab-flakes)
-        refs        (extract-ref-sids (:pred schema))]
+  (let [schema (update-with (base-schema) t vocab-flakes)
+        refs   (extract-ref-sids (:pred schema))]
     (assoc schema :refs refs)))
 
 (defn hydrate-schema
