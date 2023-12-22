@@ -3,7 +3,6 @@
 (defprotocol IFlureeDb
   (-rootdb [db] "Returns root db version of this db.")
   ;; schema-related
-  (-c-prop [db property collection] "Returns schema property for a collection.")
   (-p-prop [db property predicate] "Returns the property specified for the given predicate.")
   (-class-prop [db property class] "Return class properties")
   ;; following return async chans

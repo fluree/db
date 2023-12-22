@@ -85,21 +85,13 @@
 (defn- jsonld-root-db [this]
   (assoc this :policy root-policy-map))
 
-(defn- jsonld-c-prop [{:keys [schema]} property collection]
-  ;; collection properties TODO-deprecate :id property below in favor of :partition
-  (assert (#{:name :id :sid :partition :spec :specDoc :base-iri} property)
-          (str "Invalid collection property: " (pr-str property)))
-  (if (neg-int? collection)
-    (get-in schema [:coll "_tx" property])
-    (get-in schema [:coll collection property])))
-
-(defn- jsonld-p-prop [{:keys [schema] :as this} property predicate]
+(defn- jsonld-p-prop [{:keys [schema]} property predicate]
   (assert (#{:name :id :iri :type :ref? :unique :multi :index :upsert :datatype
-             :component :noHistory :restrictCollection :spec :specDoc :txSpec
-             :txSpecDoc :restrictTag :retractDuplicates :subclassOf :new?} property)
+             :component :noHistory :spec :specDoc :txSpec :txSpecDoc :restrictTag
+             :retractDuplicates :subclassOf :new?}
+            property)
           (str "Invalid predicate property: " (pr-str property)))
-  (cond->> (get-in schema [:pred predicate property])
-           (= :restrictCollection property) (dbproto/-c-prop this :partition)))
+  (get-in schema [:pred predicate property]))
 
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
@@ -127,7 +119,6 @@
                      namespaces namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
-  (-c-prop [this property collection] (jsonld-c-prop this property collection))
   (-class-prop [_this property class]
     (if (= :subclasses property)
       (get @(:subclasses schema) class)
