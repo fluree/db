@@ -181,13 +181,7 @@
 
 (defn base-schema
   []
-  (let [coll {-1           {:name "_tx" :id -1 :sid -1}
-              "_tx"        {:name "_tx" :id -1 :sid -1}
-              0            {:name "_predicate" :id 0 :sid nil}
-              "_predicate" {:name "_predicate" :id 0 :sid nil}
-              11           {:name "_default" :id 11 :sid nil}
-              "_default"   {:name "_default" :id 11 :sid nil}}
-        pred (map-pred-id+iri [{:iri  "@type"
+  (let [pred (map-pred-id+iri [{:iri  "@type"
                                 :ref? true
                                 :id   const/$rdf:type}
                                {:iri  "http://www.w3.org/2000/01/rdf-schema#Class"
@@ -195,7 +189,6 @@
                                 :id   const/$rdfs:Class}])]
     {:t           0
      :refs        #{}
-     :coll        coll
      :pred        pred
      :shapes      (atom {:class {} ; TODO: Does this need to be an atom?
                          :pred  {}})
