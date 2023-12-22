@@ -287,7 +287,7 @@
         _            (log/trace "hydrate-schema pred-flakes:" pred-flakes)
         vocab-flakes (filter-vocab-flakes pred-flakes new-flakes)
         _            (log/trace "hydrate-schema vocab-flakes:" vocab-flakes)
-        {:keys [t refs coll pred shapes prefix subclasses]}
+        {:keys [t refs pred shapes prefix subclasses]}
         (-> vocab-flakes
             (build-schema (:t db))
             (add-pred-datatypes (pred-dt-constraints new-flakes)))]
@@ -295,7 +295,6 @@
     (-> db
         (assoc-in [:schema :t] t)
         (update-in [:schema :refs] into refs)
-        (update-in [:schema :coll] (partial merge-with merge) coll)
         (update-in [:schema :pred] (partial merge-with merge) pred)
         (update-in [:schema :prefix] merge prefix)
         (assoc-in [:schema :subclasses] subclasses)
