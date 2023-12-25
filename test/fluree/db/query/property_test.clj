@@ -109,26 +109,22 @@
                                  "where"    {"@id" "ex:subject-as-predicate"
                                              "?p"  "?o"}}))
           "via variable selector")
-      (is (= #{["id" {"id"                "ex:subject-as-predicate",
-                      "ex:labeled-pred"   "labeled",
-                      "ex:new-pred"       {"id" "ex:nested"}
-                      "ex:unlabeled-pred" "unlabeled"}]
-               ["ex:labeled-pred" {"id"                "ex:subject-as-predicate",
-                                   "ex:labeled-pred"   "labeled",
-                                   "ex:new-pred"       {"id" "ex:nested"},
-                                   "ex:unlabeled-pred" "unlabeled"}]
-               ["ex:new-pred" {"id"                "ex:subject-as-predicate",
-                               "ex:labeled-pred"   "labeled",
-                               "ex:new-pred"       {"id" "ex:nested"},
-                               "ex:unlabeled-pred" "unlabeled"}]
-               ["ex:unlabeled-pred" {"id"                "ex:subject-as-predicate",
-                                     "ex:labeled-pred"   "labeled",
-                                     "ex:new-pred"       {"id" "ex:nested"},
-                                     "ex:unlabeled-pred" "unlabeled"}]}
-             (set @(fluree/query db2 {"@context" context
-                                      "select"   ["?p" {"ex:subject-as-predicate" ["*"]}]
-                                      "where"    {"@id" "ex:subject-as-predicate"
-                                                  "?p"  "?o"}})))
+      (is (= [["ex:labeled-pred" {"id"                "ex:subject-as-predicate",
+                                  "ex:labeled-pred"   "labeled",
+                                  "ex:new-pred"       {"id" "ex:nested"},
+                                  "ex:unlabeled-pred" "unlabeled"}]
+              ["ex:new-pred" {"id"                "ex:subject-as-predicate",
+                              "ex:labeled-pred"   "labeled",
+                              "ex:new-pred"       {"id" "ex:nested"},
+                              "ex:unlabeled-pred" "unlabeled"}]
+              ["ex:unlabeled-pred" {"id"                "ex:subject-as-predicate",
+                                    "ex:labeled-pred"   "labeled",
+                                    "ex:new-pred"       {"id" "ex:nested"},
+                                    "ex:unlabeled-pred" "unlabeled"}]]
+             @(fluree/query db2 {"@context" context
+                                 "select"   ["?p" {"ex:subject-as-predicate" ["*"]}]
+                                 "where"    {"@id" "ex:subject-as-predicate"
+                                             "?p"  "?o"}}))
           "via variable+subgraph selector")
 
       (is (= [{"id" "ex:nested"

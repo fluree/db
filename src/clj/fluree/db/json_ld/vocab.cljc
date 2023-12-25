@@ -129,7 +129,7 @@
         with-subclass   (fnil add-subclass initial-map)]
     (cond
       (= const/$rdf:type pid)
-      (if (property-sids obj)
+      (if (contains? property-sids obj)
         (if (= const/$owl:ObjectProperty obj)
           (update pred-map sid with-properties :class false, :ref? true)
           (update pred-map sid with-properties :class false))
