@@ -158,13 +158,13 @@
 
       ;; checking s, p, o values all pulled correctly and all IRIs are resolved from sid integer & compacted
       (is (= [[:ex/cam :type :ex/User]
-              [:ex/cam :schema/name "Cam"]
-              [:ex/cam :schema/email "cam@example.org"]
               [:ex/cam :schema/age 34]
+              [:ex/cam :schema/email "cam@example.org"]
+              [:ex/cam :schema/name "Cam"]
               [:ex/cam :ex/favNums 5]
               [:ex/cam :ex/favNums 10]
-              [:ex/cam :ex/friend :ex/brian]
-              [:ex/cam :ex/friend :ex/alice]]
+              [:ex/cam :ex/friend :ex/alice]
+              [:ex/cam :ex/friend :ex/brian]]
              @(fluree/query db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select '[?s ?p ?o]
