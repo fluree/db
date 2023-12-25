@@ -430,22 +430,22 @@
                        "ex:json" {"@type"  "@json"
                                   "@value" {:edn "data"
                                             :is  ["cool" "right?" 1 false 1.0]}}}]})]
-      (is (= #{{"id"     "ex:bob",
-                "type"   "ex:Person",
-                "ex:json" {":edn" "data", ":is" ["cool" "right?" 1 false 1]}}
-               {"id"     "ex:alice",
-                "type"   "ex:Person",
-                "ex:json" {"json" "data", "is" ["cool" "right?" 1 false 1]}}}
-             (into #{} @(fluree/query db1 {"@context" [test-utils/default-str-context
-                                                       {"ex" "http://example.org/ns/"}]
-                                           "where"  {"@id" "?s" "@type" "ex:Person"}
-                                           "select" {"?s" ["*"]}})))
+      (is (= [{"id"     "ex:bob",
+               "type"   "ex:Person",
+               "ex:json" {":edn" "data", ":is" ["cool" "right?" 1 false 1]}}
+              {"id"     "ex:alice",
+               "type"   "ex:Person",
+               "ex:json" {"json" "data", "is" ["cool" "right?" 1 false 1]}}]
+             @(fluree/query db1 {"@context" [test-utils/default-str-context
+                                             {"ex" "http://example.org/ns/"}]
+                                 "where"  {"@id" "?s" "@type" "ex:Person"}
+                                 "select" {"?s" ["*"]}}))
           "comes out as data from subject crawl")
-      (is (= #{{":edn" "data", ":is" ["cool" "right?" 1 false 1]}
-               {"json" "data", "is" ["cool" "right?" 1 false 1]}}
-             (into #{} @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"}
-                                           "select"   "?json"
-                                           "where"  {"@id" "?s" "ex:json" "?json"}})))
+      (is (= [{":edn" "data", ":is" ["cool" "right?" 1 false 1]}
+              {"json" "data", "is" ["cool" "right?" 1 false 1]}]
+             @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"}
+                                 "select"   "?json"
+                                 "where"  {"@id" "?s" "ex:json" "?json"}}))
           "comes out as data from select clause"))))
 
 (deftest ^:integration no-where-solutions

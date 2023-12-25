@@ -563,10 +563,8 @@
 
 (defn parse-object-value
   [v datatype metadata]
-  (let [datatype* (iri/normalize datatype)
-        dt-sid    (iri/iri->sid datatype*)
-        v*        (datatype/coerce v dt-sid)]
-    (where/anonymous-value v* datatype* metadata)))
+  (let [datatype* (iri/normalize datatype)]
+    (where/anonymous-value v datatype* metadata)))
 
 (defn parse-obj-cmp
   [allowed-vars subj-cmp pred-cmp m triples
