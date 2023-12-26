@@ -182,7 +182,6 @@
      :pred        pred
      :shapes      (atom {:class {} ; TODO: Does this need to be an atom?
                          :pred  {}})
-     :prefix      {}
      :subclasses  (delay {})}))
 
 (defn reset-shapes
@@ -287,7 +286,7 @@
         _            (log/trace "hydrate-schema pred-flakes:" pred-flakes)
         vocab-flakes (filter-vocab-flakes pred-flakes new-flakes)
         _            (log/trace "hydrate-schema vocab-flakes:" vocab-flakes)
-        {:keys [t refs pred shapes prefix subclasses]}
+        {:keys [t refs pred shapes subclasses]}
         (-> vocab-flakes
             (build-schema (:t db))
             (add-pred-datatypes (pred-dt-constraints new-flakes)))]
@@ -296,7 +295,6 @@
         (assoc-in [:schema :t] t)
         (update-in [:schema :refs] into refs)
         (update-in [:schema :pred] (partial merge-with merge) pred)
-        (update-in [:schema :prefix] merge prefix)
         (assoc-in [:schema :subclasses] subclasses)
         (assoc-in [:schema :shapes] shapes))))
 
