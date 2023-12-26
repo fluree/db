@@ -232,6 +232,10 @@
               (map infer-predicate-id))
         flakes))
 
+(defn datatype-constraint?
+  [f]
+  (-> f flake/p (= const/$sh:datatype)))
+
 (defn descending
   [x y]
   (compare y x))
@@ -247,7 +251,7 @@
          res []]
     (if s-flakes
       (if-let [dt-constraints (->> s-flakes
-                                   (filter #(= const/$sh:datatype (flake/p %)))
+                                   (filter datatype-constraint?)
                                    (map flake/o)
                                    first)]
         (let [path (->> s-flakes
