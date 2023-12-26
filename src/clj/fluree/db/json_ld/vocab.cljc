@@ -213,23 +213,24 @@
               ps))
           {} flakes))
 
-(defn filter-vocab-flakes
-  "Filters out the vocab-flakes from all-flakes using the predicate-flakes map
-  (as returned by predicate-flakes-by-type)."
-  [predicate-flakes all-flakes]
-  (let [ref-flakes               (::ref predicate-flakes)
-        class-or-prop-flakes     (::class-or-prop predicate-flakes)
-        ref-flake-os             (->> ref-flakes (map flake/o) set)
-        class-or-prop-flake-sids (->> class-or-prop-flakes (map flake/s) set)
-        predicate-sids           (->> all-flakes (map flake/p) set)]
-    (reduce (fn [vfs f]
-              (let [fs (flake/s f)]
-                (if (or (predicate-sids fs)
-                        (ref-flake-os fs)
-                        (class-or-prop-flake-sids fs))
-                  (conj vfs f)
-                  vfs)))
-            (or ref-flakes #{}) all-flakes)))
+(defn infer-predicate-id
+  [f]
+  (let [[s p o] ((juxt flake/s flake/p flake/o) f)]
+    (cond (and (= const/$rdf:type p)
+               (contains? jld-ledger/class-or-property-sid o))
+          s
+
+          (contains? jld-ledger/predicate-refs p)
+          o
+
+          :else p)))
+
+(defn infer-predicate-ids
+  [flakes]
+  (into #{}
+        (comp (filter flake/op)
+              (map infer-predicate-id))
+        flakes))
 
 (defn descending
   [x y]
@@ -264,7 +265,8 @@
   recent wins."
   [{:keys [pred] :as schema} pred-tuples]
   (reduce (fn [schema [pid dt]]
-            (let [{:keys [iri] :as pred-meta} (-> pred (get pid)
+            (let [{:keys [iri] :as pred-meta} (-> pred
+                                                  (get pid)
                                                   (assoc :datatype dt))]
               (-> schema
                   (assoc-in [:pred pid] pred-meta)
@@ -282,10 +284,12 @@
   "Updates the :schema key of db by processing just the vocabulary flakes out of
   the new flakes."
   [db new-flakes]
-  (let [pred-flakes  (predicate-flakes-by-type new-flakes)
-        _            (log/trace "hydrate-schema pred-flakes:" pred-flakes)
-        vocab-flakes (filter-vocab-flakes pred-flakes new-flakes)
-        _            (log/trace "hydrate-schema vocab-flakes:" vocab-flakes)
+  (let [pred-sids    (infer-predicate-ids new-flakes)
+        vocab-flakes (into #{}
+                           (filter (fn [f]
+                                     (or (contains? pred-sids (flake/s f))
+                                         (contains? jld-ledger/predicate-refs (flake/p f)))))
+                           new-flakes)
         {:keys [t refs pred shapes subclasses]}
         (-> vocab-flakes
             (build-schema (:t db))
