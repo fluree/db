@@ -68,7 +68,11 @@
 
 (defn extract-ref-sids
   [property-maps]
-  (into #{} (keep #(when (true? (:ref? %)) (:id %)) property-maps)))
+  (into #{}
+        (keep (fn [p-map]
+                (when (-> p-map :ref? true?)
+                  (:id p-map))))
+        property-maps))
 
 
 (def property-sids #{const/$rdf:Property
