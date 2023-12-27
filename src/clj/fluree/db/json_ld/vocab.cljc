@@ -194,29 +194,6 @@
   (reset! shapes {:class {}
                   :pred  {}}))
 
-(defn predicate-flakes-by-type
-  "Returns a map of predicate flakes mapped by type"
-  [flakes]
-  (reduce (fn [ps f]
-            (if (flake/op f)
-              (let [p         (flake/p f)
-                    o         (flake/o f)
-                    _         (log/trace "predicate-flakes-by-type p:" p "o:" o)
-                    pred-type (cond
-                                (and (= const/$rdf:type p)
-                                     (jld-ledger/class-or-property-sid o))
-                                (do
-                                  (log/trace "predicate-flakes-by-type found ::class-or-prop pred")
-                                  ::class-or-prop)
-
-                                (jld-ledger/predicate-refs p)
-                                ::ref)]
-                (if pred-type
-                  (update ps pred-type (fnil conj #{}) f)
-                  ps))
-              ps))
-          {} flakes))
-
 (defn infer-predicate-id
   [f]
   (let [[s p o] ((juxt flake/s flake/p flake/o) f)]
