@@ -80,16 +80,18 @@
                      const/$owl:ObjectProperty})
 
 (defn initial-property-map
-  [sid]
+  [db sid]
   (if (= sid const/$rdf:type)
     {:id    sid ; rdf:type is predefined, so flakes to build map won't be present.
      :class false
      :ref?  true}
-    {:id                 sid
-     :class              true ; default
-     :ref?               false ; could go from false->true if defined in vocab but hasn't been used yet
-     :subclassOf         #{}
-     :equivalentProperty #{}}))
+    (let [iri (iri/sid->iri sid (:namespace-codes db))]
+      {:id                 sid
+       :iri                iri
+       :class              true ; default
+       :ref?               false ; could go from false->true if defined in vocab but hasn't been used yet
+       :subclassOf         #{}
+       :equivalentProperty #{}})))
 
 (defn add-subclass
   [prop-map subclass]
@@ -100,21 +102,21 @@
   (update prop-map :equivalentProperty conj prop))
 
 (defn update-equivalent-property
-  [prop-map sid prop]
-  (let [initial-map              (initial-property-map sid)
+  [db prop-map sid prop]
+  (let [initial-map              (initial-property-map db sid)
         with-equivalent-property (fnil add-equivalent-property initial-map)]
     (update prop-map sid with-equivalent-property prop)))
 
 (defn update-all-equivalent-properties
-  [prop-map sid o-props]
+  [db prop-map sid o-props]
   (reduce (fn [p-map o-prop]
-            (-> p-map
-                (update-equivalent-property sid o-prop)
-                (update-equivalent-property o-prop sid)))
+            (as-> p-map props
+              (update-equivalent-property db props sid o-prop)
+              (update-equivalent-property db props o-prop sid)))
           prop-map o-props))
 
 (defn update-equivalent-properties
-  [pred-map sid obj]
+  [db pred-map sid obj]
   (let [s-props (-> pred-map
                     (get-in [sid :equivalentProperty])
                     (conj sid))
@@ -122,13 +124,13 @@
                     (get-in [obj :equivalentProperty])
                     (conj obj))]
     (reduce (fn [p-map s-prop]
-              (update-all-equivalent-properties p-map s-prop o-props))
+              (update-all-equivalent-properties db p-map s-prop o-props))
             pred-map s-props)))
 
 (defn update-pred-map
-  [pred-map vocab-flake]
+  [db pred-map vocab-flake]
   (let [[sid pid obj]   ((juxt flake/s flake/p flake/o) vocab-flake)
-        initial-map     (initial-property-map sid)
+        initial-map     (initial-property-map db sid)
         with-properties (fnil assoc initial-map)
         with-subclass   (fnil add-subclass initial-map)]
     (cond
@@ -146,13 +148,13 @@
       (update pred-map sid with-subclass obj)
 
       (= const/$owl:equivalentProperty pid)
-      (update-equivalent-properties pred-map sid obj)
+      (update-equivalent-properties db pred-map sid obj)
 
       :else pred-map)))
 
 (defn with-vocab-flakes
-  [pred-map vocab-flakes]
-  (let [new-pred-map  (reduce update-pred-map pred-map vocab-flakes)]
+  [db pred-map vocab-flakes]
+  (let [new-pred-map  (reduce (partial update-pred-map db) pred-map vocab-flakes)]
     (reduce-kv (fn [preds k v]
                  (if (iri/sid? k)
                    (assoc preds k v, (:iri v) v)
@@ -167,10 +169,10 @@
   (assoc schema :subclasses (delay (calc-subclass pred))))
 
 (defn update-with
-  [schema t vocab-flakes]
+  [db schema t vocab-flakes]
   (-> schema
       (assoc :t t)
-      (update :pred with-vocab-flakes vocab-flakes)
+      (update :pred (partial with-vocab-flakes db) vocab-flakes)
       refresh-subclasses))
 
 (defn base-schema
@@ -260,8 +262,8 @@
           pred-tuples))
 
 (defn build-schema
-  [vocab-flakes t]
-  (let [schema (update-with (base-schema) t vocab-flakes)
+  [db vocab-flakes t]
+  (let [schema (update-with db (base-schema) t vocab-flakes)
         refs   (extract-ref-sids (:pred schema))]
     (assoc schema :refs refs)))
 
@@ -276,8 +278,7 @@
                                          (contains? jld-ledger/predicate-refs (flake/p f)))))
                            new-flakes)
         {:keys [t refs pred shapes subclasses]}
-        (-> vocab-flakes
-            (build-schema (:t db))
+        (-> (build-schema db vocab-flakes (:t db))
             (add-pred-datatypes (pred-dt-constraints new-flakes)))]
     (log/trace "hydrate-schema pred:" pred)
     (-> db
@@ -295,7 +296,6 @@
       (if pred-sid
         (let [pred-flakes (<? (query-range/index-range db :spot = [pred-sid]))]
           (recur r (into vocab-flakes pred-flakes)))
-        (-> vocab-flakes
-            (build-schema t)
+        (-> (build-schema db vocab-flakes t)
             ;; only use predicates that have a dt
             (add-pred-datatypes (filterv #(> (count %) 1) preds)))))))
