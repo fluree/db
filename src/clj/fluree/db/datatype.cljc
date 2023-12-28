@@ -430,6 +430,7 @@
   [value datatype]
   (let [value* (coerce value datatype)]
     (if (nil? value*)
-      (throw (ex-info (str "Value " value " cannot be coerced to provided datatype: " datatype ".")
-                      {:status 400 :error, :db/value-coercion}))
+      (let [dt-iri (iri/sid->iri datatype)]
+        (throw (ex-info (str "Value " value " cannot be coerced to provided datatype: " (or dt-iri datatype) ".")
+                        {:status 400 :error, :db/value-coercion})))
       value*)))
