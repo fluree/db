@@ -209,11 +209,14 @@
           :else p)))
 
 (defn infer-predicate-ids
-  [flakes]
-  (into #{}
-        (comp (filter flake/op)
-              (map infer-predicate-id))
-        flakes))
+  [db flakes]
+  (let [pred-map (get-in db [:schema :pred])]
+    (into #{}
+          (comp (filter flake/op)
+                (map infer-predicate-id)
+                (filter (fn [pid]
+                          (not (contains? pred-map pid)))))
+          flakes)))
 
 (defn datatype-constraint?
   [f]
@@ -261,26 +264,41 @@
           schema
           pred-tuples))
 
+(defn add-pid
+  [db preds pid]
+  (let [{:keys [iri] :as p-map} (initial-property-map db pid)]
+    (assoc preds pid p-map, iri p-map)))
+
+(defn add-predicates
+  [db pred-map pids]
+  (reduce (fn [preds pid]
+            (if (contains? preds pid)
+              preds
+              (add-pid db preds pid)))
+          pred-map pids))
+
 (defn build-schema
-  [db vocab-flakes t]
-  (let [schema (update-with db (base-schema) t vocab-flakes)
-        refs   (extract-ref-sids (:pred schema))]
+  [db pids vocab-flakes]
+  (let [t        (:t db)
+        schema   (-> (base-schema)
+                     (update :pred (partial add-predicates db) pids)
+                     (as-> s (update-with db s t vocab-flakes)))
+        refs     (extract-ref-sids (:pred schema))]
     (assoc schema :refs refs)))
 
 (defn hydrate-schema
   "Updates the :schema key of db by processing just the vocabulary flakes out of
   the new flakes."
   [db new-flakes]
-  (let [pred-sids    (infer-predicate-ids new-flakes)
+  (let [pred-sids    (infer-predicate-ids db new-flakes)
         vocab-flakes (into #{}
                            (filter (fn [f]
                                      (or (contains? pred-sids (flake/s f))
                                          (contains? jld-ledger/predicate-refs (flake/p f)))))
                            new-flakes)
         {:keys [t refs pred shapes subclasses]}
-        (-> (build-schema db vocab-flakes (:t db))
+        (-> (build-schema db pred-sids vocab-flakes)
             (add-pred-datatypes (pred-dt-constraints new-flakes)))]
-    (log/trace "hydrate-schema pred:" pred)
     (-> db
         (assoc-in [:schema :t] t)
         (update-in [:schema :refs] into refs)
@@ -296,6 +314,6 @@
       (if pred-sid
         (let [pred-flakes (<? (query-range/index-range db :spot = [pred-sid]))]
           (recur r (into vocab-flakes pred-flakes)))
-        (-> (build-schema db vocab-flakes t)
+        (-> (build-schema db preds vocab-flakes)
             ;; only use predicates that have a dt
             (add-pred-datatypes (filterv #(> (count %) 1) preds)))))))

@@ -36,40 +36,40 @@
                                                    "vocab3:prenom" "Francois"}]})
                       deref)]
       (testing "querying for the property defined to be equivalent"
-        (is (= #{["Brian"] ["Ben"] ["Francois"]}
-               (set @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                                    "vocab2" "http://vocab2.example.org/"}
-                                        :select    [?name]
-                                        :where     {"vocab2:firstName" ?name}})))
+        (is (= [["Ben"] ["Brian"] ["Francois"]]
+               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
+                                               "vocab2" "http://vocab2.example.org/"}
+                                   :select    [?name]
+                                   :where     {"vocab2:firstName" ?name}}))
             "returns all values"))
       (testing "querying for the symmetric property"
-        (is (= #{["Brian"] ["Ben"] ["Francois"]}
-               (set @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                                    "vocab2" "http://vocab2.example.org/"}
-                                        :select    [?name]
-                                        :where     {"vocab1:givenName" ?name}})))
+        (is (= [["Ben"] ["Brian"] ["Francois"]]
+               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
+                                               "vocab2" "http://vocab2.example.org/"}
+                                   :select    [?name]
+                                   :where     {"vocab1:givenName" ?name}}))
             "returns all values"))
       (testing "querying for the transitive properties"
-        (is (= #{["Brian"] ["Ben"] ["Francois"]}
-               (set @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                                    "vocab3" "http://vocab3.example.fr/"}
-                                        :select    [?name]
-                                        :where     {"vocab3:prenom" ?name}})))
+        (is (= [["Ben"] ["Brian"] ["Francois"]]
+               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
+                                               "vocab3" "http://vocab3.example.fr/"}
+                                   :select    [?name]
+                                   :where     {"vocab3:prenom" ?name}}))
             "returns all values"))
       (testing "querying with graph crawl"
-        (is (= #{{"@id"              "ex:brian"
-                  "vocab1:givenName" "Brian"
-                  "ex:age"           50}
-                 {"@id"              "ex:ben"
-                  "vocab2:firstName" "Ben"}
-                 {"@id"           "ex:francois"
-                  "vocab3:prenom" "Francois"}}
-               (set @(fluree/query db '{"@context" {"ex"     "http://example.org/ns/"
-                                                    "vocab1" "http://vocab1.example.org/"
-                                                    "vocab2" "http://vocab2.example.org/"
-                                                    "vocab3" "http://vocab3.example.fr/"}
-                                        :select    {?s [:*]}
-                                        :where     {"@id" ?s, "vocab2:firstName" ?name}})))
+        (is (= [{"@id"              "ex:ben"
+                 "vocab2:firstName" "Ben"}
+                {"@id"              "ex:brian"
+                 "vocab1:givenName" "Brian"
+                 "ex:age"           50}
+                {"@id"           "ex:francois"
+                 "vocab3:prenom" "Francois"}]
+               @(fluree/query db '{"@context" {"ex"     "http://example.org/ns/"
+                                               "vocab1" "http://vocab1.example.org/"
+                                               "vocab2" "http://vocab2.example.org/"
+                                               "vocab3" "http://vocab3.example.fr/"}
+                                   :select    {?s [:*]}
+                                   :where     {"@id" ?s, "vocab2:firstName" ?name}}))
             "returns all values")))))
 
 (deftest ^:integration subjects-as-predicates
