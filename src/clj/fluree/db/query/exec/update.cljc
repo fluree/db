@@ -6,7 +6,8 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log]
-            [clojure.core.async :as async]))
+            [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [clojure.core.async :as async :refer [>! go]]))
 
 (defn assign-clause
   [clause solution]
@@ -40,34 +41,46 @@
 
 
 (defn generate-sids
-  [db t sid-gen [s-mch p-mch o-mch]]
-  (let [m     (where/get-meta o-mch)
-        s-iri (where/get-iri s-mch)
-        sid   (iri/generate-sid sid-gen s-iri)
-        p-iri (where/get-iri p-mch)
-        pid   (iri/generate-sid sid-gen p-iri)]
-    (if (where/matched-iri? o-mch)
-      (let [o-iri (where/get-iri o-mch)
-            oid   (iri/generate-sid sid-gen o-iri)
-            dt    const/$xsd:anyURI]
-        (flake/create sid pid oid dt t true m))
-      (let [v  (where/get-value o-mch)
-            dt (or (dbproto/-p-prop db :datatype p-iri)
-                   (some-> o-mch
-                           where/get-datatype-iri
-                           (as-> dt-iri (iri/generate-sid sid-gen dt-iri)))
-                   (datatype/infer v))
-            v* (datatype/coerce-value v dt)]
-        (flake/create sid pid v* dt t true m)))))
+  [db t sid-gen error-ch [s-mch p-mch o-mch]]
+  (go (try*
+        (let [m     (where/get-meta o-mch)
+              s-iri (where/get-iri s-mch)
+              sid   (iri/generate-sid sid-gen s-iri)
+              p-iri (where/get-iri p-mch)
+              pid   (iri/generate-sid sid-gen p-iri)]
+          (if (where/matched-iri? o-mch)
+            (let [o-iri (where/get-iri o-mch)
+                  oid   (iri/generate-sid sid-gen o-iri)
+                  dt    const/$xsd:anyURI]
+              (flake/create sid pid oid dt t true m))
+            (let [v  (where/get-value o-mch)
+                  dt (or (dbproto/-p-prop db :datatype p-iri)
+                         (some-> o-mch
+                                 where/get-datatype-iri
+                                 (as-> dt-iri (iri/generate-sid sid-gen dt-iri)))
+                         (datatype/infer v))
+                  v* (datatype/coerce-value v dt)]
+              (flake/create sid pid v* dt t true m))))
+        (catch* e
+                (log/error e "Error inserting triple")
+                (>! error-ch e)))))
 
 
 (defn insert
-  [db txn {:keys [t]} sid-gen solution-ch]
+  [db txn {:keys [t]} sid-gen error-ch solution-ch]
   (let [clause    (:insert txn)
-        insert-ch (async/chan 2 (comp (mapcat (partial assign-clause clause))
-                                      (filter where/all-matched?)
-                                      (map (partial generate-sids db t sid-gen))))]
-    (async/pipe solution-ch insert-ch)))
+        triple-ch (async/chan 2 (comp (mapcat (partial assign-clause clause))
+                                      (filter where/all-matched?)))
+        insert-ch (async/chan)]
+    (async/pipe solution-ch triple-ch)
+    (async/pipeline-async 2
+                          insert-ch
+                          (fn [triple ch]
+                            (-> db
+                                (generate-sids t sid-gen error-ch triple)
+                                (async/pipe ch)))
+                          triple-ch)
+    insert-ch))
 
 (defn insert-retract
   [db mdfn tx-state sid-gen fuel-tracker error-ch solution-ch]
@@ -77,7 +90,7 @@
         solution-mult   (async/mult solution-ch*)
         insert-soln-ch  (->> (async/chan 2)
                              (async/tap solution-mult))
-        insert-ch       (insert db mdfn tx-state sid-gen insert-soln-ch)
+        insert-ch       (insert db mdfn tx-state sid-gen error-ch insert-soln-ch)
         retract-soln-ch (->> (async/chan 2)
                              (async/tap solution-mult))
         retract-ch      (retract db mdfn tx-state fuel-tracker error-ch retract-soln-ch)]
@@ -103,7 +116,7 @@
       (insert-retract db parsed-txn tx-state sid-gen fuel-tracker error-ch solution-ch*)
 
       (insert? parsed-txn)
-      (insert db parsed-txn tx-state sid-gen solution-ch*)
+      (insert db parsed-txn tx-state sid-gen error-ch solution-ch*)
 
       (retract? parsed-txn)
       (retract db parsed-txn tx-state fuel-tracker error-ch solution-ch*))))
