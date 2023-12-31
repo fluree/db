@@ -517,6 +517,6 @@
            @(fluree/query db2 {"@context"  context
                                "selectOne" {"ex:freddy" ["schema:age"]}}))
         "8 is converted from a long to an int.")
-    (is (= "Value alot cannot be coerced to provided datatype: 7."
+    (is (= "Value alot cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#integer."
            (ex-message db3))
         "datatype constraint is restored after a load")))
