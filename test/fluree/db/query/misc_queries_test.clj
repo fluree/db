@@ -132,34 +132,24 @@
                                :schema/email "jane@flur.ee"
                                :schema/age   30}]}})]
       (testing "Query that pulls entire database."
-        (is (= #{[:ex/jane :id "http://example.org/ns/jane"]
-                 [:ex/jane :type :ex/User]
-                 [:ex/jane :schema/name "Jane"]
-                 [:ex/jane :schema/email "jane@flur.ee"]
-                 [:ex/jane :schema/age 30]
-                 [:ex/bob :id "http://example.org/ns/bob"]
-                 [:ex/bob :type :ex/User]
-                 [:ex/bob :schema/name "Bob"]
-                 [:ex/bob :schema/age 22]
-                 [:ex/alice :id "http://example.org/ns/alice"]
-                 [:ex/alice :type :ex/User]
-                 [:ex/alice :schema/name "Alice"]
-                 [:ex/alice :schema/email "alice@flur.ee"]
-                 [:ex/alice :schema/age 42]
-                 [:schema/age :id "http://schema.org/age"]
-                 [:schema/email :id "http://schema.org/email"]
-                 [:schema/name :id "http://schema.org/name"]
-                 [:ex/User :id "http://example.org/ns/User"]
-                 [:type :id "@type"]
-                 [:id :id "@id"]}
-               (set @(fluree/query db {:context [test-utils/default-context
-                                                 {:ex "http://example.org/ns/"}]
-                                       :select  ['?s '?p '?o]
-                                       :where   {:id '?s
-                                                 '?p '?o}})))
+        (is (= [[:ex/jane :type :ex/User]
+                [:ex/jane :schema/name "Jane"]
+                [:ex/jane :schema/email "jane@flur.ee"]
+                [:ex/jane :schema/age 30]
+                [:ex/bob :type :ex/User]
+                [:ex/bob :schema/name "Bob"]
+                [:ex/bob :schema/age 22]
+                [:ex/alice :type :ex/User]
+                [:ex/alice :schema/name "Alice"]
+                [:ex/alice :schema/email "alice@flur.ee"]
+                [:ex/alice :schema/age 42]]
+               @(fluree/query db {:context [test-utils/default-context
+                                            {:ex "http://example.org/ns/"}]
+                                  :select  ['?s '?p '?o]
+                                  :where   {:id '?s
+                                            '?p '?o}}))
             "Entire database should be pulled.")
-        (is (= [{:id :id}
-                {:id :type}
+        (is (= [{:id :type}
                 {:id :ex/User}
                 {:id           :ex/alice,
                  :type         :ex/User,
@@ -230,10 +220,10 @@
                 {:id :schema/age}
                 {:id :schema/email}
                 {:id :schema/name}]
-               (sort-by :id @(fluree/query db {:context [test-utils/default-context
-                                                         {:ex "http://example.org/ns/"}]
-                                               :select  {'?s ["*"]}
-                                               :where   {:id '?s, '?p '?o}})))
+               @(fluree/query db {:context [test-utils/default-context
+                                            {:ex "http://example.org/ns/"}]
+                                  :select  {'?s ["*"]}
+                                  :where   {:id '?s, '?p '?o}}))
             "Every triple should be returned.")
         (let [db*    @(fluree/commit! ledger db)
               result @(fluree/query db* {:context [test-utils/default-context
