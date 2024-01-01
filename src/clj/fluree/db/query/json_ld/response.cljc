@@ -127,15 +127,22 @@
                                                                   (<? (cache-sid->iri db cache compact-fn const/$id))))
                                                 ns-codes (:namespace-codes db)
                                                 c-iri    (-> f flake/o (iri/sid->iri ns-codes) compact-fn)
-                                                ref-attrs (cond
-                                                            ;; have a specified sub-selection (graph crawl)
-                                                            (:spec spec)
-                                                            (<? (crawl-ref-item db context compact-fn (flake/o f) (:spec spec) cache fuel-vol max-fuel (inc depth-i)))
+                                                subselect (:spec spec)]
+                                            (cond
+                                              ;; have a specified sub-selection (graph crawl)
+                                              subselect
+                                              (let [ref-attrs (<? (crawl-ref-item db context compact-fn (flake/o f) subselect cache fuel-vol max-fuel (inc depth-i)))]
+                                                (if (includes-id? subselect)
+                                                  (assoc ref-attrs id-key c-iri)
+                                                  ref-attrs))
 
-                                                            ;; requested graph crawl depth has not yet been reached
-                                                            (< depth-i depth)
-                                                            (<? (crawl-ref-item db context compact-fn (flake/o f) select-spec cache fuel-vol max-fuel (inc depth-i))))]
-                                            (assoc ref-attrs id-key c-iri))
+                                              ;; requested graph crawl depth has not yet been reached
+                                              (< depth-i depth)
+                                              (-> (<? (crawl-ref-item db context compact-fn (flake/o f) select-spec cache fuel-vol max-fuel (inc depth-i)))
+                                                  (assoc id-key c-iri))
+
+                                              :else
+                                              {id-key c-iri}))
 
                                           (= const/$rdf:json (flake/dt f))
                                           (json/parse (flake/o f) false)
