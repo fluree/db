@@ -1143,8 +1143,8 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
         (is (= [{"id"          "ex:good-pal"
                  "type"        "ex:Pal"
                  "schema:name" "J.D."
-                 "ex:pal"      [{"schema:name" "Turk"}
-                                {"schema:name" "Rowdy"}]}]
+                 "ex:pal"      [{"schema:name" "Rowdy"}
+                                {"schema:name" "Turk"}]}]
                @(fluree/query valid-pal {"@context" context
                                          "select"   {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})))
         (is (util/exception? invalid-pal))
