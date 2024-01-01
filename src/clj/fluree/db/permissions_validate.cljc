@@ -87,8 +87,8 @@
 
   Returns map with :default and :property keys, each having k-v tuples of
   their respective policies"
-  [policy action class-ids]
-  (->> class-ids
+  [policy action class-iris]
+  (->> class-iris
        (keep #(get-in policy [action :class %]))
        (mapcat identity)
        (group-by (fn [policy-map]
@@ -128,12 +128,16 @@
 
   If no property policies are not defined, a single evaluation for
   the subject can be done and each flake does not need to be checked."
-  [{:keys [policy] :as db} flakes]
+  [{:keys [policy namespace-codes] :as db} flakes]
   (go-try
+    (log/info "filtering flakes:" flakes)
     (when-let [fflake (first flakes)]
-      (let [class-ids      (<? (dbproto/-class-ids db (flake/s fflake)))
+      (let [class-ids  (<? (dbproto/-class-ids db (flake/s fflake)))
+            class-iris (map (fn [class-id]
+                              (iri/sid->iri class-id namespace-codes))
+                            class-ids)
             {defaults :default props :property} (group-policies-by-default
-                                                 policy const/iri-view class-ids)
+                                                 policy const/iri-view class-iris)
             ;; default-allow? will be the default for all flakes that don't have a property-specific policy
             default-allow? (<? (default-allow? db fflake defaults))]
         (cond

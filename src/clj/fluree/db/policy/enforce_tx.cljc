@@ -23,8 +23,8 @@
     (let [policies-by-iri (validate/group-property-policies property-policies)
           ns-codes (:namespace-codes db)]
       (loop [[flake & r] flakes]
-        (let [p-iri (-> flake flake/p (iri/sid->iri ns-codes))]
-          (if flake
+        (if flake
+          (let [p-iri (-> flake flake/p (iri/sid->iri ns-codes))]
             (if-let [p-policies (get policies-by-iri p-iri)]
               (let [allow? (loop [[[async? f] & r] p-policies]
                              ;; return first truthy response, else false
@@ -43,9 +43,9 @@
               (if default-allow?
                 (recur r)
                 (throw (ex-info "Policy enforcement prevents modification."
-                                {:status 400 :error :db/policy-exception}))))
-            ;; passed all property policies, allow everything!
-            true))))))
+                                {:status 400 :error :db/policy-exception})))))
+          ;; passed all property policies, allow everything!
+          true)))))
 
 
 (defn allowed?
