@@ -249,9 +249,10 @@
       (loop [[f & r] p-flakes
              res []]
         (if f
-          (let [s-flakes      (<? (query-range/index-range db :spot = [(flake/o f)]))
+          (let [sid           (flake/o f)
+                s-flakes      (<? (query-range/index-range db :spot = [sid]))
                 pid->p-flakes (group-by flake/p s-flakes)
-                validation    (<? (validate-shape db shape s-flakes pid->p-flakes))]
+                validation    (<? (validate-shape db shape sid s-flakes pid->p-flakes))]
             (recur r (conj res validation)))
           (coalesce-validation-results res))))))
 
@@ -432,7 +433,7 @@
                 pid->p-flakes (group-by flake/p s-flakes)
 
                 [valid?] (if node-shape?
-                           (<? (validate-shape db q-shape s-flakes pid->p-flakes))
+                           (<? (validate-shape db q-shape sid s-flakes pid->p-flakes))
                            (let [path-flakes (<? (resolve-path-flakes db sid (:path q-shape) pid->p-flakes))]
                              (<? (validate-property-constraints q-shape path-flakes db))))]
             (recur r (if valid?
@@ -490,38 +491,37 @@
 
 (defn validate-shape
   "Check to see if each property shape is valid, then check node shape constraints."
-  [db {:keys [property validated-properties] :as shape} s-flakes pid->p-flakes]
+  [db {:keys [property validated-properties] :as shape} sid s-flakes pid->p-flakes]
   (go-try
-    (let [sid (flake/s (first s-flakes))]
-      (log/trace "validate-shape" sid shape )
-      (loop [[{:keys [path rhs-property qualified-value-shape] :as p-shape} & r] property
-             q-shapes             []
-             validated-properties validated-properties
-             results              []]
-        (if p-shape
-          ;; check property shape
-          (let [path-flakes (<? (resolve-path-flakes db sid path pid->p-flakes))
+    (log/trace "validate-shape" sid shape )
+    (loop [[{:keys [path rhs-property qualified-value-shape] :as p-shape} & r] property
+           q-shapes             []
+           validated-properties validated-properties
+           results              []]
+      (if p-shape
+        ;; check property shape
+        (let [path-flakes (<? (resolve-path-flakes db sid path pid->p-flakes))
 
-                pid         (when (first path-flakes) (flake/p (first path-flakes)))
-                res         (if rhs-property
-                              (let [rhs-flakes (filter #(= rhs-property (flake/p %)) s-flakes)]
-                                (validate-pair-constraints p-shape path-flakes rhs-flakes))
-                              (<? (validate-property-constraints p-shape path-flakes db)))]
+              pid         (when (first path-flakes) (flake/p (first path-flakes)))
+              res         (if rhs-property
+                            (let [rhs-flakes (filter #(= rhs-property (flake/p %)) s-flakes)]
+                              (validate-pair-constraints p-shape path-flakes rhs-flakes))
+                            (<? (validate-property-constraints p-shape path-flakes db)))]
 
-            (recur r
-                   (if qualified-value-shape ; build up collection of q-shapes for further processing
-                     (conj q-shapes p-shape)
-                     q-shapes)
-                   (if pid
-                     (conj validated-properties pid)
-                     validated-properties)
-                   (conj results res)))
+          (recur r
+                 (if qualified-value-shape ; build up collection of q-shapes for further processing
+                   (conj q-shapes p-shape)
+                   q-shapes)
+                 (if pid
+                   (conj validated-properties pid)
+                   validated-properties)
+                 (conj results res)))
 
-          (let [ ;; check qualifed shape constraints
-                q-results (<? (validate-q-shapes db q-shapes sid pid->p-flakes))
-                ;; check node shape
-                closed-results (validate-closed-constraint shape pid->p-flakes validated-properties)]
-            (coalesce-validation-results (conj results q-results closed-results))))))))
+        (let [ ;; check qualifed shape constraints
+              q-results (<? (validate-q-shapes db q-shapes sid pid->p-flakes))
+              ;; check node shape
+              closed-results (validate-closed-constraint shape pid->p-flakes validated-properties)]
+          (coalesce-validation-results (conj results q-results closed-results)))))))
 
 (defn throw-shacl-exception
   [err-msg]
@@ -532,11 +532,11 @@
 
 (defn validate-target
   "Validate the data graph (s-flakes) with the provided shapes."
-  [shapes db s-flakes]
+  [shapes db sid s-flakes]
   (go-try
     (let [pid->p-flakes (group-by flake/p s-flakes)]
       (doseq [shape shapes]
-        (let [[valid? err-msg] (<? (validate-shape db shape s-flakes pid->p-flakes))]
+        (let [[valid? err-msg] (<? (validate-shape db shape sid s-flakes pid->p-flakes))]
           (when (not valid?)
             (throw-shacl-exception err-msg)))))))
 

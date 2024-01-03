@@ -41,7 +41,7 @@
                                               (get shape->validated-properties (:id shape))))
                                     shacl)
                     s-flakes* (<? (query-range/index-range root-db :spot = [sid]))]
-                (<? (shacl/validate-target shacl* root-db s-flakes*))))
+                (<? (shacl/validate-target shacl* root-db sid s-flakes*))))
             (recur r (into all-classes classes) (dissoc remaining-subj-mods sid)))
           ;; There may be subjects who need to have rules checked due to the addition
           ;; of a reference, but the subjects themselves were not modified in this txn.
@@ -53,7 +53,7 @@
               (when sid
                 (let [{:keys [shacl]} mod
                       flakes (<? (query-range/index-range root-db :spot = [sid]))]
-                  (<? (shacl/validate-target shacl root-db flakes))
+                  (<? (shacl/validate-target shacl root-db sid flakes))
                   (recur r))))
             (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
                                  (contains? all-classes const/$sh:PropertyShape))]
