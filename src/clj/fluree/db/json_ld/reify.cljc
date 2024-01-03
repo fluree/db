@@ -221,17 +221,13 @@
 (defn assert-flakes
   [db assertions t iri-cache ref-cache]
   (go-try
-    (let [last-pid (volatile! (jld-ledger/last-pid db))
-          last-sid (volatile! (jld-ledger/last-sid db))
-          flakes   (loop [[node & r] assertions
+    (let [flakes   (loop [[node & r] assertions
                           acc []]
                      (if node
                        (let [assert-flakes (<? (assert-node db node t iri-cache ref-cache))]
                          (recur r (into acc assert-flakes)))
                        acc))]
-      {:flakes flakes
-       :pid    @last-pid
-       :sid    @last-sid})))
+      {:flakes flakes})))
 
 (defn merge-flakes
   "Returns updated db with merged flakes."

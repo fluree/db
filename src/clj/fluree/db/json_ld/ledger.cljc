@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.ledger
   (:require [fluree.json-ld :as json-ld]
-            [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.util.core :as util]
@@ -107,24 +106,6 @@
     {}
     predefined-sids))
 
-(defn last-pid
-  [db]
-  (-> db :ecount (get const/$_predicate)))
-
-(defn last-sid
-  "Last used sid - so next available would increment result of this by one."
-  [db]
-  (or (-> db :ecount (get const/$_default))
-      ;; decrement because
-      (dec (flake/->sid const/$_default 0))))
-
-(defn last-commit-sid
-  "Last used sid - so next available would increment result of this by one.
-  Commits use a different address space than all other 'default' flakes."
-  [db]
-  (or (-> db :ecount (get const/$_shard))
-      (dec (flake/->sid const/$_shard 0))))
-
 (def predicate-refs
   "The following predicates have objects that are refs to other predicates."
   #{const/$fluree:targetClass
@@ -148,15 +129,3 @@
     const/$sh:zeroOrMorePath
     const/$sh:zeroOrOnePath
     const/$rdf:type})
-
-(defn generate-new-pid
-  "Generates a new pid for a property that has not yet been used.
-  Optionally 'refs-v' is a volatile! set of refs that gets used in
-  the pre-computed :schema of a db, and 'ref?', if truthy, indicates
-  if this property should get added to the refs-v."
-  [property-iri iris next-pid ref? refs-v]
-  (let [new-pid (next-pid)]
-    (vswap! iris assoc property-iri new-pid)
-    (when ref?
-      (vswap! refs-v conj new-pid))
-    new-pid))
