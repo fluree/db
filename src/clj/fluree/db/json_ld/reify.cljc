@@ -236,7 +236,7 @@
     (-> db
         (assoc :t t)
         (commit-data/update-novelty flakes)
-        (update :schema vocab/update-with t refs vocab-flakes))))
+        (update :schema vocab/update-with db t refs vocab-flakes))))
 
 (defn commit-error
   [message commit-data]
