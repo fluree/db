@@ -810,6 +810,9 @@
                              (assoc shape :closed? true)
                              shape)
 
+                           const/$sh:ignoredProperties
+                           (update shape :ignored-properties (fnil conj #{}) o)
+
                            ;; else
                            shape)]
               (recur r' shape* p-shapes))))
