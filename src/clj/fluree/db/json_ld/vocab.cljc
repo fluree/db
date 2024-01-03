@@ -196,24 +196,25 @@
   (reset! shapes {:class {}
                   :pred  {}}))
 
-(defn infer-predicate-id
+(defn infer-predicate-ids
   [f]
   (let [[s p o] ((juxt flake/s flake/p flake/o) f)]
     (cond (and (= const/$rdf:type p)
                (contains? jld-ledger/class-or-property-sid o))
-          s
+          [s p]
 
           (contains? jld-ledger/predicate-refs p)
-          o
+          [p o]
 
-          :else p)))
+          :else
+          [p])))
 
-(defn infer-predicate-ids
+(defn collect-predicate-ids
   [db flakes]
   (let [pred-map (get-in db [:schema :pred])]
     (into #{}
           (comp (filter flake/op)
-                (map infer-predicate-id)
+                (mapcat infer-predicate-ids)
                 (filter (fn [pid]
                           (not (contains? pred-map pid)))))
           flakes)))
@@ -290,7 +291,7 @@
   "Updates the :schema key of db by processing just the vocabulary flakes out of
   the new flakes."
   [db new-flakes]
-  (let [pred-sids    (infer-predicate-ids db new-flakes)
+  (let [pred-sids    (collect-predicate-ids db new-flakes)
         vocab-flakes (into #{}
                            (filter (fn [f]
                                      (or (contains? pred-sids (flake/s f))
