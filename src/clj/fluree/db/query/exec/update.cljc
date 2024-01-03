@@ -54,10 +54,10 @@
                   dt    const/$xsd:anyURI]
               (flake/create sid pid oid dt t true m))
             (let [v  (where/get-value o-mch)
-                  dt (or (dbproto/-p-prop db :datatype p-iri)
-                         (some-> o-mch
+                  dt (or (some-> o-mch
                                  where/get-datatype-iri
-                                 (as-> dt-iri (iri/generate-sid sid-gen dt-iri)))
+                                 (->> (iri/generate-sid sid-gen)))
+                         (dbproto/-p-prop db :datatype p-iri)
                          (datatype/infer v))
                   v* (datatype/coerce-value v dt)]
               (flake/create sid pid v* dt t true m))))
