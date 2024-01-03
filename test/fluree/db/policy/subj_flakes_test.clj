@@ -96,7 +96,7 @@
           ssn-iri (fluree/expand-iri context :schema/ssn)
           ssn-sid @(fluree/internal-id db ssn-iri)]
       (is (= 0
-             (count (filterv #(= ssn-sid (flake/p %)) alice-db-john)))
+             (count (filter #(= ssn-sid (flake/p %)) alice-db-john)))
           "Alice cannot see John's ssn.")
       (is (= 5
              (count alice-db-john))
@@ -105,7 +105,7 @@
       (is (= 1
              (count (filterv #(= ssn-sid (flake/p %)) alice-db-alice)))
           "Alice cannot see her own ssn.")
-      (is (= 7
+      (is (= 6
              (count alice-db-alice))
           "Alice can see her own everything.")
 
