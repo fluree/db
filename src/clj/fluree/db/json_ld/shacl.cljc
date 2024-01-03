@@ -4,6 +4,7 @@
                :cljs [fluree.db.util.cljs-const :as uc])
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -204,10 +205,12 @@
       (loop [[f & r] p-flakes
              res     []]
         (if f
-          (let [[id-flake] (<? (query-range/index-range db :spot = [(flake/o f) const/$xsd:anyURI]))
-                literal?   (not= (flake/dt f) const/$xsd:anyURI)
-                bnode?     (str/starts-with? (flake/o id-flake) "_:")
-                iri?       (not (or literal? bnode?))
+          (let [literal? (not= (flake/dt f) const/$xsd:anyURI)
+                bnode?   (-> f
+                             flake/o
+                             iri/get-namespace
+                             (= (get iri/default-namespaces "_:")))
+                iri?     (not (or literal? bnode?))
                 [valid? :as result]
                 (condp = node-kind
                   const/$sh:BlankNode
