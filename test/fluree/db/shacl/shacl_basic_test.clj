@@ -1722,7 +1722,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                 {"id"        "ex:Alice"
                                                  "type"      "ex:User"
                                                  "ex:friend" {"@id" "ex:Bob"}}})]
-        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be http://www.w3.org/2001/XMLSchema#string."
                (ex-message db-forbidden-friend)))))
     (testing "shape constraints"
       (let [db1            @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]

@@ -177,8 +177,9 @@
     (coalesce-validation-results results)))
 
 (defn validate-value-properties
-  [{:keys [in has-value datatype nodekind logical-constraint] :as _p-shape} p-flakes]
-  (let [in-results (when in
+  [db {:keys [in has-value datatype nodekind logical-constraint] :as _p-shape} p-flakes]
+  (let [ns-codes (:namespace-codes db)
+        in-results (when in
                      (if (every? #(contains? (set in) (flake/o %)) p-flakes)
                        [true (str "sh:not sh:in: value must not be one of " in)]
                        [false (str "sh:in: value must be one of " in)]))
@@ -188,8 +189,8 @@
                               [false (str "sh:hasValue: at least one value must be " has-value)]))
         datatype-results (when datatype
                            (if (every? #(= (flake/dt %) datatype) p-flakes)
-                             [true (str "sh:not sh:datatype: every datatype must not be " datatype)]
-                             [false (str "sh:datatype: every datatype must be " datatype)]))]
+                             [true (str "sh:not sh:datatype: every datatype must not be " (iri/sid->iri datatype ns-codes))]
+                             [false (str "sh:datatype: every datatype must be " (iri/sid->iri datatype ns-codes))]))]
     (coalesce-validation-results [in-results has-value-results datatype-results] logical-constraint)))
 
 
@@ -281,7 +282,7 @@
 
 (defn validate-simple-property-constraints
   "Validate property constraints that do not require any db lookups to verify."
-  [{:keys [min-count max-count
+  [db {:keys [min-count max-count
            min-inclusive min-exclusive max-inclusive max-exclusive
            min-length max-length pattern
            in has-value datatype] :as p-shape} p-flakes]
@@ -298,19 +299,19 @@
                      validation)
         validation (if (and (first validation)
                             (or in has-value datatype))
-                     (validate-value-properties p-shape p-flakes)
+                     (validate-value-properties db p-shape p-flakes)
                      validation)]
     validation))
 
 (defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
-  [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive node-kind
+  [db
+   {:keys [min-count max-count min-inclusive min-exclusive max-inclusive node-kind
            max-exclusive min-length max-length pattern in has-value datatype node class] :as p-shape}
-   p-flakes
-   db]
+   p-flakes]
   (go-try
-    (let [validation (validate-simple-property-constraints p-shape p-flakes)
+    (let [validation (validate-simple-property-constraints db p-shape p-flakes)
           validation (if (and (first validation) node)
                        (<? (validate-node-constraint db p-shape p-flakes))
                        validation)
@@ -435,7 +436,7 @@
                 [valid?] (if node-shape?
                            (<? (validate-shape db q-shape sid s-flakes pid->p-flakes))
                            (let [path-flakes (<? (resolve-path-flakes db sid (:path q-shape) pid->p-flakes))]
-                             (<? (validate-property-constraints q-shape path-flakes db))))]
+                             (<? (validate-property-constraints db q-shape path-flakes))))]
             (recur r (if valid?
                        (conj conforming sid)
                        conforming)))
@@ -506,7 +507,7 @@
               res         (if rhs-property
                             (let [rhs-flakes (filter #(= rhs-property (flake/p %)) s-flakes)]
                               (validate-pair-constraints p-shape path-flakes rhs-flakes))
-                            (<? (validate-property-constraints p-shape path-flakes db)))]
+                            (<? (validate-property-constraints db p-shape path-flakes)))]
 
           (recur r
                  (if qualified-value-shape ; build up collection of q-shapes for further processing
