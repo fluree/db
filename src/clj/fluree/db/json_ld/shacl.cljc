@@ -481,11 +481,16 @@
                  (coalesce-validation-results))))))))
 
 (defn validate-closed-constraint
-  [{:keys [closed? ignored-properties] :as _shape} pid->p-flakes validated-properties]
+  [db {:keys [closed? ignored-properties] :as _shape} pid->p-flakes validated-properties]
   (let [unvalidated-properties (->> (keys pid->p-flakes)
                                     (remove (set/union ignored-properties validated-properties)))]
     (if (and closed? (not-empty unvalidated-properties))
-      [false (str "SHACL shape is closed, extra properties not allowed: " (into [] unvalidated-properties))]
+      (let [ns-codes  (:namespace-codes db)
+            prop-iris (into []
+                            (map (fn [p]
+                                   (iri/sid->iri p ns-codes)))
+                            unvalidated-properties)]
+        [false (str "SHACL shape is closed, extra properties not allowed: " prop-iris)])
       [true])))
 
 (defn validate-shape
@@ -519,7 +524,7 @@
         (let [ ;; check qualifed shape constraints
               q-results (<? (validate-q-shapes db q-shapes sid pid->p-flakes))
               ;; check node shape
-              closed-results (validate-closed-constraint shape pid->p-flakes validated-properties)]
+              closed-results (validate-closed-constraint db shape pid->p-flakes validated-properties)]
           (coalesce-validation-results (conj results q-results closed-results)))))))
 
 (defn throw-shacl-exception
