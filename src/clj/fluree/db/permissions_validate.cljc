@@ -130,7 +130,6 @@
   the subject can be done and each flake does not need to be checked."
   [{:keys [policy namespace-codes] :as db} flakes]
   (go-try
-    (log/info "filtering flakes:" flakes)
     (when-let [fflake (first flakes)]
       (let [class-ids  (<? (dbproto/-class-ids db (flake/s fflake)))
             class-iris (map (fn [class-id]
