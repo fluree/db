@@ -77,13 +77,14 @@
 (defn decompose
   [iri]
   (when iri
-    (let [length (count iri)]
-      (or (decompose-by-char iri \@ length)
-          (decompose-by-char iri \# length)
-          (decompose-by-char iri \? length)
-          (decompose-by-char iri \/ length)
-          (decompose-by-char iri \: length)
-          ["" iri]))))
+    (let [iri*   (normalize iri)
+          length (count iri*)]
+      (or (decompose-by-char iri* \@ length)
+          (decompose-by-char iri* \# length)
+          (decompose-by-char iri* \? length)
+          (decompose-by-char iri* \/ length)
+          (decompose-by-char iri* \: length)
+          ["" iri*]))))
 
 (def name-code-xf
   (comp (partition-all 8)
@@ -168,7 +169,7 @@
   ([iri]
    (iri->sid iri default-namespaces))
   ([iri namespaces]
-   (let [[ns nme] (-> iri normalize decompose)]
+   (let [[ns nme] (decompose iri)]
      (when-let [ns-code (get namespaces ns)]
        (let [name-codes (name->codes nme)]
          (->sid ns-code name-codes))))))
