@@ -210,7 +210,7 @@
                 bnode?   (-> f
                              flake/o
                              iri/get-namespace
-                             (= (get iri/default-namespaces "_:")))
+                             (= "_:"))
                 iri?     (not (or literal? bnode?))
                 [valid? :as result]
                 (condp = node-kind
