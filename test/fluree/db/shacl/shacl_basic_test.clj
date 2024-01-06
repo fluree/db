@@ -1628,14 +1628,12 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                                    {"id"        "ex:Zorba"
                                                                     "type"      "ex:Parent"
                                                                     "ex:gender" "alien"}]}})]
-      (is (= {"id"        "ex:ValidKid"
-              "type"      "ex:Kid"
-              "ex:parent" [{"id" "ex:Dad"}
-                           {"id" "ex:Mom"}]}
-             (-> @(fluree/query valid-kid {"@context" context
-                                           "select"   {"ex:ValidKid" ["*"]}})
-                 first
-                 (update "ex:parent" (partial sort-by #(get % "id"))))))
+      (is (= [{"id"        "ex:ValidKid"
+               "type"      "ex:Kid"
+               "ex:parent" [{"id" "ex:Dad"}
+                            {"id" "ex:Mom"}]}]
+             @(fluree/query valid-kid {"@context" context
+                                       "select"   {"ex:ValidKid" ["*"]}})))
       (is (= "SHACL PropertyShape exception - sh:pattern: value alien does not match pattern \"female\" or it is not a literal value."
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
