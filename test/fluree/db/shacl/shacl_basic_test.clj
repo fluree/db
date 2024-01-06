@@ -184,8 +184,8 @@
                                :schema/email "john@flur.ee"}})
                           (catch Exception e e))]
       (is (util/exception? db-extra-prop))
-      (is (str/starts-with? (ex-message db-extra-prop)
-                            "[\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\" \"http://schema.org/email\"]"))
+      (is (= (ex-message db-extra-prop)
+             "SHACL shape is closed, extra properties not allowed: [\"http://schema.org/email\"]"))
 
       (is (= [{:id          :ex/john
                :type        :ex/User
