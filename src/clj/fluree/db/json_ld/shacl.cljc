@@ -440,14 +440,23 @@
                        conforming)))
           (assoc p-shape :conforming conforming))))))
 
+(defn format-path
+  [db path]
+  (let [ns-codes (:namespace-codes db)]
+    (into []
+          (map (fn [[pid type]]
+                 (let [p-iri (iri/sid->iri pid ns-codes)]
+                   [p-iri type])))
+          path)))
+
 (defn validate-qualified-cardinality-constraints
   [db {:keys [path conforming qualified-min-count qualified-max-count]}]
   (let [conforming-count (count conforming)]
     (cond (and qualified-min-count (< conforming-count qualified-min-count))
-          [false (str "path " path " conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times")]
+          [false (str "path " (format-path db path) " conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times")]
 
           (and qualified-max-count (> conforming-count qualified-max-count))
-          [false (str "path " path " conformed to sh:qualifiedValueShape more than sh:qualifiedMaxCount times")]
+          [false (str "path " (format-path db path) " conformed to sh:qualifiedValueShape more than sh:qualifiedMaxCount times")]
 
           :else
           [true (str "sh:not conformed to sh:qualifiedValueShape between sh:qualifiedMinCount " qualified-min-count
