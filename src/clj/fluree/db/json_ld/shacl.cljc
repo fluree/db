@@ -441,7 +441,7 @@
           (assoc p-shape :conforming conforming))))))
 
 (defn validate-qualified-cardinality-constraints
-  [{:keys [path conforming qualified-min-count qualified-max-count]}]
+  [db {:keys [path conforming qualified-min-count qualified-max-count]}]
   (let [conforming-count (count conforming)]
     (cond (and qualified-min-count (< conforming-count qualified-min-count))
           [false (str "path " path " conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times")]
@@ -477,7 +477,7 @@
             (recur r (map (partial remove-disjoint-conformers disjoint-shape) conforming-q-shapes))
             ;; finally, validate the qualified cardinality constraints
             (->> results
-                 (map validate-qualified-cardinality-constraints)
+                 (map (partial validate-qualified-cardinality-constraints db))
                  (coalesce-validation-results))))))))
 
 (defn validate-closed-constraint
