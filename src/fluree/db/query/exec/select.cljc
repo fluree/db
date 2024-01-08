@@ -67,7 +67,7 @@
             select-seq (util/sequential select)
             select-vars (into #{} (map get-select-vars) select-seq)
             select* (mapv #(unparse-selector % compact) select-seq)
-            where* (where/unparse-patterns (::where/patterns where) select-vars compact)]
+            where* (where/unparse-where where compact)]
         (cond-> (assoc {} "select" select* "where" where*)
            group-by (assoc "group-by" (mapv str group-by))))))
 

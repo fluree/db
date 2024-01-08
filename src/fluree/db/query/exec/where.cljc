@@ -184,7 +184,7 @@
       (::val component)))
 
 (defn unparse-node
-  [[s patterns :as node] select-vars compact-fn]
+  [[s patterns :as node] compact-fn]
   (let [id (compact-fn "@id")
         unparsed-s (unparse-component s compact-fn)]
     (if-let [s-var (::var s)]
@@ -198,34 +198,33 @@
                 patterns)))))
 
 (defn unparse-nonrecursive-patterns
-  [patterns select-vars compact-fn]
+  [patterns compact-fn]
   (let [by-subject (group-by first patterns)]
-    (into [] (map #(unparse-node % select-vars compact-fn))
+    (into [] (map #(unparse-node % compact-fn))
           by-subject)))
 
 (declare unparse-patterns)
 
 (defn unparse-optional
-  [optional-patterns select-vars compact-fn]
+  [optional-patterns compact-fn]
   (mapv (fn [[_typ {::keys [patterns]}]]
           (into ["optional"]
-                (unparse-patterns patterns select-vars compact-fn)))
+                (unparse-patterns patterns compact-fn)))
         optional-patterns))
 
 (defn unparse-union
-  [union-patterns select-vars compact-fn]
+  [union-patterns compact-fn]
   (mapv (fn [[_typ disjuncts]]
           (into ["union"]
                 (into []
                       (mapcat #(unparse-patterns
                                 (::patterns %)
-                                select-vars
                                 compact-fn))
                       disjuncts)))
         union-patterns))
 
 (defn unparse-bind
-  [bind-patterns select-vars compact-fn]
+  [bind-patterns compact-fn]
   (mapv (fn [[_typ bind-map]]
           (into ["bind"]
                 (into []
@@ -237,14 +236,26 @@
 
 
 (defn unparse-patterns
-  [patterns select-vars compact-fn]
+  [patterns compact-fn]
   (let [{:keys [class tuple optional union bind]} (group-by pattern-type patterns)
         nonrecursive-patterns (into tuple (map second class))]
     (into []
-          (concat (unparse-nonrecursive-patterns nonrecursive-patterns select-vars compact-fn)
-                  (unparse-optional optional select-vars compact-fn)
-                  (unparse-union union select-vars compact-fn)
-                  (unparse-bind bind select-vars compact-fn)))))
+          (concat (unparse-nonrecursive-patterns nonrecursive-patterns  compact-fn)
+                  (unparse-optional optional compact-fn)
+                  (unparse-union union compact-fn)
+                  (unparse-bind bind compact-fn)))))
+(defn unparse-filters
+  [filters]
+  (reduce (fn [filter-clause [_var filters]]
+            (into filter-clause (map ::fn-source) filters))
+          ["filter" ]
+          filters))
+
+(defn unparse-where
+  [where compact-fn]
+  (let [{::keys [patterns filters]} where]
+    (cond-> (unparse-patterns patterns compact-fn)
+      filters (conj (unparse-filters filters)))))
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
    `db` that are compatible with the initial solution `solution` and matches the

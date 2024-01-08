@@ -700,4 +700,52 @@
                               {"@context"  context
                                :select ["?query"]
                                :where {:id :ex/bindQuery2
-                                       :f/query "?query"}}))) ))))
+                                       :f/query "?query"}}))))))
+  (testing "filters"
+    (let [conn @(fluree/connect {:method :memory})
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]
+          ledger-id "test/query-queries"
+          ledger @(fluree/create conn ledger-id)
+          db @(fluree/stage (fluree/db ledger)
+                            {"@context" context
+                             "insert" [{:id :ex/filterQuery1
+                                        :f/query {:type :f/queryType
+                                                  :value
+                                                  (str '{:select [?name ?age]
+                                                         :where  [{:type :ex/User
+                                                                   :schema/age ?age
+                                                                   :schema/name ?name}
+                                                                  [:filter "(> ?age (/ (+ ?age 47) 2))"]]})}}]})]
+      (is (= [[{"select" ["?name" "?age"],
+                "where"
+                [{:schema/age "?age",
+                  :schema/name "?name",
+                  :type :ex/User}
+                 ["filter" "(> ?age (/ (+ ?age 47) 2))"]]}]]
+             @(fluree/query db
+                            {"@context"  context
+                             :select ["?query"]
+                             :where {:id :ex/filterQuery1
+                                     :f/query "?query"}})))
+      (let [db2 @(fluree/stage db
+                               {"@context" context
+                                "insert" [{:id :ex/filterQuery2
+                                           :f/query {:type :f/queryType
+                                                     :value
+                                                     (str '{:select [?name ?last]
+                                                            :where  [{:type :ex/User
+                                                                      :schema/age ?age
+                                                                      :schema/name ?name
+                                                                      :ex/last ?last}
+                                                                     [:filter "(> ?age 45)" "(strEnds ?last \"ith\")"]]})}}]})]
+        (is (= [[{"select" ["?name" "?last"]
+                  "where"  [{:type :ex/User
+                             :schema/age "?age"
+                             :schema/name "?name"
+                             :ex/last "?last"}
+                            ["filter" "(> ?age 45)" "(strEnds ?last \"ith\")"]]}]]
+               @(fluree/query db2
+                              {"@context"  context
+                               :select ["?query"]
+                               :where {:id :ex/filterQuery2
+                                       :f/query "?query"}})))))))
