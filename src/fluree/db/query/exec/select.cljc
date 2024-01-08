@@ -60,16 +60,25 @@
   (or (:subj selector)
       (:var selector)))
 
+(defn get-select
+  [parsed-query]
+  (if-let [select (:select parsed-query)]
+    ["select" select]
+    (if-let [select-one (:select-one parsed-query)]
+      ["selectOne" select-one]
+      (let [select-distinct (:select-distinct parsed-query)]
+        ["selectDistinct" select-distinct]))))
+
 (defmethod display const/$fluree:queryType
   [match db iri-cache compact error-ch]
   (go (let [v (where/get-value match)
-            {:keys [select where context group-by]} v
-            select-seq (util/sequential select)
+            {:keys [where context group-by order-by]} v
+            [select-key select-clause] (get-select v)
+            select-seq (util/sequential select-clause)
             select-vars (into #{} (map get-select-vars) select-seq)
             select* (mapv #(unparse-selector % compact) select-seq)
             where* (where/unparse-where where compact)]
-        (cond-> (assoc {} "select" select* "where" where*)
-           group-by (assoc "group-by" (mapv str group-by))))))
+        (cond-> (assoc {} select-key select* "where" where*)
 
 (defprotocol ValueSelector
   (implicit-grouping? [this]

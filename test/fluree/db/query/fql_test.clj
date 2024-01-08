@@ -748,4 +748,51 @@
                               {"@context"  context
                                :select ["?query"]
                                :where {:id :ex/filterQuery2
+                                       :f/query "?query"}}))))))
+  (testing "select clauses"
+    (let [conn @(fluree/connect {:method :memory})
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]
+          ledger-id "test/query-queries"
+          ledger @(fluree/create conn ledger-id)
+          db @(fluree/stage (fluree/db ledger)
+                            {"@context" context
+                             "insert" [{:id :ex/selectDistinctQuery
+                                        :f/query {:type :f/queryType
+                                                  :value
+                                                  (str '{:select-distinct [?name ?email]
+                                                         :where           {:schema/name  ?name
+                                                                           :schema/email ?email
+                                                                           :ex/favNums   ?favNum}
+                                                         :order-by        ?favNum})}}]})]
+      (is (= [[{"selectDistinct" ["?name" "?email"]
+                "where"           [{:schema/name  "?name"
+                                    :schema/email "?email"
+                                    :ex/favNums   "?favNum"}]
+                 "orderBy"        "?favNum"}]]
+             @(fluree/query db
+                            {"@context"  context
+                             :select ["?query"]
+                             :where {:id :ex/selectDistinctQuery
+                                     :f/query "?query"}})))
+      (let [db2 @(fluree/stage db
+                               {"@context" context
+                                "insert" [{:id :ex/selectOneQuery
+                                           :f/query {:type :f/queryType
+                                                     :value
+                                                     (str '{:selectOne [?name ?age ?email]
+                                                            :where     {:schema/name "Cam"
+                                                                        :ex/friend   {:schema/name  ?name
+                                                                                      :schema/age   ?age
+                                                                                      :schema/email ?email}}})}}]})]
+        (is (= [[{"selectOne" ["?name" "?age" "?email"],
+                  "where"
+                  ;;TODO: where clause will actually be two clauses with gensym id vars
+                  [{:schema/name "Cam",
+                    :ex/friend {:schema/name "?name",
+                                :schema/age "?age",
+                                :schema/email "?email"}}]}]]
+               @(fluree/query db2
+                              {"@context"  context
+                               :select ["?query"]
+                               :where {:id :ex/selectOneQuery
                                        :f/query "?query"}})))))))
