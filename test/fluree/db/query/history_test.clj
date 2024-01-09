@@ -225,10 +225,10 @@
                  :cause))))
 
     #_(testing "invalid query"
-      (is (= "History query not properly formatted. Provided {:history []}"
-             (-> @(fluree/history ledger {:history []})
-                 Throwable->map
-                 :cause))))
+        (is (= "History query not properly formatted. Provided {:history []}"
+               (-> @(fluree/history ledger {:history []})
+                   Throwable->map
+                   :cause))))
 
     (testing "small cache"
       (let [conn    (test-utils/create-conn)
@@ -260,7 +260,6 @@
           ledger  @(fluree/create conn "committest")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
 
-
           db1 @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
                                             "insert"   {:id   :ex/alice
                                                         :ex/x "foo-1"
@@ -284,25 +283,25 @@
                                     {:message "meow"})]
       (testing "at time t"
         (is (pred-match?
-              [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
-                           {:id test-utils/did?}
-                           :f/address        test-utils/address?
-                           :f/alias          "committest"
-                           :f/branch         "main"
-                           :f/data           #:f{:address test-utils/address?
-                                                 :assert  [{:ex/x "foo-1"
-                                                            :ex/y "bar-1"
-                                                            :id   :ex/alice}]
-                                                 :flakes  7
-                                                 :retract []
-                                                 :size    pos-int?
-                                                 :t       1}
-                           :f/time           720000
-                           :f/v              0
-                           :id               test-utils/commit-id?}}]
-              @(fluree/history ledger {:context        context
-                                       :commit-details true
-                                       :t              {:from 1 :to 1}})))
+             [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                          {:id test-utils/did?}
+                          :f/address        test-utils/address?
+                          :f/alias          "committest"
+                          :f/branch         "main"
+                          :f/data           #:f{:address test-utils/address?
+                                                :assert  [{:ex/x "foo-1"
+                                                           :ex/y "bar-1"
+                                                           :id   :ex/alice}]
+                                                :flakes  7
+                                                :retract []
+                                                :size    pos-int?
+                                                :t       1}
+                          :f/time           720000
+                          :f/v              0
+                          :id               test-utils/commit-id?}}]
+             @(fluree/history ledger {:context        context
+                                      :commit-details true
+                                      :t              {:from 1 :to 1}})))
         (let [commit-5 {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                                    {:id test-utils/did?}
                                    :f/address        test-utils/address?
@@ -343,46 +342,162 @@
                                    :f/v              0
                                    :id               test-utils/commit-id?}}]
           (is (pred-match?
-                [commit-4 commit-5]
-                @(fluree/history ledger {:context        context
-                                         :commit-details true
-                                         :t              {:from 4 :to 5}})))
+               [commit-4 commit-5]
+               @(fluree/history ledger {:context        context
+                                        :commit-details true
+                                        :t              {:from 4 :to 5}})))
           (is (pred-match?
-                [commit-5]
-                @(fluree/history ledger {:context        context
-                                         :commit-details true
-                                         :t              {:at :latest}})))))
+               [commit-5]
+               @(fluree/history ledger {:context        context
+                                        :commit-details true
+                                        :t              {:at :latest}})))))
 
       (testing "time range"
         (let [[c2 c3 c4 :as response] @(fluree/history
-                                         ledger
-                                         {:context        context
-                                          :commit-details true
-                                          :t              {:from 2 :to 4}})]
+                                        ledger
+                                        {:context        context
+                                         :commit-details true
+                                         :t              {:from 2 :to 4}})]
           (testing "all commits in time range are returned"
             (is (= 3 (count response)))
             (is (pred-match?
-                  {:f/commit {"https://www.w3.org/2018/credentials#issuer"
-                              {:id test-utils/did?}
-                              :f/address        test-utils/address?
-                              :f/alias          "committest"
-                              :f/branch         "main"
-                              :f/data           #:f{:address  test-utils/address?
-                                                    :assert   [{:ex/x "foo-cat"
-                                                                :ex/y "bar-cat"
-                                                                :id   :ex/cat}]
-                                                    :flakes   70
-                                                    :previous {:id test-utils/db-id?}
-                                                    :retract  []
-                                                    :size     pos-int?
-                                                    :t        4}
-                              :f/previous       {:id test-utils/commit-id?}
-                              :f/time           720000
-                              :f/v              0
-                              :id               test-utils/commit-id?}}
-                  c4)))
+                 {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                             {:id test-utils/did?}
+                             :f/address        test-utils/address?
+                             :f/alias          "committest"
+                             :f/branch         "main"
+                             :f/data           #:f{:address  test-utils/address?
+                                                   :assert   [{:ex/x "foo-cat"
+                                                               :ex/y "bar-cat"
+                                                               :id   :ex/cat}]
+                                                   :flakes   70
+                                                   :previous {:id test-utils/db-id?}
+                                                   :retract  []
+                                                   :size     pos-int?
+                                                   :t        4}
+                             :f/previous       {:id test-utils/commit-id?}
+                             :f/time           720000
+                             :f/v              0
+                             :id               test-utils/commit-id?}}
+                 c4)))
           (is (pred-match?
-                {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+               {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                           {:id test-utils/did?}
+                           :f/address        test-utils/address?
+                           :f/alias          "committest"
+                           :f/branch         "main"
+                           :f/data           #:f{:address  test-utils/address?
+                                                 :assert   [{:ex/x "foo-3"
+                                                             :ex/y "bar-3"
+                                                             :id   :ex/alice}]
+                                                 :flakes   52
+                                                 :previous {:id test-utils/db-id?}
+                                                 :retract  [{:ex/x "foo-2"
+                                                             :ex/y "bar-2"
+                                                             :id   :ex/alice}]
+                                                 :size     pos-int?
+                                                 :t        3}
+                           :f/previous       {:id test-utils/commit-id?}
+                           :f/time           720000
+                           :f/v              0
+                           :id               test-utils/commit-id?}}
+               c3))
+          (is (pred-match?
+               {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                           {:id test-utils/did?}
+                           :f/address        test-utils/address?
+                           :f/alias          "committest"
+                           :f/branch         "main"
+                           :f/data           #:f{:address  test-utils/address?
+                                                 :assert   [{:ex/x "foo-2"
+                                                             :ex/y "bar-2"
+                                                             :id   :ex/alice}]
+                                                 :flakes   35
+                                                 :previous {:id test-utils/db-id?}
+                                                 :retract  [{:ex/x "foo-1"
+                                                             :ex/y "bar-1"
+                                                             :id   :ex/alice}]
+                                                 :size     pos-int?
+                                                 :t        2}
+                           :f/previous       {:id test-utils/commit-id?}
+                           :f/time           720000
+                           :f/v              0
+                           :id               test-utils/commit-id?}}
+               c2))))
+
+      (testing "time range from"
+        (is (pred-match?
+             [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                          {:id test-utils/did?}
+                          :f/address        test-utils/address?
+                          :f/alias          "committest"
+                          :f/branch         "main"
+                          :f/data           #:f{:address  test-utils/address?
+                                                :assert   [{:ex/x "foo-cat"
+                                                            :ex/y "bar-cat"
+                                                            :id   :ex/cat}]
+                                                :flakes   70
+                                                :previous {:id test-utils/db-id?}
+                                                :retract  []
+                                                :size     pos-int?
+                                                :t        4}
+                          :f/previous       {:id test-utils/commit-id?}
+                          :f/time           720000
+                          :f/v              0
+                          :id               test-utils/commit-id?}}
+              {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                          {:id test-utils/did?}
+                          :f/address        test-utils/address?
+                          :f/alias          "committest"
+                          :f/branch         "main"
+                          :f/data           #:f{:address  test-utils/address?
+                                                :assert   [{:ex/x "foo-cat"
+                                                            :ex/y "bar-cat"
+                                                            :id   :ex/alice}]
+                                                :flakes   87
+                                                :previous {:id test-utils/db-id?}
+                                                :retract  [{:ex/x "foo-3"
+                                                            :ex/y "bar-3"
+                                                            :id   :ex/alice}]
+                                                :size     pos-int?
+                                                :t        5}
+                          :f/message        "meow"
+                          :f/previous       {:id test-utils/commit-id?}
+                          :f/time           720000
+                          :f/v              0
+                          :id               test-utils/commit-id?}}]
+             @(fluree/history ledger {:context        context
+                                      :commit-details true
+                                      :t              {:from 4}}))))
+
+      (testing "time range to"
+        (is (pred-match?
+             [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                          {:id test-utils/did?}
+                          :f/address        test-utils/address?
+                          :f/alias          "committest"
+                          :f/branch         "main"
+                          :f/data           #:f{:address test-utils/address?
+                                                :assert  [{:ex/x "foo-1"
+                                                           :ex/y "bar-1"
+                                                           :id   :ex/alice}]
+                                                :flakes  7
+                                                :retract []
+                                                :size    pos-int?
+                                                :t       1}
+                          :f/time           720000
+                          :f/v              0
+                          :id               test-utils/commit-id?}}]
+             @(fluree/history ledger {:context        context
+                                      :commit-details true
+                                      :t              {:to 1}}))))
+
+      (testing "history commit details"
+        (is (pred-match?
+             [#:f{:assert  [{:ex/x "foo-3"
+                             :ex/y "bar-3"
+                             :id   :ex/alice}]
+                  :commit  {"https://www.w3.org/2018/credentials#issuer"
                             {:id test-utils/did?}
                             :f/address        test-utils/address?
                             :f/alias          "committest"
@@ -401,159 +516,43 @@
                             :f/previous       {:id test-utils/commit-id?}
                             :f/time           720000
                             :f/v              0
-                            :id               test-utils/commit-id?}}
-                c3))
-          (is (pred-match?
-                {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                            :id               test-utils/commit-id?}
+                  :retract [{:ex/x "foo-2"
+                             :ex/y "bar-2"
+                             :id   :ex/alice}]
+                  :t       3}
+              #:f{:assert  [{:ex/x "foo-cat"
+                             :ex/y "bar-cat"
+                             :id   :ex/alice}]
+                  :commit  {"https://www.w3.org/2018/credentials#issuer"
                             {:id test-utils/did?}
                             :f/address        test-utils/address?
                             :f/alias          "committest"
                             :f/branch         "main"
                             :f/data           #:f{:address  test-utils/address?
-                                                  :assert   [{:ex/x "foo-2"
-                                                              :ex/y "bar-2"
+                                                  :assert   [{:ex/x "foo-cat"
+                                                              :ex/y "bar-cat"
                                                               :id   :ex/alice}]
-                                                  :flakes   35
+                                                  :flakes   87
                                                   :previous {:id test-utils/db-id?}
-                                                  :retract  [{:ex/x "foo-1"
-                                                              :ex/y "bar-1"
+                                                  :retract  [{:ex/x "foo-3"
+                                                              :ex/y "bar-3"
                                                               :id   :ex/alice}]
                                                   :size     pos-int?
-                                                  :t        2}
+                                                  :t        5}
+                            :f/message        "meow"
                             :f/previous       {:id test-utils/commit-id?}
                             :f/time           720000
                             :f/v              0
-                            :id               test-utils/commit-id?}}
-                c2))))
-
-      (testing "time range from"
-        (is (pred-match?
-              [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
-                           {:id test-utils/did?}
-                           :f/address        test-utils/address?
-                           :f/alias          "committest"
-                           :f/branch         "main"
-                           :f/data           #:f{:address  test-utils/address?
-                                                 :assert   [{:ex/x "foo-cat"
-                                                             :ex/y "bar-cat"
-                                                             :id   :ex/cat}]
-                                                 :flakes   70
-                                                 :previous {:id test-utils/db-id?}
-                                                 :retract  []
-                                                 :size     pos-int?
-                                                 :t        4}
-                           :f/previous       {:id test-utils/commit-id?}
-                           :f/time           720000
-                           :f/v              0
-                           :id               test-utils/commit-id?}}
-               {:f/commit {"https://www.w3.org/2018/credentials#issuer"
-                           {:id test-utils/did?}
-                           :f/address        test-utils/address?
-                           :f/alias          "committest"
-                           :f/branch         "main"
-                           :f/data           #:f{:address  test-utils/address?
-                                                 :assert   [{:ex/x "foo-cat"
-                                                             :ex/y "bar-cat"
-                                                             :id   :ex/alice}]
-                                                 :flakes   87
-                                                 :previous {:id test-utils/db-id?}
-                                                 :retract  [{:ex/x "foo-3"
-                                                             :ex/y "bar-3"
-                                                             :id   :ex/alice}]
-                                                 :size     pos-int?
-                                                 :t        5}
-                           :f/message        "meow"
-                           :f/previous       {:id test-utils/commit-id?}
-                           :f/time           720000
-                           :f/v              0
-                           :id               test-utils/commit-id?}}]
-              @(fluree/history ledger {:context        context
-                                       :commit-details true
-                                       :t              {:from 4}}))))
-
-      (testing "time range to"
-        (is (pred-match?
-              [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
-                           {:id test-utils/did?}
-                           :f/address        test-utils/address?
-                           :f/alias          "committest"
-                           :f/branch         "main"
-                           :f/data           #:f{:address test-utils/address?
-                                                 :assert  [{:ex/x "foo-1"
-                                                            :ex/y "bar-1"
-                                                            :id   :ex/alice}]
-                                                 :flakes  7
-                                                 :retract []
-                                                 :size    pos-int?
-                                                 :t       1}
-                           :f/time           720000
-                           :f/v              0
-                           :id               test-utils/commit-id?}}]
-              @(fluree/history ledger {:context        context
-                                       :commit-details true
-                                       :t              {:to 1}}))))
-
-      (testing "history commit details"
-        (is (pred-match?
-              [#:f{:assert  [{:ex/x "foo-3"
-                              :ex/y "bar-3"
-                              :id   :ex/alice}]
-                   :commit  {"https://www.w3.org/2018/credentials#issuer"
-                             {:id test-utils/did?}
-                             :f/address        test-utils/address?
-                             :f/alias          "committest"
-                             :f/branch         "main"
-                             :f/data           #:f{:address  test-utils/address?
-                                                   :assert   [{:ex/x "foo-3"
-                                                               :ex/y "bar-3"
-                                                               :id   :ex/alice}]
-                                                   :flakes   52
-                                                   :previous {:id test-utils/db-id?}
-                                                   :retract  [{:ex/x "foo-2"
-                                                               :ex/y "bar-2"
-                                                               :id   :ex/alice}]
-                                                   :size     pos-int?
-                                                   :t        3}
-                             :f/previous       {:id test-utils/commit-id?}
-                             :f/time           720000
-                             :f/v              0
-                             :id               test-utils/commit-id?}
-                   :retract [{:ex/x "foo-2"
-                              :ex/y "bar-2"
-                              :id   :ex/alice}]
-                   :t       3}
-               #:f{:assert  [{:ex/x "foo-cat"
-                              :ex/y "bar-cat"
-                              :id   :ex/alice}]
-                   :commit  {"https://www.w3.org/2018/credentials#issuer"
-                             {:id test-utils/did?}
-                             :f/address        test-utils/address?
-                             :f/alias          "committest"
-                             :f/branch         "main"
-                             :f/data           #:f{:address  test-utils/address?
-                                                   :assert   [{:ex/x "foo-cat"
-                                                               :ex/y "bar-cat"
-                                                               :id   :ex/alice}]
-                                                   :flakes   87
-                                                   :previous {:id test-utils/db-id?}
-                                                   :retract  [{:ex/x "foo-3"
-                                                               :ex/y "bar-3"
-                                                               :id   :ex/alice}]
-                                                   :size     pos-int?
-                                                   :t        5}
-                             :f/message        "meow"
-                             :f/previous       {:id test-utils/commit-id?}
-                             :f/time           720000
-                             :f/v              0
-                             :id               test-utils/commit-id?}
-                   :retract [{:ex/x "foo-3"
-                              :ex/y "bar-3"
-                              :id   :ex/alice}]
-                   :t       5}]
-              @(fluree/history ledger {:context        context
-                                       :history        :ex/alice
-                                       :commit-details true
-                                       :t              {:from 3}}))))
+                            :id               test-utils/commit-id?}
+                  :retract [{:ex/x "foo-3"
+                             :ex/y "bar-3"
+                             :id   :ex/alice}]
+                  :t       5}]
+             @(fluree/history ledger {:context        context
+                                      :history        :ex/alice
+                                      :commit-details true
+                                      :t              {:from 3}}))))
       (testing "multiple history results"
         (let [history-with-commits @(fluree/history ledger {:context        context
                                                             :history        :ex/alice
@@ -613,67 +612,67 @@
                                                 {:message "meow"})
             loaded-ledger (test-utils/retry-load conn ledger-name 100)]
         (is (pred-match?
-              [#:f{:assert  [{:ex/x "foo-3"
-                              :ex/y "bar-3"
-                              :id   :ex/alice}]
-                   :commit  {:f/address  test-utils/address?
-                             :f/alias    ledger-name
-                             :f/branch   "main"
-                             :f/data     #:f{:address  test-utils/address?
-                                             :assert   [{:ex/x "foo-3"
-                                                         :ex/y "bar-3"
-                                                         :id   :ex/alice}]
-                                             :flakes   53
-                                             :previous {:id test-utils/db-id?}
-                                             :retract  [{:ex/x "foo-2"
-                                                         :ex/y "bar-2"
-                                                         :id   :ex/alice}]
-                                             :size     pos-int?
-                                             :t        3}
-                             :f/previous {:id test-utils/commit-id?}
-                             :f/time     720000
-                             :f/v        0
-                             :id         test-utils/commit-id?}
-                   :retract [{:ex/x "foo-2"
-                              :ex/y "bar-2"
-                              :id   :ex/alice}]
-                   :t       3}
-               #:f{:assert  [{:ex/x "foo-cat"
-                              :ex/y "bar-cat"
-                              :id   :ex/alice}]
-                   :commit  {:f/address  test-utils/address?
-                             :f/alias    ledger-name
-                             :f/branch   "main"
-                             :f/data     #:f{:address  test-utils/address?
-                                             :assert   [{:ex/x "foo-cat"
-                                                         :ex/y "bar-cat"
-                                                         :id   :ex/alice}]
-                                             :flakes   88
-                                             :previous {:id test-utils/db-id?}
-                                             :retract  [{:ex/x "foo-3"
-                                                         :ex/y "bar-3"
-                                                         :id   :ex/alice}]
-                                             :size     pos-int?
-                                             :t        5}
-                             :f/message  "meow"
-                             :f/previous {:id test-utils/commit-id?}
-                             :f/time     720000
-                             :f/v        0
-                             :id         test-utils/commit-id?}
-                   :retract [{:ex/x "foo-3"
-                              :ex/y "bar-3"
-                              :id   :ex/alice}]
-                   :t       5}]
-              @(fluree/history loaded-ledger {:context        context
-                                              :history        :ex/alice
-                                              :commit-details true
-                                              :t              {:from 3}})))))
+             [#:f{:assert  [{:ex/x "foo-3"
+                             :ex/y "bar-3"
+                             :id   :ex/alice}]
+                  :commit  {:f/address  test-utils/address?
+                            :f/alias    ledger-name
+                            :f/branch   "main"
+                            :f/data     #:f{:address  test-utils/address?
+                                            :assert   [{:ex/x "foo-3"
+                                                        :ex/y "bar-3"
+                                                        :id   :ex/alice}]
+                                            :flakes   53
+                                            :previous {:id test-utils/db-id?}
+                                            :retract  [{:ex/x "foo-2"
+                                                        :ex/y "bar-2"
+                                                        :id   :ex/alice}]
+                                            :size     pos-int?
+                                            :t        3}
+                            :f/previous {:id test-utils/commit-id?}
+                            :f/time     720000
+                            :f/v        0
+                            :id         test-utils/commit-id?}
+                  :retract [{:ex/x "foo-2"
+                             :ex/y "bar-2"
+                             :id   :ex/alice}]
+                  :t       3}
+              #:f{:assert  [{:ex/x "foo-cat"
+                             :ex/y "bar-cat"
+                             :id   :ex/alice}]
+                  :commit  {:f/address  test-utils/address?
+                            :f/alias    ledger-name
+                            :f/branch   "main"
+                            :f/data     #:f{:address  test-utils/address?
+                                            :assert   [{:ex/x "foo-cat"
+                                                        :ex/y "bar-cat"
+                                                        :id   :ex/alice}]
+                                            :flakes   88
+                                            :previous {:id test-utils/db-id?}
+                                            :retract  [{:ex/x "foo-3"
+                                                        :ex/y "bar-3"
+                                                        :id   :ex/alice}]
+                                            :size     pos-int?
+                                            :t        5}
+                            :f/message  "meow"
+                            :f/previous {:id test-utils/commit-id?}
+                            :f/time     720000
+                            :f/v        0
+                            :id         test-utils/commit-id?}
+                  :retract [{:ex/x "foo-3"
+                             :ex/y "bar-3"
+                             :id   :ex/alice}]
+                  :t       5}]
+             @(fluree/history loaded-ledger {:context        context
+                                             :history        :ex/alice
+                                             :commit-details true
+                                             :t              {:from 3}})))))
 
     (testing "history commit details on a loaded memory ledger w/ issuer"
       (let [ledger-name "loaded-history-mem-issuer"
             conn        @(fluree/connect {:method   :memory
                                           :defaults {:did (did/private->did-map
-                                                            test-utils/default-private-key)}})
+                                                           test-utils/default-private-key)}})
             ledger      @(fluree/create conn ledger-name)
             context     [test-utils/default-context {:ex "http://example.org/ns/"}]
 
@@ -705,65 +704,65 @@
                                                 {:message "meow"})
             loaded-ledger (test-utils/retry-load conn ledger-name 100)]
         (is (pred-match?
-              [#:f{:assert  [{:ex/x "foo-3"
-                              :ex/y "bar-3"
-                              :id   :ex/alice}]
-                   :commit  {"https://www.w3.org/2018/credentials#issuer"
-                             {:id test-utils/did?}
-                             :f/address  test-utils/address?
-                             :f/alias    ledger-name
-                             :f/branch   "main"
-                             :f/data     #:f{:address  test-utils/address?
-                                             :assert   [{:ex/x "foo-3"
-                                                         :ex/y "bar-3"
-                                                         :id   :ex/alice}]
-                                             :flakes   52
-                                             :previous {:id test-utils/db-id?}
-                                             :retract  [{:ex/x "foo-2"
-                                                         :ex/y "bar-2"
-                                                         :id   :ex/alice}]
-                                             :size     pos-int?
-                                             :t        3}
-                             :f/previous {:id test-utils/commit-id?}
-                             :f/time     720000
-                             :f/v        0
-                             :id         test-utils/commit-id?}
-                   :retract [{:ex/x "foo-2"
-                              :ex/y "bar-2"
-                              :id   :ex/alice}]
-                   :t       3}
-               #:f{:assert  [{:ex/x "foo-cat"
-                              :ex/y "bar-cat"
-                              :id   :ex/alice}]
-                   :commit  {"https://www.w3.org/2018/credentials#issuer"
-                             {:id test-utils/did?}
-                             :f/address  test-utils/address?
-                             :f/alias    ledger-name
-                             :f/branch   "main"
-                             :f/data     #:f{:address  test-utils/address?
-                                             :assert   [{:ex/x "foo-cat"
-                                                         :ex/y "bar-cat"
-                                                         :id   :ex/alice}]
-                                             :flakes   87
-                                             :previous {:id test-utils/db-id?}
-                                             :retract  [{:ex/x "foo-3"
-                                                         :ex/y "bar-3"
-                                                         :id   :ex/alice}]
-                                             :size     pos-int?
-                                             :t        5}
-                             :f/message  "meow"
-                             :f/previous {:id test-utils/commit-id?}
-                             :f/time     720000
-                             :f/v        0
-                             :id         test-utils/commit-id?}
-                   :retract [{:ex/x "foo-3"
-                              :ex/y "bar-3"
-                              :id   :ex/alice}]
-                   :t       5}]
-              @(fluree/history loaded-ledger {:context        context
-                                              :history        :ex/alice
-                                              :commit-details true
-                                              :t              {:from 3}})))))))
+             [#:f{:assert  [{:ex/x "foo-3"
+                             :ex/y "bar-3"
+                             :id   :ex/alice}]
+                  :commit  {"https://www.w3.org/2018/credentials#issuer"
+                            {:id test-utils/did?}
+                            :f/address  test-utils/address?
+                            :f/alias    ledger-name
+                            :f/branch   "main"
+                            :f/data     #:f{:address  test-utils/address?
+                                            :assert   [{:ex/x "foo-3"
+                                                        :ex/y "bar-3"
+                                                        :id   :ex/alice}]
+                                            :flakes   52
+                                            :previous {:id test-utils/db-id?}
+                                            :retract  [{:ex/x "foo-2"
+                                                        :ex/y "bar-2"
+                                                        :id   :ex/alice}]
+                                            :size     pos-int?
+                                            :t        3}
+                            :f/previous {:id test-utils/commit-id?}
+                            :f/time     720000
+                            :f/v        0
+                            :id         test-utils/commit-id?}
+                  :retract [{:ex/x "foo-2"
+                             :ex/y "bar-2"
+                             :id   :ex/alice}]
+                  :t       3}
+              #:f{:assert  [{:ex/x "foo-cat"
+                             :ex/y "bar-cat"
+                             :id   :ex/alice}]
+                  :commit  {"https://www.w3.org/2018/credentials#issuer"
+                            {:id test-utils/did?}
+                            :f/address  test-utils/address?
+                            :f/alias    ledger-name
+                            :f/branch   "main"
+                            :f/data     #:f{:address  test-utils/address?
+                                            :assert   [{:ex/x "foo-cat"
+                                                        :ex/y "bar-cat"
+                                                        :id   :ex/alice}]
+                                            :flakes   87
+                                            :previous {:id test-utils/db-id?}
+                                            :retract  [{:ex/x "foo-3"
+                                                        :ex/y "bar-3"
+                                                        :id   :ex/alice}]
+                                            :size     pos-int?
+                                            :t        5}
+                            :f/message  "meow"
+                            :f/previous {:id test-utils/commit-id?}
+                            :f/time     720000
+                            :f/v        0
+                            :id         test-utils/commit-id?}
+                  :retract [{:ex/x "foo-3"
+                             :ex/y "bar-3"
+                             :id   :ex/alice}]
+                  :t       5}]
+             @(fluree/history loaded-ledger {:context        context
+                                             :history        :ex/alice
+                                             :commit-details true
+                                             :t              {:from 3}})))))))
 
 (deftest loaded-file-ledger-history-test
   (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
@@ -773,7 +772,7 @@
               conn        @(fluree/connect {:method       :file
                                             :storage-path storage-path
                                             :defaults     {:did (did/private->did-map
-                                                                  test-utils/default-private-key)}})
+                                                                 test-utils/default-private-key)}})
               ledger      @(fluree/create conn ledger-name)
               context     [test-utils/default-context {:ex "http://example.org/ns/"}]
 
@@ -814,62 +813,62 @@
                                                   {:message "meow"})
               loaded-ledger (test-utils/retry-load conn ledger-name 100)]
           (is (pred-match?
-                [#:f{:assert  [{:ex/x "foo-3"
-                                :ex/y "bar-3"
-                                :id   :ex/alice}]
-                     :commit  {"https://www.w3.org/2018/credentials#issuer"
-                               {:id test-utils/did?}
-                               :f/address  test-utils/address?
-                               :f/alias    ledger-name
-                               :f/branch   "main"
-                               :f/data     #:f{:address  test-utils/address?
-                                               :assert   [{:ex/x "foo-3"
-                                                           :ex/y "bar-3"
-                                                           :id   :ex/alice}]
-                                               :flakes   56
-                                               :previous {:id test-utils/db-id?}
-                                               :retract  [{:ex/x "foo-2"
-                                                           :ex/y "bar-2"
-                                                           :id   :ex/alice}]
-                                               :size     pos-int?
-                                               :t        3}
-                               :f/previous {:id test-utils/commit-id?}
-                               :f/time     720000
-                               :f/v        0
-                               :id         test-utils/commit-id?}
-                     :retract [{:ex/x "foo-2"
-                                :ex/y "bar-2"
-                                :id   :ex/alice}]
-                     :t       3}
-                 #:f{:assert  [{:ex/x "foo-cat"
-                                :ex/y "bar-cat"
-                                :id   :ex/alice}]
-                     :commit  {"https://www.w3.org/2018/credentials#issuer"
-                               {:id test-utils/did?}
-                               :f/address  test-utils/address?
-                               :f/alias    ledger-name
-                               :f/branch   "main"
-                               :f/data     #:f{:address  test-utils/address?
-                                               :assert   [{:ex/x "foo-cat"
-                                                           :ex/y "bar-cat"
-                                                           :id   :ex/alice}]
-                                               :flakes   93
-                                               :previous {:id test-utils/db-id?}
-                                               :retract  [{:ex/x "foo-3"
-                                                           :ex/y "bar-3"
-                                                           :id   :ex/alice}]
-                                               :size     pos-int?
-                                               :t        5}
-                               :f/message  "meow"
-                               :f/previous {:id test-utils/commit-id?}
-                               :f/time     720000
-                               :f/v        0
-                               :id         test-utils/commit-id?}
-                     :retract [{:ex/x "foo-3"
-                                :ex/y "bar-3"
-                                :id   :ex/alice}]
-                     :t       5}]
-                @(fluree/history loaded-ledger {:context        context
-                                                :history        :ex/alice
-                                                :commit-details true
-                                                :t              {:from 3}}))))))))
+               [#:f{:assert  [{:ex/x "foo-3"
+                               :ex/y "bar-3"
+                               :id   :ex/alice}]
+                    :commit  {"https://www.w3.org/2018/credentials#issuer"
+                              {:id test-utils/did?}
+                              :f/address  test-utils/address?
+                              :f/alias    ledger-name
+                              :f/branch   "main"
+                              :f/data     #:f{:address  test-utils/address?
+                                              :assert   [{:ex/x "foo-3"
+                                                          :ex/y "bar-3"
+                                                          :id   :ex/alice}]
+                                              :flakes   56
+                                              :previous {:id test-utils/db-id?}
+                                              :retract  [{:ex/x "foo-2"
+                                                          :ex/y "bar-2"
+                                                          :id   :ex/alice}]
+                                              :size     pos-int?
+                                              :t        3}
+                              :f/previous {:id test-utils/commit-id?}
+                              :f/time     720000
+                              :f/v        0
+                              :id         test-utils/commit-id?}
+                    :retract [{:ex/x "foo-2"
+                               :ex/y "bar-2"
+                               :id   :ex/alice}]
+                    :t       3}
+                #:f{:assert  [{:ex/x "foo-cat"
+                               :ex/y "bar-cat"
+                               :id   :ex/alice}]
+                    :commit  {"https://www.w3.org/2018/credentials#issuer"
+                              {:id test-utils/did?}
+                              :f/address  test-utils/address?
+                              :f/alias    ledger-name
+                              :f/branch   "main"
+                              :f/data     #:f{:address  test-utils/address?
+                                              :assert   [{:ex/x "foo-cat"
+                                                          :ex/y "bar-cat"
+                                                          :id   :ex/alice}]
+                                              :flakes   93
+                                              :previous {:id test-utils/db-id?}
+                                              :retract  [{:ex/x "foo-3"
+                                                          :ex/y "bar-3"
+                                                          :id   :ex/alice}]
+                                              :size     pos-int?
+                                              :t        5}
+                              :f/message  "meow"
+                              :f/previous {:id test-utils/commit-id?}
+                              :f/time     720000
+                              :f/v        0
+                              :id         test-utils/commit-id?}
+                    :retract [{:ex/x "foo-3"
+                               :ex/y "bar-3"
+                               :id   :ex/alice}]
+                    :t       5}]
+               @(fluree/history loaded-ledger {:context        context
+                                               :history        :ex/alice
+                                               :commit-details true
+                                               :t              {:from 3}}))))))))
