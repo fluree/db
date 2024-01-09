@@ -7,7 +7,7 @@
   "keywords" : [ "fluree", "nodejs" ],
   "author" : "Fluree PBC (https://flur.ee)",
   "requires" : true,
-  "version" : "3.0.0-alpha1",
+  "version" : "3.0.0-alpha2",
   "main" : "fluree-node-sdk.js",
   "dependencies" : {
     "source-map-support" : "^0.5.21",
