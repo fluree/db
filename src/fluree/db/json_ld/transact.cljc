@@ -210,9 +210,10 @@
    (stage db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (go-try
-     (let [ctx           (:context parsed-opts)
-           parsed-txn    (q-parse/parse-txn txn ctx)
-           db*           (if-let [policy-identity (perm/parse-policy-identity parsed-opts ctx)]
+     (let [{:keys [context raw-txn did]} parsed-opts
+
+           parsed-txn    (q-parse/parse-txn txn context)
+           db*           (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                            (<? (perm/wrap-policy db policy-identity))
                            db)
            tx-state      (->tx-state db*)
