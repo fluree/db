@@ -33,8 +33,7 @@
          com.fluree/alphabase            {:mvn/version "3.3.0"}
 
          ;; cryptography
-         com.fluree/crypto               {:git/url "https://github.com/fluree/fluree.crypto"
-                                          :git/sha "da7b0f63601519726bb00a8f388e2b809ea35458"}
+         com.fluree/crypto               {:mvn/version "1.0.0"}
 
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
