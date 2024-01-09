@@ -10,14 +10,14 @@
          cheshire/cheshire               {:mvn/version "5.12.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
          metosin/malli                   {:git/url "https://github.com/metosin/malli.git"
-                                          :git/sha "5211aca498ff7b022c36de4ca713990f5e731a9c"}
+                                          :git/sha "2aac49abffb9005188c70ffff825d88efee18069"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
                                           :git/sha "c2bef3785631dd178b9261e2f4d2ee012fed984c"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
-         ch.qos.logback/logback-classic  {:mvn/version "1.4.11"}
-         org.slf4j/slf4j-api             {:mvn/version "2.0.9"}
+         ch.qos.logback/logback-classic  {:mvn/version "1.4.14"}
+         org.slf4j/slf4j-api             {:mvn/version "2.0.11"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
@@ -39,7 +39,7 @@
 
          ;; storage
          com.cognitect.aws/api           {:mvn/version "0.8.686"}
-         com.cognitect.aws/endpoints     {:mvn/version "1.1.12.504"}
+         com.cognitect.aws/endpoints     {:mvn/version "1.1.12.626"}
          com.cognitect.aws/s3            {:mvn/version "848.2.1413.0"}}
 
  :paths ["src" "resources"]
@@ -48,7 +48,7 @@
  {:build
   {:deps       {io.github.clojure/tools.build {:git/tag "v0.9.6"
                                                :git/sha "8e78bcc"}
-                slipset/deps-deploy           {:mvn/version "0.2.1"}}
+                slipset/deps-deploy           {:mvn/version "0.2.2"}}
    :ns-default build}
 
   :dev
@@ -56,7 +56,7 @@
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.4.4"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs              {:mvn/version "2.25.9"}}}
+                 thheller/shadow-cljs              {:mvn/version "2.26.3"}}}
 
   :cljtest
   {:extra-paths ["test" "dev-resources" "test-resources"]
@@ -100,7 +100,7 @@
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps  {jonase/eastwood {:mvn/version "1.4.0"}}
+  {:extra-deps  {jonase/eastwood {:mvn/version "1.4.2"}}
    :main-opts   ["-m" "eastwood.lint"
                  {:source-paths ["src" "src-docs"]
                   :test-paths   ["test"]
@@ -115,5 +115,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.10.20"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.12.15"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
