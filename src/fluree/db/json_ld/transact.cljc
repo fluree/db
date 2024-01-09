@@ -1,23 +1,25 @@
 (ns fluree.db.json-ld.transact
-  (:require [clojure.core.async :as async :refer [go alts!]]
+  (:require [clojure.core.async :as async :refer [alts! go]]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.ledger :as jld-ledger]
+            [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.policy.enforce-tx :as policy]
-            [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util]
+            [fluree.json-ld :as json-ld]
+            [fluree.store.core :as store]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -93,7 +95,7 @@
     (get iri->sid* iri)))
 
 (defn ->tx-state
-  [db]
+  [db txn-id author-did]
   (let [{:keys [schema branch ledger policy], db-t :t} db
         iri->sid (atom {:last-pid (jld-ledger/last-pid db)
                         :last-sid (jld-ledger/last-sid db)})
@@ -101,6 +103,8 @@
         t         (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
         db-before (dbproto/-rootdb db)]
     {:db-before                db-before
+     :txn-id                   txn-id
+     :author-did               author-did
      :policy                   policy
      :stage-update?            (= t db-t) ;; if a previously staged db is getting updated again before committed
      :t                        t
@@ -170,7 +174,7 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [new-flakes {:keys [stage-update? db-before iri->sid policy t] :as _tx-state}]
+  [new-flakes {:keys [stage-update? db-before iri->sid policy t txn-id author-did] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
@@ -179,6 +183,7 @@
           {:keys [last-pid last-sid]} @iri->sid
 
           db-after (-> db-before
+                       (update :txns (fnil conj []) [txn-id author-did])
                        (update :ecount assoc const/$_predicate last-pid)
                        (update :ecount assoc const/$_default last-sid)
                        (assoc :policy policy) ;; re-apply policy to db-after
@@ -211,12 +216,19 @@
   ([db fuel-tracker txn parsed-opts]
    (go-try
      (let [{:keys [context raw-txn did]} parsed-opts
+           {:keys [conn ledger]} db
 
            parsed-txn    (q-parse/parse-txn txn context)
            db*           (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                            (<? (perm/wrap-policy db policy-identity))
                            db)
-           tx-state      (->tx-state db*)
+
+           {txn-id :hash path :path} (store/write (:store conn)
+                                                  (str (ledger-proto/-alias ledger) "/txn/")
+                                                  (json-ld/normalize-data raw-txn)
+                                                  {:content-address? true})
+
+           tx-state      (->tx-state db* txn-id did)
            flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
            fuel-error-ch (:error-ch fuel-tracker)
            chans         (remove nil? [fuel-error-ch flakes-ch])
