@@ -1,6 +1,7 @@
 (ns fluree.store.file
   (:refer-clojure :exclude [read])
   (:require [fluree.crypto :as crypto]
+            [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
             [fluree.store.proto :as store-proto]
             [fluree.store.util :as store-util]))
@@ -13,12 +14,15 @@
                      :k            k
                      :v            v
                      :opts         opts})))
-  (let [hash (crypto/sha2-256 v)
-        k*   (if content-address?
-                   (str k hash)
-                   k)
-        path (str (fs/local-path storage-path) "/" k)]
-    (fs/write-file path v)
+  (let [hash  (crypto/sha2-256 v)
+        k*    (if content-address?
+                (str k hash)
+                k)
+        path  (str (fs/local-path storage-path) "/" k)
+        bytes (if (string? v)
+                (bytes/string->UTF8 v)
+                v)]
+    (fs/write-file path bytes)
     {:k    k*
      :hash hash
      :size (count v)}))
