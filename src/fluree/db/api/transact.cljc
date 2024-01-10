@@ -24,16 +24,16 @@
     (let [{txn* :subject did :did} (or (<? (cred/verify txn))
                                        {:subject txn})
           txn-context              (or (:context opts)
-                                      (ctx-util/txn-context txn*))
+                                       (ctx-util/txn-context txn*))
 
           expanded            (json-ld/expand (ctx-util/use-fluree-context txn*))
           txn-opts            (util/get-first-value expanded const/iri-opts)
           {:keys [maxFuel meta]
            :as   parsed-opts} (cond-> opts
-                                raw-txn     (assoc :raw-txn txn)
-                                did         (assoc :did did)
-                                txn-context (assoc :context txn-context)
-                                true        (parse-opts txn-opts))]
+                                (not raw-txn) (assoc :raw-txn txn)
+                                did           (assoc :did did)
+                                txn-context   (assoc :context txn-context)
+                                true          (parse-opts txn-opts))]
       (if (or maxFuel meta)
         (let [start-time   #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))
