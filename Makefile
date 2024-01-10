@@ -50,13 +50,13 @@ install: target/fluree-db.jar
 deploy: target/fluree-db.jar
 	clojure -T:build deploy
 
-js-packages/nodejs/package.json: package.json
+js-packages/nodejs/package.json: package.json build.clj
 	clojure -T:build sync-package-json :target $(@D)/package.json :node? true
 
-js-packages/browser/package.json: package.json
+js-packages/browser/package.json: package.json build.clj
 	clojure -T:build sync-package-json :target $(@D)/package.json
 
-js-packages/webworker/package.json: package.json
+js-packages/webworker/package.json: package.json build.clj
 	clojure -T:build sync-package-json :target $(@D)/package.json
 
 js-packages/nodejs/fluree-node-sdk.js: out/fluree-node-sdk.js
@@ -68,7 +68,7 @@ js-packages/browser/fluree-browser-sdk.js: out/fluree-browser-sdk.js
 js-packages/webworker/fluree-webworker.js: out/fluree-webworker.js
 	cp $< $@
 
-js-packages: js-packages/nodejs/fluree-node-sdk.js js-packages/browser/fluree-browser-sdk.js js-packages/webworker/fluree-webworker.js
+js-packages: sync-package-json js-packages/nodejs/fluree-node-sdk.js js-packages/browser/fluree-browser-sdk.js js-packages/webworker/fluree-webworker.js
 
 sync-package-json: js-packages/nodejs/package.json js-packages/browser/package.json js-packages/webworker/package.json
 
