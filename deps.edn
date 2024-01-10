@@ -12,7 +12,7 @@
          metosin/malli                   {:git/url "https://github.com/metosin/malli.git"
                                           :git/sha "2aac49abffb9005188c70ffff825d88efee18069"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
-                                          :git/sha "c2bef3785631dd178b9261e2f4d2ee012fed984c"}
+                                          :git/sha "0958995acf5540271d1807fc6d8f2da131164e24"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
