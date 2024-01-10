@@ -852,26 +852,26 @@
 
 (defn build-class-shapes
   "Given a class SID, returns class shape"
-  [db type-sid]
+  [db class-sid]
   (go-try
-    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetClass type-sid]
+    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetClass class-sid]
                                                   {:flake-xf (map flake/s)}))]
       (->> (<? (build-shapes db shape-sids))
-           (mapv (fn [shape] (assoc shape :target-class type-sid)))))))
+           (mapv (fn [shape] (assoc shape :target-class class-sid)))))))
 
 (defn class-shapes
   "Takes a list of target classes and returns shapes that must pass validation,
   or nil if none exist."
-  [{:keys [schema] :as db} type-sids]
+  [{:keys [schema] :as db} class-sids]
   (go-try
     (let [shapes-cache (:shapes schema)]
-      (loop [[type-sid & r] type-sids
-             shapes []]
-        (if type-sid
-          (let [class-shapes (if (contains? (:class @shapes-cache) type-sid)
-                               (get-in @shapes-cache [:class type-sid])
-                               (let [shapes (<? (build-class-shapes db type-sid))]
-                                 (swap! shapes-cache assoc-in [:class type-sid] shapes)
+      (loop [[class-sid & r] class-sids
+             shapes          []]
+        (if class-sid
+          (let [class-shapes (if (contains? (:class @shapes-cache) class-sid)
+                               (get-in @shapes-cache [:class class-sid])
+                               (let [shapes (<? (build-class-shapes db class-sid))]
+                                 (swap! shapes-cache assoc-in [:class class-sid] shapes)
                                  shapes))]
             (recur r (into shapes class-shapes)))
           shapes)))))
