@@ -282,24 +282,38 @@
                    [:f/message :id "https://ns.flur.ee/ledger#message"]
                    [:f/previous :id "https://ns.flur.ee/ledger#previous"]
                    [:id :id "@id"]
-                   ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2"
-                    "https://www.w3.org/2018/credentials#issuer"
+                   ["fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"
+                    :f/author
                     "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                   ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2"
+                   ["fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"
+                    :f/v
+                    0]
+                   ["fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"
                     :id
-                    "fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2"]
-                   ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2"
-                    :f/address
-                    "fluree:memory://759f66318bc08a599045cb08d0d517654d7a09c9863e866bf8e6f0e51cb701ba"]
-                   ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2"
-                    :f/alias
-                    "query/everything"]
-                   ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2" :f/branch "main"]
-                   ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2"
+                    "fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"]
+                   ["fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"
+                    :f/time
+                    720000]
+                   [:f/txn :id "https://ns.flur.ee/ledger#txn"]
+                   ["fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"
                     :f/data
                     "fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"]
-                   ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2" :f/time 720000]
-                   ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2" :f/v 0]}
+                   ["fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"
+                    :f/alias
+                    "query/everything"]
+                   [:f/author :id "https://ns.flur.ee/ledger#author"]
+                   ["fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"
+                    :f/address
+                    "fluree:memory://6ce26676eedd7cb43fde1077652100e72de65c80e8380999671941ba981c6c32"]
+                   ["fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"
+                    "https://www.w3.org/2018/credentials#issuer"
+                    "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
+                   ["fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"
+                    :f/branch
+                    "main"]
+                   ["fluree:commit:sha256:bxqx6ehnhod77zuz7labldvitretrbl23c6uns6fw4443ectpevt"
+                    :f/txn
+                    "query/everything/txn/144908452423d421230317bbc681f6023039201145ab05336b69c39c3958e39c"]}
                  (set result))
               (str "query result was: " (pr-str result))))))))
 

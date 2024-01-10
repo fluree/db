@@ -1,9 +1,11 @@
 (ns fluree.db.query.history-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils :refer [pred-match?]]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.crypto :as crypto]
             [fluree.db.did :as did]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.util.core :as util]
+            [fluree.db.util.json :as json]
             [test-with-files.tools :refer [with-tmp-dir]]))
 
 (deftest ^:integration history-query-test
@@ -258,25 +260,25 @@
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "committest")
-          context [test-utils/default-context {:ex "http://example.org/ns/"}]
+          context ["https://ns.flur.ee" test-utils/default-context {:ex "http://example.org/ns/"}]
 
-          db1 @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
+          db1 @(test-utils/transact ledger {"@context" context
                                             "insert"   {:id   :ex/alice
                                                         :ex/x "foo-1"
                                                         :ex/y "bar-1"}})
-          db2 @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
+          db2 @(test-utils/transact ledger {"@context" context
                                             "insert"   {:id   :ex/alice
                                                         :ex/x "foo-2"
                                                         :ex/y "bar-2"}})
-          db3 @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
+          db3 @(test-utils/transact ledger {"@context" context
                                             "insert"   {:id   :ex/alice
                                                         :ex/x "foo-3"
                                                         :ex/y "bar-3"}})
-          db4 @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
+          db4 @(test-utils/transact ledger {"@context" context
                                             "insert"   {:id   :ex/cat
                                                         :ex/x "foo-cat"
                                                         :ex/y "bar-cat"}})
-          db5 @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
+          db5 @(test-utils/transact ledger {"@context" context
                                             "insert"   {:id   :ex/alice
                                                         :ex/x "foo-cat"
                                                         :ex/y "bar-cat"}}
@@ -287,6 +289,7 @@
                           {:id test-utils/did?}
                           :f/address        test-utils/address?
                           :f/alias          "committest"
+                          :f/author         (-> ledger :did :id)
                           :f/branch         "main"
                           :f/data           #:f{:address test-utils/address?
                                                 :assert  [{:ex/x "foo-1"
@@ -297,6 +300,7 @@
                                                 :size    pos-int?
                                                 :t       1}
                           :f/time           720000
+                          :f/txn            string?
                           :f/v              0
                           :id               test-utils/commit-id?}}]
              @(fluree/history ledger {:context        context
@@ -306,12 +310,13 @@
                                    {:id test-utils/did?}
                                    :f/address        test-utils/address?
                                    :f/alias          "committest"
+                                   :f/author         (-> ledger :did :id)
                                    :f/branch         "main"
                                    :f/data           #:f{:address  test-utils/address?
                                                          :assert   [{:ex/x "foo-cat"
                                                                      :ex/y "bar-cat"
                                                                      :id   :ex/alice}]
-                                                         :flakes   87
+                                                         :flakes   97
                                                          :previous {:id test-utils/db-id?}
                                                          :retract  [{:ex/x "foo-3"
                                                                      :ex/y "bar-3"
@@ -321,24 +326,27 @@
                                    :f/message        "meow"
                                    :f/previous       {:id test-utils/commit-id?}
                                    :f/time           720000
+                                   :f/txn            string?
                                    :f/v              0
                                    :id               test-utils/commit-id?}}
               commit-4 {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                                    {:id test-utils/did?}
                                    :f/address        test-utils/address?
                                    :f/alias          "committest"
+                                   :f/author         (-> ledger :did :id)
                                    :f/branch         "main"
                                    :f/data           #:f{:address  test-utils/address?
                                                          :assert   [{:ex/x "foo-cat"
                                                                      :ex/y "bar-cat"
                                                                      :id   :ex/cat}]
-                                                         :flakes   70
+                                                         :flakes   78
                                                          :previous {:id test-utils/db-id?}
                                                          :retract  []
                                                          :size     pos-int?
                                                          :t        4}
                                    :f/previous       {:id test-utils/commit-id?}
                                    :f/time           720000
+                                   :f/txn            string?
                                    :f/v              0
                                    :id               test-utils/commit-id?}}]
           (is (pred-match?
@@ -355,74 +363,80 @@
       (testing "time range"
         (let [[c2 c3 c4 :as response] @(fluree/history
                                         ledger
-                                        {:context        context
+                                        {:context context
                                          :commit-details true
-                                         :t              {:from 2 :to 4}})]
+                                         :t {:from 2 :to 4}})]
           (testing "all commits in time range are returned"
             (is (= 3 (count response)))
             (is (pred-match?
                  {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                              {:id test-utils/did?}
-                             :f/address        test-utils/address?
-                             :f/alias          "committest"
-                             :f/branch         "main"
-                             :f/data           #:f{:address  test-utils/address?
-                                                   :assert   [{:ex/x "foo-cat"
-                                                               :ex/y "bar-cat"
-                                                               :id   :ex/cat}]
-                                                   :flakes   70
-                                                   :previous {:id test-utils/db-id?}
-                                                   :retract  []
-                                                   :size     pos-int?
-                                                   :t        4}
-                             :f/previous       {:id test-utils/commit-id?}
-                             :f/time           720000
-                             :f/v              0
-                             :id               test-utils/commit-id?}}
+                             :f/address test-utils/address?
+                             :f/alias "committest"
+                             :f/author (-> ledger :did :id)
+                             :f/branch "main"
+                             :f/data #:f{:address test-utils/address?
+                                         :assert [{:ex/x "foo-cat"
+                                                   :ex/y "bar-cat"
+                                                   :id :ex/cat}]
+                                         :flakes 78
+                                         :previous {:id test-utils/db-id?}
+                                         :retract []
+                                         :size pos-int?
+                                         :t 4}
+                             :f/previous {:id test-utils/commit-id?}
+                             :f/time 720000
+                             :f/txn string?
+                             :f/v 0
+                             :id test-utils/commit-id?}}
                  c4)))
           (is (pred-match?
                {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                            {:id test-utils/did?}
-                           :f/address        test-utils/address?
-                           :f/alias          "committest"
-                           :f/branch         "main"
-                           :f/data           #:f{:address  test-utils/address?
-                                                 :assert   [{:ex/x "foo-3"
-                                                             :ex/y "bar-3"
-                                                             :id   :ex/alice}]
-                                                 :flakes   52
-                                                 :previous {:id test-utils/db-id?}
-                                                 :retract  [{:ex/x "foo-2"
-                                                             :ex/y "bar-2"
-                                                             :id   :ex/alice}]
-                                                 :size     pos-int?
-                                                 :t        3}
-                           :f/previous       {:id test-utils/commit-id?}
-                           :f/time           720000
-                           :f/v              0
-                           :id               test-utils/commit-id?}}
+                           :f/address test-utils/address?
+                           :f/alias "committest"
+                           :f/author (-> ledger :did :id)
+                           :f/branch "main"
+                           :f/data #:f{:address test-utils/address?
+                                       :assert [{:ex/x "foo-3"
+                                                 :ex/y "bar-3"
+                                                 :id :ex/alice}]
+                                       :flakes 58
+                                       :previous {:id test-utils/db-id?}
+                                       :retract [{:ex/x "foo-2"
+                                                  :ex/y "bar-2"
+                                                  :id :ex/alice}]
+                                       :size pos-int?
+                                       :t 3}
+                           :f/previous {:id test-utils/commit-id?}
+                           :f/time 720000
+                           :f/txn string?
+                           :f/v 0
+                           :id test-utils/commit-id?}}
                c3))
           (is (pred-match?
                {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                            {:id test-utils/did?}
-                           :f/address        test-utils/address?
-                           :f/alias          "committest"
-                           :f/branch         "main"
-                           :f/data           #:f{:address  test-utils/address?
-                                                 :assert   [{:ex/x "foo-2"
-                                                             :ex/y "bar-2"
-                                                             :id   :ex/alice}]
-                                                 :flakes   35
-                                                 :previous {:id test-utils/db-id?}
-                                                 :retract  [{:ex/x "foo-1"
-                                                             :ex/y "bar-1"
-                                                             :id   :ex/alice}]
-                                                 :size     pos-int?
-                                                 :t        2}
-                           :f/previous       {:id test-utils/commit-id?}
-                           :f/time           720000
-                           :f/v              0
-                           :id               test-utils/commit-id?}}
+                           :f/address test-utils/address?
+                           :f/alias "committest"
+                           :f/author (-> ledger :did :id)
+                           :f/branch "main"
+                           :f/data #:f{:address test-utils/address?
+                                       :assert [{:ex/x "foo-2"
+                                                 :ex/y "bar-2"
+                                                 :id :ex/alice}]
+                                       :flakes 39
+                                       :previous {:id test-utils/db-id?}
+                                       :retract [{:ex/x "foo-1"
+                                                  :ex/y "bar-1"
+                                                  :id :ex/alice}]
+                                       :size pos-int?
+                                       :t 2}
+                           :f/previous {:id test-utils/commit-id?}
+                           :f/time 720000
+                           :f/txn string?
+                           :f/v 0
+                           :id test-utils/commit-id?}}
                c2))))
 
       (testing "time range from"
@@ -431,30 +445,33 @@
                           {:id test-utils/did?}
                           :f/address        test-utils/address?
                           :f/alias          "committest"
+                          :f/author         (-> ledger :did :id)
                           :f/branch         "main"
                           :f/data           #:f{:address  test-utils/address?
                                                 :assert   [{:ex/x "foo-cat"
                                                             :ex/y "bar-cat"
                                                             :id   :ex/cat}]
-                                                :flakes   70
+                                                :flakes   78
                                                 :previous {:id test-utils/db-id?}
                                                 :retract  []
                                                 :size     pos-int?
                                                 :t        4}
                           :f/previous       {:id test-utils/commit-id?}
                           :f/time           720000
+                          :f/txn            string?
                           :f/v              0
                           :id               test-utils/commit-id?}}
               {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                           {:id test-utils/did?}
                           :f/address        test-utils/address?
                           :f/alias          "committest"
+                          :f/author         (-> ledger :did :id)
                           :f/branch         "main"
                           :f/data           #:f{:address  test-utils/address?
                                                 :assert   [{:ex/x "foo-cat"
                                                             :ex/y "bar-cat"
                                                             :id   :ex/alice}]
-                                                :flakes   87
+                                                :flakes   97
                                                 :previous {:id test-utils/db-id?}
                                                 :retract  [{:ex/x "foo-3"
                                                             :ex/y "bar-3"
@@ -464,6 +481,7 @@
                           :f/message        "meow"
                           :f/previous       {:id test-utils/commit-id?}
                           :f/time           720000
+                          :f/txn            string?
                           :f/v              0
                           :id               test-utils/commit-id?}}]
              @(fluree/history ledger {:context        context
@@ -476,6 +494,7 @@
                           {:id test-utils/did?}
                           :f/address        test-utils/address?
                           :f/alias          "committest"
+                          :f/author         (-> ledger :did :id)
                           :f/branch         "main"
                           :f/data           #:f{:address test-utils/address?
                                                 :assert  [{:ex/x "foo-1"
@@ -486,6 +505,7 @@
                                                 :size    pos-int?
                                                 :t       1}
                           :f/time           720000
+                          :f/txn            string?
                           :f/v              0
                           :id               test-utils/commit-id?}}]
              @(fluree/history ledger {:context        context
@@ -501,12 +521,13 @@
                             {:id test-utils/did?}
                             :f/address        test-utils/address?
                             :f/alias          "committest"
+                            :f/author         (-> ledger :did :id)
                             :f/branch         "main"
                             :f/data           #:f{:address  test-utils/address?
                                                   :assert   [{:ex/x "foo-3"
                                                               :ex/y "bar-3"
                                                               :id   :ex/alice}]
-                                                  :flakes   52
+                                                  :flakes   58
                                                   :previous {:id test-utils/db-id?}
                                                   :retract  [{:ex/x "foo-2"
                                                               :ex/y "bar-2"
@@ -515,6 +536,7 @@
                                                   :t        3}
                             :f/previous       {:id test-utils/commit-id?}
                             :f/time           720000
+                            :f/txn            string?
                             :f/v              0
                             :id               test-utils/commit-id?}
                   :retract [{:ex/x "foo-2"
@@ -528,12 +550,13 @@
                             {:id test-utils/did?}
                             :f/address        test-utils/address?
                             :f/alias          "committest"
+                            :f/author         (-> ledger :did :id)
                             :f/branch         "main"
                             :f/data           #:f{:address  test-utils/address?
                                                   :assert   [{:ex/x "foo-cat"
                                                               :ex/y "bar-cat"
                                                               :id   :ex/alice}]
-                                                  :flakes   87
+                                                  :flakes   97
                                                   :previous {:id test-utils/db-id?}
                                                   :retract  [{:ex/x "foo-3"
                                                               :ex/y "bar-3"
@@ -543,6 +566,7 @@
                             :f/message        "meow"
                             :f/previous       {:id test-utils/commit-id?}
                             :f/time           720000
+                            :f/txn            string?
                             :f/v              0
                             :id               test-utils/commit-id?}
                   :retract [{:ex/x "foo-3"
@@ -617,12 +641,13 @@
                              :id   :ex/alice}]
                   :commit  {:f/address  test-utils/address?
                             :f/alias    ledger-name
+                            :f/author   ""
                             :f/branch   "main"
                             :f/data     #:f{:address  test-utils/address?
                                             :assert   [{:ex/x "foo-3"
                                                         :ex/y "bar-3"
                                                         :id   :ex/alice}]
-                                            :flakes   53
+                                            :flakes   59
                                             :previous {:id test-utils/db-id?}
                                             :retract  [{:ex/x "foo-2"
                                                         :ex/y "bar-2"
@@ -631,6 +656,7 @@
                                             :t        3}
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
+                            :f/txn      string?
                             :f/v        0
                             :id         test-utils/commit-id?}
                   :retract [{:ex/x "foo-2"
@@ -642,12 +668,13 @@
                              :id   :ex/alice}]
                   :commit  {:f/address  test-utils/address?
                             :f/alias    ledger-name
+                            :f/author   ""
                             :f/branch   "main"
                             :f/data     #:f{:address  test-utils/address?
                                             :assert   [{:ex/x "foo-cat"
                                                         :ex/y "bar-cat"
                                                         :id   :ex/alice}]
-                                            :flakes   88
+                                            :flakes   98
                                             :previous {:id test-utils/db-id?}
                                             :retract  [{:ex/x "foo-3"
                                                         :ex/y "bar-3"
@@ -657,6 +684,7 @@
                             :f/message  "meow"
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
+                            :f/txn      string?
                             :f/v        0
                             :id         test-utils/commit-id?}
                   :retract [{:ex/x "foo-3"
@@ -711,12 +739,13 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
                             :f/alias    ledger-name
+                            :f/author   (-> ledger :did :id)
                             :f/branch   "main"
                             :f/data     #:f{:address  test-utils/address?
                                             :assert   [{:ex/x "foo-3"
                                                         :ex/y "bar-3"
                                                         :id   :ex/alice}]
-                                            :flakes   52
+                                            :flakes   58
                                             :previous {:id test-utils/db-id?}
                                             :retract  [{:ex/x "foo-2"
                                                         :ex/y "bar-2"
@@ -725,6 +754,7 @@
                                             :t        3}
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
+                            :f/txn      string?
                             :f/v        0
                             :id         test-utils/commit-id?}
                   :retract [{:ex/x "foo-2"
@@ -738,12 +768,13 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
                             :f/alias    ledger-name
+                            :f/author   (-> ledger :did :id)
                             :f/branch   "main"
                             :f/data     #:f{:address  test-utils/address?
                                             :assert   [{:ex/x "foo-cat"
                                                         :ex/y "bar-cat"
                                                         :id   :ex/alice}]
-                                            :flakes   87
+                                            :flakes   97
                                             :previous {:id test-utils/db-id?}
                                             :retract  [{:ex/x "foo-3"
                                                         :ex/y "bar-3"
@@ -753,6 +784,7 @@
                             :f/message  "meow"
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
+                            :f/txn      string?
                             :f/v        0
                             :id         test-utils/commit-id?}
                   :retract [{:ex/x "foo-3"
@@ -820,12 +852,13 @@
                               {:id test-utils/did?}
                               :f/address  test-utils/address?
                               :f/alias    ledger-name
+                              :f/author   (-> ledger :did :id)
                               :f/branch   "main"
                               :f/data     #:f{:address  test-utils/address?
                                               :assert   [{:ex/x "foo-3"
                                                           :ex/y "bar-3"
                                                           :id   :ex/alice}]
-                                              :flakes   56
+                                              :flakes   62
                                               :previous {:id test-utils/db-id?}
                                               :retract  [{:ex/x "foo-2"
                                                           :ex/y "bar-2"
@@ -834,6 +867,7 @@
                                               :t        3}
                               :f/previous {:id test-utils/commit-id?}
                               :f/time     720000
+                              :f/txn      string?
                               :f/v        0
                               :id         test-utils/commit-id?}
                     :retract [{:ex/x "foo-2"
@@ -847,12 +881,13 @@
                               {:id test-utils/did?}
                               :f/address  test-utils/address?
                               :f/alias    ledger-name
+                              :f/author   (-> ledger :did :id)
                               :f/branch   "main"
                               :f/data     #:f{:address  test-utils/address?
                                               :assert   [{:ex/x "foo-cat"
                                                           :ex/y "bar-cat"
                                                           :id   :ex/alice}]
-                                              :flakes   93
+                                              :flakes   103
                                               :previous {:id test-utils/db-id?}
                                               :retract  [{:ex/x "foo-3"
                                                           :ex/y "bar-3"
@@ -862,6 +897,7 @@
                               :f/message  "meow"
                               :f/previous {:id test-utils/commit-id?}
                               :f/time     720000
+                              :f/txn      string?
                               :f/v        0
                               :id         test-utils/commit-id?}
                     :retract [{:ex/x "foo-3"
@@ -872,3 +908,55 @@
                                                :history        :ex/alice
                                                :commit-details true
                                                :t              {:from 3}}))))))))
+
+(deftest ^:integration author-and-txn-id
+  (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+    (let [conn         @(fluree/connect {:method :memory})
+          ledger-name  "authortest"
+          ledger       @(fluree/create conn ledger-name)
+          context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
+          root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
+          root-did     (:id (did/private->did-map root-privkey))
+
+          db0 (fluree/db ledger)
+          db1 @(fluree/stage db0 {"@context" context
+                                  "insert"   [{"@id"         "ex:betty"
+                                               "@type"       "ex:Yeti"
+                                               "schema:name" "Betty"
+                                               "schema:age"  55}
+                                              {"@id"         "ex:freddy"
+                                               "@type"       "ex:Yeti"
+                                               "schema:name" "Freddy"
+                                               "schema:age"  1002}
+                                              {"@id"         "ex:letty"
+                                               "@type"       "ex:Yeti"
+                                               "schema:name" "Leticia"
+                                               "schema:age"  38}
+                                              {"@id"    root-did
+                                               "f:role" {"@id" "ex:rootRole"}}]})
+          db2 (->> @(fluree/stage db1 {"@context" context
+                                       "insert"   {"@id"          "ex:rootPolicy"
+                                                   "@type"        ["f:Policy"]
+                                                   "f:targetNode" {"@id" "f:allNodes"}
+                                                   "f:allow"      [{"@id"          "ex:rootAccessAllow"
+                                                                    "f:targetRole" {"@id" "ex:rootRole"}
+                                                                    "f:action"     [{"@id" "f:view"}
+                                                                                    {"@id" "f:modify"}]}]}})
+                   (fluree/commit! ledger)
+                   (deref))
+
+          db3 @(test-utils/transact ledger (crypto/create-jws
+                                            (json/stringify {"@context" context "insert" {"ex:foo" 3}})
+                                            root-privkey))]
+      (is (= [{"f:author" "" "f:txn" "" "f:data" {"f:t" 1}}
+              {"f:author" root-did
+               "f:txn"
+               "authortest/txn/9f321be5fd184f43d998ef7b02cdded2625579cc52b95e1d8f12c9b28cd7a5b0",
+               "f:data" {"f:t" 2}}]
+             (->> @(fluree/history ledger {:context        context
+                                           :commit-details true
+                                           :t              {:from 1 :to :latest}})
+                  (mapv (fn [c]
+                          (-> (get c "f:commit")
+                              (update "f:data" select-keys ["f:t"])
+                              (select-keys ["f:author" "f:txn" "f:data"]))))))))))

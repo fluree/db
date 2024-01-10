@@ -238,7 +238,7 @@
     result))
 
 (def db-id-regex
-  (re-pattern (str "fluree:db:sha256:" base32-pattern "{52,53}")))
+  (re-pattern (str "fluree:db:sha256:" base32-pattern "{51,53}")))
 
 (defn db-id?
   [s]
