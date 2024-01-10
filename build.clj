@@ -3,7 +3,7 @@
             [deps-deploy.deps-deploy :as dd]))
 
 (def lib 'com.fluree/db)
-(def version "3.0.0-alpha1")
+(def version "3.0.0-alpha2")
 
 (def class-dir "target/classes")
 (def basis (b/create-basis {:project "deps.edn"}))
@@ -20,9 +20,10 @@
                 :version   version
                 :basis     basis
                 :src-dirs  ["src"]
-                :scm       {:url                 source-uri
-                            :connection          "scm:git:https://github.com/fluree/db.git"
-                            :developerConnection "scm:git:git@github.com:fluree/db.git"}})
+                :scm
+                {:url                 source-uri
+                 :connection          "scm:git:https://github.com/fluree/db.git"
+                 :developerConnection "scm:git:git@github.com:fluree/db.git"}})
   (b/copy-dir {:src-dirs    ["src" "resources"]
                :target-dir  class-dir})
   (b/jar {:class-dir class-dir
