@@ -91,11 +91,6 @@
                 :name        com.fluree/db
                 :output-path "docs"}}
 
-  :deploy
-  {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.1"}}
-   :main-opts    ["-m" "deps-deploy.deps-deploy" "deploy"
-                  "target/fluree-db.jar"]}
-
   :meta
   {:main-opts ["-m" "fluree.db.meta"]}
 
