@@ -115,6 +115,19 @@
                    (let [nses (iri/get-namespaces sid-gen)]
                      [nses flakes]))))))
 
+(defn class-flake?
+  [f]
+  (-> f flake/p (= const/$rdf:type)))
+
+(def extract-class-xf
+  (comp
+    (filter class-flake?)
+    (map flake/o)))
+
+(defn extract-classes
+  [flakes]
+  (into #{} extract-class-xf flakes))
+
 (defn subject-mods
   [new-flakes db-before]
   (go-try
@@ -122,12 +135,8 @@
       (loop [[s-flakes & r] (partition-by flake/s new-flakes)
              subj-mods      {}]
         (if s-flakes
-          (let [sid              (flake/s (first s-flakes))
-                new-classes      (into #{}
-                                       (comp
-                                         (filter #(= const/$rdf:type (flake/p %)))
-                                         (map flake/o))
-                                       s-flakes)
+          (let [new-classes      (extract-classes s-flakes)
+                sid              (flake/s (first s-flakes))
                 existing-classes (<? (query-range/index-range db-before :spot = [sid const/$rdf:type]
                                                               {:flake-xf (map flake/o)}))
                 classes          (into new-classes existing-classes)

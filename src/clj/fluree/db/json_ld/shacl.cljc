@@ -834,7 +834,9 @@
               (recur r' shape* p-shapes))))
         (let [pid->shacl-dt (->> p-shapes
                                  (filter :datatype)
-                                 (map (fn [p-shape] [(-> p-shape :path last first) (:datatype p-shape)]))
+                                 (map (fn [p-shape]
+                                        [(-> p-shape :path last first)
+                                         (:datatype p-shape)]))
                                  (into {}))]
           (assoc shape :property p-shapes :pid->shacl-dt pid->shacl-dt))))))
 
@@ -843,10 +845,10 @@
   (go-try
     (when (seq shape-sids)
       (loop [[shape-sid & r] shape-sids
-             shapes   []]
+             shapes          []]
         (if shape-sid
           (let [shape-flakes (<? (query-range/index-range db :spot = [shape-sid]))
-                shape (<? (build-node-shape db shape-flakes))]
+                shape        (<? (build-node-shape db shape-flakes))]
             (recur r (conj shapes shape)))
           shapes)))))
 
@@ -856,8 +858,9 @@
   (go-try
     (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetClass class-sid]
                                                   {:flake-xf (map flake/s)}))]
-      (->> (<? (build-shapes db shape-sids))
-           (mapv (fn [shape] (assoc shape :target-class class-sid)))))))
+      (map (fn [shape]
+             (assoc shape :target-class class-sid))
+           (<? (build-shapes db shape-sids))))))
 
 (defn class-shapes
   "Takes a list of target classes and returns shapes that must pass validation,
@@ -882,8 +885,9 @@
   (go-try
     (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetObjectsOf pred-sid]
                                                   {:flake-xf (map flake/s)}))]
-      (->> (<? (build-shapes db shape-sids))
-           (mapv (fn [shape] (assoc shape :target-objects-of pred-sid)))))))
+      (map (fn [shape]
+             (assoc shape :target-objects-of pred-sid))
+           (<? (build-shapes db shape-sids))))))
 
 (defn targetobject-shapes
   "Takes a list of predicates and returns shapes that must pass validation,
