@@ -1,9 +1,10 @@
 (ns fluree.store.localstorage
-  (:refer-clojure :exclude [read])
+  (:refer-clojure :exclude [read list])
   (:require [fluree.crypto :as crypto]
             [fluree.db.platform :as platform]
             [fluree.store.proto :as store-proto]
-            [fluree.store.util :as store-util]))
+            [fluree.store.util :as store-util]
+            [clojure.string :as str]))
 
 (defn localstorage-write
   [k v {:keys [content-address?]}]
@@ -25,6 +26,12 @@
   #?(:cljs
      (.getItem js/localStorage k)))
 
+(defn localstorage-list
+  [prefix]
+  #?(:cljs
+     (->> (js/Object.keys js/localstorage)
+          (filter #(str/starts-with? % prefix)))))
+
 (defn localstorage-delete
   [k]
   #?(:cljs
@@ -39,6 +46,7 @@
   store-proto/Store
   (write [_ k v opts] (localstorage-write k v opts))
   (read [_ k] (localstorage-read k))
+  (list [_ prefix] (localstorage-list prefix))
   (delete [_ k] (localstorage-delete k))
   (exists? [_ k] (localstorage-exists? k)))
 

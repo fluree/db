@@ -52,9 +52,10 @@
 
 (defn ledger-list
   [store opts]
-  (go (->> (keys @(:storage-atom store))
-           (filter #(and (string? %)
-                         (str/ends-with? % "head"))))))
+  (go
+    (->> (store/list store "")
+         (filter #(and (string? %)
+                       (str/ends-with? % "head"))))))
 
 (defn address
   [ledger-alias {:keys [branch] :as _opts}]

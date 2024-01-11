@@ -4,7 +4,7 @@
             #?(:clj [clojure.java.io :as io])
             #?@(:cljs [["fs" :as fs]
                        ["path" :as path]]))
-  #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException))))
+  #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -86,13 +86,31 @@
        (io/delete-file (io/file path))
        :deleted
        (catch Exception e
-         (log/error e (str "Failed to delete file: " path))))
+         (log/error e (str "Failed to delete file: " path))
+         (throw e)))
      :cljs
      (try
        (fs/unlinkSync path)
        :deleted
        (catch :default e
-         (log/error e (str "Failed to delete file: " path))))))
+         (log/error e (str "Failed to delete file: " path))
+         (throw e)))))
+
+(defn list-files
+  [path]
+  #?(:clj
+     (try
+       (map #(.getName ^File %)
+            (.listFiles (io/file path)))
+       (catch Exception e
+         (log/error e (str "Failed to list files at path: " path))
+         (throw e)))
+     :cljs
+     (try
+       (fs/readdirSync path)
+       (catch :default e
+         (log/error e (str "Failed to list files at path: " path))
+         (throw e)))))
 
 (defn exists?
   [path]
