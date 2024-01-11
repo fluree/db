@@ -2,7 +2,8 @@
   (:refer-clojure :exclude [read])
   (:require [fluree.store.proto :as store-proto]
             [fluree.crypto :as crypto]
-            [fluree.store.util :as store-util]))
+            [fluree.store.util :as store-util]
+            [clojure.string :as str]))
 
 (defn memory-write
   [storage-atom k v {:keys [content-address?]}]
@@ -22,6 +23,11 @@
   [storage-atom k]
   (get @storage-atom k))
 
+(defn memory-list
+  [storage-atom prefix]
+  (filter #(when (string? %) (str/starts-with? % prefix))
+          (keys storage-atom)))
+
 (defn memory-delete
   [storage-atom k]
   (swap! storage-atom dissoc k))
@@ -34,6 +40,7 @@
   store-proto/Store
   (write [_ k v opts] (memory-write storage-atom k v opts))
   (read [_ k] (memory-read storage-atom k))
+  (list [_ prefix] (memory-list storage-atom prefix))
   (delete [_ k] (memory-delete storage-atom k))
   (exists? [_ k] (memory-exists? storage-atom k)))
 

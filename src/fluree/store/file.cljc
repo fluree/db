@@ -1,5 +1,5 @@
 (ns fluree.store.file
-  (:refer-clojure :exclude [read])
+  (:refer-clojure :exclude [read list])
   (:require [fluree.crypto :as crypto]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
@@ -32,6 +32,11 @@
   (let [path (str (fs/local-path storage-path) "/" k)]
     (fs/read-file path)))
 
+(defn file-list
+  [storage-path prefix]
+  (let [path (str (fs/local-path storage-path) "/" prefix)]
+    (fs/list-files path)))
+
 (defn file-delete
   [storage-path k]
   (let [path (str (fs/local-path storage-path) "/" k)]
@@ -46,6 +51,7 @@
   store-proto/Store
   (write [_ k v opts] (file-write storage-path k v opts))
   (read [_ k] (file-read storage-path k))
+  (list [_ prefix] (file-list storage-path prefix))
   (delete [_ k] (file-delete storage-path k))
   (exists? [_ k] (file-exists? storage-path k)))
 
