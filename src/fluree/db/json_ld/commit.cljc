@@ -304,7 +304,6 @@
           db**          (if new-t?
                           (<? (commit-data/add-commit-flakes (:prev-commit db) db*))
                           db*)
-          _ (log/warn "DEP do-commit" (:txns db**))
           db***         (ledger-proto/-commit-update ledger branch (dissoc db** :txns))
           push-res      (<? (nameservice/push! conn (assoc new-commit**
                                                            :meta commit-res
@@ -352,7 +351,6 @@
           dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
           ledger-update-res (<? (conn-proto/-c-write conn ledger ledger-update)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
-          _ (log/warn "DEP commit" txns)
           [[txn-id author]] txns
           base-commit-map   {:old-commit commit, :issuer did
                              :message    message, :tag tag, :dbid dbid, :t t
