@@ -12,7 +12,8 @@
 
 (defn localstorage-write
   [k v {:keys [content-address?]}]
-  #?(:cljs
+  #?(:clj (throw (ex-info "LocalStorageStore is only supported on the Browser platform." {}))
+     :cljs
      (let [hashable (if (store-util/hashable? v)
                       v
                       (json-ld/normalize-data v))
@@ -21,32 +22,36 @@
                       (str k hash)
                       k)]
        (.setItem js/localStorage k* v)
-       {:k k*
+       {:k       k*
         :address (localstorage-address k*)
-        :hash hash
-        :size (count hashable)})))
+        :hash    hash
+        :size    (count hashable)})))
 
 (defn localstorage-list
   [prefix]
-  #?(:cljs
+  #?(:clj (throw (ex-info "LocalStorageStore is only supported on the Browser platform." {}))
+     :cljs
      (->> (js/Object.keys js/localstorage)
           (filter #(str/starts-with? % prefix)))))
 
 (defn localstorage-read
   [address]
-  #?(:cljs
+  #?(:clj (throw (ex-info "LocalStorageStore is only supported on the Browser platform." {}))
+     :cljs
      (let [k (:local (store-util/address-parts address))]
        (.getItem js/localStorage k))))
 
 (defn localstorage-delete
   [address]
-  #?(:cljs
+  #?(:clj (throw (ex-info "LocalStorageStore is only supported on the Browser platform." {}))
+     :cljs
      (let [k (:local (store-util/address-parts address))]
        (.removeItem js/localStorage k))))
 
 (defn localstorage-exists?
   [address]
-  #?(:cljs
+  #?(:clj (throw (ex-info "LocalStorageStore is only supported on the Browser platform." {}))
+     :cljs
      (let [k (:local (store-util/address-parts address))]
        (boolean (localstorage-read k)))))
 
