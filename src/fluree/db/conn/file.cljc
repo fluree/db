@@ -11,7 +11,7 @@
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.core :as conn-core]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.storage :as storage]
+            [fluree.db.indexer.storage :as storage]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.util.filesystem :as fs]

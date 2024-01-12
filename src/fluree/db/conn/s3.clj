@@ -12,7 +12,7 @@
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.storage :as storage]
+            [fluree.db.indexer.storage :as storage]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]

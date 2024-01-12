@@ -1,6 +1,6 @@
 (ns fluree.db.conn.remote
   (:require [clojure.core.async :as async :refer [go chan]]
-            [fluree.db.storage :as storage]
+            [fluree.db.indexer.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]
