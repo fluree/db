@@ -22,44 +22,27 @@
 
 ;; Memory Connection object
 
-(defn memory-address
-  "Turn a path into a fluree memory address."
-  [path]
-  (str "fluree:memory://" path))
-
-(defn- address-path
-  "Returns the path portion of a Fluree memory address."
-  [address]
-  (if-let [[_ path] (re-find #"^fluree:memory://(.+)$" address)]
-    path
-    (throw (ex-info (str "Incorrectly formatted Fluree memory db address: " address)
-                    {:status 500 :error :db/invalid-db}))))
-
 (defn- write-data!
   [store data]
   (let [json (json-ld/normalize-data data)
         hash (crypto/sha2-256 json)
         {path :k
+         address :address
          size :size}
         (store/write store hash data)]
     {:name    hash
      :hash    hash
      :json    json
      :size    (count json)
-     :address (memory-address path)}))
+     :address address}))
 
 (defn write-commit!
   [store commit-data]
   (write-data! store commit-data))
 
-(defn- read-address
-  [store address]
-  (let [addr-path (address-path address)]
-    (store/read store addr-path)))
-
 (defn- read-data
   [store address]
-  (let [data (read-address store address)]
+  (let [data (store/read store address)]
     #?(:cljs (if (and platform/BROWSER (string? data))
                (js->clj (.parse js/JSON data))
                data)

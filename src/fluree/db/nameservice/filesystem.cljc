@@ -24,11 +24,11 @@
 
 (defn address-path-exists?
   [store address]
-  (store/exists? store (address-path address)))
+  (store/exists? store address))
 
 (defn read-address
   [store address]
-  (store/read store (address-path address)))
+  (store/read store address))
 
 (defn address
   [ledger-alias {:keys [branch] :as _opts}]
