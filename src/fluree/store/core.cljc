@@ -1,10 +1,11 @@
 (ns fluree.store.core
+  (:refer-clojure :exclude [read list])
   (:require [fluree.store.proto :as store-proto]
             [fluree.store.file :as file-store]
             [fluree.store.localstorage :as localstorage-store]
             [fluree.store.memory :as mem-store]
             [malli.core :as m]))
-  (:refer-clojure :exclude [read list])
+
 
 (def BaseConfig
   [:map
@@ -57,17 +58,17 @@
    (store-proto/write store k v opts)))
 
 (defn read
-  [store k]
-  (store-proto/read store k))
+  [store address]
+  (store-proto/read store address))
 
 (defn list
   [store prefix]
   (store-proto/list store prefix))
 
 (defn delete
-  [store k]
-  (store-proto/delete store k))
+  [store address]
+  (store-proto/delete store address))
 
 (defn exists?
-  [store k]
-  (store-proto/exists? store k))
+  [store address]
+  (store-proto/exists? store address))

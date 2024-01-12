@@ -1,10 +1,17 @@
 (ns fluree.store.file
   (:refer-clojure :exclude [read list])
-  (:require [fluree.crypto :as crypto]
+  (:require [clojure.string :as str]
+            [fluree.crypto :as crypto]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
             [fluree.store.proto :as store-proto]
             [fluree.store.util :as store-util]))
+
+(defn file-address
+  [path]
+  (if (str/starts-with? path "//")
+    (str "fluree:file:" path)
+    (str "fluree:file://" path)))
 
 (defn file-write
   [storage-path k v {:keys [content-address?] :as opts}]
@@ -24,36 +31,40 @@
                 v)]
     (fs/write-file path bytes)
     {:k    k*
+     :address (file-address k*)
      :hash hash
-     :size (count v)}))
-
-(defn file-read
-  [storage-path k]
-  (let [path (str (fs/local-path storage-path) "/" k)]
-    (fs/read-file path)))
+     :size (count bytes)}))
 
 (defn file-list
   [storage-path prefix]
   (let [path (str (fs/local-path storage-path) "/" prefix)]
     (fs/list-files path)))
 
+(defn file-read
+  [storage-path address]
+  (let [k    (:local (store-util/address-parts address))
+        path (str (fs/local-path storage-path) "/" k)]
+    (fs/read-file path)))
+
 (defn file-delete
-  [storage-path k]
-  (let [path (str (fs/local-path storage-path) "/" k)]
+  [storage-path address]
+  (let [k    (:local (store-util/address-parts address))
+        path (str (fs/local-path storage-path) "/" k)]
     (fs/delete-file path)))
 
 (defn file-exists?
-  [storage-path k]
-  (let [path (str (fs/local-path storage-path) "/" k)]
+  [storage-path address]
+  (let [k    (:local (store-util/address-parts address))
+        path (str (fs/local-path storage-path) "/" k)]
     (fs/exists? path)))
 
 (defrecord FileStore [storage-path]
   store-proto/Store
   (write [_ k v opts] (file-write storage-path k v opts))
-  (read [_ k] (file-read storage-path k))
+  (read [_ address] (file-read storage-path address))
   (list [_ prefix] (file-list storage-path prefix))
-  (delete [_ k] (file-delete storage-path k))
-  (exists? [_ k] (file-exists? storage-path k)))
+  (delete [_ address] (file-delete storage-path address))
+  (exists? [_ address] (file-exists? storage-path address)))
 
 (defn create-file-store
   [{:keys [:file-store/storage-path] :as config}]
