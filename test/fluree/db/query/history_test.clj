@@ -950,8 +950,7 @@
                                             root-privkey))]
       (is (= [{"f:author" "" "f:txn" "" "f:data" {"f:t" 1}}
               {"f:author" root-did
-               "f:txn"
-               "authortest/txn/9f321be5fd184f43d998ef7b02cdded2625579cc52b95e1d8f12c9b28cd7a5b0",
+               "f:txn" "fluree:memory://authortest/txn/9f321be5fd184f43d998ef7b02cdded2625579cc52b95e1d8f12c9b28cd7a5b0"
                "f:data" {"f:t" 2}}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true
