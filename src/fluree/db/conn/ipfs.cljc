@@ -1,5 +1,5 @@
 (ns fluree.db.conn.ipfs
-  (:require [fluree.db.storage :as storage]
+  (:require [fluree.db.indexer.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]

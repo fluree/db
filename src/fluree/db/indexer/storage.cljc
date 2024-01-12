@@ -1,4 +1,4 @@
-(ns fluree.db.storage
+(ns fluree.db.indexer.storage
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake]
             [clojure.string :as str]
