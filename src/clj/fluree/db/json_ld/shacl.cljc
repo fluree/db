@@ -555,101 +555,103 @@
 
 (defn build-property-base-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
-  [property-flakes]
-  (reduce
-   (fn [acc property-flake]
-     (let [o (flake/o property-flake)]
-       (condp = (flake/p property-flake)
-         const/$sh:path
-         (update acc :path (fnil conj []) o)
+  [db property-flakes]
+  (let [pid (->> property-flakes first flake/s)
+        iri (iri/sid->iri pid (:namespace-codes db))]
+    (reduce
+      (fn [acc property-flake]
+        (let [o (flake/o property-flake)]
+          (condp = (flake/p property-flake)
+            const/$sh:path
+            (update acc :path (fnil conj []) o)
 
-         ;; The datatype of all value nodes (e.g., xsd:integer).
-         ;; A shape has at most one value for sh:datatype.
-         const/$sh:datatype
-         (assoc acc :datatype o)
+            ;; The datatype of all value nodes (e.g., xsd:integer).
+            ;; A shape has at most one value for sh:datatype.
+            const/$sh:datatype
+            (assoc acc :datatype o)
 
-         const/$sh:minCount
-         (assoc acc :min-count o)
+            const/$sh:minCount
+            (assoc acc :min-count o)
 
-         const/$sh:maxCount
-         (assoc acc :max-count o)
+            const/$sh:maxCount
+            (assoc acc :max-count o)
 
-         ;; values of sh:nodeKind in a shape are one of the following six instances of the
-         ;; class sh:NodeKind: sh:BlankNode, sh:IRI, sh:Literal sh:BlankNodeOrIRI,
-         ;; sh:BlankNodeOrLiteral and sh:IRIOrLiteral.
-         ;; A shape has at most one value for sh:nodeKind.
-         const/$sh:nodeKind
-         (assoc acc :node-kind o)
+            ;; values of sh:nodeKind in a shape are one of the following six instances of the
+            ;; class sh:NodeKind: sh:BlankNode, sh:IRI, sh:Literal sh:BlankNodeOrIRI,
+            ;; sh:BlankNodeOrLiteral and sh:IRIOrLiteral.
+            ;; A shape has at most one value for sh:nodeKind.
+            const/$sh:nodeKind
+            (assoc acc :node-kind o)
 
-         ;; Note that multiple values for sh:class are interpreted as a conjunction,
-         ;; i.e. the values need to be SHACL instances of all of them.
-         const/$sh:class
-         (update acc :class (fnil conj #{}) o)
+            ;; Note that multiple values for sh:class are interpreted as a conjunction,
+            ;; i.e. the values need to be SHACL instances of all of them.
+            const/$sh:class
+            (update acc :class (fnil conj #{}) o)
 
-         const/$sh:pattern
-         (assoc acc :pattern o)
+            const/$sh:pattern
+            (assoc acc :pattern o)
 
-         const/$sh:minLength
-         (assoc acc :min-length o)
+            const/$sh:minLength
+            (assoc acc :min-length o)
 
-         const/$sh:maxLength
-         (assoc acc :max-length o)
+            const/$sh:maxLength
+            (assoc acc :max-length o)
 
-         const/$sh:flags
-         (update acc :flags (fnil conj []) o)
+            const/$sh:flags
+            (update acc :flags (fnil conj []) o)
 
-         const/$sh:languageIn
-         (assoc acc :language-in o)
+            const/$sh:languageIn
+            (assoc acc :language-in o)
 
-         const/$sh:uniqueLang
-         (assoc acc :unique-lang o)
+            const/$sh:uniqueLang
+            (assoc acc :unique-lang o)
 
-         const/$sh:hasValue
-         (assoc acc :has-value o)
+            const/$sh:hasValue
+            (assoc acc :has-value o)
 
-         const/$sh:in
-         (update acc :in (fnil conj []) o)
+            const/$sh:in
+            (update acc :in (fnil conj []) o)
 
-         const/$sh:minExclusive
-         (assoc acc :min-exclusive o)
+            const/$sh:minExclusive
+            (assoc acc :min-exclusive o)
 
-         const/$sh:minInclusive
-         (assoc acc :min-inclusive o)
+            const/$sh:minInclusive
+            (assoc acc :min-inclusive o)
 
-         const/$sh:maxExclusive
-         (assoc acc :max-exclusive o)
+            const/$sh:maxExclusive
+            (assoc acc :max-exclusive o)
 
-         const/$sh:maxInclusive
-         (assoc acc :max-inclusive o)
+            const/$sh:maxInclusive
+            (assoc acc :max-inclusive o)
 
-         const/$sh:equals
-         (assoc acc :pair-constraint :equals :rhs-property o)
+            const/$sh:equals
+            (assoc acc :pair-constraint :equals :rhs-property o)
 
-         const/$sh:disjoint
-         (assoc acc :pair-constraint :disjoint :rhs-property o)
+            const/$sh:disjoint
+            (assoc acc :pair-constraint :disjoint :rhs-property o)
 
-         const/$sh:lessThan
-         (assoc acc :pair-constraint :lessThan :rhs-property o)
+            const/$sh:lessThan
+            (assoc acc :pair-constraint :lessThan :rhs-property o)
 
-         const/$sh:lessThanOrEquals
-         (assoc acc :pair-constraint :lessThanOrEquals :rhs-property o)
+            const/$sh:lessThanOrEquals
+            (assoc acc :pair-constraint :lessThanOrEquals :rhs-property o)
 
-         const/$sh:node
-         (assoc acc :node o)
+            const/$sh:node
+            (assoc acc :node o)
 
-         const/$sh:qualifiedValueShape
-         (assoc acc :qualified-value-shape o)
-         const/$sh:qualifiedMinCount
-         (assoc acc :qualified-min-count o)
-         const/$sh:qualifiedMaxCount
-         (assoc acc :qualified-max-count o)
-         const/$sh:qualifiedValueShapesDisjoint
-         (assoc acc :qualified-value-shapes-disjoint o)
+            const/$sh:qualifiedValueShape
+            (assoc acc :qualified-value-shape o)
+            const/$sh:qualifiedMinCount
+            (assoc acc :qualified-min-count o)
+            const/$sh:qualifiedMaxCount
+            (assoc acc :qualified-max-count o)
+            const/$sh:qualifiedValueShapesDisjoint
+            (assoc acc :qualified-value-shapes-disjoint o)
 
-         ;; else
-         acc)))
-   {}
-   (sort-by (comp :i flake/m) property-flakes)))
+            ;; else
+            acc)))
+      {:id iri}
+      (sort-by (comp :i flake/m) property-flakes))))
 
 ;; TODO - pass along additional shape metadata to provided better error message.
 (defn register-datatype
@@ -798,7 +800,7 @@
 (defn build-property-shape
   [db p p-shape-flakes]
   (go-try
-    (let [base     (build-property-base-shape p-shape-flakes)
+    (let [base     (build-property-base-shape db p-shape-flakes)
           base*    (<? (resolve-path-types base db))]
       (cond-> base*
         (:pattern base) (build-pattern)
