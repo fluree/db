@@ -1,8 +1,8 @@
-(ns fluree.store.memory
+(ns fluree.db.store.memory
   (:refer-clojure :exclude [read])
-  (:require [fluree.store.proto :as store-proto]
+  (:require [fluree.db.store.proto :as store-proto]
             [fluree.crypto :as crypto]
-            [fluree.store.util :as store-util]
+            [fluree.db.store.util :as store-util]
             [clojure.string :as str]))
 
 (defn memory-address

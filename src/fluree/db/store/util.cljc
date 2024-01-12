@@ -1,4 +1,4 @@
-(ns fluree.store.util
+(ns fluree.db.store.util
   (:require [clojure.string :as str]))
 
 (defn hashable?

@@ -1,9 +1,9 @@
-(ns fluree.store.core
+(ns fluree.db.store
   (:refer-clojure :exclude [read list])
-  (:require [fluree.store.proto :as store-proto]
-            [fluree.store.file :as file-store]
-            [fluree.store.localstorage :as localstorage-store]
-            [fluree.store.memory :as mem-store]
+  (:require [fluree.db.store.proto :as store-proto]
+            [fluree.db.store.file :as file-store]
+            [fluree.db.store.localstorage :as localstorage-store]
+            [fluree.db.store.memory :as mem-store]
             [malli.core :as m]))
 
 

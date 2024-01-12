@@ -4,8 +4,8 @@
             [clojure.string :as str]
             [fluree.db.platform :as platform]
             [fluree.db.util.log :as log]
-            [fluree.store.core :as store]
-            [fluree.store.util :as store-util]))
+            [fluree.db.store :as store]
+            [fluree.db.store.util :as store-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

@@ -15,7 +15,7 @@
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]
-            [fluree.store.core :as store])
+            [fluree.db.store :as store])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
