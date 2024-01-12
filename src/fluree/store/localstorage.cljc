@@ -6,6 +6,10 @@
             [fluree.store.util :as store-util]
             [clojure.string :as str]))
 
+(defn localstorage-address
+  [path]
+  (str "fluree:localstorage:" path))
+
 (defn localstorage-write
   [k v {:keys [content-address?]}]
   #?(:cljs
@@ -18,13 +22,9 @@
                       k)]
        (.setItem js/localStorage k* v)
        {:k k*
+        :address (localstorage-address k*)
         :hash hash
         :size (count hashable)})))
-
-(defn localstorage-read
-  [k]
-  #?(:cljs
-     (.getItem js/localStorage k)))
 
 (defn localstorage-list
   [prefix]
@@ -32,23 +32,31 @@
      (->> (js/Object.keys js/localstorage)
           (filter #(str/starts-with? % prefix)))))
 
-(defn localstorage-delete
-  [k]
+(defn localstorage-read
+  [address]
   #?(:cljs
-     (.removeItem js/localStorage k)))
+     (let [k (:local (store-util/address-parts address))]
+       (.getItem js/localStorage k))))
+
+(defn localstorage-delete
+  [address]
+  #?(:cljs
+     (let [k (:local (store-util/address-parts address))]
+       (.removeItem js/localStorage k))))
 
 (defn localstorage-exists?
-  [k]
+  [address]
   #?(:cljs
-     (boolean (localstorage-read k))))
+     (let [k (:local (store-util/address-parts address))]
+       (boolean (localstorage-read k)))))
 
 (defrecord LocalStorageStore []
   store-proto/Store
   (write [_ k v opts] (localstorage-write k v opts))
-  (read [_ k] (localstorage-read k))
   (list [_ prefix] (localstorage-list prefix))
-  (delete [_ k] (localstorage-delete k))
-  (exists? [_ k] (localstorage-exists? k)))
+  (read [_ address] (localstorage-read address))
+  (delete [_ address] (localstorage-delete address))
+  (exists? [_ address] (localstorage-exists? address)))
 
 (defn create-localstorage-store
   [config]
