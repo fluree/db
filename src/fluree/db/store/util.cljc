@@ -4,7 +4,7 @@
 (defn hashable?
   [x]
   (or (string? x)
-      (bytes? x)))
+      #?(:clj (bytes? x))))
 
 (defn address-parts
   [address]

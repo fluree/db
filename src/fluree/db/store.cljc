@@ -1,5 +1,5 @@
 (ns fluree.db.store
-  (:refer-clojure :exclude [read list])
+  (:refer-clojure :exclude [read list exists?])
   (:require [fluree.db.store.proto :as store-proto]
             [fluree.db.store.file :as file-store]
             [fluree.db.store.localstorage :as localstorage-store]
