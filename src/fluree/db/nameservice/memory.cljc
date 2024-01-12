@@ -4,7 +4,8 @@
             [clojure.string :as str]
             [fluree.db.platform :as platform]
             [fluree.db.util.log :as log]
-            [fluree.store.core :as store]))
+            [fluree.store.core :as store]
+            [fluree.store.util :as store-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -23,7 +24,7 @@
 
 (defn- read-address
   [store address]
-  (store/read store (address-path address)))
+  (store/read store address))
 
 (defn push!
   [store {commit-address   :address
@@ -31,10 +32,9 @@
           :as              commit-data}]
   (go
     (let [my-ns-iri   (some #(when (re-matches #"^fluree:memory:(.+)" (:id %)) (:id %)) nameservice-iris)
-          commit-path (address-path commit-address)
           head-path   (address-path my-ns-iri)
 
-          commit (store/read store commit-path)
+          commit (store/read store commit-address)
           _      (when-not commit
                    (throw (ex-info (str "Unable to locate commit in memory, cannot push!: " commit-address)
                                    {:status 500 :error :db/invalid-db})))
@@ -44,7 +44,7 @@
 
 (defn lookup
   [store ledger-alias opts]
-  (go (if-let [head-commit (read-address store ledger-alias)]
+  (go (if-let [head-commit (store/read store ledger-alias)]
         (-> head-commit (get "address"))
         (throw (ex-info (str "Unable to lookup ledger address from conn: "
                              ledger-alias)
@@ -70,7 +70,7 @@
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported MemoryNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported MemoryNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
-  (-exists? [_ ledger-address] (go (boolean (read-address store ledger-address))))
+  (-exists? [_ ledger-address] (go (boolean (store/read store ledger-address))))
   (-ledgers [_ opts] (ledger-list store opts))
   (-address [_ ledger-alias opts]
     (address ledger-alias opts))

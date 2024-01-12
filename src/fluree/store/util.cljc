@@ -8,7 +8,10 @@
 
 (defn address-parts
   [address]
-  (let [[ns method path] (str/split address #":")]
+  (let [[ns method path] (str/split address #":")
+        local            (if (str/starts-with? path "//")
+                           (subs path 2)
+                           path)]
     {:ns ns
      :method method
-     :local path}))
+     :local local}))

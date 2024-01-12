@@ -20,35 +20,15 @@
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.store.core :as store])
+            [fluree.store.core :as store]
+            [fluree.store.util :as store-util])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn file-address
-  "Turn a path or a protocol-relative URL into a fluree file address."
-  [path]
-  (if (str/starts-with? path "//")
-    (str "fluree:file:" path)
-    (str "fluree:file://" path)))
-
-
-(defn address-path
-  [address]
-  (let [[_ _ path] (str/split address #":")]
-    path))
-
-(defn address-path-exists?
-  [conn address]
-  (store/exists? (:store conn) (address-path address)))
-
-(defn read-address
-  [conn address]
-  (store/read (:store conn) (address-path address)))
-
 (defn read-commit
   [conn address]
-  (json/parse (read-address conn address) false))
+  (json/parse (store/read (:store conn) address) false))
 
 (defn- write-data
   [{:keys [store] :as _conn} ledger data-type data]
@@ -65,12 +45,12 @@
                         (str "/" type-dir "/")
                         hash ".json")
         ;; TODO: build migration to remove .json suffix so we can use :content-address? true
-        {:keys [k hash v]} (store/write store path bytes)]
+        {:keys [k hash v address]} (store/write store path bytes)]
     {:name    hash
      :hash    hash
      :json    json
      :size    (count json)
-     :address (file-address path)}))
+     :address address}))
 
 (defn write-commit
   [conn ledger commit-data]
@@ -87,13 +67,13 @@
 (defn push
   "Just write to a different directory?"
   [{:keys [store] :as _conn} publish-address {commit-address :address}]
-  (let [commit-path (address-path commit-address)
-        head-path   (address-path publish-address)
+  (let [commit-path (:local (store-util/address-parts commit-address))
+        head-path   (:local (store-util/address-parts publish-address))
 
         work        (fn [complete]
                       (log/debug (str "Updating head at " head-path " to " commit-path "."))
-                      (store/write store head-path (bytes/string->UTF8 commit-path))
-                      (complete (file-address head-path)))]
+                      (let [address (:address (store/write store head-path (bytes/string->UTF8 commit-path)))]
+                        (complete address)))]
     #?(:clj  (let [p (promise)]
                (future (work (partial deliver p)))
                p)
@@ -101,7 +81,7 @@
 
 (defn read-context
   [conn context-key]
-  (json/parse (read-address conn context-key) true))
+  (json/parse (store/read (:store conn) context-key) true))
 
 (defn close
   [id state]
@@ -122,8 +102,8 @@
     #?(:clj (async/thread (write-index-item conn ledger index-type index-data))
        :cljs (async/go (write-index-item conn ledger index-type index-data))))
   (-index-file-read [conn index-address]
-    #?(:clj (async/thread (json/parse (read-address conn index-address) true))
-       :cljs (async/go (json/parse (read-address conn index-address) true))))
+    #?(:clj (async/thread (json/parse (store/read (:store conn) index-address) true))
+       :cljs (async/go (json/parse (store/read (:store conn) index-address) true))))
 
   conn-proto/iConnection
   (-close [_] (close id state))
