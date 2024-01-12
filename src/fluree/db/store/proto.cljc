@@ -1,5 +1,5 @@
 (ns fluree.db.store.proto
-  (:refer-clojure :exclude [read list]))
+  (:refer-clojure :exclude [read list exists?]))
 
 (defprotocol Store
   (write [store k v opts] "Writes `v` to Store associated with `k`. Returns value's address.")
