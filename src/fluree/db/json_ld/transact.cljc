@@ -19,7 +19,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
-            [fluree.store.core :as store]))
+            [fluree.db.store :as store]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
