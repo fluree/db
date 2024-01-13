@@ -155,7 +155,10 @@
                                                                 {:flake-xf (map flake/p)})))
                 s-pred-shapes    (when (seq referring-pids)
                                    (<? (shacl/targetobject-shapes db-before referring-pids)))
-                shacl-shapes     (into class-shapes s-pred-shapes)]
+                shacl-shapes     (into class-shapes s-pred-shapes)
+                subj-mods*       (-> subj-mods
+                                     (update-in [sid :classes] (fnil into []) classes)
+                                     (update-in [sid :shacl] (fnil into []) shacl-shapes))]
             (recur r (reduce
                        (fn [subj-mods o-pred-shape]
                          (let [target-os (->> (get pid->ref-flakes (:target-objects-of o-pred-shape))
@@ -164,9 +167,7 @@
                                      (update-in subj-mods [target-o :shacl] (fnil conj []) o-pred-shape))
                                    subj-mods
                                    target-os)))
-                       (-> subj-mods
-                           (update-in [sid :classes] (fnil into []) classes)
-                           (update-in [sid :shacl] (fnil into []) shacl-shapes))
+                       subj-mods*
                        o-pred-shapes)))
           subj-mods)))))
 
