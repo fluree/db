@@ -108,9 +108,9 @@
 
 (defn infer-iri
   ([x]
-   (-> x infer iri/sid->iri))
+   (some-> x infer iri/sid->iri))
   ([x lang]
-   (-> x (infer lang) iri/sid->iri)))
+   (some-> x (infer lang) iri/sid->iri)))
 
 #?(:cljs
    (defn- left-pad
