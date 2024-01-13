@@ -387,7 +387,7 @@
    (go-try
      (let [[[first-pid type] & r] path
            path-flakes (case type
-                         :inverse (<? (query-range/index-range db :post = [first-pid sid]))
+                         :inverse (<? (query-range/index-range db :post = [first-pid [sid const/$xsd:anyURI]]))
                          :predicate (get pid->p-flakes first-pid)
                          (throw (ex-info "Unsupported property path." {:path-type type :path path})))]
        (<? (resolve-path-flakes db r path-flakes)))))
@@ -401,7 +401,7 @@
                               (if f
                                 (let [path-flakes*
                                       (case type
-                                        :inverse (<? (query-range/index-range db :post = [pid (flake/s f)]))
+                                        :inverse (<? (query-range/index-range db :post = [pid [(flake/s f) const/$xsd:anyURI]]))
                                         :predicate (<? (query-range/index-range db :spot = [(flake/o f) pid]))
                                         (throw (ex-info "Unsupported property path." {:path-type type :path path})))]
                                   (recur r (into res path-flakes*)))
@@ -858,7 +858,7 @@
   "Given a class SID, returns class shape"
   [db class-sid]
   (go-try
-    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetClass class-sid]
+    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetClass [class-sid const/$xsd:anyURI]]
                                                   {:flake-xf (map flake/s)}))]
       (map (fn [shape]
              (assoc shape :target-class class-sid))
@@ -885,7 +885,7 @@
   "Given a pred SID, returns shape"
   [db pred-sid]
   (go-try
-    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetObjectsOf pred-sid]
+    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetObjectsOf [pred-sid const/$xsd:anyURI]]
                                                   {:flake-xf (map flake/s)}))]
       (map (fn [shape]
              (assoc shape :target-objects-of pred-sid))
