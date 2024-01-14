@@ -57,28 +57,29 @@
 (defn- evaluate-subject-properties
   [db property-policies default-allow? flakes]
   (go-try
-    (let [policies-by-pid (group-property-policies property-policies)]
+    (let [policies-by-property (group-property-policies property-policies)
+          ns-codes             (:namespace-codes db)]
       (loop [[flake & r] flakes
-             acc []]
+             acc         []]
         (if flake
-          (let [p          (flake/p flake)
-                p-policies (get policies-by-pid p)]
+          (let [prop          (-> flake flake/p (iri/sid->iri ns-codes))
+                prop-policies (get policies-by-property prop)]
             (cond
-              p-policies (let [allow? (loop [[[async? f] & r] p-policies]
-                                        ;; return first truthy response, else false
-                                        (if f
-                                          (let [res (if async?
-                                                      (<? (f db flake))
-                                                      (f db flake))]
-                                            (or res
-                                                (recur r)))
-                                          ;; always default to false! (deny)
-                                          false))]
-                           (if allow?
-                             (recur r (conj acc flake))
-                             (recur r acc)))
+              prop-policies  (let [allow? (loop [[[async? f] & r] prop-policies]
+                                            ;; return first truthy response, else false
+                                            (if f
+                                              (let [res (if async?
+                                                          (<? (f db flake))
+                                                          (f db flake))]
+                                                (or res
+                                                    (recur r)))
+                                              ;; always default to false! (deny)
+                                              false))]
+                               (if allow?
+                                 (recur r (conj acc flake))
+                                 (recur r acc)))
               default-allow? (recur r (conj acc flake))
-              :else (recur r acc)))
+              :else          (recur r acc)))
           acc)))))
 
 (defn group-policies-by-default
@@ -96,7 +97,7 @@
                      :default
                      :property)))))
 
-(defn default-allow?
+(defn allow-by-default?
   "Returns true or false if the default policy allows, or denies access
   to the subject's flakes.
 
@@ -138,7 +139,7 @@
             {defaults :default props :property} (group-policies-by-default
                                                  policy const/iri-view class-iris)
             ;; default-allow? will be the default for all flakes that don't have a property-specific policy
-            default-allow? (<? (default-allow? db fflake defaults))]
+            default-allow? (<? (allow-by-default? db fflake defaults))]
         (cond
           props (<? (evaluate-subject-properties db props default-allow? flakes))
           default-allow? flakes

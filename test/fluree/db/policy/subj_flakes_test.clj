@@ -98,8 +98,8 @@
       (is (= 0
              (count (filter #(= ssn-sid (flake/p %)) alice-db-john)))
           "Alice cannot see John's ssn.")
-      (is (= 5
-             (count alice-db-john))
+      (is (= 1 (- (count john-flakes)
+                  (count alice-db-john)))
           "Alice can see John's everything but ssn.")
 
       (is (= 1

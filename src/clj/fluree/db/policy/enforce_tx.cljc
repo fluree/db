@@ -68,7 +68,7 @@
                   {defaults :default props :property}
                   (validate/group-policies-by-default policy const/iri-modify
                                                       class-iris)
-                  default-allow? (<? (validate/default-allow? db-after fflake defaults))
+                  default-allow? (<? (validate/allow-by-default? db-after fflake defaults))
                   allow?         (if props
                                    (<? (check-property-policies db-after props default-allow? s-flakes))
                                    default-allow?)]
