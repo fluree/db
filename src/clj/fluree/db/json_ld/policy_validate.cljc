@@ -24,7 +24,7 @@
           nses    (:namespaces db-root)]
       (loop [[next-iri & r] path
              last-result    ident]
-        (if next-iri
+        (if (and last-result next-iri)
           (let [next-pid (iri/iri->sid next-iri nses)
                 next-res (<? (query-range/index-range db-root :spot = [last-result next-pid]))
                 ;; in case of mixed data types, take the first IRI result - unless we
