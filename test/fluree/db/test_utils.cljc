@@ -229,16 +229,6 @@
       (log/warn "address? falsey result from:" s))
     result))
 
-(def context-id-regex
-  (re-pattern (str "fluree:context:" base64-pattern "{64}")))
-
-(defn context-id?
-  [s]
-  (let [result (and (string? s) (re-matches context-id-regex s))]
-    (when-not result
-      (log/warn "context-id? falsey result from:" s))
-    result))
-
 (def db-id-regex
   (re-pattern (str "fluree:db:sha256:" base32-pattern "{52,53}")))
 
