@@ -3,6 +3,7 @@
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util]
+            [fluree.db.json-ld.iri :as iri]
             [test-with-files.tools :refer [with-tmp-dir]]))
 
 (deftest ^:integration select-sid
@@ -31,7 +32,7 @@
                          (cond-> (conj sids _id)
                            (:ex/favArtist node) (conj (:_id (:ex/favArtist node)))))
                        [])
-               (every? int?))))))
+               (every? iri/sid?))))))
 
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
