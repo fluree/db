@@ -133,14 +133,12 @@
                                                    "insert"   tx})
 
            mdfn {"@context" ["https://ns.flur.ee" context]
-                 "delete"   {"@id"        "?s"
+                 "delete"   {"@id"        (:id auth)
                              "ct:name"    "Daniel"
                              "ct:favnums" 1}
-                 "insert"   {"@id"        "?s"
+                 "insert"   {"@id"        (:id auth)
                              "ct:name"    "D"
-                             "ct:favnums" [4 5 6]}
-                 "where"    {"@id" "?s"}
-                 "values"   ["?s" [(:id auth)]]}
+                             "ct:favnums" [4 5 6]}}
 
            db2 @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
 
