@@ -19,7 +19,7 @@
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.conn.core :refer [notify-ledger]]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.store :as store])
+            [fluree.db.storage :as store])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
