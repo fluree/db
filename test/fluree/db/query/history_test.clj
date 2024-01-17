@@ -289,7 +289,7 @@
                           {:id test-utils/did?}
                           :f/address        test-utils/address?
                           :f/alias          "committest"
-                          :f/author         (-> ledger :did :id)
+                          :f/author         ""
                           :f/branch         "main"
                           :f/data           #:f{:address test-utils/address?
                                                 :assert  [{:ex/x "foo-1"
@@ -310,7 +310,7 @@
                                    {:id test-utils/did?}
                                    :f/address        test-utils/address?
                                    :f/alias          "committest"
-                                   :f/author         (-> ledger :did :id)
+                                   :f/author         ""
                                    :f/branch         "main"
                                    :f/data           #:f{:address  test-utils/address?
                                                          :assert   [{:ex/x "foo-cat"
@@ -333,7 +333,7 @@
                                    {:id test-utils/did?}
                                    :f/address        test-utils/address?
                                    :f/alias          "committest"
-                                   :f/author         (-> ledger :did :id)
+                                   :f/author         ""
                                    :f/branch         "main"
                                    :f/data           #:f{:address  test-utils/address?
                                                          :assert   [{:ex/x "foo-cat"
@@ -373,7 +373,7 @@
                              {:id test-utils/did?}
                              :f/address test-utils/address?
                              :f/alias "committest"
-                             :f/author (-> ledger :did :id)
+                             :f/author ""
                              :f/branch "main"
                              :f/data #:f{:address test-utils/address?
                                          :assert [{:ex/x "foo-cat"
@@ -395,7 +395,7 @@
                            {:id test-utils/did?}
                            :f/address test-utils/address?
                            :f/alias "committest"
-                           :f/author (-> ledger :did :id)
+                           :f/author ""
                            :f/branch "main"
                            :f/data #:f{:address test-utils/address?
                                        :assert [{:ex/x "foo-3"
@@ -419,7 +419,7 @@
                            {:id test-utils/did?}
                            :f/address test-utils/address?
                            :f/alias "committest"
-                           :f/author (-> ledger :did :id)
+                           :f/author ""
                            :f/branch "main"
                            :f/data #:f{:address test-utils/address?
                                        :assert [{:ex/x "foo-2"
@@ -445,7 +445,7 @@
                           {:id test-utils/did?}
                           :f/address        test-utils/address?
                           :f/alias          "committest"
-                          :f/author         (-> ledger :did :id)
+                          :f/author         ""
                           :f/branch         "main"
                           :f/data           #:f{:address  test-utils/address?
                                                 :assert   [{:ex/x "foo-cat"
@@ -465,7 +465,7 @@
                           {:id test-utils/did?}
                           :f/address        test-utils/address?
                           :f/alias          "committest"
-                          :f/author         (-> ledger :did :id)
+                          :f/author         ""
                           :f/branch         "main"
                           :f/data           #:f{:address  test-utils/address?
                                                 :assert   [{:ex/x "foo-cat"
@@ -494,7 +494,7 @@
                           {:id test-utils/did?}
                           :f/address        test-utils/address?
                           :f/alias          "committest"
-                          :f/author         (-> ledger :did :id)
+                          :f/author         ""
                           :f/branch         "main"
                           :f/data           #:f{:address test-utils/address?
                                                 :assert  [{:ex/x "foo-1"
@@ -521,7 +521,7 @@
                             {:id test-utils/did?}
                             :f/address        test-utils/address?
                             :f/alias          "committest"
-                            :f/author         (-> ledger :did :id)
+                            :f/author         ""
                             :f/branch         "main"
                             :f/data           #:f{:address  test-utils/address?
                                                   :assert   [{:ex/x "foo-3"
@@ -550,7 +550,7 @@
                             {:id test-utils/did?}
                             :f/address        test-utils/address?
                             :f/alias          "committest"
-                            :f/author         (-> ledger :did :id)
+                            :f/author         ""
                             :f/branch         "main"
                             :f/data           #:f{:address  test-utils/address?
                                                   :assert   [{:ex/x "foo-cat"
@@ -739,7 +739,7 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
                             :f/alias    ledger-name
-                            :f/author   (-> ledger :did :id)
+                            :f/author   ""
                             :f/branch   "main"
                             :f/data     #:f{:address  test-utils/address?
                                             :assert   [{:ex/x "foo-3"
@@ -768,7 +768,7 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
                             :f/alias    ledger-name
-                            :f/author   (-> ledger :did :id)
+                            :f/author   ""
                             :f/branch   "main"
                             :f/data     #:f{:address  test-utils/address?
                                             :assert   [{:ex/x "foo-cat"
@@ -852,7 +852,7 @@
                               {:id test-utils/did?}
                               :f/address  test-utils/address?
                               :f/alias    ledger-name
-                              :f/author   (-> ledger :did :id)
+                              :f/author   ""
                               :f/branch   "main"
                               :f/data     #:f{:address  test-utils/address?
                                               :assert   [{:ex/x "foo-3"
@@ -881,7 +881,7 @@
                               {:id test-utils/did?}
                               :f/address  test-utils/address?
                               :f/alias    ledger-name
-                              :f/author   (-> ledger :did :id)
+                              :f/author   ""
                               :f/branch   "main"
                               :f/data     #:f{:address  test-utils/address?
                                               :assert   [{:ex/x "foo-cat"

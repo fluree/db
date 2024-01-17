@@ -355,7 +355,7 @@
           base-commit-map   {:old-commit commit, :issuer did
                              :message    message, :tag tag, :dbid dbid, :t t
                              :db-address db-address
-                             :author     (or author did "")
+                             :author     (or author "")
                              :txn-id     (if (= 1 (count txns)) txn-id "")
                              :flakes     (:flakes stats)
                              :size       (:size stats)}
