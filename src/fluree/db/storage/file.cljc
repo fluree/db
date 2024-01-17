@@ -1,11 +1,11 @@
-(ns fluree.db.store.file
+(ns fluree.db.storage.file
   (:refer-clojure :exclude [read list])
   (:require [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
-            [fluree.db.store.proto :as store-proto]
-            [fluree.db.store.util :as store-util]))
+            [fluree.db.storage.proto :as store-proto]
+            [fluree.db.storage.util :as store-util]))
 
 (defn file-address
   [path]

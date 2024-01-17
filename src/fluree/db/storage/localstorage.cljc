@@ -1,9 +1,9 @@
-(ns fluree.db.store.localstorage
+(ns fluree.db.storage.localstorage
   (:refer-clojure :exclude [read list])
   (:require [fluree.crypto :as crypto]
             [fluree.db.platform :as platform]
-            [fluree.db.store.proto :as store-proto]
-            [fluree.db.store.util :as store-util]
+            [fluree.db.storage.proto :as store-proto]
+            [fluree.db.storage.util :as store-util]
             [clojure.string :as str]))
 
 (defn localstorage-address

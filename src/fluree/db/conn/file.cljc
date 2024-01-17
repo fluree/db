@@ -20,8 +20,8 @@
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.store :as store]
-            [fluree.db.store.util :as store-util])
+            [fluree.db.storage :as store]
+            [fluree.db.storage.util :as store-util])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))

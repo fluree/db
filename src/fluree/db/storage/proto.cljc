@@ -1,4 +1,4 @@
-(ns fluree.db.store.proto
+(ns fluree.db.storage.proto
   (:refer-clojure :exclude [read list exists?]))
 
 (defprotocol Store
