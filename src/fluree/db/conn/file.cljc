@@ -64,21 +64,6 @@
   [conn ledger index-type index-data]
   (write-data conn ledger (str "index/" (name index-type)) index-data))
 
-(defn push
-  "Just write to a different directory?"
-  [{:keys [store] :as _conn} publish-address {commit-address :address}]
-  (let [commit-path (:local (store-util/address-parts commit-address))
-        head-path   (:local (store-util/address-parts publish-address))
-
-        work        (fn [complete]
-                      (log/debug (str "Updating head at " head-path " to " commit-path "."))
-                      (let [address (:address (store/write store head-path (bytes/string->UTF8 commit-path)))]
-                        (complete address)))]
-    #?(:clj  (let [p (promise)]
-               (future (work (partial deliver p)))
-               p)
-       :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
-
 (defn read-context
   [conn context-key]
   (json/parse (store/read (:store conn) context-key) true))
