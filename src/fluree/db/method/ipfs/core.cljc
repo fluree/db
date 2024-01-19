@@ -60,7 +60,7 @@
   [ipfs-endpoint commit-map]
   (go-try
     (let [{:keys [meta db ledger-state ns]} commit-map
-          my-ns-iri   (some #(when (re-matches #"^fluree:file:.+" (:id %)) (:id %)) ns)
+          my-ns-iri   (some #(when (re-matches #"^fluree:ipns:.+" (:id %)) (:id %)) ns)
           {:keys [t]} db
           {:keys [hash size]} meta
           {:keys [ipns-address relative-address]} (address-parts my-ns-iri)
