@@ -32,6 +32,7 @@
 (def ^:const iri-time "https://ns.flur.ee/ledger#time")
 (def ^:const iri-author "https://ns.flur.ee/ledger#author")
 (def ^:const iri-txn "https://ns.flur.ee/ledger#txn")
+(def ^:const iri-annotation "https://ns.flur.ee/ledger#annotation")
 (def ^:const iri-message "https://ns.flur.ee/ledger#message")
 (def ^:const iri-tag "https://ns.flur.ee/ledger#tag")
 (def ^:const iri-updates "https://ns.flur.ee/ledger#updates")
@@ -100,6 +101,7 @@
 (def ^:const $_commit:signer 57)
 (def ^:const $_commit:author 60)
 (def ^:const $_commit:txn 61)
+(def ^:const $_commit:annotation 62)
 
 
 (def ^:const $_ledger:alias 170)

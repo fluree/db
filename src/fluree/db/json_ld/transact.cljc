@@ -95,23 +95,24 @@
     (get iri->sid* iri)))
 
 (defn ->tx-state
-  [db txn-id author-did]
+  [db txn-id annotation author-did]
   (let [{:keys [schema branch ledger policy], db-t :t} db
-        iri->sid (atom {:last-pid (jld-ledger/last-pid db)
-                        :last-sid (jld-ledger/last-sid db)})
+        iri->sid  (atom {:last-pid (jld-ledger/last-pid db)
+                         :last-sid (jld-ledger/last-sid db)})
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t         (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
         db-before (dbproto/-rootdb db)]
-    {:db-before                db-before
-     :txn-id                   txn-id
-     :author-did               author-did
-     :policy                   policy
-     :stage-update?            (= t db-t) ;; if a previously staged db is getting updated again before committed
-     :t                        t
-     :iri->sid                 iri->sid
-     :next-pid                 (partial next-id iri->sid :last-pid)
-     :next-sid                 (partial next-id iri->sid :last-sid)
-     :iris                     (volatile! {})}))
+    {:db-before     db-before
+     :txn-id        txn-id
+     :author-did    author-did
+     :annotation    annotation
+     :policy        policy
+     :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
+     :t             t
+     :iri->sid      iri->sid
+     :next-pid      (partial next-id iri->sid :last-pid)
+     :next-sid      (partial next-id iri->sid :last-sid)
+     :iris          (volatile! {})}))
 
 (defn generate-flakes
   [db fuel-tracker parsed-txn tx-state]
@@ -174,7 +175,7 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [new-flakes {:keys [stage-update? db-before iri->sid policy t txn-id author-did] :as _tx-state}]
+  [new-flakes {:keys [stage-update? db-before iri->sid policy t txn-id author-did annotation] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
@@ -183,7 +184,7 @@
           {:keys [last-pid last-sid]} @iri->sid
 
           db-after (-> db-before
-                       (update :txns (fnil conj []) [txn-id author-did])
+                       (update :txns (fnil conj []) [txn-id author-did annotation])
                        (update :ecount assoc const/$_predicate last-pid)
                        (update :ecount assoc const/$_default last-sid)
                        (assoc :policy policy) ;; re-apply policy to db-after
@@ -215,7 +216,7 @@
    (stage db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (go-try
-     (let [{:keys [context raw-txn did]} parsed-opts
+     (let [{:keys [context raw-txn did annotation]} parsed-opts
            {:keys [conn ledger]} db
 
            parsed-txn    (q-parse/parse-txn txn context)
@@ -224,11 +225,11 @@
                            db)
 
            {txn-id :address} (store/write (:store conn)
-                                           (str (ledger-proto/-alias ledger) "/txn/")
-                                           (json-ld/normalize-data raw-txn)
-                                           {:content-address? true})
+                                          (str (ledger-proto/-alias ledger) "/txn/")
+                                          (json-ld/normalize-data raw-txn)
+                                          {:content-address? true})
 
-           tx-state      (->tx-state db* txn-id did)
+           tx-state      (->tx-state db* txn-id annotation did)
            flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
            fuel-error-ch (:error-ch fuel-tracker)
            chans         (remove nil? [fuel-error-ch flakes-ch])

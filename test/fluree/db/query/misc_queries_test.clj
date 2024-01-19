@@ -323,7 +323,8 @@
                    [:ex/alice :schema/email "alice@flur.ee"]
                    ["fluree:commit:sha256:bs5ut2obtyi5rw5wnlybedqty3ddvwd3t5kia2u33ytonibizzqy"
                     :f/address
-                    "fluree:memory://de0152de88b39ccf4e5d63a77b9284316645287b8c8cd631ef56aa8298a7d6d6"]}
+                    "fluree:memory://de0152de88b39ccf4e5d63a77b9284316645287b8c8cd631ef56aa8298a7d6d6"]
+                   [:f/annotation :id "https://ns.flur.ee/ledger#annotation"]}
                  (set result))
               (str "query result was: " (pr-str result))))))))
 

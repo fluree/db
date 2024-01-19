@@ -65,14 +65,15 @@
    ["alias" :alias]
    ["issuer" :issuer]
    ["author" :author]
+   ["annotation" :annotation]
    ["txn" :txn]
    ["branch" :branch]
    ["time" :time]
    ["tag" :tag]
    ["message" :message]
    ["previous" :previous] ;; refer to :prev-commit template
-   ["data" :data] ;; refer to :data template
-   ["ns" :ns] ;; refer to :ns template
+   ["data" :data]         ;; refer to :data template
+   ["ns" :ns]             ;; refer to :ns template
    ["index" :index]]) ;; refer to :index template
 
 
@@ -331,7 +332,7 @@
   "Returns a commit map with a new db registered.
   Assumes commit is not yet created (but db is persisted), so
   commit-id and commit-address are added after finalizing and persisting commit."
-  [{:keys [old-commit issuer message tag dbid t db-address flakes size author txn-id]
+  [{:keys [old-commit issuer message tag dbid t db-address flakes size author txn-id annotation]
     :as   _commit}]
   (let [prev-data   (select-keys (data old-commit) [:id :address])
         data-commit (new-db-commit dbid t db-address prev-data flakes size)
@@ -344,10 +345,11 @@
                                :data data-commit
                                :time (util/current-time-iso)))]
     (cond-> commit
-            issuer (assoc :issuer {:id issuer})
-            prev-commit (assoc :previous prev-commit)
-            message (assoc :message message)
-            tag (assoc :tag tag))))
+      issuer      (assoc :issuer {:id issuer})
+      annotation  (assoc :annotation annotation)
+      prev-commit (assoc :previous prev-commit)
+      message     (assoc :message message)
+      tag         (assoc :tag tag))))
 
 (defn ref?
   [f]
@@ -395,6 +397,7 @@
     (flake/create const/$_commit:time const/$xsd:anyURI const/iri-time const/$xsd:string -1 true nil)
     (flake/create const/$_commit:author const/$xsd:anyURI const/iri-author const/$xsd:string -1 true nil)
     (flake/create const/$_commit:txn const/$xsd:anyURI const/iri-txn const/$xsd:string -1 true nil)
+    (flake/create const/$_commit:annotation const/$xsd:anyURI const/iri-annotation const/$xsd:string -1 true nil)
     (flake/create const/$_commit:data const/$xsd:anyURI const/iri-data const/$xsd:string -1 true nil)
 
     (flake/create const/$_commitdata:flakes const/$xsd:anyURI const/iri-flakes const/$xsd:string -1 true nil)
@@ -514,6 +517,11 @@
   [t message]
   [(flake/create t const/$_commit:message message const/$xsd:string t true nil)])
 
+(defn annotation-flakes
+  "Builds the flake for an annotation, if supplied."
+  [t annotation]
+  [(flake/create t const/$_commit:annotation (json-ld/normalize-data annotation) const/$rdf:json t true nil)])
+
 
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
@@ -522,7 +530,7 @@
     (let [last-sid           (volatile! (jld-ledger/last-commit-sid db))
           next-sid           (fn [] (vswap! last-sid inc))
 
-          {:keys [data issuer message]} commit
+          {:keys [data issuer message annotation]} commit
           {db-t :t} data
 
           {previous-id :id prev-data :data} prev-commit
@@ -539,11 +547,14 @@
                                (<? (issuer-flakes db t next-sid issuer-iri)))
           message-flakes     (when message
                                (message-flakes t message))
+          annotation-flakes  (when annotation
+                               (annotation-flakes t annotation))
           commit-flakes      (cond-> base-flakes
-                                     prev-commit-flakes (into prev-commit-flakes)
-                                     prev-db-flakes (into prev-db-flakes)
-                                     issuer-flakes (into issuer-flakes)
-                                     message-flakes (into message-flakes))]
+                               annotation-flakes (into annotation-flakes)
+                               prev-commit-flakes (into prev-commit-flakes)
+                               prev-db-flakes (into prev-db-flakes)
+                               issuer-flakes (into issuer-flakes)
+                               message-flakes (into message-flakes))]
       (-> db
           (assoc-in [:ecount const/$_shard] @last-sid)
           (cond-> (= 1 db-t) add-commit-schema-flakes)

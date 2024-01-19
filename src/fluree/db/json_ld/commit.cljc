@@ -351,12 +351,13 @@
           dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
           ledger-update-res (<? (conn-proto/-c-write conn ledger ledger-update)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
-          [[txn-id author]] txns
+          [[txn-id author annotation]] txns
           base-commit-map   {:old-commit commit, :issuer did
                              :message    message, :tag tag, :dbid dbid, :t t
                              :db-address db-address
                              :author     (or author "")
                              :txn-id     (if (= 1 (count txns)) txn-id "")
+                             :annotation annotation
                              :flakes     (:flakes stats)
                              :size       (:size stats)}
           new-commit        (commit-data/new-db-commit-map base-commit-map)
