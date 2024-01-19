@@ -55,13 +55,6 @@
         (vswap! iris assoc iri sid)
         sid))))
 
-
-(defn get-vocab-flakes
-  [flakes]
-  (flake/subrange flakes
-                  >= (flake/parts->Flake [(flake/max-subject-id const/$_collection) -1])
-                  <= (flake/parts->Flake [0 -1])))
-
 (defn- get-type-retractions
   [{:keys [db iri-cache sid t]} type]
   (go-try
@@ -231,12 +224,11 @@
 
 (defn merge-flakes
   "Returns updated db with merged flakes."
-  [db t refs flakes]
-  (let [vocab-flakes (get-vocab-flakes flakes)]
-    (-> db
-        (assoc :t t)
-        (commit-data/update-novelty flakes)
-        (update :schema vocab/update-with db t refs vocab-flakes))))
+  [db t flakes]
+  (-> db
+      (assoc :t t)
+      (commit-data/update-novelty flakes)
+      (vocab/hydrate-schema flakes)))
 
 (defn commit-error
   [message commit-data]
@@ -411,7 +403,9 @@
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
-      (merge-flakes (assoc db :ecount ecount*) t-new @refs-cache all-flakes))))
+      (-> db
+          (assoc :ecount ecount*)
+          (merge-flakes t-new all-flakes)))))
 
 
 (defn trace-commits
