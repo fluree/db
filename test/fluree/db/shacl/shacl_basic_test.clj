@@ -1132,13 +1132,15 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                         "type"        "ex:Pal"
                                                         "schema:name" "Darth Vader"
                                                         "ex:pal"      {"ex:evil" "has no name"}}})]
-        (is (= [{"id"          "ex:good-pal"
-                 "type"        "ex:Pal"
-                 "schema:name" "J.D."
-                 "ex:pal"      [{"schema:name" "Rowdy"}
-                                {"schema:name" "Turk"}]}]
-               @(fluree/query valid-pal {"@context" context
-                                         "select"   {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})))
+        (is (= {"id"          "ex:good-pal"
+                "type"        "ex:Pal"
+                "schema:name" "J.D."
+                "ex:pal"      #{{"schema:name" "Rowdy"}
+                                {"schema:name" "Turk"}}}
+               (-> @(fluree/query valid-pal {"@context" context
+                                             "select"   {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})
+                   first
+                   (update "ex:pal" set))))
         (is (util/exception? invalid-pal))
         (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
                (ex-message invalid-pal)))))
