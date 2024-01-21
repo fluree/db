@@ -370,22 +370,24 @@
           {:keys [previous issuer message] :as commit-metadata}
           (commit-data/json-ld->map commit db)
 
-          [prev-commit _] (some->> previous :address (read-commit conn) <?)
+          commit-id          (:id commit-metadata)
+          commit-sid         (iri/iri->sid commit-id)
+          [prev-commit _]    (some->> previous :address (read-commit conn) <?)
           db-sid             (iri/iri->sid alias (:namespaces db))
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
-                                                                 t-new db-sid)
+                                                                 t-new commit-sid db-sid)
           previous-id        (when prev-commit (:id prev-commit))
           prev-commit-flakes (when previous-id
-                               (<? (commit-data/prev-commit-flakes db t-new
+                               (<? (commit-data/prev-commit-flakes db t-new commit-sid
                                                                    previous-id)))
           prev-data-id       (get-first-id prev-commit const/iri-data)
           prev-db-flakes     (when prev-data-id
                                (<? (commit-data/prev-data-flakes db db-sid t-new
                                                                  prev-data-id)))
           issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                               (<? (commit-data/issuer-flakes db t-new issuer-iri)))
+                               (<? (commit-data/issuer-flakes db t-new commit-sid issuer-iri)))
           message-flakes     (when message
-                               (commit-data/message-flakes t-new message))
+                               (commit-data/message-flakes t-new commit-sid message))
           all-flakes         (-> db
                                  (get-in [:novelty :spot])
                                  empty
