@@ -223,11 +223,3 @@
 (defn fluree-iri
   [nme]
   (str f-ns nme))
-
-(defn tx-iri
-  [t]
-  (str f-t-ns (- t)))
-
-(defn t->sid
-  [t]
-  (-> t tx-iri iri->sid))

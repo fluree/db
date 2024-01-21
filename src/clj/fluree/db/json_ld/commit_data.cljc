@@ -401,8 +401,7 @@
   db-sid. Used when committing to an in-memory ledger value and when reifying
   a ledger from storage on load."
   [{:keys [address alias branch data id time v] :as _commit} t commit-sid db-sid]
-  (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data
-        t-sid (iri/t->sid t)]
+  (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data]
     [;; commit flakes
      ;; address
      (flake/create commit-sid const/$_address address const/$xsd:string t true nil)
