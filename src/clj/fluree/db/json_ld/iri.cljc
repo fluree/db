@@ -64,6 +64,14 @@
 
 (def last-default-code 100)
 
+(def commit-namespaces
+  #{f-commit-256-ns})
+
+(def commit-namespace-codes
+  (into #{}
+        (map default-namespaces)
+        commit-namespaces))
+
 (defn decompose-by-char
   [iri c limit]
   (when-let [char-idx (some-> iri

@@ -248,8 +248,8 @@
   data from the outer wrapper of a commit
   (eg commit message, time, v)"
   [f]
-  (let [t-sid (-> f flake/t iri/t->sid)]
-    (= (flake/s f) t-sid)))
+  (let [ns-code (-> f flake/s iri/get-ns-code)]
+    (contains? iri/commit-namespace-codes ns-code)))
 
 (defn commit-metadata-flake?
   "Returns `true` if a flake is part of commit metadata.
