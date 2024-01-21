@@ -204,5 +204,5 @@
                     :policy          root-policy-map
                     :context-cache   (volatile! nil)
                     :ecount          genesis-ecount
-                    :namespaces       iri/default-namespaces
-                    :namespace-coedes iri/default-namespace-codes})))
+                    :namespaces      iri/default-namespaces
+                    :namespace-codes iri/default-namespace-codes})))
