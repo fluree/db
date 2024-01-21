@@ -266,14 +266,19 @@
                           (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
       (with-meta db-json* {:dbid dbid}))))
 
+(defn new-t?
+  [ledger-commit db-commit]
+  (let [ledger-t (commit-data/t ledger-commit)]
+    (or (nil? ledger-t)
+        (> (commit-data/t db-commit)
+           ledger-t))))
+
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
   [{:keys [ledger commit] :as db} {:keys [branch did private] :as _opts}]
   (go-try
     (let [{:keys [conn state]} ledger
           ledger-commit (:commit (ledger-proto/-status ledger branch))
-          new-t?        (or (nil? (commit-data/t ledger-commit))
-                            (> (commit-data/t commit) (commit-data/t ledger-commit)))
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
           [new-commit* jld-commit] (commit-data/commit-jsonld new-commit)
@@ -284,7 +289,7 @@
           new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
           db*           (assoc db :commit new-commit**
                                   :new-context? false)
-          db**          (if new-t?
+          db**          (if (new-t? ledger-commit commit)
                           (<? (commit-data/add-commit-flakes (:prev-commit db) db*))
                           db*)
           db***         (ledger-proto/-commit-update ledger branch db**)
