@@ -150,9 +150,7 @@
                                   :where   {:id '?s
                                             '?p '?o}}))
             "Entire database should be pulled.")
-        (is (= [{:id :type}
-                {:id :ex/User}
-                {:id           :ex/alice,
+        (is (= [{:id           :ex/alice,
                  :type         :ex/User,
                  :schema/name  "Alice",
                  :schema/email "alice@flur.ee",
@@ -217,10 +215,7 @@
                  :type         :ex/User,
                  :schema/name  "Jane",
                  :schema/email "jane@flur.ee",
-                 :schema/age   30}
-                {:id :schema/age}
-                {:id :schema/email}
-                {:id :schema/name}]
+                 :schema/age   30}]
                @(fluree/query db {:context [test-utils/default-context
                                             {:ex "http://example.org/ns/"}]
                                   :select  {'?s ["*"]}
@@ -231,54 +226,26 @@
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
                                          :where   {:id '?s, '?p '?o}})]
-          (is (= #{[:ex/jane :id "http://example.org/ns/jane"]
-                   [:ex/jane :type :ex/User]
+          (is (= #{[:ex/jane :type :ex/User]
                    [:ex/jane :schema/age 30]
                    [:ex/jane :schema/name "Jane"]
                    [:ex/jane :schema/email "jane@flur.ee"]
-                   [:ex/bob :id "http://example.org/ns/bob"]
                    [:ex/bob :type :ex/User]
                    [:ex/bob :schema/age 22]
                    [:ex/bob :schema/name "Bob"]
-                   [:ex/User :id "http://example.org/ns/User"]
-                   [:ex/alice :id "http://example.org/ns/alice"]
                    [:ex/alice :type :ex/User]
                    [:ex/alice :schema/age 42]
                    [:ex/alice :schema/name "Alice"]
                    [:ex/alice :schema/email "alice@flur.ee"]
-                   ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6" :id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                   ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"
-                    :id
-                    "fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"]
                    ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw"
                     :f/address
                     "fluree:memory://eb42c9187ee0bddcc215c5d7ca829c1528a22bf8ee94f933affbe830b845030a"]
                    ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw" :f/flakes 21]
                    ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw" :f/size 1370]
                    ["fluree:db:sha256:bboe6nikw75nolggme4ohcpmqbeknnulujn4c5wqspovvd2munlkw" :f/t 1]
-                   [:schema/email :id "http://schema.org/email"]
-                   [:schema/name :id "http://schema.org/name"]
-                   [:schema/age :id "http://schema.org/age"]
-                   [:type :id "@type"]
-                   [:f/t :id "https://ns.flur.ee/ledger#t"]
-                   [:f/size :id "https://ns.flur.ee/ledger#size"]
-                   [:f/flakes :id "https://ns.flur.ee/ledger#flakes"]
-                   [:f/branch :id "https://ns.flur.ee/ledger#branch"]
-                   [:f/alias :id "https://ns.flur.ee/ledger#alias"]
-                   [:f/data :id "https://ns.flur.ee/ledger#data"]
-                   [:f/address :id "https://ns.flur.ee/ledger#address"]
-                   [:f/v :id "https://ns.flur.ee/ledger#v"]
-                   ["https://www.w3.org/2018/credentials#issuer" :id "https://www.w3.org/2018/credentials#issuer"]
-                   [:f/time :id "https://ns.flur.ee/ledger#time"]
-                   [:f/message :id "https://ns.flur.ee/ledger#message"]
-                   [:f/previous :id "https://ns.flur.ee/ledger#previous"]
-                   [:id :id "@id"]
                    ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2"
                     "https://www.w3.org/2018/credentials#issuer"
                     "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                   ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2"
-                    :id
-                    "fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2"]
                    ["fluree:commit:sha256:bpxwlm5kecw2sx4sfmqb52dtulnr7mwocdjj2wnpnjeqgldm5hq2"
                     :f/address
                     "fluree:memory://759f66318bc08a599045cb08d0d517654d7a09c9863e866bf8e6f0e51cb701ba"]
