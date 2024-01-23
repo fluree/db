@@ -114,8 +114,10 @@
       (async/alt!
         error-ch ([e] e)
         update-ch ([flakes]
-                   (let [nses (iri/get-namespaces sid-gen)]
-                     [nses flakes]))))))
+                   (if (util/exception? flakes)
+                     flakes
+                     (let [nses (iri/get-namespaces sid-gen)]
+                       [nses flakes])))))))
 
 (defn class-flake?
   [f]
