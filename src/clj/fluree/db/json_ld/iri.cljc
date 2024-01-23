@@ -19,9 +19,11 @@
 (def ^:const f-s3-ns "fluree:s3://")
 (def ^:const f-ctx-ns "fluree:context:")
 
+(def type-iri "@type")
+
 (def json-iri-keywords
-  {"@type" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-   "@json" "http://www.w3.org/2001/XMLSchema#json"})
+  {type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+   "@json"  "http://www.w3.org/2001/XMLSchema#json"})
 
 (defn normalize
   [iri]
@@ -212,13 +214,18 @@
       (get-namespaces [_]
         @namespaces))))
 
+(def type-sid
+  (iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))
+
 (defn sid->iri
   "Converts an sid back into a string iri."
   ([sid]
    (sid->iri sid default-namespace-codes))
   ([^SID sid namespace-codes]
-   (str (get-namespace sid namespace-codes)
-        (get-name sid))))
+   (if (= type-sid sid)
+     type-iri
+     (str (get-namespace sid namespace-codes)
+          (get-name sid)))))
 
 (defn fluree-iri
   [nme]

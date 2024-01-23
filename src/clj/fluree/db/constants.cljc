@@ -97,7 +97,7 @@
 
 (def ^:const $id (iri/iri->sid "@id"))
 
-(def ^:const $rdf:type (iri/iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))
+(def ^:const $rdf:type iri/type-sid)
 (def ^:const $rdf:Property (iri/iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"))
 (def ^:const $rdf:langString (iri/iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"))
 
