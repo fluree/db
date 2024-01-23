@@ -95,11 +95,13 @@
 
 (defn into-flakeset
   [fuel-tracker flake-ch]
-  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)]
-    (if fuel-tracker
-      (let [track-fuel (fuel/track fuel-tracker)]
-        (async/transduce track-fuel (completing conj) flakeset flake-ch))
-      (async/reduce conj flakeset flake-ch))))
+  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)
+        error-xf (halt-when util/exception?)
+        flake-xf (if fuel-tracker
+                   (let [track-fuel (fuel/track fuel-tracker)]
+                     (comp error-xf track-fuel))
+                   error-xf)]
+    (async/transduce flake-xf (completing conj) flakeset flake-ch)))
 
 (defn generate-flakes
   [db fuel-tracker parsed-txn tx-state]
