@@ -19,10 +19,12 @@
   root user as the results will not come back correctly."
   [{:keys [policy namespace-codes] :as db} flake]
   (go-try
-    (let [s-iri   (-> flake flake/s (iri/sid->iri namespace-codes))
-          p-iri   (-> flake flake/p (iri/sid->iri namespace-codes))
+    (let [sid     (flake/s flake)
+          s-iri   (iri/sid->iri sid namespace-codes)
+          pid     (flake/p flake)
+          p-iri   (iri/sid->iri pid namespace-codes)
           classes (or (get @(:cache policy) s-iri)
-                      (let [class-sids (<? (dbproto/-class-ids db (flake/s flake)))
+                      (let [class-sids (<? (dbproto/-class-ids db sid))
                             class-iris (map (fn [c]
                                               (iri/sid->iri c namespace-codes))
                                             class-sids)]
