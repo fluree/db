@@ -4,7 +4,7 @@
             [deps-deploy.deps-deploy :as dd]))
 
 (def lib 'com.fluree/db)
-(def version "3.0.0-alpha1")
+(def version "3.0.0-alpha2")
 
 (def class-dir "target/classes")
 (def basis (b/create-basis {:project "deps.edn"}))
@@ -30,7 +30,11 @@
                 :src-dirs  ["src/clj"]
                 :scm       {:url                 source-uri
                             :connection          "scm:git:https://github.com/fluree/db.git"
-                            :developerConnection "scm:git:git@github.com:fluree/db.git"}})
+                            :developerConnection "scm:git:git@github.com:fluree/db.git"}
+                :pom-data  [[:licenses
+                             [:license
+                              [:name "EPL-2.0"]
+                              [:url "https://www.eclipse.org/legal/epl-2.0"]]]]})
   (b/copy-dir {:src-dirs    ["src/clj" "resources"]
                :target-dir  class-dir})
   (b/jar {:class-dir class-dir

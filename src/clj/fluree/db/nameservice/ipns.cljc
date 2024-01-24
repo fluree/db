@@ -85,6 +85,10 @@
   [ipfs-endpoint ipns-key]
   (go-try
     (let [base-address (<? (ipfs-keys/address ipfs-endpoint ipns-key))]
+      (when-not base-address
+        (throw (ex-info (str "IPNS publishing appears to have an issue. No corresponding ipns address found for key: "
+                             ipns-key)
+                        {:status 400 :error :db/ipfs-keys})))
       (map->IpnsNameService {:ipfs-endpoint ipfs-endpoint
                              :ipns-key      ipns-key
                              :base-address  base-address
