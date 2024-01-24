@@ -65,9 +65,9 @@
         result-ch ([result] result)))))
 
 (defn into-flakeset
-  [fuel-tracker flake-ch]
+  [fuel-tracker error-ch flake-ch]
   (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)]
     (if fuel-tracker
-      (let [track-fuel (fuel/track fuel-tracker)]
+      (let [track-fuel (fuel/track fuel-tracker error-ch)]
         (async/transduce track-fuel into flakeset flake-ch))
       (async/reduce into flakeset flake-ch))))
