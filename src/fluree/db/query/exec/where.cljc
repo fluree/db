@@ -333,9 +333,7 @@
          start-flake (flake/create s p o* o-dt nil nil util/min-integer)
          end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
          track-fuel  (when fuel-tracker
-                       (take! (:error-ch fuel-tracker)
-                              #(put! error-ch %))
-                       (fuel/track fuel-tracker))
+                       (fuel/track fuel-tracker error-ch))
          subj-filter (when s-fn
                        (filter (fn [f]
                                  (-> unmatched

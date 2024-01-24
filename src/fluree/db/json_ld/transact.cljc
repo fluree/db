@@ -115,7 +115,7 @@
     (let [error-ch  (async/chan)
           update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
                          (update/modify db parsed-txn tx-state fuel-tracker error-ch)
-                         (exec/into-flakeset fuel-tracker))]
+                         (exec/into-flakeset fuel-tracker error-ch))]
       (async/alt!
         error-ch ([e] e)
         update-ch ([flakes] flakes)))))
