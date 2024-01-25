@@ -14,11 +14,10 @@
 
 (defn cache-sid->iri
   [db cache compact-fn sid]
-  (go-try
-    (when-let [iri (or (some-> db :schema :pred (get sid) :iri compact-fn)
-                       (some-> sid (iri/sid->iri (:namespace-codes db)) compact-fn))]
-      (vswap! cache assoc sid {:as iri})
-      {:as iri})))
+  (when-let [iri (or (some-> db :schema :pred (get sid) :iri compact-fn)
+                     (some-> sid (iri/sid->iri (:namespace-codes db)) compact-fn))]
+    (vswap! cache assoc sid {:as iri})
+    {:as iri}))
 
 (defn wildcard-spec
   [db cache compact-fn iri]
@@ -56,7 +55,7 @@
                                               (<? (crawl-ref-item db context compact-fn ref-sid spec cache fuel-vol max-fuel (inc depth-i)))
                                               ;; no sub-selection, just return IRI
                                               (or (:as (get @cache ref-sid))
-                                                  (:as (<? (cache-sid->iri db cache compact-fn ref-sid)))))]
+                                                  (:as (cache-sid->iri db cache compact-fn ref-sid))))]
                                  (recur r (conj acc-item result)))
                                (if (= 1 (count acc-item))
                                  (first acc-item)
@@ -95,7 +94,7 @@
                             (when wildcard?
                               (or (get @cache iri)
                                   (wildcard-spec db cache compact-fn iri)
-                                  (<? (cache-sid->iri db cache compact-fn p)))))
+                                  (cache-sid->iri db cache compact-fn p))))
                   p-iri (:as spec)
                   v     (cond
                           (nil? spec)
@@ -108,7 +107,7 @@
                             (if type-id
                               (recur rest-types
                                      (conj acc (:as (or (get @cache type-id)
-                                                        (<? (cache-sid->iri db cache compact-fn type-id))))))
+                                                        (cache-sid->iri db cache compact-fn type-id)))))
                               (if (= 1 (count acc))
                                 (first acc)
                                 acc)))
@@ -124,7 +123,7 @@
                                           (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
                                                 id-key   (:as (or (get @cache const/$id)
                                                                   (wildcard-spec db cache compact-fn const/$id)
-                                                                  (<? (cache-sid->iri db cache compact-fn const/$id))))
+                                                                  (cache-sid->iri db cache compact-fn const/$id)))
                                                 ns-codes (:namespace-codes db)
                                                 c-iri    (-> f flake/o (iri/sid->iri ns-codes) compact-fn)
                                                 subselect (:spec spec)]
