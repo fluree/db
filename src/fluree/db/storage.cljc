@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [read list exists?])
   (:require [fluree.db.storage.proto :as store-proto]
             [fluree.db.storage.file :as file-store]
+            [fluree.db.storage.ipfs :as ipfs-store]
             [fluree.db.storage.localstorage :as localstorage-store]
             [fluree.db.storage.memory :as mem-store]
             [malli.core :as m]))
@@ -31,11 +32,19 @@
     [:store/method [:enum :memory]]
     [:memory-store/storage-atom {:optional true} :any]]])
 
+(def IpfsConfig
+  [:and
+   BaseConfig
+   [:map
+    [:store/method [:enum :ipfs]]
+    [:ipfs-store/server :string]]])
+
 (def StoreConfig
   [:or
    FileConfig
    LocalStorageConfig
-   MemoryConfig])
+   MemoryConfig
+   IpfsConfig])
 
 (defn start
   [{:keys [:store/method] :as config}]
@@ -45,6 +54,7 @@
                      :config config}))
     (case method
       :file         (file-store/create-file-store config)
+      :ipfs         (ipfs-store/create-ipfs-store config)
       :localstorage (localstorage-store/create-localstorage-store config)
       :memory       (mem-store/create-memory-store config)
 
