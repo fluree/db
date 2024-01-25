@@ -95,7 +95,7 @@
 (def ^:const $_commitdata:size (iri/iri->sid iri-size))
 (def ^:const $_commitdata:t (iri/iri->sid iri-t))
 
-(def ^:const $id (iri/iri->sid "@id"))
+(def ^:const $id (iri/iri->sid iri-id))
 
 (def ^:const $rdf:type iri/type-sid)
 (def ^:const $rdf:Property (iri/iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"))
