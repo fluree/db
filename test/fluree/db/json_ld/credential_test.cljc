@@ -178,13 +178,12 @@
                 "f:assert"  [{"id"         (:id auth)
                               "ct:name"    "Daniel"
                               "ct:favnums" [1 2 3],
-                              :id          (:id auth)
                               "f:role"     {"id" "role:cool"}}],
                 "f:retract" []}
 
                {"f:t"       3,
-                "f:assert"  [{"ct:name" "D", "ct:favnums" [4 5 6], :id (:id auth)}],
-                "f:retract" [{"ct:name" "Daniel", "ct:favnums" 1, :id (:id auth)}]}]
+                "f:assert"  [{"ct:name" "D", "ct:favnums" [4 5 6], "id" (:id auth)}],
+                "f:retract" [{"ct:name" "Daniel", "ct:favnums" 1, "id" (:id auth)}]}]
               @(fluree/history ledger (async/<!! (cred/generate {:context context
                                                                  :history (:id auth)
                                                                  :t {:from 1}}

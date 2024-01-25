@@ -100,7 +100,6 @@
       (is (= [{"https://ns.flur.ee/ledger#t"       1
                "https://ns.flur.ee/ledger#assert"
                [{"@id"                     "http://example.org/ns/dan"
-                 :id                       "http://example.org/ns/dan"
                  "http://example.org/ns/x" 1}]
                "https://ns.flur.ee/ledger#retract" []}]
              @(fluree/history ledger {"@context" nil

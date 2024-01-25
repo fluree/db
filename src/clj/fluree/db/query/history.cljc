@@ -130,17 +130,12 @@
   [db cache context compact fuel error-ch s-flakes]
   (go
     (try*
-      (let [json     (<? (json-ld-resp/flakes->res db cache context compact fuel 1000000
-                                                   {:wildcard? true, :depth 0}
-                                                   0 s-flakes))
-            sid      (->> s-flakes first flake/s)
-            ns-codes (:namespace-codes db)
-            iri      (-> sid (iri/sid->iri ns-codes) compact)]
-        ;; add the id in case the iri flake isn't present in s-flakes
-        (assoc json :id iri))
+      (<? (json-ld-resp/flakes->res db cache context compact fuel 1000000
+                                    {:wildcard? true, :depth 0}
+                                    0 s-flakes))
       (catch* e
-       (log/error e "Error transforming s-flakes.")
-       (>! error-ch e)))))
+        (log/error e "Error transforming s-flakes.")
+        (>! error-ch e)))))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
