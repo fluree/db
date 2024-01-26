@@ -49,7 +49,7 @@
 (defn ledger-list
   [store opts]
   (go
-    (->> (store/list store "")
+    (->> (<! (store/list store ""))
          (filter #(and (string? %)
                        (str/ends-with? % "head"))))))
 

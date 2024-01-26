@@ -60,7 +60,7 @@
 (defrecord LocalStorageStore []
   store-proto/Store
   (write [_ k v opts] (async/go (localstorage-write k v opts)))
-  (list [_ prefix] (localstorage-list prefix))
+  (list [_ prefix] (async/go (localstorage-list prefix)))
   (read [_ address] (async/go (localstorage-read address)))
   (delete [_ address] (localstorage-delete address))
   (exists? [_ address] (localstorage-exists? address)))

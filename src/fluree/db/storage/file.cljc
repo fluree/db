@@ -42,7 +42,7 @@
 (defn file-list
   [storage-path prefix]
   (let [path (str (fs/local-path storage-path) "/" prefix)]
-    (fs/list-files path)))
+    (async/thread (fs/list-files path))))
 
 (defn file-read
   [storage-path address]

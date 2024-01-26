@@ -28,8 +28,9 @@
 
 (defn memory-list
   [storage-atom prefix]
-  (filter #(when (string? %) (str/starts-with? % prefix))
-          (keys storage-atom)))
+  (async/go
+    (filter #(when (string? %) (str/starts-with? % prefix))
+            (keys storage-atom))))
 
 (defn memory-read
   [storage-atom address]
