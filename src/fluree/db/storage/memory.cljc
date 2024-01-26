@@ -34,7 +34,7 @@
 (defn memory-read
   [storage-atom address]
   (let [k (:local (store-util/address-parts address))]
-    (get @storage-atom k)))
+    (async/go (get @storage-atom k))))
 
 (defn memory-delete
   [storage-atom address]

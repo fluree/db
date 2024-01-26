@@ -26,10 +26,6 @@
   [store address]
   (store/exists? store address))
 
-(defn read-address
-  [store address]
-  (store/read store address))
-
 (defn address
   [ledger-alias {:keys [branch] :as _opts}]
   (let [branch (if branch (name branch) "main")]
@@ -54,7 +50,7 @@
 (defn lookup
   [store ledger-alias {:keys [branch] :or {branch "main"} :as _opts}]
   (go-try
-    (file-address (read-address store ledger-alias))))
+    (file-address (<? (store/read store ledger-alias)))))
 
 
 (defrecord FileNameService

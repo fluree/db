@@ -26,11 +26,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn read-commit
-  [conn address]
-  (-> (store/read (:store conn) address)
-      (json/parse  false)))
-
 (defn- write-data
   [{:keys [store] :as _conn} ledger data-type data]
   (go-try
@@ -65,9 +60,23 @@
   [conn ledger index-type index-data]
   (write-data conn ledger (str "index/" (name index-type)) index-data))
 
+(defn read-commit
+  [conn address]
+  (go-try
+    (-> (<? (store/read (:store conn) address))
+        (json/parse false))))
+
 (defn read-context
   [conn context-key]
-  (json/parse (store/read (:store conn) context-key) true))
+  (go-try
+    (-> (<? (store/read (:store conn) context-key))
+        (json/parse true))))
+
+(defn read-index-item
+  [conn index-address]
+  (go-try
+    (-> (<? (store/read (:store conn) index-address))
+        (json/parse true))))
 
 (defn close
   [id state]
@@ -78,16 +87,14 @@
                            nameservices serializer msg-out-ch lru-cache-atom]
 
   conn-proto/iStorage
-  (-c-read [conn commit-key] (go (read-commit conn commit-key)))
+  (-c-read [conn commit-key] (read-commit conn commit-key))
   (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
-  (-ctx-read [conn context-key] (go (read-context conn context-key)))
+  (-ctx-read [conn context-key] (read-context conn context-key))
   (-ctx-write [conn ledger context-data] (write-context conn ledger context-data))
   (-index-file-write [conn ledger index-type index-data]
-    #?(:clj (write-index-item conn ledger index-type index-data)
-       :cljs (write-index-item conn ledger index-type index-data)))
+    (write-index-item conn ledger index-type index-data))
   (-index-file-read [conn index-address]
-    #?(:clj (async/thread (json/parse (store/read (:store conn) index-address) true))
-       :cljs (async/go (json/parse (store/read (:store conn) index-address) true))))
+    (read-index-item conn index-address))
 
   conn-proto/iConnection
   (-close [_] (close id state))

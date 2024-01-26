@@ -22,10 +22,6 @@
     (throw (ex-info (str "Incorrectly formatted Fluree memory db address: " address)
                     {:status 500 :error :db/invalid-db}))))
 
-(defn- read-address
-  [store address]
-  (store/read store address))
-
 (defn push!
   [store {commit-address   :address
           nameservice-iris :ns
@@ -34,7 +30,7 @@
     (let [my-ns-iri   (some #(when (re-matches #"^fluree:memory:(.+)" (:id %)) (:id %)) nameservice-iris)
           head-path   (address-path my-ns-iri)
 
-          commit (store/read store commit-address)
+          commit (<! (store/read store commit-address))
           _      (when-not commit
                    (throw (ex-info (str "Unable to locate commit in memory, cannot push!: " commit-address)
                                    {:status 500 :error :db/invalid-db})))
@@ -44,7 +40,7 @@
 
 (defn lookup
   [store ledger-alias opts]
-  (go (if-let [head-commit (store/read store ledger-alias)]
+  (go (if-let [head-commit (<! (store/read store ledger-alias))]
         (-> head-commit (get "address"))
         (throw (ex-info (str "Unable to lookup ledger address from conn: "
                              ledger-alias)
@@ -70,7 +66,7 @@
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported MemoryNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported MemoryNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
-  (-exists? [_ ledger-address] (go (boolean (store/read store ledger-address))))
+  (-exists? [_ ledger-address] (go (boolean (<! (store/read store ledger-address)))))
   (-ledgers [_ opts] (ledger-list store opts))
   (-address [_ ledger-alias opts]
     (address ledger-alias opts))

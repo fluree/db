@@ -61,7 +61,7 @@
   store-proto/Store
   (write [_ k v opts] (async/go (localstorage-write k v opts)))
   (list [_ prefix] (localstorage-list prefix))
-  (read [_ address] (localstorage-read address))
+  (read [_ address] (async/go (localstorage-read address)))
   (delete [_ address] (localstorage-delete address))
   (exists? [_ address] (localstorage-exists? address)))
 

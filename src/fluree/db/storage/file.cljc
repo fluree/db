@@ -48,7 +48,7 @@
   [storage-path address]
   (let [k    (:local (store-util/address-parts address))
         path (str (fs/local-path storage-path) "/" k)]
-    (fs/read-file path)))
+    (async/thread (fs/read-file path))))
 
 (defn file-delete
   [storage-path address]

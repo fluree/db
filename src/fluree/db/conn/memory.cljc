@@ -39,19 +39,12 @@
 
 (defn- read-data
   [store address]
-  (let [data (store/read store address)]
-    #?(:cljs (if (and platform/BROWSER (string? data))
-               (js->clj (.parse js/JSON data))
-               data)
-       :clj  data)))
-
-(defn read-commit
-  [store address]
-  (read-data store address))
-
-(defn read-context
-  [store context-key]
-  (read-data store context-key))
+  (go-try
+    (let [data (<? (store/read store address))]
+      #?(:cljs (if (and platform/BROWSER (string? data))
+                 (js->clj (.parse js/JSON data))
+                 data)
+         :clj  data))))
 
 (defn close
   [id state]
@@ -62,10 +55,10 @@
                              parallelism msg-in-ch msg-out-ch nameservices data-atom]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key] (go (read-commit store commit-key)))
+  (-c-read [_ commit-key] (read-data store commit-key))
   (-c-write [_ _ledger commit-data] (write-data! store commit-data))
   (-ctx-write [_ _ledger context-data] (write-data! store context-data))
-  (-ctx-read [_ context-key] (go (read-context store context-key)))
+  (-ctx-read [_ context-key] (read-data store context-key))
 
   conn-proto/iConnection
   (-close [_] (close id state))
