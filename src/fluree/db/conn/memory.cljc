@@ -24,21 +24,18 @@
 
 (defn- write-data!
   [store data]
-  (let [json (json-ld/normalize-data data)
-        hash (crypto/sha2-256 json)
-        {path :k
-         address :address
-         size :size}
-        (store/write store hash data)]
-    {:name    hash
-     :hash    hash
-     :json    json
-     :size    (count json)
-     :address address}))
-
-(defn write-commit!
-  [store commit-data]
-  (write-data! store commit-data))
+  (go-try
+    (let [json (json-ld/normalize-data data)
+          hash (crypto/sha2-256 json)
+          {path :k
+           address :address
+           size :size}
+          (<? (store/write store hash data))]
+      {:name    hash
+       :hash    hash
+       :json    json
+       :size    (count json)
+       :address address})))
 
 (defn- read-data
   [store address]
@@ -51,10 +48,6 @@
 (defn read-commit
   [store address]
   (read-data store address))
-
-(defn write-context!
-  [store context-data]
-  (write-data! store context-data))
 
 (defn read-context
   [store context-key]
@@ -70,8 +63,8 @@
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (go (read-commit store commit-key)))
-  (-c-write [_ _ledger commit-data] (go (write-commit! store commit-data)))
-  (-ctx-write [_ _ledger context-data] (go (write-context! store context-data)))
+  (-c-write [_ _ledger commit-data] (write-data! store commit-data))
+  (-ctx-write [_ _ledger context-data] (write-data! store context-data))
   (-ctx-read [_ context-key] (go (read-context store context-key)))
 
   conn-proto/iConnection

@@ -223,10 +223,10 @@
                            (<? (perm/wrap-policy db policy-identity))
                            db)
 
-           {txn-id :address} (store/write (:store conn)
-                                           (str (ledger-proto/-alias ledger) "/txn/")
-                                           (json-ld/normalize-data raw-txn)
-                                           {:content-address? true})
+           {txn-id :address} (<? (store/write (:store conn)
+                                              (str (ledger-proto/-alias ledger) "/txn/")
+                                              (json-ld/normalize-data raw-txn)
+                                              {:content-address? true}))
 
            tx-state      (->tx-state db* txn-id did)
            flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)

@@ -1,9 +1,10 @@
 (ns fluree.db.storage.memory
   (:refer-clojure :exclude [read])
-  (:require [fluree.db.storage.proto :as store-proto]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.storage.util :as store-util]
-            [clojure.string :as str]))
+            [fluree.db.storage.proto :as store-proto]
+            [fluree.db.storage.util :as store-util]))
 
 (defn memory-address
   [path]
@@ -19,10 +20,11 @@
                    (str k hash)
                    k)]
     (swap! storage-atom assoc k* v)
-    {:k k*
-     :address (memory-address k*)
-     :hash hash
-     :size (count hashable)}))
+    (async/go
+      {:k k*
+       :address (memory-address k*)
+       :hash hash
+       :size (count hashable)})))
 
 (defn memory-list
   [storage-atom prefix]

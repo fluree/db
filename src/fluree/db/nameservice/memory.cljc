@@ -1,6 +1,6 @@
 (ns fluree.db.nameservice.memory
   (:require [fluree.db.nameservice.proto :as ns-proto]
-            [clojure.core.async :as async :refer [go]]
+            [clojure.core.async :as async :refer [go <!]]
             [clojure.string :as str]
             [fluree.db.platform :as platform]
             [fluree.db.util.log :as log]
@@ -39,7 +39,7 @@
                    (throw (ex-info (str "Unable to locate commit in memory, cannot push!: " commit-address)
                                    {:status 500 :error :db/invalid-db})))
           commit* (assoc commit "address" commit-address)]
-      (store/write store head-path commit*)
+      (<! (store/write store head-path commit*))
       commit-data)))
 
 (defn lookup

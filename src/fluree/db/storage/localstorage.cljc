@@ -1,10 +1,12 @@
 (ns fluree.db.storage.localstorage
   (:refer-clojure :exclude [read list])
-  (:require [fluree.crypto :as crypto]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
+            [fluree.crypto :as crypto]
             [fluree.db.platform :as platform]
             [fluree.db.storage.proto :as store-proto]
             [fluree.db.storage.util :as store-util]
-            [clojure.string :as str]))
+            [fluree.json-ld :as json-ld]))
 
 (defn localstorage-address
   [path]
@@ -57,7 +59,7 @@
 
 (defrecord LocalStorageStore []
   store-proto/Store
-  (write [_ k v opts] (localstorage-write k v opts))
+  (write [_ k v opts] (async/go (localstorage-write k v opts)))
   (list [_ prefix] (localstorage-list prefix))
   (read [_ address] (localstorage-read address))
   (delete [_ address] (localstorage-delete address))

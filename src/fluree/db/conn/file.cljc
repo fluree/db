@@ -28,29 +28,30 @@
 
 (defn read-commit
   [conn address]
-  (json/parse (store/read (:store conn) address) false))
+  (-> (store/read (:store conn) address)
+      (json/parse  false)))
 
 (defn- write-data
   [{:keys [store] :as _conn} ledger data-type data]
-  (let [alias      (ledger-proto/-alias ledger)
-        branch     (name (:name (ledger-proto/-branch ledger)))
-        json       (if (string? data)
-                     data
-                     (json-ld/normalize-data data))
-        bytes      (bytes/string->UTF8 json)
-        hash       (crypto/sha2-256 bytes :hex)
-        type-dir   (name data-type)
-        path       (str alias
-                        (when branch (str "/" branch))
-                        (str "/" type-dir "/")
-                        hash ".json")
-        ;; TODO: build migration to remove .json suffix so we can use :content-address? true
-        {:keys [k hash v address]} (store/write store path bytes)]
-    {:name    hash
-     :hash    hash
-     :json    json
-     :size    (count json)
-     :address address}))
+  (go-try
+    (let [alias      (ledger-proto/-alias ledger)
+          branch     (name (:name (ledger-proto/-branch ledger)))
+          json       (if (string? data)
+                       data
+                       (json-ld/normalize-data data))
+          bytes      (bytes/string->UTF8 json)
+          hash       (crypto/sha2-256 bytes :hex)
+          type-dir   (name data-type)
+          path       (str alias
+                          (when branch (str "/" branch))
+                          (str "/" type-dir "/")
+                          hash ".json")
+          {:keys [k hash v address]} (<? (store/write store path bytes))]
+      {:name    hash
+       :hash    hash
+       :json    json
+       :size    (count json)
+       :address address})))
 
 (defn write-commit
   [conn ledger commit-data]
@@ -78,14 +79,12 @@
 
   conn-proto/iStorage
   (-c-read [conn commit-key] (go (read-commit conn commit-key)))
-  (-c-write [conn ledger commit-data] (go (write-commit conn ledger
-                                                        commit-data)))
+  (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
   (-ctx-read [conn context-key] (go (read-context conn context-key)))
-  (-ctx-write [conn ledger context-data] (go (write-context conn ledger
-                                                            context-data)))
+  (-ctx-write [conn ledger context-data] (write-context conn ledger context-data))
   (-index-file-write [conn ledger index-type index-data]
-    #?(:clj (async/thread (write-index-item conn ledger index-type index-data))
-       :cljs (async/go (write-index-item conn ledger index-type index-data))))
+    #?(:clj (write-index-item conn ledger index-type index-data)
+       :cljs (write-index-item conn ledger index-type index-data)))
   (-index-file-read [conn index-address]
     #?(:clj (async/thread (json/parse (store/read (:store conn) index-address) true))
        :cljs (async/go (json/parse (store/read (:store conn) index-address) true))))
