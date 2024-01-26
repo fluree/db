@@ -22,10 +22,6 @@
     (str "fluree:file:" path)
     (str "fluree:file://" path)))
 
-(defn address-path-exists?
-  [store address]
-  (store/exists? store address))
-
 (defn address
   [ledger-alias {:keys [branch] :as _opts}]
   (let [branch (if branch (name branch) "main")]
@@ -62,7 +58,7 @@
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported FileNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported FileNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
-  (-exists? [nameservice ledger-address] (go (address-path-exists? store ledger-address)))
+  (-exists? [nameservice ledger-address] (store/exists? store ledger-address))
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]
     (address ledger-alias opts))

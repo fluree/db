@@ -63,7 +63,7 @@
   (list [_ prefix] (async/go (localstorage-list prefix)))
   (read [_ address] (async/go (localstorage-read address)))
   (delete [_ address] (localstorage-delete address))
-  (exists? [_ address] (localstorage-exists? address)))
+  (exists? [_ address] (async/go (localstorage-exists? address))))
 
 (defn create-localstorage-store
   [config]

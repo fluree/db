@@ -60,7 +60,7 @@
   [storage-path address]
   (let [k    (:local (store-util/address-parts address))
         path (str (fs/local-path storage-path) "/" k)]
-    (fs/exists? path)))
+    (async/thread (fs/exists? path))))
 
 (defrecord FileStore [storage-path]
   store-proto/Store

@@ -45,7 +45,7 @@
 (defn memory-exists?
   [storage-atom address]
   (let [k (:local (store-util/address-parts address))]
-    (contains? @storage-atom k)))
+    (async/go (contains? @storage-atom k))))
 
 (defrecord MemoryStore [storage-atom]
   store-proto/Store
