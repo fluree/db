@@ -54,7 +54,7 @@
   [storage-path address]
   (let [k    (:local (store-util/address-parts address))
         path (str (fs/local-path storage-path) "/" k)]
-    (fs/delete-file path)))
+    (async/thread (fs/delete-file path))))
 
 (defn file-exists?
   [storage-path address]

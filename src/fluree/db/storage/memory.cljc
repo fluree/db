@@ -40,7 +40,7 @@
 (defn memory-delete
   [storage-atom address]
   (let [k (:local (store-util/address-parts address))]
-    (swap! storage-atom dissoc k)))
+    (async/go (swap! storage-atom dissoc k))))
 
 (defn memory-exists?
   [storage-atom address]
