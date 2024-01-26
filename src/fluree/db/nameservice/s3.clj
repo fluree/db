@@ -28,7 +28,6 @@
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported S3NameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported S3NameService op: unsubscribe" {})))
   (-sync? [_] sync?)
-  (-exists? [nameservice ledger-address] (s3/s3-key-exists? s3-client s3-bucket s3-prefix ledger-address))
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported S3NameService op: ledgers" {})))
   (-address [_ ledger-alias {:keys [branch] :as _opts}]
     (let [branch (if branch (name branch) "main")]

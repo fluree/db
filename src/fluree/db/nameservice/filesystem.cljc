@@ -1,5 +1,6 @@
 (ns fluree.db.nameservice.filesystem
   (:require [fluree.db.nameservice.proto :as ns-proto]
+            [fluree.db.util.core :as util]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.util.bytes :as bytes]
             [clojure.core.async :as async :refer [go]]
@@ -25,12 +26,6 @@
     (str "fluree:file:" path)
     (str "fluree:file://" path)))
 
-(defn address-path-exists?
-  [local-path address]
-  (->> address
-       (address-full-path local-path)
-       fs/exists?))
-
 (defn read-address
   [local-path address]
   (->> address
@@ -45,26 +40,40 @@
 (defn push!
   "Just write to a different directory?"
   [local-path {commit-address :address
-               nameservices   :ns}]
-  (let [my-ns-iri   (some #(when (re-matches #"^fluree:file:.+" (:id %)) (:id %)) nameservices)
-        commit-path (address-path commit-address)
-        head-path   (address-path my-ns-iri)
-        write-path  (str local-path "/" head-path)
-
-        work        (fn [complete]
-                      (log/debug (str "Updating head at " write-path " to " commit-path "."))
-                      (fs/write-file write-path (bytes/string->UTF8 commit-path))
-                      (complete (file-address head-path)))]
+               nameservices   :ns
+               branch         :branch}]
+  (let [my-ns-iri  (some #(when (re-matches #"^fluree:file:.+" (:id %)) (:id %)) nameservices)
+        head-path  (address-path my-ns-iri)
+        write-path (str local-path "/" head-path)]
     #?(:clj  (let [p (promise)]
-               (future (work (partial deliver p)))
+               (log/debug (str "Updating head at " write-path " to " commit-address "."))
+               (future
+                 (try
+                   (fs/write-file write-path (bytes/string->UTF8 commit-address))
+                   (deliver p commit-address)
+                   (catch Exception e
+                     (deliver p e))))
                p)
-       :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
+       :cljs (js/Promise.
+               (fn [resolve reject]
+                 (let [resp (fs/write-file write-path (bytes/string->UTF8 commit-address))]
+                   (if (util/exception? resp)
+                     (reject resp)
+                     (resolve commit-address))))))))
 
 
 (defn lookup
   [local-path ledger-alias {:keys [branch] :or {branch "main"} :as _opts}]
   (go-try
-    (file-address (read-address local-path ledger-alias))))
+    (when-let [address (read-address local-path ledger-alias)]
+      (if (str/starts-with? address "fluree:")
+        address
+        ;; as of Jan '24, made it so full file address is stored (fluree:file://...)
+        ;; where previously just the path part was stored. This is because a file ns
+        ;; is now being used to store commits located in other conn/method types (e.g. ipfs)
+        ;; The below code is for upgrades where prior commits had already been written
+        ;; with the old format, but eventually can be removed
+        (file-address address)))))
 
 
 (defrecord FileNameService
@@ -76,7 +85,6 @@
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported FileNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported FileNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
-  (-exists? [nameservice ledger-address] (go (address-path-exists? local-path ledger-address)))
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]
     (address ledger-alias opts))

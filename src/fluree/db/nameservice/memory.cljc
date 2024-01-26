@@ -84,7 +84,6 @@
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported MemoryNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported MemoryNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
-  (-exists? [_ ledger-address] (go (boolean (read-address state-atom ledger-address))))
   (-ledgers [_ opts] (ledger-list state-atom opts))
   (-address [_ ledger-alias opts]
     (address ledger-alias opts))
