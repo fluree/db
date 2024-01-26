@@ -29,18 +29,19 @@
 (defn- write-data
   [{:keys [store] :as _conn} ledger data-type data]
   (go-try
-    (let [alias      (ledger-proto/-alias ledger)
-          branch     (name (:name (ledger-proto/-branch ledger)))
-          json       (if (string? data)
-                       data
-                       (json-ld/normalize-data data))
-          bytes      (bytes/string->UTF8 json)
-          hash       (crypto/sha2-256 bytes :hex)
-          type-dir   (name data-type)
-          path       (str alias
+    (let [alias    (ledger-proto/-alias ledger)
+          branch   (name (:name (ledger-proto/-branch ledger)))
+          json     (if (string? data)
+                     data
+                     (json-ld/normalize-data data))
+          bytes    (bytes/string->UTF8 json)
+          hash     (crypto/sha2-256 bytes :hex)
+          type-dir (name data-type)
+          path     (str alias
                           (when branch (str "/" branch))
                           (str "/" type-dir "/")
                           hash ".json")
+
           {:keys [k hash v address]} (<? (store/write store path bytes))]
       {:name    hash
        :hash    hash
@@ -48,35 +49,10 @@
        :size    (count json)
        :address address})))
 
-(defn write-commit
-  [conn ledger commit-data]
-  (write-data conn ledger :commit commit-data))
-
-(defn write-context
-  [conn ledger context-data]
-  (write-data conn ledger :context context-data))
-
-(defn write-index-item
-  [conn ledger index-type index-data]
-  (write-data conn ledger (str "index/" (name index-type)) index-data))
-
-(defn read-commit
-  [conn address]
+(defn read-data [conn address keywordize?]
   (go-try
     (-> (<? (store/read (:store conn) address))
-        (json/parse false))))
-
-(defn read-context
-  [conn context-key]
-  (go-try
-    (-> (<? (store/read (:store conn) context-key))
-        (json/parse true))))
-
-(defn read-index-item
-  [conn index-address]
-  (go-try
-    (-> (<? (store/read (:store conn) index-address))
-        (json/parse true))))
+        (json/parse keywordize?))))
 
 (defn close
   [id state]
@@ -87,14 +63,13 @@
                            nameservices serializer msg-out-ch lru-cache-atom]
 
   conn-proto/iStorage
-  (-c-read [conn commit-key] (read-commit conn commit-key))
-  (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
-  (-ctx-read [conn context-key] (read-context conn context-key))
-  (-ctx-write [conn ledger context-data] (write-context conn ledger context-data))
+  (-c-read [conn commit-key] (read-data conn commit-key false))
+  (-c-write [conn ledger commit-data] (write-data conn ledger :commit commit-data))
+  (-ctx-read [conn context-key] (read-data conn context-key true))
+  (-ctx-write [conn ledger context-data] (write-data conn ledger :context context-data))
   (-index-file-write [conn ledger index-type index-data]
-    (write-index-item conn ledger index-type index-data))
-  (-index-file-read [conn index-address]
-    (read-index-item conn index-address))
+    (write-data conn ledger (str "index/" (name index-type)) index-data))
+  (-index-file-read [conn index-address] (read-data conn index-address true))
 
   conn-proto/iConnection
   (-close [_] (close id state))
