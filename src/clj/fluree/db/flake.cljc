@@ -17,13 +17,6 @@
 
 (declare equiv-flake assoc-flake get-flake-val nth-flake)
 
-(def inc-t
-  "Increments a transaction value"
-  dec)
-
-(def dec-t
-  "Decrements a transaction value"
-  inc)
 
 (defn lshift
   [n bits]
@@ -36,11 +29,6 @@
   [cid n]
   (+ (lshift cid 44) n))
 
-
-(defn max-subject-id
-  "For a given collection id, returns the max subject id that is allowed."
-  [cid]
-  (->sid cid MAX-COLL-SUBJECTS))
 
 (def ^:const min-s iri/max-sid)
 (def ^:const max-s iri/min-sid)
