@@ -94,11 +94,11 @@
      :t             t}))
 
 (defn into-flakeset
-  [fuel-tracker flake-ch]
+  [fuel-tracker error-ch flake-ch]
   (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)
         error-xf (halt-when util/exception?)
         flake-xf (if fuel-tracker
-                   (let [track-fuel (fuel/track fuel-tracker)]
+                   (let [track-fuel (fuel/track fuel-tracker error-ch)]
                      (comp error-xf track-fuel))
                    error-xf)]
     (async/transduce flake-xf (completing conj) flakeset flake-ch)))
@@ -110,7 +110,7 @@
           sid-gen   (iri/sid-generator! (:namespaces db))
           update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
                          (update/modify db parsed-txn tx-state sid-gen fuel-tracker error-ch)
-                         (into-flakeset fuel-tracker))]
+                         (into-flakeset fuel-tracker error-ch))]
       (async/alt!
         error-ch ([e] e)
         update-ch ([flakes]
