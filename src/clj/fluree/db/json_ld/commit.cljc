@@ -186,7 +186,7 @@
      :tag            tag
      :file-data?     file-data? ;; if instead of returning just a db from commit, return also the written files (for consensus)
      :alias          (ledger-proto/-alias ledger)
-     :t              (- t)
+     :t              t
      :v              0
      :prev-commit    (:address commit)
      :prev-dbid      (:dbid commit)
@@ -212,13 +212,11 @@
        (str "fluree:db:sha256:b")))
 
 (defn commit-flakes
-  "Returns commit flakes from novelty based on 't' value.
-  Reverses natural sort order so smallest sids come first."
+  "Returns commit flakes from novelty based on 't' value."
   [{:keys [novelty t] :as _db}]
   (-> novelty
       :tspo
       (flake/match-tspo t)
-      reverse
       not-empty))
 
 (defn commit-opts->data
@@ -227,10 +225,9 @@
   (go-try
     (let [committed-t (-> ledger
                           (ledger-proto/-status branch)
-                          (branch/latest-commit-t)
-                          -)
+                          branch/latest-commit-t)
           new-flakes  (commit-flakes db)]
-      (when (not= t (dec committed-t))
+      (when (not= t (inc committed-t))
         (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
                              " is no longer consistent with staged db 't' value of: " t ".")
                         {:status 400 :error :db/invalid-commit})))
@@ -260,7 +257,7 @@
                               (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
                               (:size stats) (assoc (compact const/iri-size) (:size stats)))
           ;; TODO - this is re-normalized below, can try to do it just once
-          dbid        (db-json->db-id (json-ld/normalize-data db-json))
+          dbid        (-> db-json json-ld/normalize-data db-json->db-id)
           db-json*    (-> db-json
                           (assoc id-key dbid)
                           (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]

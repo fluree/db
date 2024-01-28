@@ -37,16 +37,16 @@
          [from-t to-t] (if at
                          (let [t (cond (= :latest at) (:t db*)
                                        (string? at) (<? (time-travel/datetime->t db* at))
-                                       (number? at) (- at))]
+                                       (number? at) at)]
                            [t t])
                          ;; either (:from or :to)
                          [(cond (= :latest from) (:t db*)
                                 (string? from) (<? (time-travel/datetime->t db* from))
-                                (number? from) (- from)
-                                (nil? from) -1)
+                                (number? from) from
+                                (nil? from) 1)
                           (cond (= :latest to) (:t db*)
                                 (string? to) (<? (time-travel/datetime->t db* to))
-                                (number? to) (- to)
+                                (number? to) to
                                 (nil? to) (:t db*))])
 
          context        (ctx-util/extract parsed)

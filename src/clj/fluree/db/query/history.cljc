@@ -174,7 +174,7 @@
         out-ch      (async/chan)
 
         t-flakes-ch (->> flakes
-                         (sort-by flake/t >)
+                         (sort-by flake/t <)
                          (group-by flake/t)
                          (vals)
                          (async/to-chan!))
@@ -191,7 +191,7 @@
               (let [{assert-flakes  true
                      retract-flakes false} (group-by flake/op t-flakes)
 
-                    t        (- (flake/t (first t-flakes)))
+                    t        (flake/t (first t-flakes))
 
                     asserts  (->> assert-flakes
                                   (t-flakes->json-ld db context compact cache
@@ -379,8 +379,8 @@
      (fn [chunk ch]
        (async/pipe
         (go
-          (let [to-t                       (- (-> chunk peek (get t-key)))
-                from-t                     (- (-> chunk (nth 0) (get t-key)))
+          (let [to-t                       (-> chunk peek (get t-key))
+                from-t                     (-> chunk (nth 0) (get t-key))
                 flake-slices-ch            (query-range/time-range
                                             db :tspo = []
                                             {:from-t from-t, :to-t to-t})

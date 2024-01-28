@@ -306,7 +306,7 @@
   "Returns the :data portion of the commit map for a new db commit."
   [dbid t db-address prev-data flakes size]
   (cond-> {:id      dbid ;; db's unique identifier
-           :t       (- t)
+           :t       t
            :address db-address ;; address to locate db
            :flakes  flakes
            :size    size}
@@ -482,7 +482,7 @@
           {previous-id :id prev-data :data} prev-commit
           prev-data-id       (:id prev-data)
 
-          t                  (- db-t)
+          t                  db-t
           commit-sid         (iri/iri->sid id)
           db-sid             (iri/iri->sid db-id)
           base-flakes        (commit-metadata-flakes commit t commit-sid db-sid)

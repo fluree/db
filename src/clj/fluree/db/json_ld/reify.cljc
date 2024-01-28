@@ -239,11 +239,11 @@
 (defn db-t
   "Returns 't' value from commit data."
   [db-data]
-  (let [db-t (get-first-value db-data const/iri-t)]
-    (when-not (pos-int? db-t)
+  (let [t (get-first-value db-data const/iri-t)]
+    (when-not (pos-int? t)
       (commit-error
-        (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
-    db-t))
+        (str "Invalid, or non existent 't' value inside commit: " t) db-data))
+    t))
 
 (defn enrich-values
   [id->node values]
@@ -357,10 +357,10 @@
                                        (get-first const/iri-data)
                                        (get-first-value const/iri-address))
           db-data                  (<? (read-db conn db-address))
-          t-new                    (- (db-t db-data))
-          _                        (when (and (not= t-new (dec t))
+          t-new                    (db-t db-data)
+          _                        (when (and (not= t-new (inc t))
                                               (not merged-db?)) ;; when including multiple dbs, t values will get reused.
-                                     (throw (ex-info (str "Cannot merge commit with t " (- t-new) " into db of t " (- t) ".")
+                                     (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
                                                      {:status 500 :error :db/invalid-commit})))
           assert                   (db-assert db-data)
           retract                  (db-retract db-data)

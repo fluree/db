@@ -30,14 +30,14 @@
   (+ (lshift cid 44) n))
 
 
-(def ^:const min-s iri/max-sid)
-(def ^:const max-s iri/min-sid)
+(def ^:const min-s iri/min-sid)
+(def ^:const max-s iri/max-sid)
 (def ^:const min-p iri/min-sid)
 (def ^:const max-p iri/max-sid)
 (def ^:const min-dt iri/min-sid)
 (def ^:const max-dt iri/max-sid)
 (def ^:const min-t 0)
-(def ^:const max-t util/min-long)
+(def ^:const max-t util/max-long)
 (def ^:const min-op false)
 (def ^:const max-op true)
 (def ^:const min-meta util/min-integer)
@@ -301,19 +301,17 @@
     0))
 
 (defn cmp-subj
-  "Comparator for subject values. The supplied values are reversed before the
-  comparison to account for the decreasing sort order of subjects"
+  "Compare two subject values by comparing them as SIDs."
   [s1 s2]
-  (cmp-sid s2 s1))
+  (cmp-sid s1 s2))
 
 (defn cmp-pred [p1 p2]
   (cmp-sid p1 p2))
 
 (defn cmp-tx
-  "Comparator for transaction values. The supplied values are reversed before the
-  comparison to account for the decreasing sort order of transactions"
+  "Compare two transaction values by comparing them as long numbers."
   [t1 t2]
-  (cmp-long t2 t1))
+  (cmp-long t1 t2))
 
 (defn cmp-dt
   "Used within cmp-obj to compare data types in more edge cases"

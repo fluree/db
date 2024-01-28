@@ -162,12 +162,12 @@
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
   [t flake]
-  (< (flake/t flake) t))
+  (< t (flake/t flake)))
 
 (defn before-t?
   "Returns `true` if `flake` has a transaction value before the provided `t`"
   [t flake]
-  (> (flake/t flake) t))
+  (> t (flake/t flake)))
 
 (defn filter-after
   "Returns a sequence containing only flakes from the flake set `flakes` with
@@ -234,9 +234,9 @@
   "Returns a sorted set of flakes that are not out of date between the
   transactions `from-t` and `to-t`."
   ([{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
-   (let [latest       (cond-> flakes
-                        (> leaf-t to-t)
-                        (flake/conj-all (novelty-subrange leaf to-t novelty)))
+   (let [latest       (if (> to-t leaf-t)
+                        (flake/conj-all flakes (novelty-subrange leaf to-t novelty))
+                        flakes)
          stale-flakes (stale-by from-t latest)
          subsequent   (filter-after to-t latest)
          out-of-range (concat stale-flakes subsequent)]
@@ -274,9 +274,9 @@
 (defn history-t-range
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
   ([{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
-   (let [latest       (cond-> flakes
-                        (> leaf-t to-t)
-                        (flake/conj-all (novelty-subrange leaf to-t novelty)))
+   (let [latest       (if (> to-t leaf-t)
+                        (flake/conj-all flakes (novelty-subrange leaf to-t novelty))
+                        flakes)
          ;; flakes that happen after to-t
          subsequent   (filter-after to-t latest)
          ;; flakes that happen before from-t
@@ -310,10 +310,10 @@
   (if (= leaf-t t)
     leaf
     (cond-> leaf
-      (> leaf-t t)
+      (< leaf-t t)
       (add-flakes (novelty-subrange leaf t idx-novelty))
 
-      (< leaf-t t)
+      (> leaf-t t)
       (rem-flakes (filter-after t flakes))
 
       true

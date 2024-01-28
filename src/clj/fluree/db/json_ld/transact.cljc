@@ -84,8 +84,7 @@
   [db]
   (let [{:keys [branch ledger policy], db-t :t} db
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
-        t         (-> commit-t inc -) ; commit-t is always positive, need to
-                                      ; make negative for internal indexing
+        t         (inc commit-t)
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before
      :policy        policy

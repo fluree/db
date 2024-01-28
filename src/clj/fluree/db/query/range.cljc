@@ -206,8 +206,7 @@
   Returns core async channel.
 
   opts:
-  :from-t - start transaction (transaction 't' is negative, so smallest number
-            is most recent). Defaults to db's t
+  :from-t - start transaction. Defaults to db's t
   :to-t - stop transaction - can be null, which pulls full history
   :xform - xform applied to each result individually. This is not used
            when :chan is supplied.

@@ -57,7 +57,7 @@
 (defn update-db
   "Updates the latest staged db and returns new branch data."
   [{:keys [t index] :as branch-data} {db-t :t, :as db}]
-  (if (or (= (dec t) db-t)
+  (if (or (= (inc t) db-t)
           (= t db-t)
           (zero? t)) ;; when loading a ledger from disk, 't' will be zero but ledger will be >= 1
     (let [db* (dbproto/-index-update db index)]
@@ -86,7 +86,7 @@
         {branch-commit :commit} branch-data
         ledger-t       (commit-data/t branch-commit)
         commit-t       (commit-data/t db-commit)
-        _              (when-not (= (- db-t) commit-t)
+        _              (when-not (= db-t commit-t)
                          (throw (ex-info (str "Unexpected Error. Db's t value and commit's t value are not the same: "
                                               (- db-t) " and " commit-t " respectively.")
                                          {:status 500 :error :db/invalid-db})))
@@ -96,7 +96,7 @@
                          (assoc db :commit (commit-data/use-latest-index db-commit branch-commit))
                          db)]
     (when-not (or (nil? ledger-t)
-                  (and updated-index? (>= ledger-t commit-t)) ;; index update may come after multiple commits
+                  (and updated-index? (<= ledger-t commit-t)) ;; index update may come after multiple commits
                   (= commit-t (inc ledger-t)))
       (throw (ex-info (str "Commit failed, latest committed db is " ledger-t
                            " and you are trying to commit at db at t value of: "

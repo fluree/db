@@ -5,8 +5,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.async :refer [<? go-try into?]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -32,7 +31,7 @@
       (log/debug "datetime->t index-range:" (pr-str flakes))
       (if (empty? flakes)
         (:t db)
-        (let [t (-> flakes first flake/t inc)]
+        (let [t (-> flakes first flake/t dec)]
           (if (zero? t)
             (throw (ex-info (str "There is no data as of " datetime)
                             {:status 400, :error :db/invalid-query}))
@@ -46,11 +45,10 @@
     (async/go
       (try*
         (let [t* (cond
-                   (string? t) (<? (datetime->t db t)) ; ISO-8601 datetime
-                   (pos-int? t) (- t)
-                   (neg-int? t) t
-                   :else (throw (ex-info (str "Time travel to t value of: " t " not yet supported.")
-                                         {:status 400 :error :db/invalid-query})))]
+                   (string? t)  (<? (datetime->t db t)) ; ISO-8601 datetime
+                   (pos-int? t) t
+                   :else        (throw (ex-info (str "Time travel to t value of: " t " not yet supported.")
+                                                {:status 400 :error :db/invalid-query})))]
           (log/debug "as-of t:" t*)
           (async/put! pc (assoc db :t t*)))
         (catch* e
