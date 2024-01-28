@@ -52,6 +52,11 @@
                     (recur r)))
               false))))))
 
+(defn allow-iri?
+  [db sid]
+  (let [id-flake (flake/create sid const/$id nil nil nil nil nil)]
+    (allow-flake? db id-flake)))
+
 (defn group-property-policies
   "Returns a map of property policies grouped by property-id (pid).
   For each pid key, returns a vector containing only the function tuples (not entire policy map) of
