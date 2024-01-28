@@ -430,12 +430,12 @@
                        "ex:json" {"@type"  "@json"
                                   "@value" {:edn "data"
                                             :is  ["cool" "right?" 1 false 1.0]}}}]})]
-      (is (= [{"id"     "ex:bob",
+      (is (= [{"id"     "ex:alice",
                "type"   "ex:Person",
-               "ex:json" {":edn" "data", ":is" ["cool" "right?" 1 false 1]}}
-              {"id"     "ex:alice",
+               "ex:json" {"json" "data", "is" ["cool" "right?" 1 false 1]}}
+              {"id"     "ex:bob",
                "type"   "ex:Person",
-               "ex:json" {"json" "data", "is" ["cool" "right?" 1 false 1]}}]
+               "ex:json" {":edn" "data", ":is" ["cool" "right?" 1 false 1]}}]
              @(fluree/query db1 {"@context" [test-utils/default-str-context
                                              {"ex" "http://example.org/ns/"}]
                                  "where"  {"@id" "?s" "@type" "ex:Person"}

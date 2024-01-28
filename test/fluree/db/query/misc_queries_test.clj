@@ -132,56 +132,24 @@
                                :schema/email "jane@flur.ee"
                                :schema/age   30}]}})]
       (testing "Query that pulls entire database."
-        (is (= [[:ex/jane :type :ex/User]
-                [:ex/jane :schema/age 30]
-                [:ex/jane :schema/email "jane@flur.ee"]
-                [:ex/jane :schema/name "Jane"]
+        (is (= [[:ex/alice :type :ex/User]
+                [:ex/alice :schema/age 42]
+                [:ex/alice :schema/email "alice@flur.ee"]
+                [:ex/alice :schema/name "Alice"]
                 [:ex/bob :type :ex/User]
                 [:ex/bob :schema/age 22]
                 [:ex/bob :schema/name "Bob"]
-                [:ex/alice :type :ex/User]
-                [:ex/alice :schema/age 42]
-                [:ex/alice :schema/email "alice@flur.ee"]
-                [:ex/alice :schema/name "Alice"]]
+                [:ex/jane :type :ex/User]
+                [:ex/jane :schema/age 30]
+                [:ex/jane :schema/email "jane@flur.ee"]
+                [:ex/jane :schema/name "Jane"]]
                @(fluree/query db {:context [test-utils/default-context
                                             {:ex "http://example.org/ns/"}]
                                   :select  ['?s '?p '?o]
                                   :where   {:id '?s
                                             '?p '?o}}))
             "Entire database should be pulled.")
-        (is (= [{:id           :ex/jane,
-                 :type         :ex/User,
-                 :schema/name  "Jane",
-                 :schema/email "jane@flur.ee",
-                 :schema/age   30}
-                {:id           :ex/jane,
-                 :type         :ex/User,
-                 :schema/name  "Jane",
-                 :schema/email "jane@flur.ee",
-                 :schema/age   30}
-                {:id           :ex/jane,
-                 :type         :ex/User,
-                 :schema/name  "Jane",
-                 :schema/email "jane@flur.ee",
-                 :schema/age   30}
-                {:id           :ex/jane,
-                 :type         :ex/User,
-                 :schema/name  "Jane",
-                 :schema/email "jane@flur.ee",
-                 :schema/age   30}
-                {:id          :ex/bob,
-                 :type        :ex/User,
-                 :schema/name "Bob",
-                 :schema/age  22}
-                {:id          :ex/bob,
-                 :type        :ex/User,
-                 :schema/name "Bob",
-                 :schema/age  22}
-                {:id          :ex/bob,
-                 :type        :ex/User,
-                 :schema/name "Bob",
-                 :schema/age  22}
-                {:id           :ex/alice,
+        (is (= [{:id           :ex/alice,
                  :type         :ex/User,
                  :schema/name  "Alice",
                  :schema/email "alice@flur.ee",
@@ -200,7 +168,39 @@
                  :type         :ex/User,
                  :schema/name  "Alice",
                  :schema/email "alice@flur.ee",
-                 :schema/age   42}]
+                 :schema/age   42}
+                {:id          :ex/bob,
+                 :type        :ex/User,
+                 :schema/name "Bob",
+                 :schema/age  22}
+                {:id          :ex/bob,
+                 :type        :ex/User,
+                 :schema/name "Bob",
+                 :schema/age  22}
+                {:id          :ex/bob,
+                 :type        :ex/User,
+                 :schema/name "Bob",
+                 :schema/age  22}
+                {:id           :ex/jane,
+                 :type         :ex/User,
+                 :schema/name  "Jane",
+                 :schema/email "jane@flur.ee",
+                 :schema/age   30}
+                {:id           :ex/jane,
+                 :type         :ex/User,
+                 :schema/name  "Jane",
+                 :schema/email "jane@flur.ee",
+                 :schema/age   30}
+                {:id           :ex/jane,
+                 :type         :ex/User,
+                 :schema/name  "Jane",
+                 :schema/email "jane@flur.ee",
+                 :schema/age   30}
+                {:id           :ex/jane,
+                 :type         :ex/User,
+                 :schema/name  "Jane",
+                 :schema/email "jane@flur.ee",
+                 :schema/age   30}]
                @(fluree/query db {:context [test-utils/default-context
                                             {:ex "http://example.org/ns/"}]
                                   :select  {'?s ["*"]}
@@ -211,17 +211,18 @@
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
                                          :where   {:id '?s, '?p '?o}})]
-          (is (= [[:ex/jane :type :ex/User]
-                  [:ex/jane :schema/age 30]
-                  [:ex/jane :schema/email "jane@flur.ee"]
-                  [:ex/jane :schema/name "Jane"]
-                  [:ex/bob :type :ex/User]
-                  [:ex/bob :schema/age 22]
-                  [:ex/bob :schema/name "Bob"]
-                  [:ex/alice :type :ex/User]
-                  [:ex/alice :schema/age 42]
-                  [:ex/alice :schema/email "alice@flur.ee"]
-                  [:ex/alice :schema/name "Alice"]
+          (is (= [["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"
+                   :f/address
+                   "fluree:memory://9a32a7fe9e98219a5340a0148934aac8329eb123c5df589153f74b6990410576"]
+                  ["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"
+                   :f/flakes
+                   11]
+                  ["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"
+                   :f/size
+                   584]
+                  ["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"
+                   :f/t
+                   1]
                   ["fluree:commit:sha256:bb4jfbk3q6ze2sjvblrla4ewngxiadbopzjq7y62q553q5cowo7fl"
                    "https://www.w3.org/2018/credentials#issuer"
                    "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
@@ -237,12 +238,17 @@
                    "fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"]
                   ["fluree:commit:sha256:bb4jfbk3q6ze2sjvblrla4ewngxiadbopzjq7y62q553q5cowo7fl" :f/time 720000]
                   ["fluree:commit:sha256:bb4jfbk3q6ze2sjvblrla4ewngxiadbopzjq7y62q553q5cowo7fl" :f/v 0]
-                  ["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"
-                   :f/address
-                   "fluree:memory://9a32a7fe9e98219a5340a0148934aac8329eb123c5df589153f74b6990410576"]
-                  ["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f" :f/flakes 11]
-                  ["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f" :f/size 584]
-                  ["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f" :f/t 1]]
+                  [:ex/alice :type :ex/User]
+                  [:ex/alice :schema/age 42]
+                  [:ex/alice :schema/email "alice@flur.ee"]
+                  [:ex/alice :schema/name "Alice"]
+                  [:ex/bob :type :ex/User]
+                  [:ex/bob :schema/age 22]
+                  [:ex/bob :schema/name "Bob"]
+                  [:ex/jane :type :ex/User]
+                  [:ex/jane :schema/age 30]
+                  [:ex/jane :schema/email "jane@flur.ee"]
+                  [:ex/jane :schema/name "Jane"]]
                  result)
               (str "query result was: " (pr-str result))))))))
 

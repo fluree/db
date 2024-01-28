@@ -28,9 +28,9 @@
                         :ex/friend    [:ex/brian :ex/alice]}]})]
 
       ;; basic single optional statement
-      (is (= [["Cam" nil]
+      (is (= [["Alice" "Green"]
               ["Brian" nil]
-              ["Alice" "Green"]]
+              ["Cam" nil]]
              @(fluree/query db {:context context
                                 :select  '[?name ?favColor]
                                 :where   '[{:id          ?s
@@ -39,9 +39,9 @@
                                            [:optional {:id ?s, :ex/favColor ?favColor}]]}))
           "Cam, Alice and Brian should all return, but only Alica has a favColor")
 
-      (is (= [["Cam" nil]
+      (is (= [["Alice" "Green"]
               ["Brian" nil]
-              ["Alice" "Green"]]
+              ["Cam" nil]]
              @(fluree/query db {:context context
                                 :select  '[?name ?favColor]
                                 :where   '[{:id          ?s
@@ -51,8 +51,8 @@
           "Cam, Alice and Brian should all return, but only Alice has a favColor, even with string 'optional' key")
 
       ;; including another pass-through variable - note Brian doesn't have an email
-      (is (= [["Cam" nil "cam@flur.ee"]
-              ["Alice" "Green" "alice@flur.ee"]]
+      (is (= [["Alice" "Green" "alice@flur.ee"]
+              ["Cam" nil "cam@flur.ee"]]
              @(fluree/query db {:context context
                                 :select  '[?name ?favColor ?email]
                                 :where   '[{:id           ?s
@@ -62,8 +62,8 @@
                                            [:optional {:id ?s, :ex/favColor ?favColor}]]})))
 
       ;; including another pass-through variable, but with 'optional' sandwiched
-      (is (= [["Cam" nil "cam@flur.ee"]
-              ["Alice" "Green" "alice@flur.ee"]]
+      (is (= [["Alice" "Green" "alice@flur.ee"]
+              ["Cam" nil "cam@flur.ee"]]
              @(fluree/query db {:context context
                                 :select  '[?name ?favColor ?email]
                                 :where   '[{:id          ?s,
@@ -74,9 +74,9 @@
                                             :schema/email ?email}]})))
 
       ;; query with two optionals!
-      (is (= [["Cam" nil "cam@flur.ee"]
+      (is (= [["Alice" "Green" "alice@flur.ee"]
               ["Brian" nil nil]
-              ["Alice" "Green" "alice@flur.ee"]]
+              ["Cam" nil "cam@flur.ee"]]
              @(fluree/query db {:context context
                                 :select  '[?name ?favColor ?email]
                                 :where   '[{:id          ?s
@@ -86,9 +86,9 @@
                                            [:optional {:id ?s, :schema/email ?email}]]})))
 
       ;; query with two optionals in the same vector
-      (is (= [["Cam" nil "cam@flur.ee"]
+      (is (= [["Alice" "Green" "alice@flur.ee"]
               ["Brian" nil nil]
-              ["Alice" "Green" "alice@flur.ee"]]
+              ["Cam" nil "cam@flur.ee"]]
              @(fluree/query db {:context context
                                 :select  '[?name ?favColor ?email]
                                 :where   '[{:id          ?s
@@ -99,9 +99,9 @@
                                             {:id ?s, :schema/email ?email}]]})))
 
       ;; optional with unnecessary embedded vector statement
-      (is (= [["Cam" nil]
+      (is (= [["Alice" "Green"]
               ["Brian" nil]
-              ["Alice" "Green"]]
+              ["Cam" nil]]
              @(fluree/query db {:context context
                                 :select  '[?name ?favColor]
                                 :where   '[{:id          ?s
@@ -111,9 +111,9 @@
           "Cam, Alice and Brian should all return, but only Alica has a favColor")
 
       ;; Multiple optional clauses should work as a left outer join between them
-      (is (= [["Cam" nil nil]
+      (is (= [["Alice" "Green" "alice@flur.ee"]
               ["Brian" nil nil]
-              ["Alice" "Green" "alice@flur.ee"]]
+              ["Cam" nil nil]]
              @(fluree/query db {:context context
                                 :select  '[?name ?favColor ?email]
                                 :where   '[{:id          ?s

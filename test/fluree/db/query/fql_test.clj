@@ -446,8 +446,8 @@
                               "isBasedOn" {"isbn"   ?bookIsbn
                                            "author" {"name" ?authorName}}}}]
 
-          (is (= [["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]
-                  ["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]]
+          (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
+                  ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
                  @(fluree/query-connection conn q))
               "returns unified results from each component ledger")))
       (testing "with separate data sets"
@@ -463,7 +463,7 @@
                                                      "author" ?author}]
                                [:graph "test/authors" {"id"   ?author
                                                        "name" ?authorName}]]}]
-          (is (= [["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]
-                  ["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]]
+          (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
+                  ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
                  @(fluree/query-connection conn q))
               "returns unified results from each component ledger"))))))

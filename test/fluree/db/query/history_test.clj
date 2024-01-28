@@ -194,7 +194,7 @@
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
               {:f/t       4
                :f/assert  [{:ex/x "foo-cat" :id :ex/cat} {:ex/x "foo-dog" :id :ex/dog}]
-               :f/retract [{:ex/x "foo-1" :id :ex/dog} {:ex/x "foo-1" :id :ex/cat}]}]
+               :f/retract [{:ex/x "foo-1" :id :ex/cat} {:ex/x "foo-1" :id :ex/dog}]}]
              @(fluree/history ledger {:context context
                                       :history [nil :ex/x]
                                       :t       {:from 2 :to 4}}))))

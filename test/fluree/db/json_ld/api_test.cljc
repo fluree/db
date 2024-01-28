@@ -213,17 +213,17 @@
                loaded-db    (fluree/db loaded)]
            (is (= target-t (:t loaded-db)))
            (testing "query returns expected `list` values"
-             (is (= #{{:id         :ex/cam,
-                       :type       :ex/User,
-                       :ex/numList [7 8 9 10]}
-                      {:id :ex/john, :type :ex/User}
-                      {:id         :ex/alice,
-                       :type       :ex/User,
-                       :ex/friends [{:id :ex/john} {:id :ex/cam}]}}
-                    (set @(fluree/query loaded-db {:context [test-utils/default-context
-                                                             {:ex "http://example.org/ns/"}]
-                                                   :select  '{?s [:*]}
-                                                   :where   '{:id ?s, :type :ex/User}})))))))
+             (is (= [{:id         :ex/alice,
+                      :type       :ex/User,
+                      :ex/friends [{:id :ex/john} {:id :ex/cam}]}
+                     {:id         :ex/cam,
+                      :type       :ex/User,
+                      :ex/numList [7 8 9 10]}
+                     {:id :ex/john, :type :ex/User}]
+                    @(fluree/query loaded-db {:context [test-utils/default-context
+                                                        {:ex "http://example.org/ns/"}]
+                                              :select  '{?s [:*]}
+                                              :where   '{:id ?s, :type :ex/User}}))))))
 
        (testing "can load with policies"
          (with-tmp-dir storage-path
@@ -978,20 +978,20 @@
        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
               (ex-message db4)))
 
-       (is (= [{"id"               "ex:john"
-                "type"             "ex:User"
-                "ex:address"       {"ex:state" "SC" "ex:country" "USA"}
-                "schema:birthDate" "2022-08-17"
-                "schema:name"      "John"
-                "schema:email"     "john@flur.ee"
-                "schema:ssn"       "222-22-2222"}
-               {"id"               "ex:alice"
+       (is (= [{"id"               "ex:alice"
                 "type"             "ex:User"
                 "ex:address"       {"ex:state" "NC" "ex:country" "USA"}
                 "schema:birthDate" "2022-08-17"
                 "schema:name"      "Alice"
                 "schema:email"     "alice@flur.ee"
-                "schema:ssn"       "111-11-1111"}]
+                "schema:ssn"       "111-11-1111"}
+               {"id"               "ex:john"
+                "type"             "ex:User"
+                "ex:address"       {"ex:state" "SC" "ex:country" "USA"}
+                "schema:birthDate" "2022-08-17"
+                "schema:name"      "John"
+                "schema:email"     "john@flur.ee"
+                "schema:ssn"       "222-22-2222"}]
               @(fluree/query db5 {:context [test-utils/default-str-context
                                             {"ex" "ns:ex/"}]
                                   :where   {"id" "?s", "@type" "ex:User"}
@@ -1000,17 +1000,17 @@
                                             :role "ex:rootRole"}}))
            "rootRole user can see all ex:Users")
 
-       (is (= [{"id"               "ex:john"
-                "type"             "ex:User"
-                "schema:email"     "john@flur.ee"
-                "schema:birthDate" "2022-08-17"
-                "schema:name"      "John"}
-               {"id"               "ex:alice"
+       (is (= [{"id"               "ex:alice"
                 "type"             "ex:User"
                 "schema:email"     "alice@flur.ee"
                 "schema:birthDate" "2022-08-17"
                 "schema:name"      "Alice"
-                "schema:ssn"       "111-11-1111"}]
+                "schema:ssn"       "111-11-1111"}
+               {"id"               "ex:john"
+                "type"             "ex:User"
+                "schema:email"     "john@flur.ee"
+                "schema:birthDate" "2022-08-17"
+                "schema:name"      "John"}]
               @(fluree/query db5 {:context [test-utils/default-str-context
                                             {"ex" "ns:ex/"}]
                                   :where   {"id" "?s", "@type" "ex:User"}
