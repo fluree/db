@@ -1,4 +1,6 @@
 (ns fluree.db.policy.subj-flakes-test
+  "tests for the optimized policy filtering for groups of flakes of the same
+  subject (used for simple subject crawl)"
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
@@ -6,9 +8,6 @@
             [fluree.db.permissions-validate :as policy-enforce]
             [clojure.core.async :as async]
             [fluree.db.flake :as flake]))
-
-;; tests for the optimized policy filtering for groups of flakes of the same subject
-;; (used for simple subject crawl)
 
 (deftest ^:integration subject-flakes-policy
   (testing "Policy enforcement for groups of flakes by subject."
