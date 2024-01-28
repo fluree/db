@@ -135,12 +135,12 @@
   containing only the schema flakes and the flakes validated by
   fluree.db.permissions-validate/allow-flake? function for the database `db`
   from the `flake-slices` channel"
-  [{:keys [policy] :as db} start end error-ch flake-slices]
+  [db start end error-ch flake-slices]
   #?(:cljs
      flake-slices ; Note this bypasses all permissions in CLJS for now!
 
      :clj
-     (if (true? (get-in policy [const/iri-view :root?]))
+     (if (perm-validate/unrestricted-view? db)
        flake-slices
        (let [auth-fn (fn [flakes ch]
                        (-> (authorize-flakes db error-ch flakes)

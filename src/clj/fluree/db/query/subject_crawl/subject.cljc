@@ -10,7 +10,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.common :refer [result-af resolve-ident-vars
                                                           filter-subject]]
-            [fluree.db.permissions-validate :refer [filter-subject-flakes]]
+            [fluree.db.permissions-validate :as validate :refer [filter-subject-flakes]]
             [fluree.db.dbproto :as dbproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -42,7 +42,7 @@
 
 (defn permissioned-db?
   [db]
-  (not (get-in db [:policy const/iri-view :root?])))
+  (not (validate/unrestricted-view? db)))
 
 (defn flakes-xf
   [{:keys [db fuel-vol max-fuel error-ch vars filter-map] :as _opts}]

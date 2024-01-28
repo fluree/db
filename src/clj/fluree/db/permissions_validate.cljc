@@ -8,6 +8,13 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn unrestricted-view?
+  [{:keys [policy] :as _db}]
+  (true? (get-in policy [const/iri-view :root?])))
+
+(defn unrestricted-modify?
+  [{:keys [policy] :as _db}]
+  (true? (get-in policy [const/iri-modify :root?])))
 
 (defn allow-flake?
   "Returns one of:
@@ -19,31 +26,31 @@
   root user as the results will not come back correctly."
   [{:keys [policy namespace-codes] :as db} flake]
   (go-try
-    (let [sid     (flake/s flake)
-          s-iri   (iri/sid->iri sid namespace-codes)
-          pid     (flake/p flake)
-          p-iri   (iri/sid->iri pid namespace-codes)
-          classes (or (get @(:cache policy) s-iri)
-                      (let [class-sids (<? (dbproto/-class-ids db sid))
-                            class-iris (map (fn [c]
-                                              (iri/sid->iri c namespace-codes))
-                                            class-sids)]
-                        ;; note, classes will return empty list if none found ()
-                        (swap! (:cache policy) assoc s-iri class-iris)
-                        class-iris))
-          fns     (keep #(or (get-in policy [const/iri-view :class % p-iri :function])
-                             (get-in policy [const/iri-view :class % :default :function]))
-                        classes)]
-      (loop [[[async? f] & r] fns]
-        ;; return first truthy response, else false
-        (if f
-          (let [res (if async?
-                      (<? (f db flake))
-                      (f db flake))]
-            (or res
-                (recur r)))
-          false)))))
-
+    (or (unrestricted-view? db)
+        (let [sid     (flake/s flake)
+              s-iri   (iri/sid->iri sid namespace-codes)
+              pid     (flake/p flake)
+              p-iri   (iri/sid->iri pid namespace-codes)
+              classes (or (get @(:cache policy) s-iri)
+                          (let [class-sids (<? (dbproto/-class-ids db sid))
+                                class-iris (map (fn [c]
+                                                  (iri/sid->iri c namespace-codes))
+                                                class-sids)]
+                            ;; note, classes will return empty list if none found ()
+                            (swap! (:cache policy) assoc s-iri class-iris)
+                            class-iris))
+              fns     (keep #(or (get-in policy [const/iri-view :class % p-iri :function])
+                                 (get-in policy [const/iri-view :class % :default :function]))
+                            classes)]
+          (loop [[[async? f] & r] fns]
+            ;; return first truthy response, else false
+            (if f
+              (let [res (if async?
+                          (<? (f db flake))
+                          (f db flake))]
+                (or res
+                    (recur r)))
+              false))))))
 
 (defn group-property-policies
   "Returns a map of property policies grouped by property-id (pid).

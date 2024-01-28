@@ -8,12 +8,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn root?
-  "Returns true if policy has root modify permissions."
-  [policy]
-  (= {:root? true} (get policy const/iri-modify)))
-
-
 (defn- check-property-policies
   "Checks property policies, if they exist for a given flake's property and
   will reject entire transaction if any fail. If they don't exist, default to
@@ -55,7 +49,7 @@
   (let [{:keys [policy namespace-codes]} db-after
         subj-mods' @subj-mods]
     (go-try
-      (if (root? policy)
+      (if (validate/unrestricted-modify? db-after)
         db-after
         (loop [[s-flakes & r] (partition-by flake/s add)]
           (if s-flakes
