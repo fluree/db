@@ -189,10 +189,8 @@
                                                                  :t {:from 1}}
                                                                 (:private auth)))))
            "history query credential - allowing access")
-       (is (= "Subject identity does not exist: \"did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh\""
-              (-> @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private pleb-auth))))
-                  (Throwable->map)
-                  (:cause)))
+       (is (= []
+              @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private pleb-auth)))))
            "history query credential - forbidding access"))))
 
 (comment
