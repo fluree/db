@@ -17,19 +17,6 @@
 
 (declare equiv-flake assoc-flake get-flake-val nth-flake)
 
-
-(defn lshift
-  [n bits]
-  #?(:clj  (bit-shift-left n bits)
-     :cljs (* n (js/Math.pow 2 bits))))
-
-
-(defn ->sid
-  "Converts a collection id and a number (n) into a subject-id."
-  [cid n]
-  (+ (lshift cid 44) n))
-
-
 (def ^:const min-s iri/min-sid)
 (def ^:const max-s iri/max-sid)
 (def ^:const min-p iri/min-sid)
