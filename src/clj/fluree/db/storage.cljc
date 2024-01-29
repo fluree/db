@@ -95,9 +95,8 @@
   [db changes-ch garbage]
   (go-try
     (let [{:keys [conn ledger ledger-alias t]} db
-          t'       (- t) ;; use positive t integer
           data     {:ledger-alias ledger-alias
-                    :block     t'
+                    :block     t
                     :garbage   garbage}
           ser      (serdeproto/-serialize-garbage (serde conn) data)
           res      (<? (conn-proto/-index-file-write conn ledger :garbage ser))
@@ -177,9 +176,9 @@
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
   [conn blank-db root-data]
   (let [{:keys [t stats preds]} root-data
-        db* (assoc blank-db :t (- t)
-                            :preds preds
-                            :stats (assoc stats :indexed t))]
+        db*                     (assoc blank-db :t t
+                                       :preds preds
+                                       :stats (assoc stats :indexed t))]
     (reduce
       (fn [db idx]
         (let [idx-root (reify-index-root conn db idx (get root-data idx))]
