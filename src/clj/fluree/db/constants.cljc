@@ -65,20 +65,6 @@
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
 (def ^:const iri-lang-string "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
 
-;; system collection ids
-(def ^:const $_predicate 0)
-(def ^:const $_collection 1)
-(def ^:const $_shard 2)
-(def ^:const $_tag 3)
-(def ^:const $_fn 4)
-(def ^:const $_user 5)
-(def ^:const $_auth 6)
-(def ^:const $_role 7)
-(def ^:const $_rule 8)
-(def ^:const $_setting 9)
-(def ^:const $_prefix 11)
-(def ^:const $_default 12)
-
 ;; predicate id constants
 
 (def ^:const $_previous (iri/iri->sid iri-previous))
