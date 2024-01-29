@@ -10,13 +10,11 @@
             [fluree.db.util.async :refer [<? go-try]]
             #?(:clj  [clojure.core.async :refer [go] :as async]
                :cljs [cljs.core.async :refer [go] :as async])
-            [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.util.log :as log]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.commit-data :as commit-data])
   #?(:clj (:import (java.io Writer))))
 
@@ -115,7 +113,7 @@
 ;; ================ end Jsonld record support fns ============================
 
 (defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot post opst
-                     tspo schema comparators novelty policy ecount context-cache
+                     tspo schema comparators novelty policy context-cache
                      namespaces namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
@@ -159,18 +157,6 @@
                        flake/sorted-set-by)))
     {:size 0} index/types))
 
-(def genesis-ecount {const/$_predicate  (flake/->sid const/$_predicate 1000)
-                     const/$_collection (flake/->sid const/$_collection 19)
-                     const/$_tag        (flake/->sid const/$_tag 1000)
-                     const/$_fn         (flake/->sid const/$_fn 1000)
-                     const/$_user       (flake/->sid const/$_user 1000)
-                     const/$_auth       (flake/->sid const/$_auth 1000)
-                     const/$_role       (flake/->sid const/$_role 1000)
-                     const/$_rule       (flake/->sid const/$_rule 1000)
-                     const/$_setting    (flake/->sid const/$_setting 1000)
-                     const/$_prefix     (flake/->sid const/$_prefix 1000)
-                     const/$_shard      (flake/->sid const/$_shard 1000)})
-
 (defn create
   [{:keys [alias conn] :as ledger}]
   (let [novelty (new-novelty-map index/default-comparators)
@@ -203,6 +189,5 @@
                     :novelty         novelty
                     :policy          root-policy-map
                     :context-cache   (volatile! nil)
-                    :ecount          genesis-ecount
                     :namespaces      iri/default-namespaces
                     :namespace-codes iri/default-namespace-codes})))

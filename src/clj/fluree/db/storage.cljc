@@ -47,7 +47,7 @@
                         (contains? written-node :children) :branch
                         (contains? written-node :flakes) :leaf
                         (contains? written-node :garbage) :garbage
-                        (contains? written-node :ecount) :root)]
+                        (contains? written-node :preds) :root)]
         (async/>! changes-ch {:event     :new-index-file
                               :file-type file-type
                               :data      write-response
@@ -118,16 +118,15 @@
                [])))
 
 (defn write-db-root
-  [db changes-ch custom-ecount]
+  [db changes-ch]
   (go-try
-    (let [{:keys [conn ledger commit t ecount stats spot psot post opst
-                  tspo fork fork-block schema]} db
+    (let [{:keys [conn ledger commit t stats spot psot post opst
+                  tspo fork fork-block]} db
           t'        (- t)
           ledger-alias (:id commit)
           preds     (extract-schema-root db)
           data      {:ledger-alias ledger-alias
                      :t         t'
-                     :ecount    (or custom-ecount ecount)
                      :preds     preds
                      :stats     (select-keys stats [:flakes :size])
                      :spot      (child-data spot)
@@ -177,10 +176,9 @@
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
   [conn blank-db root-data]
-  (let [{:keys [t ecount stats preds]} root-data
+  (let [{:keys [t stats preds]} root-data
         db* (assoc blank-db :t (- t)
                             :preds preds
-                            :ecount ecount
                             :stats (assoc stats :indexed t))]
     (reduce
       (fn [db idx]

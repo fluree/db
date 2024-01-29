@@ -349,7 +349,7 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates
   respective indexes and returns updated db"
-  [conn {:keys [alias ecount t] :as db} merged-db? [commit _proof]]
+  [conn {:keys [alias t] :as db} merged-db? [commit _proof]]
   (go-try
     (let [iri-cache                (volatile! {})
           refs-cache               (volatile! (-> db :schema :refs))
@@ -398,16 +398,11 @@
                                      prev-commit-flakes (into prev-commit-flakes)
                                      prev-db-flakes (into prev-db-flakes)
                                      issuer-flakes  (into issuer-flakes)
-                                     message-flakes (into message-flakes)))
-          ecount*            (assoc ecount
-                                    const/$_predicate pid
-                                    const/$_default sid)]
+                                     message-flakes (into message-flakes)))]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
-      (-> db
-          (assoc :ecount ecount*)
-          (merge-flakes t-new all-flakes)))))
+      (merge-flakes db t-new all-flakes))))
 
 
 (defn trace-commits

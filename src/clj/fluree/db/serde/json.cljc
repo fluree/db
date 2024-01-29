@@ -48,30 +48,15 @@
          :first (some-> child-node :first deserialize-flake)
          :rhs   (some-> child-node :rhs deserialize-flake)))
 
-(defn- deserialize-ecount
-  "Converts ecount from keywordized keys back to integers."
-  [ecount]
-  (reduce-kv
-    (fn [acc k v]
-      (if (keyword? k)
-        (assoc acc (-> k name util/str->int) v)
-        (throw (ex-info (str "Expected serialized ecount values to be keywords, instead found: " ecount)
-                        {:status 500 :error :db/invalid-index}))))
-    {} ecount))
-
 (defn- deserialize-db-root
-  "Assumes all data comes in as keywordized JSON.
-  :ecount will have string keys converted to keywords. Need to re-convert
-  them to integer keys."
+  "Assumes all data comes in as keywordized JSON."
   [db-root]
-  (let [{:keys [spot post opst tspo ecount]} db-root]
+  (let [{:keys [spot post opst tspo]} db-root]
     (assoc db-root
-           :ecount (deserialize-ecount ecount)
            :spot   (deserialize-child-node spot)
            :post   (deserialize-child-node post)
            :opst   (deserialize-child-node opst)
            :tspo   (deserialize-child-node tspo))))
-
 
 (defn- deserialize-branch-node
   [branch]

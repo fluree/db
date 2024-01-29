@@ -436,7 +436,7 @@
 
 (defn refresh
   [indexer
-   {:keys [ecount novelty t ledger-alias] :as db}
+   {:keys [novelty t ledger-alias] :as db}
    {:keys [remove-preds changes-ch]}]
   (go-try
     (let [start-time-ms (util/current-time-millis)
@@ -465,7 +465,7 @@
                        garbage-res   (when (seq garbage)
                                        (<? (storage/write-garbage indexed-db changes-ch garbage)))
                        ;; TODO - WRITE GARBAGE INTO INDEX ROOT!!!
-                       db-root-res   (<? (storage/write-db-root indexed-db changes-ch ecount))
+                       db-root-res   (<? (storage/write-db-root indexed-db changes-ch))
                        index-address (:address db-root-res)
                        index-id      (str "fluree:index:sha256:" (:hash db-root-res))
                        commit-index  (commit-data/new-index (-> indexed-db :commit :data)
