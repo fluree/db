@@ -86,7 +86,7 @@
           "http://www.w3.org/ns/shacl#qualifiedMaxCount"        const/$sh:qualifiedMaxCount
           "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint" const/$sh:qualifiedValueShapesDisjoint
           ;; fluree
-          const/iri-role                                        const/$_role
+          const/iri-role                                        const/$f:role
           const/iri-target-class                                const/$fluree:targetClass}))
 
 (def class-or-property-sid
