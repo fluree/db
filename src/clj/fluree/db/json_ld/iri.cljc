@@ -4,7 +4,7 @@
             [fluree.db.util.bytes :as bytes]
             [clojure.string :as str]
             [clojure.set :refer [map-invert]])
-  (:import (fluree.db SID)))
+  #?(:clj (:import (fluree.db SID))))
 
 #?(:clj (set! *warn-on-reflection* true))
 

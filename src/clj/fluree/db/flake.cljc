@@ -5,7 +5,7 @@
             [fluree.db.util.core :as util]
             [fluree.db.json-ld.iri :as iri]
             #?(:clj [clojure.pprint :as pprint]))
-  (:import (fluree.db SID))
+  #?(:clj (:import (fluree.db SID)))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
