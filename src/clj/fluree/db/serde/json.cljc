@@ -10,12 +10,6 @@
   #?(:clj (:import (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn deserialize-subject
-  [serialized-sid]
-  (let [ns  (nth serialized-sid 0)
-        nme (nth serialized-sid 1)]
-    (iri/append-name-codes [ns] nme)))
-
 (defn deserialize-meta
   [serialized-meta]
   (util/keywordize-keys serialized-meta))
@@ -27,14 +21,14 @@
 (defn deserialize-object
   [serialized-obj dt]
   (if (subject-reference? dt)
-    (deserialize-subject serialized-obj)
+    (iri/deserialize-sid serialized-obj)
     (datatype/coerce serialized-obj dt)))
 
 (defn deserialize-flake
   [flake-vec]
-  (let [s  (-> flake-vec (get flake/subj-pos) deserialize-subject)
-        p  (-> flake-vec (get flake/pred-pos) deserialize-subject)
-        dt (-> flake-vec (get flake/dt-pos) deserialize-subject)
+  (let [s  (-> flake-vec (get flake/subj-pos) iri/deserialize-sid)
+        p  (-> flake-vec (get flake/pred-pos) iri/deserialize-sid)
+        dt (-> flake-vec (get flake/dt-pos) iri/deserialize-sid)
         o  (-> flake-vec (get flake/obj-pos) (deserialize-object dt))
         t  (get flake-vec flake/t-pos)
         op (get flake-vec flake/op-pos)

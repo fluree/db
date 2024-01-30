@@ -106,12 +106,6 @@
        bytes/string->UTF8
        (into [] name-code-xf)))
 
-(defn append-name-codes
-  [ns-sid nme]
-  (into ns-sid
-        name-code-xf
-        (bytes/string->UTF8 nme)))
-
 (defn codes->name
   [nme-codes]
   (->> nme-codes
