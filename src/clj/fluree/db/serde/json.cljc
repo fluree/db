@@ -63,12 +63,6 @@
   [leaf]
   (assoc leaf :flakes (mapv deserialize-flake (:flakes leaf))))
 
-(defn serialize-sid
-  [sid]
-  (let [ns-code (iri/get-ns-code sid)
-        nme     (iri/get-name sid)]
-    [ns-code nme]))
-
 #?(:clj (def ^DateTimeFormatter xsdDateTimeFormatter
           (DateTimeFormatter/ofPattern "uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSS[XXXXX]")))
 
@@ -78,21 +72,13 @@
 #?(:clj (def ^DateTimeFormatter xsdDateFormatter
           (DateTimeFormatter/ofPattern "uuuu-MM-dd[XXXXX]")))
 
-(defn serialize-subject
-  [sid]
-  (serialize-sid sid))
-
-(defn serialize-predicate
-  [pid]
-  (serialize-sid pid))
-
 (defn serialize-object
   "Flakes with time types will have time objects as values.
   We need to serialize these into strings that will be successfully re-coerced into
   the same objects upon loading."
   [val dt]
   (uc/case dt
-    const/$xsd:anyURI    (serialize-subject val)
+    const/$xsd:anyURI    (iri/serialize-sid val)
     const/$xsd:dateTime  #?(:clj (.format xsdDateTimeFormatter val)
                             :cljs (.toJSON val))
     const/$xsd:date      #?(:clj (.format xsdDateFormatter val)
@@ -100,10 +86,6 @@
     const/$xsd:time      #?(:clj (.format xsdTimeFormatter val)
                             :cljs (.toJSON val))
     val))
-
-(defn serialize-datatype
-  [dt]
-  (serialize-sid dt))
 
 (defn serialize-meta
   [m]
@@ -116,10 +98,10 @@
 
   Flakes with an 'm' value need keys converted from keyword keys into strings."
   [flake]
-  (let [s   (-> flake flake/s serialize-subject)
-        p   (-> flake flake/p serialize-predicate)
+  (let [s   (-> flake flake/s iri/serialize-sid)
+        p   (-> flake flake/p iri/serialize-sid)
         dt* (flake/dt flake)
-        dt  (serialize-datatype dt*)
+        dt  (iri/serialize-sid dt*)
         o   (-> flake flake/o (serialize-object dt))
         t   (flake/t flake)
         op  (flake/op flake)
