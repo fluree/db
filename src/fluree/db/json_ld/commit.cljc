@@ -278,6 +278,8 @@
                               (:size stats) (assoc (compact const/iri-size) (:size stats)))
           ;; TODO - this is re-normalized below, can try to do it just once
           dbid        (db-json->db-id (json-ld/normalize-data db-json))
+          _           (log/debug "ledger-update-jsonld @ctx-used-atom:" @ctx-used-atom)
+          _           (log/debug "ledger-update-jsonld refs-ctx*:" refs-ctx*)
           db-json*    (-> db-json
                           (assoc id-key dbid)
                           (log/debug->val "ledger-update-jsonld db-json just prior to @context merge & assoc:")
