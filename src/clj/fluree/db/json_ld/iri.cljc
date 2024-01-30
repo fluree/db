@@ -3,7 +3,8 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.bytes :as bytes]
             [clojure.string :as str]
-            [clojure.set :refer [map-invert]])
+            [clojure.set :refer [map-invert]]
+            #?(:cljs [fluree.db.sid :refer [SID]]))
   #?(:clj (:import (fluree.db SID))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -120,7 +121,8 @@
 
 (defn get-ns-code
   [^SID sid]
-  (.getNamespaceCode sid))
+  #?(:clj (.getNamespaceCode sid)
+     :cljs (:namespace-code sid)))
 
 (defn get-namespace
   ([sid]
@@ -129,20 +131,17 @@
    (let [ns-code (get-ns-code sid)]
      (get namespace-codes ns-code))))
 
-(defn get-name-codes
-  [^SID sid]
-  (into [] (.getNameCodes sid)))
-
 (defn get-name
-  [sid]
-  (->> sid get-name-codes codes->name))
+  [^SID sid]
+  #?(:clj (->> sid .getNameCodes codes->name)
+     :cljs (:name sid)))
 
 (defn deserialize-sid
   [[ns-code nme]]
   (->sid ns-code nme))
 
 (defn serialize-sid
-  [^SID sid]
+  [sid]
   ((juxt get-ns-code get-name) sid))
 
 #?(:clj (defmethod print-method SID [^SID sid ^java.io.Writer w]
@@ -213,7 +212,7 @@
   "Converts an sid back into a string iri."
   ([sid]
    (sid->iri sid default-namespace-codes))
-  ([^SID sid namespace-codes]
+  ([sid namespace-codes]
    (if (= type-sid sid)
      type-iri
      (str (get-namespace sid namespace-codes)
