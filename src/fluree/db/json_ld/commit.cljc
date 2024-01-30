@@ -280,6 +280,7 @@
           dbid        (db-json->db-id (json-ld/normalize-data db-json))
           db-json*    (-> db-json
                           (assoc id-key dbid)
+                          (log/debug->val "ledger-update-jsonld db-json just prior to @context merge & assoc:")
                           (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
       (with-meta db-json* {:dbid dbid}))))
 
