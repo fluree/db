@@ -113,9 +113,9 @@
        bytes/UTF8->string))
 
 (defn ->sid
-  [ns-code name-codes]
+  [ns-code nme]
   (let [ns-int     (int ns-code)
-        name-longs (long-array name-codes)]
+        name-longs (-> nme name->codes long-array)]
     (SID. ns-int name-longs)))
 
 (defn get-ns-code
@@ -139,7 +139,7 @@
 
 (defn deserialize-sid
   [[ns-code nme]]
-  (->sid ns-code (name->codes nme)))
+  (->sid ns-code nme))
 
 (defn serialize-sid
   [^SID sid]
@@ -152,19 +152,19 @@
 
 #?(:clj (defmethod print-dup SID
           [^SID sid ^java.io.Writer w]
-          (let [ns-code    (get-ns-code sid)
-                name-codes (get-name-codes sid)]
-            (.write w (str "#=" `(->sid ~ns-code ~name-codes))))))
+          (let [ns-code (get-ns-code sid)
+                nme     (get-name sid)]
+            (.write w (str "#=" `(->sid ~ns-code ~nme))))))
 
 (defn sid?
   [x]
   (instance? SID x))
 
 (def ^:const min-sid
-  (->sid util/min-integer [0x0000]))
+  (->sid 0 ""))
 
 (def ^:const max-sid
-  (->sid util/max-integer [0xFFFF]))
+  (->sid util/max-integer ""))
 
 (defn iri->sid
   "Converts a string iri into a vector of long integer codes. The first code
@@ -175,8 +175,7 @@
   ([iri namespaces]
    (let [[ns nme] (decompose iri)]
      (when-let [ns-code (get namespaces ns)]
-       (let [name-codes (name->codes nme)]
-         (->sid ns-code name-codes))))))
+       (->sid ns-code nme)))))
 
 (defn next-namespace-code
   [namespaces]
@@ -201,9 +200,8 @@
                                        ns-map
                                        (let [new-ns-code (next-namespace-code ns-map)]
                                          (assoc ns-map ns new-ns-code)))))
-                           (get ns))
-              name-codes (name->codes nme)]
-          (->sid ns-code name-codes)))
+                           (get ns))]
+          (->sid ns-code nme)))
 
       (get-namespaces [_]
         @namespaces))))
