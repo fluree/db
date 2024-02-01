@@ -284,7 +284,8 @@
 (defn cmp-sid
   [^SID sid1 ^SID sid2]
   (if (and sid1 sid2)
-    (SID/compare sid1 sid2)
+    #?(:clj (SID/compare sid1 sid2)
+       :cljs (compare sid1 sid2))
     0))
 
 (defn cmp-subj
