@@ -20,10 +20,8 @@
 (defrecord S3NameService
   [s3-client s3-bucket s3-prefix sync?]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias]
-    (go (s3/s3-address s3-bucket s3-prefix (<! (s3/read-address s3-client s3-bucket s3-prefix ledger-alias)))))
-  (-lookup [_ ledger-alias opts]
-    (go (s3/s3-address s3-bucket s3-prefix (<! (s3/read-address s3-client s3-bucket s3-prefix ledger-alias)))))
+  (-lookup [_ ledger-address]
+    (go (s3/s3-address s3-bucket s3-prefix (<! (s3/read-address s3-client s3-bucket s3-prefix ledger-address)))))
   (-push [_ commit-data] (push s3-client s3-bucket s3-prefix commit-data))
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported S3NameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported S3NameService op: unsubscribe" {})))

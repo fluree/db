@@ -34,11 +34,11 @@
       commit-data)))
 
 (defn lookup
-  [store ledger-alias opts]
-  (go (if-let [head-commit (<! (store/read store ledger-alias))]
+  [store ledger-address]
+  (go (if-let [head-commit (<! (store/read store ledger-address))]
         (-> head-commit (get "address"))
         (throw (ex-info (str "Unable to lookup ledger address from conn: "
-                             ledger-alias)
+                             ledger-address)
                         {:status 500 :error :db/missing-head})))))
 
 (defn ledger-list
@@ -55,8 +55,7 @@
 (defrecord MemoryNameService
   [store sync?]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias] (lookup store ledger-alias nil))
-  (-lookup [_ ledger-alias opts] (lookup store ledger-alias opts))
+  (-lookup [_ ledger-address] (lookup store ledger-address))
   (-push [_ commit-data] (push! store commit-data))
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported MemoryNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported MemoryNameService op: unsubscribe" {})))

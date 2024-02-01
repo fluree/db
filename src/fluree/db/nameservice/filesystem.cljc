@@ -11,14 +11,8 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn address
-  "The ledger's head address."
-  [store ledger-alias {:keys [branch] :as _opts}]
-  (let [branch (if branch (name branch) "main")]
-    (go (store/address store (str ledger-alias "/" branch "/head")))))
-
 (defn push!
-  "Just write to a different directory?"
+  "Writes the commit address to the ledger's head."
   [store {commit-address :address nameservices :ns}]
   (let [my-ns-iri   (some #(when (re-matches #"^fluree:file:.+" (:id %)) (:id %)) nameservices)
         commit-path (:local (store-util/address-parts commit-address))
@@ -32,17 +26,30 @@
                p)
        :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
 
+(defn head
+  "The ledger's head address."
+  [store ledger-alias {:keys [branch] :as _opts}]
+  (let [branch (if branch (name branch) "main")]
+    (store/address store (str ledger-alias "/" branch "/head"))))
+
 (defn lookup
   "Return the head commit address."
-  [store ledger-alias opts]
+  [store ledger-address]
   (go-try
-    (store/address store (<? (store/read store (<? (address store ledger-alias opts)))))))
+    (let [commit-path (<? (store/read store ledger-address))]
+      (store/address store commit-path))))
 
-(defrecord FileNameService
-  [store sync?]
+(defn address->alias
+  [address]
+  ;; TODO: need to validate that the branch doesn't have a slash?
+  (-> (:local (store-util/address-parts address))
+      (str/split #"/")
+      (->> (drop-last 2)                ; branch-name, head
+           (str/join #"/"))))
+
+(defrecord FileNameService [store sync?]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias] (lookup store ledger-alias nil))
-  (-lookup [_ ledger-alias opts] (lookup store ledger-alias opts))
+  (-lookup [_ ledger-address] (lookup store ledger-address))
   (-push [_ commit-data] (go (push! store commit-data)))
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported FileNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported FileNameService op: unsubscribe" {})))
@@ -50,13 +57,8 @@
   (-exists? [nameservice ledger-address] (store/exists? store ledger-address))
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]
-    (address store ledger-alias opts))
-  (-alias [_ ledger-address]
-    ;; TODO: need to validate that the branch doesn't have a slash?
-    (-> (:local (store-util/address-parts ledger-address))
-        (str/split #"/")
-        (->> (drop-last 2) ; branch-name, head
-             (str/join #"/"))))
+    (go (head store ledger-alias opts)))
+  (-alias [_ ledger-address] (address->alias ledger-address))
   (-close [nameservice] true))
 
 (defn initialize
