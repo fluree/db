@@ -813,7 +813,7 @@
                  (testing "queries returning metadata"
                    (let [query* (assoc-in query [:opts :meta] true)
                          sut    (<p! (fluree/query db query*))]
-                     (is (= (dec flake-total) (:fuel sut))
+                     (is (= flake-total (:fuel sut))
                          "Reports that all flakes were traversed"))))
                (testing "short-circuits if request fuel exhausted"
                  (let [query   {:context [test-utils/default-context
