@@ -49,6 +49,7 @@
 
 (defrecord MemoryStore [storage-atom]
   store-proto/Store
+  (address [_ k] (memory-address k))
   (write [_ k v opts] (memory-write storage-atom k v opts))
   (list [_ prefix] (memory-list storage-atom prefix))
   (read [_ address] (memory-read storage-atom address))

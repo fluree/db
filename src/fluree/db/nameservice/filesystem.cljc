@@ -6,48 +6,37 @@
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.string :as str]
             [fluree.db.util.log :as log]
-            [fluree.db.storage :as store]))
+            [fluree.db.storage :as store]
+            [fluree.db.storage.util :as store-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn address-path
-  [address]
-  (let [[_ _ path] (str/split address #":")]
-    path))
-
-(defn file-address
-  "Turn a path or a protocol-relative URL into a fluree file address."
-  [path]
-  (if (str/starts-with? path "//")
-    (str "fluree:file:" path)
-    (str "fluree:file://" path)))
-
 (defn address
-  [ledger-alias {:keys [branch] :as _opts}]
+  "The ledger's head address."
+  [store ledger-alias {:keys [branch] :as _opts}]
   (let [branch (if branch (name branch) "main")]
-    (go (file-address (str ledger-alias "/" branch "/head")))))
+    (go (store/address store (str ledger-alias "/" branch "/head")))))
 
 (defn push!
   "Just write to a different directory?"
   [store {commit-address :address nameservices :ns}]
   (let [my-ns-iri   (some #(when (re-matches #"^fluree:file:.+" (:id %)) (:id %)) nameservices)
-        commit-path (address-path commit-address)
-        head-path   (address-path my-ns-iri)
+        commit-path (:local (store-util/address-parts commit-address))
+        head-path   (:local (store-util/address-parts my-ns-iri))
 
         work        (fn [complete]
                       (store/write store head-path (bytes/string->UTF8 commit-path))
-                      (complete (file-address head-path)))]
+                      (complete (store/address store head-path)))]
     #?(:clj  (let [p (promise)]
                (future (work (partial deliver p)))
                p)
        :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
 
-
 (defn lookup
-  [store ledger-alias {:keys [branch] :or {branch "main"} :as _opts}]
+  "Return the head commit address."
+  [store ledger-alias opts]
   (go-try
-    (file-address (<? (store/read store ledger-alias)))))
-
+    (store/address store (<? (store/read store (<? (address store ledger-alias opts)))))))
 
 (defrecord FileNameService
   [store sync?]
@@ -61,15 +50,14 @@
   (-exists? [nameservice ledger-address] (store/exists? store ledger-address))
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]
-    (address ledger-alias opts))
+    (address store ledger-alias opts))
   (-alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?
-    (-> (address-path ledger-address)
+    (-> (:local (store-util/address-parts ledger-address))
         (str/split #"/")
         (->> (drop-last 2) ; branch-name, head
              (str/join #"/"))))
   (-close [nameservice] true))
-
 
 (defn initialize
   [store]

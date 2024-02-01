@@ -61,6 +61,10 @@
       (throw (ex-info (str "No Store implementation for :store/method: " (pr-str method))
                       config)))))
 
+(defn address
+  [store k]
+  (store-proto/address store k))
+
 (defn write
   ([store k v]
    (store-proto/write store k v nil))

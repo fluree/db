@@ -64,6 +64,7 @@
 
 (defrecord FileStore [storage-path]
   store-proto/Store
+  (address [_ k] (file-address k))
   (write [_ k v opts] (file-write storage-path k v opts))
   (read [_ address] (file-read storage-path address))
   (list [_ prefix] (file-list storage-path prefix))

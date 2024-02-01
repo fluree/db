@@ -9,15 +9,10 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn memory-address
-  "Turn a path into a fluree memory address."
-  [path]
-  (str "fluree:memory://" path))
-
 (defn- address-path
   "Returns the path portion of a Fluree memory address."
   [address]
-  (if-let [[_ path] (re-find #"^fluree:memory://(.+)$" address)]
+  (if-let [path (:local (store-util/address-parts address))]
     path
     (throw (ex-info (str "Incorrectly formatted Fluree memory db address: " address)
                     {:status 500 :error :db/invalid-db}))))
@@ -54,8 +49,8 @@
                        (str/ends-with? % "head"))))))
 
 (defn address
-  [ledger-alias {:keys [branch] :as _opts}]
-  (go (memory-address (str ledger-alias "/" (name branch) "/head"))))
+  [store ledger-alias {:keys [branch] :as _opts}]
+  (go (store/address store (str ledger-alias "/" (name branch) "/head"))))
 
 (defrecord MemoryNameService
   [store sync?]
@@ -69,7 +64,7 @@
   (-exists? [_ ledger-address] (go (boolean (<! (store/read store ledger-address)))))
   (-ledgers [_ opts] (ledger-list store opts))
   (-address [_ ledger-alias opts]
-    (address ledger-alias opts))
+    (address store ledger-alias opts))
   (-alias [_ ledger-address]
     (-> (address-path ledger-address)
         (str/split #"/")
