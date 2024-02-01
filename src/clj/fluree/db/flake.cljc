@@ -535,7 +535,8 @@
   [^Flake f]
   (let [o      (o f)
         dt     (dt f)
-        o-size (util/case+ dt
+        o-size (#?@(:clj (util/case+)
+                    :cljs (condp =)) dt
                  const/$xsd:string (* 2 (count o))
                  const/$xsd:anyURI 8
                  const/$xsd:boolean 1
