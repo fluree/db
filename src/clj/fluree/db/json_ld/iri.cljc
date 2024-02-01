@@ -141,9 +141,8 @@
   [[ns-code nme]]
   (->sid ns-code nme))
 
-(defn serialize-sid
-  [sid]
-  ((juxt get-ns-code get-name) sid))
+(def serialize-sid
+  (juxt get-ns-code get-name))
 
 #?(:clj (defmethod print-method SID [^SID sid ^java.io.Writer w]
           (doto w
