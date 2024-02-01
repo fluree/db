@@ -674,22 +674,22 @@
                   :where   {:id          "?person"
                             :type        :ex/User
                             :schema/name "?name"}}
-        expected #{[:ex/liam "Liam"]
-                   [:ex/cam "Cam"]
-                   [:ex/alice "Alice"]
-                   [:ex/brian "Brian"]}]
+        expected [[:ex/alice "Alice"]
+                  [:ex/brian "Brian"]
+                  [:ex/cam "Cam"]
+                  [:ex/liam "Liam"]]]
     (testing "basic query works"
       #?(:clj
          (let [conn    (test-utils/create-conn)
                ledger  (test-utils/load-people conn)
-               results (set @(fluree/query (fluree/db ledger) query))]
+               results @(fluree/query (fluree/db ledger) query)]
            (is (= expected results)))
          :cljs
          (async done
            (go
              (let [conn    (<! (test-utils/create-conn))
                    ledger  (<! (test-utils/load-people conn))
-                   results (set (<p! (fluree/query (fluree/db ledger) query)))]
+                   results (<p! (fluree/query (fluree/db ledger) query))]
                (is (= expected results))
                (done))))))))
 
