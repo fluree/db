@@ -101,23 +101,24 @@
   (comp (partition-all 8)
         (map bytes/UTF8->long)))
 
-(defn name->codes
-  [nme]
-  (->> nme
-       bytes/string->UTF8
-       (into [] name-code-xf)))
+#?(:clj (defn name->codes
+          [nme]
+          (->> nme
+               bytes/string->UTF8
+               (into [] name-code-xf))))
 
-(defn codes->name
-  [nme-codes]
-  (->> nme-codes
-       (mapcat bytes/long->UTF8)
-       bytes/UTF8->string))
+#?(:clj (defn codes->name
+          [nme-codes]
+          (->> nme-codes
+               (mapcat bytes/long->UTF8)
+               bytes/UTF8->string)))
 
 (defn ->sid
   [ns-code nme]
-  (let [ns-int     (int ns-code)
-        name-longs (-> nme name->codes long-array)]
-    (SID. ns-int name-longs)))
+  (let [ns-int (int ns-code)
+        nme*   #?(:clj (-> nme name->codes long-array)
+                  :cljs nme)]
+    (SID. ns-int nme*)))
 
 (defn get-ns-code
   [^SID sid]
