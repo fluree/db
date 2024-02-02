@@ -98,8 +98,7 @@
                      :schema/name "Alice",
                      :schema/email "alice@foo.bar",
                      :schema/birthDate "2022-08-17",
-                     :schema/ssn "111-11-1111",
-                     :ex/location {:id nil}}]
+                     :schema/ssn "111-11-1111"}]
                    @(fluree/query update-name
                                   {:context context
                                    :select {'?s [:*]}

@@ -244,7 +244,6 @@
                      :schema/email     "alice@flur.ee",
                      :schema/birthDate "2022-08-17",
                      :schema/ssn       "111-11-1111",
-                     :ex/location      {:id nil},
                      :id               :ex/alice}
                     {:type             :ex/User,
                      :schema/name      "John",
