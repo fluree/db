@@ -360,18 +360,15 @@
 
     const/$xsd:date
     (when (string? value)
-      #?(:clj (parse-iso8601-date value)
-         :cljs (js/Date. value)))
+      (parse-iso8601-date value))
 
     const/$xsd:dateTime
     (when (string? value)
-      #?(:clj (parse-iso8601-datetime value)
-         :cljs (js/Date. value)))
+      (parse-iso8601-datetime value))
 
     const/$xsd:time
     (when (string? value)
-      #?(:clj (parse-iso8601-time value)
-         :cljs (js/Date. value)))
+      (parse-iso8601-time value))
 
     const/$xsd:decimal
     (coerce-decimal value)
