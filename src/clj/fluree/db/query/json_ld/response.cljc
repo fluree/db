@@ -140,11 +140,12 @@
 
                                               ;; requested graph crawl depth has not yet been reached
                                               (< depth-i depth)
-                                              (-> (<? (crawl-ref-item db context compact-fn (flake/o f) select-spec cache fuel-vol max-fuel (inc depth-i)))
-                                                  (assoc id-key o-iri))
+                                              (cond-> (<? (crawl-ref-item db context compact-fn (flake/o f) select-spec cache fuel-vol max-fuel (inc depth-i)))
+                                                (<? (validate/allow-iri? db oid)) (assoc id-key o-iri))
 
                                               :else
-                                              {id-key o-iri}))
+                                              (when (<? (validate/allow-iri? db oid))
+                                                {id-key o-iri})))
 
                                           (= const/$rdf:json (flake/dt f))
                                           (json/parse (flake/o f) false)
