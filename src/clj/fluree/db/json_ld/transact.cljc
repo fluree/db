@@ -111,10 +111,10 @@
                          (into-flakeset fuel-tracker error-ch))]
       (async/alt!
         error-ch ([e] e)
-        update-ch ([flakes]
-                   (if (util/exception? flakes)
-                     flakes
-                     [@db-vol flakes]))))))
+        update-ch ([result]
+                   (if (util/exception? result)
+                     result
+                     [@db-vol result]))))))
 
 (defn class-flake?
   [f]
@@ -210,16 +210,11 @@
    (stage db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (go-try
-     (let [ctx           (:context parsed-opts)
-           parsed-txn    (q-parse/parse-txn txn ctx)
-           db*           (if-let [policy-identity (perm/parse-policy-identity parsed-opts ctx)]
-                           (<? (perm/wrap-policy db policy-identity))
-                           db)
-           tx-state      (->tx-state db*)
-           flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
-           fuel-error-ch (:error-ch fuel-tracker)
-           chans         (remove nil? [fuel-error-ch flakes-ch])
-           [flakes]      (alts! chans :priority true)]
-       (when (util/exception? flakes)
-         (throw flakes))
+     (let [ctx        (:context parsed-opts)
+           parsed-txn (q-parse/parse-txn txn ctx)
+           db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts ctx)]
+                        (<? (perm/wrap-policy db policy-identity))
+                        db)
+           tx-state   (->tx-state db*)
+           flakes     (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
        (<? (flakes->final-db tx-state flakes))))))
