@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [go alts!]]
-            [clojure.set :refer [map-invert]]
             [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
@@ -106,17 +105,16 @@
   [db fuel-tracker parsed-txn tx-state]
   (go
     (let [error-ch  (async/chan)
-          sid-gen   (iri/sid-generator! (:namespaces db))
+          db-vol    (volatile! db)
           update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
-                         (update/modify db parsed-txn tx-state sid-gen fuel-tracker error-ch)
+                         (update/modify db-vol parsed-txn tx-state fuel-tracker error-ch)
                          (into-flakeset fuel-tracker error-ch))]
       (async/alt!
         error-ch ([e] e)
         update-ch ([flakes]
                    (if (util/exception? flakes)
                      flakes
-                     (let [nses (iri/get-namespaces sid-gen)]
-                       [nses flakes])))))))
+                     [@db-vol flakes]))))))
 
 (defn class-flake?
   [f]
@@ -174,40 +172,32 @@
                        o-pred-shapes)))
           subj-mods)))))
 
-(defn reset-namespaces
-  [db nses]
-  (let [codes (map-invert nses)]
-    (assoc db
-           :namespaces nses
-           :namespace-codes codes)))
-
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [namespaces new-flakes {:keys [stage-update? db-before policy t] :as _tx-state}]
+  [db new-flakes {:keys [stage-update? policy t] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
-                         (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
+                         (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-          db-after  (-> db-before
+          db-after  (-> db
                         (assoc :policy policy) ;; re-apply policy to db-after
                         (assoc :t t)
                         (commit-data/update-novelty add remove)
                         (commit-data/add-tt-id)
-                        (reset-namespaces namespaces)
                         (vocab/hydrate-schema add))]
       {:add add :remove remove :db-after db-after})))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
   along with performing any final validation and policy enforcement."
-  [tx-state [nses flakes]]
+  [tx-state [db flakes]]
   (go-try
     (let [subj-mods (<? (subject-mods flakes (:db-before tx-state)))
           ;; wrap it in an atom to reuse old validate-rules and policy/allowed? unchanged
           ;; TODO: remove the atom wrapper once subj-mods is no longer shared code
           tx-state* (assoc tx-state :subj-mods (atom subj-mods))]
-      (-> (final-db nses flakes tx-state)
+      (-> (final-db db flakes tx-state)
           <?
           (validate-rules tx-state*)
           <?

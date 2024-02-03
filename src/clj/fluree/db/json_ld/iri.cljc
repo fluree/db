@@ -183,28 +183,6 @@
        (apply max last-default-code)
        inc))
 
-(defprotocol SIDGenerator
-  (generate-sid [g iri])
-  (get-namespaces [g]))
-
-(defn sid-generator!
-  [initial-namespaces]
-  (let [namespaces (volatile! initial-namespaces)]
-    (reify SIDGenerator
-      (generate-sid [_ iri]
-        (let [[ns nme] (decompose iri)
-              ns-code  (-> namespaces
-                           (vswap! (fn [ns-map]
-                                     (if (contains? ns-map ns)
-                                       ns-map
-                                       (let [new-ns-code (next-namespace-code ns-map)]
-                                         (assoc ns-map ns new-ns-code)))))
-                           (get ns))]
-          (->sid ns-code nme)))
-
-      (get-namespaces [_]
-        @namespaces))))
-
 (def type-sid
   (iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))
 
