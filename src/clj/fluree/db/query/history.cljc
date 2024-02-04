@@ -226,9 +226,9 @@
           {:keys [s p o]} (if (= :subject query-type)
                             {:s parsed-query}
                             parsed-query)
-
-          [s p o] [(when s (<? (dbproto/-subid db (json-ld/expand-iri s context) {:strict? true})))
-                   (when p (<? (dbproto/-subid db (json-ld/expand-iri p context) {:strict? true})))
+          nses    (:namespaces db)
+          [s p o] [(when s (iri/iri->sid (json-ld/expand-iri s context) nses))
+                   (when p (iri/iri->sid (json-ld/expand-iri p context) nses))
                    (when o (json-ld/expand-iri o context))]
 
           idx     (index/for-components s p o nil)
