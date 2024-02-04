@@ -9,7 +9,8 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.common :refer [result-af filter-subject]]
             [fluree.db.permissions-validate :as validate :refer [filter-subject-flakes]]
-            [fluree.db.dbproto :as dbproto]))
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -68,20 +69,18 @@
   [db error-ch vars {:keys [o] :as f-where}]
   (log/trace "subjects-id-chan f-where:" f-where)
   (let [return-ch (async/chan)
-        _id-val   (or (:value o)
+        iri       (or (:value o)
                       (get vars (:variable o)))]
-    (when-not _id-val
-      (throw (ex-info (str "When using _id as the predicate, a value must be provided: " f-where)
+    (when-not iri
+      (throw (ex-info (str "No IRI value provided: " f-where)
                       {:status 400 :error :db/invalid-query})))
     (async/go
-      (if (number? _id-val)
-        (async/>! return-ch _id-val)
-        (let [sid (<! (dbproto/-subid db _id-val))]
-          (cond (util/exception? sid)
-                (>! error-ch sid)
+      (let [sid (iri/iri->sid iri (:namespaces db))]
+        (cond (util/exception? sid)
+              (>! error-ch sid)
 
-                (some? sid)
-                (>! return-ch sid))))
+              (some? sid)
+              (>! return-ch sid)))
       (async/close! return-ch))
     return-ch))
 
@@ -91,7 +90,7 @@
   (go-try
     (log/trace "subj-crawl opts:" opts)
     (let [opts*     (assoc opts :vars vars)
-          sid-ch    (if (#{:_id :iri} (:type f-where))
+          sid-ch    (if (#{:iri} (:type f-where))
                       (subjects-id-chan db error-ch vars f-where)
                       (subjects-chan db error-ch vars f-where))
           flakes-af (flakes-xf opts*)
