@@ -3,13 +3,11 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.range :as query-range]
-            [fluree.db.constants :as const]
             [fluree.db.index :as index]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.query.subject-crawl.common :refer [result-af resolve-ident-vars
-                                                          filter-subject]]
+            [fluree.db.query.subject-crawl.common :refer [result-af filter-subject]]
             [fluree.db.permissions-validate :as validate :refer [filter-subject-flakes]]
             [fluree.db.dbproto :as dbproto]))
 
@@ -89,17 +87,13 @@
 
 
 (defn subj-crawl
-  [{:keys [db error-ch f-where limit offset parallelism vars ident-vars
-           finish-fn] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism vars finish-fn] :as opts}]
   (go-try
     (log/trace "subj-crawl opts:" opts)
-    (let [vars*     (if ident-vars
-                      (<? (resolve-ident-vars db vars ident-vars))
-                      vars)
-          opts*     (assoc opts :vars vars*)
+    (let [opts*     (assoc opts :vars vars)
           sid-ch    (if (#{:_id :iri} (:type f-where))
-                      (subjects-id-chan db error-ch vars* f-where)
-                      (subjects-chan db error-ch vars* f-where))
+                      (subjects-id-chan db error-ch vars f-where)
+                      (subjects-chan db error-ch vars f-where))
           flakes-af (flakes-xf opts*)
           offset-xf (if offset
                       (drop offset)

@@ -60,7 +60,7 @@
   (c) filter subjects based on subsequent where clause(s)
   (d) apply offset/limit for (c)
   (e) send result into :select graph crawl"
-  [db {:keys [vars ident-vars where limit offset fuel rel-binding?
+  [db {:keys [vars where limit offset fuel rel-binding?
               order-by opts] :as parsed-query}]
   (log/trace "Running simple subject crawl query:" parsed-query)
   (let [error-ch    (async/chan)
@@ -82,7 +82,6 @@
                      :select-spec   select-spec
                      :error-ch      error-ch
                      :vars          vars
-                     :ident-vars    ident-vars
                      :filter-map    filter-map
                      :limit         (if order-by util/max-long limit) ;; if ordering, limit performed by finish-fn after sort
                      :offset        (if order-by 0 offset)

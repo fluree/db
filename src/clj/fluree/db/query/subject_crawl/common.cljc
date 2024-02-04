@@ -78,26 +78,3 @@
             (comp (drop offset)
                   (take limit))
             sorted))))
-
-(defn resolve-ident-vars
-  "When some variables may be idents (two-tuples) they need to get resolved into
-  subject _id values before executing query."
-  [db vars ident-vars]
-  (go-try
-    (loop [[ident-var & r] ident-vars
-           vars* vars]
-      (if ident-var
-        (let [v (get vars ident-var)]
-          (cond
-            (int? v)
-            (recur r vars*)
-
-            (util/pred-ident? v)
-            (recur r (assoc vars* ident-var (or (<? (dbproto/-subid db v)) 0)))
-
-            :else
-            (throw (ex-info (str "Invalid identity provided in variable: " ident-var
-                                 ". Must be a two-tuple identity, IRI, or integer id. "
-                                 "Provided: " v)
-                            {:status 400 :error :db/invalid-query}))))
-        vars*))))
