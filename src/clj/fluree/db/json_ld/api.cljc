@@ -6,7 +6,7 @@
             [fluree.db.conn.remote :as remote-conn]
             [fluree.json-ld :as json-ld]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
-            [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.query :as query-api]
@@ -331,9 +331,6 @@
 (defn internal-id
   "Returns the internal Fluree integer id for a given IRI.
   This can be used for doing range scans, slices and for other
-  more advanced needs.
-
-  Returns promise"
+  more advanced needs."
   [db iri]
-  (promise-wrap
-    (dbproto/-subid db iri)))
+  (iri/iri->sid iri (:namespaces db)))

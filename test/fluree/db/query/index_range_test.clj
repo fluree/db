@@ -35,7 +35,7 @@
                         :ex/favNums   [5, 10]
                         :ex/friend    [:ex/brian :ex/alice]}]})
           cam-iri (fluree/expand-iri context :ex/cam)
-          cam-sid @(fluree/internal-id db cam-iri)]
+          cam-sid (fluree/internal-id db cam-iri)]
 
       (is (= "http://example.org/ns/cam"
              cam-iri)
@@ -47,7 +47,7 @@
       (testing "Slice operations"
         (testing "Slice for subject id only"
           (let [alice-iri (fluree/expand-iri context :ex/alice)
-                alice-sid @(fluree/internal-id db alice-iri)]
+                alice-sid (fluree/internal-id db alice-iri)]
             (is (= 7
                    (->> @(fluree/slice db :spot [alice-sid])
                         (filterv #(= alice-sid (flake/s %)))
@@ -56,9 +56,9 @@
 
         (testing "Slice for subject + predicate"
           (let [alice-iri   (fluree/expand-iri context :ex/alice)
-                alice-sid   @(fluree/internal-id db alice-iri)
+                alice-sid   (fluree/internal-id db alice-iri)
                 favNums-iri (fluree/expand-iri context :ex/favNums)
-                favNums-pid @(fluree/internal-id db favNums-iri)]
+                favNums-pid (fluree/internal-id db favNums-iri)]
             (is (= [[alice-sid favNums-pid 9 const/$xsd:long 1 true nil]
                     [alice-sid favNums-pid 42 const/$xsd:long 1 true nil]
                     [alice-sid favNums-pid 76 const/$xsd:long 1 true nil]]
@@ -68,9 +68,9 @@
 
         (testing "Slice for subject + predicate + value"
           (let [alice-iri   (fluree/expand-iri context :ex/alice)
-                alice-sid   @(fluree/internal-id db alice-iri)
+                alice-sid   (fluree/internal-id db alice-iri)
                 favNums-iri (fluree/expand-iri context :ex/favNums)
-                favNums-pid @(fluree/internal-id db favNums-iri)]
+                favNums-pid (fluree/internal-id db favNums-iri)]
             (is (= [[alice-sid favNums-pid 42 const/$xsd:long 1 true nil]]
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid 42])
                         (mapv flake/Flake->parts)))
@@ -78,9 +78,9 @@
 
         (testing "Slice for subject + predicate + value + datatype"
           (let [alice-iri   (fluree/expand-iri context :ex/alice)
-                alice-sid   @(fluree/internal-id db alice-iri)
+                alice-sid   (fluree/internal-id db alice-iri)
                 favNums-iri (fluree/expand-iri context :ex/favNums)
-                favNums-pid @(fluree/internal-id db favNums-iri)]
+                favNums-pid (fluree/internal-id db favNums-iri)]
             (is (= [[alice-sid favNums-pid 42 const/$xsd:long 1 true nil]]
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 const/$xsd:long]])
                         (mapv flake/Flake->parts)))
@@ -88,9 +88,9 @@
 
         (testing "Slice for subject + predicate + value + mismatch datatype"
           (let [alice-iri   (fluree/expand-iri context :ex/alice)
-                alice-sid   @(fluree/internal-id db alice-iri)
+                alice-sid   (fluree/internal-id db alice-iri)
                 favNums-iri (fluree/expand-iri context :ex/favNums)
-                favNums-pid @(fluree/internal-id db favNums-iri)]
+                favNums-pid (fluree/internal-id db favNums-iri)]
             (is (= []
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 const/$xsd:string]])
                         (mapv flake/Flake->parts)))
