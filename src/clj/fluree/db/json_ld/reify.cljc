@@ -44,36 +44,27 @@
     :else
     true))
 
-(defn get-iri-sid
-  "Gets the IRI for any existing subject ID."
-  [iri db iris]
-  (go-try
-    (if-let [cached (get @iris iri)]
-      cached
-      ;; TODO following, if a retract was made there could be 2 matching flakes and want to make sure we take the latest .-op = true
-      (when-let [sid (<? (dbproto/-subid db iri))]
-        (vswap! iris assoc iri sid)
-        sid))))
-
 (defn- get-type-retractions
-  [{:keys [db iri-cache sid t]} type]
-  (go-try
-    (if type
-      (loop [[type-item & r] type
-             acc []]
-        (if type-item
-          (let [type-id (or (<? (get-iri-sid type-item db iri-cache))
-                            (throw (ex-info
-                                     (str "Retractions specifies an @type that does not exist: "
-                                          type-item)
-                                     {:status 400 :error :db/invalid-commit})))]
-            (recur r (conj acc (flake/create sid const/$rdf:type type-id
-                                             const/$xsd:anyURI t false nil))))
-          acc))
-      [])))
+  [{:keys [db sid t]} type]
+  (let [nses (:namespaces db)]
+    (into []
+          (map (fn [type-item]
+                 (let [type-sid (iri/iri->sid type-item nses)]
+                   (flake/create sid const/$rdf:type type-sid
+                                 const/$xsd:anyURI t false nil))))
+          type)))
+
+(defn retract-value-map
+  [db sid pid t v-map]
+  (let [ref-id (:id v-map)]
+    (if (and ref-id (node? v-map))
+      (let [ref-sid (iri/iri->sid ref-id (:namespaces db))]
+        (flake/create sid pid ref-sid const/$xsd:anyURI t false nil))
+      (let [[value dt] (datatype/from-expanded v-map nil)]
+        (flake/create sid pid value dt t false nil)))))
 
 (defn- retract-v-maps
-  [{:keys [db sid pid t acc iri-cache]} v-maps]
+  [{:keys [db sid pid t acc]} v-maps]
   (go-try
     (loop [[v-map & r-v-maps] v-maps
            acc* acc]
@@ -81,7 +72,7 @@
 
       (let [ref-id (:id v-map)]
         (cond (and ref-id (node? v-map))
-              (let [ref-sid (<? (get-iri-sid ref-id db iri-cache))
+              (let [ref-sid (iri/iri->sid ref-id (:namespaces db))
                     acc**   (conj acc* (flake/create sid pid ref-sid const/$xsd:anyURI t false nil))]
                 (if (seq r-v-maps)
                   (recur r-v-maps acc**)
@@ -95,21 +86,21 @@
                   acc**)))))))
 
 (defn- retract-node*
-  [{:keys [db type-retractions iri-cache] :as retract-state} node]
+  [{:keys [db sid t type-retractions] :as retract-state} node]
   (go-try
     (loop [[[k v-maps] & r] node
            acc type-retractions]
       (if k
         (if (keyword? k)
           (recur r acc)
-          (let [pid     (or (<? (get-iri-sid k db iri-cache))
+          (let [pid     (or (iri/iri->sid k (:namespaces db))
                             (throw (ex-info (str "Retraction on a property that does not exist: " k)
                                             {:status 400
                                              :error  :db/invalid-commit})))
                 _       (log/trace "retract-node* v-maps:" v-maps)
-                v-maps* (if (sequential? v-maps) v-maps [v-maps])
-                acc*    (<? (retract-v-maps (assoc retract-state :pid pid :acc acc)
-                                            v-maps*))]
+                acc*    (into acc
+                              (map (partial retract-value-map db sid pid t))
+                              (util/sequential v-maps))]
             (recur r acc*)))
         acc))))
 
@@ -117,14 +108,14 @@
   [db node t iri-cache]
   (go-try
     (let [{:keys [id type]} node
-          sid              (or (<? (get-iri-sid id db iri-cache))
+          sid              (or (iri/iri->sid id (:namesaces db))
                                (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
                                                     " at db t value: " t ".")
                                                {:status 400 :error
                                                 :db/invalid-commit})))
           retract-state    {:db db, :iri-cache iri-cache, :sid sid, :t t}
           type-retractions (if (seq type)
-                             (<? (get-type-retractions retract-state type))
+                             (get-type-retractions retract-state type)
                              [])
           retract-state*   (assoc retract-state :type-retractions type-retractions)]
       (<? (retract-node* retract-state* node)))))
