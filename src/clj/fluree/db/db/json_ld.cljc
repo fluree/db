@@ -25,46 +25,6 @@
   {const/iri-view   {:root? true}
    const/iri-modify {:root? true}})
 
-(defn subid
-  "Returns subject ID of ident as async promise channel.
-  Closes channel (nil) if doesn't exist, or if strict? is true, will return exception."
-  [db ident {:keys [strict?]}]
-  (let [return-chan (async/promise-chan)]
-    (go
-      (try*
-        (let [res (cond (iri/sid? ident)
-                        (if (not-empty (<? (query-range/index-range db :spot = [ident])))
-                          ident
-                          (throw (ex-info (str "ident does not exist:" ident)
-                                          {})))
-
-                        ;; assume iri
-                        (string? ident)
-                        (iri/iri->sid ident (:namespaces db))
-
-                        :else
-                        (throw (ex-info (str "Entid lookup must be a valid iri " (pr-str ident))
-                                        {:status 400
-                                         :error  :db/invalid-ident})))]
-          (cond
-            res
-            (async/put! return-chan res)
-
-            (and (nil? res) strict?)
-            (async/put! return-chan
-                        (ex-info (str "Subject identity does not exist: " (pr-str ident))
-                                 {:status 400 :error :db/invalid-subject}))
-
-            :else
-            (async/close! return-chan)))
-
-        (catch* e
-                (async/put! return-chan
-                            (ex-info (str "Error looking up subject id: " (pr-str ident))
-                                     {:status 400 :error :db/invalid-subject}
-                                     e)))))
-    return-chan))
-
 (defn class-ids
   "Returns list of class-ids for given subject-id"
   [db subject-id]
@@ -122,8 +82,6 @@
       (get @(:subclasses schema) class)
       (get-in schema [:pred class property])))
   (-p-prop [this property predicate] (jsonld-p-prop this property predicate))
-  (-subid [this ident] (subid this ident {:strict? false :expand? true}))
-  (-subid [this ident opts] (subid this ident opts))
   (-class-ids [this subject] (class-ids this subject))
   (-query [this query-map]
     (fql/query this query-map))
