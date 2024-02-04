@@ -106,7 +106,7 @@
   :eastwood
   {:extra-deps  {jonase/eastwood {:mvn/version "1.4.2"}}
    :main-opts   ["-m" "eastwood.lint"
-                 {:source-paths ["src" "src-docs"]
+                 {:source-paths ["src/clj" "src-docs"]
                   :test-paths   ["test"]
                   ;; TODO: Un-exclude this when it stops triggering false
                   ;;       positives on "UnsupportedOperationException empty is
