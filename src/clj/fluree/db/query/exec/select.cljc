@@ -166,7 +166,7 @@
                            (-> solution
                                (get subj)
                                (where/get-sid db-alias))
-                           (<? (dbproto/-subid db subj false)))]
+                           (iri/iri->sid subj (:namespaces db)))]
             (let [flakes (<? (query-range/index-range db :spot = [sid]))]
               ;; TODO: Replace these nils with fuel values when we turn fuel back on
               (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))))
