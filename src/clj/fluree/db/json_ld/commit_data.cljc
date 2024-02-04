@@ -433,7 +433,7 @@
   load."
   [db t commit-sid previous-id]
   (go-try
-    (let [prev-sid (<? (dbproto/-subid db previous-id))]
+    (let [prev-sid (iri/iri->sid previous-id (:namespaces db))]
       [(flake/create commit-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
 
 (defn prev-data-flakes
@@ -443,7 +443,7 @@
   reifying a ledger from storage on load."
   [db db-sid t prev-data-id]
   (go-try
-    (let [prev-sid (<? (dbproto/-subid db prev-data-id))]
+    (let [prev-sid (iri/iri->sid prev-data-id (:namespaces db))]
       [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
 
 (defn issuer-flakes
@@ -455,7 +455,7 @@
   ledger value and when reifying a ledger from storage on load."
   [db t commit-sid issuer-iri]
   (go-try
-    (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
+    (if-let [issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
       ;; create reference to existing issuer
       [(flake/create commit-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true
                      nil)]
