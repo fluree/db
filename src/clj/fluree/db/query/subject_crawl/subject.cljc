@@ -64,8 +64,8 @@
 
 
 (defn subjects-id-chan
-  "For queries that specify _id as the predicate, we will have a
-  single subject as a value."
+  "For queries that specify an explicit iri as node id, we will have a single
+  subject as a value."
   [db error-ch vars {:keys [o] :as f-where}]
   (log/trace "subjects-id-chan f-where:" f-where)
   (let [return-ch (async/chan)
