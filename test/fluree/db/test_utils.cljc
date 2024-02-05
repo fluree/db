@@ -1,8 +1,10 @@
 (ns fluree.db.test-utils
-  (:require [fluree.db.did :as did]
+  (:require [clojure.core.async :as async]
+            [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
+            [fluree.db.json-ld.commit :as commit]
             #?@(:cljs [[clojure.core.async :refer [go go-loop]]
                        [clojure.core.async.interop :refer [<p!]]])))
 
@@ -192,6 +194,10 @@
         (if (and (< db-t t) (pos-int? attempts-left))
           (recur (- attempts-left attempts-per-batch))
           ledger)))))
+
+(defn force-index!
+  [db]
+  (commit/run-index db {:branch (:branch db)} (async/chan)))
 
 (defn retry-exists?
   "Retry calling exists? until it returns true or max-attempts."
