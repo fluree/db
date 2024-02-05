@@ -329,7 +329,11 @@
           alias    (if address?
                      (alias-from-address alias-or-address)
                      alias-or-address)
-          [not-cached? ledger-chan] (register-ledger conn alias)] ;; holds final cached ledger in a promise-chan avoid race conditions]
+          _ (when-not alias
+              (throw (ex-info (str "Unable to load. Unable to parse ledger's alias from: " alias-or-address)
+                              {:status 400 :error :db/invalid-alias})))
+          [not-cached? ledger-chan] (register-ledger conn alias)] ;; holds final cached ledger in a promise-chan avoid race conditions
+
       (if not-cached?
         (let [address (if address?
                         alias-or-address
