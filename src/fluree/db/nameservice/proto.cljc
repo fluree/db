@@ -13,6 +13,6 @@
   (-close [nameservice] "Closes all resources for this nameservice")
 
   (-alias [nameservice ledger-address] "Given a ledger address, returns ledger's default alias name else nil, if not avail")
-  (-address [nameservice ledger-alias key] "Returns address/iri for provided ledger alias specific to the connection type"))
+  (-address [nameservice ledger-alias key] "Returns address/iri that can be used to lookup latest ledger details. By returning nil, indicates nameservice is private and not to publish in the commit."))
 
 
