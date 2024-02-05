@@ -1,8 +1,8 @@
 (ns fluree.db.conn.ipfs
   (:require [fluree.db.storage :as storage]
+            [clojure.string :as str]
             [fluree.db.index :as index]
-            [fluree.db.util.context :as ctx-util]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
