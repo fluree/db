@@ -158,7 +158,7 @@
   (->> nodes
        (map :t)
        (some (fn [node-t]
-               (> t node-t)))                               ; t gets smaller as it moves forward!
+               (< t node-t)))
        boolean))
 
 (defn update-branch
