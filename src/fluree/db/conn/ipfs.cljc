@@ -115,6 +115,18 @@
   (ns-ipns/initialize ipfs-endpoint ipns-profile))
 
 
+(defn validate-http-url
+  "Tests that URL starts with http:// or https://, returns exception or
+  original url if passes. Appends a '/' at the end if not already present."
+  [url]
+  (if (and (string? url)
+           (re-matches #"^https?://(.*)" url))
+    (if (str/ends-with? url "/")
+      url
+      (str url "/"))
+    (throw (ex-info (str "Invalid IPFS endpoint: " url)
+                    {:status 400 :error :db/invalid-ipfs-endpoint}))))
+
 (defn connect
   "Creates a new IPFS connection."
   [{:keys [server parallelism lru-cache-atom memory ipns defaults serializer nameservices]
@@ -122,7 +134,8 @@
            serializer (json-serde)
            ipns       "self"}}]
   (go-try
-    (let [ipfs-endpoint   (or server "http://127.0.0.1:5001/") ;; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
+    (let [ipfs-endpoint   (-> (or server "http://127.0.0.1:5001/")
+                              validate-http-url)
           ledger-defaults (ledger-defaults defaults)
           memory          (or memory 1000000) ;; default 1MB memory
           conn-id         (str (random-uuid))
