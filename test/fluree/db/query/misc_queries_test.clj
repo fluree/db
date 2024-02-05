@@ -3,36 +3,7 @@
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util]
-            [fluree.db.json-ld.iri :as iri]
             [test-with-files.tools :refer [with-tmp-dir]]))
-
-(deftest ^:integration select-sid
-  (testing "Select index's subject id in query using special keyword"
-    (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/subid")
-          db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee"
-                                 test-utils/default-context
-                                 {:ex "http://example.org/ns/"}]
-                     "insert"
-                     {:graph [{:id          :ex/alice,
-                               :type        :ex/User,
-                               :schema/name "Alice"}
-                              {:id           :ex/bob,
-                               :type         :ex/User,
-                               :schema/name  "Bob"
-                               :ex/favArtist {:id          :ex/picasso
-                                              :schema/name "Picasso"}}]}})]
-      (is (->> @(fluree/query db {:context [test-utils/default-context
-                                            {:ex "http://example.org/ns/"}]
-                                  :select  {'?s [:_id {:ex/favArtist [:_id ]}]}
-                                  :where   {:id '?s, :type :ex/User}})
-               (reduce (fn [sids {:keys [_id] :as node}]
-                         (cond-> (conj sids _id)
-                           (:ex/favArtist node) (conj (:_id (:ex/favArtist node)))))
-                       [])
-               (every? iri/sid?))))))
 
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)

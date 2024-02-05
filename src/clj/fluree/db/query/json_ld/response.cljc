@@ -74,7 +74,7 @@
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
-  [db cache context compact-fn fuel-vol max-fuel {:keys [wildcard? _id? depth reverse] :as select-spec} depth-i s-flakes]
+  [db cache context compact-fn fuel-vol max-fuel {:keys [wildcard? depth reverse] :as select-spec} depth-i s-flakes]
   (go-try
     (when (not-empty s-flakes)
       (let [sid           (->> s-flakes first flake/s)
@@ -85,8 +85,7 @@
                               {(compact-fn const/iri-id) iri})
                             {})]
         (loop [[p-flakes & r] (partition-by flake/p s-flakes)
-               acc            (cond-> initial-attrs
-                                _id? (assoc :_id sid))]
+               acc             initial-attrs]
           (if p-flakes
             (let [ff    (first p-flakes)
                   p     (flake/p ff)

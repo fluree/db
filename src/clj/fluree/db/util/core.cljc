@@ -149,13 +149,6 @@
   (string? x))
 
 
-(defn subj-ident?
-  "Tests if an _id is a numeric or predicate-ident"
-  [x]
-  (or (int? x)
-      (pred-ident? x)))
-
-
 (defn str->int
   "Converts string to integer. Assumes you've already verified the string is
   parsable to an integer."

@@ -420,9 +420,6 @@
        (#{"*" :* '*} select-item)
        (assoc acc :wildcard? true)
 
-       (#{"_id" :_id} select-item)
-       (assoc acc :_id? true)
-
        :else
        (let [iri  (json-ld/expand-iri select-item context)
              spec {:iri iri, :as select-item}]
