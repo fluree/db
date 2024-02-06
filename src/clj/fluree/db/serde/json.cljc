@@ -102,7 +102,7 @@
         p   (-> flake flake/p iri/serialize-sid)
         dt* (flake/dt flake)
         dt  (iri/serialize-sid dt*)
-        o   (-> flake flake/o (serialize-object dt))
+        o   (-> flake flake/o (serialize-object dt*))
         t   (flake/t flake)
         op  (flake/op flake)
         m   (-> flake flake/m serialize-meta)]
