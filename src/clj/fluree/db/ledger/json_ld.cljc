@@ -1,5 +1,5 @@
 (ns fluree.db.ledger.json-ld
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.flake :as flake]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
@@ -273,7 +273,7 @@
   (go-try
     (let [[not-cached? ledger-chan] (register-ledger conn ledger-alias)] ;; holds final cached ledger in a promise-chan avoid race conditions
       (if not-cached?
-        (let [ledger (async/<! (create* conn ledger-alias opts))]
+        (let [ledger (<! (create* conn ledger-alias opts))]
           (when (util/exception? ledger)
             (release-ledger conn ledger-alias))
           (async/put! ledger-chan ledger)
@@ -291,7 +291,7 @@
            (some #(ns-proto/-alias % db-alias)))))
 
 ;; TODO - once we have a different delimiter than `/` for branch/t-value this can simplified
-(defn alias-from-address
+(defn address->alias
   [address]
   (when-let [path (->> address
                        (re-matches #"^fluree:[^:]+://(.*)$")
@@ -301,7 +301,7 @@
       path)))
 
 (defn load*
-  [conn address]
+  [conn ledger-chan address]
   (go-try
     (let [commit-addr  (<? (nameservice/lookup-commit conn address nil))
           _            (when-not commit-addr
@@ -319,30 +319,43 @@
           db           (ledger-proto/-db ledger)
           db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
       (ledger-proto/-commit-update ledger branch db*)
-      (nameservice/subscribe-ledger conn ledger-alias) ;; async in background, elect to receive update notifications
+      (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
+      (async/put! ledger-chan ledger) ; note, ledger can be an exception!
       ledger)))
+
+(def fluree-address-prefix
+  "fluree:")
+
+(defn fluree-address?
+  [x]
+  (str/starts-with? x fluree-address-prefix))
+
+(defn load-address
+  [conn address]
+  (go-try
+    (let [alias (address->alias address)
+          [not-cached? ledger-chan] (register-ledger conn alias)]
+      (if not-cached?
+        (<? (load* conn ledger-chan address))
+        (<? ledger-chan)))))
+
+(defn load-alias
+  [conn alias]
+  (go-try
+    (let [[not-cached? ledger-chan] (register-ledger conn alias)]
+      (if not-cached?
+        (let [address (<! (nameservice/primary-address conn alias nil))]
+          (if (util/exception? address)
+            (do (release-ledger conn alias)
+                (async/put! ledger-chan
+                            (ex-info (str "Load for " alias " failed due to failed address lookup.")
+                                     {:status 400 :error :db/invalid-address}
+                                     address)))
+            (<? (load* conn ledger-chan address))))
+        (<? ledger-chan)))))
 
 (defn load
   [conn alias-or-address]
-  (async/go
-    (let [address? (str/starts-with? alias-or-address "fluree:")
-          alias    (if address?
-                     (alias-from-address alias-or-address)
-                     alias-or-address)
-          [not-cached? ledger-chan] (register-ledger conn alias)] ;; holds final cached ledger in a promise-chan avoid race conditions]
-      (if not-cached?
-        (let [address (if address?
-                        alias-or-address
-                        (async/<! (nameservice/primary-address conn alias-or-address nil)))]
-          (if (util/exception? address)
-            (do
-              (release-ledger conn alias)
-              (async/put! ledger-chan
-                          (ex-info (str "Load for " alias-or-address " failed due to exception in address lookup.")
-                                   {:status 400 :error :db/invalid-address}
-                                   address)))
-            (let [ledger (async/<! (load* conn address))]
-              ;; note, ledger can be an exception!
-              (async/put! ledger-chan ledger)
-              ledger)))
-        (<? ledger-chan)))))
+  (if (fluree-address? alias-or-address)
+    (load-address conn alias-or-address)
+    (load-alias conn alias-or-address)))
