@@ -81,7 +81,7 @@
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
-  [branch-data db force?]
+  [branch-data db]
   (let [{db-commit :commit, db-t :t} db
         {branch-commit :commit} branch-data
         ledger-t       (commit-data/t branch-commit)
