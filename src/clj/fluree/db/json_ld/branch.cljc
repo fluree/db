@@ -83,12 +83,14 @@
   't' should be the same (if just updating an index) or after the db's 't' value."
   [branch-data db]
   (let [{db-commit :commit, db-t :t} db
-        {branch-commit :commit} branch-data
-        ledger-t       (commit-data/t branch-commit)
-        commit-t       (commit-data/t db-commit)
+        {branch-commit :commit}      branch-data
+
+        ledger-t (commit-data/t branch-commit)
+        commit-t (commit-data/t db-commit)
+
         _              (when-not (= db-t commit-t)
                          (throw (ex-info (str "Unexpected Error. Db's t value and commit's t value are not the same: "
-                                              (- db-t) " and " commit-t " respectively.")
+                                              db-t " and " commit-t " respectively.")
                                          {:status 500 :error :db/invalid-db})))
         updated-index? (not= (commit-data/index-t branch-commit)
                              (commit-data/index-t db-commit))
