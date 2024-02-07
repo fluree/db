@@ -66,11 +66,11 @@
 (defrecord IpnsNameService
   [ipfs-endpoint ipns-key base-address sync?]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias] (lookup-address ipfs-endpoint ledger-alias nil))
-  (-lookup [_ ledger-alias opts] (lookup-address ipfs-endpoint ledger-alias opts))
+  (-lookup [_ ledger-address] (lookup-address ipfs-endpoint ledger-address nil))
+  (-lookup [_ ledger-address opts] (lookup-address ipfs-endpoint ledger-address opts))
   (-push [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
-  (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported IpfsNameService op: subscribe" {})))
-  (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported IpfsNameService op: unsubscribe" {})))
+  (-subscribe [nameservice ledger-address callback] (throw (ex-info "Unsupported IpfsNameService op: subscribe" {})))
+  (-unsubscribe [nameservice ledger-address] (throw (ex-info "Unsupported IpfsNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
   (-exists? [_ ledger-address] (address-exists? ipfs-endpoint ledger-address))
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))

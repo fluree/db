@@ -48,23 +48,22 @@
       commit-data)))
 
 (defn lookup
-  [data-atom ledger-alias opts]
+  [data-atom ledger-address opts]
   (go #?(:clj
-         (if-let [head-commit (read-address data-atom ledger-alias)]
+         (if-let [head-commit (read-address data-atom ledger-address)]
            (-> head-commit (get "address"))
-           (throw (ex-info (str "Unable to lookup ledger address from conn: "
-                                ledger-alias)
+           (throw (ex-info (str "Unable to lookup ledger address: " ledger-address)
                            {:status 500 :error :db/missing-head})))
 
          :cljs
          (if platform/BROWSER
-           (if-let [head-commit (read-address data-atom ledger-alias)]
+           (if-let [head-commit (read-address data-atom ledger-address)]
              (memory-address head-commit)
              (throw (ex-info (str "Unable to lookup ledger address from localStorage: "
-                                  ledger-alias)
+                                  ledger-address)
                              {:status 500 :error :db/missing-head})))
            (throw (ex-info (str "Cannot lookup ledger address with memory connection: "
-                                ledger-alias)
+                                ledger-address)
                            {:status 500 :error :db/invalid-ledger}))))))
 
 (defn ledger-list
@@ -78,11 +77,11 @@
 (defrecord MemoryNameService
   [state-atom sync?]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias] (lookup state-atom ledger-alias nil))
-  (-lookup [_ ledger-alias opts] (lookup state-atom ledger-alias opts))
+  (-lookup [_ ledger-address] (lookup state-atom ledger-address nil))
+  (-lookup [_ ledger-address opts] (lookup state-atom ledger-address opts))
   (-push [_ commit-data] (push! state-atom commit-data))
-  (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported MemoryNameService op: subscribe" {})))
-  (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported MemoryNameService op: unsubscribe" {})))
+  (-subscribe [nameservice ledger-address callback] (throw (ex-info "Unsupported MemoryNameService op: subscribe" {})))
+  (-unsubscribe [nameservice ledger-address] (throw (ex-info "Unsupported MemoryNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
   (-exists? [_ ledger-address] (go (boolean (read-address state-atom ledger-address))))
   (-ledgers [_ opts] (ledger-list state-atom opts))

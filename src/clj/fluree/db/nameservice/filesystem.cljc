@@ -62,19 +62,19 @@
 
 
 (defn lookup
-  [local-path ledger-alias {:keys [branch] :or {branch "main"} :as _opts}]
+  [local-path ledger-address {:keys [branch] :or {branch "main"} :as _opts}]
   (go-try
-    (file-address (read-address local-path ledger-alias))))
+    (file-address (read-address local-path ledger-address))))
 
 
 (defrecord FileNameService
   [local-path sync?]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias] (lookup local-path ledger-alias nil))
-  (-lookup [_ ledger-alias opts] (lookup local-path ledger-alias opts))
+  (-lookup [_ ledger-address] (lookup local-path ledger-address nil))
+  (-lookup [_ ledger-address opts] (lookup local-path ledger-address opts))
   (-push [_ commit-data] (go (push! local-path commit-data)))
-  (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported FileNameService op: subscribe" {})))
-  (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported FileNameService op: unsubscribe" {})))
+  (-subscribe [nameservice ledger-address callback] (throw (ex-info "Unsupported FileNameService op: subscribe" {})))
+  (-unsubscribe [nameservice ledger-address] (throw (ex-info "Unsupported FileNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
   (-exists? [nameservice ledger-address] (go (address-path-exists? local-path ledger-address)))
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
