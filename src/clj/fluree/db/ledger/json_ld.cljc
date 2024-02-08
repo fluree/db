@@ -66,7 +66,8 @@
     (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                          "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
                     {:status 400 :error :db/invalid-branch})))
-  (-> (swap! state update-in [:branches branch-name] branch/update-commit db)
+  (-> state
+      (swap! update-in [:branches branch-name] branch/update-commit db)
       (get-in [:branches branch-name :commit-db])))
 
 (defn status
@@ -130,20 +131,21 @@
                         (get-first const/iri-data)
                         (get-first-value const/iri-t))
           latest-db (ledger-proto/-db ledger {:branch branch})
-          latest-t  (- (:t latest-db))]
+          latest-t  (:t latest-db)
+          next-t    (inc latest-t)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
                  "where current cached db t value is:" latest-t)
       ;; note, index updates will have same t value as current one, so still need to check if t = latest-t
       (cond
 
-        (= commit-t (inc latest-t))
+        (= commit-t next-t)
         (let [updated-db  (<? (jld-reify/merge-commit conn latest-db false [commit proof]))
               commit-map  (commit-data/json-ld->map commit (select-keys updated-db index/types))
               updated-db* (assoc updated-db :commit commit-map)]
           (commit-update ledger branch updated-db*))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
-        (> commit-t (inc latest-t))
+        (> commit-t next-t)
         (do
           (log/debug "Received commit update that is more than 1 ahead of current ledger state. "
                      "Will dump in-memory ledger and force a reload: " (:alias ledger))
@@ -305,7 +307,7 @@
           _            (when-not commit-addr
                          (throw (ex-info (str "Unable to load. No commit exists for: " address)
                                          {:status 400 :error :db/invalid-commit-address})))
-          [commit _] (<? (jld-reify/read-commit conn commit-addr))
+          [commit _]   (<? (jld-reify/read-commit conn commit-addr))
           _            (when-not commit
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
                                          {:status 400 :error :db/invalid-db})))
