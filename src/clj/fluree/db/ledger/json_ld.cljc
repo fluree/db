@@ -157,8 +157,7 @@
                     " however, latest-t is more current: " latest-t)
           false)))))
 
-(defrecord JsonLDLedger [id address alias did indexer
-                         state cache conn method]
+(defrecord JsonLDLedger [id address alias did indexer state cache conn method]
   ledger-proto/iCommit
   (-commit! [ledger db] (commit! ledger db nil))
   (-commit! [ledger db opts] (commit! ledger db opts))
@@ -324,12 +323,11 @@
 
 (defn load-address
   [conn address]
-  (go-try
-    (let [alias (address->alias address)
-          [not-cached? ledger-chan] (register-ledger conn alias)]
-      (if not-cached?
-        (<? (load* conn ledger-chan address))
-        (<? ledger-chan)))))
+  (let [alias (address->alias address)
+        [not-cached? ledger-chan] (register-ledger conn alias)]
+    (if not-cached?
+      (load* conn ledger-chan address)
+      ledger-chan)))
 
 (defn load-alias
   [conn alias]
