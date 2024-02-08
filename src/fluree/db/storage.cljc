@@ -37,7 +37,7 @@
    BaseConfig
    [:map
     [:store/method [:enum :ipfs]]
-    [:ipfs-store/server :string]]])
+    [:ipfs-store/server {:optional true} [:maybe :string]]]])
 
 (def StoreConfig
   [:or

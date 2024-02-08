@@ -17,7 +17,16 @@
 (defn ipfs-write
   [ipfs-endpoint k v _]
   (go-try
-    (let [{:keys [hash size]} (<? (ipfs/add ipfs-endpoint k (json-ld/normalize-data v)))]
+    (let [content (if (string? v)
+                    v
+                    (json-ld/normalize-data v))
+
+          {:keys [hash size] :as res} (<? (ipfs/add ipfs-endpoint k content))]
+      (when-not size
+        (throw
+          (ex-info
+            "IPFS publish error, unable to retrieve IPFS name."
+            {:status 500 :error :db/push-ipfs :result res})))
       {:k hash
        :hash hash
        :address (ipfs-address hash)
@@ -25,7 +34,13 @@
 
 (defn ipfs-read
   [ipfs-endpoint address]
-  (let [ipfs-path (:local (store-util/address-parts address))]
+
+  (let [{:keys [ns local method]} (store-util/address-parts address)
+        ipfs-path              (str "/" method "/" local)]
+    (when-not (and (= "fluree" ns)
+                   (#{"ipfs" "ipns"} method))
+      (throw (ex-info (str "Invalid file type or method: " address)
+                      {:status 500 :error :db/invalid-address})))
     (ipfs/cat ipfs-endpoint ipfs-path false)))
 
 (defn ipfs-exists?
@@ -39,15 +54,16 @@
           (throw resp))
         (boolean resp)))))
 
-(defrecord IpfsStore [ipfs-endpoint]
+(defrecord IpfsStore [ipfs-endpoint ipns]
   store-proto/Store
-  (write [_ k v opts] (ipfs-write k v opts))
+  (address [_ k] (ipfs-address k))
+  (write [_ k v opts] (ipfs-write ipfs-endpoint k v opts))
   (list [_ prefix] (throw (ex-info "Unsupported operation IpfsStore method: list." {:prefix prefix})))
   (exists? [_ address] (ipfs-exists? ipfs-endpoint address))
   (read [_ address] (ipfs-read ipfs-endpoint address))
   (delete [_ address] (throw (ex-info "Unsupported operation IpfsStore method: delete." {:address address}))))
 
 (defn create-ipfs-store
-  [{:keys [:ipfs-store/server] :as config}]
+  [{:keys [:ipfs-store/server :ipfs-store/ipns] :as config}]
   (map->IpfsStore {:config config
-                   :ipfs-endpoint server}))
+                   :ipfs-endpoint (or server "http://127.0.0.1:5001/")}))

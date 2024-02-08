@@ -72,11 +72,12 @@
                                           {:status 500 :error :db/invalid-configuration})))
 
           store   (store/start (cond->  {:store/method method*}
+                                 (= method :ipfs) (assoc :ipfs-store/server (:server opts*))
                                  (= method :file) (assoc :file-store/storage-path (or (:storage-path opts*)
                                                                                       "data/ledger"))))]
       (case method*
         :remote (remote-conn/connect opts*)
-        :ipfs (ipfs-conn/connect opts*)
+        :ipfs (ipfs-conn/connect (assoc opts* :store store))
         :file (if platform/BROWSER
                 (throw (ex-info "File connection not supported in the browser" opts))
                 (file-conn/connect (assoc opts* :store store)))
