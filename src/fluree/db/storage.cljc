@@ -5,6 +5,7 @@
             [fluree.db.storage.ipfs :as ipfs-store]
             [fluree.db.storage.localstorage :as localstorage-store]
             [fluree.db.storage.memory :as mem-store]
+            #?(:clj [fluree.db.storage.s3 :as s3-store])
             [malli.core :as m]))
 
 
@@ -39,12 +40,22 @@
     [:store/method [:enum :ipfs]]
     [:ipfs-store/server {:optional true} [:maybe :string]]]])
 
+(def S3Config
+  [:and
+   BaseConfig
+   [:map
+    [:store/method [:enum :s3]]
+    [:s3-store/endpoint {:optional true} :string]
+    [:s3-store/bucket :string]
+    [:s3-store/prefix :string]]])
+
 (def StoreConfig
   [:or
    FileConfig
    LocalStorageConfig
    MemoryConfig
-   IpfsConfig])
+   IpfsConfig
+   S3Config])
 
 (defn start
   [{:keys [:store/method] :as config}]
@@ -57,6 +68,10 @@
       :ipfs         (ipfs-store/create-ipfs-store config)
       :localstorage (localstorage-store/create-localstorage-store config)
       :memory       (mem-store/create-memory-store config)
+      :s3           #?(:clj (s3-store/create-s3-store config)
+                       :cljs (throw (ex-info "S3 storage not supported in ClojureScript."
+                                             {:status 400, :error :store/unsupported-method})))
+
 
       (throw (ex-info (str "No Store implementation for :store/method: " (pr-str method))
                       config)))))

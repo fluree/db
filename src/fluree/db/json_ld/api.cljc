@@ -74,7 +74,11 @@
           store   (store/start (cond->  {:store/method method*}
                                  (= method :ipfs) (assoc :ipfs-store/server (:server opts*))
                                  (= method :file) (assoc :file-store/storage-path (or (:storage-path opts*)
-                                                                                      "data/ledger"))))]
+                                                                                      "data/ledger"))
+                                 (= method :s3)   (-> (assoc :s3-store/bucket (:s3-bucket opts*))
+                                                      (assoc :s3-store/prefix (:s3-prefix opts*))
+                                                      (cond-> (:s3-endpoint opts*)
+                                                        (assoc :s3-store/endpoint (:s3-endpoint opts*))))))]
       (case method*
         :remote (remote-conn/connect opts*)
         :ipfs (ipfs-conn/connect (assoc opts* :store store))
@@ -82,7 +86,7 @@
                 (throw (ex-info "File connection not supported in the browser" opts))
                 (file-conn/connect (assoc opts* :store store)))
         :memory (memory-conn/connect (assoc opts* :store store))
-        :s3     #?(:clj  (s3-conn/connect opts*)
+        :s3     #?(:clj  (s3-conn/connect (assoc opts* :store store))
                    :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
                                          {:status 400, :error :db/unsupported-operation})))))))
 
