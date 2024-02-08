@@ -43,7 +43,7 @@
                           hash ".json")
 
           {:keys [k hash v address]} (<? (store/write store path bytes))]
-      {:name    hash
+      {:name    path
        :hash    hash
        :json    json
        :size    (count json)
