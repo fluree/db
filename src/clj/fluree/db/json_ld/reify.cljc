@@ -63,28 +63,6 @@
       (let [[value dt] (datatype/from-expanded v-map nil)]
         (flake/create sid pid value dt t false nil)))))
 
-(defn- retract-v-maps
-  [{:keys [db sid pid t acc]} v-maps]
-  (go-try
-    (loop [[v-map & r-v-maps] v-maps
-           acc* acc]
-      (log/trace "retract v-map:" v-map)
-
-      (let [ref-id (:id v-map)]
-        (cond (and ref-id (node? v-map))
-              (let [ref-sid (iri/iri->sid ref-id (:namespaces db))
-                    acc**   (conj acc* (flake/create sid pid ref-sid const/$xsd:anyURI t false nil))]
-                (if (seq r-v-maps)
-                  (recur r-v-maps acc**)
-                  acc**))
-
-              :else
-              (let [[value dt] (datatype/from-expanded v-map nil)
-                    acc** (conj acc* (flake/create sid pid value dt t false nil))]
-                (if (seq r-v-maps)
-                  (recur r-v-maps acc**)
-                  acc**)))))))
-
 (defn- retract-node*
   [{:keys [db sid t type-retractions] :as retract-state} node]
   (loop [[[k v-maps] & r] node
