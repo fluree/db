@@ -105,28 +105,28 @@
         acc))))
 
 (defn retract-node
-  [db node t iri-cache]
+  [db node t]
   (go-try
     (let [{:keys [id type]} node
-          sid              (or (iri/iri->sid id (:namesaces db))
-                               (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
-                                                    " at db t value: " t ".")
-                                               {:status 400 :error
-                                                :db/invalid-commit})))
-          retract-state    {:db db, :iri-cache iri-cache, :sid sid, :t t}
-          type-retractions (if (seq type)
-                             (get-type-retractions retract-state type)
-                             [])
-          retract-state*   (assoc retract-state :type-retractions type-retractions)]
+          sid               (or (iri/iri->sid id (:namesaces db))
+                                (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
+                                                     " at db t value: " t ".")
+                                                {:status 400 :error
+                                                 :db/invalid-commit})))
+          retract-state     {:db db, :sid sid, :t t}
+          type-retractions  (if (seq type)
+                              (get-type-retractions retract-state type)
+                              [])
+          retract-state*    (assoc retract-state :type-retractions type-retractions)]
       (<? (retract-node* retract-state* node)))))
 
 (defn retract-flakes
-  [db retractions t iri-cache]
+  [db retractions t]
   (go-try
     (loop [[node & r] retractions
            acc []]
       (if node
-        (let [flakes (<? (retract-node db node t iri-cache))]
+        (let [flakes (<? (retract-node db node t))]
           (recur r (into acc flakes)))
         acc))))
 
@@ -188,13 +188,12 @@
       [])))
 
 (defn assert-node
-  [db node t iri-cache ref-cache]
+  [db node t ref-cache]
   (go-try
     (log/trace "assert-node:" node)
     (let [{:keys [id type]} node
           sid             (iri/iri->sid id (:namespaces db))
-          assert-state    {:db db, :iri-cache iri-cache, :id id
-                           :ref-cache ref-cache, :sid sid, :t t}
+          assert-state    {:db db, :id id, :ref-cache ref-cache, :sid sid, :t t}
           type-assertions (if (seq type)
                             (<? (get-type-assertions assert-state type))
                             [])
@@ -203,14 +202,14 @@
       (<? (assert-node* assert-state* node)))))
 
 (defn assert-flakes
-  [db assertions t iri-cache ref-cache]
+  [db assertions t ref-cache]
   (go-try
-    (let [flakes   (loop [[node & r] assertions
-                          acc []]
-                     (if node
-                       (let [assert-flakes (<? (assert-node db node t iri-cache ref-cache))]
-                         (recur r (into acc assert-flakes)))
-                       acc))]
+    (let [flakes (loop [[node & r] assertions
+                        acc        []]
+                   (if node
+                     (let [assert-flakes (<? (assert-node db node t ref-cache))]
+                       (recur r (into acc assert-flakes)))
+                     acc))]
       {:flakes flakes})))
 
 (defn merge-flakes
@@ -342,9 +341,7 @@
   respective indexes and returns updated db"
   [conn {:keys [alias t] :as db} merged-db? [commit _proof]]
   (go-try
-    (let [iri-cache        (volatile! {})
-          refs-cache       (volatile! (-> db :schema :refs))
-          db-address       (-> commit
+    (let [db-address       (-> commit
                                (get-first const/iri-data)
                                (get-first-value const/iri-address))
           db-data          (<? (read-db conn db-address))
@@ -353,10 +350,11 @@
                                       (not merged-db?)) ;; when including multiple dbs, t values will get reused.
                              (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
                                              {:status 500 :error :db/invalid-commit})))
+          refs-cache       (volatile! (-> db :schema :refs))
           assert           (db-assert db-data)
           retract          (db-retract db-data)
-          retract-flakes   (<? (retract-flakes db retract t-new iri-cache))
-          {:keys [flakes]} (<? (assert-flakes db assert t-new iri-cache refs-cache))
+          retract-flakes   (<? (retract-flakes db retract t-new))
+          {:keys [flakes]} (<? (assert-flakes db assert t-new refs-cache))
 
           {:keys [previous issuer message] :as commit-metadata}
           (commit-data/json-ld->map commit db)
