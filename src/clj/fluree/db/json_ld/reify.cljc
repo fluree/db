@@ -342,21 +342,21 @@
   respective indexes and returns updated db"
   [conn {:keys [alias t] :as db} merged-db? [commit _proof]]
   (go-try
-    (let [iri-cache                (volatile! {})
-          refs-cache               (volatile! (-> db :schema :refs))
-          db-address               (-> commit
-                                       (get-first const/iri-data)
-                                       (get-first-value const/iri-address))
-          db-data                  (<? (read-db conn db-address))
-          t-new                    (db-t db-data)
-          _                        (when (and (not= t-new (inc t))
-                                              (not merged-db?)) ;; when including multiple dbs, t values will get reused.
-                                     (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
-                                                     {:status 500 :error :db/invalid-commit})))
-          assert                   (db-assert db-data)
-          retract                  (db-retract db-data)
-          retract-flakes           (<? (retract-flakes db retract t-new iri-cache))
-          {:keys [flakes pid sid]} (<? (assert-flakes db assert t-new iri-cache refs-cache))
+    (let [iri-cache        (volatile! {})
+          refs-cache       (volatile! (-> db :schema :refs))
+          db-address       (-> commit
+                               (get-first const/iri-data)
+                               (get-first-value const/iri-address))
+          db-data          (<? (read-db conn db-address))
+          t-new            (db-t db-data)
+          _                (when (and (not= t-new (inc t))
+                                      (not merged-db?)) ;; when including multiple dbs, t values will get reused.
+                             (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
+                                             {:status 500 :error :db/invalid-commit})))
+          assert           (db-assert db-data)
+          retract          (db-retract db-data)
+          retract-flakes   (<? (retract-flakes db retract t-new iri-cache))
+          {:keys [flakes]} (<? (assert-flakes db assert t-new iri-cache refs-cache))
 
           {:keys [previous issuer message] :as commit-metadata}
           (commit-data/json-ld->map commit db)
