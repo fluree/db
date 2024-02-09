@@ -160,7 +160,7 @@
           acc**)))))
 
 (defn- assert-node*
-  [{:keys [base-flakes db ref-cache] :as assert-state} node]
+  [{:keys [base-flakes db] :as assert-state} node]
   (go-try
     (loop [[[k v-maps] & r] node
            acc base-flakes]
@@ -188,12 +188,12 @@
       [])))
 
 (defn assert-node
-  [db node t ref-cache]
+  [db node t]
   (go-try
     (log/trace "assert-node:" node)
     (let [{:keys [id type]} node
           sid             (iri/iri->sid id (:namespaces db))
-          assert-state    {:db db, :id id, :ref-cache ref-cache, :sid sid, :t t}
+          assert-state    {:db db, :id id, :sid sid, :t t}
           type-assertions (if (seq type)
                             (<? (get-type-assertions assert-state type))
                             [])
@@ -202,12 +202,12 @@
       (<? (assert-node* assert-state* node)))))
 
 (defn assert-flakes
-  [db assertions t ref-cache]
+  [db assertions t]
   (go-try
     (let [flakes (loop [[node & r] assertions
                         acc        []]
                    (if node
-                     (let [assert-flakes (<? (assert-node db node t ref-cache))]
+                     (let [assert-flakes (<? (assert-node db node t))]
                        (recur r (into acc assert-flakes)))
                      acc))]
       {:flakes flakes})))
@@ -350,11 +350,10 @@
                                       (not merged-db?)) ;; when including multiple dbs, t values will get reused.
                              (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
                                              {:status 500 :error :db/invalid-commit})))
-          refs-cache       (volatile! (-> db :schema :refs))
           assert           (db-assert db-data)
           retract          (db-retract db-data)
           retract-flakes   (<? (retract-flakes db retract t-new))
-          {:keys [flakes]} (<? (assert-flakes db assert t-new refs-cache))
+          {:keys [flakes]} (<? (assert-flakes db assert t-new))
 
           {:keys [previous issuer message] :as commit-metadata}
           (commit-data/json-ld->map commit db)
