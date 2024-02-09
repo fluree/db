@@ -287,7 +287,7 @@
           db*           (assoc db :commit new-commit**
                                   :new-context? false)
           db**          (if (new-t? ledger-commit commit)
-                          (<? (commit-data/add-commit-flakes (:prev-commit db) db*))
+                          (commit-data/add-commit-flakes (:prev-commit db) db*)
                           db*)
           db***         (ledger-proto/-commit-update ledger branch db**)
           push-res      (<? (nameservice/push! conn (assoc new-commit**

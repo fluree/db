@@ -1,10 +1,8 @@
 (ns fluree.db.json-ld.commit-data
   (:require [fluree.crypto :as crypto]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.json-ld :as json-ld]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]))
 
@@ -432,9 +430,8 @@
   committing to an in-memory ledger and when reifying a ledger from storage on
   load."
   [db t commit-sid previous-id]
-  (go-try
-    (let [prev-sid (iri/iri->sid previous-id (:namespaces db))]
-      [(flake/create commit-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
+  (let [prev-sid (iri/iri->sid previous-id (:namespaces db))]
+    [(flake/create commit-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
 
 (defn prev-data-flakes
   "Builds and returns a channel containing the previous data flakes for the
@@ -442,9 +439,8 @@
   previous pointer). Used when committing to an in-memory ledger value and when
   reifying a ledger from storage on load."
   [db db-sid t prev-data-id]
-  (go-try
-    (let [prev-sid (iri/iri->sid prev-data-id (:namespaces db))]
-      [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
+  (let [prev-sid (iri/iri->sid prev-data-id (:namespaces db))]
+    [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
 
 (defn issuer-flakes
   "Builds and returns a channel containing the credential issuer's flakes for
@@ -454,15 +450,14 @@
   used. It will only be called if needed. Used when committing to an in-memory
   ledger value and when reifying a ledger from storage on load."
   [db t commit-sid issuer-iri]
-  (go-try
-    (if-let [issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
-      ;; create reference to existing issuer
-      [(flake/create commit-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true
-                     nil)]
-      ;; create new issuer flake and a reference to it
-      (let [new-issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
-        [(flake/create commit-sid const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
-                       true nil)]))))
+  (if-let [issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
+    ;; create reference to existing issuer
+    [(flake/create commit-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true
+                   nil)]
+    ;; create new issuer flake and a reference to it
+    (let [new-issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
+      [(flake/create commit-sid const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
+                     true nil)])))
 
 (defn message-flakes
   "Builds and returns the commit message flakes for the given t and message.
@@ -474,31 +469,30 @@
 
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
-  [prev-commit {:keys [alias commit] :as db}]
-  (go-try
-    (let [{:keys [data id issuer message]} commit
-          {db-t :t, db-id :id} data
+  [prev-commit {:keys [commit] :as db}]
+  (let [{:keys [data id issuer message]} commit
+        {db-t :t, db-id :id} data
 
-          {previous-id :id prev-data :data} prev-commit
-          prev-data-id       (:id prev-data)
+        {previous-id :id prev-data :data} prev-commit
+        prev-data-id       (:id prev-data)
 
-          t                  db-t
-          commit-sid         (iri/iri->sid id)
-          db-sid             (iri/iri->sid db-id)
-          base-flakes        (commit-metadata-flakes commit t commit-sid db-sid)
-          prev-commit-flakes (when previous-id
-                               (<? (prev-commit-flakes db t commit-sid previous-id)))
-          prev-db-flakes     (when prev-data-id
-                               (<? (prev-data-flakes db db-sid t prev-data-id)))
-          issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                               (<? (issuer-flakes db t commit-sid issuer-iri)))
-          message-flakes     (when message
-                               (message-flakes t commit-sid message))
-          commit-flakes      (cond-> base-flakes
-                                     prev-commit-flakes (into prev-commit-flakes)
-                                     prev-db-flakes (into prev-db-flakes)
-                                     issuer-flakes (into issuer-flakes)
-                                     message-flakes (into message-flakes))]
-      (-> db
-          (update-novelty commit-flakes)
-          add-tt-id))))
+        t                  db-t
+        commit-sid         (iri/iri->sid id)
+        db-sid             (iri/iri->sid db-id)
+        base-flakes        (commit-metadata-flakes commit t commit-sid db-sid)
+        prev-commit-flakes (when previous-id
+                             (prev-commit-flakes db t commit-sid previous-id))
+        prev-db-flakes     (when prev-data-id
+                             (prev-data-flakes db db-sid t prev-data-id))
+        issuer-flakes      (when-let [issuer-iri (:id issuer)]
+                             (issuer-flakes db t commit-sid issuer-iri))
+        message-flakes     (when message
+                             (message-flakes t commit-sid message))
+        commit-flakes      (cond-> base-flakes
+                             prev-commit-flakes (into prev-commit-flakes)
+                             prev-db-flakes (into prev-db-flakes)
+                             issuer-flakes (into issuer-flakes)
+                             message-flakes (into message-flakes))]
+    (-> db
+        (update-novelty commit-flakes)
+        add-tt-id)))

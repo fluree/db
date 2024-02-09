@@ -66,18 +66,17 @@
 (defn- retract-node*
   [{:keys [db sid t type-retractions] :as retract-state} node]
   (loop [[[k v-maps] & r] node
-         acc type-retractions]
+         acc              type-retractions]
     (if k
       (if (keyword? k)
         (recur r acc)
-        (let [pid     (or (iri/iri->sid k (:namespaces db))
-                          (throw (ex-info (str "Retraction on a property that does not exist: " k)
-                                          {:status 400
-                                           :error  :db/invalid-commit})))
-              _       (log/trace "retract-node* v-maps:" v-maps)
-              acc*    (into acc
-                            (map (partial retract-value-map db sid pid t))
-                            (util/sequential v-maps))]
+        (let [pid  (or (iri/iri->sid k (:namespaces db))
+                       (throw (ex-info (str "Retraction on a property that does not exist: " k)
+                                       {:status 400
+                                        :error  :db/invalid-commit})))
+              acc* (into acc
+                         (map (partial retract-value-map db sid pid t))
+                         (util/sequential v-maps))]
           (recur r acc*)))
       acc)))
 
@@ -336,14 +335,14 @@
                                                                  t-new commit-sid db-sid)
           previous-id        (when prev-commit (:id prev-commit))
           prev-commit-flakes (when previous-id
-                               (<? (commit-data/prev-commit-flakes db t-new commit-sid
-                                                                   previous-id)))
+                               (commit-data/prev-commit-flakes db t-new commit-sid
+                                                               previous-id))
           prev-data-id       (get-first-id prev-commit const/iri-data)
           prev-db-flakes     (when prev-data-id
-                               (<? (commit-data/prev-data-flakes db db-sid t-new
-                                                                 prev-data-id)))
+                               (commit-data/prev-data-flakes db db-sid t-new
+                                                             prev-data-id))
           issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                               (<? (commit-data/issuer-flakes db t-new commit-sid issuer-iri)))
+                               (commit-data/issuer-flakes db t-new commit-sid issuer-iri))
           message-flakes     (when message
                                (commit-data/message-flakes t-new commit-sid message))
           all-flakes         (-> db
