@@ -87,130 +87,122 @@
 
 (defn- retract-node*
   [{:keys [db sid t type-retractions] :as retract-state} node]
-  (go-try
-    (loop [[[k v-maps] & r] node
-           acc type-retractions]
-      (if k
-        (if (keyword? k)
-          (recur r acc)
-          (let [pid     (or (iri/iri->sid k (:namespaces db))
-                            (throw (ex-info (str "Retraction on a property that does not exist: " k)
-                                            {:status 400
-                                             :error  :db/invalid-commit})))
-                _       (log/trace "retract-node* v-maps:" v-maps)
-                acc*    (into acc
-                              (map (partial retract-value-map db sid pid t))
-                              (util/sequential v-maps))]
-            (recur r acc*)))
-        acc))))
+  (loop [[[k v-maps] & r] node
+         acc type-retractions]
+    (if k
+      (if (keyword? k)
+        (recur r acc)
+        (let [pid     (or (iri/iri->sid k (:namespaces db))
+                          (throw (ex-info (str "Retraction on a property that does not exist: " k)
+                                          {:status 400
+                                           :error  :db/invalid-commit})))
+              _       (log/trace "retract-node* v-maps:" v-maps)
+              acc*    (into acc
+                            (map (partial retract-value-map db sid pid t))
+                            (util/sequential v-maps))]
+          (recur r acc*)))
+      acc)))
 
 (defn retract-node
   [db node t]
-  (go-try
-    (let [{:keys [id type]} node
-          sid               (or (iri/iri->sid id (:namesaces db))
-                                (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
-                                                     " at db t value: " t ".")
-                                                {:status 400 :error
-                                                 :db/invalid-commit})))
-          retract-state     {:db db, :sid sid, :t t}
-          type-retractions  (if (seq type)
-                              (get-type-retractions retract-state type)
-                              [])
-          retract-state*    (assoc retract-state :type-retractions type-retractions)]
-      (<? (retract-node* retract-state* node)))))
+  (let [{:keys [id type]} node
+        sid               (or (iri/iri->sid id (:namesaces db))
+                              (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
+                                                   " at db t value: " t ".")
+                                              {:status 400 :error
+                                               :db/invalid-commit})))
+        retract-state     {:db db, :sid sid, :t t}
+        type-retractions  (if (seq type)
+                            (get-type-retractions retract-state type)
+                            [])
+        retract-state*    (assoc retract-state :type-retractions type-retractions)]
+    (retract-node* retract-state* node)))
 
 (defn retract-flakes
   [db retractions t]
-  (go-try
-    (loop [[node & r] retractions
-           acc []]
-      (if node
-        (let [flakes (<? (retract-node db node t))]
-          (recur r (into acc flakes)))
-        acc))))
+  (loop [[node & r] retractions
+         acc []]
+    (if node
+      (let [flakes (retract-node db node t)]
+        (recur r (into acc flakes)))
+      acc)))
 
 (defn- assert-v-maps
   [{:keys [db pid sid id t acc list-members?] :as assert-state} v-maps]
-  (go-try
-    (loop [[v-map & r-v-maps] v-maps
-           acc*               acc]
-      (log/trace "assert-v-maps v-map:" v-map)
-      (log/trace "assert-v-maps id:" id)
-      (let [ref-id (:id v-map)
-            meta   (when list-members? {:i (-> v-map :idx last)})
-            acc**  (cond
-                     (and ref-id (node? v-map))
-                     (let [ref-sid   (iri/iri->sid ref-id (:namespaces db))
-                           new-flake (flake/create sid pid ref-sid
-                                                   const/$xsd:anyURI t true meta)]
-                       (log/trace "creating ref flake:" new-flake)
-                       (conj acc* new-flake))
-                     (list-value? v-map)
-                     (let [list-vals (:list v-map)]
-                       (<? (assert-v-maps (assoc assert-state :list-members? true) list-vals)))
+  (loop [[v-map & r-v-maps] v-maps
+         acc*               acc]
+    (log/trace "assert-v-maps v-map:" v-map)
+    (log/trace "assert-v-maps id:" id)
+    (let [ref-id (:id v-map)
+          meta   (when list-members? {:i (-> v-map :idx last)})
+          acc**  (cond
+                   (and ref-id (node? v-map))
+                   (let [ref-sid   (iri/iri->sid ref-id (:namespaces db))
+                         new-flake (flake/create sid pid ref-sid
+                                                 const/$xsd:anyURI t true meta)]
+                     (log/trace "creating ref flake:" new-flake)
+                     (conj acc* new-flake))
+                   (list-value? v-map)
+                   (let [list-vals (:list v-map)]
+                     (assert-v-maps (assoc assert-state :list-members? true) list-vals))
 
-                     :else
-                     (let [[value dt] (datatype/from-expanded v-map nil)
-                           new-flake  (flake/create sid pid value dt t true meta)]
-                       (log/trace "creating value flake:" new-flake)
-                       (conj acc* new-flake)))]
-        (if (seq r-v-maps)
-          (recur r-v-maps acc**)
-          acc**)))))
+                   :else
+                   (let [[value dt] (datatype/from-expanded v-map nil)
+                         new-flake  (flake/create sid pid value dt t true meta)]
+                     (log/trace "creating value flake:" new-flake)
+                     (conj acc* new-flake)))]
+      (if (seq r-v-maps)
+        (recur r-v-maps acc**)
+        acc**))))
 
 (defn- assert-node*
   [{:keys [base-flakes db] :as assert-state} node]
-  (go-try
-    (loop [[[k v-maps] & r] node
-           acc base-flakes]
-      (if k
-        (if (keyword? k)
-          (recur r acc)
-          (let [v-maps*      (util/sequential v-maps)
-                pid          (iri/iri->sid k (:namespaces db))
-                acc*         (<? (assert-v-maps
-                                   (assoc assert-state :pid pid, :k k, :acc acc)
-                                   v-maps*))]
-            (recur r acc*)))
-        acc))))
+  (loop [[[k v-maps] & r] node
+         acc              base-flakes]
+    (if k
+      (if (keyword? k)
+        (recur r acc)
+        (let [v-maps* (util/sequential v-maps)
+              pid     (iri/iri->sid k (:namespaces db))
+              acc*    (-> assert-state
+                          (assoc :pid pid, :k k, :acc acc)
+                          (assert-v-maps v-maps*))]
+          (recur r acc*)))
+      acc)))
 
 (defn- get-type-assertions
   [{:keys [db sid t]} type]
-  (go-try
-    (if type
-      (loop [[type-item & r] type
-             acc []]
-        (if type-item
-          (let [type-id  (iri/iri->sid type-item (:namespaces db))]
-            (recur r  (conj acc (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t true nil))))
-          acc))
-      [])))
+  (if type
+    (loop [[type-item & r] type
+           acc []]
+      (if type-item
+        (let [type-id  (iri/iri->sid type-item (:namespaces db))]
+          (recur r  (conj acc (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t true nil))))
+        acc))
+    []))
 
 (defn assert-node
   [db node t]
-  (go-try
-    (log/trace "assert-node:" node)
-    (let [{:keys [id type]} node
-          sid             (iri/iri->sid id (:namespaces db))
-          assert-state    {:db db, :id id, :sid sid, :t t}
-          type-assertions (if (seq type)
-                            (<? (get-type-assertions assert-state type))
-                            [])
-          base-flakes      type-assertions
-          assert-state*    (assoc assert-state :base-flakes base-flakes)]
-      (<? (assert-node* assert-state* node)))))
+  (log/trace "assert-node:" node)
+  (let [{:keys [id type]} node
+        sid             (iri/iri->sid id (:namespaces db))
+        assert-state    {:db db, :id id, :sid sid, :t t}
+        type-assertions (if (seq type)
+                          (get-type-assertions assert-state type)
+                          [])
+        base-flakes      type-assertions
+        assert-state*    (assoc assert-state :base-flakes base-flakes)]
+    (assert-node* assert-state* node)))
 
 (defn assert-flakes
   [db assertions t]
-  (go-try
-    (let [flakes (loop [[node & r] assertions
-                        acc        []]
-                   (if node
-                     (let [assert-flakes (<? (assert-node db node t))]
-                       (recur r (into acc assert-flakes)))
-                     acc))]
-      {:flakes flakes})))
+  (let [flakes (loop [[node & r] assertions
+                      acc        []]
+                 (if node
+                   (let [assert-flakes (assert-node db node t)]
+                     (recur r (into acc assert-flakes)))
+                   acc))]
+    {:flakes flakes}))
 
 (defn merge-flakes
   "Returns updated db with merged flakes."
@@ -352,8 +344,8 @@
                                              {:status 500 :error :db/invalid-commit})))
           assert           (db-assert db-data)
           retract          (db-retract db-data)
-          retract-flakes   (<? (retract-flakes db retract t-new))
-          {:keys [flakes]} (<? (assert-flakes db assert t-new))
+          retract-flakes   (retract-flakes db retract t-new)
+          {:keys [flakes]} (assert-flakes db assert t-new)
 
           {:keys [previous issuer message] :as commit-metadata}
           (commit-data/json-ld->map commit db)
