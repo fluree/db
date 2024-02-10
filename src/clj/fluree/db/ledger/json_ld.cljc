@@ -1,24 +1,19 @@
 (ns fluree.db.ledger.json-ld
-  (:require [clojure.core.async :as async :refer [<! go]]
-            [fluree.db.flake :as flake]
+  (:require [clojure.core.async :as async :refer [<!]]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.json-ld.commit :as jld-commit]
-            [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.conn.core :refer [register-ledger release-ledger cached-ledger]]
+            [fluree.db.conn.core :refer [register-ledger release-ledger]]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
             [fluree.db.util.log :as log])
@@ -199,10 +194,7 @@
     (loop [[commit-address & r] include
            db* db]
       (if commit-address
-        (let [base-context {:base commit-address}
-              commit-data  (-> (<? (conn-proto/-c-read conn commit-address))
-                               (json-ld/expand base-context))
-              commit-tuple (jld-reify/parse-commit commit-data)
+        (let [commit-tuple (jld-reify/read-commit conn commit-address)
               db**         (<? (jld-reify/load-db db* commit-tuple true))]
           (recur r db**))
         db*))))
