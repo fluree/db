@@ -101,7 +101,7 @@
   "Returns true if the argument is a full ledger address, false if it is just an
   alias."
   [ledger-alias-or-address]
-  (str/starts-with? ledger-alias-or-address "fluree:"))
+  (jld-ledger/fluree-address? ledger-alias-or-address))
 
 (defn create
   "Creates a new json-ld ledger. A connection (conn)
