@@ -305,8 +305,7 @@
           _            (log/debug "load commit:" commit)
           ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
-          ledger       (<? (create* conn ledger-alias {:branch         branch
-                                                       :id             commit-addr}))
+          ledger       (<? (create* conn ledger-alias {:branch branch}))
           db           (ledger-proto/-db ledger)
           db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
       (ledger-proto/-commit-update ledger branch db*)
