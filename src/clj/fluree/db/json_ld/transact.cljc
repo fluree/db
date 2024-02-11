@@ -176,17 +176,16 @@
   "Returns map of all elements for a stage transaction required to create an
   updated db."
   [db new-flakes {:keys [stage-update? policy t] :as _tx-state}]
-  (go-try
-    (let [[add remove] (if stage-update?
-                         (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
-                         [new-flakes nil])
-          db-after  (-> db
-                        (assoc :policy policy) ;; re-apply policy to db-after
-                        (assoc :t t)
-                        (commit-data/update-novelty add remove)
-                        (commit-data/add-tt-id)
-                        (vocab/hydrate-schema add))]
-      {:add add :remove remove :db-after db-after})))
+  (let [[add remove] (if stage-update?
+                       (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
+                       [new-flakes nil])
+        db-after  (-> db
+                      (assoc :policy policy) ;; re-apply policy to db-after
+                      (assoc :t t)
+                      (commit-data/update-novelty add remove)
+                      (commit-data/add-tt-id)
+                      (vocab/hydrate-schema add))]
+    {:add add :remove remove :db-after db-after}))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
@@ -198,7 +197,6 @@
           ;; TODO: remove the atom wrapper once subj-mods is no longer shared code
           tx-state* (assoc tx-state :subj-mods (atom subj-mods))]
       (-> (final-db db flakes tx-state)
-          <?
           (validate-rules tx-state*)
           <?
           (policy/allowed? tx-state*)
