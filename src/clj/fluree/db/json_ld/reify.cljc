@@ -79,7 +79,7 @@
       acc)))
 
 (defn retract-node
-  [db node t]
+  [db t node]
   (let [{:keys [id type]} node
         sid               (or (iri/iri->sid id (:namesaces db))
                               (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
@@ -94,11 +94,11 @@
     (retract-node* retract-state* node)))
 
 (defn retract-flakes
-  [db retractions t]
+  [db t retractions]
   (loop [[node & r] retractions
          acc []]
     (if node
-      (let [flakes (retract-node db node t)]
+      (let [flakes (retract-node db t node)]
         (recur r (into acc flakes)))
       acc)))
 
@@ -157,7 +157,7 @@
     []))
 
 (defn assert-node
-  [db node t]
+  [db t node]
   (log/trace "assert-node:" node)
   (let [{:keys [id type]} node
         sid             (iri/iri->sid id (:namespaces db))
@@ -170,11 +170,11 @@
     (assert-node* assert-state* node)))
 
 (defn assert-flakes
-  [db assertions t]
+  [db t assertions]
   (let [flakes (loop [[node & r] assertions
                       acc        []]
                  (if node
-                   (let [assert-flakes (assert-node db node t)]
+                   (let [assert-flakes (assert-node db t node)]
                      (recur r (into acc assert-flakes)))
                    acc))]
     flakes))
@@ -318,9 +318,9 @@
                              (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
                                              {:status 500 :error :db/invalid-commit})))
           assert           (db-assert db-data)
-          asserted-flakes  (assert-flakes db assert t-new)
+          asserted-flakes  (assert-flakes db t-new assert)
           retract          (db-retract db-data)
-          retracted-flakes (retract-flakes db retract t-new)
+          retracted-flakes (retract-flakes db t-new retract)
 
           {:keys [previous issuer message] :as commit-metadata}
           (commit-data/json-ld->map commit db)
