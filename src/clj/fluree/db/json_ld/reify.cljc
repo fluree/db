@@ -308,19 +308,19 @@
   respective indexes and returns updated db"
   [conn {:keys [alias t] :as db} merged-db? [commit _proof]]
   (go-try
-    (let [db-address     (-> commit
-                             (get-first const/iri-data)
-                             (get-first-value const/iri-address))
-          db-data        (<? (read-db conn db-address))
-          t-new          (db-t db-data)
-          _              (when (and (not= t-new (inc t))
-                                    (not merged-db?)) ;; when including multiple dbs, t values will get reused.
-                           (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
-                                           {:status 500 :error :db/invalid-commit})))
-          assert         (db-assert db-data)
-          retract        (db-retract db-data)
-          retract-flakes (retract-flakes db retract t-new)
-          flakes         (assert-flakes db assert t-new)
+    (let [db-address       (-> commit
+                               (get-first const/iri-data)
+                               (get-first-value const/iri-address))
+          db-data          (<? (read-db conn db-address))
+          t-new            (db-t db-data)
+          _                (when (and (not= t-new (inc t))
+                                      (not merged-db?)) ;; when including multiple dbs, t values will get reused.
+                             (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
+                                             {:status 500 :error :db/invalid-commit})))
+          assert           (db-assert db-data)
+          asserted-flakes  (assert-flakes db assert t-new)
+          retract          (db-retract db-data)
+          retracted-flakes (retract-flakes db retract t-new)
 
           {:keys [previous issuer message] :as commit-metadata}
           (commit-data/json-ld->map commit db)
@@ -347,8 +347,8 @@
                                  (get-in [:novelty :spot])
                                  empty
                                  (into metadata-flakes)
-                                 (into retract-flakes)
-                                 (into flakes)
+                                 (into retracted-flakes)
+                                 (into asserted-flakes)
                                  (cond->
                                      prev-commit-flakes (into prev-commit-flakes)
                                      prev-db-flakes (into prev-db-flakes)
