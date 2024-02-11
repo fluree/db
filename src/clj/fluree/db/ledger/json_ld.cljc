@@ -298,7 +298,7 @@
           _            (when-not commit-addr
                          (throw (ex-info (str "Unable to load. No commit exists for: " address)
                                          {:status 400 :error :db/invalid-commit-address})))
-          [commit _] (<? (jld-reify/read-commit conn commit-addr))
+          [commit _]   (<? (jld-reify/read-commit conn commit-addr))
           _            (when-not commit
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
                                          {:status 400 :error :db/invalid-db})))

@@ -2,13 +2,11 @@
   (:require [fluree.json-ld :as json-ld]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.storage :as storage]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
             [fluree.db.datatype :as datatype]
@@ -179,7 +177,7 @@
                    (let [assert-flakes (assert-node db node t)]
                      (recur r (into acc assert-flakes)))
                    acc))]
-    {:flakes flakes}))
+    flakes))
 
 (defn merge-flakes
   "Returns updated db with merged flakes."
@@ -310,19 +308,19 @@
   respective indexes and returns updated db"
   [conn {:keys [alias t] :as db} merged-db? [commit _proof]]
   (go-try
-    (let [db-address       (-> commit
-                               (get-first const/iri-data)
-                               (get-first-value const/iri-address))
-          db-data          (<? (read-db conn db-address))
-          t-new            (db-t db-data)
-          _                (when (and (not= t-new (inc t))
-                                      (not merged-db?)) ;; when including multiple dbs, t values will get reused.
-                             (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
-                                             {:status 500 :error :db/invalid-commit})))
-          assert           (db-assert db-data)
-          retract          (db-retract db-data)
-          retract-flakes   (retract-flakes db retract t-new)
-          {:keys [flakes]} (assert-flakes db assert t-new)
+    (let [db-address     (-> commit
+                             (get-first const/iri-data)
+                             (get-first-value const/iri-address))
+          db-data        (<? (read-db conn db-address))
+          t-new          (db-t db-data)
+          _              (when (and (not= t-new (inc t))
+                                    (not merged-db?)) ;; when including multiple dbs, t values will get reused.
+                           (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
+                                           {:status 500 :error :db/invalid-commit})))
+          assert         (db-assert db-data)
+          retract        (db-retract db-data)
+          retract-flakes (retract-flakes db retract t-new)
+          flakes         (assert-flakes db assert t-new)
 
           {:keys [previous issuer message] :as commit-metadata}
           (commit-data/json-ld->map commit db)
