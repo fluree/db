@@ -95,12 +95,9 @@
 
 (defn retract-flakes
   [db t retractions]
-  (loop [[node & r] retractions
-         acc []]
-    (if node
-      (let [flakes (retract-node db t node)]
-        (recur r (into acc flakes)))
-      acc)))
+  (into []
+        (mapcat (partial retract-node db t))
+        retractions))
 
 (defn- assert-v-maps
   [{:keys [db pid sid id t acc list-members?] :as assert-state} v-maps]
@@ -171,13 +168,9 @@
 
 (defn assert-flakes
   [db t assertions]
-  (let [flakes (loop [[node & r] assertions
-                      acc        []]
-                 (if node
-                   (let [assert-flakes (assert-node db t node)]
-                     (recur r (into acc assert-flakes)))
-                   acc))]
-    flakes))
+  (into []
+        (mapcat (partial assert-node db t))
+        assertions))
 
 (defn merge-flakes
   "Returns updated db with merged flakes."
