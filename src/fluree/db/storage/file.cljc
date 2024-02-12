@@ -32,8 +32,7 @@
           bytes (if (string? v)
                   (bytes/string->UTF8 v)
                   v)]
-      (<? #?(:clj (async/thread (fs/write-file path bytes))
-             :cljs (async/go (fs/write-file path bytes))))
+      (<? (fs/write-file path bytes))
       {:k    k*
        :address (file-address k*)
        :hash hash
@@ -42,25 +41,25 @@
 (defn file-list
   [storage-path prefix]
   (let [path (str (fs/local-path storage-path) "/" prefix)]
-    (async/thread (fs/list-files path))))
+    (fs/list-files path)))
 
 (defn file-read
   [storage-path address]
   (let [k    (:local (store-util/address-parts address))
         path (str (fs/local-path storage-path) "/" k)]
-    (async/thread (fs/read-file path))))
+    (fs/read-file path)))
 
 (defn file-delete
   [storage-path address]
   (let [k    (:local (store-util/address-parts address))
         path (str (fs/local-path storage-path) "/" k)]
-    (async/thread (fs/delete-file path))))
+    (fs/delete-file path)))
 
 (defn file-exists?
   [storage-path address]
   (let [k    (:local (store-util/address-parts address))
         path (str (fs/local-path storage-path) "/" k)]
-    (async/thread (fs/exists? path))))
+    (fs/exists? path)))
 
 (defrecord FileStore [storage-path]
   store-proto/Store
