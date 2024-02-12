@@ -43,7 +43,7 @@
     true))
 
 (defn- get-type-retractions
-  [{:keys [db sid t]} type]
+  [db t sid type]
   (let [nses (:namespaces db)]
     (into []
           (map (fn [type-item]
@@ -62,7 +62,7 @@
         (flake/create sid pid value dt t false nil)))))
 
 (defn- retract-node*
-  [{:keys [db sid t type-retractions] :as retract-state} node]
+  [db t {:keys [sid type-retractions] :as retract-state} node]
   (loop [[[k v-maps] & r] node
          acc              type-retractions]
     (if k
@@ -86,12 +86,12 @@
                                                    " at db t value: " t ".")
                                               {:status 400 :error
                                                :db/invalid-commit})))
-        retract-state     {:db db, :sid sid, :t t}
+        retract-state     {:sid sid}
         type-retractions  (if (seq type)
-                            (get-type-retractions retract-state type)
+                            (get-type-retractions db t sid type)
                             [])
         retract-state*    (assoc retract-state :type-retractions type-retractions)]
-    (retract-node* retract-state* node)))
+    (retract-node* db t retract-state* node)))
 
 (defn retract-flakes
   [db t retractions]
@@ -99,72 +99,60 @@
         (mapcat (partial retract-node db t))
         retractions))
 
-(defn- assert-v-maps
-  [{:keys [db pid sid id t acc list-members?] :as assert-state} v-maps]
-  (loop [[v-map & r-v-maps] v-maps
-         acc*               acc]
-    (log/trace "assert-v-maps v-map:" v-map)
-    (log/trace "assert-v-maps id:" id)
-    (let [ref-id (:id v-map)
-          meta   (when list-members? {:i (-> v-map :idx last)})
-          acc**  (cond
-                   (and ref-id (node? v-map))
-                   (let [ref-sid   (iri/iri->sid ref-id (:namespaces db))
-                         new-flake (flake/create sid pid ref-sid
-                                                 const/$xsd:anyURI t true meta)]
-                     (log/trace "creating ref flake:" new-flake)
-                     (conj acc* new-flake))
-                   (list-value? v-map)
-                   (let [list-vals (:list v-map)]
-                     (assert-v-maps (assoc assert-state :list-members? true) list-vals))
-
-                   :else
-                   (let [[value dt] (datatype/from-expanded v-map nil)
-                         new-flake  (flake/create sid pid value dt t true meta)]
-                     (log/trace "creating value flake:" new-flake)
-                     (conj acc* new-flake)))]
-      (if (seq r-v-maps)
-        (recur r-v-maps acc**)
-        acc**))))
-
-(defn- assert-node*
-  [{:keys [base-flakes db] :as assert-state} node]
-  (loop [[[k v-maps] & r] node
-         acc              base-flakes]
-    (if k
-      (if (keyword? k)
-        (recur r acc)
-        (let [v-maps* (util/sequential v-maps)
-              pid     (iri/iri->sid k (:namespaces db))
-              acc*    (-> assert-state
-                          (assoc :pid pid, :k k, :acc acc)
-                          (assert-v-maps v-maps*))]
-          (recur r acc*)))
-      acc)))
-
 (defn- get-type-assertions
-  [{:keys [db sid t]} type]
+  [db t sid type]
   (if type
     (loop [[type-item & r] type
-           acc []]
+           acc             []]
       (if type-item
-        (let [type-id  (iri/iri->sid type-item (:namespaces db))]
+        (let [type-id (iri/iri->sid type-item (:namespaces db))]
           (recur r  (conj acc (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t true nil))))
         acc))
     []))
+
+(defn assert-value-map
+  [db sid pid t v-map]
+  (let [ref-id (:id v-map)
+        meta   (::meta v-map)]
+    (if (and ref-id (node? v-map))
+      (let [ref-sid (iri/iri->sid ref-id (:namespaces db))]
+        (flake/create sid pid ref-sid const/$xsd:anyURI t true meta))
+      (let [[value dt] (datatype/from-expanded v-map nil)]
+        (flake/create sid pid value dt t true meta)))))
+
+(defn add-list-meta
+  [list-val]
+  (let [m {:i (-> list-val :idx last)}]
+    (assoc list-val ::meta m)))
+
+(defn assert-property
+  [db sid pid t value]
+  (let [v-maps (util/sequential value)]
+    (mapcat (fn [v-map]
+              (if (list-value? v-map)
+                (let [list-vals (:list v-map)]
+                  (into []
+                        (comp (map add-list-meta)
+                              (map (partial assert-value-map db sid pid t)))
+                        list-vals))
+                [(assert-value-map db sid pid t v-map)]))
+            v-maps)))
 
 (defn assert-node
   [db t node]
   (log/trace "assert-node:" node)
   (let [{:keys [id type]} node
         sid             (iri/iri->sid id (:namespaces db))
-        assert-state    {:db db, :id id, :sid sid, :t t}
         type-assertions (if (seq type)
-                          (get-type-assertions assert-state type)
-                          [])
-        base-flakes      type-assertions
-        assert-state*    (assoc assert-state :base-flakes base-flakes)]
-    (assert-node* assert-state* node)))
+                          (get-type-assertions db t sid type)
+                          [])]
+    (into type-assertions
+          (comp (filter (fn [node-entry]
+                          (not (-> node-entry key keyword?))))
+                (mapcat (fn [[prop value]]
+                          (let [pid (iri/iri->sid prop (:namespaces db))]
+                            (assert-property db sid pid t value)))))
+          node)))
 
 (defn assert-flakes
   [db t assertions]
