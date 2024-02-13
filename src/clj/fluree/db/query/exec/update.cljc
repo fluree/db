@@ -43,18 +43,22 @@
   (let [ns-code (get namespaces ns)]
     (iri/->sid ns-code nme)))
 
+(defn ensure-namespace
+  [db ns]
+  (let [nses (:namespaces db)]
+    (if (contains? nses ns)
+      db
+      (let [new-ns-code (iri/next-namespace-code nses)]
+        (-> db
+            (update :namespaces assoc ns new-ns-code)
+            (update :namespace-codes assoc new-ns-code ns))))))
+
 (defn generate-sid!
   [db-vol iri]
   (let [[ns nme] (iri/decompose iri)]
     (-> db-vol
         (vswap! (fn [db]
-                  (let [nses (:namespaces db)]
-                    (if (contains? nses ns)
-                      db
-                      (let [new-ns-code (iri/next-namespace-code nses)]
-                        (-> db
-                            (update :namespaces assoc ns new-ns-code)
-                            (update :namespace-codes assoc new-ns-code ns)))))))
+                  (ensure-namespace db ns)))
         (build-sid ns nme))))
 
 (defn build-flake
