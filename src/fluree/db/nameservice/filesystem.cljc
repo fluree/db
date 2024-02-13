@@ -12,7 +12,7 @@
 (defn address-path
   [address]
   (let [[_ _ path] (str/split address #":")]
-    path))
+    (subs path 2)))
 
 (defn address-full-path
   [local-path address]
