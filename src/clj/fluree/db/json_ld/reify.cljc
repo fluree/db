@@ -185,7 +185,7 @@
 
 (defn enrich-values
   [id->node values]
-  (mapv (fn [{:keys [id list type] :as v-map}]
+  (mapv (fn [{:keys [id type] :as v-map}]
           (if id
             (merge (get id->node id)
                    (cond-> v-map

@@ -5,7 +5,6 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.index :as index]
             [fluree.db.query.json-ld.response :as json-ld-resp]
@@ -13,7 +12,6 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
-            [fluree.db.db.json-ld :as jld-db]
             [fluree.db.validation :as v]
             [fluree.db.json-ld.iri :as iri]))
 

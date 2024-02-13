@@ -17,8 +17,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
-            [fluree.db.json-ld.iri :as iri]))
+            [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
