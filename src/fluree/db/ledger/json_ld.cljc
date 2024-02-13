@@ -330,7 +330,7 @@
                      (alias-from-address alias-or-address)
                      alias-or-address)
           [not-cached? ledger-chan] (register-ledger conn alias)] ;; holds final cached ledger in a promise-chan avoid race conditions]
-      (if not-cached?
+      (when not-cached?
         (let [address (if address?
                         alias-or-address
                         (async/<! (nameservice/primary-address conn alias-or-address nil)))]
@@ -343,6 +343,5 @@
                                    address)))
             (let [ledger (async/<! (load* conn address))]
               ;; note, ledger can be an exception!
-              (async/put! ledger-chan ledger)
-              ledger)))
-        (<? ledger-chan)))))
+              (async/put! ledger-chan ledger)))))
+      (<? ledger-chan))))
