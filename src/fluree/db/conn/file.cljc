@@ -144,18 +144,18 @@
 
 (defn default-file-nameservice
   "Returns file nameservice or will throw if storage-path generates an exception."
-  [store]
-  (ns-filesystem/initialize store))
+  [path]
+  (ns-filesystem/initialize path))
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism store lru-cache-atom memory serializer nameservices]
+  [{:keys [defaults parallelism store storage-path lru-cache-atom memory serializer nameservices]
     :or {serializer (json-serde)} :as _opts}]
   (go
     (let [conn-id        (str (random-uuid))
           state          (conn-core/blank-state)
           nameservices*  (util/sequential
-                           (or nameservices (default-file-nameservice store)))
+                           (or nameservices (default-file-nameservice storage-path)))
           cache-size     (conn-cache/memory->cache-size memory)
           lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans

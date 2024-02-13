@@ -126,7 +126,7 @@
           state           (conn-core/blank-state)
           nameservices*   (util/sequential
                             (or nameservices
-                                (default-memory-nameservice store)))
+                                (default-memory-nameservice (:storage-atom store))))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]
