@@ -73,8 +73,8 @@
 ;; ================ end Jsonld record support fns ============================
 
 (defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot post opst
-                     tspo schema comparators novelty policy context-cache
-                     namespaces namespace-codes]
+                     tspo schema comparators novelty policy namespaces
+                     namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
   (-class-prop [_this property class]
@@ -93,7 +93,7 @@
 #?(:cljs
    (extend-type JsonLdDb
      IPrintWithWriter
-     (-pr-writer [db w opts]
+     (-pr-writer [db w _opts]
        (-write w "#FlureeJsonLdDb ")
        (-write w (pr {:method      (:method db) :alias (:alias db)
                       :t           (:t db) :stats (:stats db)
@@ -146,6 +146,5 @@
                     :comparators     index/default-comparators
                     :novelty         novelty
                     :policy          root-policy-map
-                    :context-cache   (volatile! nil)
                     :namespaces      iri/default-namespaces
                     :namespace-codes iri/default-namespace-codes})))
