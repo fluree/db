@@ -31,7 +31,7 @@
            address :address
            size :size}
           (<? (store/write store hash data))]
-      {:name    hash
+      {:name    path
        :hash    hash
        :json    json
        :size    (count json)
