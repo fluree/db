@@ -64,7 +64,8 @@
 (defn lookup
   [local-path ledger-alias {:keys [branch] :or {branch "main"} :as _opts}]
   (go-try
-    (file-address (read-address local-path ledger-alias))))
+    (when-let [read-address (read-address local-path ledger-alias)]
+      (file-address read-address))))
 
 
 (defrecord FileNameService
