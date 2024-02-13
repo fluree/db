@@ -199,12 +199,11 @@
         db*))))
 
 
-(defn create*
+(defn ->ledger
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [did branch indexer include reindex-min-bytes
-                  reindex-max-bytes]
+    (let [{:keys [did branch indexer reindex-min-bytes reindex-max-bytes]
            :or   {branch :main}}
           opts
 
@@ -232,31 +231,42 @@
           ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
           method-type   (conn-proto/-method conn)
           ;; map of all branches and where they are branched from
-          branches      {branch (branch/new-branch-map nil ledger-alias* branch ns-addresses)}
-          ledger        (map->JsonLDLedger
-                          {:id      (random-uuid)
-                           :did     did*
-                           :state   (atom {:closed?  false
-                                           :branches branches
-                                           :branch   branch
-                                           :graphs   {}
-                                           :push     {:complete {:t   0
-                                                                 :dag nil}
-                                                      :pending  {:t   0
-                                                                 :dag nil}}})
-                           :alias   ledger-alias*
-                           :address address
-                           :method  method-type
-                           :cache   (atom {})
-                           :indexer indexer
-                           :conn    conn})
-          db            (jld-db/create ledger)]
-      ;; place initial 'blank' DB into ledger.
-      (ledger-proto/-db-update ledger db)
-      (when include
-        ;; includes other ledgers - experimental
-        (let [db* (<? (include-dbs conn db include))]
-          (ledger-proto/-db-update ledger db*)))
+          branches      {branch (branch/new-branch-map nil ledger-alias* branch ns-addresses)}]
+      (map->JsonLDLedger
+        {:id      (random-uuid)
+         :did     did*
+         :state   (atom {:closed?  false
+                         :branches branches
+                         :branch   branch
+                         :graphs   {}
+                         :push     {:complete {:t   0
+                                               :dag nil}
+                                    :pending  {:t   0
+                                               :dag nil}}})
+         :alias   ledger-alias*
+         :address address
+         :method  method-type
+         :cache   (atom {})
+         :indexer indexer
+         :conn    conn}))))
+
+(defn initialize-db!
+  ([ledger]
+   (initialize-db! ledger nil))
+  ([{:keys [conn] :as ledger} include]
+   (go-try
+     (let [db (jld-db/create ledger)]
+       (if (seq include)
+         ;; includes other ledgers - experimental
+         (let [db* (<? (include-dbs conn db include))]
+           (ledger-proto/-db-update ledger db*))
+         (ledger-proto/-db-update ledger db))))))
+
+(defn create*
+  [conn ledger-alias {:keys [include] :as opts}]
+  (go-try
+    (let [ledger (<? (->ledger conn ledger-alias opts))]
+      (<? (initialize-db! ledger include))
       ledger)))
 
 (defn create
