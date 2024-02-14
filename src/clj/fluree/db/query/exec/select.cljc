@@ -23,18 +23,14 @@
   "Format a where-pattern match for presentation based on the match's datatype.
   Return an async channel that will eventually contain the formatted match."
   (fn [match db _iri-cache _compact _error-ch]
-    (let [dt-iri (where/get-datatype-iri match)]
-      (if (keyword? dt-iri)
-        dt-iri
-        (let [nses (:namespaces db)]
-          (iri/iri->sid dt-iri nses))))))
+    (where/get-datatype-iri match)))
 
 (defmethod display :default
   [match _ _ _ _]
   (go (where/get-value match)))
 
-(defmethod display const/$rdf:json
-  [match db iri-cach compact error-ch]
+(defmethod display const/iri-json
+  [match _db _iri-cach _compact error-ch]
   (go
     (let [v (where/get-value match)]
       (try* (json/parse v false)
@@ -42,7 +38,7 @@
                     (log/error e "Error displaying json:" v)
                     (>! error-ch e))))))
 
-(defmethod display const/$xsd:anyURI
+(defmethod display const/iri-anyURI
   [match db iri-cache compact error-ch]
   (go
     (or (some-> match ::where/iri compact)

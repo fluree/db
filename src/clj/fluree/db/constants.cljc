@@ -61,6 +61,8 @@
 (def ^:const iri-value "@value")
 (def ^:const iri-language "@language")
 (def ^:const iri-type "@type")
+(def ^:const iri-json "http://www.w3.org/2001/XMLSchema#json")
+(def ^:const iri-anyURI "http://www.w3.org/2001/XMLSchema#anyURI")
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
 (def ^:const iri-lang-string "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
@@ -167,8 +169,7 @@
 ;; == xsd data types ==
 ;; major types (a) ref, (b) string, (c) number, (d) boolean
 ;; xsd common types
-(def ^:const $xsd:anyURI-iri "http://www.w3.org/2001/XMLSchema#anyURI")
-(def ^:const $xsd:anyURI (iri/iri->sid $xsd:anyURI-iri))
+(def ^:const $xsd:anyURI (iri/iri->sid iri-anyURI))
 (def ^:const $xsd:string (iri/iri->sid "http://www.w3.org/2001/XMLSchema#string"))
 (def ^:const $xsd:boolean (iri/iri->sid "http://www.w3.org/2001/XMLSchema#boolean"))
 (def ^:const $xsd:date (iri/iri->sid "http://www.w3.org/2001/XMLSchema#date"))
@@ -204,7 +205,7 @@
 (def ^:const $xsd:unsignedByte (iri/iri->sid "http://www.w3.org/2001/XMLSchema#unsignedByte")) ; store as number
 (def ^:const $xsd:hexBinary (iri/iri->sid "http://www.w3.org/2001/XMLSchema#hexBinary"))
 (def ^:const $xsd:base64Binary (iri/iri->sid "http://www.w3.org/2001/XMLSchema#base64Binary"))
-(def ^:const $rdf:json (iri/iri->sid "http://www.w3.org/2001/XMLSchema#json"))
+(def ^:const $rdf:json (iri/iri->sid iri-json))
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
 

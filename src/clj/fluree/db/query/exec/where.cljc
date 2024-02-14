@@ -66,7 +66,7 @@
   [mch]
   (if (or (matched-iri? mch)
           (matched-sid? mch))
-    const/$xsd:anyURI-iri
+    const/iri-anyURI
     (::datatype-iri mch)))
 
 (defn get-datatype-sid
