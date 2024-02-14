@@ -430,7 +430,7 @@
   committing to an in-memory ledger and when reifying a ledger from storage on
   load."
   [db t commit-sid previous-id]
-  (let [prev-sid (iri/iri->sid previous-id (:namespaces db))]
+  (let [prev-sid (iri/encode-iri db previous-id)]
     [(flake/create commit-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
 
 (defn prev-data-flakes
@@ -439,7 +439,7 @@
   previous pointer). Used when committing to an in-memory ledger value and when
   reifying a ledger from storage on load."
   [db db-sid t prev-data-id]
-  (let [prev-sid (iri/iri->sid prev-data-id (:namespaces db))]
+  (let [prev-sid (iri/encode-iri db prev-data-id)]
     [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
 
 (defn issuer-flakes
@@ -450,12 +450,12 @@
   used. It will only be called if needed. Used when committing to an in-memory
   ledger value and when reifying a ledger from storage on load."
   [db t commit-sid issuer-iri]
-  (if-let [issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
+  (if-let [issuer-sid (iri/encode-iri db issuer-iri)]
     ;; create reference to existing issuer
     [(flake/create commit-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true
                    nil)]
     ;; create new issuer flake and a reference to it
-    (let [new-issuer-sid (iri/iri->sid issuer-iri (:namespaces db))]
+    (let [new-issuer-sid (iri/encode-iri db issuer-iri)]
       [(flake/create commit-sid const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
                      true nil)])))
 
@@ -477,8 +477,8 @@
         prev-data-id       (:id prev-data)
 
         t                  db-t
-        commit-sid         (iri/iri->sid id)
-        db-sid             (iri/iri->sid db-id)
+        commit-sid         (iri/encode-iri db id)
+        db-sid             (iri/encode-iri db db-id)
         base-flakes        (commit-metadata-flakes commit t commit-sid db-sid)
         prev-commit-flakes (when previous-id
                              (prev-commit-flakes db t commit-sid previous-id))

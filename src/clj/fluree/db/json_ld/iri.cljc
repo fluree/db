@@ -196,6 +196,10 @@
      (str (get-namespace sid namespace-codes)
           (get-name sid)))))
 
+(defprotocol IRICodec
+  (encode-iri [codec iri])
+  (decode-sid [codec sid]))
+
 (defn fluree-iri
   [nme]
   (str f-ns nme))

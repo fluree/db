@@ -67,7 +67,7 @@
          filter-map {}] ;; key 'p' value, val is list of filtering fns
     (if where-smt
       (let [[s p o] where-smt
-            p*      (-> p ::where/iri (iri/iri->sid (:namespaces db)))
+            p*      (iri/encode-iri db (::where/iri p))
             type (where/pattern-type where-smt)]
         (when (and (= :tuple type)
                    (= first-s (clause-subject-var where-smt)))
@@ -113,7 +113,7 @@
 (defn reparse-predicate-component
   [db pred]
   (if-let [p-iri (::where/iri pred)]
-    {:value (iri/iri->sid p-iri (:namespaces db))}
+    {:value (iri/encode-iri db p-iri)}
     (reparse-component pred)))
 
 (defn re-parse-pattern
@@ -130,9 +130,9 @@
      :p (reparse-predicate-component db p)
      :o (-> o
             reparse-component
-            (assoc :datatype (some-> o
-                                     where/get-datatype-iri
-                                     (iri/iri->sid (:namespaces db)))))}))
+            (assoc :datatype (some->> o
+                                      where/get-datatype-iri
+                                      (iri/encode-iri db))))}))
 
 (defn simple-subject-merge-where
   "Revises where clause for simple-subject-crawl query to optimize processing.

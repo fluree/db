@@ -16,7 +16,7 @@
 (defn cache-sid->iri
   [db cache compact-fn sid]
   (when-let [iri (or (some-> db :schema :pred (get sid) :iri compact-fn)
-                     (some-> sid (iri/sid->iri (:namespace-codes db)) compact-fn))]
+                     (some-> (iri/decode-sid db sid) compact-fn))]
     (vswap! cache assoc sid {:as iri})
     {:as iri}))
 
@@ -79,9 +79,7 @@
     (when (not-empty s-flakes)
       (let [sid           (->> s-flakes first flake/s)
             initial-attrs (if (<? (includes-id? db sid select-spec))
-                            (let [iri (-> sid
-                                          (iri/sid->iri (:namespace-codes db))
-                                          compact-fn)]
+                            (let [iri (compact-fn (iri/decode-sid db sid))]
                               {(compact-fn const/iri-id) iri})
                             {})]
         (loop [[p-flakes & r] (partition-by flake/p s-flakes)
@@ -89,7 +87,7 @@
           (if p-flakes
             (let [ff    (first p-flakes)
                   p     (flake/p ff)
-                  iri   (iri/sid->iri p (:namespace-codes db))
+                  iri   (iri/decode-sid db p)
                   list? (contains? (flake/m ff) :i)
                   spec  (or (get select-spec iri)
                             (when wildcard?
@@ -125,9 +123,8 @@
                                                 id-key    (:as (or (get @cache const/$id)
                                                                    (wildcard-spec db cache compact-fn const/$id)
                                                                    (cache-sid->iri db cache compact-fn const/$id)))
-                                                ns-codes  (:namespace-codes db)
                                                 oid       (flake/o f)
-                                                o-iri     (-> oid (iri/sid->iri ns-codes) compact-fn)
+                                                o-iri     (compact-fn (iri/decode-sid db oid))
                                                 subselect (:spec spec)]
                                             (cond
                                               ;; have a specified sub-selection (graph crawl)

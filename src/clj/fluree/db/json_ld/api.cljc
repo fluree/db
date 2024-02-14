@@ -333,4 +333,4 @@
   This can be used for doing range scans, slices and for other
   more advanced needs."
   [db iri]
-  (iri/iri->sid iri (:namespaces db)))
+  (iri/encode-iri db iri))

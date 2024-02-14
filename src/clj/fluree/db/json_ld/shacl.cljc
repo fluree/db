@@ -178,8 +178,7 @@
 
 (defn validate-value-properties
   [db {:keys [in has-value datatype nodekind logical-constraint] :as _p-shape} p-flakes]
-  (let [ns-codes (:namespace-codes db)
-        in-results (when in
+  (let [in-results (when in
                      (if (every? #(contains? (set in) (flake/o %)) p-flakes)
                        [true (str "sh:not sh:in: value must not be one of " in)]
                        [false (str "sh:in: value must be one of " in)]))
@@ -189,8 +188,8 @@
                               [false (str "sh:hasValue: at least one value must be " has-value)]))
         datatype-results (when datatype
                            (if (every? #(= (flake/dt %) datatype) p-flakes)
-                             [true (str "sh:not sh:datatype: every datatype must not be " (iri/sid->iri datatype ns-codes))]
-                             [false (str "sh:datatype: every datatype must be " (iri/sid->iri datatype ns-codes))]))]
+                             [true (str "sh:not sh:datatype: every datatype must not be " (iri/decode-sid db datatype))]
+                             [false (str "sh:datatype: every datatype must be " (iri/decode-sid db datatype))]))]
     (coalesce-validation-results [in-results has-value-results datatype-results] logical-constraint)))
 
 
@@ -442,12 +441,11 @@
 
 (defn format-path
   [db path]
-  (let [ns-codes (:namespace-codes db)]
-    (into []
-          (map (fn [[pid type]]
-                 (let [p-iri (iri/sid->iri pid ns-codes)]
-                   [p-iri type])))
-          path)))
+  (into []
+        (map (fn [[pid type]]
+               (let [p-iri (iri/decode-sid db pid)]
+                 [p-iri type])))
+        path))
 
 (defn validate-qualified-cardinality-constraints
   [db {:keys [path conforming qualified-min-count qualified-max-count]}]
@@ -494,10 +492,8 @@
   (let [unvalidated-properties (->> (keys pid->p-flakes)
                                     (remove (set/union ignored-properties validated-properties)))]
     (if (and closed? (not-empty unvalidated-properties))
-      (let [ns-codes  (:namespace-codes db)
-            prop-iris (into []
-                            (map (fn [p]
-                                   (iri/sid->iri p ns-codes)))
+      (let [prop-iris (into []
+                            (map (partial iri/decode-sid db))
                             unvalidated-properties)]
         [false (str "SHACL shape is closed, extra properties not allowed: " prop-iris)])
       [true])))
@@ -557,7 +553,7 @@
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
   [db property-flakes]
   (let [pid (->> property-flakes first flake/s)
-        iri (iri/sid->iri pid (:namespace-codes db))]
+        iri (iri/decode-sid db pid)]
     (reduce
       (fn [acc property-flake]
         (let [o (flake/o property-flake)]

@@ -27,8 +27,7 @@
 (defn get-s-iri
   "Returns an IRI from a subject id (sid)."
   [sid db compact-fn]
-  (let [ns-codes (:namespace-codes db)]
-    (-> sid (iri/sid->iri ns-codes) compact-fn)))
+  (compact-fn (iri/decode-sid db sid)))
 
 (defn- subject-block-pred
   [db iri-map compact-fn list? p-flakes]

@@ -222,10 +222,9 @@
   component `s-match`, and marks the matched pattern component as a URI data
   type."
   [s-match db flake]
-  (let [alias    (:alias db)
-        ns-codes (:namespace-codes db)
-        sid      (flake/s flake)
-        s-iri    (iri/sid->iri sid ns-codes)]
+  (let [alias (:alias db)
+        sid   (flake/s flake)
+        s-iri (iri/decode-sid db sid)]
     (-> s-match
         (match-sid alias sid)
         (match-iri s-iri))))
@@ -236,9 +235,8 @@
   type."
   [p-match db flake]
   (let [alias    (:alias db)
-        ns-codes (:namespace-codes db)
         pid      (flake/p flake)
-        p-iri    (iri/sid->iri pid ns-codes)]
+        p-iri    (iri/decode-sid db pid)]
     (-> p-match
         (match-sid alias pid)
         (match-iri p-iri))))
@@ -247,16 +245,15 @@
   "Matches the object, data type, and metadata of the supplied `flake` to the
   triple object pattern component `o-match`."
   [o-match db flake]
-  (let [ns-codes (:namespace-codes db)
-        dt       (flake/dt flake)]
-    (if (#{const/$xsd:anyURI} dt)
+  (let [dt (flake/dt flake)]
+    (if (= const/$xsd:anyURI dt)
       (let [alias (:alias db)
             oid   (flake/o flake)
-            o-iri (iri/sid->iri oid ns-codes)]
+            o-iri (iri/decode-sid db oid)]
         (-> o-match
             (match-sid alias oid)
             (match-iri o-iri)))
-      (let [dt-iri (iri/sid->iri dt ns-codes)]
+      (let [dt-iri (iri/decode-sid db dt)]
         (match-value o-match (flake/o flake) dt-iri (flake/m flake))))))
 
 (defn match-flake
@@ -299,7 +296,7 @@
   ([db fuel-tracker error-ch components]
    (resolve-flake-range db fuel-tracker nil error-ch components))
 
-  ([{:keys [alias conn t namespaces] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
+  ([{:keys [alias conn t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
    (let [s    (get-sid s-mch alias)
          s-fn (::fn s-mch)
          p    (get-sid p-mch alias)
@@ -307,7 +304,7 @@
          o    (or (get-value o-mch)
                   (get-sid o-mch alias))
          o-fn (::fn o-mch)
-         o-dt (some-> o-mch get-datatype-iri (iri/iri->sid namespaces))
+         o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
 
          idx         (try* (index/for-components s p o o-dt)
                            (catch* e
@@ -323,17 +320,17 @@
          subj-filter (when s-fn
                        (filter (fn [f]
                                  (-> unmatched
-                                     (match-subject alias f)
+                                     (match-subject db f)
                                      s-fn))))
          pred-filter (when p-fn
                        (filter (fn [f]
                                  (-> unmatched
-                                     (match-predicate alias f)
+                                     (match-predicate db f)
                                      p-fn))))
          obj-filter  (when o-fn*
                        (filter (fn [f]
                                  (-> unmatched
-                                     (match-object alias f)
+                                     (match-object db f)
                                      o-fn*))))
          flake-xf*   (->> [subj-filter pred-filter obj-filter
                            flake-xf track-fuel]
@@ -352,17 +349,15 @@
 (defn compute-sid
   [s-mch db]
   (let [db-alias (:alias db)
-        nses     (:namespaces db)
         s-iri    (::iri s-mch)]
-    (when-let [sid (iri/iri->sid s-iri nses)]
+    (when-let [sid (iri/encode-iri db s-iri)]
       (match-sid s-mch db-alias sid))))
 
 (defn compute-datatype-sid
   [o-mch db]
-  (let [db-alias (:alias db)
-        nses     (:namespaces db)]
-    (if-let [dt-iri   (::datatype-iri o-mch)]
-      (when-let [sid (iri/iri->sid dt-iri nses)]
+  (let [db-alias (:alias db)]
+    (if-let [dt-iri (::datatype-iri o-mch)]
+      (when-let [sid (iri/encode-iri db dt-iri)]
         (assoc-in o-mch [::datatype-sid db-alias] sid))
       o-mch)))
 

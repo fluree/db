@@ -75,7 +75,7 @@
       (throw (ex-info (str "No IRI value provided: " f-where)
                       {:status 400 :error :db/invalid-query})))
     (async/go
-      (let [sid (iri/iri->sid iri (:namespaces db))]
+      (let [sid (iri/encode-iri db iri)]
         (cond (util/exception? sid)
               (>! error-ch sid)
 

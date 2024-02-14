@@ -44,19 +44,18 @@
 
 (defn- get-type-retractions
   [db t sid type]
-  (let [nses (:namespaces db)]
-    (into []
-          (map (fn [type-item]
-                 (let [type-sid (iri/iri->sid type-item nses)]
-                   (flake/create sid const/$rdf:type type-sid
-                                 const/$xsd:anyURI t false nil))))
-          type)))
+  (into []
+        (map (fn [type-item]
+               (let [type-sid (iri/encode-iri db type-item)]
+                 (flake/create sid const/$rdf:type type-sid
+                               const/$xsd:anyURI t false nil))))
+        type))
 
 (defn retract-value-map
   [db sid pid t v-map]
   (let [ref-id (:id v-map)]
     (if (and ref-id (node? v-map))
-      (let [ref-sid (iri/iri->sid ref-id (:namespaces db))]
+      (let [ref-sid (iri/encode-iri db ref-id)]
         (flake/create sid pid ref-sid const/$xsd:anyURI t false nil))
       (let [[value dt] (datatype/from-expanded v-map nil)]
         (flake/create sid pid value dt t false nil)))))
@@ -68,7 +67,7 @@
     (if k
       (if (keyword? k)
         (recur r acc)
-        (let [pid  (or (iri/iri->sid k (:namespaces db))
+        (let [pid  (or (iri/encode-iri db k)
                        (throw (ex-info (str "Retraction on a property that does not exist: " k)
                                        {:status 400
                                         :error  :db/invalid-commit})))
@@ -81,7 +80,7 @@
 (defn retract-node
   [db t node]
   (let [{:keys [id type]} node
-        sid               (or (iri/iri->sid id (:namesaces db))
+        sid               (or (iri/encode-iri db id)
                               (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
                                                    " at db t value: " t ".")
                                               {:status 400 :error
@@ -105,7 +104,7 @@
     (loop [[type-item & r] type
            acc             []]
       (if type-item
-        (let [type-id (iri/iri->sid type-item (:namespaces db))]
+        (let [type-id (iri/encode-iri db type-item)]
           (recur r  (conj acc (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t true nil))))
         acc))
     []))
@@ -115,7 +114,7 @@
   (let [ref-id (:id v-map)
         meta   (::meta v-map)]
     (if (and ref-id (node? v-map))
-      (let [ref-sid (iri/iri->sid ref-id (:namespaces db))]
+      (let [ref-sid (iri/encode-iri db ref-id)]
         (flake/create sid pid ref-sid const/$xsd:anyURI t true meta))
       (let [[value dt] (datatype/from-expanded v-map nil)]
         (flake/create sid pid value dt t true meta)))))
@@ -142,7 +141,7 @@
   [db t node]
   (log/trace "assert-node:" node)
   (let [{:keys [id type]} node
-        sid             (iri/iri->sid id (:namespaces db))
+        sid             (iri/encode-iri db id)
         type-assertions (if (seq type)
                           (get-type-assertions db t sid type)
                           [])]
@@ -150,7 +149,7 @@
           (comp (filter (fn [node-entry]
                           (not (-> node-entry key keyword?))))
                 (mapcat (fn [[prop value]]
-                          (let [pid (iri/iri->sid prop (:namespaces db))]
+                          (let [pid (iri/encode-iri db prop)]
                             (assert-property db sid pid t value)))))
           node)))
 
@@ -307,9 +306,9 @@
           (commit-data/json-ld->map commit db)
 
           commit-id          (:id commit-metadata)
-          commit-sid         (iri/iri->sid commit-id)
+          commit-sid         (iri/encode-iri db commit-id)
           [prev-commit _]    (some->> previous :address (read-commit conn) <?)
-          db-sid             (iri/iri->sid alias (:namespaces db))
+          db-sid             (iri/encode-iri db alias)
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new commit-sid db-sid)
           previous-id        (when prev-commit (:id prev-commit))

@@ -493,13 +493,12 @@
   [db did]
   (go-try
     (let [ns-codes (:namespace-codes db)
-          did-sid  (iri/iri->sid did (:namespaces db))]
+          did-sid  (iri/encode-iri db did)]
       (into #{}
             (<? (query-range/index-range db :spot = [did-sid const/$f:role]
                                          {:flake-xf (comp (map flake/o)
                                                           (distinct)
-                                                          (map (fn [sid]
-                                                                 (iri/sid->iri sid ns-codes))))}))))))
+                                                          (map (partial iri/decode-sid db)))}))))))
 
 (defn wrap-policy
   "Given a db object and a map containing the identity,

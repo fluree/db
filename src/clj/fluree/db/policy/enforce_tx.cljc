@@ -14,11 +14,10 @@
   default-allow?, where it will continue if true, else reject entire transaction if false."
   [db property-policies default-allow? flakes]
   (go-try
-    (let [policies-by-iri (validate/group-property-policies property-policies)
-          ns-codes (:namespace-codes db)]
+    (let [policies-by-iri (validate/group-property-policies property-policies)]
       (loop [[flake & r] flakes]
         (if flake
-          (let [p-iri (-> flake flake/p (iri/sid->iri ns-codes))]
+          (let [p-iri (iri/decode-sid db (flake/p flake))]
             (if-let [p-policies (get policies-by-iri p-iri)]
               (let [allow? (loop [[[async? f] & r] p-policies]
                              ;; return first truthy response, else false
@@ -46,7 +45,7 @@
   "Returns true if all policy enforcement passes, else exception related to
   first policy the fails."
   [{:keys [db-after add]} {:keys [subj-mods] :as _tx-state}]
-  (let [{:keys [policy namespace-codes]} db-after
+  (let [{:keys [policy]} db-after
         subj-mods' @subj-mods]
     (go-try
       (if (validate/unrestricted-modify? db-after)
@@ -56,8 +55,7 @@
             (let [fflake         (first s-flakes)
                   sid            (flake/s fflake)
                   {:keys [classes]} (get subj-mods' sid)
-                  class-iris (map (fn [c]
-                                    (iri/sid->iri c namespace-codes))
+                  class-iris (map (partial iri/decode-sid db-after)
                                   classes)
                   {defaults :default props :property}
                   (validate/group-policies-by-default policy const/iri-modify

@@ -17,7 +17,7 @@
   "If a predicate is provided as a string value, coerce to pid"
   [db pred]
   (if (string? pred)
-    (or (iri/iri->sid pred (:namespaces db))
+    (or (iri/encode-iri db pred)
         (throw (ex-info (str "Invalid predicate, does not exist: " pred)
                         {:status 400, :error :db/invalid-predicate})))
     pred))
@@ -282,7 +282,7 @@
      (go-try
        (let [s1*         (if (or (iri/sid? s1) (nil? s1))
                            s1
-                           (iri/iri->sid s1 (:namespaces db)))
+                           (iri/encode-iri db s1))
              start-flake (resolve-match-flake start-test s1* p1 o1 t1 op1 m1)
              s2*         (cond
                            (or (iri/sid? s2) (nil? s2))
@@ -292,7 +292,7 @@
                            s1*
 
                            :else
-                           (iri/iri->sid s2 (:namespaces db)))
+                           (iri/encode-iri db s2))
              end-flake   (resolve-match-flake end-test s2* p2 o2 t2 op2 m2)
              error-ch    (chan)
              range-ch    (index-range* db

@@ -20,12 +20,11 @@
   [{:keys [policy] :as db} path equals-rule]
   (go-try
     (let [{:keys [cache ident]} policy
-          db-root (dbproto/-rootdb db)
-          nses    (:namespaces db-root)]
+          db-root (dbproto/-rootdb db)]
       (loop [[next-iri & r] path
              last-result    ident]
         (if (and last-result next-iri)
-          (let [next-pid (iri/iri->sid next-iri nses)
+          (let [next-pid (iri/encode-iri db next-iri)
                 next-res (<? (query-range/index-range db-root :spot = [last-result next-pid]))
                 ;; in case of mixed data types, take the first IRI result - unless we
                 ;; are at the end of the path in which case take the first value regardless

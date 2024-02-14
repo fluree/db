@@ -24,17 +24,17 @@
 
   Note this should only be called if the db is permissioned, don't call if the
   root user as the results will not come back correctly."
-  [{:keys [policy namespace-codes] :as db} flake]
+  [{:keys [policy] :as db} flake]
   (go-try
     (or (unrestricted-view? db)
         (let [sid     (flake/s flake)
-              s-iri   (iri/sid->iri sid namespace-codes)
+              s-iri   (iri/decode-sid db sid)
               pid     (flake/p flake)
-              p-iri   (iri/sid->iri pid namespace-codes)
+              p-iri   (iri/decode-sid db pid)
               classes (or (get @(:cache policy) s-iri)
                           (let [class-sids (<? (dbproto/-class-ids db sid))
                                 class-iris (map (fn [c]
-                                                  (iri/sid->iri c namespace-codes))
+                                                  (iri/decode-sid db c))
                                                 class-sids)]
                             ;; note, classes will return empty list if none found ()
                             (swap! (:cache policy) assoc s-iri class-iris)
@@ -71,12 +71,11 @@
 (defn- evaluate-subject-properties
   [db property-policies default-allow? flakes]
   (go-try
-    (let [policies-by-property (group-property-policies property-policies)
-          ns-codes             (:namespace-codes db)]
+    (let [policies-by-property (group-property-policies property-policies)]
       (loop [[flake & r] flakes
              acc         []]
         (if flake
-          (let [prop          (-> flake flake/p (iri/sid->iri ns-codes))
+          (let [prop          (iri/decode-sid db (flake/p flake))
                 prop-policies (get policies-by-property prop)]
             (cond
               prop-policies  (let [allow? (loop [[[async? f] & r] prop-policies]
@@ -143,12 +142,11 @@
 
   If no property policies are not defined, a single evaluation for
   the subject can be done and each flake does not need to be checked."
-  [{:keys [policy namespace-codes] :as db} flakes]
+  [{:keys [policy] :as db} flakes]
   (go-try
     (when-let [fflake (first flakes)]
       (let [class-ids  (<? (dbproto/-class-ids db (flake/s fflake)))
-            class-iris (map (fn [class-id]
-                              (iri/sid->iri class-id namespace-codes))
+            class-iris (map (partial iri/decode-sid db)
                             class-ids)
             {defaults :default props :property} (group-policies-by-default
                                                  policy const/iri-view class-iris)

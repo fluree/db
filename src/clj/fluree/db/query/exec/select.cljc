@@ -47,7 +47,7 @@
           (if-let [cached (-> @iri-cache (get v) :as)]
             cached
             (try* (let [ns-codes (:namespace-codes db)
-                        iri      (-> v (iri/sid->iri ns-codes) compact)]
+                        iri      (compact (iri/decode-sid db v))]
                     (vswap! iri-cache assoc v {:as iri})
                     iri)
                   (catch* e
@@ -162,7 +162,7 @@
                            (-> solution
                                (get subj)
                                (where/get-sid db-alias))
-                           (iri/iri->sid subj (:namespaces db)))]
+                           (iri/encode-iri db subj))]
             (let [flakes (<? (query-range/index-range db :spot = [sid]))]
               ;; TODO: Replace these nils with fuel values when we turn fuel back on
               (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))))

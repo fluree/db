@@ -85,7 +85,7 @@
     {:id    sid ; rdf:type is predefined, so flakes to build map won't be present.
      :class false
      :ref?  true}
-    (let [iri (iri/sid->iri sid (:namespace-codes db))]
+    (let [iri (iri/decode-sid db sid)]
       {:id                 sid
        :iri                iri
        :class              true ; default

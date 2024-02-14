@@ -34,10 +34,6 @@
              (query-range/index-range :spot = [subject-id const/$rdf:type])
              <?))))
 
-(defn sid->iri
-  [{:keys [namespace-codes] :as _db} sid]
-  (iri/sid->iri sid namespace-codes))
-
 ;; ================ Jsonld record support fns ================================
 
 (defn- jsonld-root-db [this]
@@ -88,7 +84,13 @@
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
   (-stage [db fuel-tracker json-ld opts] (jld-transact/stage db fuel-tracker json-ld opts))
-  (-index-update [db commit-index] (index-update db commit-index)))
+  (-index-update [db commit-index] (index-update db commit-index))
+
+  iri/IRICodec
+  (encode-iri [_ iri]
+    (iri/iri->sid iri namespaces))
+  (decode-sid [_ sid]
+    (iri/sid->iri sid namespace-codes)))
 
 #?(:cljs
    (extend-type JsonLdDb
