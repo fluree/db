@@ -24,41 +24,27 @@
 
 (defn- write-data!
   [store data]
-  (let [json (json-ld/normalize-data data)
-        hash (crypto/sha2-256 json)
-        {path :k
-         address :address
-         size :size}
-        (store/write store hash data)]
-    {:name    hash
-     :hash    hash
-     :json    json
-     :size    (count json)
-     :address address}))
-
-(defn write-commit!
-  [store commit-data]
-  (write-data! store commit-data))
+  (go-try
+    (let [json (json-ld/normalize-data data)
+          hash (crypto/sha2-256 json)
+          {path :k
+           address :address
+           size :size}
+          (<? (store/write store hash data))]
+      {:name    path
+       :hash    hash
+       :json    json
+       :size    (count json)
+       :address address})))
 
 (defn- read-data
   [store address]
-  (let [data (store/read store address)]
-    #?(:cljs (if (and platform/BROWSER (string? data))
-               (js->clj (.parse js/JSON data))
-               data)
-       :clj  data)))
-
-(defn read-commit
-  [store address]
-  (read-data store address))
-
-(defn write-context!
-  [store context-data]
-  (write-data! store context-data))
-
-(defn read-context
-  [store context-key]
-  (read-data store context-key))
+  (go-try
+    (let [data (<? (store/read store address))]
+      #?(:cljs (if (and platform/BROWSER (string? data))
+                 (js->clj (.parse js/JSON data))
+                 data)
+         :clj  data))))
 
 (defn close
   [id state]
@@ -69,10 +55,10 @@
                              parallelism msg-in-ch msg-out-ch nameservices data-atom]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key] (go (read-commit store commit-key)))
-  (-c-write [_ _ledger commit-data] (go (write-commit! store commit-data)))
-  (-ctx-write [_ _ledger context-data] (go (write-context! store context-data)))
-  (-ctx-read [_ context-key] (go (read-context store context-key)))
+  (-c-read [_ commit-key] (read-data store commit-key))
+  (-c-write [_ _ledger commit-data] (write-data! store commit-data))
+  (-ctx-write [_ _ledger context-data] (write-data! store context-data))
+  (-ctx-read [_ context-key] (read-data store context-key))
 
   conn-proto/iConnection
   (-close [_] (close id state))
@@ -140,7 +126,7 @@
           state           (conn-core/blank-state)
           nameservices*   (util/sequential
                             (or nameservices
-                                (default-memory-nameservice store)))
+                                (default-memory-nameservice (:storage-atom store))))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]

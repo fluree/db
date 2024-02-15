@@ -1,7 +1,9 @@
 (ns fluree.db.storage.file
   (:refer-clojure :exclude [read list])
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.crypto :as crypto]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.storage.proto :as store-proto]
@@ -21,19 +23,20 @@
                      :k            k
                      :v            v
                      :opts         opts})))
-  (let [hash  (crypto/sha2-256 v)
-        k*    (if content-address?
-                (str k hash)
-                k)
-        path  (str (fs/local-path storage-path) "/" k)
-        bytes (if (string? v)
-                (bytes/string->UTF8 v)
-                v)]
-    (fs/write-file path bytes)
-    {:k    k*
-     :address (file-address k*)
-     :hash hash
-     :size (count bytes)}))
+  (go-try
+    (let [hash  (crypto/sha2-256 v)
+          k*    (if content-address?
+                  (str k hash)
+                  k)
+          path  (str (fs/local-path storage-path) "/" k)
+          bytes (if (string? v)
+                  (bytes/string->UTF8 v)
+                  v)]
+      (<? (fs/write-file path bytes))
+      {:k    k*
+       :address (file-address k*)
+       :hash hash
+       :size (count bytes)})))
 
 (defn file-list
   [storage-path prefix]
@@ -60,6 +63,7 @@
 
 (defrecord FileStore [storage-path]
   store-proto/Store
+  (address [_ k] (file-address k))
   (write [_ k v opts] (file-write storage-path k v opts))
   (read [_ address] (file-read storage-path address))
   (list [_ prefix] (file-list storage-path prefix))

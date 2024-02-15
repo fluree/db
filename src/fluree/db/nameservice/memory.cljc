@@ -3,9 +3,7 @@
             [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.db.platform :as platform]
-            [fluree.db.util.log :as log]
-            [fluree.db.storage :as store]
-            [fluree.db.storage.util :as store-util]))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -23,55 +21,70 @@
                     {:status 500 :error :db/invalid-db}))))
 
 (defn- read-address
-  [store address]
-  (store/read store address))
+  [data-atom address]
+  (let [addr-path (address-path address)]
+    #?(:clj  (get @data-atom addr-path)
+       :cljs (or (get @data-atom addr-path)
+                 (and platform/BROWSER (.getItem js/localStorage addr-path))))))
 
 (defn push!
-  [store {commit-address   :address
-          nameservice-iris :ns
-          :as              commit-data}]
+  [data-atom {commit-address   :address
+              nameservice-iris :ns
+              :as              commit-data}]
   (go
     (let [my-ns-iri   (some #(when (re-matches #"^fluree:memory:(.+)" (:id %)) (:id %)) nameservice-iris)
-          head-path   (address-path my-ns-iri)
-
-          commit (store/read store commit-address)
-          _      (when-not commit
+          commit-path (address-path commit-address)
+          head-path   (address-path my-ns-iri)]
+      (swap! data-atom
+             (fn [state]
+               (let [commit (get state commit-path)]
+                 (when-not commit
                    (throw (ex-info (str "Unable to locate commit in memory, cannot push!: " commit-address)
                                    {:status 500 :error :db/invalid-db})))
-          commit* (assoc commit "address" commit-address)]
-      (store/write store head-path commit*)
+                 (log/debug "pushing:" my-ns-iri "referencing commit:" commit-address)
+                 (let [commit (assoc commit "address" commit-address)]
+                   (assoc state head-path commit)))))
+      #?(:cljs (and platform/BROWSER (.setItem js/localStorage address-path commit-path)))
       commit-data)))
 
 (defn lookup
-  [store ledger-alias opts]
-  (go (if-let [head-commit (store/read store ledger-alias)]
-        (-> head-commit (get "address"))
-        (throw (ex-info (str "Unable to lookup ledger address from conn: "
-                             ledger-alias)
-                        {:status 500 :error :db/missing-head})))))
+  [data-atom ledger-address]
+  (go #?(:clj
+         (if-let [head-commit (read-address data-atom ledger-address)]
+           (-> head-commit (get "address"))
+           (throw (ex-info (str "Unable to lookup ledger address from conn: "
+                                ledger-address)
+                           {:status 500 :error :db/missing-head})))
+
+         :cljs
+         (if platform/BROWSER
+           (if-let [head-commit (read-address data-atom ledger-address)]
+             (memory-address head-commit)
+             (throw (ex-info (str "Unable to lookup ledger address from localStorage: "
+                                  ledger-address)
+                             {:status 500 :error :db/missing-head})))
+           (throw (ex-info (str "Cannot lookup ledger address with memory connection: "
+                                ledger-address)
+                           {:status 500 :error :db/invalid-ledger}))))))
 
 (defn ledger-list
-  [store opts]
-  (go
-    (->> (store/list store "")
-         (filter #(and (string? %)
-                       (str/ends-with? % "head"))))))
+  [state-atom opts]
+  (go (-> @state-atom keys)))
 
 (defn address
   [ledger-alias {:keys [branch] :as _opts}]
   (go (memory-address (str ledger-alias "/" (name branch) "/head"))))
 
 (defrecord MemoryNameService
-  [store sync?]
+  [state-atom sync?]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias] (lookup store ledger-alias nil))
-  (-lookup [_ ledger-alias opts] (lookup store ledger-alias opts))
-  (-push [_ commit-data] (push! store commit-data))
+  (-lookup [_ ledger-address] (lookup state-atom ledger-address))
+  (-push [_ commit-data] (push! state-atom commit-data))
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported MemoryNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported MemoryNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
-  (-exists? [_ ledger-address] (go (boolean (store/read store ledger-address))))
-  (-ledgers [_ opts] (ledger-list store opts))
+  (-exists? [_ ledger-address] (go (boolean (read-address state-atom ledger-address))))
+  (-ledgers [_ opts] (ledger-list state-atom opts))
   (-address [_ ledger-alias opts]
     (address ledger-alias opts))
   (-alias [_ ledger-address]
@@ -79,10 +92,10 @@
         (str/split #"/")
         (->> (drop 2)
              (str/join "/"))))
-  (-close [nameservice] (reset! store {})))
+  (-close [nameservice] (reset! state-atom {})))
 
 
 (defn initialize
-  [store]
-  (map->MemoryNameService {:store store
-                           :sync? true}))
+  [state-atom]
+  (map->MemoryNameService {:state-atom state-atom
+                           :sync?      true}))

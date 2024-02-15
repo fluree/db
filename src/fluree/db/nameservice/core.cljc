@@ -70,12 +70,12 @@
 (defn lookup-commit
   "Returns commit address from first matching nameservice on a conn
    for a given ledger alias and branch"
-  [conn ledger-alias {:keys [branch] :or {branch "main"} :as _opts}]
+  [conn ledger-address]
   (let [nameservices (nameservices conn)]
     (go-try
       (loop [nameservices* nameservices]
         (when-let [ns (first nameservices*)]
-          (let [commit-address (<? (ns-proto/-lookup ns ledger-alias branch))]
+          (let [commit-address (<? (ns-proto/-lookup ns ledger-address))]
             (if commit-address
               commit-address
               (recur (rest nameservices*)))))))))

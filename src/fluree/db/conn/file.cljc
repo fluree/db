@@ -26,47 +26,33 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn read-commit
-  [conn address]
-  (json/parse (store/read (:store conn) address) false))
-
 (defn- write-data
   [{:keys [store] :as _conn} ledger data-type data]
-  (let [alias      (ledger-proto/-alias ledger)
-        branch     (name (:name (ledger-proto/-branch ledger)))
-        json       (if (string? data)
+  (go-try
+    (let [alias    (ledger-proto/-alias ledger)
+          branch   (name (:name (ledger-proto/-branch ledger)))
+          json     (if (string? data)
                      data
                      (json-ld/normalize-data data))
-        bytes      (bytes/string->UTF8 json)
-        hash       (crypto/sha2-256 bytes :hex)
-        type-dir   (name data-type)
-        path       (str alias
-                        (when branch (str "/" branch))
-                        (str "/" type-dir "/")
-                        hash ".json")
-        ;; TODO: build migration to remove .json suffix so we can use :content-address? true
-        {:keys [k hash v address]} (store/write store path bytes)]
-    {:name    hash
-     :hash    hash
-     :json    json
-     :size    (count json)
-     :address address}))
+          bytes    (bytes/string->UTF8 json)
+          hash     (crypto/sha2-256 bytes :hex)
+          type-dir (name data-type)
+          path     (str alias
+                          (when branch (str "/" branch))
+                          (str "/" type-dir "/")
+                          hash ".json")
 
-(defn write-commit
-  [conn ledger commit-data]
-  (write-data conn ledger :commit commit-data))
+          {:keys [k hash v address]} (<? (store/write store path bytes))]
+      {:name    path
+       :hash    hash
+       :json    json
+       :size    (count json)
+       :address address})))
 
-(defn write-context
-  [conn ledger context-data]
-  (write-data conn ledger :context context-data))
-
-(defn write-index-item
-  [conn ledger index-type index-data]
-  (write-data conn ledger (str "index/" (name index-type)) index-data))
-
-(defn read-context
-  [conn context-key]
-  (json/parse (store/read (:store conn) context-key) true))
+(defn read-data [conn address keywordize?]
+  (go-try
+    (-> (<? (store/read (:store conn) address))
+        (json/parse keywordize?))))
 
 (defn close
   [id state]
@@ -77,18 +63,13 @@
                            nameservices serializer msg-out-ch lru-cache-atom]
 
   conn-proto/iStorage
-  (-c-read [conn commit-key] (go (read-commit conn commit-key)))
-  (-c-write [conn ledger commit-data] (go (write-commit conn ledger
-                                                        commit-data)))
-  (-ctx-read [conn context-key] (go (read-context conn context-key)))
-  (-ctx-write [conn ledger context-data] (go (write-context conn ledger
-                                                            context-data)))
+  (-c-read [conn commit-key] (read-data conn commit-key false))
+  (-c-write [conn ledger commit-data] (write-data conn ledger :commit commit-data))
+  (-ctx-read [conn context-key] (read-data conn context-key true))
+  (-ctx-write [conn ledger context-data] (write-data conn ledger :context context-data))
   (-index-file-write [conn ledger index-type index-data]
-    #?(:clj (async/thread (write-index-item conn ledger index-type index-data))
-       :cljs (async/go (write-index-item conn ledger index-type index-data))))
-  (-index-file-read [conn index-address]
-    #?(:clj (async/thread (json/parse (store/read (:store conn) index-address) true))
-       :cljs (async/go (json/parse (store/read (:store conn) index-address) true))))
+    (write-data conn ledger (str "index/" (name index-type)) index-data))
+  (-index-file-read [conn index-address] (read-data conn index-address true))
 
   conn-proto/iConnection
   (-close [_] (close id state))
@@ -163,18 +144,18 @@
 
 (defn default-file-nameservice
   "Returns file nameservice or will throw if storage-path generates an exception."
-  [store]
-  (ns-filesystem/initialize store))
+  [path]
+  (ns-filesystem/initialize path))
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism store lru-cache-atom memory serializer nameservices]
+  [{:keys [defaults parallelism store storage-path lru-cache-atom memory serializer nameservices]
     :or {serializer (json-serde)} :as _opts}]
   (go
     (let [conn-id        (str (random-uuid))
           state          (conn-core/blank-state)
           nameservices*  (util/sequential
-                           (or nameservices (default-file-nameservice store)))
+                           (or nameservices (default-file-nameservice storage-path)))
           cache-size     (conn-cache/memory->cache-size memory)
           lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans
