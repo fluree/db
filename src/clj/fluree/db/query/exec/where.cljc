@@ -40,7 +40,7 @@
 
 (defn get-iri
   [match]
-  (-> match ::iri))
+  (::iri match))
 
 (defn matched-iri?
   [match]

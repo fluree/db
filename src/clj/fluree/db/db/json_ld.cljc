@@ -1,6 +1,5 @@
 (ns fluree.db.db.json-ld
   (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql :as fql]
             [fluree.db.index :as index]
@@ -8,8 +7,6 @@
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try]]
-            #?(:clj  [clojure.core.async :refer [go] :as async]
-               :cljs [cljs.core.async :refer [go] :as async])
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.transact :as jld-transact]
