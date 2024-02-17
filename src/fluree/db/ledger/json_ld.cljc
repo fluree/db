@@ -307,6 +307,7 @@
           _            (when-not commit-addr
                          (throw (ex-info (str "Unable to load. No commit exists for: " address)
                                          {:status 400 :error :db/invalid-commit-address})))
+          _            (log/debug "load from address: " commit-addr)
           [commit _] (<? (jld-reify/read-commit conn commit-addr))
           _            (when-not commit
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
@@ -346,7 +347,9 @@
                                    {:status 400 :error :db/invalid-address}
                                    address)))
             (let [ledger (async/<! (load* conn address))]
-              ;; note, ledger can be an exception!
+              ;; note, ledger can be an exception, don't cache if so!
+              (when (util/exception? ledger)
+                (release-ledger conn alias))
               (async/put! ledger-chan ledger)
               ledger)))
         (<? ledger-chan)))))
