@@ -44,23 +44,30 @@
           (str "Invalid predicate property: " (pr-str property)))
   (get-in schema [:pred predicate property]))
 
+(defn force-index-update
+  [{:keys [ledger commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
+  (let [index-t (:t data-map)
+        commit* (assoc commit :index commit-index)]
+    (-> db
+        (assoc :commit commit*
+               :novelty* (idx-proto/-empty-novelty (:indexer ledger) db index-t)
+               :spot spot
+               :post post
+               :opst opst
+               :tspo tspo)
+        (assoc-in [:stats :indexed] index-t))))
+
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [ledger commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
-  (let [index-t      (:t data-map)
-        newer-index? (and data-map
-                          (or (nil? (commit-data/index-t commit))
-                              (> index-t (commit-data/index-t commit))))]
+  [{:keys [commit] :as db} {data-map :data, :as commit-index}]
+  (let [index-t        (:t data-map)
+        commit-index-t (commit-data/index-t commit)
+        newer-index?   (and data-map
+                            (or (nil? commit-index-t)
+                                (> index-t commit-index-t)))]
     (if newer-index?
-      (-> db
-          (assoc :commit (assoc commit :index commit-index)
-                 :novelty* (idx-proto/-empty-novelty (:indexer ledger) db index-t)
-                 :spot spot
-                 :post post
-                 :opst opst
-                 :tspo tspo)
-          (assoc-in [:stats :indexed] index-t))
+      (force-index-update db commit-index)
       db)))
 
 ;; ================ end Jsonld record support fns ============================
