@@ -45,8 +45,6 @@
 (defn file-path
   "Returns fully formed file path where a ns record would be stored."
   [local-path alias]
-  (log/warn "Loading file path: " (str local-path "/" alias ".json"))
-  (log/warn "All files in path: "  (list-files-in-path local-path))
   (str local-path "/" alias ".json"))
 
 (defn ns-record-from-disk
@@ -74,7 +72,6 @@
         ns-address     (address base-address alias nil)
         commit-address (:address meta)
         record         (ns-record ns-address commit-address commit-json-ld)
- _              (log/warn "ns record: " record)
         record-bs      (try* (json/stringify-UTF8 record)
                              (catch* e
                                      (log/error "Error json-encoding nameservice record for ledger: " alias
