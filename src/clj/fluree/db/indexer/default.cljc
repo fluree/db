@@ -458,7 +458,7 @@
                 refresh-ch
                 ([{:keys [garbage], refreshed-db :db, :as status}]
                  (let [indexed-db    (-> (idx-proto/-empty-novelty indexer refreshed-db)
-                                         (assoc-in [:stats :indexed] (- t)))
+                                         (assoc-in [:stats :indexed] t))
                        ;; TODO - ideally issue garbage/root writes to RAFT together
                        ;;        as a tx, currently requires waiting for both
                        ;;        through raft sync

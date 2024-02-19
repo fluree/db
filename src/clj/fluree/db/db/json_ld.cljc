@@ -55,7 +55,7 @@
     (if newer-index?
       (-> db
           (assoc :commit (assoc commit :index commit-index)
-                 :novelty* (idx-proto/-empty-novelty (:indexer ledger) db (- index-t))
+                 :novelty* (idx-proto/-empty-novelty (:indexer ledger) db index-t)
                  :spot spot
                  :post post
                  :opst opst
