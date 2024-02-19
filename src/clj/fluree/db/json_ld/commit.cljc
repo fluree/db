@@ -283,8 +283,7 @@
                           jld-commit)
           commit-res    (<? (conn-proto/-c-write conn ledger signed-commit)) ;; write commit credential
           new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
-          db*           (assoc db :commit new-commit**
-                                  :new-context? false)
+          db*           (assoc db :commit new-commit**)
           db**          (if (new-t? ledger-commit commit)
                           (commit-data/add-commit-flakes (:prev-commit db) db*)
                           db*)
