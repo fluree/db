@@ -7,7 +7,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.string :as str]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            #?(:clj [clojure.java.io :as io])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
