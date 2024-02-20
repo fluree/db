@@ -208,6 +208,7 @@
                                  {:id   :ex/john,
                                   :type :ex/User}]})
                db           @(fluree/commit! ledger db)
+               _            (test-utils/force-index! db)
                target-t     (:t db)
                loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
                loaded-db    (fluree/db loaded)]

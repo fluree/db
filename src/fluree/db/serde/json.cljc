@@ -100,7 +100,7 @@
   [flake]
   (-> (vec flake)
       (update 2 serialize-flake-value (flake/dt flake))
-      (cond-> (flake/m flake) (assoc 5 (util/stringify-keys (flake/m flake))))))
+      (cond-> (flake/m flake) (assoc 6 (util/stringify-keys (flake/m flake))))))
 
 (defn- deserialize-garbage
   [garbage-data]
