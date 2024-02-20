@@ -16,12 +16,6 @@
           head-address (get head-commit "address")]
       head-address)))
 
-(defn remote-ledger-exists?
-  [state server-state ledger-address]
-  (go-try
-    (boolean
-      (<? (remote-lookup state server-state ledger-address nil)))))
-
 (defn monitor-socket-messages
   [{:keys [conn-state msg-in] :as _remote-ns} websocket]
   (go-loop []
@@ -81,7 +75,6 @@
   (-subscribe [nameservice ledger-alias callback] (subscribe conn-state ledger-alias callback))
   (-unsubscribe [nameservice ledger-alias] (unsubscribe conn-state ledger-alias))
   (-sync? [_] sync?)
-  (-exists? [_ ledger-address] (remote-ledger-exists? conn-state server-state ledger-address))
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported RemoteNameService op: ledgers" {})))
   (-address [_ ledger-alias {:keys [branch] :or {branch :main} :as _opts}]
     (go (str ledger-alias "/" (name branch) "/head")))

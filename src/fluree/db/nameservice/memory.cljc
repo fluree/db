@@ -50,19 +50,13 @@
 (defn lookup
   [data-atom ledger-alias opts]
   (go #?(:clj
-         (if-let [head-commit (read-address data-atom ledger-alias)]
-           (-> head-commit (get "address"))
-           (throw (ex-info (str "Unable to lookup ledger address from conn: "
-                                ledger-alias)
-                           {:status 500 :error :db/missing-head})))
+         (when-let [head-commit (read-address data-atom ledger-alias)]
+           (-> head-commit (get "address")))
 
          :cljs
          (if platform/BROWSER
-           (if-let [head-commit (read-address data-atom ledger-alias)]
-             (memory-address head-commit)
-             (throw (ex-info (str "Unable to lookup ledger address from localStorage: "
-                                  ledger-alias)
-                             {:status 500 :error :db/missing-head})))
+           (when-let [head-commit (read-address data-atom ledger-alias)]
+             (memory-address head-commit))
            (throw (ex-info (str "Cannot lookup ledger address with memory connection: "
                                 ledger-alias)
                            {:status 500 :error :db/invalid-ledger}))))))
@@ -84,7 +78,6 @@
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported MemoryNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported MemoryNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
-  (-exists? [_ ledger-address] (go (boolean (read-address state-atom ledger-address))))
   (-ledgers [_ opts] (ledger-list state-atom opts))
   (-address [_ ledger-alias opts]
     (address ledger-alias opts))

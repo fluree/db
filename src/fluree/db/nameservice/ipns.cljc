@@ -29,18 +29,6 @@
     [proto address (trim-slashes db)]))
 
 
-(defn address-exists?
-  [ipfs-endpoint ledger-address]
-  (go-try
-    (log/debug "Checking for existence of ledger" ledger-address)
-    (boolean
-      (when-let [[proto address ledger] (address-parts ledger-address)]
-        (let [ipfs-addr (if (= "ipns" proto)
-                          (str "/ipns/" address)
-                          address)
-              ledgers   (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
-          (contains? ledgers ledger))))))
-
 (defn lookup-address
   "Given IPNS address, performs lookup and returns latest ledger address."
   [ipfs-endpoint ledger-name opts]
@@ -72,7 +60,6 @@
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported IpfsNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported IpfsNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
-  (-exists? [_ ledger-address] (address-exists? ipfs-endpoint ledger-address))
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]
     (get-address ipfs-endpoint ipns-key ledger-alias opts))

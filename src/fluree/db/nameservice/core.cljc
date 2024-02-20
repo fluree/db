@@ -81,14 +81,15 @@
               (recur (rest nameservices*)))))))))
 
 (defn exists?
-  "Checks nameservices on a connection and returns true for the
-  first one that knows given ledger-alias exists."
+  "Checks nameservices on a connection and returns true
+  if any nameservice already has a ledger associated with
+  the given alias."
   [conn ledger-alias]
   (let [nameservices (nameservices conn)]
     (go-try
       (loop [nameservices* nameservices]
         (if-let [ns (first nameservices*)]
-          (let [exists? (<? (ns-proto/-exists? ns ledger-alias))]
+          (let [exists? (<? (ns-proto/-lookup ns ledger-alias))]
             (if exists?
               true
               (recur (rest nameservices*))))

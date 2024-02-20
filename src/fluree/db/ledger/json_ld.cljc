@@ -304,12 +304,16 @@
   [conn address]
   (go-try
     (let [commit-addr  (<? (nameservice/lookup-commit conn address nil))
+          _            (log/debug "Attempting to load from address:" address
+                                  "with commit address:" commit-addr)
           _            (when-not commit-addr
-                         (throw (ex-info (str "Unable to load. No commit exists for: " address)
+                         (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
                                          {:status 400 :error :db/invalid-commit-address})))
+          _            (log/debug "load from address: " commit-addr)
           [commit _] (<? (jld-reify/read-commit conn commit-addr))
           _            (when-not commit
-                         (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
+                         (throw (ex-info (str "Unable to load. Commit file for ledger: " address
+                                              " at location: " commit-addr " is not found.")
                                          {:status 400 :error :db/invalid-db})))
           _            (log/debug "load commit:" commit)
           ledger-alias (commit->ledger-alias conn address commit)
@@ -329,7 +333,11 @@
           alias    (if address?
                      (alias-from-address alias-or-address)
                      alias-or-address)
-          [not-cached? ledger-chan] (register-ledger conn alias)] ;; holds final cached ledger in a promise-chan avoid race conditions]
+          _ (when-not alias
+              (throw (ex-info (str "Unable to load. Unable to parse ledger's alias from: " alias-or-address)
+                              {:status 400 :error :db/invalid-alias})))
+          [not-cached? ledger-chan] (register-ledger conn alias)] ;; holds final cached ledger in a promise-chan avoid race conditions
+
       (if not-cached?
         (let [address (if address?
                         alias-or-address
@@ -342,7 +350,9 @@
                                    {:status 400 :error :db/invalid-address}
                                    address)))
             (let [ledger (async/<! (load* conn address))]
-              ;; note, ledger can be an exception!
+              ;; note, ledger can be an exception, don't cache if so!
+              (when (util/exception? ledger)
+                (release-ledger conn alias))
               (async/put! ledger-chan ledger)
               ledger)))
         (<? ledger-chan)))))
