@@ -56,6 +56,7 @@
                                    (< n 0) (-> n int)))
      'count          count
      'count-distinct (fn [coll] (count (distinct coll)))
+     'distinct       (fn [coll] (distinct coll))
      'floor          (fn [n]
                        (cond (= n (int n)) n
                              (> n 0) (-> n int)

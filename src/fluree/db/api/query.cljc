@@ -265,3 +265,34 @@
   (case format
     :fql (query-connection-fql conn query)
     :sparql (query-connection-sparql conn query)))
+
+(comment
+
+  (println (clojure.core.async/<!!
+   (query-connection
+    jace/conn
+    {"@context" [
+                 {
+                  "ex" "http://example.org/",
+                  "f" "https://ns.flur.ee/ledger#",
+                  "foaf" "http://xmlns.com/foaf/0.1/",
+                  "owl" "http://www.w3.org/2002/07/owl#",
+                  "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                  "rdfs" "http://www.w3.org/2000/01/rdf-schema#",
+                  "schema" "http://schema.org/",
+                  "sh" "http://www.w3.org/ns/shacl#",
+                  "skos" "http://www.w3.org/2008/05/skos#",
+                  "wiki" "https://www.wikidata.org/wiki/",
+                  "xsd" "http://www.w3.org/2001/XMLSchema#"
+                  }
+                 ]
+     :from "fluree/myledger3"
+     :where {
+             "@id" "?s"
+             "@type" "?type"
+             "?p" "?o"}
+     :select ["?type", "(distinct ?p)"]
+     :group-by "?type"
+     }
+    {})))
+  )
