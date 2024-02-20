@@ -1,15 +1,21 @@
 (ns fluree.db.json-ld.migrate.sid
   (:require [fluree.db.constants :as const]
+            [fluree.db.storage :as storage]
             [fluree.db.query.exec.update :as update]
+            [fluree.db.json-ld.commit :as commit]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.ledger.json-ld :as ledger]
+            [fluree.db.indexer.default :as indexer]
+            [fluree.db.index :as index]
             [fluree.db.db.json-ld :as db]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.util.log :as log :include-macros true]
+            [clojure.core.async :as async]))
 
 (defrecord NamespaceMapping [mapping]
   iri/IRICodec
@@ -83,8 +89,45 @@
       (when (empty? all-flakes)
         (reify/commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
-      (reify/merge-flakes db* t-new all-flakes))))
+      (-> db*
+          (reify/merge-flakes t-new all-flakes)
+          (assoc :previous (:commit db*))
+          (assoc :commit commit-metadata)))))
 
+(defn merge-commits
+  [{:keys [conn] :as ledger} commit-tuples]
+  (go-try
+    (loop [[commit-tuple & r] commit-tuples
+           db                 (db/create ledger)]
+      (if commit-tuple
+        (let [new-db (<? (merge-commit conn db commit-tuple))]
+          (recur r new-db))
+        db))))
+
+(defn index
+  [{:keys [t] :as db} branch]
+  (go-try
+    (let [error-ch (async/chan)
+          index-ch (indexer/refresh-all db error-ch)]
+      (async/alt!
+        error-ch ([e] e)
+        index-ch ([{:keys [garbage], refreshed-db :db, :as _status}]
+                  (let [indexed-db    (-> (indexer/empty-novelty refreshed-db t)
+                                          (assoc-in [:stats :indexed] t))
+                        db-root-res   (<? (storage/write-db-root indexed-db nil))
+                        index-address (:address db-root-res)
+                        index-id      (str "fluree:index:sha256:" (:hash db-root-res))
+                        commit-data   (-> indexed-db :commit :data)
+                        commit-index  (commit-data/new-index commit-data
+                                                             index-id
+                                                             index-address
+                                                             (select-keys indexed-db index/types))
+                        indexed-db*   (db/force-index-update indexed-db commit-index)]
+                    (when (seq garbage)
+                      (<? (storage/write-garbage indexed-db* nil garbage)))
+
+
+                    (<? (commit/do-commit+push indexed-db* {:branch branch}))))))))
 
 (defn migrate
   [conn address]
@@ -96,10 +139,7 @@
           ledger-alias      (ledger/commit->ledger-alias conn address first-commit)
           branch            (keyword (get-first-value first-commit const/iri-branch))
           ledger            (<? (ledger/->ledger conn ledger-alias {:branch branch}))
-          initial-db        (db/create ledger)]
-      (loop [[commit-tuple & r] all-commit-tuples
-             db                 initial-db]
-        (if commit-tuple
-          (let [new-db (<? (merge-commit conn db commit-tuple))]
-            (recur r new-db))
-          db)))))
+          db                (<? (merge-commits ledger all-commit-tuples))
+          indexed-db        (<? (index db branch))]
+      (ledger-proto/-db-update ledger indexed-db)
+      ledger)))
