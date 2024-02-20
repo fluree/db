@@ -334,3 +334,58 @@
   more advanced needs."
   [db iri]
   (iri/encode-iri db iri))
+
+;; reasoning APIs
+
+(defn reasoner-set
+  "Sets the reasoner type(s) to perform on a db.
+  Reasoning is done in-memory at the db-level and is not persisted.
+
+  Reasoning types currently supported are :datalog and :owl2rl.
+
+  You can give a single reasoning type as an argument, or multiple
+  as a sequential list/vector."
+  [db reasoner-type]
+  (let [reasoner-types (set (util/sequential reasoner-type))]
+    (update db :reasoner #(into reasoner-types %))))
+
+(defn reasoned-count
+  "Returns a count of reasoned facts in the provided db."
+  [db]
+  (let [spot (-> db :novelty :spot)]
+    (reduce (fn [n flake]
+              (if (-> flake flake/m :reasoned)
+                (inc n)
+                n))
+            0 spot)))
+
+(defn reasoned-facts
+  "Returns all reasoned facts in the provided db as  4-tuples of:
+  [subject property object rule-iri]
+  where the rule-iri is the @id of the rule that generated the fact
+
+  Returns 4-tuples of  where
+  the rule-iri is the @id of the rule that generated the fact.
+
+  NOTE: Currently returns internal fluree ids for subject, property and object.
+  This will be changed to return IRIs in a future release.
+
+  Optional opts map can include:
+  :group-by - :rule (default), :subject, :property"
+  ([db] (reasoned-facts db {:group-by :rule}))
+  ([db opts]
+   (let [group-fn (case (:group-by opts)
+                    nil nil
+                    :subject (fn [p] (nth p 0))
+                    :property (fn [p] (nth p 1))
+                    :rule (fn [p] (nth p 3)))
+         result   (->> db :novelty :spot
+                       reasoner/reasoned-flakes
+                       (map (fn [flake] [(flake/s flake)
+                                         (flake/p flake)
+                                         (flake/o flake)
+                                         (-> flake flake/m :reasoned)])))]
+     (if group-fn
+       (group-by group-fn result)
+       result))))
+

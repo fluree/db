@@ -17,6 +17,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.reasoner.core :as reasoner]
             [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -79,7 +80,11 @@
       [(not-empty adds) (not-empty removes)])))
 
 (defn ->tx-state
-  [db]
+  "Generates a state map for transaction processing.
+  When optional reasoned-from-IRI is provided, will mark
+  any new flakes as reasoned from the provided value
+  in the flake's metadata (.-m) as :reasoned key."
+  [db reasoned-from-IRI]
   (let [{:keys [branch ledger policy], db-t :t} db
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t         (inc commit-t)
@@ -89,6 +94,8 @@
      :stage-update? (= t db-t) ; if a previously staged db is getting updated
                                ; again before committed
      :t             t}))
+     :reasoner-max  10 ;; maximum number of reasoner iterations before exception
+     :reasoned      reasoned-from-IRI}))
 
 (defn into-flakeset
   [fuel-tracker error-ch flake-ch]
@@ -186,10 +193,82 @@
                       (vocab/hydrate-schema add))]
     {:add add :remove remove :db-after db-after}))
 
+(defn reasoner-stage
+  [db fuel-tracker rule-id full-rule]
+  (go-try
+    (let [tx-state      (->tx-state db rule-id)
+          parsed-txn    (:rule-parsed full-rule)
+          _             (when-not (:where parsed-txn)
+                          (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
+                                          {:status 400 :error :db/invalid-transaction})))
+
+          flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
+          fuel-error-ch (:error-ch fuel-tracker)
+          chans         (remove nil? [fuel-error-ch flakes-ch])
+          [flakes] (alts! chans :priority true)]
+      (when (util/exception? flakes)
+        (throw flakes))
+      flakes)))
+
+(defn execute-reasoner-rule
+  [db rule-id reasoning-rules fuel-tracker tx-state]
+  (go-try
+    (let [[db reasoner-flakes] (<? (reasoner-stage db fuel-tracker rule-id (get reasoning-rules rule-id)))
+          tx-state* (assoc tx-state :stage-update? true
+                                    :db-before db)]
+      (log/warn "REASONER FLAKES: " rule-id reasoner-flakes)
+      ;; returns map of :db-after, :add, :remove - but for reasoning we only support adds, so remove should be empty
+      (final-db db reasoner-flakes tx-state*))))
+
+(defn execute-reasoner
+  "Executes the reasoner on the staged db-after and returns the updated db-after."
+  [{:keys [reasoner] :as db-after} fuel-tracker {:keys [reasoner-max] :as tx-state}]
+  (go-try
+    (if reasoner
+      (let [reasoning-rules (<? (reasoner/rules-graph db-after))
+            rule-schedule   (reasoner/schedule reasoning-rules)]
+        (log/debug "reasoning rules: " reasoning-rules)
+        (log/debug "reasoning schedule: " rule-schedule)
+        (if (seq rule-schedule)
+          (loop [[rule-id & r] rule-schedule
+                 reasoned-flakes nil ;; Note these are in an AVL set in with spot comparator
+                 reasoned-db     db-after
+                 summary         {:iterations      0 ;; holds summary across all runs
+                                  :reasoned-flakes []
+                                  :total-flakes    0}]
+            (if rule-id
+              (let [{:keys [db-after add]} (<? (execute-reasoner-rule reasoned-db rule-id reasoning-rules fuel-tracker tx-state))]
+                (log/debug "executed reasoning rule: " rule-id)
+                (log/trace "reasoning rule: " rule-id "produced flakes:" add)
+                (recur r
+                       (if reasoned-flakes
+                         (into reasoned-flakes add)
+                         add)
+                       db-after
+                       summary))
+              (let [all-reasoned-flakes (into reasoned-flakes (:reasoned-flakes summary))
+                    summary*            {:iterations      (-> summary :iterations inc)
+                                         :reasoned-flakes all-reasoned-flakes
+                                         :total-flakes    (count all-reasoned-flakes)}
+                    new-flakes?         (> (:total-flakes summary*)
+                                           (:total-flakes summary))
+                    ;reasoning-rules* (<? (convert-rules-dependency-flakes-to-SIDs reasoned-db reasoning-rules))
+                    ;rules* (select-keys reasoning-rules rule-schedule) ;; reduce possible rules to only the rules that were run in last iteration
+                    ;rule-schedule* (reasoner/schedule reasoning-rules (rule-dependency-fn reasoning-rules reasoned-flakes))
+                    ]
+                (log/debug "completed reasoning iteration number: " (:iterations summary*)
+                           "Total reasoned flakes:" (:total-flakes summary*))
+                (if (and new-flakes?
+                         (< (:iterations summary*) reasoner-max))
+                  (recur rule-schedule nil reasoned-db summary*)
+                  reasoned-db))))
+          db-after))
+      db-after)))
+
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
   along with performing any final validation and policy enforcement."
-  [tx-state [db flakes]]
+  [fuel-tracker tx-state [db flakes]]
   (go-try
     (let [subj-mods (<? (subject-mods flakes (:db-before tx-state)))
           ;; wrap it in an atom to reuse old validate-rules and policy/allowed? unchanged
@@ -199,6 +278,8 @@
           (validate-rules tx-state*)
           <?
           (policy/allowed? tx-state*)
+          <?
+          (execute-reasoner fuel-tracker tx-state*)
           <?
           dbproto/-rootdb))))
 
@@ -212,6 +293,6 @@
            db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts ctx)]
                         (<? (perm/wrap-policy db policy-identity))
                         db)
-           tx-state   (->tx-state db*)
+           tx-state   (->tx-state db* nil)
            flakes     (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
-       (<? (flakes->final-db tx-state flakes))))))
+       (<? (flakes->final-db fuel-tracker tx-state flakes))))))
