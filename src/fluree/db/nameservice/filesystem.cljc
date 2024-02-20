@@ -59,33 +59,20 @@
   (when base-address
     (str base-address ledger-alias)))
 
-(defn push!
-  "The file nameservice will eventually hold metadata including various
-  branch heads, ledger status, and possibly more.
-  Even though we only store the head commit address for now, using a JSON
-  map to allow for future expansion."
-  [local-path base-address {commit-address :address
-                            alias          :alias
-                            meta           :meta
-                            commit-json-ld :json-ld}]
-  (let [p-chan         (async/promise-chan) ;; return value
-        write-path     (file-path local-path alias)
-        ns-address     (address base-address alias nil)
-        commit-address (:address meta)
-        record         (ns-record ns-address commit-address commit-json-ld)
-        record-bs      (try* (json/stringify-UTF8 record)
-                             (catch* e
-                                     (log/error "Error json-encoding nameservice record for ledger: " alias
-                                                "with exception: " (ex-message e)
-                                                "Original record where error occurred: " record)
-                                     (async/put!
-                                       p-chan
-                                       (ex-info (str "Exception encoding file nameservice file for ledger: " alias)
-                                                {:status 500 :error :db/invalid-commit}))
-                                     ;; return nil for record-bs to ensure something to write
-                                     nil))]
-    (when record-bs
-      (log/debug (str "Updating head at " write-path " to " commit-address "."))
+(defn write-ns-record
+  [ns-record local-path alias]
+  (let [p-chan     (async/promise-chan) ;; return value
+        write-path (file-path local-path alias)
+        record-bs  (try* (json/stringify-UTF8 ns-record)
+                         (catch* e
+                                 (log/error "Error json-encoding nameservice record for ledger: " alias
+                                            "with exception: " (ex-message e)
+                                            "Original record where error occurred: " ns-record)
+                                 ;; return exception, don't throw.. will check for it below
+                                 (ex-info (str "Exception encoding file nameservice file for ledger: " alias)
+                                          {:status 500 :error :db/invalid-commit})))]
+    (if (util/exception? record-bs)
+      (async/put! p-chan record-bs)
       #?(:clj  (async/thread
                  (try
                    (fs/write-file write-path record-bs)
@@ -103,6 +90,21 @@
                  (async/put! p-chan write-path)
                  (catch* e (async/put! p-chan e)))))
     p-chan))
+
+(defn push!
+  "The file nameservice will eventually hold metadata including various
+  branch heads, ledger status, and possibly more.
+  Even though we only store the head commit address for now, using a JSON
+  map to allow for future expansion."
+  [local-path base-address {commit-address :address
+                            alias          :alias
+                            meta           :meta
+                            commit-json-ld :json-ld}]
+  (let [ns-address     (address base-address alias nil)
+        commit-address (:address meta)
+        record         (ns-record ns-address commit-address commit-json-ld)]
+    ;; write-ns-record returns a promise chan, with path of file if successful or exception
+    (write-ns-record record local-path alias)))
 
 (defn extract-branch
   "Splits a given namespace address into its nameservice and branch parts.
@@ -152,6 +154,46 @@
          (some #(when (= (get % "@id") branch-iri)
                   (get % "address"))))))
 
+(defn try-legacy-ns-lookup
+  "This is for legacy filesystem nameservice file format only.
+  It should be removed once Fluree v3 is GA, but will allow for
+  the old format to be read and converted to the new format in the background.
+
+  If deemed important, this can be done in an upgrade script instead as part of
+  the v3 GA launch."
+  [local-path alias]
+  (let [path           (str local-path "/" alias "/main/head")
+        commit-address (when-let [address (fs/read-file path)]
+                         (cond
+                           (str/starts-with? address "//")
+                           (str "fluree:file:" address)
+
+                           (str/starts-with? address "fluree:")
+                           address
+
+                           :else
+                           (do
+                             (log/warn "Unexpected commit address format in legacy nameservice file:" path
+                                       "with address:" address)
+                             nil)))]
+    (when commit-address
+      ;; write out new NS file record format in the background
+      (async/go
+        (let [ns-address (str "fluree:file://" alias)
+              ns-record  (ns-record ns-address commit-address {"alias" alias, "branch" "main"})]
+          (let [successful? (async/<! (write-ns-record ns-record local-path alias))]
+            (if (util/exception? successful?)
+              (log/error successful?
+                         (str "Unable to update legacy nameservice file for ledger: " alias
+                              "with exception: " (ex-message successful?)))
+              #?(:clj (try
+                        (.renameTo (io/file path) (io/file (str path ".legacy")))
+                        (catch Exception e
+                          (log/error "Exception renaming legacy nameservice file for ledger: " alias
+                                     "with exception: " (ex-message e)))))))))
+
+      commit-address)))
+
 (defn lookup
   "When provided a 'relative' ledger alias, looks in file system to see if
   nameservice file exists and if so returns the latest commit address."
@@ -159,10 +201,12 @@
   (go-try
     (let [{:keys [alias branch* address]} (resolve-address base-address ns-address branch)
           ns-record (retrieve-ns-record local-path alias)]
-      (when ns-record
+      (if ns-record
         (or (commit-address-from-record ns-record branch*)
             (throw (ex-info (str "No nameservice record found for ledger alias: " ns-address)
-                            {:status 404 :error :db/ledger-not-found})))))))
+                            {:status 404 :error :db/ledger-not-found})))
+        ;; Note, below is for leagacy conversion only, will get removed in v3 GA
+        (try-legacy-ns-lookup local-path alias)))))
 
 (defrecord FileNameService
   [local-path sync? base-address]
