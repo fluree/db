@@ -19,11 +19,7 @@
   Input is the original rule set, and a list/set of newly generated
   flakes from the last rules run."
   [rules post-flakes]
-  (let []
-
-    )
-
-  )
+  :TODO)
 
 (defn extract-pattern*
   [patterns]
