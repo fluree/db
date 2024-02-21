@@ -18,7 +18,8 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.conn.core :refer [notify-ledger]]
-            [fluree.db.json-ld.policy :as perm])
+            [fluree.db.json-ld.policy :as perm]
+            [fluree.db.storage :as store])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -63,19 +64,29 @@
   ;; TODO - do some validation
   (promise-wrap
     (let [opts*   (assoc opts :parallelism (or parallelism 4))
+
           method* (cond
                     method (keyword method)
                     remote-servers :remote
                     :else (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
-                                          {:status 500 :error :db/invalid-configuration})))]
+                                          {:status 500 :error :db/invalid-configuration})))
+
+          store   (store/start (cond->  {:store/method method*}
+                                 (= method :ipfs) (assoc :ipfs-store/server (:server opts*))
+                                 (= method :file) (assoc :file-store/storage-path (or (:storage-path opts*)
+                                                                                      "data/ledger"))
+                                 (= method :s3)   (-> (assoc :s3-store/bucket (:s3-bucket opts*))
+                                                      (assoc :s3-store/prefix (:s3-prefix opts*))
+                                                      (cond-> (:s3-endpoint opts*)
+                                                        (assoc :s3-store/endpoint (:s3-endpoint opts*))))))]
       (case method*
         :remote (remote-conn/connect opts*)
-        :ipfs (ipfs-conn/connect opts*)
+        :ipfs (ipfs-conn/connect (assoc opts* :store store))
         :file (if platform/BROWSER
                 (throw (ex-info "File connection not supported in the browser" opts))
-                (file-conn/connect opts*))
-        :memory (memory-conn/connect opts*)
-        :s3     #?(:clj  (s3-conn/connect opts*)
+                (file-conn/connect (assoc opts* :store store)))
+        :memory (memory-conn/connect (assoc opts* :store store))
+        :s3     #?(:clj  (s3-conn/connect (assoc opts* :store store))
                    :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
                                          {:status 400, :error :db/unsupported-operation})))))))
 

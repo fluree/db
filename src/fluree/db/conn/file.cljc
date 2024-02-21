@@ -11,7 +11,7 @@
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.core :as conn-core]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.storage :as storage]
+            [fluree.db.indexer.storage :as storage]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.util.filesystem :as fs]
@@ -19,118 +19,57 @@
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
-            [fluree.db.ledger.proto :as ledger-proto])
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.storage :as store]
+            [fluree.db.storage.util :as store-util])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn file-address
-  "Turn a path or a protocol-relative URL into a fluree file address."
-  [path]
-  (if (str/starts-with? path "//")
-    (str "fluree:file:" path)
-    (str "fluree:file://" path)))
-
-
-(defn address-path
-  [address]
-  (let [[_ _ path] (str/split address #":")]
-    path))
-
-(defn address-full-path
-  [{:keys [storage-path] :as _conn} address]
-  (str (fs/local-path storage-path) "/" (address-path address)))
-
-(defn address-path-exists?
-  [conn address]
-  (let [full-path (address-full-path conn address)]
-    (fs/exists? full-path)))
-
-(defn read-address
-  [conn address]
-  (->> address (address-full-path conn) fs/read-file))
-
-(defn read-commit
-  [conn address]
-  (json/parse (read-address conn address) false))
-
 (defn- write-data
-  [{:keys [storage-path] :as _conn} ledger data-type data]
-  (let [alias      (ledger-proto/-alias ledger)
-        branch     (name (:name (ledger-proto/-branch ledger)))
-        json       (if (string? data)
+  [{:keys [store] :as _conn} ledger data-type data]
+  (go-try
+    (let [alias    (ledger-proto/-alias ledger)
+          branch   (name (:name (ledger-proto/-branch ledger)))
+          json     (if (string? data)
                      data
                      (json-ld/normalize-data data))
-        bytes      (bytes/string->UTF8 json)
-        hash       (crypto/sha2-256 bytes :hex)
-        type-dir   (name data-type)
-        path       (str alias
-                        (when branch (str "/" branch))
-                        (str "/" type-dir "/")
-                        hash ".json")
-        write-path (str (fs/local-path storage-path) "/" path)]
-    (log/debug (str "Writing " (name data-type) " at " write-path))
-    (fs/write-file write-path bytes)
-    {:name    hash
-     :hash    hash
-     :json    json
-     :size    (count json)
-     :address (file-address path)}))
+          bytes    (bytes/string->UTF8 json)
+          hash     (crypto/sha2-256 bytes :hex)
+          type-dir (name data-type)
+          path     (str alias
+                          (when branch (str "/" branch))
+                          (str "/" type-dir "/")
+                          hash ".json")
 
-(defn write-commit
-  [conn ledger commit-data]
-  (write-data conn ledger :commit commit-data))
+          {:keys [k hash v address]} (<? (store/write store path bytes))]
+      {:name    path
+       :hash    hash
+       :json    json
+       :size    (count json)
+       :address address})))
 
-(defn write-context
-  [conn ledger context-data]
-  (write-data conn ledger :context context-data))
-
-(defn write-index-item
-  [conn ledger index-type index-data]
-  (write-data conn ledger (str "index/" (name index-type)) index-data))
-
-(defn push
-  "Just write to a different directory?"
-  [{:keys [storage-path] :as _conn} publish-address {commit-address :address}]
-  (let [local-path  (fs/local-path storage-path)
-        commit-path (address-path commit-address)
-        head-path   (address-path publish-address)
-        write-path  (str local-path "/" head-path)
-
-        work        (fn [complete]
-                      (log/debug (str "Updating head at " write-path " to " commit-path "."))
-                      (fs/write-file write-path (bytes/string->UTF8 commit-path))
-                      (complete (file-address head-path)))]
-    #?(:clj  (let [p (promise)]
-               (future (work (partial deliver p)))
-               p)
-       :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
-
-(defn read-context
-  [conn context-key]
-  (json/parse (read-address conn context-key) true))
+(defn read-data [conn address keywordize?]
+  (go-try
+    (-> (<? (store/read (:store conn) address))
+        (json/parse keywordize?))))
 
 (defn close
   [id state]
   (log/info "Closing file connection" id)
   (swap! state assoc :closed? true))
 
-(defrecord FileConnection [id state ledger-defaults parallelism msg-in-ch
+(defrecord FileConnection [id state ledger-defaults parallelism msg-in-ch store
                            nameservices serializer msg-out-ch lru-cache-atom]
 
   conn-proto/iStorage
-  (-c-read [conn commit-key] (go (read-commit conn commit-key)))
-  (-c-write [conn ledger commit-data] (go (write-commit conn ledger
-                                                        commit-data)))
-  (-ctx-read [conn context-key] (go (read-context conn context-key)))
-  (-ctx-write [conn ledger context-data] (go (write-context conn ledger
-                                                            context-data)))
+  (-c-read [conn commit-key] (read-data conn commit-key false))
+  (-c-write [conn ledger commit-data] (write-data conn ledger :commit commit-data))
+  (-ctx-read [conn context-key] (read-data conn context-key true))
+  (-ctx-write [conn ledger context-data] (write-data conn ledger :context context-data))
   (-index-file-write [conn ledger index-type index-data]
-    #?(:clj (async/thread (write-index-item conn ledger index-type index-data))
-       :cljs (async/go (write-index-item conn ledger index-type index-data))))
-  (-index-file-read [conn index-address]
-    #?(:clj (async/thread (json/parse (read-address conn index-address) true))
-       :cljs (async/go (json/parse (read-address conn index-address) true))))
+    (write-data conn ledger (str "index/" (name index-type)) index-data))
+  (-index-file-read [conn index-address] (read-data conn index-address true))
 
   conn-proto/iConnection
   (-close [_] (close id state))
@@ -205,17 +144,15 @@
 
 (defn default-file-nameservice
   "Returns file nameservice or will throw if storage-path generates an exception."
-  [storage-path]
-  (ns-filesystem/initialize storage-path))
+  [path]
+  (ns-filesystem/initialize path))
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism storage-path lru-cache-atom memory serializer nameservices]
-    :or {serializer (json-serde)
-         storage-path "data/ledger"} :as _opts}]
+  [{:keys [defaults parallelism store storage-path lru-cache-atom memory serializer nameservices]
+    :or {serializer (json-serde)} :as _opts}]
   (go
-    (let [storage-path   (trim-last-slash storage-path)
-          conn-id        (str (random-uuid))
+    (let [conn-id        (str (random-uuid))
           state          (conn-core/blank-state)
           nameservices*  (util/sequential
                            (or nameservices (default-file-nameservice storage-path)))
@@ -223,7 +160,7 @@
           lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id              conn-id
-                            :storage-path    storage-path
+                            :store           store
                             :ledger-defaults (ledger-defaults defaults)
                             :serializer      serializer
                             :parallelism     parallelism

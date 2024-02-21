@@ -303,7 +303,7 @@
 (defn load*
   [conn address]
   (go-try
-    (let [commit-addr  (<? (nameservice/lookup-commit conn address nil))
+    (let [commit-addr  (<? (nameservice/lookup-commit conn address))
           _            (when-not commit-addr
                          (throw (ex-info (str "Unable to load. No commit exists for: " address)
                                          {:status 400 :error :db/invalid-commit-address})))

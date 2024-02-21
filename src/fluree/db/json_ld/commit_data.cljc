@@ -64,6 +64,8 @@
    ["type" ["Commit"]]
    ["alias" :alias]
    ["issuer" :issuer]
+   ["author" :author]
+   ["txn" :txn]
    ["branch" :branch]
    ["time" :time]
    ["tag" :tag]
@@ -329,7 +331,7 @@
   "Returns a commit map with a new db registered.
   Assumes commit is not yet created (but db is persisted), so
   commit-id and commit-address are added after finalizing and persisting commit."
-  [{:keys [old-commit issuer message tag dbid t db-address flakes size]
+  [{:keys [old-commit issuer message tag dbid t db-address flakes size author txn-id]
     :as   _commit}]
   (let [prev-data   (select-keys (data old-commit) [:id :address])
         data-commit (new-db-commit dbid t db-address prev-data flakes size)
@@ -337,6 +339,8 @@
         commit      (-> old-commit
                         (dissoc :id :address :data :issuer :time :message :tag :prev-commit)
                         (assoc :address ""
+                               :author author
+                               :txn  txn-id
                                :data data-commit
                                :time (util/current-time-iso)))]
     (cond-> commit
@@ -389,6 +393,8 @@
     (flake/create const/$_commit:signer const/$xsd:anyURI const/iri-issuer const/$xsd:string -1 true nil)
     (flake/create const/$_commit:message const/$xsd:anyURI const/iri-message const/$xsd:string -1 true nil)
     (flake/create const/$_commit:time const/$xsd:anyURI const/iri-time const/$xsd:string -1 true nil)
+    (flake/create const/$_commit:author const/$xsd:anyURI const/iri-author const/$xsd:string -1 true nil)
+    (flake/create const/$_commit:txn const/$xsd:anyURI const/iri-txn const/$xsd:string -1 true nil)
     (flake/create const/$_commit:data const/$xsd:anyURI const/iri-data const/$xsd:string -1 true nil)
 
     (flake/create const/$_commitdata:flakes const/$xsd:anyURI const/iri-flakes const/$xsd:string -1 true nil)
@@ -426,7 +432,7 @@
   "Builds and returns the commit metadata flakes for the given commit, t, and
   db-sid. Used when committing to an in-memory ledger value and when reifying
   a ledger from storage on load."
-  [{:keys [address alias branch data id time v] :as _commit} t db-sid]
+  [{:keys [address alias branch data id time v author txn] :as _commit} t db-sid]
   (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data]
     [;; link db to associated commit meta: @id
      (flake/create t const/$xsd:anyURI id const/$xsd:string t true nil)
@@ -443,6 +449,10 @@
      ;; time
      (flake/create t const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil) ;; data
      (flake/create t const/$_commit:data db-sid const/$xsd:anyURI t true nil)
+     ;; author
+     (flake/create t const/$_commit:author author const/$xsd:string t true nil)
+     ;; txn
+     (flake/create t const/$_commit:txn txn const/$xsd:string t true nil)
 
      ;; db flakes
      ;; @id

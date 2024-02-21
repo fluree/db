@@ -43,17 +43,17 @@
 
 (defn lookup-address
   "Given IPNS address, performs lookup and returns latest ledger address."
-  [ipfs-endpoint ledger-name opts]
+  [ipfs-endpoint ledger-address]
   (go-try
-    (if-let [[proto address ledger] (address-parts ledger-name)]
+    (if-let [[proto address ledger] (address-parts ledger-address)]
       (let [ipfs-addr (if (= "ipns" proto)
                         (str "/ipns/" address)
                         address)]
         ;; address might be a directory, or could directly be a commit file - try to look up as directory first
         (let [ledgers (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
           (or (get ledgers ledger)
-              ledger-name)))
-      ledger-name)))
+              ledger-address)))
+      ledger-address)))
 
 (defn get-address
   "Returns IPNS address for a given key."
@@ -66,9 +66,8 @@
 (defrecord IpnsNameService
   [ipfs-endpoint ipns-key base-address sync?]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias] (lookup-address ipfs-endpoint ledger-alias nil))
-  (-lookup [_ ledger-alias opts] (lookup-address ipfs-endpoint ledger-alias opts))
   (-push [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
+  (-lookup [_ ledger-address] (lookup-address ipfs-endpoint ledger-address))
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported IpfsNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported IpfsNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
