@@ -48,6 +48,7 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
 NOTE: use `make -j` to run tasks in parallel.
 
 * `make deps` - install all local dependencies
+* `make compile` - locally compile necessary classes (required for Clojure development)
 * `make` - make everything below
 * `make jar` - make Java JAR file
 * `make nodejs` - make JavaScript Fluree DB for Node
@@ -90,7 +91,7 @@ following:
 
 1. Run `npx shadow-cljs watch flureenjs` (or `flureedb` for a browser REPL)
 2. (Node only) Run `node out/nodejs/flureenjs.js` in a separate shell
-3. (browser only) Connect to `http://localhost:9630/` in your browser 
+3. (browser only) Connect to `http://localhost:9630/` in your browser
     1. This seems currently broken though. It first gets stuck at
        "shadow-cljs Loading..." with an "unknown route" error in the JS console.
        If you reload that seems to resolve. But even once the dashboard loads
