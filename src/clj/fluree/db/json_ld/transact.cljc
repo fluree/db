@@ -93,7 +93,7 @@
      :policy        policy
      :stage-update? (= t db-t) ; if a previously staged db is getting updated
                                ; again before committed
-     :t             t}))
+     :t             t
      :reasoner-max  10 ;; maximum number of reasoner iterations before exception
      :reasoned      reasoned-from-IRI}))
 
