@@ -152,7 +152,7 @@
 
 #?(:clj (defmethod print-method SID [^SID sid ^java.io.Writer w]
           (doto w
-            (.write "#SID ")
+            (.write "#fluree/SID ")
             (.write (-> sid serialize-sid pr-str)))))
 
 #?(:clj (defmethod print-dup SID

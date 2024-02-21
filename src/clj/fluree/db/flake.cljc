@@ -112,7 +112,7 @@
              IPrintWithWriter
              (-pr-writer [^Flake f writer opts]
                          (pr-sequential-writer writer pr-writer
-                                               "#Flake [" " " "]"
+                                               "#fluree/Flake [" " " "]"
                                                opts [(.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)]))]))
 
 
