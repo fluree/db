@@ -141,6 +141,12 @@
   [[ns-code nme]]
   (->sid ns-code nme))
 
+(defn measure-sid
+  "Returns the size of an SID."
+  [sid]
+  (+ 4 ; 4 bytes for namespace code
+     (count (get-name sid))))
+
 (def serialize-sid
   (juxt get-ns-code get-name))
 

@@ -47,7 +47,7 @@
              (ex-message stage-id-only)))
       (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
              (ex-message stage-empty-txn)))
-      (is (= {:flakes 1, :size 50, :indexed 0}
+      (is (= {:flakes 1, :size 40, :indexed 0}
              (:stats stage-empty-node))
           "empty nodes are allowed as long as there is other data, they are just noops")
       (is (= [[:ex/alice :schema/age 42]]

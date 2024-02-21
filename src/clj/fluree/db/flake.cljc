@@ -533,26 +533,30 @@
   it should be 'close enough'
   reference: https://www.javamex.com/tutorials/memory/string_memory_usage.shtml"
   [^Flake f]
-  (let [o      (o f)
-        dt     (dt f)
-        o-size (#?@(:clj (util/case+)
-                    :cljs (condp =)) dt
-                 const/$xsd:string (* 2 (count o))
-                 const/$xsd:anyURI 8
-                 const/$xsd:boolean 1
-                 const/$xsd:long 8
-                 const/$xsd:int 4
-                 const/$xsd:short 2
-                 const/$xsd:double 8
-                 const/$xsd:float 4
-                 const/$xsd:byte 1
-                 ;; else
-                 (if (number? o)
-                   8
-                   (if (string? o)
-                     (* 2 (count o))
-                     (* 2 (count (pr-str o))))))]
-    (cond-> (+ 42 o-size)
+  (let [s-size  (-> f s iri/measure-sid)
+        p-size  (-> f p iri/measure-sid)
+        o       (o f)
+        dt      (dt f)
+        dt-size (iri/measure-sid dt)
+        o-size  (#?@(:clj (util/case+)
+                     :cljs (condp =)) dt
+                  const/$xsd:string (* 2 (count o))
+                  const/$xsd:anyURI (iri/measure-sid o)
+                  const/$xsd:boolean 1
+                  const/$xsd:long 8
+                  const/$xsd:int 4
+                  const/$xsd:short 2
+                  const/$xsd:double 8
+                  const/$xsd:float 4
+                  const/$xsd:byte 1
+                  ;; else
+                  (if (number? o)
+                    8
+                    (if (string? o)
+                      (* 2 (count o))
+                      (* 2 (count (pr-str o))))))
+        t-size 8]
+    (cond-> (+ s-size p-size o-size dt-size t-size)
             (m f) (* 2 (count (pr-str (m f)))))))
 
 

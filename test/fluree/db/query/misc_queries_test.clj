@@ -182,33 +182,39 @@
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
                                          :where   {:id '?s, '?p '?o}})]
-          (is (= [["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"
+          (is (= [["fluree:db:sha256:b7tld52pvt4fnqi5q6v2yfllz7ehaywttsvfomsjxww2zi4ov55c"
                    :f/address
-                   "fluree:memory://9a32a7fe9e98219a5340a0148934aac8329eb123c5df589153f74b6990410576"]
-                  ["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"
+                   "fluree:memory://2cb396f6662e474c0c484b53e73584b26dde60208456499bd7d204f38e23dd80"]
+                  ["fluree:db:sha256:b7tld52pvt4fnqi5q6v2yfllz7ehaywttsvfomsjxww2zi4ov55c"
                    :f/flakes
                    11]
-                  ["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"
+                  ["fluree:db:sha256:b7tld52pvt4fnqi5q6v2yfllz7ehaywttsvfomsjxww2zi4ov55c"
                    :f/size
-                   584]
-                  ["fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"
+                   490]
+                  ["fluree:db:sha256:b7tld52pvt4fnqi5q6v2yfllz7ehaywttsvfomsjxww2zi4ov55c"
                    :f/t
                    1]
-                  ["fluree:commit:sha256:bb4jfbk3q6ze2sjvblrla4ewngxiadbopzjq7y62q553q5cowo7fl"
+                  ["fluree:commit:sha256:bppuvk43q3ciziibqftnzmibt5xpsvrfoa6nntcuvjtkpfmzmv6l"
                    "https://www.w3.org/2018/credentials#issuer"
                    "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                  ["fluree:commit:sha256:bb4jfbk3q6ze2sjvblrla4ewngxiadbopzjq7y62q553q5cowo7fl"
+                  ["fluree:commit:sha256:bppuvk43q3ciziibqftnzmibt5xpsvrfoa6nntcuvjtkpfmzmv6l"
                    :f/address
-                   "fluree:memory://c91e7060ad58b19e9fff36c15293982df608453e0c8dc31fb67066952d09ef89"]
-                  ["fluree:commit:sha256:bb4jfbk3q6ze2sjvblrla4ewngxiadbopzjq7y62q553q5cowo7fl"
+                   "fluree:memory://4a2c205258f984bd5737870c47234eb3ae8cf907cbefd96d6a1c46d2bd290bcf"]
+                  ["fluree:commit:sha256:bppuvk43q3ciziibqftnzmibt5xpsvrfoa6nntcuvjtkpfmzmv6l"
                    :f/alias
                    "query/everything"]
-                  ["fluree:commit:sha256:bb4jfbk3q6ze2sjvblrla4ewngxiadbopzjq7y62q553q5cowo7fl" :f/branch "main"]
-                  ["fluree:commit:sha256:bb4jfbk3q6ze2sjvblrla4ewngxiadbopzjq7y62q553q5cowo7fl"
+                  ["fluree:commit:sha256:bppuvk43q3ciziibqftnzmibt5xpsvrfoa6nntcuvjtkpfmzmv6l"
+                   :f/branch
+                   "main"]
+                  ["fluree:commit:sha256:bppuvk43q3ciziibqftnzmibt5xpsvrfoa6nntcuvjtkpfmzmv6l"
                    :f/data
-                   "fluree:db:sha256:bbqkn4av3bujrsic3womwj7uvqfz2cfxgv7t4jdy4xbn6iwgew53f"]
-                  ["fluree:commit:sha256:bb4jfbk3q6ze2sjvblrla4ewngxiadbopzjq7y62q553q5cowo7fl" :f/time 720000]
-                  ["fluree:commit:sha256:bb4jfbk3q6ze2sjvblrla4ewngxiadbopzjq7y62q553q5cowo7fl" :f/v 0]
+                   "fluree:db:sha256:b7tld52pvt4fnqi5q6v2yfllz7ehaywttsvfomsjxww2zi4ov55c"]
+                  ["fluree:commit:sha256:bppuvk43q3ciziibqftnzmibt5xpsvrfoa6nntcuvjtkpfmzmv6l"
+                   :f/time
+                   720000]
+                  ["fluree:commit:sha256:bppuvk43q3ciziibqftnzmibt5xpsvrfoa6nntcuvjtkpfmzmv6l"
+                   :f/v
+                   0]
                   [:ex/alice :type :ex/User]
                   [:ex/alice :schema/age 42]
                   [:ex/alice :schema/email "alice@flur.ee"]
