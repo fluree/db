@@ -118,14 +118,14 @@
                         index-address (:address db-root-res)
                         index-id      (str "fluree:index:sha256:" (:hash db-root-res))
                         commit-data   (-> indexed-db :commit :data)
+                        index-roots   (select-keys indexed-db index/types)
                         commit-index  (commit-data/new-index commit-data
                                                              index-id
                                                              index-address
-                                                             (select-keys indexed-db index/types))
+                                                             index-roots)
                         indexed-db*   (db/force-index-update indexed-db commit-index)]
                     (when (seq garbage)
                       (<? (storage/write-garbage indexed-db* nil garbage)))
-
 
                     (<? (commit/do-commit+push indexed-db* {:branch branch}))))))))
 
