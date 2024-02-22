@@ -120,8 +120,7 @@
 (defn write-db-root
   [db changes-ch]
   (go-try
-    (let [{:keys [conn ledger commit t stats spot psot post opst
-                  tspo fork fork-block schema]} db
+    (let [{:keys [conn ledger commit t stats spot psot post opst tspo]} db
 
           ledger-alias (:id commit)
           preds     (extract-schema-root db)
@@ -135,9 +134,7 @@
                      :opst      (child-data opst)
                      :tspo      (child-data tspo)
                      :timestamp (util/current-time-millis)
-                     :prevIndex (or (:indexed stats) 0)
-                     :fork      fork
-                     :forkBlock fork-block}
+                     :prevIndex (or (:indexed stats) 0)}
           ser       (serdeproto/-serialize-db-root (serde conn) data)
           res       (<? (conn-proto/-index-file-write conn ledger :root ser))]
       (notify-new-index-file changes-ch data res)
