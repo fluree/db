@@ -117,7 +117,7 @@
 
 
 #?(:clj (defmethod print-method Flake [^Flake f, ^java.io.Writer w]
-          (.write w (str "#Flake "))
+          (.write w (str "#fluree/Flake "))
           (binding [*out* w]
             (pr [(.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)]))))
 
