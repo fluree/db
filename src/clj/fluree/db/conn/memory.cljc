@@ -2,19 +2,18 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.indexer.storage :as storage]
             [fluree.db.index :as index]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.nameservice.memory :as ns-memory]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.platform :as platform]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.core :as conn-core]
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]
-            [fluree.db.storage :as store])
+            [fluree.db.storage :as store]
+            #?(:cljs [fluree.db.platform :as platform]))
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -56,8 +55,6 @@
   conn-proto/iStorage
   (-c-read [_ commit-key] (read-data store commit-key))
   (-c-write [_ _ledger commit-data] (write-data! store commit-data))
-  (-ctx-write [_ _ledger context-data] (write-data! store context-data))
-  (-ctx-read [_ context-key] (read-data store context-key))
 
   conn-proto/iConnection
   (-close [_] (close id state))
@@ -102,7 +99,7 @@
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
   [{:keys [did] :as _defaults}]
-  (async/go
+  (go
     {:did did}))
 
 (defn default-memory-nameservice

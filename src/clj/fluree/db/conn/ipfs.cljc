@@ -4,12 +4,10 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.method.ipfs.core :as ipfs]
             [fluree.db.util.async :refer [<? go-try]]
-            [clojure.core.async :as async :refer [go <! chan]]
+            [clojure.core.async :as async :refer [chan]]
             [fluree.db.conn.core :as conn-core]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.nameservice.ipns :as ns-ipns]
             [fluree.db.conn.cache :as conn-cache]
@@ -32,8 +30,6 @@
   conn-proto/iStorage
   (-c-read [_ commit-key] (store/read store commit-key))
   (-c-write [_ _ commit-data] (store/write store "commit" commit-data))
-  (-ctx-read [_ context-key] (store/read store context-key))
-  (-ctx-write [_ _ context-data] (store/write store "context" context-data))
 
   conn-proto/iConnection
   (-close [_] (close id state))

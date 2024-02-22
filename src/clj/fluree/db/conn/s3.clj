@@ -1,6 +1,5 @@
 (ns fluree.db.conn.s3
   (:require [cognitect.aws.client.api :as aws]
-            [fluree.db.method.s3.core :as s3]
             [fluree.db.nameservice.s3 :as ns-s3]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.crypto :as crypto]
@@ -12,7 +11,6 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.indexer.storage :as storage]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
@@ -54,14 +52,6 @@
   [conn ledger commit-data]
   (write-data conn ledger :commit commit-data))
 
-(defn read-context
-  [{:keys [store] :as _conn} address]
-  (go (json/parse (<! (store/read store address)) false)))
-
-(defn write-context
-  [conn ledger context-data]
-  (write-data conn ledger :context context-data))
-
 (defn write-index
   [conn ledger index-type index-data]
   (write-data conn ledger (str "index/" (name index-type)) index-data))
@@ -75,8 +65,6 @@
   conn-proto/iStorage
   (-c-read [conn commit-key] (read-commit conn commit-key))
   (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
-  (-ctx-read [conn context-key] (read-context conn context-key))
-  (-ctx-write [conn ledger context-data] (write-context conn ledger context-data))
   (-index-file-write [conn ledger index-type index-data]
     (write-index conn ledger index-type index-data))
   (-index-file-read [conn index-address]
