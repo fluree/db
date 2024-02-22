@@ -6,7 +6,7 @@
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.storage :as storage]
+            [fluree.db.indexer.storage :as storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
             [fluree.db.datatype :as datatype]

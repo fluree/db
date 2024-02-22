@@ -1,5 +1,5 @@
 (ns fluree.db.conn.ipfs
-  (:require [fluree.db.storage :as storage]
+  (:require [fluree.db.indexer.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
@@ -12,7 +12,8 @@
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.nameservice.ipns :as ns-ipns]
-            [fluree.db.conn.cache :as conn-cache])
+            [fluree.db.conn.cache :as conn-cache]
+            [fluree.db.storage :as store])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -26,17 +27,13 @@
 
 (defrecord IPFSConnection [id state ledger-defaults lru-cache-atom
                            serializer parallelism msg-in-ch msg-out-ch
-                           nameservices ipfs-endpoint]
+                           nameservices ipfs-endpoint store]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key]
-    (ipfs/read ipfs-endpoint commit-key))
-  (-c-write [_ _ commit-data]
-    (ipfs/write ipfs-endpoint commit-data))
-  (-ctx-read [_ context-key]
-    (ipfs/read ipfs-endpoint context-key))
-  (-ctx-write [_ _ context-data]
-    (ipfs/write ipfs-endpoint context-data))
+  (-c-read [_ commit-key] (store/read store commit-key))
+  (-c-write [_ _ commit-data] (store/write store "commit" commit-data))
+  (-ctx-read [_ context-key] (store/read store context-key))
+  (-ctx-write [_ _ context-data] (store/write store "context" context-data))
 
   conn-proto/iConnection
   (-close [_] (close id state))
@@ -109,7 +106,7 @@
 
 (defn connect
   "Creates a new IPFS connection."
-  [{:keys [server parallelism lru-cache-atom memory ipns defaults serializer nameservices]
+  [{:keys [server parallelism lru-cache-atom memory ipns defaults serializer nameservices store]
     :or   {server     "http://127.0.0.1:5001/"
            serializer (json-serde)
            ipns       "self"}}]
@@ -125,6 +122,7 @@
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id              conn-id
+                            :store           store
                             :ipfs-endpoint   ipfs-endpoint
                             :ledger-defaults ledger-defaults
                             :serializer      serializer

@@ -19,20 +19,21 @@
           opts))
 
 (defn stage
-  [db txn opts]
+  [db txn {:keys [raw-txn] :as opts}]
   (go-try
-    (let [{txn :subject did :did} (or (<? (cred/verify txn))
-                                      {:subject txn})
-          txn-context             (or (:context opts)
-                                      (ctx-util/txn-context txn))
+    (let [{txn* :subject did :did} (or (<? (cred/verify txn))
+                                       {:subject txn})
+          txn-context              (or (:context opts)
+                                       (ctx-util/txn-context txn*))
 
-          expanded            (json-ld/expand (ctx-util/use-fluree-context txn))
+          expanded            (json-ld/expand (ctx-util/use-fluree-context txn*))
           txn-opts            (util/get-first-value expanded const/iri-opts)
           {:keys [maxFuel meta]
            :as   parsed-opts} (cond-> opts
-                                did         (assoc :did did)
-                                txn-context (assoc :context txn-context)
-                                true        (parse-opts txn-opts))]
+                                (not raw-txn) (assoc :raw-txn txn)
+                                did           (assoc :did did)
+                                txn-context   (assoc :context txn-context)
+                                true          (parse-opts txn-opts))]
       (if (or maxFuel meta)
         (let [start-time   #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))
@@ -53,11 +54,11 @@
 (defn transact!
   [conn txn]
   (go-try
-    (let [{txn :subject did :did} (or (<? (cred/verify txn))
-                                      {:subject txn})
+    (let [{txn* :subject did :did} (or (<? (cred/verify txn))
+                                       {:subject txn})
 
-          txn-context (ctx-util/txn-context txn)
-          expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
+          txn-context (ctx-util/txn-context txn*)
+          expanded    (json-ld/expand (ctx-util/use-fluree-context txn*))
           ledger-id   (util/get-first-value expanded const/iri-ledger)
           _ (when-not ledger-id
               (throw (ex-info "Invalid transaction, missing required key: ledger."
@@ -68,21 +69,21 @@
                  did         (assoc :did did)
                  txn-context (assoc :context txn-context))
 
-          parsed-opts (parse-opts {} opts)]
+          parsed-opts (parse-opts {:raw-txn txn} opts)]
       (if-not (<? (nameservice/exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))
         (let [ledger (<? (jld-ledger/load conn address))
-              db     (<? (stage (ledger-proto/-db ledger) txn parsed-opts))]
+              db     (<? (stage (ledger-proto/-db ledger) txn* parsed-opts))]
           (<? (ledger-proto/-commit! ledger db)))))))
 
 (defn create-with-txn
   [conn txn]
   (go-try
-    (let [{txn :subject did :did} (or (<? (cred/verify txn))
-                                      {:subject txn})
+    (let [{txn* :subject did :did} (or (<? (cred/verify txn))
+                                       {:subject txn})
 
-          txn-context (ctx-util/txn-context txn)
-          expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
+          txn-context (ctx-util/txn-context txn*)
+          expanded    (json-ld/expand (ctx-util/use-fluree-context txn*))
           ledger-id   (util/get-first-value expanded const/iri-ledger)
           _ (when-not ledger-id
               (throw (ex-info "Invalid transaction, missing required key: ledger."
@@ -93,10 +94,10 @@
                  did         (assoc :did did)
                  txn-context (assoc :context txn-context))
 
-          parsed-opts (parse-opts {} opts)]
+          parsed-opts (parse-opts {:raw-txn txn} opts)]
       (if (<? (nameservice/exists? conn address))
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
         (let [ledger (<? (jld-ledger/create conn ledger-id parsed-opts))
-              db     (<? (stage (ledger-proto/-db ledger) txn parsed-opts))]
+              db     (<? (stage (ledger-proto/-db ledger) txn* parsed-opts))]
           (<? (ledger-proto/-commit! ledger db)))))))

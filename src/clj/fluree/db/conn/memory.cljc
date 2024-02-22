@@ -1,6 +1,6 @@
 (ns fluree.db.conn.memory
   (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.storage :as storage]
+            [fluree.db.indexer.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.nameservice.memory :as ns-memory]
@@ -13,84 +13,51 @@
             [fluree.db.conn.core :as conn-core]
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
-            [fluree.crypto :as crypto])
+            [fluree.crypto :as crypto]
+            [fluree.db.storage :as store])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 ;; Memory Connection object
 
-(defn memory-address
-  "Turn a path into a fluree memory address."
-  [path]
-  (str "fluree:memory://" path))
-
-(defn- address-path
-  "Returns the path portion of a Fluree memory address."
-  [address]
-  (if-let [[_ path] (re-find #"^fluree:memory://(.+)$" address)]
-    path
-    (throw (ex-info (str "Incorrectly formatted Fluree memory db address: " address)
-                    {:status 500 :error :db/invalid-db}))))
-
 (defn- write-data!
-  [data-atom data]
-  (let [json (json-ld/normalize-data data)
-        hash (crypto/sha2-256-normalize json)
-        path hash]
-    #?(:cljs (when platform/BROWSER
-               (.setItem js/localStorage hash json)))
-    (swap! data-atom assoc hash data)
-    {:name    hash
-     :hash    hash
-     :json    json
-     :size    (count json)
-     :address (memory-address path)}))
-
-(defn write-commit!
-  [data-atom commit-data]
-  (write-data! data-atom commit-data))
-
-(defn- read-address
-  [data-atom address]
-  (let [addr-path (address-path address)]
-    #?(:clj  (get @data-atom addr-path)
-       :cljs (or (get @data-atom addr-path)
-                 (and platform/BROWSER (.getItem js/localStorage addr-path))))))
+  [store data]
+  (go-try
+    (let [json (json-ld/normalize-data data)
+          hash (crypto/sha2-256 json)
+          {path :k
+           address :address
+           size :size}
+          (<? (store/write store hash data))]
+      {:name    path
+       :hash    hash
+       :json    json
+       :size    (count json)
+       :address address})))
 
 (defn- read-data
-  [data-atom address]
-  (let [data (read-address data-atom address)]
-    #?(:cljs (if (and platform/BROWSER (string? data))
-               (js->clj (.parse js/JSON data))
-               data)
-       :clj  data)))
-
-(defn read-commit
-  [data-atom address]
-  (read-data data-atom address))
-
-(defn write-context!
-  [data-atom context-data]
-  (write-data! data-atom context-data))
-
-(defn read-context
-  [data-atom context-key]
-  (read-data data-atom context-key))
+  [store address]
+  (go-try
+    (let [data (<? (store/read store address))]
+      #?(:cljs (if (and platform/BROWSER (string? data))
+                 (js->clj (.parse js/JSON data))
+                 data)
+         :clj  data))))
 
 (defn close
   [id state]
   (log/info "Closing memory connection" id)
   (swap! state assoc :closed? true))
 
-(defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom
+(defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom store
                              parallelism msg-in-ch msg-out-ch nameservices data-atom]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key] (go (read-commit data-atom commit-key)))
-  (-c-write [_ _ledger commit-data] (go (write-commit! data-atom commit-data)))
-  (-ctx-write [_ _ledger context-data] (go (write-context! data-atom context-data)))
-  (-ctx-read [_ context-key] (go (read-context data-atom context-key)))
+  (-c-read [_ commit-key] (read-data store commit-key))
+  (-c-write [_ _ledger commit-data] (write-data! store commit-data))
+  (-ctx-write [_ _ledger context-data] (write-data! store context-data))
+  (-ctx-read [_ context-key] (read-data store context-key))
 
   conn-proto/iConnection
   (-close [_] (close id state))
@@ -140,26 +107,25 @@
 
 (defn default-memory-nameservice
   "Returns memory nameservice"
-  [data-atom]
-  (ns-memory/initialize data-atom))
+  [store]
+  (ns-memory/initialize store))
 
 (defn connect
   "Creates a new memory connection."
-  [{:keys [parallelism lru-cache-atom memory defaults nameservices]}]
+  [{:keys [parallelism lru-cache-atom memory defaults nameservices store]}]
   (go-try
     (let [ledger-defaults (<? (ledger-defaults defaults))
           conn-id         (str (random-uuid))
-          data-atom       (atom {})
           state           (conn-core/blank-state)
           nameservices*   (util/sequential
                             (or nameservices
-                                (default-memory-nameservice data-atom)))
+                                (default-memory-nameservice (:storage-atom store))))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
-                              :data-atom       data-atom
+                              :store           store
                               :parallelism     parallelism
                               :msg-in-ch       (async/chan)
                               :msg-out-ch      (async/chan)

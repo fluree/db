@@ -46,16 +46,18 @@
   :name - name
   :hash - hash (likely same as name)
   :size - size of file."
-  [ipfs-endpoint data]
-  (go-try
-    (let [endpoint (str ipfs-endpoint "api/v0/add")
-          req      {:multipart [{:name        "json-ld"
-                                 :content     data
-                                 :contentType "application/ld+json"}]}
-          {:keys [Name Hash Size]} (<? (xhttp/post endpoint req {:json? true}))]
-      {:name Name
-       :hash Hash
-       :size (util/str->int Size)})))
+  ([ipfs-endpoint data]
+   (add ipfs-endpoint "json-ld" data))
+  ([ipfs-endpoint filename data]
+   (go-try
+     (let [endpoint (str ipfs-endpoint "api/v0/add")
+           req      {:multipart [{:name        filename
+                                  :content     data
+                                  :contentType "application/ld+json"}]}
+           {:keys [Name Hash Size]} (<? (xhttp/post endpoint req {:json? true}))]
+       {:name Name
+        :hash Hash
+        :size (util/str->int Size)}))))
 
 (defn cat
   "Retrieves JSON object from IPFS, returns core async channel with
