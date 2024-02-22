@@ -520,10 +520,8 @@
 (defn size-flake
   "Base size of a flake is 38 bytes... then add size for 'o' and 'm'.
   Flakes have the following:
-    - s - 8 bytes
-    - p - 8 bytes
+    - s, p, dt - sid size as returned by fluree.db.json-ld.iri/measure-sid
     - o - ??
-    - dt - 4 bytes
     - t - 8 bytes
     - add? - 1 byte
     - m - 1 byte + ??

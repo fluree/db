@@ -173,31 +173,31 @@
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
                                          :where   {:id '?s, '?p '?o}})]
-          (is (= [["fluree:db:sha256:b7tld52pvt4fnqi5q6v2yfllz7ehaywttsvfomsjxww2zi4ov55c"
+          (is (= [["fluree:db:sha256:byqg2alei2vf5fyre2bjcdc5w5c77ejbg3h4x5gxt72ze6snnbmq"
                    :f/address
-                   "fluree:memory://2cb396f6662e474c0c484b53e73584b26dde60208456499bd7d204f38e23dd80"]
-                  ["fluree:db:sha256:b7tld52pvt4fnqi5q6v2yfllz7ehaywttsvfomsjxww2zi4ov55c" :f/flakes 11]
-                  ["fluree:db:sha256:b7tld52pvt4fnqi5q6v2yfllz7ehaywttsvfomsjxww2zi4ov55c" :f/size 490]
-                  ["fluree:db:sha256:b7tld52pvt4fnqi5q6v2yfllz7ehaywttsvfomsjxww2zi4ov55c" :f/t 1]
-                  ["fluree:commit:sha256:bbjo2bdj4uedfmnmiv2g6sxi35gjexiyxjy54pvrobtrc6jsornbv"
+                   "fluree:memory://7aa94e177be8d03a59de148cedbb10c18203fb970451299dee03f9417942e17d"]
+                  ["fluree:db:sha256:byqg2alei2vf5fyre2bjcdc5w5c77ejbg3h4x5gxt72ze6snnbmq" :f/flakes 11]
+                  ["fluree:db:sha256:byqg2alei2vf5fyre2bjcdc5w5c77ejbg3h4x5gxt72ze6snnbmq" :f/size 1082]
+                  ["fluree:db:sha256:byqg2alei2vf5fyre2bjcdc5w5c77ejbg3h4x5gxt72ze6snnbmq" :f/t 1]
+                  ["fluree:commit:sha256:bbwrbqogf4xdqer5oh5xrcj4mpevzotbmkqdwbiaperecjqmjirqs"
                    "https://www.w3.org/2018/credentials#issuer"
                    "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                  ["fluree:commit:sha256:bbjo2bdj4uedfmnmiv2g6sxi35gjexiyxjy54pvrobtrc6jsornbv"
+                  ["fluree:commit:sha256:bbwrbqogf4xdqer5oh5xrcj4mpevzotbmkqdwbiaperecjqmjirqs"
                    :f/address
-                   "fluree:memory://bc06f323da67892da74bc321164d52aa58237f00633725a34384d544bd09fb89"]
-                  ["fluree:commit:sha256:bbjo2bdj4uedfmnmiv2g6sxi35gjexiyxjy54pvrobtrc6jsornbv"
+                   "fluree:memory://21210d33bd0152def2702f93a7097c5397911dbf777eb0eab9bd146d25777697"]
+                  ["fluree:commit:sha256:bbwrbqogf4xdqer5oh5xrcj4mpevzotbmkqdwbiaperecjqmjirqs"
                    :f/alias
                    "query/everything"]
-                  ["fluree:commit:sha256:bbjo2bdj4uedfmnmiv2g6sxi35gjexiyxjy54pvrobtrc6jsornbv" :f/author ""]
-                  ["fluree:commit:sha256:bbjo2bdj4uedfmnmiv2g6sxi35gjexiyxjy54pvrobtrc6jsornbv" :f/branch "main"]
-                  ["fluree:commit:sha256:bbjo2bdj4uedfmnmiv2g6sxi35gjexiyxjy54pvrobtrc6jsornbv"
+                  ["fluree:commit:sha256:bbwrbqogf4xdqer5oh5xrcj4mpevzotbmkqdwbiaperecjqmjirqs" :f/author ""]
+                  ["fluree:commit:sha256:bbwrbqogf4xdqer5oh5xrcj4mpevzotbmkqdwbiaperecjqmjirqs" :f/branch "main"]
+                  ["fluree:commit:sha256:bbwrbqogf4xdqer5oh5xrcj4mpevzotbmkqdwbiaperecjqmjirqs"
                    :f/data
-                   "fluree:db:sha256:b7tld52pvt4fnqi5q6v2yfllz7ehaywttsvfomsjxww2zi4ov55c"]
-                  ["fluree:commit:sha256:bbjo2bdj4uedfmnmiv2g6sxi35gjexiyxjy54pvrobtrc6jsornbv" :f/time 720000]
-                  ["fluree:commit:sha256:bbjo2bdj4uedfmnmiv2g6sxi35gjexiyxjy54pvrobtrc6jsornbv"
+                   "fluree:db:sha256:byqg2alei2vf5fyre2bjcdc5w5c77ejbg3h4x5gxt72ze6snnbmq"]
+                  ["fluree:commit:sha256:bbwrbqogf4xdqer5oh5xrcj4mpevzotbmkqdwbiaperecjqmjirqs" :f/time 720000]
+                  ["fluree:commit:sha256:bbwrbqogf4xdqer5oh5xrcj4mpevzotbmkqdwbiaperecjqmjirqs"
                    :f/txn
                    "fluree:memory://query/everything/txn/144908452423d421230317bbc681f6023039201145ab05336b69c39c3958e39c"]
-                  ["fluree:commit:sha256:bbjo2bdj4uedfmnmiv2g6sxi35gjexiyxjy54pvrobtrc6jsornbv" :f/v 0]
+                  ["fluree:commit:sha256:bbwrbqogf4xdqer5oh5xrcj4mpevzotbmkqdwbiaperecjqmjirqs" :f/v 0]
                   [:ex/alice :type :ex/User]
                   [:ex/alice :schema/age 42]
                   [:ex/alice :schema/email "alice@flur.ee"]

@@ -144,8 +144,9 @@
 (defn measure-sid
   "Returns the size of an SID."
   [sid]
-  (+ 4 ; 4 bytes for namespace code
-     (count (get-name sid))))
+  (+ 12 ; 12 bytes for object header
+     4  ; 4 bytes for namespace code
+     (* 2 (count (get-name sid)))))
 
 (def serialize-sid
   (juxt get-ns-code get-name))
