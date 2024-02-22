@@ -28,7 +28,7 @@
           k*    (if content-address?
                   (str k hash)
                   k)
-          path  (str (fs/local-path storage-path) "/" k)
+          path  (str (fs/local-path storage-path) "/" k*)
           bytes (if (string? v)
                   (bytes/string->UTF8 v)
                   v)]
