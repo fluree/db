@@ -90,7 +90,16 @@
                                            :select  '{?s [:* {:schema/isBasedOn [:*]}]}
                                            :where   '{:id   ?s
                                                       :type :schema/Movie}})]
-          (is (= [{:id                               :wiki/Q2875,
+          (is (= [{:id                :wiki/Q109331, :type :schema/Movie,
+                   :schema/name       "Back to the Future Part II",
+                   :schema/titleEIDR  "10.5240/5DA5-C386-2911-7E2B-1782-L",
+                   :schema/followedBy {:id :wiki/Q230552}}
+                  {:id                               :wiki/Q230552,
+                   :type                             :schema/Movie,
+                   :schema/name                      "Back to the Future Part III",
+                   :schema/disambiguatingDescription "1990 film by Robert Zemeckis",
+                   :schema/titleEIDR                 "10.5240/15F9-F913-FF25-8041-E798-O"}
+                  {:id                               :wiki/Q2875,
                    :type                             :schema/Movie,
                    :schema/disambiguatingDescription "1939 film by Victor Fleming",
                    :schema/isBasedOn                 {:id            :wiki/Q2870,
@@ -100,21 +109,6 @@
                                                       :schema/name   "Gone with the Wind"},
                    :schema/name                      "Gone with the Wind",
                    :schema/titleEIDR                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4"}
-                  {:id                               :wiki/Q230552,
-                   :type                             :schema/Movie,
-                   :schema/name                      "Back to the Future Part III",
-                   :schema/disambiguatingDescription "1990 film by Robert Zemeckis",
-                   :schema/titleEIDR                 "10.5240/15F9-F913-FF25-8041-E798-O"}
-                  {:id                :wiki/Q109331, :type :schema/Movie,
-                   :schema/name       "Back to the Future Part II",
-                   :schema/titleEIDR  "10.5240/5DA5-C386-2911-7E2B-1782-L",
-                   :schema/followedBy {:id :wiki/Q230552}}
-                  {:id                               :wiki/Q91540,
-                   :type                             :schema/Movie,
-                   :schema/name                      "Back to the Future",
-                   :schema/disambiguatingDescription "1985 film by Robert Zemeckis",
-                   :schema/titleEIDR                 "10.5240/09A3-1F6E-3538-DF46-5C6F-I",
-                   :schema/followedBy                {:id :wiki/Q109331}}
                   {:id                               :wiki/Q836821, :type :schema/Movie,
                    :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                    :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
@@ -123,7 +117,13 @@
                                                       :type          :schema/Book,
                                                       :schema/name   "The Hitchhiker's Guide to the Galaxy",
                                                       :schema/isbn   "0-330-25864-8",
-                                                      :schema/author {:id :wiki/Q42}}}]                                  ;; :id is a DID and will be unique per DB so exclude from comparison
+                                                      :schema/author {:id :wiki/Q42}}}
+                  {:id                               :wiki/Q91540,
+                   :type                             :schema/Movie,
+                   :schema/name                      "Back to the Future",
+                   :schema/disambiguatingDescription "1985 film by Robert Zemeckis",
+                   :schema/titleEIDR                 "10.5240/09A3-1F6E-3538-DF46-5C6F-I",
+                   :schema/followedBy                {:id :wiki/Q109331}}]
                  query-res)
               "Standard bootstrap data isn't matching."))))))
 
@@ -216,24 +216,7 @@
                                 :select  {:ex/brian ["*"]}}))))
     ;;TODO not getting reparsed as ssc
     (testing "iri from `where`"
-      (is (= [{:id           :ex/david
-               :type         :ex/User
-               :schema/name  "David"
-               :ex/last      "Jones"
-               :schema/email "david@example.org"
-               :schema/age   46
-               :ex/favNums   [15 70]
-               :ex/friend    {:id :ex/cam}}
-              {:type         :ex/User
-               :schema/email "cam@example.org"
-               :ex/favNums   [5 10]
-               :schema/age   34
-               :ex/last      "Jones"
-               :schema/name  "Cam"
-               :id           :ex/cam
-               :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
-               :ex/favColor  "Blue"}
-              {:id           :ex/alice
+      (is (= [{:id           :ex/alice
                :type         :ex/User
                :schema/name  "Alice"
                :ex/last      "Smith"
@@ -248,7 +231,24 @@
                :schema/email "brian@example.org"
                :schema/age   50
                :ex/favColor  "Green"
-               :ex/favNums   7}]
+               :ex/favNums   7}
+              {:type         :ex/User
+               :schema/email "cam@example.org"
+               :ex/favNums   [5 10]
+               :schema/age   34
+               :ex/last      "Jones"
+               :schema/name  "Cam"
+               :id           :ex/cam
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
+               :ex/favColor  "Blue"}
+              {:id           :ex/david
+               :type         :ex/User
+               :schema/name  "David"
+               :ex/last      "Jones"
+               :schema/email "david@example.org"
+               :schema/age   46
+               :ex/favNums   [15 70]
+               :ex/friend    {:id :ex/cam}}]
              @(fluree/query db {:context context
                                 :select  {"?s" ["*"]}
                                 :where   {:id   "?s"
@@ -273,7 +273,7 @@
                :ex/last      "Jones"
                :schema/name  "Cam"
                :id           :ex/cam
-               :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
                :ex/favColor  "Blue"}
               {:id           :ex/alice
                :type         :ex/User
@@ -296,23 +296,23 @@
                                 :where   {:id          "?s"
                                           :ex/favColor "?color"}})))
 
-      (is (= [{:type         :ex/User
-               :schema/email "cam@example.org"
-               :ex/favNums   [5 10]
-               :schema/age   34
-               :ex/last      "Jones"
-               :schema/name  "Cam"
-               :id           :ex/cam
-               :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
-               :ex/favColor  "Blue"}
-              {:id           :ex/alice
-               :type         :ex/User
-               :schema/name  "Alice"
-               :ex/last      "Smith"
-               :schema/email "alice@example.org"
-               :schema/age   42
-               :ex/favNums   [9 42 76]
-               :ex/favColor  "Green"}]
+      (is (= [{:id           :ex/cam,
+               :type         :ex/User,
+               :ex/favColor  "Blue",
+               :ex/favNums   [5 10],
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}],
+               :ex/last      "Jones",
+               :schema/age   34,
+               :schema/email "cam@example.org",
+               :schema/name  "Cam"}
+              {:id           :ex/alice,
+               :type         :ex/User,
+               :ex/favColor  "Green",
+               :ex/favNums   [9 42 76],
+               :ex/last      "Smith",
+               :schema/age   42,
+               :schema/email "alice@example.org",
+               :schema/name  "Alice"}]
              @(fluree/query db {:context context
                                 :select  {"?s" ["*"]}
                                 :where   {:id          "?s"

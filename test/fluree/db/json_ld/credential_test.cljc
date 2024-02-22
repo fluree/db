@@ -133,14 +133,12 @@
                                                    "insert"   tx})
 
            mdfn {"@context" ["https://ns.flur.ee" context]
-                 "delete"   {"@id"        "?s"
+                 "delete"   {"@id"        (:id auth)
                              "ct:name"    "Daniel"
                              "ct:favnums" 1}
-                 "insert"   {"@id"        "?s"
+                 "insert"   {"@id"        (:id auth)
                              "ct:name"    "D"
-                             "ct:favnums" [4 5 6]}
-                 "where"    {"@id" "?s"}
-                 "values"   ["?s" [(:id auth)]]}
+                             "ct:favnums" [4 5 6]}}
 
            db2 @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
 
@@ -180,22 +178,19 @@
                 "f:assert"  [{"id"         (:id auth)
                               "ct:name"    "Daniel"
                               "ct:favnums" [1 2 3],
-                              :id          (:id auth)
                               "f:role"     {"id" "role:cool"}}],
                 "f:retract" []}
 
                {"f:t"       3,
-                "f:assert"  [{"ct:name" "D", "ct:favnums" [4 5 6], :id (:id auth)}],
-                "f:retract" [{"ct:name" "Daniel", "ct:favnums" 1, :id (:id auth)}]}]
+                "f:assert"  [{"ct:name" "D", "ct:favnums" [4 5 6], "id" (:id auth)}],
+                "f:retract" [{"ct:name" "Daniel", "ct:favnums" 1, "id" (:id auth)}]}]
               @(fluree/history ledger (async/<!! (cred/generate {:context context
                                                                  :history (:id auth)
                                                                  :t {:from 1}}
                                                                 (:private auth)))))
            "history query credential - allowing access")
-       (is (= "Subject identity does not exist: \"did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh\""
-              (-> @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private pleb-auth))))
-                  (Throwable->map)
-                  (:cause)))
+       (is (= []
+              @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private pleb-auth)))))
            "history query credential - forbidding access"))))
 
 (comment

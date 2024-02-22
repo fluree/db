@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.subject-crawl.reparse :as reparse]))
 
@@ -108,7 +109,7 @@
         (is (not (nil? context)))
         (is (= {:variable '?s}
                s))
-        (is (number? (:value p)))
+        (is (iri/sid? (:value p)))
         (let [{:keys [value datatype]} o]
           (is (= "Alice"
                  value))
@@ -120,7 +121,7 @@
         (is (not (nil? context)))
         (is (= {:variable '?s}
                s))
-        (is (number? (:value p)))
+        (is (iri/sid? (:value p)))
         (let [{:keys [value datatype]} o]
           (is (= 50
                  value))

@@ -1,4 +1,6 @@
 (ns fluree.db.policy.subj-flakes-test
+  "tests for the optimized policy filtering for groups of flakes of the same
+  subject (used for simple subject crawl)"
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
@@ -6,9 +8,6 @@
             [fluree.db.permissions-validate :as policy-enforce]
             [clojure.core.async :as async]
             [fluree.db.flake :as flake]))
-
-;; tests for the optimized policy filtering for groups of flakes of the same subject
-;; (used for simple subject crawl)
 
 (deftest ^:integration subject-flakes-policy
   (testing "Policy enforcement for groups of flakes by subject."
@@ -94,18 +93,18 @@
                                async/<!!)
 
           ssn-iri (fluree/expand-iri context :schema/ssn)
-          ssn-sid @(fluree/internal-id db ssn-iri)]
+          ssn-sid (fluree/internal-id db ssn-iri)]
       (is (= 0
-             (count (filterv #(= ssn-sid (flake/p %)) alice-db-john)))
+             (count (filter #(= ssn-sid (flake/p %)) alice-db-john)))
           "Alice cannot see John's ssn.")
-      (is (= 5
-             (count alice-db-john))
+      (is (= 1 (- (count john-flakes)
+                  (count alice-db-john)))
           "Alice can see John's everything but ssn.")
 
       (is (= 1
              (count (filterv #(= ssn-sid (flake/p %)) alice-db-alice)))
           "Alice cannot see her own ssn.")
-      (is (= 7
+      (is (= 6
              (count alice-db-alice))
           "Alice can see her own everything.")
 

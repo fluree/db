@@ -1,4 +1,5 @@
 (ns build
+  (:refer-clojure :exclude [compile])
   (:require [clojure.tools.build.api :as b]
             [deps-deploy.deps-deploy :as dd]))
 
@@ -11,25 +12,30 @@
 
 (def source-uri "https://github.com/fluree/db")
 
+(defn compile [_]
+  (b/javac {:src-dirs ["src/java"]
+            :class-dir class-dir
+            :basis basis
+            :javac-opts ["--release" "11"]}))
+
 (defn clean [_]
   (b/delete {:path "target"}))
 
 (defn jar [_]
+  (compile nil)
   (b/write-pom {:class-dir class-dir
                 :lib       lib
                 :version   version
                 :basis     basis
-                :src-dirs  ["src"]
-                :scm
-                {:url                 source-uri
-                 :connection          "scm:git:https://github.com/fluree/db.git"
-                 :developerConnection "scm:git:git@github.com:fluree/db.git"}
-                :pom-data
-                [[:licenses
-                  [:license
-                   [:name "EPL-2.0"]
-                   [:url "https://www.eclipse.org/legal/epl-2.0"]]]]})
-  (b/copy-dir {:src-dirs    ["src" "resources"]
+                :src-dirs  ["src/clj"]
+                :scm       {:url                 source-uri
+                            :connection          "scm:git:https://github.com/fluree/db.git"
+                            :developerConnection "scm:git:git@github.com:fluree/db.git"}
+                :pom-data  [[:licenses
+                             [:license
+                              [:name "EPL-2.0"]
+                              [:url "https://www.eclipse.org/legal/epl-2.0"]]]]})
+  (b/copy-dir {:src-dirs    ["src/clj" "resources"]
                :target-dir  class-dir})
   (b/jar {:class-dir class-dir
           :jar-file  jar-file}))

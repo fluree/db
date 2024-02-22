@@ -196,7 +196,7 @@
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
               {:f/t       4
                :f/assert  [{:ex/x "foo-cat" :id :ex/cat} {:ex/x "foo-dog" :id :ex/dog}]
-               :f/retract [{:ex/x "foo-1" :id :ex/dog} {:ex/x "foo-1" :id :ex/cat}]}]
+               :f/retract [{:ex/x "foo-1" :id :ex/cat} {:ex/x "foo-1" :id :ex/dog}]}]
              @(fluree/history ledger {:context context
                                       :history [nil :ex/x]
                                       :t       {:from 2 :to 4}}))))
@@ -291,14 +291,15 @@
                           :f/alias          "committest"
                           :f/author         ""
                           :f/branch         "main"
-                          :f/data           #:f{:address test-utils/address?
-                                                :assert  [{:ex/x "foo-1"
-                                                           :ex/y "bar-1"
-                                                           :id   :ex/alice}]
-                                                :flakes  7
-                                                :retract []
-                                                :size    pos-int?
-                                                :t       1}
+                          :f/data           {:f/address test-utils/address?
+                                             :f/assert  [{:ex/x "foo-1"
+                                                          :ex/y "bar-1"
+                                                          :id   :ex/alice}]
+                                             :f/flakes  2
+                                             :f/retract []
+                                             :f/size    pos-int?
+                                             :f/t       1
+                                             :id test-utils/db-id?}
                           :f/time           720000
                           :f/txn            string?
                           :f/v              0
@@ -312,17 +313,18 @@
                                    :f/alias          "committest"
                                    :f/author         ""
                                    :f/branch         "main"
-                                   :f/data           #:f{:address  test-utils/address?
-                                                         :assert   [{:ex/x "foo-cat"
-                                                                     :ex/y "bar-cat"
-                                                                     :id   :ex/alice}]
-                                                         :flakes   97
-                                                         :previous {:id test-utils/db-id?}
-                                                         :retract  [{:ex/x "foo-3"
-                                                                     :ex/y "bar-3"
-                                                                     :id   :ex/alice}]
-                                                         :size     pos-int?
-                                                         :t        5}
+                                   :f/data           {:f/address  test-utils/address?
+                                                      :f/assert   [{:ex/x "foo-cat"
+                                                                    :ex/y "bar-cat"
+                                                                    :id   :ex/alice}]
+                                                      :f/flakes   68
+                                                      :f/previous {:id test-utils/db-id?}
+                                                      :f/retract  [{:ex/x "foo-3"
+                                                                    :ex/y "bar-3"
+                                                                    :id   :ex/alice}]
+                                                      :f/size     pos-int?
+                                                      :f/t        5
+                                                      :id test-utils/db-id?}
                                    :f/message        "meow"
                                    :f/previous       {:id test-utils/commit-id?}
                                    :f/time           720000
@@ -335,15 +337,16 @@
                                    :f/alias          "committest"
                                    :f/author         ""
                                    :f/branch         "main"
-                                   :f/data           #:f{:address  test-utils/address?
-                                                         :assert   [{:ex/x "foo-cat"
-                                                                     :ex/y "bar-cat"
-                                                                     :id   :ex/cat}]
-                                                         :flakes   78
-                                                         :previous {:id test-utils/db-id?}
-                                                         :retract  []
-                                                         :size     pos-int?
-                                                         :t        4}
+                                   :f/data           {:f/address  test-utils/address?
+                                                      :f/assert   [{:ex/x "foo-cat"
+                                                                    :ex/y "bar-cat"
+                                                                    :id   :ex/cat}]
+                                                      :f/flakes   51
+                                                      :f/previous {:id test-utils/db-id?}
+                                                      :f/retract  []
+                                                      :f/size     pos-int?
+                                                      :f/t        4
+                                                      :id         test-utils/db-id?}
                                    :f/previous       {:id test-utils/commit-id?}
                                    :f/time           720000
                                    :f/txn            string?
@@ -375,15 +378,16 @@
                              :f/alias "committest"
                              :f/author ""
                              :f/branch "main"
-                             :f/data #:f{:address test-utils/address?
-                                         :assert [{:ex/x "foo-cat"
-                                                   :ex/y "bar-cat"
-                                                   :id :ex/cat}]
-                                         :flakes 78
-                                         :previous {:id test-utils/db-id?}
-                                         :retract []
-                                         :size pos-int?
-                                         :t 4}
+                             :f/data {:f/address  test-utils/address?
+                                      :f/assert   [{:ex/x "foo-cat"
+                                                    :ex/y "bar-cat"
+                                                    :id   :ex/cat}]
+                                      :f/flakes   51
+                                      :f/previous {:id test-utils/db-id?}
+                                      :f/retract  []
+                                      :f/size     pos-int?
+                                      :f/t        4
+                                      :id         test-utils/db-id?}
                              :f/previous {:id test-utils/commit-id?}
                              :f/time 720000
                              :f/txn string?
@@ -397,17 +401,18 @@
                            :f/alias "committest"
                            :f/author ""
                            :f/branch "main"
-                           :f/data #:f{:address test-utils/address?
-                                       :assert [{:ex/x "foo-3"
-                                                 :ex/y "bar-3"
-                                                 :id :ex/alice}]
-                                       :flakes 58
-                                       :previous {:id test-utils/db-id?}
-                                       :retract [{:ex/x "foo-2"
+                           :f/data {:f/address  test-utils/address?
+                                    :f/assert   [{:ex/x "foo-3"
+                                                  :ex/y "bar-3"
+                                                  :id   :ex/alice}]
+                                    :f/flakes   34
+                                    :f/previous {:id test-utils/db-id?}
+                                    :f/retract  [{:ex/x "foo-2"
                                                   :ex/y "bar-2"
-                                                  :id :ex/alice}]
-                                       :size pos-int?
-                                       :t 3}
+                                                  :id   :ex/alice}]
+                                    :f/size     pos-int?
+                                    :f/t        3
+                                    :id         test-utils/db-id?}
                            :f/previous {:id test-utils/commit-id?}
                            :f/time 720000
                            :f/txn string?
@@ -421,17 +426,18 @@
                            :f/alias "committest"
                            :f/author ""
                            :f/branch "main"
-                           :f/data #:f{:address test-utils/address?
-                                       :assert [{:ex/x "foo-2"
-                                                 :ex/y "bar-2"
-                                                 :id :ex/alice}]
-                                       :flakes 39
-                                       :previous {:id test-utils/db-id?}
-                                       :retract [{:ex/x "foo-1"
+                           :f/data {:f/address  test-utils/address?
+                                    :f/assert   [{:ex/x "foo-2"
+                                                  :ex/y "bar-2"
+                                                  :id   :ex/alice}]
+                                    :f/flakes   17
+                                    :f/previous {:id test-utils/db-id?}
+                                    :f/retract  [{:ex/x "foo-1"
                                                   :ex/y "bar-1"
-                                                  :id :ex/alice}]
-                                       :size pos-int?
-                                       :t 2}
+                                                  :id   :ex/alice}]
+                                    :f/size     pos-int?
+                                    :f/t        2
+                                    :id         test-utils/db-id?}
                            :f/previous {:id test-utils/commit-id?}
                            :f/time 720000
                            :f/txn string?
@@ -447,15 +453,16 @@
                           :f/alias          "committest"
                           :f/author         ""
                           :f/branch         "main"
-                          :f/data           #:f{:address  test-utils/address?
-                                                :assert   [{:ex/x "foo-cat"
-                                                            :ex/y "bar-cat"
-                                                            :id   :ex/cat}]
-                                                :flakes   78
-                                                :previous {:id test-utils/db-id?}
-                                                :retract  []
-                                                :size     pos-int?
-                                                :t        4}
+                          :f/data           {:f/address  test-utils/address?
+                                             :f/assert   [{:ex/x "foo-cat"
+                                                           :ex/y "bar-cat"
+                                                           :id   :ex/cat}]
+                                             :f/flakes   51
+                                             :f/previous {:id test-utils/db-id?}
+                                             :f/retract  []
+                                             :f/size     pos-int?
+                                             :f/t        4
+                                             :id         test-utils/db-id?}
                           :f/previous       {:id test-utils/commit-id?}
                           :f/time           720000
                           :f/txn            string?
@@ -467,17 +474,18 @@
                           :f/alias          "committest"
                           :f/author         ""
                           :f/branch         "main"
-                          :f/data           #:f{:address  test-utils/address?
-                                                :assert   [{:ex/x "foo-cat"
-                                                            :ex/y "bar-cat"
-                                                            :id   :ex/alice}]
-                                                :flakes   97
-                                                :previous {:id test-utils/db-id?}
-                                                :retract  [{:ex/x "foo-3"
-                                                            :ex/y "bar-3"
-                                                            :id   :ex/alice}]
-                                                :size     pos-int?
-                                                :t        5}
+                          :f/data           {:f/address  test-utils/address?
+                                             :f/assert   [{:ex/x "foo-cat"
+                                                           :ex/y "bar-cat"
+                                                           :id   :ex/alice}]
+                                             :f/flakes   68
+                                             :f/previous {:id test-utils/db-id?}
+                                             :f/retract  [{:ex/x "foo-3"
+                                                           :ex/y "bar-3"
+                                                           :id   :ex/alice}]
+                                             :f/size     pos-int?
+                                             :f/t        5
+                                             :id         test-utils/db-id?}
                           :f/message        "meow"
                           :f/previous       {:id test-utils/commit-id?}
                           :f/time           720000
@@ -496,14 +504,15 @@
                           :f/alias          "committest"
                           :f/author         ""
                           :f/branch         "main"
-                          :f/data           #:f{:address test-utils/address?
-                                                :assert  [{:ex/x "foo-1"
-                                                           :ex/y "bar-1"
-                                                           :id   :ex/alice}]
-                                                :flakes  7
-                                                :retract []
-                                                :size    pos-int?
-                                                :t       1}
+                          :f/data           {:f/address test-utils/address?
+                                             :f/assert  [{:ex/x "foo-1"
+                                                          :ex/y "bar-1"
+                                                          :id   :ex/alice}]
+                                             :f/flakes  2
+                                             :f/retract []
+                                             :f/size    pos-int?
+                                             :f/t       1
+                                             :id        test-utils/db-id?}
                           :f/time           720000
                           :f/txn            string?
                           :f/v              0
@@ -523,17 +532,18 @@
                             :f/alias          "committest"
                             :f/author         ""
                             :f/branch         "main"
-                            :f/data           #:f{:address  test-utils/address?
-                                                  :assert   [{:ex/x "foo-3"
-                                                              :ex/y "bar-3"
-                                                              :id   :ex/alice}]
-                                                  :flakes   58
-                                                  :previous {:id test-utils/db-id?}
-                                                  :retract  [{:ex/x "foo-2"
-                                                              :ex/y "bar-2"
-                                                              :id   :ex/alice}]
-                                                  :size     pos-int?
-                                                  :t        3}
+                            :f/data           {:f/address  test-utils/address?
+                                               :f/assert   [{:ex/x "foo-3"
+                                                             :ex/y "bar-3"
+                                                             :id   :ex/alice}]
+                                               :f/flakes   34
+                                               :f/previous {:id test-utils/db-id?}
+                                               :f/retract  [{:ex/x "foo-2"
+                                                             :ex/y "bar-2"
+                                                             :id   :ex/alice}]
+                                               :f/size     pos-int?
+                                               :f/t        3
+                                               :id         test-utils/db-id?}
                             :f/previous       {:id test-utils/commit-id?}
                             :f/time           720000
                             :f/txn            string?
@@ -552,17 +562,18 @@
                             :f/alias          "committest"
                             :f/author         ""
                             :f/branch         "main"
-                            :f/data           #:f{:address  test-utils/address?
-                                                  :assert   [{:ex/x "foo-cat"
-                                                              :ex/y "bar-cat"
-                                                              :id   :ex/alice}]
-                                                  :flakes   97
-                                                  :previous {:id test-utils/db-id?}
-                                                  :retract  [{:ex/x "foo-3"
-                                                              :ex/y "bar-3"
-                                                              :id   :ex/alice}]
-                                                  :size     pos-int?
-                                                  :t        5}
+                            :f/data           {:f/address  test-utils/address?
+                                               :f/assert   [{:ex/x "foo-cat"
+                                                             :ex/y "bar-cat"
+                                                             :id   :ex/alice}]
+                                               :f/flakes   68
+                                               :f/previous {:id test-utils/db-id?}
+                                               :f/retract  [{:ex/x "foo-3"
+                                                             :ex/y "bar-3"
+                                                             :id   :ex/alice}]
+                                               :f/size     pos-int?
+                                               :f/t        5
+                                               :id         test-utils/db-id?}
                             :f/message        "meow"
                             :f/previous       {:id test-utils/commit-id?}
                             :f/time           720000
@@ -643,17 +654,18 @@
                             :f/alias    ledger-name
                             :f/author   ""
                             :f/branch   "main"
-                            :f/data     #:f{:address  test-utils/address?
-                                            :assert   [{:ex/x "foo-3"
-                                                        :ex/y "bar-3"
-                                                        :id   :ex/alice}]
-                                            :flakes   59
-                                            :previous {:id test-utils/db-id?}
-                                            :retract  [{:ex/x "foo-2"
-                                                        :ex/y "bar-2"
-                                                        :id   :ex/alice}]
-                                            :size     pos-int?
-                                            :t        3}
+                            :f/data     {:f/address  test-utils/address?
+                                         :f/assert   [{:ex/x "foo-3"
+                                                       :ex/y "bar-3"
+                                                       :id   :ex/alice}]
+                                         :f/flakes   36
+                                         :f/previous {:id test-utils/db-id?}
+                                         :f/retract  [{:ex/x "foo-2"
+                                                       :ex/y "bar-2"
+                                                       :id   :ex/alice}]
+                                         :f/size     pos-int?
+                                         :f/t        3
+                                         :id test-utils/db-id?}
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
                             :f/txn      string?
@@ -670,17 +682,18 @@
                             :f/alias    ledger-name
                             :f/author   ""
                             :f/branch   "main"
-                            :f/data     #:f{:address  test-utils/address?
-                                            :assert   [{:ex/x "foo-cat"
-                                                        :ex/y "bar-cat"
-                                                        :id   :ex/alice}]
-                                            :flakes   98
-                                            :previous {:id test-utils/db-id?}
-                                            :retract  [{:ex/x "foo-3"
-                                                        :ex/y "bar-3"
-                                                        :id   :ex/alice}]
-                                            :size     pos-int?
-                                            :t        5}
+                            :f/data     {:f/address  test-utils/address?
+                                         :f/assert   [{:ex/x "foo-cat"
+                                                       :ex/y "bar-cat"
+                                                       :id   :ex/alice}]
+                                         :f/flakes   70
+                                         :f/previous {:id test-utils/db-id?}
+                                         :f/retract  [{:ex/x "foo-3"
+                                                       :ex/y "bar-3"
+                                                       :id   :ex/alice}]
+                                         :f/size     pos-int?
+                                         :f/t        5
+                                         :id         test-utils/db-id?}
                             :f/message  "meow"
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
@@ -741,17 +754,18 @@
                             :f/alias    ledger-name
                             :f/author   ""
                             :f/branch   "main"
-                            :f/data     #:f{:address  test-utils/address?
-                                            :assert   [{:ex/x "foo-3"
-                                                        :ex/y "bar-3"
-                                                        :id   :ex/alice}]
-                                            :flakes   58
-                                            :previous {:id test-utils/db-id?}
-                                            :retract  [{:ex/x "foo-2"
-                                                        :ex/y "bar-2"
-                                                        :id   :ex/alice}]
-                                            :size     pos-int?
-                                            :t        3}
+                            :f/data     {:f/address  test-utils/address?
+                                         :f/assert   [{:ex/x "foo-3"
+                                                       :ex/y "bar-3"
+                                                       :id   :ex/alice}]
+                                         :f/flakes   34
+                                         :f/previous {:id test-utils/db-id?}
+                                         :f/retract  [{:ex/x "foo-2"
+                                                       :ex/y "bar-2"
+                                                       :id   :ex/alice}]
+                                         :f/size     pos-int?
+                                         :f/t        3
+                                         :id         test-utils/db-id?}
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
                             :f/txn      string?
@@ -770,17 +784,18 @@
                             :f/alias    ledger-name
                             :f/author   ""
                             :f/branch   "main"
-                            :f/data     #:f{:address  test-utils/address?
-                                            :assert   [{:ex/x "foo-cat"
-                                                        :ex/y "bar-cat"
-                                                        :id   :ex/alice}]
-                                            :flakes   97
-                                            :previous {:id test-utils/db-id?}
-                                            :retract  [{:ex/x "foo-3"
-                                                        :ex/y "bar-3"
-                                                        :id   :ex/alice}]
-                                            :size     pos-int?
-                                            :t        5}
+                            :f/data     {:f/address  test-utils/address?
+                                         :f/assert   [{:ex/x "foo-cat"
+                                                       :ex/y "bar-cat"
+                                                       :id   :ex/alice}]
+                                         :f/flakes   68
+                                         :f/previous {:id test-utils/db-id?}
+                                         :f/retract  [{:ex/x "foo-3"
+                                                       :ex/y "bar-3"
+                                                       :id   :ex/alice}]
+                                         :f/size     pos-int?
+                                         :f/t        5
+                                         :id test-utils/db-id?}
                             :f/message  "meow"
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
@@ -854,17 +869,18 @@
                               :f/alias    ledger-name
                               :f/author   ""
                               :f/branch   "main"
-                              :f/data     #:f{:address  test-utils/address?
-                                              :assert   [{:ex/x "foo-3"
-                                                          :ex/y "bar-3"
-                                                          :id   :ex/alice}]
-                                              :flakes   62
-                                              :previous {:id test-utils/db-id?}
-                                              :retract  [{:ex/x "foo-2"
-                                                          :ex/y "bar-2"
-                                                          :id   :ex/alice}]
-                                              :size     pos-int?
-                                              :t        3}
+                              :f/data     {:f/address  test-utils/address?
+                                           :f/assert   [{:ex/x "foo-3"
+                                                         :ex/y "bar-3"
+                                                         :id   :ex/alice}]
+                                           :f/flakes   38
+                                           :f/previous {:id test-utils/db-id?}
+                                           :f/retract  [{:ex/x "foo-2"
+                                                         :ex/y "bar-2"
+                                                         :id   :ex/alice}]
+                                           :f/size     pos-int?
+                                           :f/t        3
+                                           :id         test-utils/db-id?}
                               :f/previous {:id test-utils/commit-id?}
                               :f/time     720000
                               :f/txn      string?
@@ -883,17 +899,18 @@
                               :f/alias    ledger-name
                               :f/author   ""
                               :f/branch   "main"
-                              :f/data     #:f{:address  test-utils/address?
-                                              :assert   [{:ex/x "foo-cat"
-                                                          :ex/y "bar-cat"
-                                                          :id   :ex/alice}]
-                                              :flakes   103
-                                              :previous {:id test-utils/db-id?}
-                                              :retract  [{:ex/x "foo-3"
-                                                          :ex/y "bar-3"
-                                                          :id   :ex/alice}]
-                                              :size     pos-int?
-                                              :t        5}
+                              :f/data     {:f/address  test-utils/address?
+                                           :f/assert   [{:ex/x "foo-cat"
+                                                         :ex/y "bar-cat"
+                                                         :id   :ex/alice}]
+                                           :f/flakes   74
+                                           :f/previous {:id test-utils/db-id?}
+                                           :f/retract  [{:ex/x "foo-3"
+                                                         :ex/y "bar-3"
+                                                         :id   :ex/alice}]
+                                           :f/size     pos-int?
+                                           :f/t        5
+                                           :id         test-utils/db-id?}
                               :f/message  "meow"
                               :f/previous {:id test-utils/commit-id?}
                               :f/time     720000

@@ -41,7 +41,10 @@
                        :ex/friend   [:ex/brian :ex/alice]}]})]
 
       ;; basic combine :schema/email and :ex/email into same result variable
-      (is (= @(fluree/query db {:context [test-utils/default-context
+      (is (= [["Alice" "alice@example.org"]
+              ["Brian" "brian@example.org"]
+              ["Cam" "cam@example.org"]]
+             @(fluree/query db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  ['?name '?email]
                                 :where   [{:id          '?s
@@ -49,27 +52,27 @@
                                            :schema/name '?name}
                                           [:union
                                            {:id '?s, :ex/email '?email}
-                                           {:id '?s, :schema/email '?email}]]})
-             [["Cam" "cam@example.org"]
-              ["Alice" "alice@example.org"]
-              ["Brian" "brian@example.org"]])
+                                           {:id '?s, :schema/email '?email}]]}))
           "Emails for all 3 users should return, even though some are :schema/email and others :ex/email")
 
       ;; basic union that uses different variables for output
-      (is (= @(fluree/query db {:context [test-utils/default-context
+      (is (= [[:ex/alice nil "alice@example.org"]
+              [:ex/brian nil "brian@example.org"]
+              [:ex/cam "cam@example.org" nil]]
+             @(fluree/query db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  ['?s '?email1 '?email2]
                                 :where   [{:id '?s, :type :ex/User}
                                           [:union
                                            {:id '?s, :ex/email '?email1}
-                                           {:id '?s, :schema/email '?email2}]]})
-             [[:ex/cam "cam@example.org" nil]
-              [:ex/alice nil "alice@example.org"]
-              [:ex/brian nil "brian@example.org"]])
+                                           {:id '?s, :schema/email '?email2}]]}))
           "Emails for all 3 users should return, but wil each using their own var and nils for others")
 
       ;; basic union that uses different variables for output and has a passthrough variable
-      (is (= @(fluree/query db {:context [test-utils/default-context
+      (is (= [["Alice" nil "alice@example.org"]
+              ["Brian" nil "brian@example.org"]
+              ["Cam" "cam@example.org" nil]]
+             @(fluree/query db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  ['?name '?email1 '?email2]
                                 :where   [{:id          '?s
@@ -77,8 +80,5 @@
                                            :schema/name '?name}
                                           [:union
                                            {:id '?s, :ex/email '?email1}
-                                           {:id '?s, :schema/email '?email2}]]})
-             [["Cam" "cam@example.org" nil]
-              ["Alice" nil "alice@example.org"]
-              ["Brian" nil "brian@example.org"]])
+                                           {:id '?s, :schema/email '?email2}]]}))
           "Emails for all 3 users should return using different vars, but also passing through a variable"))))

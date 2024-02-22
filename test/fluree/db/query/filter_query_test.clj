@@ -46,8 +46,8 @@
                      :ex/friend    [:ex/cam]}]})]
 
     (testing "single filter"
-      (is (= [["David" 46]
-              ["Brian" 50]]
+      (is (= [["Brian" 50]
+              ["David" 46]]
              @(fluree/query db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?name ?age]
@@ -128,7 +128,7 @@
                :ex/last      "Jones"
                :schema/name  "Cam"
                :id           :ex/cam
-               :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
                :ex/favColor  "Blue"}]
              @(fluree/query db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]

@@ -1,12 +1,13 @@
 (ns fluree.db.test-utils
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]
             [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.json-ld.commit :as commit]
-            #?@(:cljs [[clojure.core.async :refer [go go-loop]]
-                       [clojure.core.async.interop :refer [<p!]]])))
+            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]])
+            [clojure.string :as str]))
 
 (def default-context
   {:id     "@id"
@@ -220,7 +221,7 @@
   [s]
   (let [result (and (string? s) (re-matches did-regex s))]
     (when-not result
-      (log/trace "did? falsey result from:" s))
+      (log/warn "did? falsey result from:" s))
     result))
 
 (def addr-regex
@@ -230,17 +231,7 @@
   [s]
   (let [result (and (string? s) (re-matches addr-regex s))]
     (when-not result
-      (log/trace "address? falsey result from:" s))
-    result))
-
-(def context-id-regex
-  (re-pattern (str "fluree:context:" base64-pattern "{64}")))
-
-(defn context-id?
-  [s]
-  (let [result (and (string? s) (re-matches context-id-regex s))]
-    (when-not result
-      (log/trace "context-id? falsey result from:" s))
+      (log/warn "address? falsey result from:" s))
     result))
 
 (def db-id-regex
@@ -250,7 +241,7 @@
   [s]
   (let [result (and (string? s) (re-matches db-id-regex s))]
     (when-not result
-      (log/trace "db-id? falsey result from:" s))
+      (log/warn "db-id? falsey result from:" s))
     result))
 
 (def commit-id-regex
@@ -260,8 +251,12 @@
   [s]
   (let [result (and (string? s) (re-matches commit-id-regex s))]
     (when-not result
-      (log/trace "commit-id? falsey result from:" s))
+      (log/warn "commit-id? falsey result from:" s))
     result))
+
+(defn blank-node-id?
+  [s]
+  (str/starts-with? s parse/blank-node-prefix))
 
 (defn pred-match?
   "Does a deep compare of expected and actual map values but any predicate fns
@@ -269,22 +264,19 @@
   used to determine whether there is a match. Returns true if all pred fns
   return true and all literal values match or false otherwise."
   [expected actual]
-  (let [result (or (= expected actual)
-                   (cond
-                     (fn? expected)
-                     (expected actual)
+  (or (= expected actual)
+      (cond
+        (fn? expected)
+        (expected actual)
 
-                     (and (map? expected) (map? actual))
-                     (every? (fn [k]
-                               (pred-match? (get expected k) (get actual k)))
-                             (set (concat (keys actual) (keys expected))))
+        (and (map? expected) (map? actual))
+        (every? (fn [k]
+                  (pred-match? (get expected k) (get actual k)))
+                (set (concat (keys actual) (keys expected))))
 
-                     (and (coll? expected) (coll? actual))
-                     (every? (fn [[e a]]
-                               (pred-match? e a))
-                             (zipmap expected actual))
+        (and (coll? expected) (coll? actual))
+        (every? (fn [[e a]]
+                  (pred-match? e a))
+                (zipmap expected actual))
 
-                     :else false))]
-    (when-not result
-      (log/info "pred-match failed:" expected actual))
-    result))
+        :else false)))

@@ -47,19 +47,15 @@
              (ex-message stage-id-only)))
       (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
              (ex-message stage-empty-txn)))
-      (is (= {:flakes 5, :size 330, :indexed 0}
+      (is (= {:flakes 1, :size 88, :indexed 0}
              (:stats stage-empty-node))
           "empty nodes are allowed as long as there is other data, they are just noops")
-      (is (= #{[:ex/alice :id "http://example.org/ns/alice"]
-               [:ex/alice :schema/age 42]
-               [:schema/age :id "http://schema.org/age"]
-               [:id :id "@id"]
-               [:type :id "@type"]}
-             (set @(fluree/query db-ok {:context [test-utils/default-context
-                                                  {:ex "http://example.org/ns/"}]
-                                        :select  '[?s ?p ?o]
-                                        :where   '{:id ?s
-                                                   ?p  ?o}}))))))
+      (is (= [[:ex/alice :schema/age 42]]
+             @(fluree/query db-ok {:context [test-utils/default-context
+                                             {:ex "http://example.org/ns/"}]
+                                   :select  '[?s ?p ?o]
+                                   :where   '{:id ?s
+                                              ?p  ?o}})))))
 
   (testing "Allow transacting `false` values"
     (let [conn    (test-utils/create-conn)
@@ -72,15 +68,11 @@
                       "insert"
                       {:id        :ex/alice
                        :ex/isCool false}})]
-      (is (= #{[:ex/alice :id "http://example.org/ns/alice"]
-               [:ex/alice :ex/isCool false]
-               [:ex/isCool :id "http://example.org/ns/isCool"]
-               [:id :id "@id"]
-               [:type :id "@type"]}
-             (set @(fluree/query db-bool {:context [test-utils/default-context
-                                                    {:ex "http://example.org/ns/"}]
-                                          :select  '[?s ?p ?o]
-                                          :where   '{:id ?s, ?p ?o}}))))))
+      (is (= [[:ex/alice :ex/isCool false]]
+             @(fluree/query db-bool {:context [test-utils/default-context
+                                               {:ex "http://example.org/ns/"}]
+                                     :select  '[?s ?p ?o]
+                                     :where   '{:id ?s, ?p ?o}})))))
 
   (testing "mixed data types (ref & string) are handled correctly"
     (let [conn   (test-utils/create-conn)
@@ -438,22 +430,22 @@
                        "ex:json" {"@type"  "@json"
                                   "@value" {:edn "data"
                                             :is  ["cool" "right?" 1 false 1.0]}}}]})]
-      (is (= #{{"id"     "ex:bob",
-                "type"   "ex:Person",
-                "ex:json" {":edn" "data", ":is" ["cool" "right?" 1 false 1]}}
-               {"id"     "ex:alice",
-                "type"   "ex:Person",
-                "ex:json" {"json" "data", "is" ["cool" "right?" 1 false 1]}}}
-             (into #{} @(fluree/query db1 {"@context" [test-utils/default-str-context
-                                                       {"ex" "http://example.org/ns/"}]
-                                           "where"  {"@id" "?s" "@type" "ex:Person"}
-                                           "select" {"?s" ["*"]}})))
+      (is (= [{"id"     "ex:alice",
+               "type"   "ex:Person",
+               "ex:json" {"json" "data", "is" ["cool" "right?" 1 false 1]}}
+              {"id"     "ex:bob",
+               "type"   "ex:Person",
+               "ex:json" {":edn" "data", ":is" ["cool" "right?" 1 false 1]}}]
+             @(fluree/query db1 {"@context" [test-utils/default-str-context
+                                             {"ex" "http://example.org/ns/"}]
+                                 "where"  {"@id" "?s" "@type" "ex:Person"}
+                                 "select" {"?s" ["*"]}}))
           "comes out as data from subject crawl")
-      (is (= #{{":edn" "data", ":is" ["cool" "right?" 1 false 1]}
-               {"json" "data", "is" ["cool" "right?" 1 false 1]}}
-             (into #{} @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"}
-                                           "select"   "?json"
-                                           "where"  {"@id" "?s" "ex:json" "?json"}})))
+      (is (= [{":edn" "data", ":is" ["cool" "right?" 1 false 1]}
+              {"json" "data", "is" ["cool" "right?" 1 false 1]}]
+             @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"}
+                                 "select"   "?json"
+                                 "where"  {"@id" "?s" "ex:json" "?json"}}))
           "comes out as data from select clause"))))
 
 (deftest ^:integration no-where-solutions
@@ -525,6 +517,6 @@
            @(fluree/query db2 {"@context"  context
                                "selectOne" {"ex:freddy" ["schema:age"]}}))
         "8 is converted from a long to an int.")
-    (is (= "Value alot cannot be coerced to provided datatype: 7."
+    (is (= "Value alot cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#integer."
            (ex-message db3))
         "datatype constraint is restored after a load")))

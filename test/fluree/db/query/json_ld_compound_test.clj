@@ -50,43 +50,43 @@
                                                       :schema/age ?age}}
                              :values  '[?name ["Cam"]]})]
 
-      (is (= two-tuple-select-with-crawl
-             two-tuple-select-with-crawl+var
-             [[50 {:id           :ex/brian,
-                   :type     :ex/User,
-                   :schema/name  "Brian",
-                   :schema/email "brian@example.org",
-                   :schema/age   50,
-                   :ex/favNums   7}]
-              [50 {:id           :ex/alice,
+      (is (= [[50 {:id           :ex/alice,
                    :type     :ex/User,
                    :schema/name  "Alice",
                    :schema/email "alice@example.org",
                    :schema/age   50,
-                   :ex/favNums   [9, 42, 76]}]]))
+                   :ex/favNums   [9, 42, 76]}]
+              [50 {:id           :ex/brian,
+                   :type     :ex/User,
+                   :schema/name  "Brian",
+                   :schema/email "brian@example.org",
+                   :schema/age   50,
+                   :ex/favNums   7}]]
+             two-tuple-select-with-crawl
+             two-tuple-select-with-crawl+var))
 
       ;; here we have pass-through variables (?name and ?age) which must get "passed through"
       ;; the last where statements into the select statement
-      (is (= @(fluree/query db '{:context {:schema "http://schema.org/"
+      (is (= [["Alice" 50 "alice@example.org"]
+              ["Brian" 50 "brian@example.org"]]
+             @(fluree/query db '{:context {:schema "http://schema.org/"
                                            :ex "http://example.org/ns/"}
                                  :select  [?name ?age ?email]
                                  :where   {:schema/name "Cam"
                                            :ex/friend   {:schema/name  ?name
                                                          :schema/age   ?age
-                                                         :schema/email ?email}}})
-             [["Brian" 50 "brian@example.org"]
-              ["Alice" 50 "alice@example.org"]])
+                                                         :schema/email ?email}}}))
           "Prior where statement variables may not be passing through to select results")
 
       ;; same as prior query, but using selectOne
-      (is (= @(fluree/query db '{:context   {:schema "http://schema.org/"
+      (is (= ["Alice" 50 "alice@example.org"]
+             @(fluree/query db '{:context   {:schema "http://schema.org/"
                                              :ex     "http://example.org/ns/"}
                                  :selectOne [?name ?age ?email]
                                  :where     {:schema/name "Cam"
                                              :ex/friend   {:schema/name  ?name
                                                            :schema/age   ?age
-                                                           :schema/email ?email}}})
-             ["Brian" 50 "brian@example.org"])
+                                                           :schema/email ?email}}}))
           "selectOne should only return a single result, like (first ...)")
 
       ;; if mixing multi-cardinality results along with single cardinality, there
@@ -157,21 +157,20 @@
 
 
       ;; checking s, p, o values all pulled correctly and all IRIs are resolved from sid integer & compacted
-      (is (= #{[:ex/cam :id "http://example.org/ns/cam"]
-               [:ex/cam :type :ex/User]
-               [:ex/cam :schema/name "Cam"]
-               [:ex/cam :schema/email "cam@example.org"]
-               [:ex/cam :schema/age 34]
-               [:ex/cam :ex/favNums 5]
-               [:ex/cam :ex/favNums 10]
-               [:ex/cam :ex/friend :ex/brian]
-               [:ex/cam :ex/friend :ex/alice]}
-             (set @(fluree/query db {:context [test-utils/default-context
-                                               {:ex "http://example.org/ns/"}]
-                                     :select '[?s ?p ?o]
-                                     :where  '{:id         ?s
-                                               :schema/age 34
-                                               ?p          ?o}})))
+      (is (= [[:ex/cam :type :ex/User]
+              [:ex/cam :schema/age 34]
+              [:ex/cam :schema/email "cam@example.org"]
+              [:ex/cam :schema/name "Cam"]
+              [:ex/cam :ex/favNums 5]
+              [:ex/cam :ex/favNums 10]
+              [:ex/cam :ex/friend :ex/alice]
+              [:ex/cam :ex/friend :ex/brian]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select '[?s ?p ?o]
+                                :where  '{:id         ?s
+                                          :schema/age 34
+                                          ?p          ?o}}))
           "IRIs are resolved from subj ids, whether s, p, or o vals.")
 
       ;; checking object-subject joins
@@ -182,18 +181,18 @@
                :schema/age 34,
                :ex/favNums [5 10],
                :ex/friend
-               [{:id :ex/brian,
-                 :type :ex/User,
-                 :schema/name "Brian",
-                 :schema/email "brian@example.org",
-                 :schema/age 50,
-                 :ex/favNums 7}
-                {:id :ex/alice,
+               [{:id :ex/alice,
                  :type :ex/User,
                  :schema/name "Alice",
                  :schema/email "alice@example.org",
                  :schema/age 50,
-                 :ex/favNums [9 42 76]}]}]
+                 :ex/favNums [9 42 76]}
+                {:id :ex/brian,
+                 :type :ex/User,
+                 :schema/name "Brian",
+                 :schema/email "brian@example.org",
+                 :schema/age 50,
+                 :ex/favNums 7}]}]
              @(fluree/query db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select '{?s ["*" {:ex/friend ["*"]}]}

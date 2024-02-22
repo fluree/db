@@ -131,11 +131,11 @@
                            :schema/name true}})]
       (is (util/exception? db-int-name)
           "Exception, because :schema/name is an integer and not a string.")
-      (is (= "Value 42 cannot be coerced to provided datatype: 1."
+      (is (= "Value 42 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
              (ex-message db-int-name)))
       (is (util/exception? db-bool-name)
           "Exception, because :schema/name is a boolean and not a string.")
-      (is (= "Value true cannot be coerced to provided datatype: 1."
+      (is (= "Value true cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
              (ex-message db-bool-name)))
       (is (= @(fluree/query db-ok user-query)
              [{:id          :ex/john
@@ -182,8 +182,8 @@
                               :schema/email "john@flur.ee"}})
                           (catch Exception e e))]
       (is (util/exception? db-extra-prop))
-      (is (str/starts-with? (ex-message db-extra-prop)
-                            "SHACL shape is closed, extra properties not allowed: [10"))
+      (is (= (ex-message db-extra-prop)
+             "SHACL shape is closed, extra properties not allowed: [\"http://schema.org/email\"]"))
 
       (is (= [{:id          :ex/john
                :type        :ex/User
@@ -753,13 +753,13 @@
               "Exception, because :schema/age is above the maximum")
           (is (= "SHACL PropertyShape exception - sh:maxInclusive: value 101 is either non-numeric or higher than maximum of 100."
                  (ex-message db-too-high)))
-          (is (= @(fluree/query db-ok2 user-query)
-                 [{:id         :ex/alice
+          (is (= [{:id         :ex/alice
                    :type       :ex/User
                    :schema/age 100}
                   {:id         :ex/brian
                    :type       :ex/User
-                   :schema/age 1}]))))
+                   :schema/age 1}]
+                 @(fluree/query db-ok2 user-query)))))
       (testing "non-numeric values"
         (let [db         @(fluree/stage
                            (fluree/db ledger)
@@ -1070,7 +1070,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message db-two-ages)))
       (is (util/exception? db-num-email))
-      (is (= "Value 42 cannot be coerced to provided datatype: 1."
+      (is (= "Value 42 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
              (ex-message db-num-email)))
       (is (= [{:id           :ex/john
                :type         :ex/User
@@ -1132,13 +1132,15 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                         "type"        "ex:Pal"
                                                         "schema:name" "Darth Vader"
                                                         "ex:pal"      {"ex:evil" "has no name"}}})]
-        (is (= [{"id"          "ex:good-pal"
-                 "type"        "ex:Pal"
-                 "schema:name" "J.D."
-                 "ex:pal"      [{"schema:name" "Turk"}
-                                {"schema:name" "Rowdy"}]}]
-               @(fluree/query valid-pal {"@context" context
-                                         "select"   {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})))
+        (is (= {"id"          "ex:good-pal"
+                "type"        "ex:Pal"
+                "schema:name" "J.D."
+                "ex:pal"      #{{"schema:name" "Rowdy"}
+                                {"schema:name" "Turk"}}}
+               (-> @(fluree/query valid-pal {"@context" context
+                                             "select"   {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})
+                   first
+                   (update "ex:pal" set))))
         (is (util/exception? invalid-pal))
         (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
                (ex-message invalid-pal)))))
@@ -1351,7 +1353,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                 {"id"      "ex:Bob"
                                                  "ex:name" 123
                                                  "type"    "ex:User"}]})]
-        (is (= "Value 123 cannot be coerced to provided datatype: 1."
+        (is (= "Value 123 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
                (ex-message db-bad-friend-name)))))
     (testing "maxCount"
       (let [conn          @(fluree/connect {:method :memory})
@@ -1505,7 +1507,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                 {"id"        "ex:Alice"
                                                  "type"      "ex:User"
                                                  "ex:friend" {"@id" "ex:Bob"}}})]
-        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be http://www.w3.org/2001/XMLSchema#string."
                (ex-message db-forbidden-friend)))))))
 
 (deftest ^:integration shape-based-constraints
@@ -1620,14 +1622,12 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                                    {"id"        "ex:Zorba"
                                                                     "type"      "ex:Parent"
                                                                     "ex:gender" "alien"}]}})]
-      (is (= {"id"        "ex:ValidKid"
-              "type"      "ex:Kid"
-              "ex:parent" [{"id" "ex:Dad"}
-                           {"id" "ex:Mom"}]}
-             (-> @(fluree/query valid-kid {"@context" context
-                                           "select"   {"ex:ValidKid" ["*"]}})
-                 first
-                 (update "ex:parent" (partial sort-by #(get % "id"))))))
+      (is (= [{"id"        "ex:ValidKid"
+               "type"      "ex:Kid"
+               "ex:parent" [{"id" "ex:Dad"}
+                            {"id" "ex:Mom"}]}]
+             @(fluree/query valid-kid {"@context" context
+                                       "select"   {"ex:ValidKid" ["*"]}})))
       (is (= "SHACL PropertyShape exception - sh:pattern: value alien does not match pattern \"female\" or it is not a literal value."
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
@@ -1714,7 +1714,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                 {"id"        "ex:Alice"
                                                  "type"      "ex:User"
                                                  "ex:friend" {"@id" "ex:Bob"}}})]
-        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be http://www.w3.org/2001/XMLSchema#string."
                (ex-message db-forbidden-friend)))))
     (testing "shape constraints"
       (let [db1            @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
