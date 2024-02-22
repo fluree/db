@@ -208,12 +208,6 @@
    (go-try
      (let [data (<? (conn-proto/-index-file-read conn idx-address))]
        (when data
-         (serdeproto/-deserialize-db-root (serde conn) data)))))
-  ([conn ledger-alias block]
-   (go-try
-     (let [key  (ledger-root-key ledger-alias block)
-           data (<? (conn-proto/-index-file-read conn key))]
-       (when data
          (serdeproto/-deserialize-db-root (serde conn) data))))))
 
 

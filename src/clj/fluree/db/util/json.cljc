@@ -2,7 +2,6 @@
   (:require #?(:clj [cheshire.core :as cjson])
             #?(:clj [cheshire.parse :as cparse])
             #?(:clj [cheshire.generate :refer [add-encoder encode-seq remove-encoder]])
-            #?(:clj [fluree.db.flake])
             #?(:cljs [goog.object :as gobject])
             [fluree.db.util.bytes :as butil]
             [fluree.db.util.core :as cutil]
