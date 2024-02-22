@@ -1,6 +1,6 @@
 (ns fluree.db.json-ld.migrate.sid
   (:require [fluree.db.constants :as const]
-            [fluree.db.storage :as storage]
+            [fluree.db.indexer.storage :as storage]
             [fluree.db.query.exec.update :as update]
             [fluree.db.json-ld.commit :as commit]
             [fluree.db.json-ld.commit-data :as commit-data]
@@ -132,7 +132,7 @@
 (defn migrate
   [conn address]
   (go-try
-    (let [last-commit-addr  (<? (nameservice/lookup-commit conn address nil))
+    (let [last-commit-addr  (<? (nameservice/lookup-commit conn address))
           last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
           all-commit-tuples (<? (reify/trace-commits conn last-commit-tuple 1))
           first-commit      (ffirst all-commit-tuples)
