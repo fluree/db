@@ -107,7 +107,8 @@
       garbage')))
 
 (defn extract-schema-root
-  "Transform the schema cache for serialization by turning every predicate into a tuple of [pid datatype]."
+  "Transform the schema cache for serialization by turning every predicate into a
+  tuple of [pid datatype]."
   [{:keys [schema]}]
   (->> (:pred schema)
        (reduce (fn [root [k {:keys [datatype]}]]

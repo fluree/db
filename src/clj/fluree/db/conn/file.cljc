@@ -3,7 +3,6 @@
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
             [fluree.db.index :as index]
@@ -14,13 +13,11 @@
             [fluree.db.indexer.storage :as storage]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.util.filesystem :as fs]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.storage :as store]
-            [fluree.db.storage.util :as store-util])
+            [fluree.db.storage :as store])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
