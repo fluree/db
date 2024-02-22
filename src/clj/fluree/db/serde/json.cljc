@@ -131,9 +131,12 @@
       (fn [acc k v]
         (assoc acc (name k)
                    (case k
-                     :stats (util/stringify-keys v)
-                     (:spot :post :opst :tspo) (stringify-child v)
-                     ;; else
+                     :stats
+                     (util/stringify-keys v)
+
+                     (:spot :post :opst :tspo)
+                     (stringify-child v)
+
                      v)))
       {} db-root))
   (-deserialize-db-root [_ db-root]
