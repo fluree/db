@@ -946,12 +946,19 @@
                    (deref))
 
           db3 @(test-utils/transact ledger (crypto/create-jws
-                                            (json/stringify {"@context" context "insert" {"ex:foo" 3}})
-                                            root-privkey))]
-      (is (= [{"f:author" "" "f:txn" "" "f:data" {"f:t" 1}}
-              {"f:author" root-did
-               "f:txn" "fluree:memory://authortest/txn/9f321be5fd184f43d998ef7b02cdded2625579cc52b95e1d8f12c9b28cd7a5b0"
-               "f:data" {"f:t" 2}}]
+                                             (json/stringify {"@context" context "insert" {"ex:foo" 3}})
+                                             root-privkey))
+
+          db4 @(test-utils/transact ledger (crypto/create-jws
+                                             (json/stringify {"@context" context "insert" {"ex:foo" 5}})
+                                             root-privkey))]
+      (is (= [{"f:author" "", "f:txn" "", "f:data" {"f:t" 1}}
+              {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+               "f:txn" "fluree:memory://authortest/txn/9f321be5fd184f43d998ef7b02cdded2625579cc52b95e1d8f12c9b28cd7a5b0",
+               "f:data" {"f:t" 2}}
+              {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+               "f:txn" "fluree:memory://authortest/txn/5e7e5ce8d21011c95844d6b8f804e162a0afdda7c794c1dc2b52bc19565bfc64",
+               "f:data" {"f:t" 3}}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true
                                            :t              {:from 1 :to :latest}})
