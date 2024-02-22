@@ -122,22 +122,24 @@
 (defn write-db-root
   [db changes-ch]
   (go-try
-    (let [{:keys [conn ledger commit t stats spot psot post opst tspo namespaces]} db
+    (let [{:keys [conn ledger commit t stats spot psot post opst tspo
+                  namespace-codes]}
+          db
 
           ledger-alias (:id commit)
           preds        (extract-schema-root db)
-          data         {:ledger-alias ledger-alias
-                        :t            t
-                        :preds        preds
-                        :stats        (select-keys stats [:flakes :size])
-                        :spot         (child-data spot)
-                        :psot         (child-data psot)
-                        :post         (child-data post)
-                        :opst         (child-data opst)
-                        :tspo         (child-data tspo)
-                        :timestamp    (util/current-time-millis)
-                        :prevIndex    (or (:indexed stats) 0)
-                        :namespaces   namespaces}
+          data         {:ledger-alias    ledger-alias
+                        :t               t
+                        :preds           preds
+                        :stats           (select-keys stats [:flakes :size])
+                        :spot            (child-data spot)
+                        :psot            (child-data psot)
+                        :post            (child-data post)
+                        :opst            (child-data opst)
+                        :tspo            (child-data tspo)
+                        :timestamp       (util/current-time-millis)
+                        :prevIndex       (or (:indexed stats) 0)
+                        :namespace-codes namespace-codes}
           ser          (serdeproto/-serialize-db-root (serde conn) data)
           res          (<? (conn-proto/-index-file-write conn ledger :root ser))]
       (notify-new-index-file changes-ch data res)
@@ -176,15 +178,15 @@
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
   [conn blank-db root-data]
-  (let [{:keys [t stats preds namespaces]} root-data
-
-        namespace-codes (map-invert namespaces)
-        db*             (assoc blank-db
-                               :t  t
-                               :preds preds
-                               :namespaces namespaces
-                               :namespace-codes namespace-codes
-                               :stats (assoc stats :indexed t))]
+  (let [{:keys [t stats preds namespace-codes]}
+        root-data
+        namespaces (map-invert namespace-codes)
+        db*        (assoc blank-db
+                          :t  t
+                          :preds preds
+                          :namespaces namespaces
+                          :namespace-codes namespace-codes
+                          :stats (assoc stats :indexed t))]
     (reduce
       (fn [db idx]
         (let [idx-root (reify-index-root conn db idx (get root-data idx))]
