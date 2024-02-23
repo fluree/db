@@ -53,17 +53,17 @@
 
 (defn reasoner-insert
   "When triples from rules require explicit inserts, returns flakes."
-  [db fuel-tracker txn-id author-did rule-id insert-smt]
+  [db fuel-tracker rule-id insert-smt]
   (go-try
-    (let [tx-state (-> (transact/->tx-state db {} txn-id author-did rule-id)
+    (let [tx-state (-> (transact/->tx-state :db db :reasoned-from-iri rule-id)
                        (assoc :stage-update? true))
           [db* new-flakes] (<? (transact/generate-flakes db fuel-tracker insert-smt tx-state))]
       (<? (transact/final-db db* new-flakes tx-state)))))
 
 (defn reasoner-stage
-  [db fuel-tracker txn-id author-did rule-id full-rule]
+  [db fuel-tracker rule-id full-rule]
   (go-try
-    (let [tx-state   (transact/->tx-state db {} txn-id author-did rule-id)
+    (let [tx-state   (transact/->tx-state :db db :reasoned-from-iri rule-id)
           parsed-txn (:rule-parsed full-rule)
           _          (when-not (:where parsed-txn)
                        (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
@@ -90,9 +90,9 @@
     new-flakes))
 
 (defn execute-reasoner-rule
-  [db rule-id reasoning-rules fuel-tracker {:keys [txn-id author-did] :as tx-state}]
+  [db rule-id reasoning-rules fuel-tracker tx-state]
   (go-try
-    (let [[db reasoner-flakes] (<? (reasoner-stage db fuel-tracker txn-id author-did rule-id (get reasoning-rules rule-id)))
+    (let [[db reasoner-flakes] (<? (reasoner-stage db fuel-tracker rule-id (get reasoning-rules rule-id)))
           tx-state*        (assoc tx-state :stage-update? true)
           reasoner-flakes* (filter-same-as-trans rule-id reasoner-flakes)]
       (log/debug "reasoner flakes: " rule-id reasoner-flakes*)
@@ -240,7 +240,7 @@
              db* db]
         (if rule-id
           (let [{db**   :db-after
-                 flakes :add} (<? (reasoner-insert db* fuel-tracker nil nil rule-id insert))]
+                 flakes :add} (<? (reasoner-insert db* fuel-tracker rule-id insert))]
             (log/debug "Rule Flake insert:" rule-id "flakes:" flakes)
             (recur r db**))
           db*)))))
@@ -252,7 +252,7 @@
     (let [methods*        (set (util/sequential methods))
           fuel-tracker    (fuel/tracker max-fuel)
           db*             (update db :reasoner #(into methods* %))
-          tx-state        (transact/->tx-state db* {} nil nil)
+          tx-state        (transact/->tx-state :db db*)
           inserts         (atom nil)
           ;; TODO - rules can be processed in parallel
           raw-rules       (<? (all-rules methods* db* inserts graph-or-db))
