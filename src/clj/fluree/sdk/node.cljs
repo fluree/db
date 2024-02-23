@@ -2,7 +2,10 @@
   (:require [cljs.nodejs :as node-js]
             [clojure.string :as str]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            ["@peculiar/webcrypto" :refer [Crypto]]))
+
+(set! js/crypto (Crypto.))
 
 (node-js/enable-util-print!)
 
