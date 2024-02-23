@@ -18,7 +18,8 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -80,17 +81,18 @@
       [(not-empty adds) (not-empty removes)])))
 
 (defn ->tx-state
-  [db txn-id author-did]
+  [db txn-id author-did annotation]
   (let [{:keys [branch ledger policy], db-t :t} db
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t         (inc commit-t)
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before
-     :txn-id                   txn-id
-     :author-did               author-did
+     :txn-id        txn-id
+     :author-did    author-did
+     :annotation    annotation
      :policy        policy
-     :stage-update? (= t db-t) ; if a previously staged db is getting updated
-                               ; again before committed
+     :stage-update? (= t db-t)          ; if a previously staged db is getting updated
+                                        ; again before committed
      :t             t}))
 
 (defn into-flakeset
@@ -177,12 +179,12 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [db new-flakes {:keys [stage-update? policy t txn-id author-did] :as _tx-state}]
+  [db new-flakes {:keys [stage-update? policy t txn-id author-did annotation] :as _tx-state}]
   (let [[add remove] (if stage-update?
                        (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                        [new-flakes nil])
         db-after  (-> db
-                      (update :txns (fnil conj []) [txn-id author-did])
+                      (update :txns (fnil conj []) [txn-id author-did annotation])
                       (assoc :policy policy) ;; re-apply policy to db-after
                       (assoc :t t)
                       (commit-data/update-novelty add remove)
@@ -214,6 +216,8 @@
      (let [{:keys [context raw-txn did]} parsed-opts
 
            parsed-txn (q-parse/parse-txn txn context)
+           annotation (some-> (or (:annotation parsed-txn) (:annotation parsed-opts))
+                               (json-ld/expand context))
            db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                         (<? (perm/wrap-policy db policy-identity))
                         db)
@@ -221,6 +225,6 @@
            {txn-id :address}
            (<? (conn-proto/-txn-write conn ledger raw-txn))
 
-           tx-state (->tx-state db* txn-id did)
+           tx-state (->tx-state db* txn-id did annotation)
            flakes   (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
        (<? (flakes->final-db tx-state flakes))))))

@@ -4,7 +4,10 @@
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.iri :as iri]))
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.query.exec.update :as update]
+            [fluree.db.query.exec.where :as where]))
 
 (comment
   ;; commit map - this map is what gets recorded in a few places:
@@ -62,13 +65,14 @@
    ["issuer" :issuer]
    ["author" :author]
    ["txn" :txn]
+   ["annotation" :annotation]
    ["branch" :branch]
    ["time" :time]
    ["tag" :tag]
    ["message" :message]
    ["previous" :previous] ;; refer to :prev-commit template
-   ["data" :data] ;; refer to :data template
-   ["ns" :ns] ;; refer to :ns template
+   ["data" :data]         ;; refer to :data template
+   ["ns" :ns]             ;; refer to :ns template
    ["index" :index]]) ;; refer to :index template
 
 
@@ -327,7 +331,7 @@
   "Returns a commit map with a new db registered.
   Assumes commit is not yet created (but db is persisted), so
   commit-id and commit-address are added after finalizing and persisting commit."
-  [{:keys [old-commit issuer message tag dbid t db-address flakes size author txn-id]
+  [{:keys [old-commit issuer message tag dbid t db-address flakes size author txn-id annotation]
     :as   _commit}]
   (let [prev-data   (select-keys (data old-commit) [:id :address])
         data-commit (new-db-commit dbid t db-address prev-data flakes size)
@@ -340,10 +344,11 @@
                                :data data-commit
                                :time (util/current-time-iso)))]
     (cond-> commit
-            issuer (assoc :issuer {:id issuer})
-            prev-commit (assoc :previous prev-commit)
-            message (assoc :message message)
-            tag (assoc :tag tag))))
+      issuer (assoc :issuer {:id issuer})
+      prev-commit (assoc :previous prev-commit)
+      message (assoc :message message)
+      annotation (assoc :annotation annotation)
+      tag (assoc :tag tag))))
 
 (defn ref?
   [f]
@@ -474,15 +479,28 @@
   [t commit-sid message]
   [(flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil)])
 
+(defn annotation-flakes
+  [db t commit-sid annotation]
+  (def commit-sid commit-sid)
+  (def annotation annotation)
+  (if annotation
+    (let [allowed-vars #{}
+          parsed       (q-parse/parse-triples allowed-vars (util/sequential annotation))
+          a-sid        (->> parsed ffirst where/get-iri (iri/encode-iri db))
+          db-vol       (volatile! db)
+          flakes       (into [(flake/create commit-sid const/$_commit:annotation a-sid const/$xsd:anyURI t true nil)]
+                             (map (partial update/build-flake db-vol t))
+                             parsed)]
+      [@db-vol flakes])
+    [db]))
 
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
   [prev-commit {:keys [commit] :as db}]
-  (let [{:keys [data id issuer message]} commit
-        {db-t :t, db-id :id} data
-
-        {previous-id :id prev-data :data} prev-commit
-        prev-data-id       (:id prev-data)
+  (let [{:keys [data id issuer message annotation]} commit
+        {db-t :t, db-id :id}                        data
+        {previous-id :id prev-data :data}           prev-commit
+        prev-data-id                                (:id prev-data)
 
         t                  db-t
         commit-sid         (iri/encode-iri db id)
@@ -496,11 +514,15 @@
                              (issuer-flakes db t commit-sid issuer-iri))
         message-flakes     (when message
                              (message-flakes t commit-sid message))
-        commit-flakes      (cond-> base-flakes
-                             prev-commit-flakes (into prev-commit-flakes)
-                             prev-db-flakes (into prev-db-flakes)
-                             issuer-flakes (into issuer-flakes)
-                             message-flakes (into message-flakes))]
-    (-> db
+
+        [db* annotation-flakes] (annotation-flakes db t commit-sid annotation)
+
+        commit-flakes (cond-> base-flakes
+                        prev-commit-flakes (into prev-commit-flakes)
+                        prev-db-flakes     (into prev-db-flakes)
+                        issuer-flakes      (into issuer-flakes)
+                        annotation-flakes  (into annotation-flakes)
+                        message-flakes     (into message-flakes))]
+    (-> db*
         (update-novelty commit-flakes)
         add-tt-id)))
