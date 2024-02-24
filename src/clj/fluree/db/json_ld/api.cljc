@@ -19,7 +19,13 @@
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.conn.core :refer [notify-ledger]]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.storage :as store])
+            [fluree.db.storage :as store]
+            [fluree.db.storage.file :as file-store]
+            [fluree.db.storage.ipfs :as ipfs-store]
+            [fluree.db.storage.localstorage :as localstorage-store]
+            [fluree.db.storage.memory :as mem-store]
+            #?(:clj [fluree.db.storage.s3 :as s3-store])
+            [malli.core :as m])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -46,6 +52,76 @@
 
 ;; ledger operations
 
+(def BaseConfig
+  [:map
+   [:store/method [:enum :memory :localstorage :file :ipfs :s3 :remote]]])
+
+(def FileConfig
+  [:and
+   BaseConfig
+   [:map
+    [:store/method [:enum :file]]
+    [:file-store/storage-path :string]]])
+
+(def LocalStorageConfig
+  [:and
+   BaseConfig
+   [:map
+    [:store/method [:enum :localstorage]]]])
+
+(def MemoryConfig
+  [:and
+   BaseConfig
+   [:map
+    [:store/method [:enum :memory]]
+    [:memory-store/storage-atom {:optional true} :any]]])
+
+(def IpfsConfig
+  [:and
+   BaseConfig
+   [:map
+    [:store/method [:enum :ipfs]]
+    [:ipfs-store/server {:optional true} [:maybe :string]]]])
+
+(def S3Config
+  [:and
+   BaseConfig
+   [:map
+    [:store/method [:enum :s3]]
+    [:s3-store/endpoint {:optional true} :string]
+    [:s3-store/bucket :string]
+    [:s3-store/prefix :string]]])
+
+(def StoreConfig
+  [:or
+   FileConfig
+   LocalStorageConfig
+   MemoryConfig
+   IpfsConfig
+   S3Config])
+
+(defn open-storage
+  [{:keys [:store/method] :as config}]
+  (if-let [config-error (m/explain StoreConfig config)]
+    (throw (ex-info "Invalid Store config."
+                    {:error  config-error
+                     :config config}))
+    (case method
+      :file         (let [storage-path (:file-store/storage-path config)]
+                      (file-store/open storage-path))
+      :ipfs         (let [endpoint (:ipfs-store/server config)]
+                      (ipfs-store/open endpoint))
+      :localstorage (localstorage-store/open)
+      :memory       (mem-store/create)
+      :s3           #?(:clj  (let [{:keys [:s3-store/endpoint :s3-store/bucket :s3-store/prefix]}
+                                   config]
+                               (s3-store/open bucket prefix endpoint))
+                       :cljs (throw (ex-info "S3 storage not supported in ClojureScript."
+                                             {:status 400, :error :store/unsupported-method})))
+
+      (throw (ex-info (str "No Store implementation for :store/method: " (pr-str method))
+                      config)))))
+
 (defn connect
   "Forms connection to ledger, enabling automatic pulls of new updates, event
   services, index service.
@@ -63,28 +139,28 @@
   [{:keys [method parallelism remote-servers] :as opts}]
   ;; TODO - do some validation
   (promise-wrap
-    (let [opts*   (assoc opts :parallelism (or parallelism 4))
+    (let [opts* (assoc opts :parallelism (or parallelism 4))
 
           method* (cond
-                    method (keyword method)
+                    method         (keyword method)
                     remote-servers :remote
-                    :else (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
-                                          {:status 500 :error :db/invalid-configuration})))
+                    :else          (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
+                                                   {:status 500 :error :db/invalid-configuration})))
 
-          store   (store/start (cond->  {:store/method method*}
-                                 (= method :ipfs) (assoc :ipfs-store/server (:server opts*))
-                                 (= method :file) (assoc :file-store/storage-path (or (:storage-path opts*)
-                                                                                      "data/ledger"))
-                                 (= method :s3)   (-> (assoc :s3-store/bucket (:s3-bucket opts*))
-                                                      (assoc :s3-store/prefix (:s3-prefix opts*))
-                                                      (cond-> (:s3-endpoint opts*)
-                                                        (assoc :s3-store/endpoint (:s3-endpoint opts*))))))]
+          store (open-storage (cond->  {:store/method method*}
+                                (= method :ipfs) (assoc :ipfs-store/server (:server opts*))
+                                (= method :file) (assoc :file-store/storage-path (or (:storage-path opts*)
+                                                                                     "data/ledger"))
+                                (= method :s3)   (-> (assoc :s3-store/bucket (:s3-bucket opts*))
+                                                     (assoc :s3-store/prefix (:s3-prefix opts*))
+                                                     (cond-> (:s3-endpoint opts*)
+                                                       (assoc :s3-store/endpoint (:s3-endpoint opts*))))))]
       (case method*
         :remote (remote-conn/connect opts*)
-        :ipfs (ipfs-conn/connect (assoc opts* :store store))
-        :file (if platform/BROWSER
-                (throw (ex-info "File connection not supported in the browser" opts))
-                (file-conn/connect (assoc opts* :store store)))
+        :ipfs   (ipfs-conn/connect (assoc opts* :store store))
+        :file   (if platform/BROWSER
+                  (throw (ex-info "File connection not supported in the browser" opts))
+                  (file-conn/connect (assoc opts* :store store)))
         :memory (memory-conn/connect (assoc opts* :store store))
         :s3     #?(:clj  (s3-conn/connect (assoc opts* :store store))
                    :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
