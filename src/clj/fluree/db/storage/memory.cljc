@@ -6,63 +6,45 @@
 
 (def method-name "memory")
 
-(defn memory-address
-  [path]
-  (storage/build-fluree-address method-name path))
-
-(defn memory-write
-  [contents path v {:keys [content-address?]}]
-  (go
-    (let [hashable (if (storage/hashable? v)
-                     v
-                     (pr-str v))
-          hash     (crypto/sha2-256 hashable)
-          path*       (if content-address?
-                        (str path hash)
-                        path)]
-      (swap! contents assoc path* v)
-      {:path path*
-       :address (memory-address path*)
-       :hash hash
-       :size (count hashable)})))
-
-(defn memory-list
-  [contents prefix]
-  (go
-    (filter #(when (string? %) (str/starts-with? % prefix))
-            (keys contents))))
-
-(defn memory-read
-  [contents address]
-  (go
-    (let [path (:local (storage/parse-address address))]
-      (get @contents path))))
-
-(defn memory-delete
-  [contents address]
-  (go
-    (let [path (:local (storage/parse-address address))]
-      (swap! contents dissoc path))))
-
-(defn memory-exists?
-  [contents address]
-  (go
-    (let [path (:local (storage/parse-address address))]
-      (contains? @contents path))))
-
 (defrecord MemoryStore [contents]
   storage/Store
-  (address [_ path] (memory-address path))
+  (address [_ path]
+    (storage/build-fluree-address method-name path))
 
-  (write [_ path v opts] (memory-write contents path v opts))
+  (write [store path v {:keys [content-address?]}]
+    (go
+      (let [hashable (if (storage/hashable? v)
+                       v
+                       (pr-str v))
+            hash     (crypto/sha2-256 hashable)
+            path*    (if content-address?
+                       (str path hash)
+                       path)]
+        (swap! contents assoc path* v)
+        {:path    path*
+         :address (storage/address store path*)
+         :hash    hash
+         :size    (count hashable)})))
 
-  (list [_ prefix] (memory-list contents prefix))
+  (list [_ prefix]
+    (go
+      (filter #(when (string? %) (str/starts-with? % prefix))
+              (keys contents))))
 
-  (read [_ address] (memory-read contents address))
+  (read [_ address]
+    (go
+      (let [path (:local (storage/parse-address address))]
+        (get @contents path))))
 
-  (delete [_ address] (memory-delete contents address))
+  (delete [_ address]
+    (go
+      (let [path (:local (storage/parse-address address))]
+        (swap! contents dissoc path))))
 
-  (exists? [_ address] (memory-exists? contents address)))
+  (exists? [_ address]
+    (go
+      (let [path (:local (storage/parse-address address))]
+        (contains? @contents path)))))
 
 (defn create
   []
