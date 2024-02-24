@@ -11,7 +11,7 @@
   (str "fluree:memory://" path))
 
 (defn memory-write
-  [storage-atom k v {:keys [content-address?]}]
+  [contents k v {:keys [content-address?]}]
   (let [hashable (if (store-util/hashable? v)
                    v
                    (pr-str v))
@@ -19,7 +19,7 @@
         k*       (if content-address?
                    (str k hash)
                    k)]
-    (swap! storage-atom assoc k* v)
+    (swap! contents assoc k* v)
     (async/go
       {:k k*
        :address (memory-address k*)
@@ -27,37 +27,42 @@
        :size (count hashable)})))
 
 (defn memory-list
-  [storage-atom prefix]
+  [contents prefix]
   (async/go
     (filter #(when (string? %) (str/starts-with? % prefix))
-            (keys storage-atom))))
+            (keys contents))))
 
 (defn memory-read
-  [storage-atom address]
+  [contents address]
   (let [k (:local (store-util/address-parts address))]
-    (async/go (get @storage-atom k))))
+    (async/go (get @contents k))))
 
 (defn memory-delete
-  [storage-atom address]
+  [contents address]
   (let [k (:local (store-util/address-parts address))]
-    (async/go (swap! storage-atom dissoc k))))
+    (async/go (swap! contents dissoc k))))
 
 (defn memory-exists?
-  [storage-atom address]
+  [contents address]
   (let [k (:local (store-util/address-parts address))]
-    (async/go (contains? @storage-atom k))))
+    (async/go (contains? @contents k))))
 
-(defrecord MemoryStore [storage-atom]
+(defrecord MemoryStore [contents]
   store-proto/Store
   (address [_ k] (memory-address k))
-  (write [_ k v opts] (memory-write storage-atom k v opts))
-  (list [_ prefix] (memory-list storage-atom prefix))
-  (read [_ address] (memory-read storage-atom address))
-  (delete [_ address] (memory-delete storage-atom address))
-  (exists? [_ address] (memory-exists? storage-atom address)))
+
+  (write [_ k v opts] (memory-write contents k v opts))
+
+  (list [_ prefix] (memory-list contents prefix))
+
+  (read [_ address] (memory-read contents address))
+
+  (delete [_ address] (memory-delete contents address))
+
+  (exists? [_ address] (memory-exists? contents address)))
 
 (defn create-memory-store
-  [{:keys [:memory-store/storage-atom] :as config}]
-  (let [storage-atom (or storage-atom (atom {}))]
+  [{:keys [:memory-store/contents] :as config}]
+  (let [contents (or contents (atom {}))]
     (map->MemoryStore {:config config
-                       :storage-atom storage-atom})))
+                       :contents contents})))
