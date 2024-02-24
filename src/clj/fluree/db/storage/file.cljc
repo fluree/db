@@ -7,6 +7,10 @@
             [fluree.db.storage.proto :as store-proto]
             [fluree.db.storage.util :as store-util]))
 
+(defn full-path
+  [storage-path relative-path]
+  (str (fs/local-path storage-path) "/" relative-path))
+
 (defn file-address
   [path]
   (if (str/starts-with? path "//")
@@ -38,25 +42,24 @@
 
 (defn file-list
   [storage-path prefix]
-  (let [path (str (fs/local-path storage-path) "/" prefix)]
-    (fs/list-files path)))
+  (fs/list-files (full-path storage-path prefix)))
 
 (defn file-read
   [storage-path address]
-  (let [path    (:local (store-util/address-parts address))
-        path (str (fs/local-path storage-path) "/" path)]
+  (let [relative-path (:local (store-util/address-parts address))
+        path          (full-path storage-path relative-path)]
     (fs/read-file path)))
 
 (defn file-delete
   [storage-path address]
-  (let [path    (:local (store-util/address-parts address))
-        path (str (fs/local-path storage-path) "/" path)]
+  (let [relative-path (:local (store-util/address-parts address))
+        path          (full-path storage-path relative-path)]
     (fs/delete-file path)))
 
 (defn file-exists?
   [storage-path address]
-  (let [path    (:local (store-util/address-parts address))
-        path (str (fs/local-path storage-path) "/" path)]
+  (let [relative-path (:local (store-util/address-parts address))
+        path          (full-path storage-path relative-path)]
     (fs/exists? path)))
 
 (defrecord FileStore [storage-path]
