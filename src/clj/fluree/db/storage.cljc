@@ -66,7 +66,8 @@
     (case method
       :file         (let [storage-path (:file-store/storage-path config)]
                       (file-store/open storage-path))
-      :ipfs         (ipfs-store/create-ipfs-store config)
+      :ipfs         (let [endpoint (:ipfs-store/server config)]
+                      (ipfs-store/open endpoint))
       :localstorage (localstorage-store/create-localstorage-store config)
       :memory       (mem-store/create)
       :s3           #?(:clj (s3-store/create-s3-store config)

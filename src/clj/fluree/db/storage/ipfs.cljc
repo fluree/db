@@ -1,5 +1,4 @@
 (ns fluree.db.storage.ipfs
-  (:refer-clojure :exclude [read list])
   (:require [clojure.string :as str]
             [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.storage.proto :as store-proto]
@@ -34,7 +33,6 @@
 
 (defn ipfs-read
   [ipfs-endpoint address]
-
   (let [{:keys [ns local method]} (store-util/address-parts address)
         ipfs-path              (str "/" method "/" local)]
     (when-not (and (= "fluree" ns)
@@ -54,16 +52,15 @@
           (throw resp))
         (boolean resp)))))
 
-(defrecord IpfsStore [ipfs-endpoint ipns]
+(defrecord IpfsStore [endpoint]
   store-proto/Store
   (address [_ k] (ipfs-address k))
-  (write [_ k v opts] (ipfs-write ipfs-endpoint k v opts))
+  (write [_ k v opts] (ipfs-write endpoint k v opts))
   (list [_ prefix] (throw (ex-info "Unsupported operation IpfsStore method: list." {:prefix prefix})))
-  (exists? [_ address] (ipfs-exists? ipfs-endpoint address))
-  (read [_ address] (ipfs-read ipfs-endpoint address))
+  (exists? [_ address] (ipfs-exists? endpoint address))
+  (read [_ address] (ipfs-read endpoint address))
   (delete [_ address] (throw (ex-info "Unsupported operation IpfsStore method: delete." {:address address}))))
 
-(defn create-ipfs-store
-  [{:keys [:ipfs-store/server :ipfs-store/ipns] :as config}]
-  (map->IpfsStore {:config config
-                   :ipfs-endpoint (or server "http://127.0.0.1:5001/")}))
+(defn open
+  [endpoint]
+  (->IpfsStore endpoint))
