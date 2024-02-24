@@ -1,6 +1,6 @@
 (ns fluree.db.storage.memory
   (:refer-clojure :exclude [read])
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.storage.proto :as store-proto]
@@ -12,15 +12,15 @@
 
 (defn memory-write
   [contents path v {:keys [content-address?]}]
-  (let [hashable (if (store-util/hashable? v)
-                   v
-                   (pr-str v))
-        hash     (crypto/sha2-256 hashable)
-        path*       (if content-address?
-                      (str path hash)
-                      path)]
-    (swap! contents assoc path* v)
-    (async/go
+  (go
+    (let [hashable (if (store-util/hashable? v)
+                     v
+                     (pr-str v))
+          hash     (crypto/sha2-256 hashable)
+          path*       (if content-address?
+                        (str path hash)
+                        path)]
+      (swap! contents assoc path* v)
       {:path path*
        :address (memory-address path*)
        :hash hash
@@ -28,24 +28,27 @@
 
 (defn memory-list
   [contents prefix]
-  (async/go
+  (go
     (filter #(when (string? %) (str/starts-with? % prefix))
             (keys contents))))
 
 (defn memory-read
   [contents address]
-  (let [path (:local (store-util/address-parts address))]
-    (async/go (get @contents path))))
+  (go
+    (let [path (:local (store-util/address-parts address))]
+      (get @contents path))))
 
 (defn memory-delete
   [contents address]
-  (let [path (:local (store-util/address-parts address))]
-    (async/go (swap! contents dissoc path))))
+  (go
+    (let [path (:local (store-util/address-parts address))]
+      (swap! contents dissoc path))))
 
 (defn memory-exists?
   [contents address]
-  (let [path (:local (store-util/address-parts address))]
-    (async/go (contains? @contents path))))
+  (go
+    (let [path (:local (store-util/address-parts address))]
+      (contains? @contents path))))
 
 (defrecord MemoryStore [contents]
   store-proto/Store
