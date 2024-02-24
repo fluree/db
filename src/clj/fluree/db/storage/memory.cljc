@@ -2,8 +2,7 @@
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.storage :as storage]
-            [fluree.db.storage.util :as store-util]))
+            [fluree.db.storage :as storage]))
 
 (defn memory-address
   [path]
@@ -12,7 +11,7 @@
 (defn memory-write
   [contents path v {:keys [content-address?]}]
   (go
-    (let [hashable (if (store-util/hashable? v)
+    (let [hashable (if (storage/hashable? v)
                      v
                      (pr-str v))
           hash     (crypto/sha2-256 hashable)
@@ -34,19 +33,19 @@
 (defn memory-read
   [contents address]
   (go
-    (let [path (:local (store-util/address-parts address))]
+    (let [path (:local (storage/parse-address address))]
       (get @contents path))))
 
 (defn memory-delete
   [contents address]
   (go
-    (let [path (:local (store-util/address-parts address))]
+    (let [path (:local (storage/parse-address address))]
       (swap! contents dissoc path))))
 
 (defn memory-exists?
   [contents address]
   (go
-    (let [path (:local (store-util/address-parts address))]
+    (let [path (:local (storage/parse-address address))]
       (contains? @contents path))))
 
 (defrecord MemoryStore [contents]

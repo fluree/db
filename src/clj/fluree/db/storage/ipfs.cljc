@@ -2,7 +2,6 @@
   (:require [clojure.string :as str]
             [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.storage :as storage]
-            [fluree.db.storage.util :as store-util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]))
@@ -33,7 +32,7 @@
 
 (defn ipfs-read
   [ipfs-endpoint address]
-  (let [{:keys [ns local method]} (store-util/address-parts address)
+  (let [{:keys [ns local method]} (storage/parse-address address)
         ipfs-path              (str "/" method "/" local)]
     (when-not (and (= "fluree" ns)
                    (#{"ipfs" "ipns"} method))

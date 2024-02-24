@@ -4,8 +4,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
-            [fluree.db.storage :as storage]
-            [fluree.db.storage.util :as store-util]))
+            [fluree.db.storage :as storage]))
 
 (defn full-path
   [root relative-path]
@@ -13,7 +12,7 @@
 
 (defn storage-path
   [root address]
-  (let [relative-path (:local (store-util/address-parts address))]
+  (let [relative-path (:local (storage/parse-address address))]
     (full-path root relative-path)))
 
 (defn file-address
@@ -24,7 +23,7 @@
 
 (defn file-write
   [root path v {:keys [content-address?] :as opts}]
-  (when (not (store-util/hashable? v))
+  (when (not (storage/hashable? v))
     (throw (ex-info "Must serialize v before writing to FileStore."
                     {:root root
                      :path path

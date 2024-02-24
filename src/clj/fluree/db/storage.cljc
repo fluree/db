@@ -1,5 +1,21 @@
 (ns fluree.db.storage
+  (:require [clojure.string :as str])
   (:refer-clojure :exclude [read list exists?]))
+
+(defn hashable?
+  [x]
+  (or (string? x)
+      #?(:clj (bytes? x))))
+
+(defn parse-address
+  [address]
+  (let [[ns method path] (str/split address #":")
+        local            (if (str/starts-with? path "//")
+                           (subs path 2)
+                           path)]
+    {:ns     ns
+     :method method
+     :local  local}))
 
 (defprotocol Store
   (address [store k] "Returns the address that would be constructed by writing to `k`.")
