@@ -1,5 +1,4 @@
 (ns fluree.db.storage.memory
-  (:refer-clojure :exclude [read])
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
@@ -64,8 +63,7 @@
 
   (exists? [_ address] (memory-exists? contents address)))
 
-(defn create-memory-store
-  [{:keys [:memory-store/contents] :as config}]
-  (let [contents (or contents (atom {}))]
-    (map->MemoryStore {:config config
-                       :contents contents})))
+(defn create
+  []
+  (let [contents (atom {})]
+    (->MemoryStore contents)))

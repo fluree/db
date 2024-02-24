@@ -67,7 +67,7 @@
       :file         (file-store/create-file-store config)
       :ipfs         (ipfs-store/create-ipfs-store config)
       :localstorage (localstorage-store/create-localstorage-store config)
-      :memory       (mem-store/create-memory-store config)
+      :memory       (mem-store/create)
       :s3           #?(:clj (s3-store/create-s3-store config)
                        :cljs (throw (ex-info "S3 storage not supported in ClojureScript."
                                              {:status 400, :error :store/unsupported-method})))
