@@ -16,60 +16,47 @@
   (let [relative-path (:local (storage/parse-address address))]
     (full-path root relative-path)))
 
-(defn file-address
-  [path]
-  (storage/build-fluree-address method-name path))
-
-(defn file-write
-  [root path v {:keys [content-address?] :as opts}]
-  (when (not (storage/hashable? v))
-    (throw (ex-info "Must serialize v before writing to FileStore."
-                    {:root root
-                     :path path
-                     :v    v
-                     :opts opts})))
-  (go-try
-    (let [hash  (crypto/sha2-256 v)
-          path* (if content-address?
-                  (str path hash)
-                  path)
-          path  (str (fs/local-path root) "/" path*)
-          bytes (if (string? v)
-                  (bytes/string->UTF8 v)
-                  v)]
-      (<? (fs/write-file path bytes))
-      {:path    path*
-       :address (file-address path*)
-       :hash    hash
-       :size    (count bytes)})))
-
-(defn file-list
-  [root prefix]
-  (fs/list-files (full-path root prefix)))
-
-(defn file-read
-  [root address]
-  (let [path (storage-path root address)]
-    (fs/read-file path)))
-
-(defn file-delete
-  [root address]
-  (let [path (storage-path root address)]
-    (fs/delete-file path)))
-
-(defn file-exists?
-  [root address]
-  (let [path (storage-path root address)]
-    (fs/exists? path)))
-
 (defrecord FileStore [root]
   storage/Store
-  (address [_ path] (file-address path))
-  (write [_ path v opts] (file-write root path v opts))
-  (read [_ address] (file-read root address))
-  (list [_ prefix] (file-list root prefix))
-  (delete [_ address] (file-delete root address))
-  (exists? [_ address] (file-exists? root address)))
+  (address [_ path]
+    (storage/build-fluree-address method-name path))
+
+  (write [store path v {:keys [content-address?] :as opts}]
+    (go-try
+      (when (not (storage/hashable? v))
+        (throw (ex-info "Must serialize v before writing to FileStore."
+                        {:root root
+                         :path path
+                         :v    v
+                         :opts opts})))
+      (let [hash  (crypto/sha2-256 v)
+            path* (if content-address?
+                    (str path hash)
+                    path)
+            path  (str (fs/local-path root) "/" path*)
+            bytes (if (string? v)
+                    (bytes/string->UTF8 v)
+                    v)]
+        (<? (fs/write-file path bytes))
+        {:path    path*
+         :address (storage/address store path*)
+         :hash    hash
+         :size    (count bytes)})))
+
+  (read [_ address]
+    (let [path (storage-path root address)]
+      (fs/read-file path)))
+
+  (list [_ prefix]
+    (fs/list-files (full-path root prefix)))
+
+  (delete [_ address]
+    (let [path (storage-path root address)]
+      (fs/delete-file path)))
+
+  (exists? [_ address]
+    (let [path (storage-path root address)]
+      (fs/exists? path))))
 
 (defn open
   [root-path]
