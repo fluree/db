@@ -1,16 +1,15 @@
 (ns fluree.db.storage.ipfs
-  (:require [clojure.string :as str]
-            [fluree.db.method.ipfs.xhttp :as ipfs]
+  (:require [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]))
 
+(def method-name "ipfs")
+
 (defn ipfs-address
   [path]
-  (if (str/starts-with? path "//")
-    (str "fluree:ipfs:" path)
-    (str "fluree:ipfs://" path)))
+  (storage/build-fluree-address method-name path))
 
 (defn ipfs-write
   [ipfs-endpoint k v _]

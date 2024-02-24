@@ -1,10 +1,11 @@
 (ns fluree.db.storage.file
-  (:require [clojure.string :as str]
-            [fluree.crypto :as crypto]
+  (:require [fluree.crypto :as crypto]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.storage :as storage]))
+
+(def method-name "file")
 
 (defn full-path
   [root relative-path]
@@ -17,9 +18,7 @@
 
 (defn file-address
   [path]
-  (if (str/starts-with? path "//")
-    (str "fluree:file:" path)
-    (str "fluree:file://" path)))
+  (storage/build-fluree-address method-name path))
 
 (defn file-write
   [root path v {:keys [content-address?] :as opts}]

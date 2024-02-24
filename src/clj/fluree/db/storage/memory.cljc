@@ -4,9 +4,11 @@
             [fluree.crypto :as crypto]
             [fluree.db.storage :as storage]))
 
+(def method-name "memory")
+
 (defn memory-address
   [path]
-  (str "fluree:memory://" path))
+  (storage/build-fluree-address method-name path))
 
 (defn memory-write
   [contents path v {:keys [content-address?]}]

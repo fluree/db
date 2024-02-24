@@ -3,7 +3,6 @@
   (:require [cognitect.aws.client.api :as aws]
             [fluree.db.method.s3.core :as s3]
             [fluree.db.storage :as storage]
-            [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async]
             [fluree.crypto :as crypto]
             [clojure.string :as str]

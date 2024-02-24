@@ -7,6 +7,23 @@
   (or (string? x)
       #?(:clj (bytes? x))))
 
+(defn sanitize-path
+  [path]
+  (if (str/starts-with? path "//")
+    path
+    (str "//" path)))
+
+(defn build-address
+  [ns method path]
+  (let [path* (sanitize-path path)]
+    (str/join ":" [ns method path*])))
+
+(def fluree-namespace "fluree")
+
+(defn build-fluree-address
+  [method path]
+  (build-address fluree-namespace method path))
+
 (defn parse-address
   [address]
   (let [[ns method path] (str/split address #":")

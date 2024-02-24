@@ -3,8 +3,11 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [cognitect.aws.client.api :as aws]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [fluree.db.storage :as storage])
   (:import (java.io ByteArrayOutputStream Closeable)))
+
+(def method-name "s3")
 
 (defn handle-s3-response
   [resp]
@@ -97,9 +100,14 @@
   [s3-client s3-bucket s3-prefix address]
   (->> address (address-path s3-bucket s3-prefix) (read-s3-data s3-client s3-bucket s3-prefix)))
 
+(defn full-path
+  [s3-bucket s3-prefix path]
+  (let [path* (if (str/starts-with? path "//")
+                (-> path (str/split #"//") last)
+                path)]
+    (str/join "/" [s3-bucket s3-prefix path*])))
+
 (defn s3-address
   [s3-bucket s3-prefix path]
-  (if (str/starts-with? path "//")
-    (str "fluree:s3://" s3-bucket "/" s3-prefix "/" (-> path (str/split #"//")
-                                                        last))
-    (str "fluree:s3://" s3-bucket "/" s3-prefix "/" path)))
+  (let [path* (full-path s3-bucket s3-prefix path)]
+    (storage/build-fluree-address method-name path*)))

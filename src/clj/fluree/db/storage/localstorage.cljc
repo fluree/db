@@ -7,9 +7,11 @@
             [fluree.db.storage :as storage]
             [fluree.json-ld :as json-ld]))
 
+(def method-name "localstorage")
+
 (defn localstorage-address
   [path]
-  (str "fluree:localstorage:" path))
+  (storage/build-fluree-address method-name path))
 
 (defn localstorage-write
   [k v {:keys [content-address?]}]
