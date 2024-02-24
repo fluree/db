@@ -70,7 +70,6 @@
   (delete [_ address] (file-delete storage-path address))
   (exists? [_ address] (file-exists? storage-path address)))
 
-(defn create-file-store
-  [{:keys [:file-store/storage-path] :as config}]
-  (map->FileStore {:config config
-                   :storage-path storage-path}))
+(defn open
+  [storage-path]
+  (->FileStore storage-path))

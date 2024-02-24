@@ -64,7 +64,8 @@
                     {:error  config-error
                      :config config}))
     (case method
-      :file         (file-store/create-file-store config)
+      :file         (let [storage-path (:file-store/storage-path config)]
+                      (file-store/open storage-path))
       :ipfs         (ipfs-store/create-ipfs-store config)
       :localstorage (localstorage-store/create-localstorage-store config)
       :memory       (mem-store/create)
