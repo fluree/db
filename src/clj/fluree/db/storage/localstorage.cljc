@@ -66,9 +66,9 @@
   (delete [_ address] (async/go (localstorage-delete address)))
   (exists? [_ address] (async/go (localstorage-exists? address))))
 
-(defn create-localstorage-store
+(defn open
   [config]
   (if-not platform/BROWSER
     (throw (ex-info "LocalStorageStore is only supported on the Browser platform."
                     {:config config}))
-    (map->LocalStorageStore {:config config})))
+    (->LocalStorageStore)))

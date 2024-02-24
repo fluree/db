@@ -68,7 +68,7 @@
                       (file-store/open storage-path))
       :ipfs         (let [endpoint (:ipfs-store/server config)]
                       (ipfs-store/open endpoint))
-      :localstorage (localstorage-store/create-localstorage-store config)
+      :localstorage (localstorage-store/open)
       :memory       (mem-store/create)
       :s3           #?(:clj  (let [{:keys [:s3-store/endpoint :s3-store/bucket :s3-store/prefix]}
                                    config]
