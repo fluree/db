@@ -24,7 +24,7 @@
                       (str k hash)
                       k)]
        (.setItem js/localStorage k* v)
-       {:k       k*
+       {:path    k*
         :address (localstorage-address k*)
         :hash    hash
         :size    (count hashable)})))
