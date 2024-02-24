@@ -26,7 +26,7 @@
           (ex-info
             "IPFS publish error, unable to retrieve IPFS name."
             {:status 500 :error :db/push-ipfs :result res})))
-      {:k hash
+      {:path hash
        :hash hash
        :address (ipfs-address hash)
        :size size})))
