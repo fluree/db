@@ -11,18 +11,18 @@
   (str "fluree:memory://" path))
 
 (defn memory-write
-  [contents k v {:keys [content-address?]}]
+  [contents path v {:keys [content-address?]}]
   (let [hashable (if (store-util/hashable? v)
                    v
                    (pr-str v))
         hash     (crypto/sha2-256 hashable)
-        k*       (if content-address?
-                   (str k hash)
-                   k)]
-    (swap! contents assoc k* v)
+        path*       (if content-address?
+                      (str path hash)
+                      path)]
+    (swap! contents assoc path* v)
     (async/go
-      {:k k*
-       :address (memory-address k*)
+      {:path path*
+       :address (memory-address path*)
        :hash hash
        :size (count hashable)})))
 
@@ -34,24 +34,24 @@
 
 (defn memory-read
   [contents address]
-  (let [k (:local (store-util/address-parts address))]
-    (async/go (get @contents k))))
+  (let [path (:local (store-util/address-parts address))]
+    (async/go (get @contents path))))
 
 (defn memory-delete
   [contents address]
-  (let [k (:local (store-util/address-parts address))]
-    (async/go (swap! contents dissoc k))))
+  (let [path (:local (store-util/address-parts address))]
+    (async/go (swap! contents dissoc path))))
 
 (defn memory-exists?
   [contents address]
-  (let [k (:local (store-util/address-parts address))]
-    (async/go (contains? @contents k))))
+  (let [path (:local (store-util/address-parts address))]
+    (async/go (contains? @contents path))))
 
 (defrecord MemoryStore [contents]
   store-proto/Store
-  (address [_ k] (memory-address k))
+  (address [_ path] (memory-address path))
 
-  (write [_ k v opts] (memory-write contents k v opts))
+  (write [_ path v opts] (memory-write contents path v opts))
 
   (list [_ prefix] (memory-list contents prefix))
 
