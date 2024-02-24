@@ -28,7 +28,7 @@
           {path :k
            address :address
            size :size}
-          (<? (store/write store hash data))]
+          (<? (store/write store hash data nil))]
       {:name    path
        :hash    hash
        :json    json

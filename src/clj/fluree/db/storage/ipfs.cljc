@@ -1,7 +1,7 @@
 (ns fluree.db.storage.ipfs
   (:require [clojure.string :as str]
             [fluree.db.method.ipfs.xhttp :as ipfs]
-            [fluree.db.storage.proto :as store-proto]
+            [fluree.db.storage :as storage]
             [fluree.db.storage.util :as store-util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
@@ -53,7 +53,7 @@
         (boolean resp)))))
 
 (defrecord IpfsStore [endpoint]
-  store-proto/Store
+  storage/Store
   (address [_ k] (ipfs-address k))
   (write [_ k v opts] (ipfs-write endpoint k v opts))
   (list [_ prefix] (throw (ex-info "Unsupported operation IpfsStore method: list." {:prefix prefix})))

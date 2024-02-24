@@ -1,30 +1,10 @@
 (ns fluree.db.storage
-  (:refer-clojure :exclude [read list exists?])
-  (:require [fluree.db.storage.proto :as store-proto]))
+  (:refer-clojure :exclude [read list exists?]))
 
-
-(defn address
-  [store k]
-  (store-proto/address store k))
-
-(defn write
-  ([store k v]
-   (store-proto/write store k v nil))
-  ([store k v opts]
-   (store-proto/write store k v opts)))
-
-(defn read
-  [store address]
-  (store-proto/read store address))
-
-(defn list
-  [store prefix]
-  (store-proto/list store prefix))
-
-(defn delete
-  [store address]
-  (store-proto/delete store address))
-
-(defn exists?
-  [store address]
-  (store-proto/exists? store address))
+(defprotocol Store
+  (address [store k] "Returns the address that would be constructed by writing to `k`.")
+  (write [store k v opts] "Writes `v` to Store associated with `k`. Returns value's address.")
+  (exists? [store address] "Returns true when address exists in Store.")
+  (delete [store address] "Remove value associated with `address` from the Store.")
+  (read [store address] "Returns value associated with `address`.")
+  (list [store prefix] "Returns sequence of keys that match prefix."))

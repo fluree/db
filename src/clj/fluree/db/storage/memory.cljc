@@ -2,7 +2,7 @@
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.storage.proto :as store-proto]
+            [fluree.db.storage :as storage]
             [fluree.db.storage.util :as store-util]))
 
 (defn memory-address
@@ -50,7 +50,7 @@
       (contains? @contents path))))
 
 (defrecord MemoryStore [contents]
-  store-proto/Store
+  storage/Store
   (address [_ path] (memory-address path))
 
   (write [_ path v opts] (memory-write contents path v opts))

@@ -4,7 +4,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
-            [fluree.db.storage.proto :as store-proto]
+            [fluree.db.storage :as storage]
             [fluree.db.storage.util :as store-util]))
 
 (defn full-path
@@ -65,7 +65,7 @@
     (fs/exists? path)))
 
 (defrecord FileStore [root]
-  store-proto/Store
+  storage/Store
   (address [_ path] (file-address path))
   (write [_ path v opts] (file-write root path v opts))
   (read [_ address] (file-read root address))

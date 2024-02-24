@@ -29,7 +29,7 @@
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (store/read store commit-key))
-  (-c-write [_ _ commit-data] (store/write store "commit" commit-data))
+  (-c-write [_ _ commit-data] (store/write store "commit" commit-data nil))
 
   conn-proto/iConnection
   (-close [_] (close id state))

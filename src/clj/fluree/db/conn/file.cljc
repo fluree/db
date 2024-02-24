@@ -38,7 +38,7 @@
                           (str "/" type-dir "/")
                           hash ".json")
 
-          {:keys [k hash v address]} (<? (store/write store path bytes))]
+          {:keys [k hash v address]} (<? (store/write store path bytes nil))]
       {:name    path
        :hash    hash
        :json    json

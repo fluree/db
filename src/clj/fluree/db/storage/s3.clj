@@ -2,7 +2,7 @@
   (:refer-clojure :exclude [read list])
   (:require [cognitect.aws.client.api :as aws]
             [fluree.db.method.s3.core :as s3]
-            [fluree.db.storage.proto :as store-proto]
+            [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async]
             [fluree.crypto :as crypto]
@@ -30,7 +30,7 @@
          :address address}))))
 
 (defrecord S3Store [client bucket prefix]
-  store-proto/Store
+  storage/Store
   (address [_ k] (s3/s3-address bucket prefix k))
   (write [_ k v opts] (s3-write client bucket prefix k v opts))
   (read [_ address] (s3/read-address client bucket prefix address))

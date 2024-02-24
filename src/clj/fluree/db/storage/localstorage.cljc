@@ -4,7 +4,7 @@
             [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.platform :as platform]
-            [fluree.db.storage.proto :as store-proto]
+            [fluree.db.storage :as storage]
             [fluree.db.storage.util :as store-util]
             [fluree.json-ld :as json-ld]))
 
@@ -58,7 +58,7 @@
        (boolean (localstorage-read k)))))
 
 (defrecord LocalStorageStore []
-  store-proto/Store
+  storage/Store
   (address [_ k] (localstorage-address k))
   (write [_ k v opts] (async/go (localstorage-write k v opts)))
   (list [_ prefix] (async/go (localstorage-list prefix)))
