@@ -12,21 +12,21 @@
 (defn s3-write
   [client bucket prefix k v {:keys [content-address?] :as opts}]
   (async/go
-    (let [hash  (crypto/sha2-256 v)
-          k*    (if content-address?
-                  (str k hash)
-                  k)
-          bytes (if (string? v)
-                  (bytes/string->UTF8 v)
-                  v)
+    (let [hash   (crypto/sha2-256 v)
+          k*     (if content-address?
+                   (str k hash)
+                   k)
+          bytes  (if (string? v)
+                   (bytes/string->UTF8 v)
+                   v)
           result (async/<! (s3/write-s3-data client bucket prefix k* bytes))
 
           address (s3/s3-address bucket prefix k*)]
       (if (instance? Throwable result)
         result
-        {:hash hash
-         :k    (str/replace address #"fluree:s3://" "")
-         :size (count bytes)
+        {:hash    hash
+         :path    (str/replace address #"fluree:s3://" "")
+         :size    (count bytes)
          :address address}))))
 
 (defrecord S3Store [client bucket prefix]
