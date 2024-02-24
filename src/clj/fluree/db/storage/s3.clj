@@ -29,7 +29,7 @@
          :size (count bytes)
          :address address}))))
 
-(defrecord S3Store [endpoint bucket prefix client]
+(defrecord S3Store [client bucket prefix]
   store-proto/Store
   (address [_ k] (s3/s3-address bucket prefix k))
   (write [_ k v opts] (s3-write client bucket prefix k v opts))
@@ -38,13 +38,11 @@
   (list [_ prefix] (throw (ex-info "Unsupported operation S3Store method: list." {:prefix prefix})))
   (delete [_ address] (throw (ex-info "Unsupported operation S3Store method: delete." {:prefix prefix}))))
 
-(defn create-s3-store
-  [{:keys [:s3-store/endpoint :s3-store/bucket :s3-store/prefix] :as config}]
-  (let [aws-opts (cond-> {:api :s3}
-                   endpoint (assoc :endpoint-override endpoint))
-        client   (aws/client aws-opts)]
-    (map->S3Store {:config   config
-                   :bucket   bucket
-                   :prefix   prefix
-                   :endpoint endpoint
-                   :client   client})))
+(defn open
+  ([bucket prefix]
+   (open bucket prefix nil))
+  ([bucket prefix endpoint-override]
+   (let [aws-opts (cond-> {:api :s3}
+                    endpoint-override (assoc :endpoint-override endpoint-override))
+         client   (aws/client aws-opts)]
+     (->S3Store client bucket prefix))))

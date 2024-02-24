@@ -70,10 +70,11 @@
                       (ipfs-store/open endpoint))
       :localstorage (localstorage-store/create-localstorage-store config)
       :memory       (mem-store/create)
-      :s3           #?(:clj (s3-store/create-s3-store config)
+      :s3           #?(:clj  (let [{:keys [:s3-store/endpoint :s3-store/bucket :s3-store/prefix]}
+                                   config]
+                               (s3-store/open bucket prefix endpoint))
                        :cljs (throw (ex-info "S3 storage not supported in ClojureScript."
                                              {:status 400, :error :store/unsupported-method})))
-
 
       (throw (ex-info (str "No Store implementation for :store/method: " (pr-str method))
                       config)))))
