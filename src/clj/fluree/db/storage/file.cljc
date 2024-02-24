@@ -11,6 +11,11 @@
   [root relative-path]
   (str (fs/local-path root) "/" relative-path))
 
+(defn storage-path
+  [root address]
+  (let [relative-path (:local (store-util/address-parts address))]
+    (full-path root relative-path)))
+
 (defn file-address
   [path]
   (if (str/starts-with? path "//")
@@ -46,20 +51,17 @@
 
 (defn file-read
   [root address]
-  (let [relative-path (:local (store-util/address-parts address))
-        path          (full-path root relative-path)]
+  (let [path (storage-path root address)]
     (fs/read-file path)))
 
 (defn file-delete
   [root address]
-  (let [relative-path (:local (store-util/address-parts address))
-        path          (full-path root relative-path)]
+  (let [path (storage-path root address)]
     (fs/delete-file path)))
 
 (defn file-exists?
   [root address]
-  (let [relative-path (:local (store-util/address-parts address))
-        path          (full-path root relative-path)]
+  (let [path (storage-path root address)]
     (fs/exists? path)))
 
 (defrecord FileStore [root]
