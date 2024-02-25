@@ -55,6 +55,8 @@
   conn-proto/iStorage
   (-c-read [_ commit-key] (read-data store commit-key))
   (-c-write [_ _ledger commit-data] (write-data! store commit-data))
+  (-txn-read [_ txn-key] (read-data store txn-key))
+  (-txn-write [_ _ledger txn-data] (write-data! store txn-data))
 
   conn-proto/iConnection
   (-close [_] (close id state))

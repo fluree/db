@@ -69,6 +69,12 @@
   conn-proto/iStorage
   (-c-read [conn commit-key] (read-commit conn commit-key))
   (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
+  (-txn-read [_ txn-key]
+    (go-try
+      (let [txn-data (<? (storage/read store txn-key))]
+        (json/parse txn-data false))))
+  (-txn-write [conn ledger txn-data]
+    (write-data conn ledger :txn txn-data))
   (-index-file-write [conn ledger index-type index-data]
     (write-index conn ledger index-type index-data))
   (-index-file-read [conn index-address]

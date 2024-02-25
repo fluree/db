@@ -1,6 +1,6 @@
 (ns fluree.db.conn.ipfs
   (:require [fluree.db.storage.ipfs :as ipfs-storage]
-            [fluree.db.indexer.storage :as storage]
+            [fluree.db.indexer.storage :as index-storage]
             [fluree.db.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
@@ -12,7 +12,7 @@
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.nameservice.ipns :as ns-ipns]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.storage :as store])
+            [fluree.db.storage :as storage])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -24,13 +24,19 @@
 
 ;; IPFS Connection object
 
-(defrecord IPFSConnection [id state ledger-defaults lru-cache-atom
-                           serializer parallelism msg-in-ch msg-out-ch
-                           nameservices ipfs-endpoint store]
+(defrecord IPFSConnection [id state ledger-defaults lru-cache-atom serializer
+                           parallelism msg-in-ch msg-out-ch nameservices
+                           ipfs-endpoint store]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key] (store/read store commit-key))
-  (-c-write [_ _ commit-data] (store/write store "commit" commit-data nil))
+  (-c-read [_ commit-key]
+    (storage/read store commit-key))
+  (-c-write [_ _ commit-data]
+    (storage/write store "commit" commit-data nil))
+  (-txn-read [_ txn-key]
+    (storage/read store txn-key))
+  (-txn-write [_ _ txn-data]
+    (storage/write store "txn" txn-data nil))
 
   conn-proto/iConnection
   (-close [_] (close id state))
@@ -59,12 +65,12 @@
     [conn {:keys [id leaf tempid] :as node}]
     (let [cache-key [::resolve id tempid]]
       (if (= :empty id)
-        (storage/resolve-empty-node node)
+        (index-storage/resolve-empty-node node)
         (conn-cache/lru-lookup
           lru-cache-atom
           cache-key
           (fn [_]
-            (storage/resolve-index-node conn node
+            (index-storage/resolve-index-node conn node
                                         (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
 
 #?(:cljs
