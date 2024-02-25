@@ -117,6 +117,15 @@
           mem-store       (memory-storage/create)
           nameservices*   (util/sequential
                             (or nameservices
+                                ;; TODO: We should not reach inside the storage
+                                ;; implementation to reuse the contents atom
+                                ;; because that breaks the abstraction and
+                                ;; implicitly couples components that should be
+                                ;; independent. We should change the memory
+                                ;; nameservice to either use a storage
+                                ;; implementation explicitly, or to use an atom
+                                ;; independent of the data held in commit and
+                                ;; index storage.
                                 (default-memory-nameservice (:contents mem-store))))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
