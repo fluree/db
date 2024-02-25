@@ -1,5 +1,6 @@
 (ns fluree.db.conn.ipfs
-  (:require [fluree.db.indexer.storage :as storage]
+  (:require [fluree.db.storage.ipfs :as ipfs-storage]
+            [fluree.db.indexer.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
@@ -102,23 +103,24 @@
 
 (defn connect
   "Creates a new IPFS connection."
-  [{:keys [server parallelism lru-cache-atom memory ipns defaults serializer nameservices store]
+  [{:keys [server parallelism lru-cache-atom memory ipns defaults serializer nameservices]
     :or   {server     "http://127.0.0.1:5001/"
            serializer (json-serde)
            ipns       "self"}}]
   (go-try
-    (let [ipfs-endpoint   (or server "http://127.0.0.1:5001/") ;; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
+    (let [ipfs-endpoint   server ; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
           ledger-defaults (ledger-defaults defaults)
-          memory          (or memory 1000000) ;; default 1MB memory
+          memory          (or memory 1000000) ; default 1MB memory
           conn-id         (str (random-uuid))
           state           (conn-core/blank-state)
-          nameservices*  (util/sequential
-                           (or nameservices (<? (default-ipns-nameservice ipfs-endpoint ipns))))
+          nameservices*   (util/sequential
+                            (or nameservices (<? (default-ipns-nameservice ipfs-endpoint ipns))))
           cache-size      (conn-cache/memory->cache-size memory)
-          lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
+          lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))
+          ipfs-store      (ipfs-storage/open ipfs-endpoint)]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id              conn-id
-                            :store           store
+                            :store           ipfs-store
                             :ipfs-endpoint   ipfs-endpoint
                             :ledger-defaults ledger-defaults
                             :serializer      serializer

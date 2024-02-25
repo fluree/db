@@ -10,12 +10,13 @@
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.indexer.storage :as storage]
+            [fluree.db.indexer.storage :as index-storage]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
-            [fluree.db.storage :as store])
+            [fluree.db.storage :as storage]
+            [fluree.db.storage.s3 :as s3-storage])
   (:import (java.io Writer)))
 
 (set! *warn-on-reflection* true)
@@ -35,7 +36,7 @@
                         (when branch (str "/" branch))
                         (str "/" type-dir "/")
                         hash ".json")
-          result   (<! (store/write store path bytes nil))]
+          result   (<! (storage/write store path bytes nil))]
       (if (instance? Throwable result)
         result
         {:name    path
@@ -46,7 +47,7 @@
 
 (defn read-commit
   [{:keys [store] :as _conn} address]
-  (go (json/parse (<! (store/read store address)) false)))
+  (go (json/parse (<! (storage/read store address)) false)))
 
 (defn write-commit
   [conn ledger commit-data]
@@ -58,7 +59,7 @@
 
 (defn read-index
   [{:keys [store] :as _conn} index-address]
-  (go (-> (store/read store index-address) <! (json/parse true))))
+  (go (-> (storage/read store index-address) <! (json/parse true))))
 
 
 (defrecord S3Connection [id state ledger-defaults parallelism lru-cache-atom nameservices]
@@ -90,10 +91,10 @@
   (resolve [conn {:keys [id leaf tempid] :as node}]
     (let [cache-key [::resolve id tempid]]
       (if (= :empty id)
-        (storage/resolve-empty-node node)
+        (index-storage/resolve-empty-node node)
         (conn-cache/lru-lookup lru-cache-atom cache-key
                                (fn [_]
-                                 (storage/resolve-index-node
+                                 (index-storage/resolve-index-node
                                    conn node
                                    (fn [] (conn-cache/lru-evict lru-cache-atom
                                                                cache-key)))))))))
@@ -128,7 +129,7 @@
 (defn connect
   "Create a new S3 connection."
   [{:keys [defaults parallelism s3-endpoint s3-bucket s3-prefix lru-cache-atom
-           memory serializer nameservices store]
+           memory serializer nameservices]
     :or   {serializer (json-serde)} :as _opts}]
   (go
     (let [aws-opts       (cond-> {:api :s3}
@@ -140,9 +141,10 @@
                            (or nameservices (default-S3-nameservice client s3-bucket s3-prefix)))
           cache-size     (conn-cache/memory->cache-size memory)
           lru-cache-atom (or lru-cache-atom
-                             (atom (conn-cache/create-lru-cache cache-size)))]
+                             (atom (conn-cache/create-lru-cache cache-size)))
+          s3-store       (s3-storage/open s3-bucket s3-prefix s3-endpoint)]
       (map->S3Connection {:id              conn-id
-                          :store           store
+                          :store           s3-store
                           :memory          memory
                           :state           state
                           :ledger-defaults (ledger-defaults defaults)
