@@ -1,7 +1,7 @@
 (ns fluree.db.conn.s3
   (:require [cognitect.aws.client.api :as aws]
             [fluree.db.nameservice.s3 :as ns-s3]
-            [clojure.core.async :as async :refer [go <!]]
+            [clojure.core.async :as async :refer [go]]
             [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.proto :as conn-proto]
@@ -11,6 +11,7 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.indexer.storage :as index-storage]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
@@ -23,7 +24,7 @@
 
 (defn write-data
   [{:keys [store] :as _conn} ledger data-type data]
-  (go
+  (go-try
     (let [alias    (ledger-proto/-alias ledger)
           branch   (-> ledger ledger-proto/-branch :name name)
           json     (if (string? data)
@@ -36,18 +37,18 @@
                         (when branch (str "/" branch))
                         (str "/" type-dir "/")
                         hash ".json")
-          result   (<! (storage/write store path bytes nil))]
-      (if (instance? Throwable result)
-        result
-        {:name    path
-         :hash    hash
-         :json    json
-         :size    (count json)
-         :address (:address result)}))))
+          result   (<? (storage/write store path bytes nil))]
+      {:name    path
+       :hash    hash
+       :json    json
+       :size    (count json)
+       :address (:address result)})))
 
 (defn read-commit
   [{:keys [store] :as _conn} address]
-  (go (json/parse (<! (storage/read store address)) false)))
+  (go-try
+    (let [commit-data (<? (storage/read store address))]
+      (json/parse commit-data false))))
 
 (defn write-commit
   [conn ledger commit-data]
@@ -59,7 +60,9 @@
 
 (defn read-index
   [{:keys [store] :as _conn} index-address]
-  (go (-> (storage/read store index-address) <! (json/parse true))))
+  (go-try
+    (let [index-data (<? (storage/read store index-address))]
+      (json/parse index-data true))))
 
 
 (defrecord S3Connection [id state ledger-defaults parallelism lru-cache-atom nameservices]
