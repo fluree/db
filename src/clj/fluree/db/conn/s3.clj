@@ -65,7 +65,7 @@
       (json/parse index-data true))))
 
 
-(defrecord S3Connection [id state ledger-defaults parallelism lru-cache-atom nameservices]
+(defrecord S3Connection [id state ledger-defaults parallelism lru-cache-atom nameservices store]
   conn-proto/iStorage
   (-c-read [conn commit-key] (read-commit conn commit-key))
   (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
