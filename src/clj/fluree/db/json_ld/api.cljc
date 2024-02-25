@@ -17,7 +17,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.conn.core :refer [notify-ledger]]
-            [malli.core :as m])
+            [fluree.db.json-ld.policy :as perm])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -43,54 +43,6 @@
                (resolve res))))))))
 
 ;; ledger operations
-
-(def BaseConfig
-  [:map
-   [:store/method [:enum :memory :localstorage :file :ipfs :s3 :remote]]])
-
-(def FileConfig
-  [:and
-   BaseConfig
-   [:map
-    [:store/method [:enum :file]]
-    [:file-store/storage-path :string]]])
-
-(def LocalStorageConfig
-  [:and
-   BaseConfig
-   [:map
-    [:store/method [:enum :localstorage]]]])
-
-(def MemoryConfig
-  [:and
-   BaseConfig
-   [:map
-    [:store/method [:enum :memory]]
-    [:memory-store/storage-atom {:optional true} :any]]])
-
-(def IpfsConfig
-  [:and
-   BaseConfig
-   [:map
-    [:store/method [:enum :ipfs]]
-    [:ipfs-store/server {:optional true} [:maybe :string]]]])
-
-(def S3Config
-  [:and
-   BaseConfig
-   [:map
-    [:store/method [:enum :s3]]
-    [:s3-store/endpoint {:optional true} :string]
-    [:s3-store/bucket :string]
-    [:s3-store/prefix :string]]])
-
-(def StoreConfig
-  [:or
-   FileConfig
-   LocalStorageConfig
-   MemoryConfig
-   IpfsConfig
-   S3Config])
 
 (defn connect
   "Forms connection to ledger, enabling automatic pulls of new updates, event
