@@ -14,20 +14,17 @@
   (address [_ path]
     (storage/build-fluree-address method-name path))
 
-  (write [store k v {:keys [content-address?]}]
+  (write [store k v]
     (go
       #?(:clj (throw (ex-info "LocalStorageStore is only supported on the Browser platform." {}))
          :cljs
          (let [hashable (if (storage/hashable? v)
                           v
                           (json-ld/normalize-data v))
-               hash     (crypto/sha2-256 hashable)
-               k*       (if content-address?
-                          (str k hash)
-                          k)]
-           (.setItem js/localStorage k* v)
-           {:path    k*
-            :address (storage/address store k*)
+               hash     (crypto/sha2-256 hashable)]
+           (.setItem js/localStorage k v)
+           {:path    k
+            :address (storage/address store k)
             :hash    hash
             :size    (count hashable)}))))
 

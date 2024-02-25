@@ -37,7 +37,7 @@
                         (when branch (str "/" branch))
                         (str "/" type-dir "/")
                         hash ".json")
-          result   (<? (storage/write store path bytes nil))]
+          result   (<? (storage/write store path bytes))]
       {:name    path
        :hash    hash
        :json    json

@@ -28,7 +28,7 @@
           hash (crypto/sha2-256 json)
 
           {:keys [path address]}
-          (<? (storage/write store hash data nil))]
+          (<? (storage/write store hash data))]
       {:name    path
        :hash    hash
        :json    json

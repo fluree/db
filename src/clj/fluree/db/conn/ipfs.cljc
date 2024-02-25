@@ -32,11 +32,11 @@
   (-c-read [_ commit-key]
     (storage/read store commit-key))
   (-c-write [_ _ commit-data]
-    (storage/write store "commit" commit-data nil))
+    (storage/write store "commit" commit-data))
   (-txn-read [_ txn-key]
     (storage/read store txn-key))
   (-txn-write [_ _ txn-data]
-    (storage/write store "txn" txn-data nil))
+    (storage/write store "txn" txn-data))
 
   conn-proto/iConnection
   (-close [_] (close id state))

@@ -21,25 +21,21 @@
   (address [_ path]
     (storage/build-fluree-address method-name path))
 
-  (write [store path v {:keys [content-address?] :as opts}]
+  (write [store path v]
     (go-try
       (when (not (storage/hashable? v))
         (throw (ex-info "Must serialize v before writing to FileStore."
                         {:root root
                          :path path
-                         :v    v
-                         :opts opts})))
+                         :v    v})))
       (let [hash  (crypto/sha2-256 v)
-            path* (if content-address?
-                    (str path hash)
-                    path)
-            path  (str (fs/local-path root) "/" path*)
+            path* (str (fs/local-path root) "/" path)
             bytes (if (string? v)
                     (bytes/string->UTF8 v)
                     v)]
-        (<? (fs/write-file path bytes))
-        {:path    path*
-         :address (storage/address store path*)
+        (<? (fs/write-file path* bytes))
+        {:path    path
+         :address (storage/address store path)
          :hash    hash
          :size    (count bytes)})))
 

@@ -13,17 +13,14 @@
   (address [_ k]
     (s3/s3-address bucket prefix k))
 
-  (write [store k v {:keys [content-address?]}]
+  (write [store k v]
     (go
       (let [hash    (crypto/sha2-256 v)
-            k*      (if content-address?
-                     (str k hash)
-                     k)
             bytes   (if (string? v)
                      (bytes/string->UTF8 v)
                      v)
-            result  (<! (s3/write-s3-data client bucket prefix k* bytes))
-            address (storage/address store k*)]
+            result  (<! (s3/write-s3-data client bucket prefix k bytes))
+            address (storage/address store k)]
         (if (instance? Throwable result)
           result
           {:hash    hash

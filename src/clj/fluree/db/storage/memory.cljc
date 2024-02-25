@@ -11,18 +11,15 @@
   (address [_ path]
     (storage/build-fluree-address method-name path))
 
-  (write [store path v {:keys [content-address?]}]
+  (write [store path v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v
                        (pr-str v))
-            hash     (crypto/sha2-256 hashable)
-            path*    (if content-address?
-                       (str path hash)
-                       path)]
-        (swap! contents assoc path* v)
-        {:path    path*
-         :address (storage/address store path*)
+            hash     (crypto/sha2-256 hashable)]
+        (swap! contents assoc path v)
+        {:path    path
+         :address (storage/address store path)
          :hash    hash
          :size    (count hashable)})))
 

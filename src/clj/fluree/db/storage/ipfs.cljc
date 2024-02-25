@@ -18,7 +18,7 @@
   (address [_ path]
     (storage/build-fluree-address method-name path))
 
-  (write [store path v _]
+  (write [store path v]
     (go-try
       (let [content (if (string? v)
                       v
