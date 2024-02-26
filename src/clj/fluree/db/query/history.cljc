@@ -243,6 +243,18 @@
   (let [ns-code (-> f flake/s iri/get-ns-code)]
     (contains? iri/commit-namespace-codes ns-code)))
 
+(defn extract-annotation-flakes
+  "Removes the annotation flakes from the assert flakes."
+  [commit-wrapper-flakes assert-flakes]
+  (let [annotation-sid (some->> commit-wrapper-flakes
+                                (filter #(= (flake/p %) const/$_commit:annotation))
+                                (first)
+                                (flake/o))
+        {annotation-flakes true
+         assert-flakes*    false}
+        (group-by (fn [f] (= annotation-sid (flake/s f))) assert-flakes)]
+    [assert-flakes* annotation-flakes]))
+
 (defn commit-metadata-flake?
   "Returns `true` if a flake is part of commit metadata.
 
@@ -289,6 +301,8 @@
                          :else
                          :ignore-flakes))
                      t-flakes)
+           [assert-flakes* annotation-flakes] (extract-annotation-flakes commit-wrapper-flakes assert-flakes)
+
            commit-wrapper-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
                                                          {:wildcard? true, :depth 0}
                                                          0 commit-wrapper-flakes)
@@ -299,7 +313,7 @@
 
            commit-wrapper      (<? commit-wrapper-chan)
            commit-meta         (<? commit-meta-chan)
-           asserts             (->> assert-flakes
+           asserts             (->> assert-flakes*
                                     (t-flakes->json-ld db context compact cache
                                                        fuel error-ch)
                                     (async/into [])
@@ -309,15 +323,22 @@
                                                        fuel error-ch)
                                     (async/into [])
                                     <!)
+           [annotation]        (->> annotation-flakes
+                                    (t-flakes->json-ld db context compact cache
+                                                       fuel error-ch)
+                                    (async/into [])
+                                    <!)
 
            assert-key          (json-ld/compact const/iri-assert compact)
            retract-key         (json-ld/compact const/iri-retract compact)
            data-key            (json-ld/compact const/iri-data compact)
-           commit-key          (json-ld/compact const/iri-commit compact)]
+           commit-key          (json-ld/compact const/iri-commit compact)
+           annotation-key      (json-ld/compact const/iri-annotation compact)]
        (-> {commit-key commit-wrapper}
            (assoc-in [commit-key data-key] commit-meta)
            (assoc-in [commit-key data-key assert-key] asserts)
-           (assoc-in [commit-key data-key retract-key] retracts)))
+           (assoc-in [commit-key data-key retract-key] retracts)
+           (cond-> annotation (assoc-in [commit-key annotation-key] annotation))))
      (catch* e
        (log/error e "Error converting commit flakes.")
        (>! error-ch e)))))

@@ -481,8 +481,6 @@
 
 (defn annotation-flakes
   [db t commit-sid annotation]
-  (def commit-sid commit-sid)
-  (def annotation annotation)
   (if annotation
     (let [allowed-vars #{}
           parsed       (q-parse/parse-triples allowed-vars (util/sequential annotation))
