@@ -985,52 +985,72 @@
                               (select-keys ["f:author" "f:txn" "f:data"]))))))))))
 
 (deftest ^:integration txn-annotation
-  (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
-    (let [conn         @(fluree/connect {:method :memory})
-          ledger-name  "annotationtest"
-          ledger       @(fluree/create conn ledger-name)
-          context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
+  (let [bnode-counter (atom 0)]
+    (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")
+                  fluree.db.json-ld.iri/new-blank-node-id (fn [] (str "_:fdb-" (swap! bnode-counter inc)))]
+      (let [conn         @(fluree/connect {:method :memory})
+            ledger-name  "annotationtest"
+            ledger       @(fluree/create conn ledger-name)
+            context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
 
-          db0 (fluree/db ledger)
-          db1 (->> @(fluree/stage db0 {"@context" context
-                                       "insert" [{"@id" "ex:betty"
-                                                  "@type" "ex:Yeti"
-                                                  "schema:name" "Betty"
-                                                  "schema:age" 55}]})
-                   (fluree/commit! ledger)
-                   (deref))
+            db0 (fluree/db ledger)
+            db1 (->> @(fluree/stage db0 {"@context" context
+                                         "insert" [{"@id" "ex:betty"
+                                                    "@type" "ex:Yeti"
+                                                    "schema:name" "Betty"
+                                                    "schema:age" 55}]})
+                     (fluree/commit! ledger)
+                     (deref))
 
-          db2 (->> @(fluree/stage db1 {"@context" context
-                                       "insert" [{"@id" "ex:freddy"
-                                                  "@type" "ex:Yeti"
-                                                  "schema:name" "Freddy"
-                                                  "schema:age" 1002}]}
-                                  {:annotation {"originator" "opts" "nested" {"foo" "bar"}}})
-                   (fluree/commit! ledger)
-                   (deref))
+            invalid1 @(fluree/stage db0 {"@context" context
+                                         "insert" [{"@id" "ex:betty"
+                                                    "@type" "ex:Yeti"
+                                                    "schema:name" "Betty"
+                                                    "schema:age" 55}]}
+                                    {:annotation {"ex:originator" "opts" "ex:nested" {"invalid" "true"}}})
+            invalid2 @(fluree/stage db0 {"@context" context
+                                         "insert" [{"@id" "ex:betty"
+                                                    "@type" "ex:Yeti"
+                                                    "schema:name" "Betty"
+                                                    "schema:age" 55}]}
+                                    {:annotation [{"ex:originator" "opts" "ex:multiple" true}
+                                                  {"ex:originator" "opts" "ex:invalid" true}]})
 
-          ;; db3 (->> @(fluree/stage db2 {"@context" context
-          ;;                              "insert"   [{"@id"         "ex:letty"
-          ;;                                           "@type"       "ex:Yeti"
-          ;;                                           "schema:name" "Leticia"
-          ;;                                           "schema:age"  38}]
-          ;;                              "opts" {"annotation" {"originator" "txn" "nested" {"bar" "foo"}}}})
-          ;;          (fluree/commit! ledger)
-          ;;          (deref))
-          ]
-      (is (= [{"f:txn" "fluree:memory://annotationtest/txn/5c54eee1fd6be197402fcd76b035cd6f42b55723f35c294992d76e6eea2cf874"}
-              {"f:txn" "fluree:memory://annotationtest/txn/6ab2e58c44af9db30feb461c212b3b566a35fdfe92d53b61018eab425ca0c342"
-               "f:annotation" {"originator" "opts" "foo" "bar"}}
+            invalid3 @(fluree/stage db0 {"@context" context
+                                         "insert" [{"@id" "ex:betty"
+                                                    "@type" "ex:Yeti"
+                                                    "schema:name" "Betty"
+                                                    "schema:age" 55}]}
+                                    {:annotation [{"ex:originator" "opts" "@id" "invalid:subj"}]})
 
-              {"f:txn" "fluree:memory://annotationtest/txn/e342e6a53d26b78b6222446eac29060c5237f54175e1d6639cb900103b729ccc"
-               "f:annotation" {"originator" "txn" "bar" "foo"}}]
-             (->> @(fluree/history ledger {:context        context
-                                           :commit-details true
-                                           :t              {:from 1 :to :latest}})
-                  (mapv (fn [c]
-                          (-> c
-                              (get "f:commit")
-                              (get "f:data")
-                              (get "f:assert")
-                              #_(keys)
-                              #_(select-keys ["f:txn" "f:annotation" "f:assert"]))))))))))
+            db2 (->> @(fluree/stage db1 {"@context" context
+                                         "insert" [{"@id" "ex:freddy"
+                                                    "@type" "ex:Yeti"
+                                                    "schema:name" "Freddy"
+                                                    "schema:age" 1002}]}
+                                    {:annotation {"ex:originator" "opts" "ex:data" "ok"}})
+                     (fluree/commit! ledger)
+                     (deref))
+
+            db3 (->> @(fluree/stage db2 {"@context" context
+                                         "insert"   [{"@id"         "ex:letty"
+                                                      "@type"       "ex:Yeti"
+                                                      "schema:name" "Leticia"
+                                                      "schema:age"  38}]
+                                         "opts" {"annotation" {"ex:originator" "txn" "ex:data" "ok"}}})
+                     (fluree/commit! ledger)
+                     (deref))]
+        (is (= "Commit annotation must only have a single subject." (ex-message invalid1)))
+        (is (= "Commit annotation must only have a single subject." (ex-message invalid2)))
+        (is (= "Commit annotation cannot specify a subject identifier." (ex-message invalid3)))
+
+        (is (= [{"f:txn" "fluree:memory://5c54eee1fd6be197402fcd76b035cd6f42b55723f35c294992d76e6eea2cf874"}
+                {"f:txn" "fluree:memory://6ab2e58c44af9db30feb461c212b3b566a35fdfe92d53b61018eab425ca0c342"
+                 "f:annotation" {"id" "_:fdb-6" "ex:data" "ok" "ex:originator" "opts"}}
+
+                {"f:txn" "fluree:memory://22738244510e8c756cbc14eedc3d223e4b66024ffbc3debb856c7d7b063798df"
+                 "f:annotation" {"id" "_:fdb-8" "ex:data" "ok" "ex:originator" "txn"}}]
+               (->> @(fluree/history ledger {:context        context
+                                             :commit-details true
+                                             :t              {:from 1 :to :latest}})
+                    (mapv (fn [c] (-> c (get "f:commit") (select-keys ["f:txn" "f:annotation"])))))))))))

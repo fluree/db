@@ -234,6 +234,18 @@
   (let [ns-code (-> f flake/s iri/get-ns-code)]
     (contains? iri/commit-namespace-codes ns-code)))
 
+(defn extract-annotation-flakes
+  "Removes the annotation flakes from the assert flakes."
+  [commit-wrapper-flakes assert-flakes]
+  (let [annotation-sid (some->> commit-wrapper-flakes
+                                (filter #(= (flake/p %) const/$_commit:annotation))
+                                (first)
+                                (flake/o))
+        {annotation-flakes true
+         assert-flakes*    false}
+        (group-by (fn [f] (= annotation-sid (flake/s f))) assert-flakes)]
+    [assert-flakes* annotation-flakes]))
+
 (defn commit-metadata-flake?
   "Returns `true` if a flake is part of commit metadata.
 
@@ -280,9 +292,11 @@
                          :else
                          :ignore-flakes))
                      t-flakes)
+           [assert-flakes* annotation-flakes] (extract-annotation-flakes commit-wrapper-flakes assert-flakes)
+
            commit-wrapper-chan (json-ld-resp/format-subject-flakes db cache context compact
-                                                         {:wildcard? true, :depth 0}
-                                                         0 nil error-ch commit-wrapper-flakes)
+                                                                   {:wildcard? true, :depth 0}
+                                                                   0 nil error-ch commit-wrapper-flakes)
 
            commit-meta-chan    (json-ld-resp/format-subject-flakes db cache context compact
                                                          {:wildcard? true, :depth 0}
@@ -298,15 +312,21 @@
                                     (t-flakes->json-ld db context compact cache error-ch)
                                     (async/into [])
                                     <!)
+           [annotation]        (->> annotation-flakes
+                                    (t-flakes->json-ld db context compact cache error-ch)
+                                    (async/into [])
+                                    <!)
 
            assert-key          (json-ld/compact const/iri-assert compact)
            retract-key         (json-ld/compact const/iri-retract compact)
            data-key            (json-ld/compact const/iri-data compact)
-           commit-key          (json-ld/compact const/iri-commit compact)]
+           commit-key          (json-ld/compact const/iri-commit compact)
+           annotation-key      (json-ld/compact const/iri-annotation compact)]
        (-> {commit-key commit-wrapper}
            (assoc-in [commit-key data-key] commit-meta)
            (assoc-in [commit-key data-key assert-key] asserts)
-           (assoc-in [commit-key data-key retract-key] retracts)))
+           (assoc-in [commit-key data-key retract-key] retracts)
+           (cond-> annotation (assoc-in [commit-key annotation-key] annotation))))
      (catch* e
        (log/error e "Error converting commit flakes.")
        (>! error-ch e)))))

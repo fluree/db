@@ -27,6 +27,24 @@
       (<? (shacl/validate! db-before root-db (vals mods) context))
       staged-map)))
 
+(defn validate-annotation
+  "Validate that the commit annotation is just a single json-ld node."
+  [[annotation :as expanded]]
+  (let [multiple-nodes? (> (count expanded) 1)
+        specified-id    (:id annotation)
+        nested-nodes    (into []
+                              (comp (remove (fn [[k v]] (keyword? k))) ; remove :id :idx :type
+                                    (mapcat rest)                      ; discard keys
+                                    (mapcat (partial remove :value))) ; remove value objects
+                              annotation)]
+    (when specified-id
+      (throw (ex-info "Commit annotation cannot specify a subject identifier."
+                      {:status 400, :error :db/invalid-annotation :id specified-id})))
+    (when (or multiple-nodes? (not-empty nested-nodes))
+      (throw (ex-info "Commit annotation must only have a single subject."
+                      {:status 400, :error :db/invalid-annotation})))
+    expanded))
+
 ;; TODO - can use transient! below
 (defn stage-update-novelty
   "If a db is staged more than once, any retractions in a previous stage will
@@ -146,7 +164,9 @@
 
            parsed-txn (q-parse/parse-txn txn context)
            annotation (some-> (or (:annotation parsed-txn) (:annotation parsed-opts))
-                              (json-ld/expand context))
+                              (json-ld/expand context)
+                              (util/sequential)
+                              (validate-annotation))
            db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                         (<? (perm/wrap-policy db policy-identity))
                         db)
