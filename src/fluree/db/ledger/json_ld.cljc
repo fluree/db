@@ -301,22 +301,21 @@
       path)))
 
 (defn load*
-  [conn address]
+  [conn ledger-alias]
   (go-try
-    (let [commit-addr  (<? (nameservice/lookup-commit conn address nil))
-          _            (log/debug "Attempting to load from address:" address
+    (let [commit-addr  (<? (nameservice/lookup-commit conn ledger-alias nil))
+          _            (log/debug "Attempting to load from alias:" ledger-alias
                                   "with commit address:" commit-addr)
           _            (when-not commit-addr
-                         (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
+                         (throw (ex-info (str "Unable to load. No record of ledger exists: " ledger-alias)
                                          {:status 400 :error :db/invalid-commit-address})))
           _            (log/debug "load from address: " commit-addr)
           [commit _] (<? (jld-reify/read-commit conn commit-addr))
           _            (when-not commit
-                         (throw (ex-info (str "Unable to load. Commit file for ledger: " address
+                         (throw (ex-info (str "Unable to load. Commit file for ledger: " ledger-alias
                                               " at location: " commit-addr " is not found.")
                                          {:status 400 :error :db/invalid-db})))
           _            (log/debug "load commit:" commit)
-          ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
           ledger       (<? (create* conn ledger-alias {:branch         branch
                                                        :id             commit-addr}))
@@ -349,7 +348,7 @@
                           (ex-info (str "Load for " alias-or-address " failed due to exception in address lookup.")
                                    {:status 400 :error :db/invalid-address}
                                    address)))
-            (let [ledger (async/<! (load* conn address))]
+            (let [ledger (async/<! (load* conn alias))]
               ;; note, ledger can be an exception, don't cache if so!
               (when (util/exception? ledger)
                 (release-ledger conn alias))

@@ -182,9 +182,8 @@
   [conn alias t context opts]
   (go-try
    (try*
-     (let [address (<? (nameservice/primary-address conn alias nil))
-           ledger  (<? (jld-ledger/load conn address))
-           db      (ledger-proto/-db ledger)]
+     (let [ledger (<? (jld-ledger/load conn alias))
+           db     (ledger-proto/-db ledger)]
        (<? (restrict-db db t context opts)))
      (catch* e
        (throw (contextualize-ledger-400-error

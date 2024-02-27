@@ -33,15 +33,13 @@
   "Given IPNS address, performs lookup and returns latest ledger address."
   [ipfs-endpoint ledger-name opts]
   (go-try
-    (if-let [[proto address ledger] (address-parts ledger-name)]
+    (when-let [[proto address ledger] (address-parts ledger-name)]
       (let [ipfs-addr (if (= "ipns" proto)
                         (str "/ipns/" address)
                         address)]
         ;; address might be a directory, or could directly be a commit file - try to look up as directory first
         (let [ledgers (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
-          (or (get ledgers ledger)
-              ledger-name)))
-      ledger-name)))
+          (get ledgers ledger))))))
 
 (defn get-address
   "Returns IPNS address for a given key."

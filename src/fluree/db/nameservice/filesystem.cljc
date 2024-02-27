@@ -125,10 +125,10 @@
 
   If 'branch' parameter is provided will always use it as the branch regardless
   of if a branch is specificed in the ns-address."
-  [base-address ns-address branch]
-  (let [[ns-address* extracted-branch] (extract-branch ns-address)
+  [base-address ledger-alias branch]
+  (let [[ns-address* extracted-branch] (extract-branch ledger-alias)
         branch*   (or branch extracted-branch)
-        absolute? (str/starts-with? ns-address base-address)
+        absolute? (str/starts-with? ledger-alias base-address)
         [ns-address** alias] (if absolute?
                                [ns-address* (subs ns-address* (count base-address))]
                                [(str base-address ns-address*) ns-address*])]
@@ -197,9 +197,9 @@
 (defn lookup
   "When provided a 'relative' ledger alias, looks in file system to see if
   nameservice file exists and if so returns the latest commit address."
-  [ns-address local-path base-address {:keys [branch] :as _opts}]
+  [ledger-alias local-path base-address {:keys [branch] :as _opts}]
   (go-try
-    (let [{:keys [alias branch* address]} (resolve-address base-address ns-address branch)
+    (let [{:keys [alias branch* address]} (resolve-address base-address ledger-alias branch)
           ns-record (retrieve-ns-record local-path alias)]
       (if ns-record
         (or (commit-address-from-record ns-record branch*)
