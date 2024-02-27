@@ -518,18 +518,52 @@
         (serdeproto/-deserialize-db-root (serde conn) data)))))
 
 
+(defn most-current-db-root
+  "Attempts to retrieve the most recent available db root.
+
+  In the case there is an index corruption, one can remove the latest index
+  root file, and provided there are other index points the db will load from
+  the latest. It is important the machine has enough memory to hold the novelty
+   from the loaded index point in memory.
+
+   Upn the next transaction, the ledger should generate a new index point that
+   will then be used in the future."
+  [conn network dbid index ledger-info]
+  (go-try
+    (let [db-root (<? (read-db-root conn network dbid index))]
+      (or db-root
+          (let [all-indexes       (->> ledger-info
+                                       :indexes
+                                       keys
+                                       (sort >))
+                ;; remaining index points available except for most current (which we already tried)
+                remaining-indexes (rest all-indexes)]
+            (log/warn (str "Database " network "/" dbid " could not be be loaded from main index point: "
+                           index ". Attempting to load from others: " remaining-indexes))
+            (loop [[next-index & r] remaining-indexes]
+              (if next-index
+                (if-let [db-root (<? (read-db-root conn network dbid next-index))]
+                  (do
+                    (log/warn (str "Database " network "/" dbid " successfully loaded from index point: "
+                                   next-index ". The db should write out a new index upon the next transaction."))
+                    db-root)
+                  (do
+                    (log/warn (str "Database " network "/" dbid " could not be be loaded from index point: "
+                                   next-index "."))
+                    (recur r)))
+                (throw (ex-info (str "Database " network "/" dbid " could not be loaded at any index points: " all-indexes ".")
+                                {:status 400
+                                 :error  :db/missing-index-root})))))))))
+
 (defn reify-db
   "Reifies db at specified index point. If unable to read db-root at index, throws."
-  [conn network dbid blank-db index]
+  ([conn network dbid blank-db index] (reify-db conn network dbid blank-db index nil))
+  ([conn network dbid blank-db index ledger-info]
   (go-try
-    (let [db-root (read-db-root conn network dbid index)]
-      (when-not db-root
-        (throw (ex-info (str "Database " network "/" dbid " could not be loaded at index point: " index ".")
-                        {:status 400
-                         :error  :db/unavailable})))
-      (let [db  (reify-db-root conn blank-db (<? db-root))
+    (let [db-root (<? (most-current-db-root conn network dbid index ledger-info))]
+      (let [db  (reify-db-root conn blank-db db-root)
             db* (assoc db :schema (<? (schema/schema-map db)))]
-        (assoc db* :settings (<? (schema/setting-map db*)))))))
+        (assoc db* :settings (<? (schema/setting-map db*))))))))
 
 
 ;; TODO - should look to add some parallelism to block fetches

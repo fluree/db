@@ -92,7 +92,7 @@
   (go-try
    (let [{:keys [index], latest-block :block, :as ledger-info}
          (<? (load-ledger-info conn network dbid))]
-     (when-let [indexed-db (<? (storage/reify-db conn network dbid blank-db index))]
+     (when-let [indexed-db (<? (storage/reify-db conn network dbid blank-db index ledger-info))]
        (loop [db         indexed-db
               next-block (-> indexed-db :block inc)]
          (if (> next-block latest-block)
