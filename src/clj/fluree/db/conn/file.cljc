@@ -10,14 +10,15 @@
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.core :as conn-core]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.indexer.storage :as storage]
+            [fluree.db.indexer.storage :as index-storage]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.storage :as store])
+            [fluree.db.storage :as storage]
+            [fluree.db.storage.file :as file-storage])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -34,11 +35,11 @@
           hash     (crypto/sha2-256 bytes :hex)
           type-dir (name data-type)
           path     (str alias
-                          (when branch (str "/" branch))
-                          (str "/" type-dir "/")
-                          hash ".json")
+                        (when branch (str "/" branch))
+                        (str "/" type-dir "/")
+                        hash ".json")
 
-          {:keys [k hash v address]} (<? (store/write store path bytes))]
+          {:keys [hash address]} (<? (storage/write store path bytes))]
       {:name    path
        :hash    hash
        :json    json
@@ -47,7 +48,7 @@
 
 (defn read-data [conn address keywordize?]
   (go-try
-    (-> (<? (store/read (:store conn) address))
+    (-> (<? (storage/read (:store conn) address))
         (json/parse keywordize?))))
 
 (defn close
@@ -61,6 +62,8 @@
   conn-proto/iStorage
   (-c-read [conn commit-key] (read-data conn commit-key false))
   (-c-write [conn ledger commit-data] (write-data conn ledger :commit commit-data))
+  (-txn-read [conn txn-key] (read-data conn txn-key false))
+  (-txn-write [conn ledger txn-data] (write-data conn ledger :txn txn-data))
   (-index-file-write [conn ledger index-type index-data]
     (write-data conn ledger (str "index/" (name index-type)) index-data))
   (-index-file-read [conn index-address] (read-data conn index-address true))
@@ -87,12 +90,12 @@
     [conn {:keys [id leaf tempid] :as node}]
     (let [cache-key [::resolve id tempid]]
       (if (= :empty id)
-        (storage/resolve-empty-node node)
+        (index-storage/resolve-empty-node node)
         (conn-cache/lru-lookup
           lru-cache-atom
           cache-key
           (fn [_]
-            (storage/resolve-index-node conn node
+            (index-storage/resolve-index-node conn node
                                         (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
 
 #?(:cljs
@@ -137,18 +140,19 @@
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism store storage-path lru-cache-atom memory serializer nameservices]
-    :or {serializer (json-serde)} :as _opts}]
+  [{:keys [defaults parallelism storage-path lru-cache-atom memory serializer nameservices]
+    :or   {serializer (json-serde)} :as _opts}]
   (go
     (let [conn-id        (str (random-uuid))
           state          (conn-core/blank-state)
           nameservices*  (util/sequential
                            (or nameservices (default-file-nameservice storage-path)))
           cache-size     (conn-cache/memory->cache-size memory)
-          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
+          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))
+          file-store     (file-storage/open storage-path)]
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id              conn-id
-                            :store           store
+                            :store           file-store
                             :ledger-defaults (ledger-defaults defaults)
                             :serializer      serializer
                             :parallelism     parallelism
