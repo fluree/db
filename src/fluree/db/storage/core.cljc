@@ -218,10 +218,17 @@
         (let [data (<! (storage-read conn key))]
           (if (or (nil? data) (instance? #?(:clj Throwable :cljs js/Error) data))
             (async/close! return-ch)
-            (->> (serdeproto/-deserialize-leaf (serde conn) data)
-                 :flakes
-                 (sort flake/cmp-flakes-history)
-                 (async/put! return-ch))))
+            (let [his-data (try* (serdeproto/-deserialize-leaf (serde conn) data)
+                                 (catch* e
+                                         (log/error e (str "Error deserializing history file: " key " with error " (ex-message e)))
+                                         (log/warn (str "History file unavailable for node: " key
+                                                        ". Continuing to operate with no history for index node. "
+                                                        "Reindexing is recommended!"))
+                                         {:flakes []}))]
+              (->> his-data
+                   :flakes
+                   (sort flake/cmp-flakes-history)
+                   (async/put! return-ch)))))
         (catch* e
                 (error-fn)
                 (async/put! return-ch e)
