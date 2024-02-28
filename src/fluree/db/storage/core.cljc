@@ -146,7 +146,13 @@
           his-key       (str leaf-key "-his")
           data          {:flakes flakes
                          :his    his-key}
-          ser           (serdeproto/-serialize-leaf (serde conn) data)
+          ser           (try* (serdeproto/-serialize-leaf (serde conn) data)
+                              (catch* e
+                                      (log/error e (str "Error serializing leaf: " leaf-key " with error " (ex-message e)
+                                                        "\n" "Data: " (pr-str data)))
+                                      (throw (ex-info (str "Error serializing leaf: " leaf-key " with error " (ex-message e))
+                                                      {}
+                                                      e))))
           write-his-ch  (write-history conn history his-key nil)
           write-leaf-ch (storage-write conn leaf-key ser)]
       ;; write history and leaf node in parallel
