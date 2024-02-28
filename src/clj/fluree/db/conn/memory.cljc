@@ -1,6 +1,6 @@
 (ns fluree.db.conn.memory
   (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.indexer.storage :as storage]
+            [fluree.db.indexer.storage :as index-storage]
             [fluree.db.index :as index]
             [fluree.db.nameservice.memory :as ns-memory]
             [fluree.db.util.core :as util]
@@ -12,7 +12,8 @@
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]
-            [fluree.db.storage :as store]
+            [fluree.db.storage :as storage]
+            [fluree.db.storage.memory :as memory-storage]
             #?(:cljs [fluree.db.platform :as platform]))
   #?(:clj (:import (java.io Writer))))
 
@@ -25,10 +26,9 @@
   (go-try
     (let [json (json-ld/normalize-data data)
           hash (crypto/sha2-256 json)
-          {path :k
-           address :address
-           size :size}
-          (<? (store/write store hash data))]
+
+          {:keys [path address]}
+          (<? (storage/write store hash data))]
       {:name    path
        :hash    hash
        :json    json
@@ -38,7 +38,7 @@
 (defn- read-data
   [store address]
   (go-try
-    (let [data (<? (store/read store address))]
+    (let [data (<? (storage/read store address))]
       #?(:cljs (if (and platform/BROWSER (string? data))
                  (js->clj (.parse js/JSON data))
                  data)
@@ -55,6 +55,8 @@
   conn-proto/iStorage
   (-c-read [_ commit-key] (read-data store commit-key))
   (-c-write [_ _ledger commit-data] (write-data! store commit-data))
+  (-txn-read [_ txn-key] (read-data store txn-key))
+  (-txn-write [_ _ledger txn-data] (write-data! store txn-data))
 
   conn-proto/iConnection
   (-close [_] (close id state))
@@ -81,7 +83,7 @@
     [_ node]
     ;; all root index nodes will be empty
 
-    (storage/resolve-empty-node node)))
+    (index-storage/resolve-empty-node node)))
 
 #?(:cljs
    (extend-type MemoryConnection
@@ -109,20 +111,30 @@
 
 (defn connect
   "Creates a new memory connection."
-  [{:keys [parallelism lru-cache-atom memory defaults nameservices store]}]
+  [{:keys [parallelism lru-cache-atom memory defaults nameservices]}]
   (go-try
     (let [ledger-defaults (<? (ledger-defaults defaults))
           conn-id         (str (random-uuid))
           state           (conn-core/blank-state)
+          mem-store       (memory-storage/create)
           nameservices*   (util/sequential
                             (or nameservices
-                                (default-memory-nameservice (:storage-atom store))))
+                                ;; TODO: We should not reach inside the storage
+                                ;; implementation to reuse the contents atom
+                                ;; because that breaks the abstraction and
+                                ;; implicitly couples components that should be
+                                ;; independent. We should change the memory
+                                ;; nameservice to either use a storage
+                                ;; implementation explicitly, or to use an atom
+                                ;; independent of the data held in commit and
+                                ;; index storage.
+                                (default-memory-nameservice (:contents mem-store))))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
-                              :store           store
+                              :store           mem-store
                               :parallelism     parallelism
                               :msg-in-ch       (async/chan)
                               :msg-out-ch      (async/chan)

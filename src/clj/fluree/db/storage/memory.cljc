@@ -1,63 +1,49 @@
 (ns fluree.db.storage.memory
-  (:refer-clojure :exclude [read])
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.storage.proto :as store-proto]
-            [fluree.db.storage.util :as store-util]))
+            [fluree.db.storage :as storage]))
 
-(defn memory-address
-  [path]
-  (str "fluree:memory://" path))
+(def method-name "memory")
 
-(defn memory-write
-  [storage-atom k v {:keys [content-address?]}]
-  (let [hashable (if (store-util/hashable? v)
-                   v
-                   (pr-str v))
-        hash     (crypto/sha2-256 hashable)
-        k*       (if content-address?
-                   (str k hash)
-                   k)]
-    (swap! storage-atom assoc k* v)
-    (async/go
-      {:k k*
-       :address (memory-address k*)
-       :hash hash
-       :size (count hashable)})))
+(defrecord MemoryStore [contents]
+  storage/Store
+  (address [_ path]
+    (storage/build-fluree-address method-name path))
 
-(defn memory-list
-  [storage-atom prefix]
-  (async/go
-    (filter #(when (string? %) (str/starts-with? % prefix))
-            (keys storage-atom))))
+  (write [store path v]
+    (go
+      (let [hashable (if (storage/hashable? v)
+                       v
+                       (pr-str v))
+            hash     (crypto/sha2-256 hashable)]
+        (swap! contents assoc path v)
+        {:path    path
+         :address (storage/address store path)
+         :hash    hash
+         :size    (count hashable)})))
 
-(defn memory-read
-  [storage-atom address]
-  (let [k (:local (store-util/address-parts address))]
-    (async/go (get @storage-atom k))))
+  (list [_ prefix]
+    (go
+      (filter #(when (string? %) (str/starts-with? % prefix))
+              (keys contents))))
 
-(defn memory-delete
-  [storage-atom address]
-  (let [k (:local (store-util/address-parts address))]
-    (async/go (swap! storage-atom dissoc k))))
+  (read [_ address]
+    (go
+      (let [path (:local (storage/parse-address address))]
+        (get @contents path))))
 
-(defn memory-exists?
-  [storage-atom address]
-  (let [k (:local (store-util/address-parts address))]
-    (async/go (contains? @storage-atom k))))
+  (delete [_ address]
+    (go
+      (let [path (:local (storage/parse-address address))]
+        (swap! contents dissoc path))))
 
-(defrecord MemoryStore [storage-atom]
-  store-proto/Store
-  (address [_ k] (memory-address k))
-  (write [_ k v opts] (memory-write storage-atom k v opts))
-  (list [_ prefix] (memory-list storage-atom prefix))
-  (read [_ address] (memory-read storage-atom address))
-  (delete [_ address] (memory-delete storage-atom address))
-  (exists? [_ address] (memory-exists? storage-atom address)))
+  (exists? [_ address]
+    (go
+      (let [path (:local (storage/parse-address address))]
+        (contains? @contents path)))))
 
-(defn create-memory-store
-  [{:keys [:memory-store/storage-atom] :as config}]
-  (let [storage-atom (or storage-atom (atom {}))]
-    (map->MemoryStore {:config config
-                       :storage-atom storage-atom})))
+(defn create
+  []
+  (let [contents (atom {})]
+    (->MemoryStore contents)))

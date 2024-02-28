@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [alts! go]]
             [fluree.db.util.log :as log]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.policy :as perm]
@@ -8,20 +9,16 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.storage :as store]))
+            [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -214,16 +211,16 @@
    (stage db nil txn parsed-opts))
   ([{:keys [conn ledger] :as db} fuel-tracker txn parsed-opts]
    (go-try
-      (let [{:keys [context raw-txn did]} parsed-opts
+     (let [{:keys [context raw-txn did]} parsed-opts
+
            parsed-txn (q-parse/parse-txn txn context)
            db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                         (<? (perm/wrap-policy db policy-identity))
                         db)
-           {txn-id :address} (<? (store/write (:store conn)
-                                              (str (ledger-proto/-alias ledger) "/txn/")
-                                              (json-ld/normalize-data raw-txn)
-                                              {:content-address? true}))
 
-           tx-state   (->tx-state db* txn-id did)
-           flakes     (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
+           {txn-id :address}
+           (<? (conn-proto/-txn-write conn ledger raw-txn))
+
+           tx-state (->tx-state db* txn-id did)
+           flakes   (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
        (<? (flakes->final-db tx-state flakes))))))
