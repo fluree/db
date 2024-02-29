@@ -64,7 +64,7 @@
 (defn lookup
   [local-path ledger-address]
   (go-try
-    (when-let [read-address (read-address local-path ledger-alias)]
+    (when-let [read-address (read-address local-path ledger-address)]
       (file-address read-address))))
 
 
