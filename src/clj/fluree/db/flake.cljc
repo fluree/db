@@ -23,12 +23,12 @@
 (def max-p iri/max-sid)
 (def min-dt iri/min-sid)
 (def max-dt iri/max-sid)
-(def min-t 0)
-(def max-t util/max-long)
-(def min-op false)
-(def max-op true)
-(def min-meta util/min-integer)
-(def max-meta util/max-integer)
+(def ^:const min-t 0)
+(def ^:const max-t util/max-long)
+(def ^:const min-op false)
+(def ^:const max-op true)
+(def ^:const min-meta util/min-integer)
+(def ^:const max-meta util/max-integer)
 
 
 (deftype Flake [s p o dt t op m]
