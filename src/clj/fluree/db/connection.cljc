@@ -13,7 +13,6 @@
 (defprotocol iConnection
   (-close [conn] "Closes all resources for this connection")
   (-closed? [conn] "Indicates if connection is open or closed")
-  (-method [conn] "Returns connection method type (as keyword)")
   (-id [conn] "Returns internal id for connection object")
   (-new-indexer [conn opts] "Returns optional default new indexer object for a new ledger with optional opts.")
   (-did [conn] "Returns optional default did map if set at connection level")
@@ -47,10 +46,9 @@
   "Returns top-level state for connection"
   []
   (atom
-    {:ledger  {}
-     :await   {}
-     :stats   {}
-     :closed? false}))
+    {:ledger {}
+     :await  {}
+     :stats  {}}))
 
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held

@@ -1,7 +1,6 @@
 (ns fluree.db.ledger.json-ld
   (:require [clojure.core.async :as async :refer [<!]]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.db.json-ld :as jld-db]
@@ -13,7 +12,7 @@
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.connection :refer [register-ledger release-ledger]]
+            [fluree.db.connection :as connection :refer [register-ledger release-ledger]]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
             [fluree.db.util.log :as log])
@@ -156,7 +155,7 @@
                     " however, latest-t is more current: " latest-t)
           false)))))
 
-(defrecord JsonLDLedger [id address alias did indexer state cache conn method]
+(defrecord JsonLDLedger [id address alias did indexer state cache conn]
   ledger-proto/iCommit
   (-commit! [ledger db] (commit! ledger db nil))
   (-commit! [ledger db opts] (commit! ledger db opts))
@@ -228,7 +227,6 @@
           ledger-alias* (normalize-alias ledger-alias)
           address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
-          method-type   (connection/-method conn)
           ;; map of all branches and where they are branched from
           branches      {branch (branch/new-branch-map nil ledger-alias* branch ns-addresses)}]
       (map->JsonLDLedger
@@ -244,7 +242,6 @@
                                                :dag nil}}})
          :alias   ledger-alias*
          :address address
-         :method  method-type
          :cache   (atom {})
          :indexer indexer
          :conn    conn}))))
