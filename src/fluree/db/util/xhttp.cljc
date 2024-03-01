@@ -95,18 +95,28 @@
     #?(:clj (http/post url (assoc base-req :headers headers*
                                            :timeout request-timeout)
                        (fn [{:keys [error status body] :as response}]
-                         (if (or error (< 299 status))
-                           (do
-                             (throw-if-timeout response)
-                             (async/put!
-                               response-chan
-                               (format-error-response
-                                 url
-                                 (or error (ex-info "error response"
-                                                    response)))))
-                           (let [data (cond-> (bs/to-string body)
-                                              json? (json/parse keywordize-keys))]
-                             (async/put! response-chan data)))))
+                         (try ;; TODO - throw-if-timeout will throw but uncaught as `post` fn returns response-chan - adding a 'try/catch' for now
+                           ;; TODO - ideally throw-if-timeout should be part of the format-error-response fn to put ex on response-chan and can remove outer try/catch
+                           (if (or error (< 299 status))
+                             (do
+                               (throw-if-timeout response)
+                               (async/put!
+                                 response-chan
+                                 (format-error-response
+                                   url
+                                   (or error (ex-info "error response"
+                                                      response)))))
+                             (let [data (try (cond-> (bs/to-string body)
+                                                     json? (json/parse keywordize-keys))
+                                             (catch Exception e
+                                               ;; don't throw, as `data` will get exception and put on response-chan
+                                               (ex-info (str "JSON parsing error for xhttp post request to: " url
+                                                             " with error message: " (ex-message e))
+                                                        {:status 400 :error :db/invalid-json}
+                                                        e)))]
+                               (async/put! response-chan data)))
+                           (catch Exception e
+                             (async/put! response-chan e)))))
        :cljs
        (let [req {:url url
                   :method "post"

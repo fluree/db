@@ -31,38 +31,44 @@
 
 (defn lookup-address
   "Given IPNS address, performs lookup and returns latest ledger address."
-  [ipfs-endpoint ledger-name opts]
+  [ipfs-endpoint ipns-profile ledger-name opts]
   (go-try
-    (if-let [[proto address ledger] (address-parts ledger-name)]
-      (let [ipfs-addr (if (= "ipns" proto)
-                        (str "/ipns/" address)
-                        address)]
-        ;; address might be a directory, or could directly be a commit file - try to look up as directory first
-        (let [ledgers (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
-          (or (get ledgers ledger)
-              ledger-name)))
-      ledger-name)))
+    (let [ipns-address (if-let [[proto address ledger] (address-parts ledger-name)]
+                         address
+                         (<? (ipfs-keys/address ipfs-endpoint ipns-profile)))
+          ipfs-address (str "/ipns/" ipns-address)
+          ledgers      (<? (ipfs-dir/list-all ipfs-endpoint ipfs-address))]
+      (log/debug "Looking up address for ledger:" ledger-name "all ledgers under ipns address are:" ledgers)
+      (get ledgers ledger-name))))
 
-(defn get-address
-  "Returns IPNS address for a given key."
-  [ipfs-endpoint ipns-key ledger-alias opts]
+(defn ipns-address
+  "Returns IPNS address for a given ipns profile and ledger alias."
+  [ipfs-endpoint ipns-profile ledger-alias opts]
   (go-try
     (log/debug "Getting address for ledger alias:" ledger-alias)
-    (let [base-address (<? (ipfs-keys/address ipfs-endpoint ipns-key))]
-      (str "fluree:ipns://" base-address "/" ledger-alias))))
+    (let [base-address (<? (ipfs-keys/address ipfs-endpoint ipns-profile))]
+      (if base-address
+        (str "fluree:ipns://" base-address "/" ledger-alias)
+        (do
+          (log/warn "Throwing exception for IPNS get-address as provided profile does not exist: " ipns-profile
+                    ". IPNS profile keys found on server are: " (<? (ipfs-keys/list ipfs-endpoint)))
+          (throw (ex-info (str "IPNS profile: " ipns-profile " does not appear on the server. "
+                               "Therefore, unable to get address for ledger: " ledger-alias)
+                          {:status 400 :error :db/ipns-profile})))))))
+
 
 (defrecord IpnsNameService
   [ipfs-endpoint ipns-key base-address sync?]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias] (lookup-address ipfs-endpoint ledger-alias nil))
-  (-lookup [_ ledger-alias opts] (lookup-address ipfs-endpoint ledger-alias opts))
+  (-lookup [_ ledger-alias] (lookup-address ipfs-endpoint ipns-key ledger-alias nil))
+  (-lookup [_ ledger-alias opts] (lookup-address ipfs-endpoint ipns-key ledger-alias opts))
   (-push [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported IpfsNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported IpfsNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]
-    (get-address ipfs-endpoint ipns-key ledger-alias opts))
+    (ipns-address ipfs-endpoint ipns-key ledger-alias opts))
   (-alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
       alias))
