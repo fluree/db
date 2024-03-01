@@ -347,8 +347,7 @@
                                    :commit new-commit
                                    :prev-commit commit)
           {db**              :db
-           commit-file-meta  :commit-res
-           context-file-meta :context-res} (<? (do-commit+push db* opts*))
+           commit-file-meta  :commit-res} (<? (do-commit+push db* opts*))
           ;; if an indexing process is kicked off, returns a channel that contains a stream of updates for consensus
           indexing-ch       (if (idx-proto/-index? indexer db**)
                               (run-index db** opts* index-files-ch)
@@ -356,7 +355,6 @@
       (if file-data?
         {:data-file-meta    ledger-update-res
          :commit-file-meta  commit-file-meta
-         :context-file-meta context-file-meta
          :indexing-ch       indexing-ch
          :db                db**}
         db**))))
