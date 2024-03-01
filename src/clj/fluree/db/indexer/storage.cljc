@@ -18,10 +18,6 @@
   [conn]
   (:serializer conn))
 
-(defn ledger-root-key
-  [ledger-alias t]
-  (str ledger-alias "_root_" (util/zero-pad t 15)))
-
 (defn ledger-garbage-prefix
   [ledger-alias]
   (str/join "_" [ledger-alias "garbage"]))
