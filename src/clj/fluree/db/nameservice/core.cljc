@@ -4,7 +4,7 @@
             [fluree.db.connection :as connection]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.conn.core :refer [notify-ledger]]
+            [fluree.db.connection :refer [notify-ledger]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))

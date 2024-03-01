@@ -8,7 +8,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.core :as conn-core]
+            [fluree.db.connection :as connection]
             [fluree.db.method.remote.core :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
             [fluree.db.indexer.default :as idx-default]
@@ -65,13 +65,13 @@
      IPrintWithWriter
      (-pr-writer [conn w opts]
        (-write w "#RemoteConnection ")
-       (-write w (pr (conn-core/printer-map conn))))))
+       (-write w (pr (connection/printer-map conn))))))
 
 #?(:clj
    (defmethod print-method RemoteConnection [^RemoteConnection conn, ^Writer w]
      (.write w (str "#RemoteConnection "))
      (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
+       (pr (connection/printer-map conn)))))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
@@ -96,7 +96,7 @@
                                  :connected-to nil
                                  :stats        {:connected-at nil}})
           conn-id         (str (random-uuid))
-          state           (conn-core/blank-state)
+          state           (connection/blank-state)
           nameservices*   (util/sequential
                             (or nameservices
                                 ;; if default ns, and returns exception, throw - connection fails

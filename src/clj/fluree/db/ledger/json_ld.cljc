@@ -13,7 +13,7 @@
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.conn.core :refer [register-ledger release-ledger]]
+            [fluree.db.connection :refer [register-ledger release-ledger]]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
             [fluree.db.util.log :as log])

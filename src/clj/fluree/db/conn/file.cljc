@@ -8,7 +8,7 @@
             [fluree.db.index :as index]
             [fluree.db.connection :as connection]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.core :as conn-core]
+            [fluree.db.connection :as connection]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.indexer.default :as idx-default]
@@ -103,13 +103,13 @@
      IPrintWithWriter
      (-pr-writer [conn w opts]
        (-write w "#FileConnection ")
-       (-write w (pr (conn-core/printer-map conn))))))
+       (-write w (pr (connection/printer-map conn))))))
 
 #?(:clj
    (defmethod print-method FileConnection [^FileConnection conn, ^Writer w]
      (.write w (str "#FileConnection "))
      (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
+       (pr (connection/printer-map conn)))))
 
 (defn trim-last-slash
   [s]
@@ -144,7 +144,7 @@
     :or   {serializer (json-serde)} :as _opts}]
   (go
     (let [conn-id        (str (random-uuid))
-          state          (conn-core/blank-state)
+          state          (connection/blank-state)
           nameservices*  (util/sequential
                            (or nameservices (default-file-nameservice storage-path)))
           cache-size     (conn-cache/memory->cache-size memory)

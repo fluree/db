@@ -5,7 +5,7 @@
             [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.connection :as connection]
-            [fluree.db.conn.core :as conn-core]
+            [fluree.db.connection :as connection]
             [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.ledger.proto :as ledger-proto]
@@ -112,7 +112,7 @@
 (defmethod print-method S3Connection [^S3Connection conn, ^Writer w]
   (.write w (str "#S3Connection "))
   (binding [*out* w]
-    (pr (conn-core/printer-map conn))))
+    (pr (connection/printer-map conn))))
 
 (defn ledger-defaults
   [{:keys [did indexer]}]
@@ -145,7 +145,7 @@
                            s3-endpoint (assoc :endpoint-override s3-endpoint))
           client         (aws/client aws-opts)
           conn-id        (str (random-uuid))
-          state          (conn-core/blank-state)
+          state          (connection/blank-state)
           nameservices*  (util/sequential
                            (or nameservices (default-S3-nameservice client s3-bucket s3-prefix)))
           cache-size     (conn-cache/memory->cache-size memory)

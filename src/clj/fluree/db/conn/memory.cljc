@@ -8,7 +8,7 @@
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.core :as conn-core]
+            [fluree.db.connection :as connection]
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]
@@ -90,13 +90,13 @@
      IPrintWithWriter
      (-pr-writer [conn w opts]
        (-write w "#MemoryConnection ")
-       (-write w (pr (conn-core/printer-map conn))))))
+       (-write w (pr (connection/printer-map conn))))))
 
 #?(:clj
    (defmethod print-method MemoryConnection [^MemoryConnection conn, ^Writer w]
      (.write w (str "#MemoryConnection "))
      (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
+       (pr (connection/printer-map conn)))))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
@@ -115,7 +115,7 @@
   (go-try
     (let [ledger-defaults (<? (ledger-defaults defaults))
           conn-id         (str (random-uuid))
-          state           (conn-core/blank-state)
+          state           (connection/blank-state)
           mem-store       (memory-storage/create)
           nameservices*   (util/sequential
                             (or nameservices

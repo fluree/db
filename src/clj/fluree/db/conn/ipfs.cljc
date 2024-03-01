@@ -7,7 +7,7 @@
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async :refer [chan]]
-            [fluree.db.conn.core :as conn-core]
+            [fluree.db.connection :as connection]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.nameservice.ipns :as ns-ipns]
@@ -78,13 +78,13 @@
      IPrintWithWriter
      (-pr-writer [conn w opts]
        (-write w "#IPFSConnection ")
-       (-write w (pr (conn-core/printer-map conn))))))
+       (-write w (pr (connection/printer-map conn))))))
 
 #?(:clj
    (defmethod print-method IPFSConnection [^IPFSConnection conn, ^Writer w]
      (.write w (str "#IPFSConnection "))
      (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
+       (pr (connection/printer-map conn)))))
 
 (defn ledger-defaults
   [{:keys [did indexer]}]
@@ -118,7 +118,7 @@
           ledger-defaults (ledger-defaults defaults)
           memory          (or memory 1000000) ; default 1MB memory
           conn-id         (str (random-uuid))
-          state           (conn-core/blank-state)
+          state           (connection/blank-state)
           nameservices*   (util/sequential
                             (or nameservices (<? (default-ipns-nameservice ipfs-endpoint ipns))))
           cache-size      (conn-cache/memory->cache-size memory)
