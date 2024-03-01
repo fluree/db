@@ -31,7 +31,6 @@
   connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
-  (-id [_] id)
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      (log/warn "-msg-in: " msg)

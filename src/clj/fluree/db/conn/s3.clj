@@ -83,7 +83,6 @@
   connection/iConnection
   (-close [_] (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
-  (-id [_] id)
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))

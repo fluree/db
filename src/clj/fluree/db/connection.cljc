@@ -13,7 +13,6 @@
 (defprotocol iConnection
   (-close [conn] "Closes all resources for this connection")
   (-closed? [conn] "Indicates if connection is open or closed")
-  (-id [conn] "Returns internal id for connection object")
   (-new-indexer [conn opts] "Returns optional default new indexer object for a new ledger with optional opts.")
   (-did [conn] "Returns optional default did map if set at connection level")
   (-msg-in [conn msg] "Handler for incoming message from nameservices")
