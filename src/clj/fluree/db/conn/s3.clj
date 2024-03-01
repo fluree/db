@@ -84,7 +84,6 @@
   (-close [_] (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :s3)
-  (-parallelism [_] parallelism)
   (-id [_] id)
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]

@@ -42,7 +42,6 @@
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :ipfs)
-  (-parallelism [_] parallelism)
   (-id [_] id)
   (-new-indexer [_ opts] ;; default new ledger indexer
     (let [indexer-fn (:indexer ledger-defaults)]

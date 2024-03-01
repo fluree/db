@@ -14,7 +14,6 @@
   (-close [conn] "Closes all resources for this connection")
   (-closed? [conn] "Indicates if connection is open or closed")
   (-method [conn] "Returns connection method type (as keyword)")
-  (-parallelism [conn] "Returns parallelism integer to use for running multi-thread operations (1->8)")
   (-id [conn] "Returns internal id for connection object")
   (-new-indexer [conn opts] "Returns optional default new indexer object for a new ledger with optional opts.")
   (-did [conn] "Returns optional default did map if set at connection level")

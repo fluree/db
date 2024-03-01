@@ -62,7 +62,6 @@
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :memory)
-  (-parallelism [_] parallelism)
   (-id [_] id)
   (-new-indexer [_ opts] (idx-default/create opts)) ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))

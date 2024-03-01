@@ -72,7 +72,6 @@
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :file)
-  (-parallelism [_] parallelism)
   (-id [_] id)
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
