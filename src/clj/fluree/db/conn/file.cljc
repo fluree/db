@@ -6,7 +6,7 @@
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
             [fluree.db.index :as index]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.core :as conn-core]
             [fluree.db.util.log :as log :include-macros true]
@@ -59,7 +59,7 @@
 (defrecord FileConnection [id state ledger-defaults parallelism msg-in-ch store
                            nameservices serializer msg-out-ch lru-cache-atom]
 
-  conn-proto/iStorage
+  connection/iStorage
   (-c-read [conn commit-key] (read-data conn commit-key false))
   (-c-write [conn ledger commit-data] (write-data conn ledger :commit commit-data))
   (-txn-read [conn txn-key] (read-data conn txn-key false))
@@ -68,7 +68,7 @@
     (write-data conn ledger (str "index/" (name index-type)) index-data))
   (-index-file-read [conn index-address] (read-data conn index-address true))
 
-  conn-proto/iConnection
+  connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :file)

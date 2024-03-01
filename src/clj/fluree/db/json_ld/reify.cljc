@@ -5,7 +5,7 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.indexer.storage :as storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
@@ -265,7 +265,7 @@
 (defn read-commit
   [conn commit-address]
   (go-try
-    (let [commit-data   (<? (conn-proto/-c-read conn commit-address))
+    (let [commit-data   (<? (connection/-c-read conn commit-address))
           addr-key-path (if (contains? commit-data "credentialSubject")
                           ["credentialSubject" "address"]
                           ["address"])]
@@ -279,7 +279,7 @@
 (defn read-db
   [conn db-address]
   (go-try
-    (let [file-data (<? (conn-proto/-c-read conn db-address))
+    (let [file-data (<? (connection/-c-read conn db-address))
           db        (assoc file-data "f:address" db-address)]
       (json-ld/expand db))))
 

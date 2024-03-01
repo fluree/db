@@ -4,7 +4,7 @@
             [fluree.db.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.conn.cache :as conn-cache]
@@ -23,12 +23,12 @@
 (defrecord RemoteConnection [id server-state state lru-cache-atom serializer
                              nameservices ledger-defaults parallelism]
 
-  conn-proto/iStorage
+  connection/iStorage
   (-c-read [_ commit-key] (remote/remote-read state server-state commit-key false))
   (-txn-read [_ txn-key] (remote/remote-read state server-state txn-key false))
   (-index-file-read [_ index-address] (remote/remote-read state server-state index-address true))
 
-  conn-proto/iConnection
+  connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :remote)

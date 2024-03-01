@@ -1,7 +1,7 @@
 (ns fluree.db.ledger.json-ld
   (:require [clojure.core.async :as async :refer [<!]]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.db.json-ld :as jld-db]
@@ -210,7 +210,7 @@
                     (if (map? did)
                       did
                       {:id did})
-                    (conn-proto/-did conn))
+                    (connection/-did conn))
           indexer (cond
                     (satisfies? indexer/iIndex indexer)
                     indexer
@@ -221,14 +221,14 @@
                                     {:status 400 :error :db/invalid-indexer}))
 
                     :else
-                    (conn-proto/-new-indexer
+                    (connection/-new-indexer
                       conn (util/without-nils
                              {:reindex-min-bytes reindex-min-bytes
                               :reindex-max-bytes reindex-max-bytes})))
           ledger-alias* (normalize-alias ledger-alias)
           address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
-          method-type   (conn-proto/-method conn)
+          method-type   (connection/-method conn)
           ;; map of all branches and where they are branched from
           branches      {branch (branch/new-branch-map nil ledger-alias* branch ns-addresses)}]
       (map->JsonLDLedger
@@ -287,7 +287,7 @@
   then tries to resolve the ledger alias from the nameservice."
   [conn db-alias commit-map]
   (or (get-first-value commit-map const/iri-alias)
-      (->> (conn-proto/-nameservices conn)
+      (->> (connection/-nameservices conn)
            (some #(ns-proto/-alias % db-alias)))))
 
 ;; TODO - once we have a different delimiter than `/` for branch/t-value this can simplified

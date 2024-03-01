@@ -9,7 +9,7 @@
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.conn.proto :as conn-proto]))
+            [fluree.db.connection :as connection]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -58,7 +58,7 @@
   [{:keys [conn ledger] :as _db} idx-type changes-ch leaf]
   (go-try
     (let [ser   (serdeproto/-serialize-leaf (serde conn) leaf)
-          res   (<? (conn-proto/-index-file-write conn ledger idx-type ser))
+          res   (<? (connection/-index-file-write conn ledger idx-type ser))
           leaf' (assoc leaf :id (:address res))]
       (notify-new-index-file changes-ch leaf' res)
       leaf')))
@@ -69,7 +69,7 @@
   [{:keys [conn ledger] :as _db} idx-type data]
   (go-try
     (let [ser (serdeproto/-serialize-branch (serde conn) data)
-          res (<? (conn-proto/-index-file-write conn ledger idx-type ser))]
+          res (<? (connection/-index-file-write conn ledger idx-type ser))]
       res)))
 
 (defn write-branch
@@ -97,7 +97,7 @@
                     :block        t
                     :garbage      garbage}
           ser      (serdeproto/-serialize-garbage (serde conn) data)
-          res      (<? (conn-proto/-index-file-write conn ledger :garbage ser))
+          res      (<? (connection/-index-file-write conn ledger :garbage ser))
           garbage' (assoc data :address (:address res))]
       (notify-new-index-file changes-ch garbage' res)
       garbage')))
@@ -137,7 +137,7 @@
                         :prevIndex       (or (:indexed stats) 0)
                         :namespace-codes namespace-codes}
           ser          (serdeproto/-serialize-db-root (serde conn) data)
-          res          (<? (conn-proto/-index-file-write conn ledger :root ser))]
+          res          (<? (connection/-index-file-write conn ledger :root ser))]
       (notify-new-index-file changes-ch data res)
       res)))
 
@@ -145,13 +145,13 @@
 (defn read-branch
   [{:keys [serializer] :as conn} key]
   (go-try
-    (when-let [data (<? (conn-proto/-index-file-read conn key))]
+    (when-let [data (<? (connection/-index-file-read conn key))]
       (serdeproto/-deserialize-branch serializer data))))
 
 (defn read-leaf
   [{:keys [serializer] :as conn} key]
   (go-try
-    (when-let [data (<? (conn-proto/-index-file-read conn key))]
+    (when-let [data (<? (connection/-index-file-read conn key))]
       (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
@@ -195,7 +195,7 @@
   [conn ledger-alias t]
   (go-try
     (let [key  (ledger-garbage-key ledger-alias t)
-          data (<? (conn-proto/-index-file-read conn key))]
+          data (<? (connection/-index-file-read conn key))]
       (when data
         (serdeproto/-deserialize-garbage (serde conn) data)))))
 
@@ -204,7 +204,7 @@
   "Returns all data for a db index root of a given t."
   ([conn idx-address]
    (go-try
-     (let [data (<? (conn-proto/-index-file-read conn idx-address))]
+     (let [data (<? (connection/-index-file-read conn idx-address))]
        (when data
          (serdeproto/-deserialize-db-root (serde conn) data))))))
 

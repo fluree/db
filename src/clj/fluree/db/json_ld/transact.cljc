@@ -1,7 +1,7 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [alts! go]]
             [fluree.db.util.log :as log]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.policy :as perm]
@@ -219,7 +219,7 @@
                         db)
 
            {txn-id :address}
-           (<? (conn-proto/-txn-write conn ledger raw-txn))
+           (<? (connection/-txn-write conn ledger raw-txn))
 
            tx-state (->tx-state db* txn-id did)
            flakes   (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]

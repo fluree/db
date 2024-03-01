@@ -1,7 +1,7 @@
 (ns fluree.db.nameservice.core
   (:refer-clojure :exclude [exists?])
   (:require [clojure.string :as str]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.core :refer [notify-ledger]]
@@ -11,7 +11,7 @@
 
 (defn nameservices
   [conn]
-  (conn-proto/-nameservices conn))
+  (connection/-nameservices conn))
 
 (defn relative-ledger-alias?
   [ledger-alias]

@@ -9,7 +9,7 @@
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.util.async :refer [<? go-try]]
@@ -281,7 +281,7 @@
           signed-commit (if did
                           (<? (cred/generate jld-commit private (:id did)))
                           jld-commit)
-          commit-res    (<? (conn-proto/-c-write conn ledger signed-commit)) ;; write commit credential
+          commit-res    (<? (connection/-c-write conn ledger signed-commit)) ;; write commit credential
           new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
           db*           (assoc db :commit new-commit**)
           db**          (if (new-t? ledger-commit commit)
@@ -332,7 +332,7 @@
     (let [{:keys [id-key did message tag file-data? index-files-ch] :as opts*} (enrich-commit-opts db opts)
           ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
           dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
-          ledger-update-res (<? (conn-proto/-c-write conn ledger ledger-update)) ;; write commit data
+          ledger-update-res (<? (connection/-c-write conn ledger ledger-update)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
           [[txn-id author]] txns
           base-commit-map   {:old-commit commit, :issuer did

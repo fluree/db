@@ -1,4 +1,4 @@
-(ns fluree.db.conn.proto)
+(ns fluree.db.connection)
 
 #?(:clj (set! *warn-on-reflection* true))
 

@@ -4,7 +4,7 @@
             [clojure.core.async :as async :refer [go]]
             [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.conn.core :as conn-core]
             [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
@@ -66,7 +66,7 @@
 
 
 (defrecord S3Connection [id state ledger-defaults parallelism lru-cache-atom nameservices store]
-  conn-proto/iStorage
+  connection/iStorage
   (-c-read [conn commit-key] (read-commit conn commit-key))
   (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
   (-txn-read [_ txn-key]
@@ -80,7 +80,7 @@
   (-index-file-read [conn index-address]
     (read-index conn index-address))
 
-  conn-proto/iConnection
+  connection/iConnection
   (-close [_] (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :s3)

@@ -5,7 +5,7 @@
             [fluree.db.nameservice.memory :as ns-memory]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.core :as conn-core]
@@ -52,13 +52,13 @@
 (defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom store
                              parallelism msg-in-ch msg-out-ch nameservices data-atom]
 
-  conn-proto/iStorage
+  connection/iStorage
   (-c-read [_ commit-key] (read-data store commit-key))
   (-c-write [_ _ledger commit-data] (write-data! store commit-data))
   (-txn-read [_ txn-key] (read-data store txn-key))
   (-txn-write [_ _ledger txn-data] (write-data! store txn-data))
 
-  conn-proto/iConnection
+  connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :memory)
