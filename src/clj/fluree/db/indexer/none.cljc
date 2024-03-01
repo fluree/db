@@ -1,5 +1,5 @@
 (ns fluree.db.indexer.none
-  (:require [fluree.db.indexer.proto :as idx-proto]))
+  (:require [fluree.db.indexer :as indexer]))
 
 ;; this is an indexer that never returns a new index
 
@@ -12,7 +12,7 @@
 
 
 (defrecord IndexerNone []
-  idx-proto/iIndex
+  indexer/iIndex
   (-index? [_ db] false)
   (-halt? [_ db] false)
   (-index [indexer db] (not-supported! "perform index!"))

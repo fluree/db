@@ -9,7 +9,7 @@
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
-            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.indexer :as indexer]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
@@ -98,7 +98,7 @@
 (defn close-ledger
   "Shuts down ledger and resources."
   [{:keys [indexer cache state conn alias] :as _ledger}]
-  (idx-proto/-close indexer)
+  (indexer/-close indexer)
   (reset! state {:closed? true})
   (reset! cache {})
   (release-ledger conn alias)) ;; remove ledger from conn cache
@@ -212,7 +212,7 @@
                       {:id did})
                     (conn-proto/-did conn))
           indexer (cond
-                    (satisfies? idx-proto/iIndex indexer)
+                    (satisfies? indexer/iIndex indexer)
                     indexer
 
                     indexer

@@ -1,5 +1,5 @@
 (ns fluree.db.indexer.default
-  (:require [fluree.db.indexer.proto :as idx-proto]
+  (:require [fluree.db.indexer :as indexer]
             [fluree.db.index :as index]
             [fluree.db.indexer.storage :as storage]
             [fluree.db.flake :as flake]
@@ -84,7 +84,7 @@
 (defn close
   "Closing indexer, sends events to all watchers and clears state atom."
   [{:keys [state-atom] :as indexer}]
-  (idx-proto/-push-event indexer (format-watch-event :close nil))
+  (indexer/-push-event indexer (format-watch-event :close nil))
   ;; TODO - if currently indexing, should stop and garbage collect any in-progress written index files
   (remove-all-watch-events state-atom))
 
@@ -457,7 +457,7 @@
 
                 refresh-ch
                 ([{:keys [garbage], refreshed-db :db, :as status}]
-                 (let [indexed-db    (-> (idx-proto/-empty-novelty indexer refreshed-db)
+                 (let [indexed-db    (-> (indexer/-empty-novelty indexer refreshed-db)
                                          (assoc-in [:stats :indexed] t))
                        ;; TODO - ideally issue garbage/root writes to RAFT together
                        ;;        as a tx, currently requires waiting for both
@@ -485,7 +485,7 @@
 
 (defn push-index-event
   [indexer event-type event-meta]
-  (idx-proto/-push-event
+  (indexer/-push-event
     indexer
     (format-watch-event event-type event-meta)))
 
@@ -564,7 +564,7 @@
 
 
 (defrecord IndexerDefault [reindex-min-bytes reindex-max-bytes state-atom]
-  idx-proto/iIndex
+  indexer/iIndex
   (-index? [_ db] (novelty-min? reindex-min-bytes db))
   (-halt? [_ db] (novelty-max? reindex-max-bytes db))
   (-index [indexer db] (do-index indexer db nil))

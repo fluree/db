@@ -15,7 +15,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
-            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.nameservice.core :as nameservice]
@@ -319,7 +319,7 @@
   (let [{:keys [indexer]} ledger
         update-fn (update-commit-fn db commit-opts)]
     ;; call indexing process with update-commit-fn to push out an updated commit once complete
-    (idx-proto/-index indexer db {:update-commit update-fn
+    (indexer/-index indexer db {:update-commit update-fn
                                   :changes-ch    changes-ch})))
 
 
@@ -349,7 +349,7 @@
           {db**              :db
            commit-file-meta  :commit-res} (<? (do-commit+push db* opts*))
           ;; if an indexing process is kicked off, returns a channel that contains a stream of updates for consensus
-          indexing-ch       (if (idx-proto/-index? indexer db**)
+          indexing-ch       (if (indexer/-index? indexer db**)
                               (run-index db** opts* index-files-ch)
                               (when index-files-ch (async/close! index-files-ch)))]
       (if file-data?

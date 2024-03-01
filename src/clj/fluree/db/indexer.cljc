@@ -1,4 +1,4 @@
-(ns fluree.db.indexer.proto
+(ns fluree.db.indexer
   (:refer-clojure :exclude [-add-watch -remove-watch]))
 
 #?(:clj (set! *warn-on-reflection* true))
