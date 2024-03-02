@@ -198,7 +198,7 @@
 
 (defn force-index!
   [db]
-  (commit/run-index db {:branch (:branch db)} (async/chan)))
+  (commit/run-index db {:branch (:branch db)}))
 
 (defn retry-exists?
   "Retry calling exists? until it returns true or max-attempts."

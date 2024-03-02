@@ -313,12 +313,14 @@
 
   If optional changes-ch is provided, will stream indexing updates to it
   so it can be replicated via consensus to other servers as needed."
-  [{:keys [ledger] :as db} commit-opts changes-ch]
-  (let [{:keys [indexer]} ledger
-        update-fn (update-commit-fn db commit-opts)]
-    ;; call indexing process with update-commit-fn to push out an updated commit once complete
-    (indexer/-index indexer db {:update-commit update-fn
-                                  :changes-ch    changes-ch})))
+  ([db commit-opts]
+   (run-index db commit-opts nil))
+  ([{:keys [ledger] :as db} commit-opts changes-ch]
+   (let [{:keys [indexer]} ledger
+         update-fn (update-commit-fn db commit-opts)]
+     ;; call indexing process with update-commit-fn to push out an updated commit once complete
+     (indexer/-index indexer db {:update-commit update-fn
+                                 :changes-ch    changes-ch}))))
 
 
 (defn commit
