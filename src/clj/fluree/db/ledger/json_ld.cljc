@@ -52,14 +52,14 @@
   newer than provided db, updates index before storing.
 
   If index in provided db is newer, updates latest index held in ledger state."
-  [{:keys [state] :as ledger} branch-name db force?]
+  [{:keys [state] :as ledger} branch-name db]
   (log/debug "Attempting to update ledger's db with new commit:"
              (:alias ledger) "branch:" branch-name)
   (when-not (get-in @state [:branches branch-name])
     (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                          "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
                     {:status 400 :error :db/invalid-branch})))
-  (-> (swap! state update-in [:branches branch-name] branch/update-commit db force?)
+  (-> (swap! state update-in [:branches branch-name] branch/update-commit db)
       (get-in [:branches branch-name :commit-db])))
 
 (defn status
@@ -133,7 +133,7 @@
         (let [updated-db  (<? (jld-reify/merge-commit conn latest-db false [commit proof]))
               commit-map  (commit-data/json-ld->map commit (select-keys updated-db index/types))
               updated-db* (assoc updated-db :commit commit-map)]
-          (commit-update ledger branch updated-db* false))
+          (commit-update ledger branch updated-db*))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
         (> commit-t (inc latest-t))
@@ -167,8 +167,7 @@
   (-db-update [ledger db] (db-update ledger db))
   (-branch [ledger] (branch-meta ledger nil))
   (-branch [ledger branch] (branch-meta ledger branch))
-  (-commit-update [ledger branch db] (commit-update ledger branch db false))
-  (-commit-update [ledger branch db force?] (commit-update ledger branch db force?))
+  (-commit-update [ledger branch db] (commit-update ledger branch db))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))
   (-did [_] did)
