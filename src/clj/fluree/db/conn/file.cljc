@@ -16,7 +16,7 @@
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.ledger :as ledger]
             [fluree.db.storage :as storage]
             [fluree.db.storage.file :as file-storage])
   #?(:clj (:import (java.io Writer))))
@@ -26,8 +26,8 @@
 (defn- write-data
   [{:keys [store] :as _conn} ledger data-type data]
   (go-try
-    (let [alias    (ledger-proto/-alias ledger)
-          branch   (name (:name (ledger-proto/-branch ledger)))
+    (let [alias    (ledger/-alias ledger)
+          branch   (name (:name (ledger/-branch ledger)))
           json     (if (string? data)
                      data
                      (json-ld/normalize-data data))

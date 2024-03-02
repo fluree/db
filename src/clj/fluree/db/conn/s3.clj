@@ -8,7 +8,7 @@
             [fluree.db.connection :as connection]
             [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.ledger :as ledger]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.util.async :refer [<? go-try]]
@@ -25,8 +25,8 @@
 (defn write-data
   [{:keys [store] :as _conn} ledger data-type data]
   (go-try
-    (let [alias    (ledger-proto/-alias ledger)
-          branch   (-> ledger ledger-proto/-branch :name name)
+    (let [alias    (ledger/-alias ledger)
+          branch   (-> ledger ledger/-branch :name name)
           json     (if (string? data)
                      data
                      (json-ld/normalize-data data))

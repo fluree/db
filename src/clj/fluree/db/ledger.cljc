@@ -1,4 +1,4 @@
-(ns fluree.db.ledger.proto)
+(ns fluree.db.ledger)
 
 #?(:clj (set! *warn-on-reflection* true))
 

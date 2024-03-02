@@ -4,7 +4,7 @@
   (:require [clojure.core.async :as async]
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.ledger :as ledger]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.dataset :as dataset]
             [fluree.db.query.fql :as fql]
@@ -185,7 +185,7 @@
    (try*
      (let [address (<? (nameservice/primary-address conn alias nil))
            ledger  (<? (jld-ledger/load conn address))
-           db      (ledger-proto/-db ledger)]
+           db      (ledger/-db ledger)]
        (<? (restrict-db db t context opts)))
      (catch* e
        (throw (contextualize-ledger-400-error

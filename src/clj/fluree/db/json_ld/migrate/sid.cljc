@@ -6,14 +6,14 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.reify :as reify]
-            [fluree.db.ledger.json-ld :as ledger]
+            [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.indexer.default :as indexer]
             [fluree.db.index :as index]
             [fluree.db.db.json-ld :as db]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log :include-macros true]
             [clojure.core.async :as async]))
 
@@ -136,10 +136,10 @@
           last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
           all-commit-tuples (<? (reify/trace-commits conn last-commit-tuple 1))
           first-commit      (ffirst all-commit-tuples)
-          ledger-alias      (ledger/commit->ledger-alias conn address first-commit)
+          ledger-alias      (jld-ledger/commit->ledger-alias conn address first-commit)
           branch            (keyword (get-first-value first-commit const/iri-branch))
-          ledger            (<? (ledger/->ledger conn ledger-alias {:branch branch}))
+          ledger            (<? (jld-ledger/->ledger conn ledger-alias {:branch branch}))
           db                (<? (merge-commits ledger all-commit-tuples))
           indexed-db        (<? (index db branch))]
-      (ledger-proto/-db-update ledger indexed-db)
+      (ledger/-db-update ledger indexed-db)
       ledger)))

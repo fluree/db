@@ -9,7 +9,7 @@
             [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.connection :as connection]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.ledger :as ledger]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.util.async :refer [<? go-try]]
             #?(:clj  [clojure.core.async :as async]
@@ -170,11 +170,11 @@
                           stringify-context)
         private*      (or private
                           (:private did)
-                          (:private (ledger-proto/-did ledger)))
+                          (:private (ledger/-did ledger)))
         did*          (or (some-> private*
                                   did-from-private)
                           did
-                          (ledger-proto/-did ledger))
+                          (ledger/-did ledger))
         ctx-used-atom (atom {})
         compact-fn    (json-ld/compact-fn context* ctx-used-atom)
         commit-time   (util/current-time-iso)]
@@ -182,7 +182,7 @@
     {:message        message
      :tag            tag
      :file-data?     file-data? ;; if instead of returning just a db from commit, return also the written files (for consensus)
-     :alias          (ledger-proto/-alias ledger)
+     :alias          (ledger/-alias ledger)
      :t              t
      :v              0
      :prev-commit    (:address commit)
@@ -221,7 +221,7 @@
   [{:keys [ledger branch t] :as db} opts]
   (go-try
     (let [committed-t (-> ledger
-                          (ledger-proto/-status branch)
+                          (ledger/-status branch)
                           branch/latest-commit-t)
           new-flakes  (commit-flakes db)]
       (when (not= t (inc committed-t))
@@ -272,7 +272,7 @@
   [{:keys [ledger commit] :as db} {:keys [branch did private] :as _opts}]
   (go-try
     (let [{:keys [conn state]} ledger
-          ledger-commit (:commit (ledger-proto/-status ledger branch))
+          ledger-commit (:commit (ledger/-status ledger branch))
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
           [new-commit* jld-commit] (commit-data/commit-jsonld new-commit)
@@ -285,7 +285,7 @@
           db**          (if (new-t? ledger-commit commit)
                           (commit-data/add-commit-flakes (:prev-commit db) db*)
                           db*)
-          db***         (ledger-proto/-commit-update ledger branch (dissoc db** :txns))
+          db***         (ledger/-commit-update ledger branch (dissoc db** :txns))
           push-res      (<? (nameservice/push! conn (assoc new-commit**
                                                            :meta commit-res
                                                            :ledger-state state)))]

@@ -1,6 +1,6 @@
 (ns fluree.db.ledger.json-ld
   (:require [clojure.core.async :as async :refer [<!]]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.ledger :as ledger]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.db.json-ld :as jld-db]
@@ -32,7 +32,7 @@
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn db
   [ledger {:keys [branch]}]
-  (let [branch-meta (ledger-proto/-branch ledger branch)]
+  (let [branch-meta (ledger/-branch ledger branch)]
     ;; if branch is nil, will return default
     (when-not branch-meta
       (throw (ex-info (str "Invalid branch: " branch ".")
@@ -90,7 +90,7 @@
 (defn commit!
   [ledger db opts]
   (let [opts* (normalize-opts opts)
-        db*   (or db (ledger-proto/-db ledger (:branch opts*)))]
+        db*   (or db (ledger/-db ledger (:branch opts*)))]
     (jld-commit/commit ledger db* opts*)))
 
 
@@ -122,7 +122,7 @@
           commit-t  (-> expanded-commit
                         (get-first const/iri-data)
                         (get-first-value const/iri-t))
-          latest-db (ledger-proto/-db ledger {:branch branch})
+          latest-db (ledger/-db ledger {:branch branch})
           latest-t  (- (:t latest-db))]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
                  "where current cached db t value is:" latest-t)
@@ -156,12 +156,12 @@
           false)))))
 
 (defrecord JsonLDLedger [id address alias did indexer state cache conn]
-  ledger-proto/iCommit
+  ledger/iCommit
   (-commit! [ledger db] (commit! ledger db nil))
   (-commit! [ledger db opts] (commit! ledger db opts))
   (-notify [ledger expanded-commit] (notify ledger expanded-commit))
 
-  ledger-proto/iLedger
+  ledger/iLedger
   (-db [ledger] (db ledger nil))
   (-db [ledger opts] (db ledger opts))
   (-db-update [ledger db] (db-update ledger db))
@@ -254,8 +254,8 @@
        (if (seq include)
          ;; includes other ledgers - experimental
          (let [db* (<? (include-dbs conn db include))]
-           (ledger-proto/-db-update ledger db*))
-         (ledger-proto/-db-update ledger db))))))
+           (ledger/-db-update ledger db*))
+         (ledger/-db-update ledger db))))))
 
 (defn create*
   [conn ledger-alias {:keys [include] :as opts}]
@@ -311,9 +311,9 @@
           ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
           ledger       (<? (create* conn ledger-alias {:branch branch}))
-          db           (ledger-proto/-db ledger)
+          db           (ledger/-db ledger)
           db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
-      (ledger-proto/-commit-update ledger branch db*)
+      (ledger/-commit-update ledger branch db*)
       (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
       (async/put! ledger-chan ledger) ; note, ledger can be an exception!
       ledger)))
