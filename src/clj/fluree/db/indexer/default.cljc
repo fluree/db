@@ -4,7 +4,7 @@
             [fluree.db.indexer.storage :as storage]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [clojure.core.async :as async]
+            [clojure.core.async :as async :refer [>! go]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
@@ -162,7 +162,7 @@
        boolean))
 
 (defn update-branch
-  [{:keys [comparator], branch-t :t, :as branch} idx t child-nodes]
+  [{:keys [comparator], branch-t :t, :as branch} t child-nodes]
   (if (some-update-after? branch-t child-nodes)
     (let [children    (apply index/child-map comparator child-nodes)
           size        (->> child-nodes
@@ -189,12 +189,12 @@
         not-leftmost))
 
 (defn rebalance-children
-  [branch idx t child-nodes]
+  [branch t child-nodes]
   (let [target-count (/ *overflow-children* 2)]
     (->> child-nodes
          (partition-all target-count)
          (map (fn [kids]
-                (update-branch branch idx t kids)))
+                (update-branch branch t kids)))
          update-sibling-leftmost)))
 
 (defn filter-predicates
@@ -298,12 +298,12 @@
                         (vswap! stack pop)
                         (xf result* child))
                  (if (overflow-children? child-nodes)
-                   (let [new-branches (rebalance-children node idx t child-nodes)
+                   (let [new-branches (rebalance-children node t child-nodes)
                          result**     (reduce xf result* new-branches)]
                      (recur new-branches
                             stack*
                             result**))
-                   (let [branch (update-branch node idx t child-nodes)]
+                   (let [branch (update-branch node t child-nodes)]
                      (vswap! stack conj branch)
                      result*)))))))
 
@@ -352,10 +352,8 @@
           (do (log/debug "Writing index leaf:" display-node)
               (<? (storage/write-leaf db idx changes-ch node)))
           (do (log/debug "Writing index branch:" display-node)
-              (->> node
-                   (update-branch-ids updated-ids)
-                   (storage/write-branch db idx changes-ch)
-                   <?)))
+              (let [node* (update-branch-ids updated-ids node)]
+                (<? (storage/write-branch db idx changes-ch node*)))))
         (catch* e
                 (log/error e
                            "Error writing novel index node:" display-node)
