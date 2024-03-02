@@ -4,7 +4,6 @@
             [fluree.db.connection :as connection]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.connection :refer [notify-ledger]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -80,6 +79,26 @@
               commit-address
               (recur (rest nameservices*)))))))))
 
+(defn read-latest-commit
+  [conn resource-address]
+  (go-try
+    (let [commit-addr (<? (lookup-commit conn resource-address))
+          _           (when-not commit-addr
+                        (throw (ex-info (str "Unable to load. No commit exists for: " resource-address)
+                                        {:status 400 :error :db/invalid-commit-address})))
+          commit-data (<? (connection/-c-read conn commit-addr))]
+      (assoc commit-data "address" commit-addr))))
+
+(defn file-read?
+  [address]
+  (str/ends-with? address ".json"))
+
+(defn read-resource
+  [conn resource-address]
+  (if file-read?
+    (connection/-c-read conn resource-address)
+    (read-latest-commit conn resource-address)))
+
 (defn exists?
   "Checks nameservices on a connection and returns true for the
   first one that knows given ledger-alias exists."
@@ -104,7 +123,7 @@
                              ledger-alias (get msg "ledger")
                              data         (get msg "data")]
                          (if (= "new-commit" action)
-                           (notify-ledger conn data)
+                           (connection/notify-ledger conn data)
                            (log/info "New subscritipn message with action: " action "received, ignored."))))]
     (go-try
       (loop [nameservices* nameservices]
