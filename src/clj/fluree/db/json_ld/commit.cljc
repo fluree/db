@@ -6,7 +6,6 @@
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.connection :as connection]
@@ -30,7 +29,7 @@
   (compact-fn (iri/decode-sid db sid)))
 
 (defn- subject-block-pred
-  [db iri-map compact-fn list? p-flakes]
+  [db compact-fn list? p-flakes]
   (go-try
     (loop [[p-flake & r'] p-flakes
            all-refs? nil
@@ -67,22 +66,22 @@
   {"@list" (->> objs (sort-by :i) (map #(dissoc % :i)))})
 
 (defn- subject-block
-  [s-flakes db iri-map ^clojure.lang.Volatile ctx compact-fn]
+  [s-flakes db ^clojure.lang.Volatile ctx compact-fn]
   (go-try
     (loop [[p-flakes & r] (partition-by flake/p s-flakes)
-           acc nil]
-      (let [fflake          (first p-flakes)
-            list?           (-> fflake flake/m :i)
-            p-iri           (-> fflake flake/p (get-s-iri db compact-fn))
-            [objs all-refs?] (<? (subject-block-pred db iri-map compact-fn
-                                                     list? p-flakes))
-            handle-all-refs (partial set-refs-type-in-ctx ctx p-iri)
-            objs*           (cond-> objs
-                                    ;; next line is for compatibility with json-ld/parse-type's expectations; should maybe revisit
-                                    (and all-refs? (not list?)) handle-all-refs
-                                    list? handle-list-values
-                                    (= 1 (count objs)) first)
-            next-acc        (assoc acc p-iri objs*)]
+           acc            nil]
+      (let [fflake           (first p-flakes)
+            list?            (-> fflake flake/m :i)
+            p-iri            (-> fflake flake/p (get-s-iri db compact-fn))
+            [objs all-refs?] (<? (subject-block-pred db compact-fn list?
+                                                     p-flakes))
+            handle-all-refs  (partial set-refs-type-in-ctx ctx p-iri)
+            objs*            (cond-> objs
+                               ;; next line is for compatibility with json-ld/parse-type's expectations; should maybe revisit
+                               (and all-refs? (not list?)) handle-all-refs
+                               list?                       handle-list-values
+                               (= 1 (count objs))          first)
+            next-acc         (assoc acc p-iri objs*)]
         (if (seq r)
           (recur r next-acc)
           next-acc)))))
@@ -99,14 +98,13 @@
   [flakes db {:keys [compact-fn id-key type-key] :as _opts}]
   (go-try
     (log/trace "generate-commit flakes:" flakes)
-    (let [id->iri (volatile! (jld-ledger/predefined-sids-compact compact-fn))
-          ctx     (volatile! {})]
+    (let [ctx (volatile! {})]
       (loop [[s-flakes & r] (partition-by flake/s flakes)
-             assert  []
-             retract []]
+             assert         []
+             retract        []]
         (if s-flakes
-          (let [sid            (flake/s (first s-flakes))
-                s-iri          (get-s-iri sid db compact-fn)
+          (let [sid   (flake/s (first s-flakes))
+                s-iri (get-s-iri sid db compact-fn)
                 [assert* retract*]
                 (if (and (= 1 (count s-flakes))
                          (= const/$rdfs:Class (->> s-flakes first flake/o))
@@ -115,19 +113,19 @@
                   ;; (they are implied when used in rdf:type statements)
                   [assert retract]
                   (let [{assert-flakes  true,
-                         retract-flakes false} (group-by flake/op s-flakes)
+                         retract-flakes false}
+                        (group-by flake/op s-flakes)
+
                         s-assert  (when assert-flakes
-                                    (-> (<? (subject-block assert-flakes db
-                                                           id->iri ctx compact-fn))
+                                    (-> (<? (subject-block assert-flakes db ctx compact-fn))
                                         (assoc id-key s-iri)))
                         s-retract (when retract-flakes
-                                    (-> (<? (subject-block retract-flakes db
-                                                           id->iri ctx compact-fn))
+                                    (-> (<? (subject-block retract-flakes db ctx compact-fn))
                                         (assoc id-key s-iri)))]
                     [(cond-> assert
-                             s-assert (conj s-assert))
+                       s-assert (conj s-assert))
                      (cond-> retract
-                             s-retract (conj s-retract))]))]
+                       s-retract (conj s-retract))]))]
             (recur r assert* retract*))
           {:refs-ctx (dissoc @ctx type-key) ; @type will be marked as @type: @id, which is implied
            :assert   assert
