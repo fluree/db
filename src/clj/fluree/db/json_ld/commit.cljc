@@ -327,14 +327,20 @@
   returns a db with an updated :commit."
   [{:keys [conn indexer] :as ledger} {:keys [t stats commit txns] :as db} opts]
   (go-try
-    (let [{:keys [id-key did message tag file-data? index-files-ch] :as opts*} (enrich-commit-opts db opts)
+    (let [{:keys [id-key did message tag file-data? index-files-ch] :as opts*}
+          (enrich-commit-opts db opts)
+
           ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
           dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
           ledger-update-res (<? (connection/-c-write conn ledger ledger-update)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
           [[txn-id author]] txns
-          base-commit-map   {:old-commit commit, :issuer did
-                             :message    message, :tag tag, :dbid dbid, :t t
+          base-commit-map   {:old-commit commit
+                             :issuer     did
+                             :message    message
+                             :tag        tag
+                             :dbid       dbid
+                             :t          t
                              :db-address db-address
                              :author     (or author "")
                              :txn-id     (if (= 1 (count txns)) txn-id "")
@@ -344,15 +350,18 @@
           db*               (assoc db
                                    :commit new-commit
                                    :prev-commit commit)
-          {db**              :db
-           commit-file-meta  :commit-res} (<? (do-commit+push db* opts*))
+
+          {db**             :db
+           commit-file-meta :commit-res}
+          (<? (do-commit+push db* opts*))
+
           ;; if an indexing process is kicked off, returns a channel that contains a stream of updates for consensus
           indexing-ch       (if (indexer/-index? indexer db**)
                               (run-index db** opts* index-files-ch)
                               (when index-files-ch (async/close! index-files-ch)))]
       (if file-data?
-        {:data-file-meta    ledger-update-res
-         :commit-file-meta  commit-file-meta
-         :indexing-ch       indexing-ch
-         :db                db**}
+        {:data-file-meta   ledger-update-res
+         :commit-file-meta commit-file-meta
+         :indexing-ch      indexing-ch
+         :db               db**}
         db**))))
