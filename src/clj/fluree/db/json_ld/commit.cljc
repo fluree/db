@@ -316,13 +316,10 @@
   ([indexer db commit-opts]
    (run-index indexer db commit-opts nil))
   ([indexer db commit-opts changes-ch]
-   (if (indexer/-index? indexer db)
-     (let [update-fn (update-commit-fn db commit-opts)]
-       ;; call indexing process with update-commit-fn to push out an updated commit once complete
-       (indexer/-index indexer db {:update-commit update-fn
-                                   :changes-ch    changes-ch}))
-     (when changes-ch
-       (async/close! changes-ch)))))
+   (let [update-fn (update-commit-fn db commit-opts)]
+     ;; call indexing process with update-commit-fn to push out an updated commit once complete
+     (indexer/-index indexer db {:update-commit update-fn
+                                 :changes-ch    changes-ch}))))
 
 
 (defn commit

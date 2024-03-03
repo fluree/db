@@ -29,9 +29,9 @@
 
 (defn novelty-min?
   "Returns true if ledger is beyond novelty-min threshold."
-  [reindex-min db]
+  [{:keys [reindex-min-bytes]} db]
   (let [novelty-size (get-in db [:novelty :size])]
-    (> novelty-size reindex-min)))
+    (> novelty-size reindex-min-bytes)))
 
 (defn novelty-max?
   "Returns true if ledger is beyond novelty-max threshold."
@@ -509,36 +509,40 @@
 (defn do-index
   "Performs an index operation and returns a promise-channel of the latest db once complete"
   [indexer {:keys [t branch] :as db} {:keys [update-commit changes-ch] :as opts}]
-  (let [[lock? index-state] (lock-indexer (:state-atom indexer) branch t update-commit)
-        {:keys [tempid port]} index-state]
-    (if lock?
-      ;; when we have a lock, reindex and put updated db onto pc.
-      (async/go
-        (try*
-          (push-index-event indexer :index-start index-state)
-          (let [indexed-db   (<? (refresh indexer db opts))
-                index-state* (unlock-indexer (:state-atom indexer) branch tempid indexed-db)
-                {:keys [update-commit-fn port]} index-state*]
-            ;; in case event listener wanted final indexed db, put on established port
-            (when (fn? update-commit-fn)
-              (let [result (async/<!
-                             (update-commit-fn indexed-db))]
-                (when (util/exception? result)
-                  (log/error result "Exception updating commit with new index: " (ex-message result))
-                  (throw result))
-                (when changes-ch
-                  (async/put! changes-ch {:event :new-commit
-                                          :data  result}))))
-            (async/put! port indexed-db)
-            ;; push out event, retain :port for downstream to retrieve indexed db if needed, but
-            ;; remove update-commit-fn as we don't want downstream processes being able to do this
-            (push-index-event indexer :index-end (dissoc index-state* :update-commit-fn)))
-          (catch* e
-                  (log/error e "Error encountered creating index for db: " db ". "
-                             "Indexing stopped."))))
-      (when changes-ch ;; if we don't have a lock, nothing to index so close changes-ch if it exists
-        (async/close! changes-ch)))
-    port))
+  (if (novelty-min? indexer db)
+    (let [[lock? index-state] (lock-indexer (:state-atom indexer) branch t update-commit)
+          {:keys [tempid port]} index-state]
+      (if lock?
+        ;; when we have a lock, reindex and put updated db onto pc.
+        (go
+          (try*
+            (push-index-event indexer :index-start index-state)
+            (let [indexed-db   (<? (refresh indexer db opts))
+                  index-state* (unlock-indexer (:state-atom indexer) branch tempid indexed-db)
+                  {:keys [update-commit-fn port]} index-state*]
+              ;; in case event listener wanted final indexed db, put on established port
+              (when (fn? update-commit-fn)
+                (let [result (async/<!
+                               (update-commit-fn indexed-db))]
+                  (when (util/exception? result)
+                    (log/error result "Exception updating commit with new index: " (ex-message result))
+                    (throw result))
+                  (when changes-ch
+                    (async/put! changes-ch {:event :new-commit
+                                            :data  result}))))
+              (async/put! port indexed-db)
+              ;; push out event, retain :port for downstream to retrieve indexed db if needed, but
+              ;; remove update-commit-fn as we don't want downstream processes being able to do this
+              (push-index-event indexer :index-end (dissoc index-state* :update-commit-fn)))
+            (catch* e
+                    (log/error e "Error encountered creating index for db: " db ". "
+                               "Indexing stopped."))))
+        (when changes-ch ;; if we don't have a lock, nothing to index so close changes-ch if it exists
+          (async/close! changes-ch)))
+      port)
+    (go
+      (async/close! changes-ch)
+      db)))
 
 
 (defn status
@@ -582,8 +586,6 @@
 
 (defrecord IndexerDefault [reindex-min-bytes reindex-max-bytes state-atom]
   indexer/iIndex
-  (-index? [_ db] (novelty-min? reindex-min-bytes db))
-  (-halt? [_ db] (novelty-max? reindex-max-bytes db))
   (-index [indexer db] (do-index indexer db nil))
   (-index [indexer db opts] (do-index indexer db opts))
   (-add-watch [_ watch-id callback] (add-watch-event state-atom watch-id callback))

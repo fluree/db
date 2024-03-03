@@ -13,8 +13,6 @@
 
 (defrecord IndexerNone []
   indexer/iIndex
-  (-index? [_ db] false)
-  (-halt? [_ db] false)
   (-index [indexer db] (not-supported! "perform index!"))
   (-index [indexer db opts] (not-supported! "perform index!"))
   (-add-watch [_ watch-id callback] (not-supported! "add watches!"))
