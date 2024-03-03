@@ -52,40 +52,26 @@
                               :t         (:t written-node)})))))
 
 (defn write-leaf
-  "Writes `leaf` to storage under the provided `leaf-id`, computing a new id if
-  one isn't provided. Returns the leaf map with the id used attached uner the
-  `:id` key"
-  [{:keys [conn ledger] :as _db} idx-type changes-ch leaf]
-  (go-try
-    (let [ser   (serdeproto/-serialize-leaf (serde conn) leaf)
-          res   (<? (connection/-index-file-write conn ledger idx-type ser))
-          leaf' (assoc leaf :id (:address res))]
-      (notify-new-index-file changes-ch leaf' res)
-      leaf')))
+  "Serializes and writes the index leaf node `leaf` to storage."
+  [{:keys [conn ledger] :as _db} idx-type leaf]
+  (let [ser (serdeproto/-serialize-leaf (serde conn) leaf)]
+    (connection/-index-file-write conn ledger idx-type ser)))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key.
   Returns two-tuple of response output and raw bytes written."
   [{:keys [conn ledger] :as _db} idx-type data]
-  (go-try
-    (let [ser (serdeproto/-serialize-branch (serde conn) data)
-          res (<? (connection/-index-file-write conn ledger idx-type ser))]
-      res)))
+  (let [ser (serdeproto/-serialize-branch (serde conn) data)]
+    (connection/-index-file-write conn ledger idx-type ser)))
 
 (defn write-branch
-  "Writes `branch` to storage under the provided `branch-id`, computing a new id
-  if one isn't provided. Returns the branch map with the id used attached uner
-  the `:id` key"
-  [db idx-type changes-ch {:keys [children] :as branch}]
-  (go-try
-    (let [child-vals (->> children
-                          (map val)
-                          (mapv child-data))
-          data       {:children child-vals}
-          res        (<? (write-branch-data db idx-type data))
-          branch'    (assoc branch :id (:address res))]
-      (notify-new-index-file changes-ch branch' res)
-      branch')))
+  "Writes the child attributes index branch node `branch` to storage."
+  [db idx-type {:keys [children] :as _branch}]
+  (let [child-vals (->> children
+                        (map val)
+                        (mapv child-data))
+        data       {:children child-vals}]
+    (write-branch-data db idx-type data)))
 
 (defn write-garbage
   "Writes garbage record out for latest index."

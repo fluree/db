@@ -4,13 +4,11 @@
             [fluree.db.indexer.storage :as storage]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [clojure.core.async :as async :refer [>! go]]
+            [clojure.core.async :as async :refer [<! >! go go-loop]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.commit-data :as commit-data]))
-
-;; default indexer
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -327,7 +325,7 @@
   (cond-> node
     (index/resolved? node) (assoc ::old-id id)))
 
-(defn update-branch-ids
+(defn update-child-ids
   "When using IPFS, we don't know what the leaf id will be until written, therefore
   branches need to get updated with final leaf ids.
 
@@ -341,19 +339,43 @@
                     children children)]
     (assoc branch-node :children children*)))
 
+(defn update-node-id
+  [node write-response]
+  (assoc node :id (:address write-response)))
+
+(defn notify-new-index-file
+  "Sends new file update into the changes notification async channel
+  if it exists. This is used to synchronize files across consensus, otherwise
+  a changes-ch won't be present and this won't be used."
+  [write-response file-type t changes-ch]
+  (go
+    (when changes-ch
+      (>! changes-ch {:file-type file-type
+                      :data      write-response
+                      :address   (:address write-response)
+                      :t         t})
+      true)))
+
 (defn write-node
   "Writes `node` to storage, and puts any errors onto the `error-ch`"
-  [db idx node error-ch changes-ch updated-ids]
-  (let [node         (dissoc node ::old-id)
-        display-node (select-keys node [:id :ledger-alias])]
-    (async/go
+  [db idx node updated-ids changes-ch error-ch]
+  (go
+    (let [node         (dissoc node ::old-id)
+          t            (:t node)
+          display-node (select-keys node [:id :ledger-alias])]
       (try*
         (if (index/leaf? node)
           (do (log/debug "Writing index leaf:" display-node)
-              (<? (storage/write-leaf db idx changes-ch node)))
+              (let [write-response (<? (storage/write-leaf db idx node))]
+                (<! (notify-new-index-file write-response :leaf t changes-ch))
+                (update-node-id node write-response)))
+
           (do (log/debug "Writing index branch:" display-node)
-              (let [node* (update-branch-ids updated-ids node)]
-                (<? (storage/write-branch db idx changes-ch node*)))))
+              (let [node*          (update-child-ids updated-ids node)
+                    write-response (<? (storage/write-branch db idx node*))]
+                (<! (notify-new-index-file write-response :branch t changes-ch))
+                (update-node-id node* write-response))))
+
         (catch* e
                 (log/error e
                            "Error writing novel index node:" display-node)
@@ -362,15 +384,15 @@
 
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
-  (async/go-loop [stats {:idx idx, :novel 0, :unchanged 0, :garbage #{} :updated-ids {}}
-                  last-node nil]
+  (go-loop [stats {:idx idx, :novel 0, :unchanged 0, :garbage #{} :updated-ids {}}
+            last-node nil]
     (if-let [{::keys [old-id] :as node} (async/<! index-ch)]
       (if (index/resolved? node)
-        (let [written-node (async/<! (write-node db idx node error-ch changes-ch (:updated-ids stats)))
+        (let [written-node (async/<! (write-node db idx node (:updated-ids stats) changes-ch error-ch))
               stats*       (cond-> stats
-                                   (not= old-id :empty) (update :garbage conj old-id)
-                                   true (update :novel inc)
-                                   true (assoc-in [:updated-ids (:id node)] (:id written-node)))]
+                             (not= old-id :empty) (update :garbage conj old-id)
+                             true (update :novel inc)
+                             true (assoc-in [:updated-ids (:id node)] (:id written-node)))]
           (recur stats*
                  written-node))
         (recur (update stats :unchanged inc)
