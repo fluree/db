@@ -523,18 +523,21 @@
                   {:keys [update-commit-fn port]} index-state*]
               ;; in case event listener wanted final indexed db, put on established port
               (when (fn? update-commit-fn)
-                (let [result (async/<!
-                               (update-commit-fn indexed-db))]
+                (let [result (<! (update-commit-fn indexed-db))]
                   (when (util/exception? result)
                     (log/error result "Exception updating commit with new index: " (ex-message result))
                     (throw result))
                   (when changes-ch
-                    (async/put! changes-ch {:event :new-commit
-                                            :data  result}))))
+                    (>! changes-ch {:event :new-commit
+                                    :data  result}))))
+
               (async/put! port indexed-db)
               ;; push out event, retain :port for downstream to retrieve indexed db if needed, but
               ;; remove update-commit-fn as we don't want downstream processes being able to do this
-              (push-index-event indexer :index-end (dissoc index-state* :update-commit-fn)))
+              (push-index-event indexer :index-end (dissoc index-state* :update-commit-fn))
+
+              (when changes-ch
+                (async/close! changes-ch)))
             (catch* e
                     (log/error e "Error encountered creating index for db: " db ". "
                                "Indexing stopped."))))
