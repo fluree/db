@@ -578,11 +578,6 @@
                          ", however provided db is only at t value: " (:t db))
                     {:status 500 :error :db/indexing}))))
 
-(defn add-update-commit-fn
-  [state-atom branch f]
-  (swap! state-atom assoc-in [:commit-fn branch] f))
-
-
 
 (defrecord IndexerDefault [reindex-min-bytes reindex-max-bytes state-atom]
   indexer/iIndex
@@ -591,7 +586,6 @@
   (-add-watch [_ watch-id callback] (add-watch-event state-atom watch-id callback))
   (-remove-watch [_ watch-id] (remove-watch-event state-atom watch-id))
   (-push-event [_ event-data] (send-watch-event state-atom event-data))
-  (-register-commit-fn [_ branch f] (add-update-commit-fn state-atom branch f))
   (-close [indexer] (close indexer))
   (-status [indexer] (status indexer))
   (-empty-novelty [_ db] (empty-novelty db nil))

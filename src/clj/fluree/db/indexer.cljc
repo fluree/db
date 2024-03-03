@@ -8,7 +8,6 @@
   (-add-watch [indexer id callback]  "Provided callback fn will be executed with new indexing events.")
   (-remove-watch [indexer id]  "Removes watch fn.")
   (-push-event [indexer event-data] "Pushes an index event (map) to all watchers")
-  (-register-commit-fn [indexer branch f] "Adds a function that will update/push a new commit with an updated index when provided the reindexed db as single arg")
   (-close [indexer]  "Shuts down indexer, removes all watches after notification.")
   (-status [indexer]  "Returns current status of reindexing.")
   (-empty-novelty [indexer db] [indexer db t]"Returns db with emptied novelty, when 't' provided only empties novelty at or before 't'")
