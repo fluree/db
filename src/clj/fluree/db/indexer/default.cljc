@@ -446,14 +446,6 @@
                         db index/types)]
     (assoc-in cleared [:novelty :size] 0)))
 
-(defn index-type-roots
-  "Returns a map of each index type's root index address"
-  [db]
-  (reduce
-    (fn [acc index-type]
-      (assoc acc index-type (-> db (get index-type) :id)))
-    {} index/types))
-
 (defn refresh
   [indexer
    {:keys [novelty t ledger-alias] :as db}
