@@ -541,7 +541,8 @@
           (async/close! changes-ch)))
       port)
     (go
-      (async/close! changes-ch)
+      (when changes-ch
+        (async/close! changes-ch))
       db)))
 
 
