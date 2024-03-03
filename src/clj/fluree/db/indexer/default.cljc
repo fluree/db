@@ -350,7 +350,8 @@
   [write-response file-type t changes-ch]
   (go
     (when changes-ch
-      (>! changes-ch {:file-type file-type
+      (>! changes-ch {:event     :new-index-file
+                      :file-type file-type
                       :data      write-response
                       :address   (:address write-response)
                       :t         t})
