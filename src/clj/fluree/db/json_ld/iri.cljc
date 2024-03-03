@@ -164,10 +164,10 @@
   [x]
   (instance? SID x))
 
-(def ^:const min-sid
+(def min-sid
   (->sid 0 ""))
 
-(def ^:const max-sid
+(def max-sid
   (->sid util/max-integer ""))
 
 (defn iri->sid
