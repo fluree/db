@@ -469,16 +469,20 @@
                  (throw e))
 
                 refresh-ch
-                ([{:keys [garbage], refreshed-db :db, :as status}]
-                 (let [indexed-db    (-> (indexer/-empty-novelty indexer refreshed-db)
-                                         (assoc-in [:stats :indexed] t))
+                ([{:keys [garbage], refreshed-db :db, :as _status}]
+                 (let [indexed-db  (-> (indexer/-empty-novelty indexer refreshed-db)
+                                       (assoc-in [:stats :indexed] t))
                        ;; TODO - ideally issue garbage/root writes to RAFT together
                        ;;        as a tx, currently requires waiting for both
                        ;;        through raft sync
-                       garbage-res   (when (seq garbage)
-                                       (<? (storage/write-garbage indexed-db changes-ch garbage)))
+                       garbage-res (when (seq garbage)
+                                     (let [write-res (<? (storage/write-garbage indexed-db garbage))]
+                                       (<! (notify-new-index-file write-res :garbage t changes-ch))
+                                       write-res))
                        ;; TODO - WRITE GARBAGE INTO INDEX ROOT!!!
-                       db-root-res   (<? (storage/write-db-root indexed-db changes-ch))
+                       db-root-res (<? (storage/write-db-root indexed-db))
+                       _           (<! (notify-new-index-file db-root-res :root t changes-ch))
+
                        index-address (:address db-root-res)
                        index-id      (str "fluree:index:sha256:" (:hash db-root-res))
                        commit-index  (commit-data/new-index (-> indexed-db :commit :data)
@@ -488,10 +492,10 @@
                        indexed-db*   (dbproto/-index-update indexed-db commit-index)
                        duration      (- (util/current-time-millis) start-time-ms)
                        end-stats     (assoc init-stats
-                                       :end-time (util/current-time-iso)
-                                       :duration duration
-                                       :address (:address db-root-res)
-                                       :garbage (:address garbage-res))]
+                                            :end-time (util/current-time-iso)
+                                            :duration duration
+                                            :address (:address db-root-res)
+                                            :garbage (:address garbage-res))]
                    (log/info "Index refresh complete:" end-stats)
                    indexed-db*)))))
         db))))

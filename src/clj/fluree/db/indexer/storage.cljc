@@ -33,24 +33,6 @@
   [child]
   (select-keys child [:id :leaf :first :rhs :size]))
 
-(defn notify-new-index-file
-  "Sends new file update into the changes notification async channel
-  if it exists. This is used to synchronize files across consensus, otherwise
-  a changes-ch won't be present and this won't be used."
-  [changes-ch written-node write-response]
-  (when changes-ch
-    (async/go
-      (let [file-type (cond
-                        (contains? written-node :children) :branch
-                        (contains? written-node :flakes) :leaf
-                        (contains? written-node :garbage) :garbage
-                        (contains? written-node :ecount) :root)]
-        (async/>! changes-ch {:event     :new-index-file
-                              :file-type file-type
-                              :data      write-response
-                              :address   (:address write-response)
-                              :t         (:t written-node)})))))
-
 (defn write-leaf
   "Serializes and writes the index leaf node `leaf` to storage."
   [{:keys [conn ledger] :as _db} idx-type leaf]
@@ -75,18 +57,14 @@
 
 (defn write-garbage
   "Writes garbage record out for latest index."
-  [db changes-ch garbage]
-  (go-try
-    (let [{:keys [conn ledger ledger-alias t]} db
+  [db garbage]
+  (let [{:keys [conn ledger ledger-alias t]} db
 
-          data     {:ledger-alias ledger-alias
-                    :block        t
-                    :garbage      garbage}
-          ser      (serdeproto/-serialize-garbage (serde conn) data)
-          res      (<? (connection/-index-file-write conn ledger :garbage ser))
-          garbage' (assoc data :address (:address res))]
-      (notify-new-index-file changes-ch garbage' res)
-      garbage')))
+        data {:ledger-alias ledger-alias
+              :t            t
+              :garbage      garbage}
+        ser  (serdeproto/-serialize-garbage (serde conn) data)]
+    (connection/-index-file-write conn ledger :garbage ser)))
 
 (defn extract-schema-root
   "Transform the schema cache for serialization by turning every predicate into a
@@ -102,30 +80,27 @@
                [])))
 
 (defn write-db-root
-  [db changes-ch]
-  (go-try
-    (let [{:keys [conn ledger commit t stats spot psot post opst tspo
-                  namespace-codes]}
-          db
+  [db]
+  (let [{:keys [conn ledger commit t stats spot psot post opst tspo
+                namespace-codes]}
+        db
 
-          ledger-alias (:id commit)
-          preds        (extract-schema-root db)
-          data         {:ledger-alias    ledger-alias
-                        :t               t
-                        :preds           preds
-                        :stats           (select-keys stats [:flakes :size])
-                        :spot            (child-data spot)
-                        :psot            (child-data psot)
-                        :post            (child-data post)
-                        :opst            (child-data opst)
-                        :tspo            (child-data tspo)
-                        :timestamp       (util/current-time-millis)
-                        :prevIndex       (or (:indexed stats) 0)
-                        :namespace-codes namespace-codes}
-          ser          (serdeproto/-serialize-db-root (serde conn) data)
-          res          (<? (connection/-index-file-write conn ledger :root ser))]
-      (notify-new-index-file changes-ch data res)
-      res)))
+        ledger-alias (:id commit)
+        preds        (extract-schema-root db)
+        data         {:ledger-alias    ledger-alias
+                      :t               t
+                      :preds           preds
+                      :stats           (select-keys stats [:flakes :size])
+                      :spot            (child-data spot)
+                      :psot            (child-data psot)
+                      :post            (child-data post)
+                      :opst            (child-data opst)
+                      :tspo            (child-data tspo)
+                      :timestamp       (util/current-time-millis)
+                      :prevIndex       (or (:indexed stats) 0)
+                      :namespace-codes namespace-codes}
+        ser          (serdeproto/-serialize-db-root (serde conn) data)]
+    (connection/-index-file-write conn ledger :root ser)))
 
 
 (defn read-branch
