@@ -105,16 +105,16 @@
         db))))
 
 (defn index
-  [{:keys [t] :as db} branch]
+  [{:keys [t] :as db} branch changes-ch]
   (go-try
     (let [error-ch (async/chan)
-          index-ch (indexer/refresh-all db error-ch)]
+          index-ch (indexer/refresh-all db #{} changes-ch error-ch)]
       (async/alt!
         error-ch ([e] e)
         index-ch ([{:keys [garbage], refreshed-db :db, :as _status}]
                   (let [indexed-db    (-> (indexer/empty-novelty refreshed-db t)
                                           (assoc-in [:stats :indexed] t))
-                        db-root-res   (<? (storage/write-db-root indexed-db nil))
+                        db-root-res   (<? (storage/write-db-root indexed-db))
                         index-address (:address db-root-res)
                         index-id      (str "fluree:index:sha256:" (:hash db-root-res))
                         commit-data   (-> indexed-db :commit :data)
@@ -125,12 +125,12 @@
                                                              index-roots)
                         indexed-db*   (db/force-index-update indexed-db commit-index)]
                     (when (seq garbage)
-                      (<? (storage/write-garbage indexed-db* nil garbage)))
+                      (<? (storage/write-garbage indexed-db* garbage)))
 
                     (<? (commit/do-commit+push indexed-db* {:branch branch}))))))))
 
 (defn migrate
-  [conn address]
+  [conn address changes-ch]
   (go-try
     (let [last-commit-addr  (<? (nameservice/lookup-commit conn address))
           last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
@@ -140,6 +140,6 @@
           branch            (keyword (get-first-value first-commit const/iri-branch))
           ledger            (<? (jld-ledger/->ledger conn ledger-alias {:branch branch}))
           db                (<? (merge-commits ledger all-commit-tuples))
-          indexed-db        (<? (index db branch))]
+          indexed-db        (<? (index db branch changes-ch))]
       (ledger/-db-update ledger indexed-db)
       ledger)))
