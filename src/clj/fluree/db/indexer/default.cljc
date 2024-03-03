@@ -384,15 +384,16 @@
 
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
-  (go-loop [stats {:idx idx, :novel 0, :unchanged 0, :garbage #{} :updated-ids {}}
+  (go-loop [stats     {:idx idx, :novel 0, :unchanged 0, :garbage #{}, :updated-ids {}}
             last-node nil]
-    (if-let [{::keys [old-id] :as node} (async/<! index-ch)]
+    (if-let [{::keys [old-id] :as node} (<! index-ch)]
       (if (index/resolved? node)
-        (let [written-node (async/<! (write-node db idx node (:updated-ids stats) changes-ch error-ch))
+        (let [updated-ids  (:updated-ids stats)
+              written-node (<! (write-node db idx node updated-ids changes-ch error-ch))
               stats*       (cond-> stats
                              (not= old-id :empty) (update :garbage conj old-id)
-                             true (update :novel inc)
-                             true (assoc-in [:updated-ids (:id node)] (:id written-node)))]
+                             true                 (update :novel inc)
+                             true                 (assoc-in [:updated-ids (:id node)] (:id written-node)))]
           (recur stats*
                  written-node))
         (recur (update stats :unchanged inc)
@@ -431,8 +432,8 @@
 
 (defn refresh-all
   ([db error-ch]
-   (refresh-all db #{} error-ch nil))
-  ([db remove-preds error-ch changes-ch]
+   (refresh-all db #{} nil error-ch))
+  ([db remove-preds changes-ch error-ch]
    (->> index/types
         (map (partial extract-root db remove-preds))
         (map (partial refresh-index db changes-ch error-ch))
@@ -461,7 +462,7 @@
               (seq remove-preds))
         (do (log/info "Refreshing Index:" init-stats)
             (let [error-ch   (async/chan)
-                  refresh-ch (refresh-all db remove-preds error-ch changes-ch)]
+                  refresh-ch (refresh-all db remove-preds changes-ch error-ch)]
               (async/alt!
                 error-ch
                 ([e]
