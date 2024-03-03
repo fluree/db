@@ -5,7 +5,6 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.json-ld :as json-ld]
-            [fluree.db.connection :as connection]
             [fluree.db.ledger :as ledger]))
 
 #?(:clj (set! *warn-on-reflection* true))
