@@ -7,7 +7,6 @@
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async :refer [chan]]
-            [fluree.db.connection :as connection]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.nameservice.ipns :as ns-ipns]

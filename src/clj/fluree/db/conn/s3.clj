@@ -5,7 +5,6 @@
             [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.connection :as connection]
-            [fluree.db.connection :as connection]
             [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.ledger :as ledger]

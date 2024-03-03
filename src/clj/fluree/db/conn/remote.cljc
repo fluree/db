@@ -8,7 +8,6 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.connection :as connection]
             [fluree.db.method.remote.core :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
             [fluree.db.indexer.default :as idx-default]

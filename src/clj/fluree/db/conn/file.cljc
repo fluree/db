@@ -8,7 +8,6 @@
             [fluree.db.index :as index]
             [fluree.db.connection :as connection]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.connection :as connection]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.indexer.default :as idx-default]
