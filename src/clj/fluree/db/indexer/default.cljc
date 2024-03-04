@@ -450,12 +450,12 @@
 
 (defn refresh
   [indexer
-   {:keys [novelty t ledger-alias] :as db}
+   {:keys [novelty t alias] :as db}
    {:keys [remove-preds changes-ch]}]
   (go-try
     (let [start-time-ms (util/current-time-millis)
           novelty-size  (:size novelty)
-          init-stats    {:ledger-alias ledger-alias
+          init-stats    {:ledger-alias alias
                          :t            t
                          :novelty-size novelty-size
                          :start-time   (util/current-time-iso)}]
