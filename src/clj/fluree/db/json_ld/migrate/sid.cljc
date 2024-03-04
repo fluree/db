@@ -104,42 +104,22 @@
           (recur r new-db))
         db))))
 
-(defn index
-  [{:keys [t] :as db} branch changes-ch]
-  (go-try
-    (let [error-ch (async/chan)
-          index-ch (indexer/refresh-all db #{} changes-ch error-ch)]
-      (async/alt!
-        error-ch ([e] e)
-        index-ch ([{:keys [garbage], refreshed-db :db, :as _status}]
-                  (let [indexed-db    (-> (indexer/empty-novelty refreshed-db t)
-                                          (assoc-in [:stats :indexed] t))
-                        db-root-res   (<? (storage/write-db-root indexed-db))
-                        index-address (:address db-root-res)
-                        index-id      (str "fluree:index:sha256:" (:hash db-root-res))
-                        commit-data   (-> indexed-db :commit :data)
-                        index-roots   (select-keys indexed-db index/types)
-                        commit-index  (commit-data/new-index commit-data
-                                                             index-id
-                                                             index-address
-                                                             index-roots)
-                        indexed-db*   (db/force-index-update indexed-db commit-index)]
-                    (when (seq garbage)
-                      (<? (storage/write-garbage indexed-db* garbage)))
-
-                    (<? (commit/do-commit+push indexed-db* {:branch branch}))))))))
-
 (defn migrate
-  [conn address changes-ch]
+  [conn address changes-ch commit-opts]
   (go-try
     (let [last-commit-addr  (<? (nameservice/lookup-commit conn address))
           last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
           all-commit-tuples (<? (reify/trace-commits conn last-commit-tuple 1))
           first-commit      (ffirst all-commit-tuples)
           ledger-alias      (jld-ledger/commit->ledger-alias conn address first-commit)
-          branch            (keyword (get-first-value first-commit const/iri-branch))
+          branch            (or (keyword (get-first-value first-commit const/iri-branch))
+                                :main)
           ledger            (<? (jld-ledger/->ledger conn ledger-alias {:branch branch}))
+          indexer           (:indexer ledger)
           db                (<? (merge-commits ledger all-commit-tuples))
-          indexed-db        (<? (index db branch changes-ch))]
+          commit-opts*      (assoc commit-opts :branch branch)
+          update-commit     (commit/update-commit-fn db commit-opts*)
+          indexed-db        (<? (indexer/do-index indexer db {:changes-ch    changes-ch
+                                                              :update-commit update-commit}))]
       (ledger/-db-update ledger indexed-db)
       ledger)))
