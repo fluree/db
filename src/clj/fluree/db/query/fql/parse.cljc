@@ -14,7 +14,8 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.validation :as v]
-            [fluree.json-ld :as json-ld]))
+            [fluree.json-ld :as json-ld]
+            [nano-id.core :refer [nano-id]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -553,7 +554,7 @@
   when a sid is generated."
   []
   (let [now (util/current-time-millis)
-        suf (rand-int 100000)]
+        suf (nano-id 8)]
     (str/join "-" [blank-node-prefix now suf] )))
 
 (declare parse-subj-cmp)

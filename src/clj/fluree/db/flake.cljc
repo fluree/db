@@ -17,12 +17,12 @@
 
 (declare equiv-flake assoc-flake get-flake-val nth-flake)
 
-(def ^:const min-s iri/min-sid)
-(def ^:const max-s iri/max-sid)
-(def ^:const min-p iri/min-sid)
-(def ^:const max-p iri/max-sid)
-(def ^:const min-dt iri/min-sid)
-(def ^:const max-dt iri/max-sid)
+(def min-s iri/min-sid)
+(def max-s iri/max-sid)
+(def min-p iri/min-sid)
+(def max-p iri/max-sid)
+(def min-dt iri/min-sid)
+(def max-dt iri/max-sid)
 (def ^:const min-t 0)
 (def ^:const max-t util/max-long)
 (def ^:const min-op false)
@@ -112,12 +112,12 @@
              IPrintWithWriter
              (-pr-writer [^Flake f writer opts]
                          (pr-sequential-writer writer pr-writer
-                                               "#Flake [" " " "]"
+                                               "#fluree/Flake [" " " "]"
                                                opts [(.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)]))]))
 
 
 #?(:clj (defmethod print-method Flake [^Flake f, ^java.io.Writer w]
-          (.write w (str "#Flake "))
+          (.write w (str "#fluree/Flake "))
           (binding [*out* w]
             (pr [(.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)]))))
 
@@ -520,10 +520,8 @@
 (defn size-flake
   "Base size of a flake is 38 bytes... then add size for 'o' and 'm'.
   Flakes have the following:
-    - s - 8 bytes
-    - p - 8 bytes
+    - s, p, dt - sid size as returned by fluree.db.json-ld.iri/measure-sid
     - o - ??
-    - dt - 4 bytes
     - t - 8 bytes
     - add? - 1 byte
     - m - 1 byte + ??
@@ -533,26 +531,30 @@
   it should be 'close enough'
   reference: https://www.javamex.com/tutorials/memory/string_memory_usage.shtml"
   [^Flake f]
-  (let [o      (o f)
-        dt     (dt f)
-        o-size (#?@(:clj (util/case+)
-                    :cljs (condp =)) dt
-                 const/$xsd:string (* 2 (count o))
-                 const/$xsd:anyURI 8
-                 const/$xsd:boolean 1
-                 const/$xsd:long 8
-                 const/$xsd:int 4
-                 const/$xsd:short 2
-                 const/$xsd:double 8
-                 const/$xsd:float 4
-                 const/$xsd:byte 1
-                 ;; else
-                 (if (number? o)
-                   8
-                   (if (string? o)
-                     (* 2 (count o))
-                     (* 2 (count (pr-str o))))))]
-    (cond-> (+ 42 o-size)
+  (let [s-size  (-> f s iri/measure-sid)
+        p-size  (-> f p iri/measure-sid)
+        o       (o f)
+        dt      (dt f)
+        dt-size (iri/measure-sid dt)
+        o-size  (#?@(:clj (util/case+)
+                     :cljs (condp =)) dt
+                  const/$xsd:string (* 2 (count o))
+                  const/$xsd:anyURI (iri/measure-sid o)
+                  const/$xsd:boolean 1
+                  const/$xsd:long 8
+                  const/$xsd:int 4
+                  const/$xsd:short 2
+                  const/$xsd:double 8
+                  const/$xsd:float 4
+                  const/$xsd:byte 1
+                  ;; else
+                  (if (number? o)
+                    8
+                    (if (string? o)
+                      (* 2 (count o))
+                      (* 2 (count (pr-str o))))))
+        t-size 8]
+    (cond-> (+ s-size p-size o-size dt-size t-size)
             (m f) (* 2 (count (pr-str (m f)))))))
 
 

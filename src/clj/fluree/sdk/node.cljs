@@ -2,7 +2,10 @@
   (:require [cljs.nodejs :as node-js]
             [clojure.string :as str]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            ["@peculiar/webcrypto" :refer [Crypto]]))
+
+(set! js/crypto (Crypto.))
 
 (node-js/enable-util-print!)
 
@@ -26,12 +29,11 @@
 
 (defn ^:export stage
   ([db json-ld]
-   (fluree/stage db (js->clj json-ld) {:context-type :string}))
+   (fluree/stage db (js->clj json-ld)))
   ([db json-ld opts]
    (fluree/stage db (js->clj json-ld)
                  (-> opts
-                     (js->clj :keywordize-keys true)
-                     (assoc :context-type :string)))))
+                     (js->clj :keywordize-keys true)))))
 
 (defn ^:export commit
   ([ledger db] (fluree/commit! ledger db))
@@ -54,7 +56,7 @@
                                               k
                                               (keyword k)) v))
                                {}))]
-    (.then (fluree/query db (assoc-in query* [:opts :context-type] :string))
+    (.then (fluree/query db query*)
            (fn [result] (clj->js result)))))
 
 (log/set-level! :warning)

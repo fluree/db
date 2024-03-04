@@ -90,7 +90,6 @@
     ::depth           nat-int?
     ::pretty-print    boolean?
     ::parse-json      boolean?
-    ::context-type    [:enum :string :keyword]
     ::issuer          [:maybe string?]
     ::role            :any
     ::did             :any
@@ -103,8 +102,6 @@
                         [:parse-json {:optional true} ::parse-json]
                         [:prettyPrint {:optional true} ::pretty-print]
                         [:pretty-print {:optional true} ::pretty-print]
-                        [:contextType {:optional true} ::context-type]
-                        [:context-type {:optional true} ::context-type]
                         [:issuer {:optional true} ::issuer]
                         [:role {:optional true} ::role]
                         [:did {:optional true} ::did]]]

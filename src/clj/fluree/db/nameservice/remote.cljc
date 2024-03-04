@@ -10,7 +10,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn remote-lookup
-  [state server-state ledger-address opts]
+  [state server-state ledger-address]
   (go-try
     (let [head-commit  (<? (remote/remote-read state server-state ledger-address false))
           head-address (get head-commit "address")]
@@ -20,7 +20,7 @@
   [state server-state ledger-address]
   (go-try
     (boolean
-      (<? (remote-lookup state server-state ledger-address nil)))))
+      (<? (remote-lookup state server-state ledger-address)))))
 
 (defn monitor-socket-messages
   [{:keys [conn-state msg-in] :as _remote-ns} websocket]
@@ -75,8 +75,7 @@
 (defrecord RemoteNameService
   [conn-state server-state sync? msg-in msg-out]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias] (remote-lookup conn-state server-state ledger-alias nil))
-  (-lookup [_ ledger-alias opts] (remote-lookup conn-state server-state ledger-alias opts))
+  (-lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
   (-push [_ commit-data] (throw (ex-info "Unsupported RemoteNameService op: push" {})))
   (-subscribe [nameservice ledger-alias callback] (subscribe conn-state ledger-alias callback))
   (-unsubscribe [nameservice ledger-alias] (unsubscribe conn-state ledger-alias))

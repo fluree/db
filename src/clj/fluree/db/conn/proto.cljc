@@ -18,8 +18,6 @@
 (defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")
   (-c-write [conn ledger commit-data] "Writes a commit to storage")
-  (-ctx-write [conn ledger context-data] "Writes a context to storage and returns the key. Expects string keys.")
-  (-ctx-read [conn context-key] "Reads a context from storage")
   (-txn-write [conn ledger txn-data] "Writes a transaction to storage and returns the key. Expects string keys.")
   (-txn-read [conn txn-key] "Reads a transaction from storage")
   (-index-file-write [conn ledger idx-type index-data] "Writes an index item to storage")

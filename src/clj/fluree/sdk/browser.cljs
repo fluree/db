@@ -37,11 +37,10 @@
 
 (defn ^:export stage
   ([db json-ld]
-   (fluree/stage db (js->clj json-ld) {:context-type :string}))
+   (fluree/stage db (js->clj json-ld)))
   ([db json-ld opts]
    (fluree/stage db (js->clj json-ld)
-                 (-> (js->clj opts :keywordize-keys true)
-                     (assoc :context-type :string)))))
+                 (js->clj opts :keywordize-keys true))))
 
 (defn ^:export commit
   ([ledger db] (.then (fluree/commit! ledger db)
@@ -64,7 +63,7 @@
                     (reduce-kv (fn [acc k v]
                                  (assoc acc (keyword k) v))
                                {}))]
-    (.then (fluree/query db (assoc-in query* [:opts :context-type] :string))
+    (.then (fluree/query db query*)
            (fn [result] (clj->js result)))))
 
 ;; ======================================

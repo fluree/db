@@ -18,7 +18,6 @@
 (def ^:const f-file-ns "fluree:file://")
 (def ^:const f-ipfs-ns "fluree:ipfs://")
 (def ^:const f-s3-ns "fluree:s3://")
-(def ^:const f-ctx-ns "fluree:context:")
 
 (def type-iri "@type")
 
@@ -51,15 +50,14 @@
    f-file-ns                                     14
    f-ipfs-ns                                     15
    f-s3-ns                                       16
-   f-ctx-ns                                      17
-   "http://schema.org/"                          18
-   "https://www.wikidata.org/wiki/"              19
-   "http://xmlns.com/foaf/0.1/"                  20
-   "http://www.w3.org/2008/05/skos#"             21
-   "urn:uuid"                                    22
-   "urn:isbn:"                                   23
-   "urn:issn"                                    24
-   "_:"                                          25})
+   "http://schema.org/"                          17
+   "https://www.wikidata.org/wiki/"              18
+   "http://xmlns.com/foaf/0.1/"                  19
+   "http://www.w3.org/2008/05/skos#"             20
+   "urn:uuid"                                    21
+   "urn:isbn:"                                   22
+   "urn:issn"                                    23
+   "_:"                                          24})
 
 
 (def default-namespace-codes
@@ -141,12 +139,19 @@
   [[ns-code nme]]
   (->sid ns-code nme))
 
+(defn measure-sid
+  "Returns the size of an SID."
+  [sid]
+  (+ 12 ; 12 bytes for object header
+     4  ; 4 bytes for namespace code
+     (* 2 (count (get-name sid)))))
+
 (def serialize-sid
   (juxt get-ns-code get-name))
 
 #?(:clj (defmethod print-method SID [^SID sid ^java.io.Writer w]
           (doto w
-            (.write "#SID ")
+            (.write "#fluree/SID ")
             (.write (-> sid serialize-sid pr-str)))))
 
 #?(:clj (defmethod print-dup SID
@@ -159,10 +164,10 @@
   [x]
   (instance? SID x))
 
-(def ^:const min-sid
+(def min-sid
   (->sid 0 ""))
 
-(def ^:const max-sid
+(def max-sid
   (->sid util/max-integer ""))
 
 (defn iri->sid

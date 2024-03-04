@@ -3,9 +3,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-
 ;; Version
-
 (def ^:const data_version 4)
 
 ;; iri constants
@@ -31,6 +29,8 @@
 (def ^:const iri-index (fluree-iri "index"))
 (def ^:const iri-ns (fluree-iri "ns"))
 (def ^:const iri-time (fluree-iri "time"))
+(def ^:const iri-author (fluree-iri "author"))
+(def ^:const iri-txn (fluree-iri "txn"))
 (def ^:const iri-message (fluree-iri "message"))
 (def ^:const iri-tag (fluree-iri "tag"))
 (def ^:const iri-updates (fluree-iri "updates"))
@@ -75,6 +75,8 @@
 (def ^:const $_commit:message (iri/iri->sid iri-message))
 (def ^:const $_commit:time (iri/iri->sid iri-time))
 (def ^:const $_commit:signer (iri/iri->sid iri-issuer))
+(def ^:const $_commit:author (iri/iri->sid iri-author))
+(def ^:const $_commit:txn (iri/iri->sid iri-txn))
 (def ^:const $_ledger:alias (iri/iri->sid iri-alias))
 (def ^:const $_ledger:branch (iri/iri->sid iri-branch))
 

@@ -1,8 +1,7 @@
 (ns fluree.db.conn.remote
-  (:require [clojure.core.async :as async :refer [go chan]]
-            [fluree.db.storage :as storage]
+  (:require [clojure.core.async :as async :refer [go]]
+            [fluree.db.indexer.storage :as storage]
             [fluree.db.index :as index]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
@@ -26,7 +25,7 @@
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (remote/remote-read state server-state commit-key false))
-  (-ctx-read [_ context-key] (remote/remote-read state server-state context-key false))
+  (-txn-read [_ txn-key] (remote/remote-read state server-state txn-key false))
   (-index-file-read [_ index-address] (remote/remote-read state server-state index-address true))
 
   conn-proto/iConnection

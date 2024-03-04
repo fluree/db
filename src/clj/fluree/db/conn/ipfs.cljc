@@ -1,18 +1,18 @@
 (ns fluree.db.conn.ipfs
-  (:require [fluree.db.storage :as storage]
+  (:require [fluree.db.storage.ipfs :as ipfs-storage]
+            [fluree.db.indexer.storage :as index-storage]
             [fluree.db.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.method.ipfs.core :as ipfs]
             [fluree.db.util.async :refer [<? go-try]]
-            [clojure.core.async :as async :refer [go <! chan]]
+            [clojure.core.async :as async :refer [chan]]
             [fluree.db.conn.core :as conn-core]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.nameservice.ipns :as ns-ipns]
-            [fluree.db.conn.cache :as conn-cache])
+            [fluree.db.conn.cache :as conn-cache]
+            [fluree.db.storage :as storage])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -24,19 +24,19 @@
 
 ;; IPFS Connection object
 
-(defrecord IPFSConnection [id state ledger-defaults lru-cache-atom
-                           serializer parallelism msg-in-ch msg-out-ch
-                           nameservices ipfs-endpoint]
+(defrecord IPFSConnection [id state ledger-defaults lru-cache-atom serializer
+                           parallelism msg-in-ch msg-out-ch nameservices
+                           ipfs-endpoint store]
 
   conn-proto/iStorage
   (-c-read [_ commit-key]
-    (ipfs/read ipfs-endpoint commit-key))
+    (storage/read store commit-key))
   (-c-write [_ _ commit-data]
-    (ipfs/write ipfs-endpoint commit-data))
-  (-ctx-read [_ context-key]
-    (ipfs/read ipfs-endpoint context-key))
-  (-ctx-write [_ _ context-data]
-    (ipfs/write ipfs-endpoint context-data))
+    (storage/write store "commit" commit-data))
+  (-txn-read [_ txn-key]
+    (storage/read store txn-key))
+  (-txn-write [_ _ txn-data]
+    (storage/write store "txn" txn-data))
 
   conn-proto/iConnection
   (-close [_] (close id state))
@@ -65,12 +65,12 @@
     [conn {:keys [id leaf tempid] :as node}]
     (let [cache-key [::resolve id tempid]]
       (if (= :empty id)
-        (storage/resolve-empty-node node)
+        (index-storage/resolve-empty-node node)
         (conn-cache/lru-lookup
           lru-cache-atom
           cache-key
           (fn [_]
-            (storage/resolve-index-node conn node
+            (index-storage/resolve-index-node conn node
                                         (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
 
 #?(:cljs
@@ -114,17 +114,19 @@
            serializer (json-serde)
            ipns       "self"}}]
   (go-try
-    (let [ipfs-endpoint   (or server "http://127.0.0.1:5001/") ;; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
+    (let [ipfs-endpoint   server ; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
           ledger-defaults (ledger-defaults defaults)
-          memory          (or memory 1000000) ;; default 1MB memory
+          memory          (or memory 1000000) ; default 1MB memory
           conn-id         (str (random-uuid))
           state           (conn-core/blank-state)
-          nameservices*  (util/sequential
-                           (or nameservices (<? (default-ipns-nameservice ipfs-endpoint ipns))))
+          nameservices*   (util/sequential
+                            (or nameservices (<? (default-ipns-nameservice ipfs-endpoint ipns))))
           cache-size      (conn-cache/memory->cache-size memory)
-          lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
+          lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))
+          ipfs-store      (ipfs-storage/open ipfs-endpoint)]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id              conn-id
+                            :store           ipfs-store
                             :ipfs-endpoint   ipfs-endpoint
                             :ledger-defaults ledger-defaults
                             :serializer      serializer

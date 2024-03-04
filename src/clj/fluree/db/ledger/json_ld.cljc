@@ -32,14 +32,13 @@
 
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn db
-  [ledger {:keys [branch context-type]}]
+  [ledger {:keys [branch]}]
   (let [branch-meta (ledger-proto/-branch ledger branch)]
     ;; if branch is nil, will return default
     (when-not branch-meta
       (throw (ex-info (str "Invalid branch: " branch ".")
                       {:status 400 :error :db/invalid-branch})))
-    (cond-> (branch/latest-db branch-meta)
-            context-type (assoc :context-type context-type))))
+    (branch/latest-db branch-meta)))
 
 (defn db-update
   "Updates db, will throw if not next 't' from current db.
@@ -305,7 +304,7 @@
 (defn load*
   [conn ledger-chan address]
   (go-try
-    (let [commit-addr  (<? (nameservice/lookup-commit conn address nil))
+    (let [commit-addr  (<? (nameservice/lookup-commit conn address))
           _            (when-not commit-addr
                          (throw (ex-info (str "Unable to load. No commit exists for: " address)
                                          {:status 400 :error :db/invalid-commit-address})))

@@ -3,7 +3,7 @@
 
 
 (defprotocol iNameService
-  (-lookup [nameservice ledger-alias] [nameservice ledger-alias opts] "Performs lookup operation on ledger alias and returns map of latest commit and other metadata")
+  (-lookup [nameservice ledger-address] "Returns the head commit address of the ledger.")
   (-push [nameservice commit-data] "Pushes new commit to nameservice.")
   (-subscribe [nameservice ledger-alias callback] "Creates a subscription to nameservice(s) for ledger events. Will call callback with event data as received.")
   (-unsubscribe [nameservice ledger-alias] "Unsubscribes to nameservice(s) for ledger events")
@@ -16,5 +16,3 @@
 
   (-alias [nameservice ledger-address] "Given a ledger address, returns ledger's default alias name else nil, if not avail")
   (-address [nameservice ledger-alias key] "Returns address/iri for provided ledger alias specific to the connection type"))
-
-

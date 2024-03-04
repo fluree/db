@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.transact
-  (:require [clojure.core.async :as async :refer [go alts!]]
+  (:require [clojure.core.async :as async :refer [alts! go]]
             [fluree.db.util.log :as log]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.policy :as perm]
@@ -84,12 +85,14 @@
   When optional reasoned-from-IRI is provided, will mark
   any new flakes as reasoned from the provided value
   in the flake's metadata (.-m) as :reasoned key."
-  [db reasoned-from-IRI]
+  [db txn-id author-did reasoned-from-IRI]
   (let [{:keys [branch ledger policy], db-t :t} db
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t         (inc commit-t)
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before
+     :txn-id                   txn-id
+     :author-did               author-did
      :policy        policy
      :stage-update? (= t db-t) ; if a previously staged db is getting updated
                                ; again before committed
@@ -181,11 +184,12 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [db new-flakes {:keys [stage-update? policy t] :as _tx-state}]
+  [db new-flakes {:keys [stage-update? policy t txn-id author-did] :as _tx-state}]
   (let [[add remove] (if stage-update?
                        (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                        [new-flakes nil])
         db-after  (-> db
+                      (update :txns (fnil conj []) [txn-id author-did])
                       (assoc :policy policy) ;; re-apply policy to db-after
                       (assoc :t t)
                       (commit-data/update-novelty add remove)
@@ -194,9 +198,9 @@
     {:add add :remove remove :db-after db-after}))
 
 (defn reasoner-stage
-  [db fuel-tracker rule-id full-rule]
+  [db fuel-tracker txn-id author-did rule-id full-rule]
   (go-try
-    (let [tx-state      (->tx-state db rule-id)
+    (let [tx-state      (->tx-state db txn-id author-did rule-id)
           parsed-txn    (:rule-parsed full-rule)
           _             (when-not (:where parsed-txn)
                           (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
@@ -211,12 +215,12 @@
       flakes)))
 
 (defn execute-reasoner-rule
-  [db rule-id reasoning-rules fuel-tracker tx-state]
+  [db rule-id reasoning-rules fuel-tracker {:keys [txn-id author-did] :as tx-state}]
   (go-try
-    (let [[db reasoner-flakes] (<? (reasoner-stage db fuel-tracker rule-id (get reasoning-rules rule-id)))
+    (let [[db reasoner-flakes] (<? (reasoner-stage db fuel-tracker txn-id author-did rule-id (get reasoning-rules rule-id)))
           tx-state* (assoc tx-state :stage-update? true
                                     :db-before db)]
-      (log/warn "REASONER FLAKES: " rule-id reasoner-flakes)
+      (log/debug "reasoner flakes: " rule-id reasoner-flakes)
       ;; returns map of :db-after, :add, :remove - but for reasoning we only support adds, so remove should be empty
       (final-db db reasoner-flakes tx-state*))))
 
@@ -286,13 +290,18 @@
 (defn stage
   ([db txn parsed-opts]
    (stage db nil txn parsed-opts))
-  ([db fuel-tracker txn parsed-opts]
+  ([{:keys [conn ledger] :as db} fuel-tracker txn parsed-opts]
    (go-try
-     (let [ctx        (:context parsed-opts)
-           parsed-txn (q-parse/parse-txn txn ctx)
-           db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts ctx)]
+     (let [{:keys [context raw-txn did]} parsed-opts
+
+           parsed-txn (q-parse/parse-txn txn context)
+           db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                         (<? (perm/wrap-policy db policy-identity))
                         db)
-           tx-state   (->tx-state db* nil)
-           flakes     (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
+
+           {txn-id :address}
+           (<? (conn-proto/-txn-write conn ledger raw-txn))
+
+           tx-state (->tx-state db* txn-id did nil)
+           flakes   (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
        (<? (flakes->final-db fuel-tracker tx-state flakes))))))

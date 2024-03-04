@@ -331,7 +331,7 @@
     #?(#_#_:cljs
        (async done
          (go
-          (let [conn   (<! (test-utils/create-conn {:context-type :string}))
+           (let [conn   (<! (test-utils/create-conn))
                 ledger (<p! (fluree/create conn "people"))
                 db     (<p! (fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
                                                                "insert" people-data}))]
@@ -345,9 +345,7 @@
                 (done))))))
 
        :clj
-       (let [conn @(fluree/connect {:method :memory
-                                    :defaults {:context-type :string
-                                               :context test-utils/default-str-context}})
+       (let [conn @(fluree/connect {:method :memory})
              db   (-> conn
                       (fluree/create "people")
                       deref

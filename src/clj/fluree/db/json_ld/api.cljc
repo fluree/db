@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.api
-  (:require [clojure.string :as str]
-            [fluree.db.conn.ipfs :as ipfs-conn]
+  (:require [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
             [fluree.db.conn.remote :as remote-conn]
@@ -64,18 +63,19 @@
   [{:keys [method parallelism remote-servers] :as opts}]
   ;; TODO - do some validation
   (promise-wrap
-    (let [opts*   (assoc opts :parallelism (or parallelism 4))
+    (let [opts* (assoc opts :parallelism (or parallelism 4))
+
           method* (cond
-                    method (keyword method)
+                    method         (keyword method)
                     remote-servers :remote
-                    :else (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
-                                          {:status 500 :error :db/invalid-configuration})))]
+                    :else          (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
+                                                   {:status 500 :error :db/invalid-configuration})))]
       (case method*
         :remote (remote-conn/connect opts*)
-        :ipfs (ipfs-conn/connect opts*)
-        :file (if platform/BROWSER
-                (throw (ex-info "File connection not supported in the browser" opts))
-                (file-conn/connect opts*))
+        :ipfs   (ipfs-conn/connect opts*)
+        :file   (if platform/BROWSER
+                  (throw (ex-info "File connection not supported in the browser" opts))
+                  (file-conn/connect opts*))
         :memory (memory-conn/connect opts*)
         :s3     #?(:clj  (s3-conn/connect opts*)
                    :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"

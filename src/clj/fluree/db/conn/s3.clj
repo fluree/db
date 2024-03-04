@@ -1,8 +1,7 @@
 (ns fluree.db.conn.s3
   (:require [cognitect.aws.client.api :as aws]
-            [fluree.db.method.s3.core :as s3]
             [fluree.db.nameservice.s3 :as ns-s3]
-            [clojure.core.async :as async :refer [go <!]]
+            [clojure.core.async :as async :refer [go]]
             [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.proto :as conn-proto]
@@ -11,20 +10,21 @@
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.storage :as storage]
-            [fluree.db.util.context :as ctx-util]
+            [fluree.db.indexer.storage :as index-storage]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld])
+            [fluree.json-ld :as json-ld]
+            [fluree.db.storage :as storage]
+            [fluree.db.storage.s3 :as s3-storage])
   (:import (java.io Writer)))
 
 (set! *warn-on-reflection* true)
 
-
 (defn write-data
-  [{:keys [s3-client s3-bucket s3-prefix] :as _conn} ledger data-type data]
-  (go
+  [{:keys [store] :as _conn} ledger data-type data]
+  (go-try
     (let [alias    (ledger-proto/-alias ledger)
           branch   (-> ledger ledger-proto/-branch :name name)
           json     (if (string? data)
@@ -37,48 +37,44 @@
                         (when branch (str "/" branch))
                         (str "/" type-dir "/")
                         hash ".json")
-          result   (<! (s3/write-s3-data s3-client s3-bucket s3-prefix path bytes))]
-      (if (instance? Throwable result)
-        result
-        {:name    hash
-         :hash    hash
-         :json    json
-         :size    (count json)
-         :address (s3/s3-address s3-bucket s3-prefix path)}))))
+          result   (<? (storage/write store path bytes))]
+      {:name    path
+       :hash    hash
+       :json    json
+       :size    (count json)
+       :address (:address result)})))
 
 (defn read-commit
-  [{:keys [s3-client s3-bucket s3-prefix] :as _conn} address]
-  (go (json/parse (<! (s3/read-address s3-client s3-bucket s3-prefix address)) false)))
+  [{:keys [store] :as _conn} address]
+  (go-try
+    (let [commit-data (<? (storage/read store address))]
+      (json/parse commit-data false))))
 
 (defn write-commit
   [conn ledger commit-data]
   (write-data conn ledger :commit commit-data))
-
-(defn read-context
-  [{:keys [s3-client s3-bucket s3-prefix] :as _conn} address]
-  (go (json/parse (<! (s3/read-address s3-client s3-bucket s3-prefix address)) false)))
-
-(defn write-context
-  [conn ledger context-data]
-  (write-data conn ledger :context context-data))
 
 (defn write-index
   [conn ledger index-type index-data]
   (write-data conn ledger (str "index/" (name index-type)) index-data))
 
 (defn read-index
-  [{:keys [s3-client s3-bucket s3-prefix] :as _conn} index-address]
-  (go (-> (s3/read-address s3-client s3-bucket s3-prefix index-address) <! (json/parse true))))
+  [{:keys [store] :as _conn} index-address]
+  (go-try
+    (let [index-data (<? (storage/read store index-address))]
+      (json/parse index-data true))))
 
 
-(defrecord S3Connection [id s3-client s3-bucket s3-prefix memory state
-                         ledger-defaults parallelism msg-in-ch msg-out-ch
-                         lru-cache-atom nameservices]
+(defrecord S3Connection [id state ledger-defaults parallelism lru-cache-atom nameservices store]
   conn-proto/iStorage
   (-c-read [conn commit-key] (read-commit conn commit-key))
   (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
-  (-ctx-read [conn context-key] (read-context conn context-key))
-  (-ctx-write [conn ledger context-data] (write-context conn ledger context-data))
+  (-txn-read [_ txn-key]
+    (go-try
+      (let [txn-data (<? (storage/read store txn-key))]
+        (json/parse txn-data false))))
+  (-txn-write [conn ledger txn-data]
+    (write-data conn ledger :txn txn-data))
   (-index-file-write [conn ledger index-type index-data]
     (write-index conn ledger index-type index-data))
   (-index-file-read [conn index-address]
@@ -104,10 +100,10 @@
   (resolve [conn {:keys [id leaf tempid] :as node}]
     (let [cache-key [::resolve id tempid]]
       (if (= :empty id)
-        (storage/resolve-empty-node node)
+        (index-storage/resolve-empty-node node)
         (conn-cache/lru-lookup lru-cache-atom cache-key
                                (fn [_]
-                                 (storage/resolve-index-node
+                                 (index-storage/resolve-index-node
                                    conn node
                                    (fn [] (conn-cache/lru-evict lru-cache-atom
                                                                cache-key)))))))))
@@ -146,7 +142,7 @@
     :or   {serializer (json-serde)} :as _opts}]
   (go
     (let [aws-opts       (cond-> {:api :s3}
-                                 s3-endpoint (assoc :endpoint-override s3-endpoint))
+                           s3-endpoint (assoc :endpoint-override s3-endpoint))
           client         (aws/client aws-opts)
           conn-id        (str (random-uuid))
           state          (conn-core/blank-state)
@@ -154,11 +150,10 @@
                            (or nameservices (default-S3-nameservice client s3-bucket s3-prefix)))
           cache-size     (conn-cache/memory->cache-size memory)
           lru-cache-atom (or lru-cache-atom
-                             (atom (conn-cache/create-lru-cache cache-size)))]
+                             (atom (conn-cache/create-lru-cache cache-size)))
+          s3-store       (s3-storage/open s3-bucket s3-prefix s3-endpoint)]
       (map->S3Connection {:id              conn-id
-                          :s3-client       client
-                          :s3-bucket       s3-bucket
-                          :s3-prefix       s3-prefix
+                          :store           s3-store
                           :memory          memory
                           :state           state
                           :ledger-defaults (ledger-defaults defaults)

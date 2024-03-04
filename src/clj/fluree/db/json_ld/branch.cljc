@@ -20,7 +20,8 @@
 
 (defn branch-meta
   "Returns branch map data for current branch, or specified branch"
-  ([ledger] (branch-meta ledger (current-branch ledger)))
+  ([ledger]
+   (branch-meta ledger (current-branch ledger)))
   ([ledger branch]
    (-> ledger
        :state
