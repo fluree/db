@@ -298,7 +298,7 @@
     (try
       (avro/binary-encoded FdbLeafNode-schema leaf)
       (catch Exception e (log/error e (str "Error serializing index leaf data: " (pr-str leaf)))
-                         (throw (ex-info "Unexpected error serializing index branch."
+                         (throw (ex-info "Unexpected error serializing index leaf."
                                          {:status 500 :error :db/unexpected-error})))))
   (-deserialize-leaf [_ leaf]
     (binding [avro/*avro-readers* bindings]
@@ -307,15 +307,15 @@
     (try
       (avro/binary-encoded FdbGarbage-schema garbage)
       (catch Exception e (log/error e (str "Error serializing index garbage data: " (pr-str garbage)))
-                         (throw (ex-info "Unexpected error serializing index branch."
+                         (throw (ex-info "Unexpected error serializing index garbage file."
                                          {:status 500 :error :db/unexpected-error})))))
   (-deserialize-garbage [_ garbage]
     (avro/decode FdbGarbage-schema garbage))
   (-serialize-db-pointer [_ pointer]
     (try
       (avro/binary-encoded FdbDbPointer-schema pointer)
-      (catch Exception e (log/error e (str "Error serializing db index pointer: " (pr-str pointer)))
-                         (throw (ex-info "Unexpected error serializing index branch."
+      (catch Exception e (log/error e (str "Error serializing db index pointer file: " (pr-str pointer)))
+                         (throw (ex-info "Unexpected error serializing index pointer file."
                                          {:status 500 :error :db/unexpected-error})))))
   (-deserialize-db-pointer [_ pointer]
     (avro/decode FdbDbPointer-schema pointer)))

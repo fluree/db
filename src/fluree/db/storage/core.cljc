@@ -146,7 +146,13 @@
           his-key       (str leaf-key "-his")
           data          {:flakes flakes
                          :his    his-key}
-          ser           (serdeproto/-serialize-leaf (serde conn) data)
+          ser           (try* (serdeproto/-serialize-leaf (serde conn) data)
+                              (catch* e
+                                      (log/error e (str "Error serializing leaf: " leaf-key " with error " (ex-message e)
+                                                        "\n" "Data: " (pr-str data)))
+                                      (throw (ex-info (str "Error serializing leaf: " leaf-key " with error " (ex-message e))
+                                                      {}
+                                                      e))))
           write-his-ch  (write-history conn history his-key nil)
           write-leaf-ch (storage-write conn leaf-key ser)]
       ;; write history and leaf node in parallel
@@ -218,10 +224,17 @@
         (let [data (<! (storage-read conn key))]
           (if (or (nil? data) (instance? #?(:clj Throwable :cljs js/Error) data))
             (async/close! return-ch)
-            (->> (serdeproto/-deserialize-leaf (serde conn) data)
-                 :flakes
-                 (sort flake/cmp-flakes-history)
-                 (async/put! return-ch))))
+            (let [his-data (try* (serdeproto/-deserialize-leaf (serde conn) data)
+                                 (catch* e
+                                         (log/error e (str "Error deserializing history file: " key " with error " (ex-message e)))
+                                         (log/warn (str "History file unavailable for node: " key
+                                                        ". Continuing to operate with no history for index node. "
+                                                        "Reindexing is recommended!"))
+                                         {:flakes []}))]
+              (->> his-data
+                   :flakes
+                   (sort flake/cmp-flakes-history)
+                   (async/put! return-ch)))))
         (catch* e
                 (error-fn)
                 (async/put! return-ch e)
@@ -518,18 +531,52 @@
         (serdeproto/-deserialize-db-root (serde conn) data)))))
 
 
+(defn most-current-db-root
+  "Attempts to retrieve the most recent available db root.
+
+  In the case there is an index corruption, one can remove the latest index
+  root file, and provided there are other index points the db will load from
+  the latest. It is important the machine has enough memory to hold the novelty
+   from the loaded index point in memory.
+
+   Upn the next transaction, the ledger should generate a new index point that
+   will then be used in the future."
+  [conn network dbid index ledger-info]
+  (go-try
+    (let [db-root (<? (read-db-root conn network dbid index))]
+      (or db-root
+          (let [all-indexes       (->> ledger-info
+                                       :indexes
+                                       keys
+                                       (sort >))
+                ;; remaining index points available except for most current (which we already tried)
+                remaining-indexes (rest all-indexes)]
+            (log/warn (str "Database " network "/" dbid " could not be be loaded from main index point: "
+                           index ". Attempting to load from others: " remaining-indexes))
+            (loop [[next-index & r] remaining-indexes]
+              (if next-index
+                (if-let [db-root (<? (read-db-root conn network dbid next-index))]
+                  (do
+                    (log/warn (str "Database " network "/" dbid " successfully loaded from index point: "
+                                   next-index ". The db should write out a new index upon the next transaction."))
+                    db-root)
+                  (do
+                    (log/warn (str "Database " network "/" dbid " could not be be loaded from index point: "
+                                   next-index "."))
+                    (recur r)))
+                (throw (ex-info (str "Database " network "/" dbid " could not be loaded at any index points: " all-indexes ".")
+                                {:status 400
+                                 :error  :db/missing-index-root})))))))))
+
 (defn reify-db
   "Reifies db at specified index point. If unable to read db-root at index, throws."
-  [conn network dbid blank-db index]
+  ([conn network dbid blank-db index] (reify-db conn network dbid blank-db index nil))
+  ([conn network dbid blank-db index ledger-info]
   (go-try
-    (let [db-root (read-db-root conn network dbid index)]
-      (when-not db-root
-        (throw (ex-info (str "Database " network "/" dbid " could not be loaded at index point: " index ".")
-                        {:status 400
-                         :error  :db/unavailable})))
-      (let [db  (reify-db-root conn blank-db (<? db-root))
+    (let [db-root (<? (most-current-db-root conn network dbid index ledger-info))]
+      (let [db  (reify-db-root conn blank-db db-root)
             db* (assoc db :schema (<? (schema/schema-map db)))]
-        (assoc db* :settings (<? (schema/setting-map db*)))))))
+        (assoc db* :settings (<? (schema/setting-map db*))))))))
 
 
 ;; TODO - should look to add some parallelism to block fetches
