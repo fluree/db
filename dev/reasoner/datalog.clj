@@ -1,23 +1,17 @@
 (ns reasoner.datalog
   (:require [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.async :refer [<? <??]]
-            [fluree.db.reasoner.core :as reasoner]))
+            [fluree.db.util.async :refer [<? <??]]))
 
 
 
 (comment
 
-
   (def conn @(fluree/connect-memory nil))
 
   (def ledger @(fluree/create conn "test/rule"))
-  (def db-reasoner (fluree/reasoner-set
-                     (fluree/db ledger) :datalog))
-
-  (-> db-reasoner :reasoner)
 
   (def db @(fluree/stage
-             db-reasoner
+             (fluree/db ledger)
              {"@context" {"ex" "http://example.org/"}
               "insert"   [{"@id"        "ex:brian"
                            "ex:name"    "Brian"
@@ -37,42 +31,71 @@
                            "ex:gender" {"@id" "ex:Male"}}]}))
 
 
-  (-> db :reasoner)
 
-
+  ;; insert rules that a reasoner will evaluate with a reasoned-db
   (def db2 @(fluree/stage
               db {"insert" [uncle-rule sibling-rule brother-rule senior-rule runs-cold-rule]}
               {:meta false}))
 
+  (def reasoned-db @(fluree/reason db2 :datalog))
 
 
-  ;; parents (via sibling)
-  @(fluree/query
-     db2 {:context {"ex" "http://example.org/"}
-          :select  ["?s" "?parent"]
-          :where   {"@id"       "?s",
-                    "ex:parent" "?parent"}})
 
-  ;; brother
-  @(fluree/query
-     db2 {:context {"ex" "http://example.org/"}
-          :select  ["?s" "?brother"]
-          :where   {"@id"        "?s",
-                    "ex:brother" "?brother"}})
+  ;;;; parents (via sibling)
+  ;; without reasoning
+  @(fluree/query db2
+                 {:context {"ex" "http://example.org/"}
+                  :select  ["?s" "?parent"]
+                  :where   {"@id"       "?s",
+                            "ex:parent" "?parent"}})
+  ;; with reasoning
+  @(fluree/query reasoned-db
+                 {:context {"ex" "http://example.org/"}
+                  :select  ["?s" "?parent"]
+                  :where   {"@id"       "?s",
+                            "ex:parent" "?parent"}})
 
-  ;; uncle
-  @(fluree/query
-     db2 {:context {"ex" "http://example.org/"}
-          :select  ["?s" "?uncle"]
-          :where   {"@id"      "?s",
-                    "ex:uncle" "?uncle"}})
+  ;;;; brother
+  ;; without reasoning
+  @(fluree/query db2
+                 {:context {"ex" "http://example.org/"}
+                  :select  ["?s" "?brother"]
+                  :where   {"@id"        "?s",
+                            "ex:brother" "?brother"}})
+  ;; with reasoning
+  @(fluree/query reasoned-db
+                 {:context {"ex" "http://example.org/"}
+                  :select  ["?s" "?brother"]
+                  :where   {"@id"        "?s",
+                            "ex:brother" "?brother"}})
 
-  ;; seniorCitizen
-  @(fluree/query
-     db2 {:context {"ex" "http://example.org/"}
-          :select  "?s"
-          :where   {"@id"              "?s",
-                    "ex:seniorCitizen" true}}))
+  ;;;; uncle
+  ;; without reasoning
+  @(fluree/query db2
+                 {:context {"ex" "http://example.org/"}
+                  :select  ["?s" "?uncle"]
+                  :where   {"@id"      "?s",
+                            "ex:uncle" "?uncle"}})
+  ;; with reasoning
+  @(fluree/query reasoned-db
+                 {:context {"ex" "http://example.org/"}
+                  :select  ["?s" "?uncle"]
+                  :where   {"@id"      "?s",
+                            "ex:uncle" "?uncle"}})
+
+  ;;;; seniorCitizen
+  ;; without reasoning
+  @(fluree/query db2
+                 {:context {"ex" "http://example.org/"}
+                  :select  "?s"
+                  :where   {"@id"              "?s",
+                            "ex:seniorCitizen" true}})
+  ;; with reasoning
+  @(fluree/query reasoned-db
+                 {:context {"ex" "http://example.org/"}
+                  :select  "?s"
+                  :where   {"@id"              "?s",
+                            "ex:seniorCitizen" true}}))
 
 
 

@@ -16,7 +16,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.conn.core :refer [notify-ledger]]
+            [fluree.db.connection :refer [notify-ledger]]
             [fluree.db.reasoner.core :as reasoner]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy :as perm])
