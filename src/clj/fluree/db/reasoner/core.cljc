@@ -7,6 +7,7 @@
             [fluree.db.reasoner.resolve :as resolve]
             [fluree.db.json-ld.transact :as transact]
             [fluree.db.fuel :as fuel]
+            [fluree.json-ld :as json-ld]
             [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -27,14 +28,6 @@
   "Takes a sequence of flakes and keeps only reasoned flakes"
   [flakes]
   (filter reasoned-flake? flakes))
-
-(defn rules-graph
-  [db]
-  (go-try
-    (let [rules (<? (resolve/find-rules db))]
-      (->> rules
-           (resolve/rules->graph db)
-           add-rule-dependencies))))
 
 (defn schedule
   "Returns list of rule @id values in the order they should be run.
@@ -81,14 +74,14 @@
 
 (defn execute-reasoner
   "Executes the reasoner on the staged db-after and returns the updated db-after."
-  [{:keys [reasoner] :as db-after} reasoning-rules fuel-tracker {:keys [reasoner-max] :as tx-state}]
+  [db reasoning-rules fuel-tracker reasoner-max tx-state]
   (go-try
     (let [rule-schedule (schedule reasoning-rules)]
       (log/debug "reasoning schedule: " rule-schedule)
       (if (seq rule-schedule)
         (loop [[rule-id & r] rule-schedule
                reasoned-flakes nil ;; Note these are in an AVL set in with spot comparator
-               reasoned-db     db-after
+               reasoned-db     db
                summary         {:iterations      0 ;; holds summary across all runs
                                 :reasoned-flakes []
                                 :total-flakes    0}]
@@ -108,17 +101,18 @@
                                        :total-flakes    (count all-reasoned-flakes)}
                   new-flakes?         (> (:total-flakes summary*)
                                          (:total-flakes summary))
-                  ;reasoning-rules* (<? (convert-rules-dependency-flakes-to-SIDs reasoned-db reasoning-rules))
-                  ;rules* (select-keys reasoning-rules rule-schedule) ;; reduce possible rules to only the rules that were run in last iteration
-                  ;rule-schedule* (reasoner/schedule reasoning-rules (rule-dependency-fn reasoning-rules reasoned-flakes))
-                  ]
+                  maxed?              (when reasoner-max
+                                        (= (:iterations summary*) reasoner-max))]
               (log/debug "completed reasoning iteration number: " (:iterations summary*)
                          "Total reasoned flakes:" (:total-flakes summary*))
-              (if (and new-flakes?
-                       (< (:iterations summary*) reasoner-max))
+              (if (and new-flakes? (not maxed?))
                 (recur rule-schedule nil reasoned-db summary*)
-                reasoned-db))))
-        db-after))))
+                (do
+                  (when (and maxed? new-flakes?)
+                    (log/warn (str "Reasoner reached max iterations: " reasoner-max
+                                   ". Returning db reasoned thus far.")))
+                  reasoned-db)))))
+        db))))
 
 (defn rules-from-graph
   [graph]
@@ -144,7 +138,7 @@
            add-rule-dependencies))))
 
 (defn reason
-  [db regimes graph {:keys [max-fuel] :as opts}]
+  [db regimes graph {:keys [max-fuel reasoner-max] :as opts}]
   (go-try
     (let [regimes         (set (util/sequential regimes))
           fuel-tracker    (fuel/tracker max-fuel)
@@ -159,4 +153,4 @@
       (log/debug "reasoning rules: " reasoning-rules)
       (if (empty? reasoning-rules)
         db
-        (<? (execute-reasoner db* reasoning-rules fuel-tracker tx-state))))))
+        (<? (execute-reasoner db* reasoning-rules fuel-tracker reasoner-max tx-state))))))
