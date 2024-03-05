@@ -339,7 +339,7 @@
 
 ;; reasoning APIs
 
-(defn reasoner-set
+(defn reason
   "Sets the reasoner type(s) to perform on a db.
   Reasoning is done in-memory at the db-level and is not persisted.
 
@@ -347,9 +347,11 @@
 
   You can give a single reasoning type as an argument, or multiple
   as a sequential list/vector."
-  [db reasoner-type]
-  (let [reasoner-types (set (util/sequential reasoner-type))]
-    (update db :reasoner #(into reasoner-types %))))
+  ([db regimes] (reason db regimes nil nil))
+  ([db regimes graphs] (reason db regimes graphs nil))
+  ([db regimes graphs opts]
+   (promise-wrap
+     (reasoner/reason db regimes graphs opts))))
 
 (defn reasoned-count
   "Returns a count of reasoned facts in the provided db."

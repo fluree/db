@@ -1,8 +1,12 @@
 (ns fluree.db.reasoner.core
-  (:require [fluree.db.flake :as flake]
+  (:require [clojure.core.async :as async :refer [alts! go]]
+            [fluree.db.flake :as flake]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
+            [fluree.db.json-ld.transact :as transact]
+            [fluree.db.fuel :as fuel]
             [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -48,3 +52,82 @@
   ([rules result-summary]
    (task-queue rules result-summary)))
 
+(defn reasoner-stage
+  [db fuel-tracker txn-id author-did rule-id full-rule]
+  (go-try
+    (let [tx-state      (transact/->tx-state db txn-id author-did rule-id)
+          parsed-txn    (:rule-parsed full-rule)
+          _             (when-not (:where parsed-txn)
+                          (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
+                                          {:status 400 :error :db/invalid-transaction})))
+
+          flakes-ch     (transact/generate-flakes db fuel-tracker parsed-txn tx-state)
+          fuel-error-ch (:error-ch fuel-tracker)
+          chans         (remove nil? [fuel-error-ch flakes-ch])
+          [flakes] (alts! chans :priority true)]
+      (when (util/exception? flakes)
+        (throw flakes))
+      flakes)))
+
+(defn execute-reasoner-rule
+  [db rule-id reasoning-rules fuel-tracker {:keys [txn-id author-did] :as tx-state}]
+  (go-try
+    (let [[db reasoner-flakes] (<? (reasoner-stage db fuel-tracker txn-id author-did rule-id (get reasoning-rules rule-id)))
+          tx-state* (assoc tx-state :stage-update? true
+                                    :db-before db)]
+      (log/debug "reasoner flakes: " rule-id reasoner-flakes)
+      ;; returns map of :db-after, :add, :remove - but for reasoning we only support adds, so remove should be empty
+      (transact/final-db db reasoner-flakes tx-state*))))
+
+(defn execute-reasoner
+  "Executes the reasoner on the staged db-after and returns the updated db-after."
+  [{:keys [reasoner] :as db-after} fuel-tracker {:keys [reasoner-max] :as tx-state}]
+  (go-try
+    (if reasoner
+      (let [reasoning-rules (<? (rules-graph db-after))
+            rule-schedule   (schedule reasoning-rules)]
+        (log/debug "reasoning rules: " reasoning-rules)
+        (log/debug "reasoning schedule: " rule-schedule)
+        (if (seq rule-schedule)
+          (loop [[rule-id & r] rule-schedule
+                 reasoned-flakes nil ;; Note these are in an AVL set in with spot comparator
+                 reasoned-db     db-after
+                 summary         {:iterations      0 ;; holds summary across all runs
+                                  :reasoned-flakes []
+                                  :total-flakes    0}]
+            (if rule-id
+              (let [{:keys [db-after add]} (<? (execute-reasoner-rule reasoned-db rule-id reasoning-rules fuel-tracker tx-state))]
+                (log/debug "executed reasoning rule: " rule-id)
+                (log/trace "reasoning rule: " rule-id "produced flakes:" add)
+                (recur r
+                       (if reasoned-flakes
+                         (into reasoned-flakes add)
+                         add)
+                       db-after
+                       summary))
+              (let [all-reasoned-flakes (into reasoned-flakes (:reasoned-flakes summary))
+                    summary*            {:iterations      (-> summary :iterations inc)
+                                         :reasoned-flakes all-reasoned-flakes
+                                         :total-flakes    (count all-reasoned-flakes)}
+                    new-flakes?         (> (:total-flakes summary*)
+                                           (:total-flakes summary))
+                    ;reasoning-rules* (<? (convert-rules-dependency-flakes-to-SIDs reasoned-db reasoning-rules))
+                    ;rules* (select-keys reasoning-rules rule-schedule) ;; reduce possible rules to only the rules that were run in last iteration
+                    ;rule-schedule* (reasoner/schedule reasoning-rules (rule-dependency-fn reasoning-rules reasoned-flakes))
+                    ]
+                (log/debug "completed reasoning iteration number: " (:iterations summary*)
+                           "Total reasoned flakes:" (:total-flakes summary*))
+                (if (and new-flakes?
+                         (< (:iterations summary*) reasoner-max))
+                  (recur rule-schedule nil reasoned-db summary*)
+                  reasoned-db))))
+          db-after))
+      db-after)))
+
+(defn reason
+  [db regimes graphs {:keys [max-fuel] :as opts}]
+  (let [regimes      (set (util/sequential regimes))
+        fuel-tracker (fuel/tracker max-fuel)
+        db*          (update db :reasoner #(into regimes %))
+        tx-state     (transact/->tx-state db* nil nil nil)]
+    (execute-reasoner db* fuel-tracker tx-state)))

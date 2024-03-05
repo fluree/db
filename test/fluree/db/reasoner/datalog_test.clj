@@ -29,16 +29,13 @@
   (testing "Some basic datalog rules"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "reasoner/basic-datalog" nil)
-          db0    (-> (fluree/db ledger)
-                     (fluree/reasoner-set :datalog))
-          db1    @(fluree/stage db0 reasoning-db-data)]
+          db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
 
-      (testing "Reasoner type correctly set"
-        (is (= #{:datalog} (-> db1 :reasoner))))
+
 
       (testing "A standard relationship"
         (let [grandparent-db  @(fluree/stage
-                                 db1
+                                 db0
                                  {"@context" {"f"  "http://flur.ee/ns/ledger#"
                                               "ex" "http://example.org/"},
                                   "insert"
@@ -50,22 +47,27 @@
                                                        "insert"   {"@id"            "?children",
                                                                    "ex:grandParent" {"@id" "?parents"}}}}}})
 
-              grandparents-of @(fluree/query
-                                 grandparent-db {:context {"ex" "http://example.org/"}
-                                                 :select  ["?grandParent" "?person"]
-                                                 :where   {"@id"            "?person",
-                                                           "ex:grandParent" "?grandParent"}})]
+              grandparent-db* @(fluree/reason grandparent-db :datalog)
 
+
+              grandparents-of @(fluree/query grandparent-db*
+                                             {:context {"ex" "http://example.org/"}
+                                              :select  ["?grandParent" "?person"]
+                                              :where   {"@id"            "?person",
+                                                        "ex:grandParent" "?grandParent"}})]
+
+          (testing "Reasoner type correctly set"
+            (is (= #{:datalog} (-> grandparent-db* :reasoner))))
 
           (is (= #{["ex:carol" "ex:alice"]}
                  (set grandparents-of)))
 
-          (is (= 1 (fluree/reasoned-count grandparent-db))
+          (is (= 1 (fluree/reasoned-count grandparent-db*))
               "Only one reasoned triple should be added")))
 
       (testing "A filter rule works"
         (let [senior-db @(fluree/stage
-                           db1
+                           db0
                            {"@context" {"f"  "http://flur.ee/ns/ledger#"
                                         "ex" "http://example.org/"},
                             "insert"   {"@id"    "ex:seniorRule"
@@ -76,22 +78,23 @@
                                                                         ["filter" "(>= ?age 62)"]]
                                                             "insert"   {"@id"              "?person",
                                                                         "ex:seniorCitizen" true}}}}})
+              senior-db* @(fluree/reason senior-db :datalog)
 
               seniors   @(fluree/query
-                           senior-db {:context {"ex" "http://example.org/"}
+                           senior-db* {:context {"ex" "http://example.org/"}
                                       :select  "?s"
                                       :where   {"@id"              "?s",
                                                 "ex:seniorCitizen" true}})]
           (is (= ["ex:carol"]
                  seniors))
 
-          (is (= 1 (fluree/reasoned-count senior-db))
+          (is (= 1 (fluree/reasoned-count senior-db*))
               "Only one reasoned triple should be added")))
 
 
       (testing "Inferring based on a relationship and IRI value"
         (let [brother-db @(fluree/stage
-                            db1
+                            db0
                             {"@context" {"f"  "http://flur.ee/ns/ledger#"
                                          "ex" "http://example.org/"}
                              "insert"   {"@id"    "ex:brotherRule"
@@ -101,19 +104,20 @@
                                                                          "ex:sibling" {"@id"       "?sibling"
                                                                                        "ex:gender" {"@id" "ex:Male"}}}
                                                              "insert"   {"@id"        "?person",
-                                                                         "ex:brother" "?sibling"}}}}})]
+                                                                         "ex:brother" "?sibling"}}}}})
+              brother-db* @(fluree/reason brother-db :datalog)]
 
           (is (= #{["ex:mike" "ex:carol"] ;; <- explicitly set
                    ["ex:bob" "ex:brian"]} ;; <- inferred
                  (-> @(fluree/query
-                        brother-db
+                        brother-db*
                         {:context {"ex" "http://example.org/"}
                          :select  ["?brother" "?s"]
                          :where   {"@id"        "?s",
                                    "ex:brother" "?brother"}})
                      set)))
 
-          (is (= 1 (fluree/reasoned-count brother-db))
+          (is (= 1 (fluree/reasoned-count brother-db*))
               "Only one reasoned triple should be added"))))))
 
 
@@ -121,10 +125,8 @@
   (testing "Some basic datalog rules"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "reasoner/recursive-datalog" nil)
-          db0    (-> (fluree/db ledger)
-                     (fluree/reasoner-set :datalog))
-          db1    @(fluree/stage
-                    db0
+          db0    @(fluree/stage
+                    (fluree/db ledger)
                     {"@context" {"ex" "http://example.org/"}
                      "insert"   [{"@id"                    "ex:task1"
                                   "ex:description"         "Task 1 (Top Level)"
@@ -150,8 +152,8 @@
 
 
       (testing "A recursive relationship"
-        (let [db2 @(fluree/stage
-                     db1
+        (let [db1 @(fluree/stage
+                     db0
                      {"@context" {"f"  "http://flur.ee/ns/ledger#"
                                   "ex" "http://example.org/"},
                       "insert"
@@ -168,7 +170,9 @@
                                             "where"    {"@id"           "?task"
                                                         "ex:hasSubTask" {"ex:hasSubTask" "?sub-sub-task"}}
                                             "insert"   {"@id"           "?task",
-                                                        "ex:hasSubTask" {"@id" "?sub-sub-task"}}}}}]})]
+                                                        "ex:hasSubTask" {"@id" "?sub-sub-task"}}}}}]})
+              db1* @(fluree/reason db1 :datalog)]
+
 
 
           (is (= ["ex:task1-1"
@@ -183,7 +187,7 @@
                   "ex:task1-2-1"
                   "ex:task1-2-2"]
                  (-> @(fluree/query
-                        db2 {:context {"ex" "http://example.org/"}
+                        db1* {:context {"ex" "http://example.org/"}
                              :select  "?subtask"
                              :where   {"@id"           "ex:task1",
                                        "ex:hasSubTask" "?subtask"}})
