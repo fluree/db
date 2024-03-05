@@ -12,7 +12,7 @@
             [fluree.db.api.transact :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
@@ -211,10 +211,10 @@
   distributed rules."
   ([ledger db]
    (promise-wrap
-     (ledger-proto/-commit! ledger db)))
+     (ledger/-commit! ledger db)))
   ([ledger db opts]
    (promise-wrap
-     (ledger-proto/-commit! ledger db opts))))
+     (ledger/-commit! ledger db opts))))
 
 (defn transact!
   [conn txn]
@@ -228,8 +228,8 @@
 
 (defn status
   "Returns current status of ledger branch."
-  ([ledger] (ledger-proto/-status ledger))
-  ([ledger branch] (ledger-proto/-status ledger branch)))
+  ([ledger] (ledger/-status ledger))
+  ([ledger branch] (ledger/-status ledger branch)))
 
 
 (defn push
@@ -266,7 +266,7 @@
    (if opts
      (throw (ex-info "DB opts not yet implemented"
                      {:status 500 :error :db/unexpected-error}))
-     (ledger-proto/-db ledger opts))))
+     (ledger/-db ledger opts))))
 
 
 (defn wrap-policy
@@ -303,7 +303,7 @@
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   [ledger query]
-  (let [latest-db (ledger-proto/-db ledger)
+  (let [latest-db (ledger/-db ledger)
         res-chan  (query-api/history latest-db query)]
     (promise-wrap res-chan)))
 

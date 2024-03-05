@@ -5,10 +5,9 @@
             [fluree.db.nameservice.memory :as ns-memory]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.core :as conn-core]
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]
@@ -52,18 +51,15 @@
 (defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom store
                              parallelism msg-in-ch msg-out-ch nameservices data-atom]
 
-  conn-proto/iStorage
+  connection/iStorage
   (-c-read [_ commit-key] (read-data store commit-key))
   (-c-write [_ _ledger commit-data] (write-data! store commit-data))
   (-txn-read [_ txn-key] (read-data store txn-key))
   (-txn-write [_ _ledger txn-data] (write-data! store txn-data))
 
-  conn-proto/iConnection
+  connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
-  (-method [_] :memory)
-  (-parallelism [_] parallelism)
-  (-id [_] id)
   (-new-indexer [_ opts] (idx-default/create opts)) ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
@@ -90,13 +86,13 @@
      IPrintWithWriter
      (-pr-writer [conn w opts]
        (-write w "#MemoryConnection ")
-       (-write w (pr (conn-core/printer-map conn))))))
+       (-write w (pr (connection/printer-map conn))))))
 
 #?(:clj
    (defmethod print-method MemoryConnection [^MemoryConnection conn, ^Writer w]
      (.write w (str "#MemoryConnection "))
      (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
+       (pr (connection/printer-map conn)))))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
@@ -115,7 +111,7 @@
   (go-try
     (let [ledger-defaults (<? (ledger-defaults defaults))
           conn-id         (str (random-uuid))
-          state           (conn-core/blank-state)
+          state           (connection/blank-state)
           mem-store       (memory-storage/create)
           nameservices*   (util/sequential
                             (or nameservices

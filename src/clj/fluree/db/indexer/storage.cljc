@@ -9,7 +9,7 @@
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.conn.proto :as conn-proto]))
+            [fluree.db.connection :as connection]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -17,10 +17,6 @@
   "Returns serializer from connection."
   [conn]
   (:serializer conn))
-
-(defn ledger-root-key
-  [ledger-alias t]
-  (str ledger-alias "_root_" (util/zero-pad t 15)))
 
 (defn ledger-garbage-prefix
   [ledger-alias]
@@ -37,74 +33,38 @@
   [child]
   (select-keys child [:id :leaf :first :rhs :size]))
 
-(defn notify-new-index-file
-  "Sends new file update into the changes notification async channel
-  if it exists. This is used to synchronize files across consensus, otherwise
-  a changes-ch won't be present and this won't be used."
-  [changes-ch written-node write-response]
-  (when changes-ch
-    (async/go
-      (let [file-type (cond
-                        (contains? written-node :children) :branch
-                        (contains? written-node :flakes) :leaf
-                        (contains? written-node :garbage) :garbage
-                        (contains? written-node :ecount) :root)]
-        (async/>! changes-ch {:event     :new-index-file
-                              :file-type file-type
-                              :data      write-response
-                              :address   (:address write-response)
-                              :t         (:t written-node)})))))
-
 (defn write-leaf
-  "Writes `leaf` to storage under the provided `leaf-id`, computing a new id if
-  one isn't provided. Returns the leaf map with the id used attached uner the
-  `:id` key"
-  [{:keys [conn ledger] :as _db} idx-type changes-ch leaf]
-  (go-try
-    (let [ser   (serdeproto/-serialize-leaf (serde conn) leaf)
-          res   (<? (conn-proto/-index-file-write conn ledger idx-type ser))
-          leaf' (assoc leaf :id (:address res))]
-      (notify-new-index-file changes-ch leaf' res)
-      leaf')))
+  "Serializes and writes the index leaf node `leaf` to storage."
+  [{:keys [conn ledger] :as _db} idx-type leaf]
+  (let [ser (serdeproto/-serialize-leaf (serde conn) leaf)]
+    (connection/-index-file-write conn ledger idx-type ser)))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key.
   Returns two-tuple of response output and raw bytes written."
   [{:keys [conn ledger] :as _db} idx-type data]
-  (go-try
-    (let [ser (serdeproto/-serialize-branch (serde conn) data)
-          res (<? (conn-proto/-index-file-write conn ledger idx-type ser))]
-      res)))
+  (let [ser (serdeproto/-serialize-branch (serde conn) data)]
+    (connection/-index-file-write conn ledger idx-type ser)))
 
 (defn write-branch
-  "Writes `branch` to storage under the provided `branch-id`, computing a new id
-  if one isn't provided. Returns the branch map with the id used attached uner
-  the `:id` key"
-  [db idx-type changes-ch {:keys [children] :as branch}]
-  (go-try
-    (let [child-vals (->> children
-                          (map val)
-                          (mapv child-data))
-          data       {:children child-vals}
-          res        (<? (write-branch-data db idx-type data))
-          branch'    (assoc branch :id (:address res))]
-      (notify-new-index-file changes-ch branch' res)
-      branch')))
+  "Writes the child attributes index branch node `branch` to storage."
+  [db idx-type {:keys [children] :as _branch}]
+  (let [child-vals (->> children
+                        (map val)
+                        (mapv child-data))
+        data       {:children child-vals}]
+    (write-branch-data db idx-type data)))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
-  [db changes-ch garbage]
-  (go-try
-    (let [{:keys [conn ledger ledger-alias t]} db
+  [db garbage]
+  (let [{:keys [conn ledger ledger-alias t]} db
 
-          data     {:ledger-alias ledger-alias
-                    :block        t
-                    :garbage      garbage}
-          ser      (serdeproto/-serialize-garbage (serde conn) data)
-          res      (<? (conn-proto/-index-file-write conn ledger :garbage ser))
-          garbage' (assoc data :address (:address res))]
-      (notify-new-index-file changes-ch garbage' res)
-      garbage')))
+        data {:ledger-alias ledger-alias
+              :t            t
+              :garbage      garbage}
+        ser  (serdeproto/-serialize-garbage (serde conn) data)]
+    (connection/-index-file-write conn ledger :garbage ser)))
 
 (defn extract-schema-root
   "Transform the schema cache for serialization by turning every predicate into a
@@ -120,42 +80,39 @@
                [])))
 
 (defn write-db-root
-  [db changes-ch]
-  (go-try
-    (let [{:keys [conn ledger commit t stats spot psot post opst tspo
-                  namespace-codes]}
-          db
+  [db]
+  (let [{:keys [conn ledger commit t stats spot psot post opst tspo
+                namespace-codes]}
+        db
 
-          ledger-alias (:id commit)
-          preds        (extract-schema-root db)
-          data         {:ledger-alias    ledger-alias
-                        :t               t
-                        :preds           preds
-                        :stats           (select-keys stats [:flakes :size])
-                        :spot            (child-data spot)
-                        :psot            (child-data psot)
-                        :post            (child-data post)
-                        :opst            (child-data opst)
-                        :tspo            (child-data tspo)
-                        :timestamp       (util/current-time-millis)
-                        :prevIndex       (or (:indexed stats) 0)
-                        :namespace-codes namespace-codes}
-          ser          (serdeproto/-serialize-db-root (serde conn) data)
-          res          (<? (conn-proto/-index-file-write conn ledger :root ser))]
-      (notify-new-index-file changes-ch data res)
-      res)))
+        ledger-alias (:id commit)
+        preds        (extract-schema-root db)
+        data         {:ledger-alias    ledger-alias
+                      :t               t
+                      :preds           preds
+                      :stats           (select-keys stats [:flakes :size])
+                      :spot            (child-data spot)
+                      :psot            (child-data psot)
+                      :post            (child-data post)
+                      :opst            (child-data opst)
+                      :tspo            (child-data tspo)
+                      :timestamp       (util/current-time-millis)
+                      :prevIndex       (or (:indexed stats) 0)
+                      :namespace-codes namespace-codes}
+        ser          (serdeproto/-serialize-db-root (serde conn) data)]
+    (connection/-index-file-write conn ledger :root ser)))
 
 
 (defn read-branch
   [{:keys [serializer] :as conn} key]
   (go-try
-    (when-let [data (<? (conn-proto/-index-file-read conn key))]
+    (when-let [data (<? (connection/-index-file-read conn key))]
       (serdeproto/-deserialize-branch serializer data))))
 
 (defn read-leaf
   [{:keys [serializer] :as conn} key]
   (go-try
-    (when-let [data (<? (conn-proto/-index-file-read conn key))]
+    (when-let [data (<? (connection/-index-file-read conn key))]
       (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
@@ -199,7 +156,7 @@
   [conn ledger-alias t]
   (go-try
     (let [key  (ledger-garbage-key ledger-alias t)
-          data (<? (conn-proto/-index-file-read conn key))]
+          data (<? (connection/-index-file-read conn key))]
       (when data
         (serdeproto/-deserialize-garbage (serde conn) data)))))
 
@@ -208,7 +165,7 @@
   "Returns all data for a db index root of a given t."
   ([conn idx-address]
    (go-try
-     (let [data (<? (conn-proto/-index-file-read conn idx-address))]
+     (let [data (<? (connection/-index-file-read conn idx-address))]
        (when data
          (serdeproto/-deserialize-db-root (serde conn) data))))))
 

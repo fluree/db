@@ -4,11 +4,10 @@
             [fluree.db.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.core :as conn-core]
             [fluree.db.method.remote.core :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
             [fluree.db.indexer.default :as idx-default]
@@ -23,17 +22,14 @@
 (defrecord RemoteConnection [id server-state state lru-cache-atom serializer
                              nameservices ledger-defaults parallelism]
 
-  conn-proto/iStorage
+  connection/iStorage
   (-c-read [_ commit-key] (remote/remote-read state server-state commit-key false))
   (-txn-read [_ txn-key] (remote/remote-read state server-state txn-key false))
   (-index-file-read [_ index-address] (remote/remote-read state server-state index-address true))
 
-  conn-proto/iConnection
+  connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
-  (-method [_] :remote)
-  (-parallelism [_] parallelism)
-  (-id [_] id)
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      (log/warn "-msg-in: " msg)
@@ -65,13 +61,13 @@
      IPrintWithWriter
      (-pr-writer [conn w opts]
        (-write w "#RemoteConnection ")
-       (-write w (pr (conn-core/printer-map conn))))))
+       (-write w (pr (connection/printer-map conn))))))
 
 #?(:clj
    (defmethod print-method RemoteConnection [^RemoteConnection conn, ^Writer w]
      (.write w (str "#RemoteConnection "))
      (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
+       (pr (connection/printer-map conn)))))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
@@ -96,7 +92,7 @@
                                  :connected-to nil
                                  :stats        {:connected-at nil}})
           conn-id         (str (random-uuid))
-          state           (conn-core/blank-state)
+          state           (connection/blank-state)
           nameservices*   (util/sequential
                             (or nameservices
                                 ;; if default ns, and returns exception, throw - connection fails

@@ -37,11 +37,14 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
 1. Install clojure tools-deps (version 1.10.3.933 or later).
    1. macOS: `brew install clojure/tools/clojure`
    2. Arch Linux: `pacman -S clojure`
+   3. Windows: follow instructions here https://applab.unc.edu/posts/2019/09/11/how-to-install-clojure-on-windows/
 2. Install Node & NPM
    1. macOS: `brew install node`
    2. Arch Linux: `pacman -S nodejs`
+   3. Windows: Download installer here https://nodejs.org/en/download
 3. Install babashka
    1. macOS: `brew install borkdude/brew/babashka`
+   2. Windows: `scoop install babashka`
 
 ### Building
 

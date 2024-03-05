@@ -10,7 +10,7 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.transact :as jld-transact]
-            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.indexer :as indexer]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.commit-data :as commit-data])
   #?(:clj (:import (java.io Writer))))
@@ -50,7 +50,7 @@
         commit* (assoc commit :index commit-index)]
     (-> db
         (assoc :commit commit*
-               :novelty* (idx-proto/-empty-novelty (:indexer ledger) db index-t)
+               :novelty* (indexer/-empty-novelty (:indexer ledger) db index-t)
                :spot spot
                :post post
                :opst opst
