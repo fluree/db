@@ -10,7 +10,7 @@
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.ledger.proto :as ledger-proto]))
+            [fluree.db.ledger :as ledger]))
 
 (defn parse-opts
   [parsed-opts opts]
@@ -73,8 +73,8 @@
       (if-not (<? (nameservice/exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))
         (let [ledger (<? (jld-ledger/load conn address))
-              db     (<? (stage (ledger-proto/-db ledger) txn* parsed-opts))]
-          (<? (ledger-proto/-commit! ledger db)))))))
+              db     (<? (stage (ledger/-db ledger) txn* parsed-opts))]
+          (<? (ledger/-commit! ledger db)))))))
 
 (defn create-with-txn
   [conn txn]
@@ -99,5 +99,5 @@
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
         (let [ledger (<? (jld-ledger/create conn ledger-id parsed-opts))
-              db     (<? (stage (ledger-proto/-db ledger) txn* parsed-opts))]
-          (<? (ledger-proto/-commit! ledger db)))))))
+              db     (<? (stage (ledger/-db ledger) txn* parsed-opts))]
+          (<? (ledger/-commit! ledger db)))))))

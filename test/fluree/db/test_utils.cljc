@@ -196,10 +196,6 @@
           (recur (- attempts-left attempts-per-batch))
           ledger)))))
 
-(defn force-index!
-  [db]
-  (commit/run-index db {:branch (:branch db)} (async/chan)))
-
 (defn retry-exists?
   "Retry calling exists? until it returns true or max-attempts."
   [conn ledger-alias max-atttemts]

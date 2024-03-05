@@ -6,9 +6,8 @@
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
             [fluree.db.index :as index]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.core :as conn-core]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.indexer.default :as idx-default]
@@ -16,7 +15,7 @@
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.ledger :as ledger]
             [fluree.db.storage :as storage]
             [fluree.db.storage.file :as file-storage])
   #?(:clj (:import (java.io Writer))))
@@ -26,8 +25,8 @@
 (defn- write-data
   [{:keys [store] :as _conn} ledger data-type data]
   (go-try
-    (let [alias    (ledger-proto/-alias ledger)
-          branch   (name (:name (ledger-proto/-branch ledger)))
+    (let [alias    (ledger/-alias ledger)
+          branch   (name (:name (ledger/-branch ledger)))
           json     (if (string? data)
                      data
                      (json-ld/normalize-data data))
@@ -59,7 +58,7 @@
 (defrecord FileConnection [id state ledger-defaults parallelism msg-in-ch store
                            nameservices serializer msg-out-ch lru-cache-atom]
 
-  conn-proto/iStorage
+  connection/iStorage
   (-c-read [conn commit-key] (read-data conn commit-key false))
   (-c-write [conn ledger commit-data] (write-data conn ledger :commit commit-data))
   (-txn-read [conn txn-key] (read-data conn txn-key false))
@@ -68,12 +67,9 @@
     (write-data conn ledger (str "index/" (name index-type)) index-data))
   (-index-file-read [conn index-address] (read-data conn index-address true))
 
-  conn-proto/iConnection
+  connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
-  (-method [_] :file)
-  (-parallelism [_] parallelism)
-  (-id [_] id)
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
@@ -103,13 +99,13 @@
      IPrintWithWriter
      (-pr-writer [conn w opts]
        (-write w "#FileConnection ")
-       (-write w (pr (conn-core/printer-map conn))))))
+       (-write w (pr (connection/printer-map conn))))))
 
 #?(:clj
    (defmethod print-method FileConnection [^FileConnection conn, ^Writer w]
      (.write w (str "#FileConnection "))
      (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
+       (pr (connection/printer-map conn)))))
 
 (defn trim-last-slash
   [s]
@@ -144,7 +140,7 @@
     :or   {serializer (json-serde)} :as _opts}]
   (go
     (let [conn-id        (str (random-uuid))
-          state          (conn-core/blank-state)
+          state          (connection/blank-state)
           nameservices*  (util/sequential
                            (or nameservices (default-file-nameservice storage-path)))
           cache-size     (conn-cache/memory->cache-size memory)

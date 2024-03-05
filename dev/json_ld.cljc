@@ -10,7 +10,7 @@
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.did :as did]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.log :as log]))

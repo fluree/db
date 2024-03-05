@@ -46,8 +46,7 @@
               v        (where/get-sid match db-alias)]
           (if-let [cached (-> @iri-cache (get v) :as)]
             cached
-            (try* (let [ns-codes (:namespace-codes db)
-                        iri      (compact (iri/decode-sid db v))]
+            (try* (let [iri (compact (iri/decode-sid db v))]
                     (vswap! iri-cache assoc v {:as iri})
                     iri)
                   (catch* e

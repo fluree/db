@@ -1,4 +1,4 @@
-(ns fluree.db.ledger.proto)
+(ns fluree.db.ledger)
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -14,7 +14,7 @@
   ;; branching
   (-branch [ledger] [ledger branch] "Returns all branch metadata, or metadata for just specified branch. :default branch is always current default.")
   ;; committing
-  (-commit-update [ledger branch db] [ledger branch db force?] "Once a commit completes, update ledger state to reflect. If optional force? flag present, don't validate consistent t sequence")
+  (-commit-update [ledger branch db] "Once a commit completes, update ledger state to reflect.")
   (-status [ledger] [ledger branch] "Returns status for branch (default branch if nil)")
   ;; ledger data across time
   ;; default did

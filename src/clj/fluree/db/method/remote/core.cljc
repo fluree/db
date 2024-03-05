@@ -86,12 +86,12 @@
 ;; TODO - locally, we'll only pay attention to those commits for ledgers
 (defn request-ledger-subscribe
   [conn ledger-id]
-  #_(conn-proto/-msg-out conn {:action :subscribe
+  #_(connection/-msg-out conn {:action :subscribe
                                :ledger ledger-id}))
 
 (defn request-ledger-unsubscribe
   [conn ledger-id]
-  #_(conn-proto/-msg-out conn {:action :unsubscribe
+  #_(connection/-msg-out conn {:action :unsubscribe
                                :ledger ledger-id}))
 
 (defn unsubscribe-ledger

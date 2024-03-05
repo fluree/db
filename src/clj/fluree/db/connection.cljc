@@ -1,16 +1,31 @@
-(ns fluree.db.conn.core
+(ns fluree.db.connection
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util :refer [try* catch* get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.json-ld :as json-ld]
-            [fluree.db.ledger.proto :as ledger-proto]))
-
-;; state machine for connections
+            [fluree.db.ledger :as ledger]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defprotocol iConnection
+  (-close [conn] "Closes all resources for this connection")
+  (-closed? [conn] "Indicates if connection is open or closed")
+  (-new-indexer [conn opts] "Returns optional default new indexer object for a new ledger with optional opts.")
+  (-did [conn] "Returns optional default did map if set at connection level")
+  (-msg-in [conn msg] "Handler for incoming message from nameservices")
+  (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")
+  (-nameservices [conn] "Returns a sequence of all nameservices configured for the connection.")
+  (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger"))
+
+(defprotocol iStorage
+  (-c-read [conn commit-key] "Reads a commit from storage")
+  (-c-write [conn ledger commit-data] "Writes a commit to storage")
+  (-txn-write [conn ledger txn-data] "Writes a transaction to storage and returns the key. Expects string keys.")
+  (-txn-read [conn txn-key] "Reads a transaction from storage")
+  (-index-file-write [conn ledger idx-type index-data] "Writes an index item to storage")
+  (-index-file-read [conn file-address] "Reads an index item from storage"))
 
 (comment
   ;; state machine looks like this:
@@ -29,69 +44,9 @@
   "Returns top-level state for connection"
   []
   (atom
-    {:ledger  {}
-     :await   {}
-     :stats   {}
-     :closed? false}))
-
-(defn mark-closed
-  [{:keys [state] :as conn}]
-  (swap! state assoc :closed? true))
-
-
-(defn await-response
-  "Returns a promise-channel that will contain eventual response for an outgoing message."
-  [{:keys [state] :as conn} message]
-  (let [ledger (:ledger message)
-        id     (random-uuid)
-        res-ch (async/promise-chan)]
-    (swap! state assoc-in [:ledger ledger :await id] res-ch)
-    res-ch))
-
-(defn subscribe
-  "Creates a new subscription on given ledger where 'callback' function
-  will get executed with every new message.
-
-  Subscription id (sub-id) is opaque, and used to cancel subscription."
-  [{:keys [state] :as conn} ledger callback sub-id]
-  (let [id (or sub-id (random-uuid))]
-    (swap! state assoc-in [:ledger ledger :subs id] callback)))
-
-(defn- message-response
-  "Checks for any pending callback functions for incoming messages.
-  Calls them and clears them from state machine."
-  [{:keys [state] :as conn} {:keys [id] :as msg}]
-  (when-let [callback (get-in @state [:await id])]
-    (swap! state update :await dissoc id)
-    (try* (callback msg)
-          (catch* e (log/error e "Callback function error for message: " msg))))
-  true)
-
-(defn- conn-event
-  "Handles generic connection-related event coming over channel.
-  First calls, and waits for response from, the main ledger callback
-  function if the respective ledger is active, then calls all registered
-  user/api callback functions without waiting for any responses."
-  [{:keys [state] :as conn} {:keys [ledger] :as msg}]
-  (async/go
-    (let [{:keys [event-fn subs]} (get @state ledger)]
-      (when event-fn
-        (event-fn msg))
-      (doseq [[id callback] subs]
-        (try* (callback msg)
-              (catch* e (log/error e (str "Callback function error for ledger subscription: "
-                                          ledger " " id ". Message: " msg))))))))
-
-(defn msg-from-network
-  "Records an incoming message from the network.
-
-  Fires off any 'await' calls for message, or triggers subscriptions for
-  generic events."
-  [conn {:keys [id] :as msg}]
-  (let [request-resp? (boolean id)]
-    (if request-resp?
-      (message-response conn msg)
-      (conn-event conn msg))))
+    {:ledger {}
+     :await  {}
+     :stats  {}}))
 
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held
@@ -121,12 +76,6 @@
   [{:keys [state] :as _conn} ledger-alias]
   (swap! state update :ledger dissoc ledger-alias))
 
-(defn release-all-ledgers
-  "Releases all ledgers from conn.
-  Typically used when closing a connection to release resources."
-  [{:keys [state] :as _conn}]
-  (swap! state assoc :ledger {}))
-
 (defn cached-ledger
   "Returns a cached ledger from the connection if it is cached, else nil"
   [{:keys [state] :as _conn} ledger-alias]
@@ -139,7 +88,7 @@
           ledger-alias    (get-first-value expanded-commit const/iri-alias)]
       (if ledger-alias
         (if-let [ledger-c (cached-ledger conn ledger-alias)]
-          (<? (ledger-proto/-notify (<? ledger-c) expanded-commit))
+          (<? (ledger/-notify (<? ledger-c) expanded-commit))
           (log/debug "No cached ledger found for commit: " commit-map))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " commit-map)))))

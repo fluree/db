@@ -4,11 +4,10 @@
             [clojure.core.async :as async :refer [go]]
             [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.conn.core :as conn-core]
+            [fluree.db.connection :as connection]
             [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.ledger :as ledger]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.util.async :refer [<? go-try]]
@@ -25,8 +24,8 @@
 (defn write-data
   [{:keys [store] :as _conn} ledger data-type data]
   (go-try
-    (let [alias    (ledger-proto/-alias ledger)
-          branch   (-> ledger ledger-proto/-branch :name name)
+    (let [alias    (ledger/-alias ledger)
+          branch   (-> ledger ledger/-branch :name name)
           json     (if (string? data)
                      data
                      (json-ld/normalize-data data))
@@ -66,7 +65,7 @@
 
 
 (defrecord S3Connection [id state ledger-defaults parallelism lru-cache-atom nameservices store]
-  conn-proto/iStorage
+  connection/iStorage
   (-c-read [conn commit-key] (read-commit conn commit-key))
   (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
   (-txn-read [_ txn-key]
@@ -80,12 +79,9 @@
   (-index-file-read [conn index-address]
     (read-index conn index-address))
 
-  conn-proto/iConnection
+  connection/iConnection
   (-close [_] (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
-  (-method [_] :s3)
-  (-parallelism [_] parallelism)
-  (-id [_] id)
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
@@ -112,7 +108,7 @@
 (defmethod print-method S3Connection [^S3Connection conn, ^Writer w]
   (.write w (str "#S3Connection "))
   (binding [*out* w]
-    (pr (conn-core/printer-map conn))))
+    (pr (connection/printer-map conn))))
 
 (defn ledger-defaults
   [{:keys [did indexer]}]
@@ -145,7 +141,7 @@
                            s3-endpoint (assoc :endpoint-override s3-endpoint))
           client         (aws/client aws-opts)
           conn-id        (str (random-uuid))
-          state          (conn-core/blank-state)
+          state          (connection/blank-state)
           nameservices*  (util/sequential
                            (or nameservices (default-S3-nameservice client s3-bucket s3-prefix)))
           cache-size     (conn-cache/memory->cache-size memory)

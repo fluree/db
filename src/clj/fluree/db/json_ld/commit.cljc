@@ -6,16 +6,15 @@
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.connection :as connection]
+            [fluree.db.ledger :as ledger]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.util.async :refer [<? go-try]]
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
-            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.nameservice.core :as nameservice]
@@ -30,7 +29,7 @@
   (compact-fn (iri/decode-sid db sid)))
 
 (defn- subject-block-pred
-  [db iri-map compact-fn list? p-flakes]
+  [db compact-fn list? p-flakes]
   (go-try
     (loop [[p-flake & r'] p-flakes
            all-refs? nil
@@ -67,22 +66,22 @@
   {"@list" (->> objs (sort-by :i) (map #(dissoc % :i)))})
 
 (defn- subject-block
-  [s-flakes db iri-map ^clojure.lang.Volatile ctx compact-fn]
+  [s-flakes db ^clojure.lang.Volatile ctx compact-fn]
   (go-try
     (loop [[p-flakes & r] (partition-by flake/p s-flakes)
-           acc nil]
-      (let [fflake          (first p-flakes)
-            list?           (-> fflake flake/m :i)
-            p-iri           (-> fflake flake/p (get-s-iri db compact-fn))
-            [objs all-refs?] (<? (subject-block-pred db iri-map compact-fn
-                                                     list? p-flakes))
-            handle-all-refs (partial set-refs-type-in-ctx ctx p-iri)
-            objs*           (cond-> objs
-                                    ;; next line is for compatibility with json-ld/parse-type's expectations; should maybe revisit
-                                    (and all-refs? (not list?)) handle-all-refs
-                                    list? handle-list-values
-                                    (= 1 (count objs)) first)
-            next-acc        (assoc acc p-iri objs*)]
+           acc            nil]
+      (let [fflake           (first p-flakes)
+            list?            (-> fflake flake/m :i)
+            p-iri            (-> fflake flake/p (get-s-iri db compact-fn))
+            [objs all-refs?] (<? (subject-block-pred db compact-fn list?
+                                                     p-flakes))
+            handle-all-refs  (partial set-refs-type-in-ctx ctx p-iri)
+            objs*            (cond-> objs
+                               ;; next line is for compatibility with json-ld/parse-type's expectations; should maybe revisit
+                               (and all-refs? (not list?)) handle-all-refs
+                               list?                       handle-list-values
+                               (= 1 (count objs))          first)
+            next-acc         (assoc acc p-iri objs*)]
         (if (seq r)
           (recur r next-acc)
           next-acc)))))
@@ -99,14 +98,13 @@
   [flakes db {:keys [compact-fn id-key type-key] :as _opts}]
   (go-try
     (log/trace "generate-commit flakes:" flakes)
-    (let [id->iri (volatile! (jld-ledger/predefined-sids-compact compact-fn))
-          ctx     (volatile! {})]
+    (let [ctx (volatile! {})]
       (loop [[s-flakes & r] (partition-by flake/s flakes)
-             assert  []
-             retract []]
+             assert         []
+             retract        []]
         (if s-flakes
-          (let [sid            (flake/s (first s-flakes))
-                s-iri          (get-s-iri sid db compact-fn)
+          (let [sid   (flake/s (first s-flakes))
+                s-iri (get-s-iri sid db compact-fn)
                 [assert* retract*]
                 (if (and (= 1 (count s-flakes))
                          (= const/$rdfs:Class (->> s-flakes first flake/o))
@@ -115,19 +113,19 @@
                   ;; (they are implied when used in rdf:type statements)
                   [assert retract]
                   (let [{assert-flakes  true,
-                         retract-flakes false} (group-by flake/op s-flakes)
+                         retract-flakes false}
+                        (group-by flake/op s-flakes)
+
                         s-assert  (when assert-flakes
-                                    (-> (<? (subject-block assert-flakes db
-                                                           id->iri ctx compact-fn))
+                                    (-> (<? (subject-block assert-flakes db ctx compact-fn))
                                         (assoc id-key s-iri)))
                         s-retract (when retract-flakes
-                                    (-> (<? (subject-block retract-flakes db
-                                                           id->iri ctx compact-fn))
+                                    (-> (<? (subject-block retract-flakes db ctx compact-fn))
                                         (assoc id-key s-iri)))]
                     [(cond-> assert
-                             s-assert (conj s-assert))
+                       s-assert (conj s-assert))
                      (cond-> retract
-                             s-retract (conj s-retract))]))]
+                       s-retract (conj s-retract))]))]
             (recur r assert* retract*))
           {:refs-ctx (dissoc @ctx type-key) ; @type will be marked as @type: @id, which is implied
            :assert   assert
@@ -172,11 +170,11 @@
                           stringify-context)
         private*      (or private
                           (:private did)
-                          (:private (ledger-proto/-did ledger)))
+                          (:private (ledger/-did ledger)))
         did*          (or (some-> private*
                                   did-from-private)
                           did
-                          (ledger-proto/-did ledger))
+                          (ledger/-did ledger))
         ctx-used-atom (atom {})
         compact-fn    (json-ld/compact-fn context* ctx-used-atom)
         commit-time   (util/current-time-iso)]
@@ -184,7 +182,7 @@
     {:message        message
      :tag            tag
      :file-data?     file-data? ;; if instead of returning just a db from commit, return also the written files (for consensus)
-     :alias          (ledger-proto/-alias ledger)
+     :alias          (ledger/-alias ledger)
      :t              t
      :v              0
      :prev-commit    (:address commit)
@@ -223,7 +221,7 @@
   [{:keys [ledger branch t] :as db} opts]
   (go-try
     (let [committed-t (-> ledger
-                          (ledger-proto/-status branch)
+                          (ledger/-status branch)
                           branch/latest-commit-t)
           new-flakes  (commit-flakes db)]
       (when (not= t (inc committed-t))
@@ -274,20 +272,20 @@
   [{:keys [ledger commit] :as db} {:keys [branch did private] :as _opts}]
   (go-try
     (let [{:keys [conn state]} ledger
-          ledger-commit (:commit (ledger-proto/-status ledger branch))
+          ledger-commit (:commit (ledger/-status ledger branch))
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
           [new-commit* jld-commit] (commit-data/commit-jsonld new-commit)
           signed-commit (if did
                           (<? (cred/generate jld-commit private (:id did)))
                           jld-commit)
-          commit-res    (<? (conn-proto/-c-write conn ledger signed-commit)) ;; write commit credential
+          commit-res    (<? (connection/-c-write conn ledger signed-commit)) ;; write commit credential
           new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
           db*           (assoc db :commit new-commit**)
           db**          (if (new-t? ledger-commit commit)
                           (commit-data/add-commit-flakes (:prev-commit db) db*)
                           db*)
-          db***         (ledger-proto/-commit-update ledger branch (dissoc db** :txns))
+          db***         (ledger/-commit-update ledger branch (dissoc db** :txns))
           push-res      (<? (nameservice/push! conn (assoc new-commit**
                                                            :meta commit-res
                                                            :ledger-state state)))]
@@ -315,12 +313,13 @@
 
   If optional changes-ch is provided, will stream indexing updates to it
   so it can be replicated via consensus to other servers as needed."
-  [{:keys [ledger] :as db} commit-opts changes-ch]
-  (let [{:keys [indexer]} ledger
-        update-fn (update-commit-fn db commit-opts)]
-    ;; call indexing process with update-commit-fn to push out an updated commit once complete
-    (idx-proto/-index indexer db {:update-commit update-fn
-                                  :changes-ch    changes-ch})))
+  ([indexer db commit-opts]
+   (run-index indexer db commit-opts nil))
+  ([indexer db commit-opts changes-ch]
+   (let [update-fn (update-commit-fn db commit-opts)]
+     ;; call indexing process with update-commit-fn to push out an updated commit once complete
+     (indexer/-index indexer db {:update-commit update-fn
+                                 :changes-ch    changes-ch}))))
 
 
 (defn commit
@@ -329,14 +328,20 @@
   returns a db with an updated :commit."
   [{:keys [conn indexer] :as ledger} {:keys [t stats commit txns] :as db} opts]
   (go-try
-    (let [{:keys [id-key did message tag file-data? index-files-ch] :as opts*} (enrich-commit-opts db opts)
+    (let [{:keys [id-key did message tag file-data? index-files-ch] :as opts*}
+          (enrich-commit-opts db opts)
+
           ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
           dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
-          ledger-update-res (<? (conn-proto/-c-write conn ledger ledger-update)) ;; write commit data
+          ledger-update-res (<? (connection/-c-write conn ledger ledger-update)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
           [[txn-id author]] txns
-          base-commit-map   {:old-commit commit, :issuer did
-                             :message    message, :tag tag, :dbid dbid, :t t
+          base-commit-map   {:old-commit commit
+                             :issuer     did
+                             :message    message
+                             :tag        tag
+                             :dbid       dbid
+                             :t          t
                              :db-address db-address
                              :author     (or author "")
                              :txn-id     (if (= 1 (count txns)) txn-id "")
@@ -346,17 +351,16 @@
           db*               (assoc db
                                    :commit new-commit
                                    :prev-commit commit)
-          {db**              :db
-           commit-file-meta  :commit-res
-           context-file-meta :context-res} (<? (do-commit+push db* opts*))
+
+          {db**             :db
+           commit-file-meta :commit-res}
+          (<? (do-commit+push db* opts*))
+
           ;; if an indexing process is kicked off, returns a channel that contains a stream of updates for consensus
-          indexing-ch       (if (idx-proto/-index? indexer db**)
-                              (run-index db** opts* index-files-ch)
-                              (when index-files-ch (async/close! index-files-ch)))]
+          indexing-ch       (run-index indexer db** opts* index-files-ch)]
       (if file-data?
-        {:data-file-meta    ledger-update-res
-         :commit-file-meta  commit-file-meta
-         :context-file-meta context-file-meta
-         :indexing-ch       indexing-ch
-         :db                db**}
+        {:data-file-meta   ledger-update-res
+         :commit-file-meta commit-file-meta
+         :indexing-ch      indexing-ch
+         :db               db**}
         db**))))

@@ -4,10 +4,9 @@
             [fluree.db.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async :refer [chan]]
-            [fluree.db.conn.core :as conn-core]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.nameservice.ipns :as ns-ipns]
@@ -28,7 +27,7 @@
                            parallelism msg-in-ch msg-out-ch nameservices
                            ipfs-endpoint store]
 
-  conn-proto/iStorage
+  connection/iStorage
   (-c-read [_ commit-key]
     (storage/read store commit-key))
   (-c-write [_ _ commit-data]
@@ -38,12 +37,9 @@
   (-txn-write [_ _ txn-data]
     (storage/write store "txn" txn-data))
 
-  conn-proto/iConnection
+  connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
-  (-method [_] :ipfs)
-  (-parallelism [_] parallelism)
-  (-id [_] id)
   (-new-indexer [_ opts] ;; default new ledger indexer
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
@@ -78,13 +74,13 @@
      IPrintWithWriter
      (-pr-writer [conn w opts]
        (-write w "#IPFSConnection ")
-       (-write w (pr (conn-core/printer-map conn))))))
+       (-write w (pr (connection/printer-map conn))))))
 
 #?(:clj
    (defmethod print-method IPFSConnection [^IPFSConnection conn, ^Writer w]
      (.write w (str "#IPFSConnection "))
      (binding [*out* w]
-       (pr (conn-core/printer-map conn)))))
+       (pr (connection/printer-map conn)))))
 
 (defn ledger-defaults
   [{:keys [did indexer]}]
@@ -118,7 +114,7 @@
           ledger-defaults (ledger-defaults defaults)
           memory          (or memory 1000000) ; default 1MB memory
           conn-id         (str (random-uuid))
-          state           (conn-core/blank-state)
+          state           (connection/blank-state)
           nameservices*   (util/sequential
                             (or nameservices (<? (default-ipns-nameservice ipfs-endpoint ipns))))
           cache-size      (conn-cache/memory->cache-size memory)

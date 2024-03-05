@@ -1,7 +1,7 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [alts! go]]
             [fluree.db.util.log :as log]
-            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.policy :as perm]
@@ -11,7 +11,7 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.ledger :as ledger]
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.exec.update :as update]
@@ -82,7 +82,7 @@
 (defn ->tx-state
   [db txn-id author-did]
   (let [{:keys [branch ledger policy], db-t :t} db
-        commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
+        commit-t  (-> (ledger/-status ledger branch) branch/latest-commit-t)
         t         (inc commit-t)
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before
@@ -219,7 +219,7 @@
                         db)
 
            {txn-id :address}
-           (<? (conn-proto/-txn-write conn ledger raw-txn))
+           (<? (connection/-txn-write conn ledger raw-txn))
 
            tx-state (->tx-state db* txn-id did)
            flakes   (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
