@@ -66,25 +66,25 @@
               "Only one reasoned triple should be added")))
 
       (testing "A filter rule works"
-        (let [senior-db @(fluree/stage
-                           db0
-                           {"@context" {"f"  "http://flur.ee/ns/ledger#"
-                                        "ex" "http://example.org/"},
-                            "insert"   {"@id"    "ex:seniorRule"
-                                        "f:rule" {"@type"  "@json"
-                                                  "@value" {"@context" {"ex" "http://example.org/"}
-                                                            "where"    [{"@id"    "?person",
-                                                                         "ex:age" "?age"}
-                                                                        ["filter" "(>= ?age 62)"]]
-                                                            "insert"   {"@id"              "?person",
-                                                                        "ex:seniorCitizen" true}}}}})
+        (let [senior-db  @(fluree/stage
+                            db0
+                            {"@context" {"f"  "http://flur.ee/ns/ledger#"
+                                         "ex" "http://example.org/"},
+                             "insert"   {"@id"    "ex:seniorRule"
+                                         "f:rule" {"@type"  "@json"
+                                                   "@value" {"@context" {"ex" "http://example.org/"}
+                                                             "where"    [{"@id"    "?person",
+                                                                          "ex:age" "?age"}
+                                                                         ["filter" "(>= ?age 62)"]]
+                                                             "insert"   {"@id"              "?person",
+                                                                         "ex:seniorCitizen" true}}}}})
               senior-db* @(fluree/reason senior-db :datalog)
 
-              seniors   @(fluree/query
-                           senior-db* {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"              "?s",
-                                                "ex:seniorCitizen" true}})]
+              seniors    @(fluree/query
+                            senior-db* {:context {"ex" "http://example.org/"}
+                                        :select  "?s"
+                                        :where   {"@id"              "?s",
+                                                  "ex:seniorCitizen" true}})]
           (is (= ["ex:carol"]
                  seniors))
 
@@ -93,18 +93,18 @@
 
 
       (testing "Inferring based on a relationship and IRI value"
-        (let [brother-db @(fluree/stage
-                            db0
-                            {"@context" {"f"  "http://flur.ee/ns/ledger#"
-                                         "ex" "http://example.org/"}
-                             "insert"   {"@id"    "ex:brotherRule"
-                                         "f:rule" {"@type"  "@json"
-                                                   "@value" {"@context" {"ex" "http://example.org/"}
-                                                             "where"    {"@id"        "?person",
-                                                                         "ex:sibling" {"@id"       "?sibling"
-                                                                                       "ex:gender" {"@id" "ex:Male"}}}
-                                                             "insert"   {"@id"        "?person",
-                                                                         "ex:brother" "?sibling"}}}}})
+        (let [brother-db  @(fluree/stage
+                             db0
+                             {"@context" {"f"  "http://flur.ee/ns/ledger#"
+                                          "ex" "http://example.org/"}
+                              "insert"   {"@id"    "ex:brotherRule"
+                                          "f:rule" {"@type"  "@json"
+                                                    "@value" {"@context" {"ex" "http://example.org/"}
+                                                              "where"    {"@id"        "?person",
+                                                                          "ex:sibling" {"@id"       "?sibling"
+                                                                                        "ex:gender" {"@id" "ex:Male"}}}
+                                                              "insert"   {"@id"        "?person",
+                                                                          "ex:brother" "?sibling"}}}}})
               brother-db* @(fluree/reason brother-db :datalog)]
 
           (is (= #{["ex:mike" "ex:carol"] ;; <- explicitly set
@@ -118,6 +118,34 @@
                      set)))
 
           (is (= 1 (fluree/reasoned-count brother-db*))
+              "Only one reasoned triple should be added"))))))
+
+(deftest ^:integration reason-graph-supplied
+  (testing "Datalog rules given as JSON-LD at query-time"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "reasoner/basic-datalog-rules" nil)
+          db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+
+      (testing "A recursive relationship"
+        (let [grandparents-db @(fluree/reason db0 :datalog {"@context" {"f"  "http://flur.ee/ns/ledger#"
+                                                                        "ex" "http://example.org/"},
+                                                            "@id"      "ex:grandParentRule"
+                                                            "f:rule"   {"@type"  "@json"
+                                                                        "@value" {"@context" {"ex" "http://example.org/"}
+                                                                                  "where"    {"ex:children" "?children"
+                                                                                              "ex:parents"  "?parents"}
+                                                                                  "insert"   {"@id"            "?children",
+                                                                                              "ex:grandParent" {"@id" "?parents"}}}}})
+              grandparents-of @(fluree/query grandparents-db
+                                             {:context {"ex" "http://example.org/"}
+                                              :select  ["?grandParent" "?person"]
+                                              :where   {"@id"            "?person",
+                                                        "ex:grandParent" "?grandParent"}})]
+
+          (is (= #{["ex:carol" "ex:alice"]}
+                 (set grandparents-of)))
+
+          (is (= 1 (fluree/reasoned-count grandparents-db))
               "Only one reasoned triple should be added"))))))
 
 
@@ -152,25 +180,25 @@
 
 
       (testing "A recursive relationship"
-        (let [db1 @(fluree/stage
-                     db0
-                     {"@context" {"f"  "http://flur.ee/ns/ledger#"
-                                  "ex" "http://example.org/"},
-                      "insert"
-                      [{"@id"    "ex:hasSubTaskRule"
-                        "f:rule" {"@type"  "@json"
-                                  "@value" {"@context" {"ex" "http://example.org/"}
-                                            "where"    {"@id"                    "?task"
-                                                        "ex:hasImmediateSubTask" "?sub-task"}
-                                            "insert"   {"@id"           "?task",
-                                                        "ex:hasSubTask" {"@id" "?sub-task"}}}}}
-                       {"@id"    "ex:hasSubTaskTransitive"
-                        "f:rule" {"@type"  "@json"
-                                  "@value" {"@context" {"ex" "http://example.org/"}
-                                            "where"    {"@id"           "?task"
-                                                        "ex:hasSubTask" {"ex:hasSubTask" "?sub-sub-task"}}
-                                            "insert"   {"@id"           "?task",
-                                                        "ex:hasSubTask" {"@id" "?sub-sub-task"}}}}}]})
+        (let [db1  @(fluree/stage
+                      db0
+                      {"@context" {"f"  "http://flur.ee/ns/ledger#"
+                                   "ex" "http://example.org/"},
+                       "insert"
+                       [{"@id"    "ex:hasSubTaskRule"
+                         "f:rule" {"@type"  "@json"
+                                   "@value" {"@context" {"ex" "http://example.org/"}
+                                             "where"    {"@id"                    "?task"
+                                                         "ex:hasImmediateSubTask" "?sub-task"}
+                                             "insert"   {"@id"           "?task",
+                                                         "ex:hasSubTask" {"@id" "?sub-task"}}}}}
+                        {"@id"    "ex:hasSubTaskTransitive"
+                         "f:rule" {"@type"  "@json"
+                                   "@value" {"@context" {"ex" "http://example.org/"}
+                                             "where"    {"@id"           "?task"
+                                                         "ex:hasSubTask" {"ex:hasSubTask" "?sub-sub-task"}}
+                                             "insert"   {"@id"           "?task",
+                                                         "ex:hasSubTask" {"@id" "?sub-sub-task"}}}}}]})
               db1* @(fluree/reason db1 :datalog)]
 
 
@@ -188,9 +216,9 @@
                   "ex:task1-2-2"]
                  (-> @(fluree/query
                         db1* {:context {"ex" "http://example.org/"}
-                             :select  "?subtask"
-                             :where   {"@id"           "ex:task1",
-                                       "ex:hasSubTask" "?subtask"}})
+                              :select  "?subtask"
+                              :where   {"@id"           "ex:task1",
+                                        "ex:hasSubTask" "?subtask"}})
                      sort
                      vec))
               "Subtasks from every level should show at top level"))))))

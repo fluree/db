@@ -81,53 +81,82 @@
 
 (defn execute-reasoner
   "Executes the reasoner on the staged db-after and returns the updated db-after."
-  [{:keys [reasoner] :as db-after} fuel-tracker {:keys [reasoner-max] :as tx-state}]
+  [{:keys [reasoner] :as db-after} reasoning-rules fuel-tracker {:keys [reasoner-max] :as tx-state}]
   (go-try
-    (if reasoner
-      (let [reasoning-rules (<? (rules-graph db-after))
-            rule-schedule   (schedule reasoning-rules)]
-        (log/debug "reasoning rules: " reasoning-rules)
-        (log/debug "reasoning schedule: " rule-schedule)
-        (if (seq rule-schedule)
-          (loop [[rule-id & r] rule-schedule
-                 reasoned-flakes nil ;; Note these are in an AVL set in with spot comparator
-                 reasoned-db     db-after
-                 summary         {:iterations      0 ;; holds summary across all runs
-                                  :reasoned-flakes []
-                                  :total-flakes    0}]
-            (if rule-id
-              (let [{:keys [db-after add]} (<? (execute-reasoner-rule reasoned-db rule-id reasoning-rules fuel-tracker tx-state))]
-                (log/debug "executed reasoning rule: " rule-id)
-                (log/trace "reasoning rule: " rule-id "produced flakes:" add)
-                (recur r
-                       (if reasoned-flakes
-                         (into reasoned-flakes add)
-                         add)
-                       db-after
-                       summary))
-              (let [all-reasoned-flakes (into reasoned-flakes (:reasoned-flakes summary))
-                    summary*            {:iterations      (-> summary :iterations inc)
-                                         :reasoned-flakes all-reasoned-flakes
-                                         :total-flakes    (count all-reasoned-flakes)}
-                    new-flakes?         (> (:total-flakes summary*)
-                                           (:total-flakes summary))
-                    ;reasoning-rules* (<? (convert-rules-dependency-flakes-to-SIDs reasoned-db reasoning-rules))
-                    ;rules* (select-keys reasoning-rules rule-schedule) ;; reduce possible rules to only the rules that were run in last iteration
-                    ;rule-schedule* (reasoner/schedule reasoning-rules (rule-dependency-fn reasoning-rules reasoned-flakes))
-                    ]
-                (log/debug "completed reasoning iteration number: " (:iterations summary*)
-                           "Total reasoned flakes:" (:total-flakes summary*))
-                (if (and new-flakes?
-                         (< (:iterations summary*) reasoner-max))
-                  (recur rule-schedule nil reasoned-db summary*)
-                  reasoned-db))))
-          db-after))
-      db-after)))
+    (let [rule-schedule (schedule reasoning-rules)]
+      (log/debug "reasoning schedule: " rule-schedule)
+      (if (seq rule-schedule)
+        (loop [[rule-id & r] rule-schedule
+               reasoned-flakes nil ;; Note these are in an AVL set in with spot comparator
+               reasoned-db     db-after
+               summary         {:iterations      0 ;; holds summary across all runs
+                                :reasoned-flakes []
+                                :total-flakes    0}]
+          (if rule-id
+            (let [{:keys [db-after add]} (<? (execute-reasoner-rule reasoned-db rule-id reasoning-rules fuel-tracker tx-state))]
+              (log/debug "executed reasoning rule: " rule-id)
+              (log/trace "reasoning rule: " rule-id "produced flakes:" add)
+              (recur r
+                     (if reasoned-flakes
+                       (into reasoned-flakes add)
+                       add)
+                     db-after
+                     summary))
+            (let [all-reasoned-flakes (into reasoned-flakes (:reasoned-flakes summary))
+                  summary*            {:iterations      (-> summary :iterations inc)
+                                       :reasoned-flakes all-reasoned-flakes
+                                       :total-flakes    (count all-reasoned-flakes)}
+                  new-flakes?         (> (:total-flakes summary*)
+                                         (:total-flakes summary))
+                  ;reasoning-rules* (<? (convert-rules-dependency-flakes-to-SIDs reasoned-db reasoning-rules))
+                  ;rules* (select-keys reasoning-rules rule-schedule) ;; reduce possible rules to only the rules that were run in last iteration
+                  ;rule-schedule* (reasoner/schedule reasoning-rules (rule-dependency-fn reasoning-rules reasoned-flakes))
+                  ]
+              (log/debug "completed reasoning iteration number: " (:iterations summary*)
+                         "Total reasoned flakes:" (:total-flakes summary*))
+              (if (and new-flakes?
+                       (< (:iterations summary*) reasoner-max))
+                (recur rule-schedule nil reasoned-db summary*)
+                reasoned-db))))
+        db-after))))
+
+(defn rules-from-graph
+  [graph]
+  (let [expanded (-> graph
+                     json-ld/expand
+                     util/sequential)]
+    (reduce
+      (fn [acc rule]
+        (let [id   (:id rule)
+              rule (util/get-first-value rule "http://flur.ee/ns/ledger#rule")]
+          (if rule
+            (conj acc [(or id (str "_:" (rand-int 2147483647))) rule])
+            acc)))
+      []
+      expanded)))
+
+(defn rules-from-db
+  [db]
+  (go-try
+    (let [rules (<? (resolve/find-rules db))]
+      (->> rules
+           (resolve/rules->graph db)
+           add-rule-dependencies))))
 
 (defn reason
-  [db regimes graphs {:keys [max-fuel] :as opts}]
-  (let [regimes      (set (util/sequential regimes))
-        fuel-tracker (fuel/tracker max-fuel)
-        db*          (update db :reasoner #(into regimes %))
-        tx-state     (transact/->tx-state db* nil nil nil)]
-    (execute-reasoner db* fuel-tracker tx-state)))
+  [db regimes graph {:keys [max-fuel] :as opts}]
+  (go-try
+    (let [regimes         (set (util/sequential regimes))
+          fuel-tracker    (fuel/tracker max-fuel)
+          db*             (update db :reasoner #(into regimes %))
+          tx-state        (transact/->tx-state db* nil nil nil)
+          raw-rules       (if graph
+                            (rules-from-graph graph)
+                            (<? (resolve/find-rules db*)))
+          reasoning-rules (->> raw-rules
+                               (resolve/rules->graph db*)
+                               add-rule-dependencies)]
+      (log/debug "reasoning rules: " reasoning-rules)
+      (if (empty? reasoning-rules)
+        db
+        (<? (execute-reasoner db* reasoning-rules fuel-tracker tx-state))))))

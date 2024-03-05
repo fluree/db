@@ -348,10 +348,10 @@
   You can give a single reasoning type as an argument, or multiple
   as a sequential list/vector."
   ([db regimes] (reason db regimes nil nil))
-  ([db regimes graphs] (reason db regimes graphs nil))
-  ([db regimes graphs opts]
+  ([db regimes graph] (reason db regimes graph nil))
+  ([db regimes graph opts]
    (promise-wrap
-     (reasoner/reason db regimes graphs opts))))
+     (reasoner/reason db regimes graph opts))))
 
 (defn reasoned-count
   "Returns a count of reasoned facts in the provided db."
