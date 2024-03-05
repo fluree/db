@@ -129,13 +129,6 @@
       []
       expanded)))
 
-(defn rules-from-db
-  [db]
-  (go-try
-    (let [rules (<? (resolve/find-rules db))]
-      (->> rules
-           (resolve/rules->graph db)
-           add-rule-dependencies))))
 
 (defn reason
   [db regimes graph {:keys [max-fuel reasoner-max] :as opts}]
