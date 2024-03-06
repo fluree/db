@@ -8,6 +8,7 @@
             [fluree.db.json-ld.transact :as transact]
             [fluree.db.fuel :as fuel]
             [fluree.json-ld :as json-ld]
+            [fluree.db.reasoner.owl-datalog :as owl-datalog]
             [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -116,8 +117,11 @@
                   reasoned-db)))))
         db))))
 
-(defn rules-from-graph
-  [graph]
+(defmulti rules-from-graph (fn [regime-type graph]
+                             regime-type))
+
+(defmethod rules-from-graph :datalog
+  [_ graph]
   (let [expanded (-> graph
                      json-ld/expand
                      util/sequential)]
@@ -131,6 +135,28 @@
       []
       expanded)))
 
+(defmethod rules-from-graph :owl2rl
+  [_ graph]
+  (let [expanded (-> graph
+                     json-ld/expand
+                     util/sequential)]
+    (log/debug "OWL expanded rules: " expanded)
+    (owl-datalog/owl->datalog expanded)))
+
+
+(defn all-rules
+  [regimes db graph]
+  (go-try
+    (loop [[regime & r] regimes
+           rules []]
+      (if regime
+        (let [rules* (if graph
+                       (rules-from-graph regime graph)
+                       (<? (resolve/find-rules db)))] ;; TODO - need to make regime-specific
+
+          (recur r (into rules rules*)))
+        rules))))
+
 
 (defn reason
   [db regimes graph {:keys [max-fuel reasoner-max] :as opts}]
@@ -139,13 +165,12 @@
           fuel-tracker    (fuel/tracker max-fuel)
           db*             (update db :reasoner #(into regimes %))
           tx-state        (transact/->tx-state db* nil nil nil)
-          raw-rules       (if graph
-                            (rules-from-graph graph)
-                            (<? (resolve/find-rules db*)))
+          raw-rules       (<? (all-rules regimes db* graph))
+          _               (log/debug "All parsed rules: " raw-rules)
           reasoning-rules (->> raw-rules
                                (resolve/rules->graph db*)
                                add-rule-dependencies)]
-      (log/debug "reasoning rules: " reasoning-rules)
+      (log/trace "Final parsed reasoning rules: " reasoning-rules)
       (if (empty? reasoning-rules)
         db
         (<? (execute-reasoner db* reasoning-rules fuel-tracker reasoner-max tx-state))))))
