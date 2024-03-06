@@ -105,6 +105,10 @@
                                         (= (:iterations summary*) reasoner-max))]
               (log/debug "completed reasoning iteration number: " (:iterations summary*)
                          "Total reasoned flakes:" (:total-flakes summary*))
+
+              (log/debug "Total reasoned flakes:" (:total-flakes summary*))
+              "completed in:" (:iterations summary*) "iteration(s)."
+
               (if (and new-flakes? (not maxed?))
                 (recur rule-schedule nil reasoned-db summary*)
                 (do
