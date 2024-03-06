@@ -103,8 +103,6 @@
                                          (:total-flakes summary))
                   maxed?              (when reasoner-max
                                         (= (:iterations summary*) reasoner-max))]
-              (log/debug "completed reasoning iteration number: " (:iterations summary*)
-                         "Total reasoned flakes:" (:total-flakes summary*))
 
               (log/debug "Total reasoned flakes:" (:total-flakes summary*))
               "completed in:" (:iterations summary*) "iteration(s)."
