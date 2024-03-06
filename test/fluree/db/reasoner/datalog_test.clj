@@ -1,8 +1,7 @@
 (ns fluree.db.reasoner.datalog-test
   (:require [clojure.test :refer :all]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [test-with-files.tools :refer [with-tmp-dir]]))
+            [fluree.db.test-utils :as test-utils]))
 
 (def reasoning-db-data
   {"@context" {"ex" "http://example.org/"}
