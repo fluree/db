@@ -58,4 +58,72 @@
 
           (is (= #{"ex:brian"}
                  (set qry-types))
-              "ex:brian should be the only subject of type ex:Child"))))))
+              "ex:brian should be the only subject of type ex:Child")))
+
+      (testing "Testing rdfs:range - rule: prp-rng"
+        (let [db-prp-rng @(fluree/reason
+                            db-base :owl2rl
+                            [{"@context"   {"ex"   "http://example.org/"
+                                            "owl"  "http://www.w3.org/2002/07/owl#"
+                                            "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                              "@id"        "ex:parent",
+                              "@type"      ["owl:ObjectProperty"],
+                              "rdfs:range" [{"@id" "ex:Person"} {"@id" "ex:Parent"}]}])
+              qry-subj   @(fluree/query db-prp-rng
+                                        {:context {"ex" "http://example.org/"}
+                                         :select  "?t"
+                                         :where   {"@id"   "ex:carol",
+                                                   "@type" "?t"}})
+              qry-parent @(fluree/query db-prp-rng
+                                        {:context {"ex" "http://example.org/"}
+                                         :select  "?s"
+                                         :where   {"@id"   "?s",
+                                                   "@type" "ex:Parent"}})]
+
+
+          (is (= #{"ex:Parent" "ex:Person"}
+                 (set qry-subj))
+              "ex:carol should be of type ex:Person and ex:Parent")
+
+          (is (= #{"ex:carol"}
+                 (set qry-parent))
+              "ex:carol should be the only subject of type ex:Parent")))
+
+
+      (testing "Testing multiple rules rdfs:domain + rdfs:range - rules: prp-dom & prp-rng"
+        (let [db-prp-dom+rng @(fluree/reason
+                                db-base :owl2rl
+                                [{"@context"    {"ex"   "http://example.org/"
+                                                 "owl"  "http://www.w3.org/2002/07/owl#"
+                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                  "@id"         "ex:parent",
+                                  "@type"       ["owl:ObjectProperty"],
+                                  "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]
+                                  "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:Parent"}]}])
+              qry-child      @(fluree/query db-prp-dom+rng
+                                            {:context {"ex" "http://example.org/"}
+                                             :select  "?s"
+                                             :where   {"@id"   "?s",
+                                                       "@type" "ex:Child"}})
+              qry-parent     @(fluree/query db-prp-dom+rng
+                                            {:context {"ex" "http://example.org/"}
+                                             :select  "?s"
+                                             :where   {"@id"   "?s",
+                                                       "@type" "ex:Parent"}})
+              qry-person     @(fluree/query db-prp-dom+rng
+                                            {:context {"ex" "http://example.org/"}
+                                             :select  "?s"
+                                             :where   {"@id"   "?s",
+                                                       "@type" "ex:Person"}})]
+
+          (is (= #{"ex:brian"}
+                 (set qry-child))
+              "ex:brian should be the only subject of type ex:Child")
+
+          (is (= #{"ex:carol"}
+                 (set qry-parent))
+              "ex:carol should be the only subject of type ex:Parent")
+
+          (is (= #{"ex:brian" "ex:carol"}
+                 (set qry-person))
+              "ex:brian and ex:carol should be of type ex:Person"))))))

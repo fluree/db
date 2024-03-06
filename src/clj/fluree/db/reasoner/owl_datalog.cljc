@@ -20,37 +20,53 @@
   []
   (str "_:" (rand-int 2147483647)))
 
-(defmulti to-datalog (fn [rule-type owl-statement]
+(defmulti to-datalog (fn [rule-type owl-statement all-rules]
                        rule-type))
 
 (defmethod to-datalog ::prp-dom
-  [_ owl-statement]
+  [_ owl-statement all-rules]
   (let [domain   (->> (get owl-statement $rdfs-domain)
                       (mapv :id))
         property (:id owl-statement)
-        rule     {"where"    {"@id"    "?s",
-                              property nil},
-                  "insert"   {"@id"   "?s",
-                              "@type" domain}}]
+        rule     {"where"  {"@id"    "?s",
+                            property nil},
+                  "insert" {"@id"   "?s",
+                            "@type" domain}}]
     ;; rule-id *is* the property
-    [property rule]))
+    (conj all-rules [(str property "(prp-dom)") rule])))
+
+(defmethod to-datalog ::prp-rng
+  [_ owl-statement all-rules]
+  (let [range    (->> (get owl-statement $rdfs-range)
+                      (mapv :id))
+        property (:id owl-statement)
+        rule     {"where"  {"@id"    nil,
+                            property "?ps"},
+                  "insert" {"@id"   "?ps",
+                            "@type" range}}]
+    ;; rule-id *is* the property
+    (conj all-rules [(str property "(prp-rng)") rule])))
 
 (defmethod to-datalog :default
-  [_ owl-statement]
+  [_ owl-statement all-rules]
   (throw (ex-info "Unsupported OWL statement" {:owl-statement owl-statement})))
 
 
 (defn statement->datalog
   [owl-statement]
-  (cond
-    (contains? owl-statement $rdfs-domain)
-    (to-datalog ::prp-dom owl-statement)
+  (cond->> []
+           (contains? owl-statement $rdfs-domain)
+           (to-datalog ::prp-dom owl-statement)
 
-    :else
-    (to-datalog :default owl-statement)))
+           (contains? owl-statement $rdfs-range)
+           (to-datalog ::prp-rng owl-statement)
+
+           ))
 
 (defn owl->datalog
   [owl-graph]
-  (mapv statement->datalog owl-graph))
+  (mapcat statement->datalog owl-graph))
+
+
 
 
