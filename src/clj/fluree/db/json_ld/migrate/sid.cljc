@@ -95,17 +95,21 @@
           (assoc :commit commit-metadata)))))
 
 (defn merge-commits
-  [{:keys [conn] :as ledger} commit-tuples]
+  [{:keys [conn indexer] :as ledger} commit-opts tuples-chans]
   (go-try
-    (loop [[commit-tuple & r] commit-tuples
-           db                 (db/create ledger)]
+    (loop [[[commit-tuple ch] & r] tuples-chans
+           db                      (db/create ledger)]
       (if commit-tuple
-        (let [new-db (<? (merge-commit conn db commit-tuple))]
-          (recur r new-db))
+        (let [merged-db     (<? (merge-commit conn db commit-tuple))
+              update-commit (commit/update-commit-fn merged-db commit-opts)
+              indexed-db    (<? (indexer/do-index indexer merged-db
+                                                  {:changes-ch    ch
+                                                   :update-commit update-commit}))]
+          (recur r indexed-db))
         db))))
 
 (defn migrate
-  [conn address changes-ch commit-opts]
+  [conn address commit-opts changes-ch]
   (go-try
     (let [last-commit-addr  (<? (nameservice/lookup-commit conn address))
           last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
@@ -115,11 +119,13 @@
           branch            (or (keyword (get-first-value first-commit const/iri-branch))
                                 :main)
           ledger            (<? (jld-ledger/->ledger conn ledger-alias {:branch branch}))
-          indexer           (:indexer ledger)
-          db                (<? (merge-commits ledger all-commit-tuples))
           commit-opts*      (assoc commit-opts :branch branch)
-          update-commit     (commit/update-commit-fn db commit-opts*)
-          indexed-db        (<? (indexer/do-index indexer db {:changes-ch    changes-ch
-                                                              :update-commit update-commit}))]
-      (ledger/-db-update ledger indexed-db)
+          tuples-chans      (->> all-commit-tuples
+                                 (map (fn [commit-tuple]
+                                        [commit-tuple (async/chan)])))
+          changes-chs       (map second tuples-chans)
+          _                 (-> (async/merge changes-chs)
+                                (async/pipe changes-ch))
+          db                (<? (merge-commits ledger commit-opts* tuples-chans))]
+      (ledger/-db-update ledger db)
       ledger)))
