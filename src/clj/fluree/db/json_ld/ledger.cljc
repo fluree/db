@@ -36,6 +36,7 @@
           ;; shacl
           "http://www.w3.org/ns/shacl#NodeShape"                const/$sh:NodeShape
           "http://www.w3.org/ns/shacl#PropertyShape"            const/$sh:PropertyShape
+          "http://www.w3.org/ns/shacl#deactivated"              const/$sh:deactivated
           "http://www.w3.org/ns/shacl#IRI"                      const/$sh:IRI
           "http://www.w3.org/ns/shacl#IRIOrLiteral"             const/$sh:IRIOrLiteral
           "http://www.w3.org/ns/shacl#BlankNodeOrIRI"           const/$sh:BlankNodeOrIRI
