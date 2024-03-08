@@ -262,7 +262,7 @@
 
 (defn datatype-constraint?
   [f]
-  (-> f flake/p (= const/$sh:datatype)))
+  (-> f flake/p (= const/sh_datatype)))
 
 (defn descending
   [x y]
@@ -283,7 +283,7 @@
                                    (map flake/o)
                                    first)]
         (let [path (->> s-flakes
-                        (filter #(= const/$sh:path (flake/p %)))
+                        (filter #(= const/sh_path (flake/p %)))
                         (sort-by list-index descending)
                         (map flake/o)
                         first)]

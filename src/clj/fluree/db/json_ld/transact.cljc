@@ -51,8 +51,8 @@
                       flakes (<? (query-range/index-range root-db :spot = [sid]))]
                   (<? (shacl/validate-target shacl root-db sid flakes))
                   (recur r))))
-            (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
-                                 (contains? all-classes const/$sh:PropertyShape))]
+            (let [new-shacl? (or (contains? all-classes const/sh_NodeShape)
+                                 (contains? all-classes const/sh_PropertyShape))]
               (when new-shacl?
                 ;; TODO - PropertyShape class is often not specified for sh:property nodes - direct changes to those would not be caught here!
                 (vocab/reset-shapes (:schema db-after)))
