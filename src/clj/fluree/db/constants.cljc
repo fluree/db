@@ -98,79 +98,79 @@
 
 
 ;; shacl
-(def ^:const $sh:NodeShape (iri/iri->sid "http://www.w3.org/ns/shacl#NodeShape"))
-(def ^:const $sh:PropertyShape (iri/iri->sid "http://www.w3.org/ns/shacl#PropertyShape"))
-(def ^:const $sh:deactivated (iri/iri->sid "http://www.w3.org/ns/shacl#deactivated"))
-(def ^:const $sh:path (iri/iri->sid "http://www.w3.org/ns/shacl#path"))
+(def ^:const sh_NodeShape (iri/iri->sid "http://www.w3.org/ns/shacl#NodeShape"))
+(def ^:const sh_PropertyShape (iri/iri->sid "http://www.w3.org/ns/shacl#PropertyShape"))
+(def ^:const sh_deactivated (iri/iri->sid "http://www.w3.org/ns/shacl#deactivated"))
+(def ^:const sh_path (iri/iri->sid "http://www.w3.org/ns/shacl#path"))
 
-(def ^:const $sh:alternativePath (iri/iri->sid "http://www.w3.org/ns/shacl#alternativePath"))
-(def ^:const $sh:zeroOrMorePath (iri/iri->sid "http://www.w3.org/ns/shacl#zeroOrMorePath"))
-(def ^:const $sh:oneOrMorePath (iri/iri->sid "http://www.w3.org/ns/shacl#oneOrMorePath"))
-(def ^:const $sh:zeroOrOnePath (iri/iri->sid "http://www.w3.org/ns/shacl#zeroOrOnePath"))
-(def ^:const $sh:inversePath (iri/iri->sid "http://www.w3.org/ns/shacl#inversePath"))
+(def ^:const sh_alternativePath (iri/iri->sid "http://www.w3.org/ns/shacl#alternativePath"))
+(def ^:const sh_zeroOrMorePath (iri/iri->sid "http://www.w3.org/ns/shacl#zeroOrMorePath"))
+(def ^:const sh_oneOrMorePath (iri/iri->sid "http://www.w3.org/ns/shacl#oneOrMorePath"))
+(def ^:const sh_zeroOrOnePath (iri/iri->sid "http://www.w3.org/ns/shacl#zeroOrOnePath"))
+(def ^:const sh_inversePath (iri/iri->sid "http://www.w3.org/ns/shacl#inversePath"))
 
 ;; targets
-(def ^:const $sh:targetClass (iri/iri->sid "http://www.w3.org/ns/shacl#targetClass"))
-(def ^:const $sh:targetNode (iri/iri->sid "http://www.w3.org/ns/shacl#targetNode"))
-(def ^:const $sh:targetObjectsOf (iri/iri->sid "http://www.w3.org/ns/shacl#targetObjectsOf"))
-(def ^:const $sh:targetSubjectsOf (iri/iri->sid "http://www.w3.org/ns/shacl#targetSubjectsOf"))
+(def ^:const sh_targetClass (iri/iri->sid "http://www.w3.org/ns/shacl#targetClass"))
+(def ^:const sh_targetNode (iri/iri->sid "http://www.w3.org/ns/shacl#targetNode"))
+(def ^:const sh_targetObjectsOf (iri/iri->sid "http://www.w3.org/ns/shacl#targetObjectsOf"))
+(def ^:const sh_targetSubjectsOf (iri/iri->sid "http://www.w3.org/ns/shacl#targetSubjectsOf"))
 
 ;; constraints:
 ;; value type
-(def ^:const $sh:class (iri/iri->sid "http://www.w3.org/ns/shacl#class"))
-(def ^:const $sh:datatype (iri/iri->sid "http://www.w3.org/ns/shacl#datatype"))
-(def ^:const $sh:nodeKind (iri/iri->sid "http://www.w3.org/ns/shacl#nodeKind"))
+(def ^:const sh_class (iri/iri->sid "http://www.w3.org/ns/shacl#class"))
+(def ^:const sh_datatype (iri/iri->sid "http://www.w3.org/ns/shacl#datatype"))
+(def ^:const sh_nodeKind (iri/iri->sid "http://www.w3.org/ns/shacl#nodeKind"))
 
-(def ^:const $sh:IRI (iri/iri->sid "http://www.w3.org/ns/shacl#IRI"))
-(def ^:const $sh:IRIOrLiteral (iri/iri->sid "http://www.w3.org/ns/shacl#IRIOrLiteral"))
-(def ^:const $sh:BlankNodeOrIRI (iri/iri->sid "http://www.w3.org/ns/shacl#BlankNodeOrIRI"))
-(def ^:const $sh:BlankNode (iri/iri->sid "http://www.w3.org/ns/shacl#BlankNode"))
-(def ^:const $sh:BlankNodeOrLiteral (iri/iri->sid "http://www.w3.org/ns/shacl#BlankNodeOrLiteral"))
-(def ^:const $sh:Literal (iri/iri->sid "http://www.w3.org/ns/shacl#Literal"))
+(def ^:const sh_IRI (iri/iri->sid "http://www.w3.org/ns/shacl#IRI"))
+(def ^:const sh_IRIOrLiteral (iri/iri->sid "http://www.w3.org/ns/shacl#IRIOrLiteral"))
+(def ^:const sh_BlankNodeOrIRI (iri/iri->sid "http://www.w3.org/ns/shacl#BlankNodeOrIRI"))
+(def ^:const sh_BlankNode (iri/iri->sid "http://www.w3.org/ns/shacl#BlankNode"))
+(def ^:const sh_BlankNodeOrLiteral (iri/iri->sid "http://www.w3.org/ns/shacl#BlankNodeOrLiteral"))
+(def ^:const sh_Literal (iri/iri->sid "http://www.w3.org/ns/shacl#Literal"))
 
 ;; cardinality
-(def ^:const $sh:minCount (iri/iri->sid "http://www.w3.org/ns/shacl#minCount"))
-(def ^:const $sh:maxCount (iri/iri->sid "http://www.w3.org/ns/shacl#maxCount"))
+(def ^:const sh_minCount (iri/iri->sid "http://www.w3.org/ns/shacl#minCount"))
+(def ^:const sh_maxCount (iri/iri->sid "http://www.w3.org/ns/shacl#maxCount"))
 
 ;; value range
-(def ^:const $sh:minExclusive (iri/iri->sid "http://www.w3.org/ns/shacl#minExclusive"))
-(def ^:const $sh:minInclusive (iri/iri->sid "http://www.w3.org/ns/shacl#minInclusive"))
-(def ^:const $sh:maxExclusive (iri/iri->sid "http://www.w3.org/ns/shacl#maxExclusive"))
-(def ^:const $sh:maxInclusive (iri/iri->sid "http://www.w3.org/ns/shacl#maxInclusive"))
+(def ^:const sh_minExclusive (iri/iri->sid "http://www.w3.org/ns/shacl#minExclusive"))
+(def ^:const sh_minInclusive (iri/iri->sid "http://www.w3.org/ns/shacl#minInclusive"))
+(def ^:const sh_maxExclusive (iri/iri->sid "http://www.w3.org/ns/shacl#maxExclusive"))
+(def ^:const sh_maxInclusive (iri/iri->sid "http://www.w3.org/ns/shacl#maxInclusive"))
 
 ;; string-based
-(def ^:const $sh:minLength (iri/iri->sid "http://www.w3.org/ns/shacl#minLength"))
-(def ^:const $sh:maxLength (iri/iri->sid "http://www.w3.org/ns/shacl#maxLength"))
-(def ^:const $sh:pattern (iri/iri->sid "http://www.w3.org/ns/shacl#pattern"))
-(def ^:const $sh:flags (iri/iri->sid "http://www.w3.org/ns/shacl#flags"))
-(def ^:const $sh:languageIn (iri/iri->sid "http://www.w3.org/ns/shacl#languageIn"))
-(def ^:const $sh:uniqueLang (iri/iri->sid "http://www.w3.org/ns/shacl#uniqueLang"))
+(def ^:const sh_minLength (iri/iri->sid "http://www.w3.org/ns/shacl#minLength"))
+(def ^:const sh_maxLength (iri/iri->sid "http://www.w3.org/ns/shacl#maxLength"))
+(def ^:const sh_pattern (iri/iri->sid "http://www.w3.org/ns/shacl#pattern"))
+(def ^:const sh_flags (iri/iri->sid "http://www.w3.org/ns/shacl#flags"))
+(def ^:const sh_languageIn (iri/iri->sid "http://www.w3.org/ns/shacl#languageIn"))
+(def ^:const sh_uniqueLang (iri/iri->sid "http://www.w3.org/ns/shacl#uniqueLang"))
 
 ;; property pair
-(def ^:const $sh:equals (iri/iri->sid "http://www.w3.org/ns/shacl#equals"))
-(def ^:const $sh:disjoint (iri/iri->sid "http://www.w3.org/ns/shacl#disjoint"))
-(def ^:const $sh:lessThan (iri/iri->sid "http://www.w3.org/ns/shacl#lessThan"))
-(def ^:const $sh:lessThanOrEquals (iri/iri->sid "http://www.w3.org/ns/shacl#lessThanOrEquals"))
+(def ^:const sh_equals (iri/iri->sid "http://www.w3.org/ns/shacl#equals"))
+(def ^:const sh_disjoint (iri/iri->sid "http://www.w3.org/ns/shacl#disjoint"))
+(def ^:const sh_lessThan (iri/iri->sid "http://www.w3.org/ns/shacl#lessThan"))
+(def ^:const sh_lessThanOrEquals (iri/iri->sid "http://www.w3.org/ns/shacl#lessThanOrEquals"))
 
 ;; logical constraints
-(def ^:const $sh:not (iri/iri->sid "http://www.w3.org/ns/shacl#not"))
-(def ^:const $sh:and (iri/iri->sid "http://www.w3.org/ns/shacl#and"))
-(def ^:const $sh:or (iri/iri->sid "http://www.w3.org/ns/shacl#or"))
-(def ^:const $sh:xone (iri/iri->sid "http://www.w3.org/ns/shacl#xone"))
+(def ^:const sh_not (iri/iri->sid "http://www.w3.org/ns/shacl#not"))
+(def ^:const sh_and (iri/iri->sid "http://www.w3.org/ns/shacl#and"))
+(def ^:const sh_or (iri/iri->sid "http://www.w3.org/ns/shacl#or"))
+(def ^:const sh_xone (iri/iri->sid "http://www.w3.org/ns/shacl#xone"))
 
 ;; shape-based
-(def ^:const $sh:property (iri/iri->sid "http://www.w3.org/ns/shacl#property"))
-(def ^:const $sh:node (iri/iri->sid "http://www.w3.org/ns/shacl#node"))
-(def ^:const $sh:qualifiedValueShape (iri/iri->sid "http://www.w3.org/ns/shacl#qualifiedValueShape"))
-(def ^:const $sh:qualifiedMinCount (iri/iri->sid "http://www.w3.org/ns/shacl#qualifiedMinCount"))
-(def ^:const $sh:qualifiedMaxCount (iri/iri->sid "http://www.w3.org/ns/shacl#qualifiedMaxCount"))
-(def ^:const $sh:qualifiedValueShapesDisjoint (iri/iri->sid "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint"))
+(def ^:const sh_property (iri/iri->sid "http://www.w3.org/ns/shacl#property"))
+(def ^:const sh_node (iri/iri->sid "http://www.w3.org/ns/shacl#node"))
+(def ^:const sh_qualifiedValueShape (iri/iri->sid "http://www.w3.org/ns/shacl#qualifiedValueShape"))
+(def ^:const sh_qualifiedMinCount (iri/iri->sid "http://www.w3.org/ns/shacl#qualifiedMinCount"))
+(def ^:const sh_qualifiedMaxCount (iri/iri->sid "http://www.w3.org/ns/shacl#qualifiedMaxCount"))
+(def ^:const sh_qualifiedValueShapesDisjoint (iri/iri->sid "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint"))
 
 ;; other
-(def ^:const $sh:closed (iri/iri->sid "http://www.w3.org/ns/shacl#closed"))
-(def ^:const $sh:ignoredProperties (iri/iri->sid "http://www.w3.org/ns/shacl#ignoredProperties"))
-(def ^:const $sh:in (iri/iri->sid "http://www.w3.org/ns/shacl#in"))
-(def ^:const $sh:hasValue (iri/iri->sid "http://www.w3.org/ns/shacl#hasValue"))
+(def ^:const sh_closed (iri/iri->sid "http://www.w3.org/ns/shacl#closed"))
+(def ^:const sh_ignoredProperties (iri/iri->sid "http://www.w3.org/ns/shacl#ignoredProperties"))
+(def ^:const sh_in (iri/iri->sid "http://www.w3.org/ns/shacl#in"))
+(def ^:const sh_hasValue (iri/iri->sid "http://www.w3.org/ns/shacl#hasValue"))
 
 
 ;; fluree-specific

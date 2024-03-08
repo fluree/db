@@ -34,58 +34,58 @@
           "http://www.w3.org/2002/07/owl#DatatypeProperty"      const/$owl:DatatypeProperty
           "http://www.w3.org/2002/07/owl#equivalentProperty"    const/$owl:equivalentProperty
           ;; shacl
-          "http://www.w3.org/ns/shacl#NodeShape"                const/$sh:NodeShape
-          "http://www.w3.org/ns/shacl#PropertyShape"            const/$sh:PropertyShape
-          "http://www.w3.org/ns/shacl#deactivated"              const/$sh:deactivated
-          "http://www.w3.org/ns/shacl#IRI"                      const/$sh:IRI
-          "http://www.w3.org/ns/shacl#IRIOrLiteral"             const/$sh:IRIOrLiteral
-          "http://www.w3.org/ns/shacl#BlankNodeOrIRI"           const/$sh:BlankNodeOrIRI
-          "http://www.w3.org/ns/shacl#BlankNode"                const/$sh:BlankNode
-          "http://www.w3.org/ns/shacl#BlankNodeOrLiteral"       const/$sh:BlankNodeOrLiteral
-          "http://www.w3.org/ns/shacl#Literal"                  const/$sh:Literal
-          "http://www.w3.org/ns/shacl#targetClass"              const/$sh:targetClass
-          "http://www.w3.org/ns/shacl#targetNode"               const/$sh:targetNode
-          "http://www.w3.org/ns/shacl#targetObjectsOf"          const/$sh:targetObjectsOf
-          "http://www.w3.org/ns/shacl#targetSubjectsOf"         const/$sh:targetSubjectsOf
-          "http://www.w3.org/ns/shacl#closed"                   const/$sh:closed
-          "http://www.w3.org/ns/shacl#ignoredProperties"        const/$sh:ignoredProperties
-          "http://www.w3.org/ns/shacl#node"                     const/$sh:node
-          "http://www.w3.org/ns/shacl#property"                 const/$sh:property
-          "http://www.w3.org/ns/shacl#path"                     const/$sh:path
-          "http://www.w3.org/ns/shacl#inversePath"              const/$sh:inversePath
-          "http://www.w3.org/ns/shacl#alternativePath"          const/$sh:alternativePath
-          "http://www.w3.org/ns/shacl#zeroOrMorePath"           const/$sh:zeroOrMorePath
-          "http://www.w3.org/ns/shacl#oneOrMorePath"            const/$sh:oneOrMorePath
-          "http://www.w3.org/ns/shacl#zeroOrOnePath"            const/$sh:zeroOrOnePath
-          "http://www.w3.org/ns/shacl#minCount"                 const/$sh:minCount
-          "http://www.w3.org/ns/shacl#maxCount"                 const/$sh:maxCount
-          "http://www.w3.org/ns/shacl#datatype"                 const/$sh:datatype
-          "http://www.w3.org/ns/shacl#nodeKind"                 const/$sh:nodeKind
-          "http://www.w3.org/ns/shacl#minLength"                const/$sh:minLength
-          "http://www.w3.org/ns/shacl#maxLength"                const/$sh:maxLength
-          "http://www.w3.org/ns/shacl#equals"                   const/$sh:equals
-          "http://www.w3.org/ns/shacl#lessThan"                 const/$sh:lessThan
-          "http://www.w3.org/ns/shacl#lessThanOrEquals"         const/$sh:lessThanOrEquals
-          "http://www.w3.org/ns/shacl#disjoint"                 const/$sh:disjoint
-          "http://www.w3.org/ns/shacl#pattern"                  const/$sh:pattern
-          "http://www.w3.org/ns/shacl#flags"                    const/$sh:flags
-          "http://www.w3.org/ns/shacl#languageIn"               const/$sh:languageIn
-          "http://www.w3.org/ns/shacl#uniqueLang"               const/$sh:uniqueLang
-          "http://www.w3.org/ns/shacl#class"                    const/$sh:class
-          "http://www.w3.org/ns/shacl#hasValue"                 const/$sh:hasValue
-          "http://www.w3.org/ns/shacl#in"                       const/$sh:in
-          "http://www.w3.org/ns/shacl#minExclusive"             const/$sh:minExclusive
-          "http://www.w3.org/ns/shacl#minInclusive"             const/$sh:minInclusive
-          "http://www.w3.org/ns/shacl#maxExclusive"             const/$sh:maxExclusive
-          "http://www.w3.org/ns/shacl#maxInclusive"             const/$sh:maxInclusive
-          "http://www.w3.org/ns/shacl#not"                      const/$sh:not
-          "http://www.w3.org/ns/shacl#and"                      const/$sh:and
-          "http://www.w3.org/ns/shacl#or"                       const/$sh:or
-          "http://www.w3.org/ns/shacl#xone"                     const/$sh:xone
-          "http://www.w3.org/ns/shacl#qualifiedValueShape"      const/$sh:qualifiedValueShape
-          "http://www.w3.org/ns/shacl#qualifiedMinCount"        const/$sh:qualifiedMinCount
-          "http://www.w3.org/ns/shacl#qualifiedMaxCount"        const/$sh:qualifiedMaxCount
-          "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint" const/$sh:qualifiedValueShapesDisjoint
+          "http://www.w3.org/ns/shacl#NodeShape"                const/sh_NodeShape
+          "http://www.w3.org/ns/shacl#PropertyShape"            const/sh_PropertyShape
+          "http://www.w3.org/ns/shacl#deactivated"              const/sh_deactivated
+          "http://www.w3.org/ns/shacl#IRI"                      const/sh_IRI
+          "http://www.w3.org/ns/shacl#IRIOrLiteral"             const/sh_IRIOrLiteral
+          "http://www.w3.org/ns/shacl#BlankNodeOrIRI"           const/sh_BlankNodeOrIRI
+          "http://www.w3.org/ns/shacl#BlankNode"                const/sh_BlankNode
+          "http://www.w3.org/ns/shacl#BlankNodeOrLiteral"       const/sh_BlankNodeOrLiteral
+          "http://www.w3.org/ns/shacl#Literal"                  const/sh_Literal
+          "http://www.w3.org/ns/shacl#targetClass"              const/sh_targetClass
+          "http://www.w3.org/ns/shacl#targetNode"               const/sh_targetNode
+          "http://www.w3.org/ns/shacl#targetObjectsOf"          const/sh_targetObjectsOf
+          "http://www.w3.org/ns/shacl#targetSubjectsOf"         const/sh_targetSubjectsOf
+          "http://www.w3.org/ns/shacl#closed"                   const/sh_closed
+          "http://www.w3.org/ns/shacl#ignoredProperties"        const/sh_ignoredProperties
+          "http://www.w3.org/ns/shacl#node"                     const/sh_node
+          "http://www.w3.org/ns/shacl#property"                 const/sh_property
+          "http://www.w3.org/ns/shacl#path"                     const/sh_path
+          "http://www.w3.org/ns/shacl#inversePath"              const/sh_inversePath
+          "http://www.w3.org/ns/shacl#alternativePath"          const/sh_alternativePath
+          "http://www.w3.org/ns/shacl#zeroOrMorePath"           const/sh_zeroOrMorePath
+          "http://www.w3.org/ns/shacl#oneOrMorePath"            const/sh_oneOrMorePath
+          "http://www.w3.org/ns/shacl#zeroOrOnePath"            const/sh_zeroOrOnePath
+          "http://www.w3.org/ns/shacl#minCount"                 const/sh_minCount
+          "http://www.w3.org/ns/shacl#maxCount"                 const/sh_maxCount
+          "http://www.w3.org/ns/shacl#datatype"                 const/sh_datatype
+          "http://www.w3.org/ns/shacl#nodeKind"                 const/sh_nodeKind
+          "http://www.w3.org/ns/shacl#minLength"                const/sh_minLength
+          "http://www.w3.org/ns/shacl#maxLength"                const/sh_maxLength
+          "http://www.w3.org/ns/shacl#equals"                   const/sh_equals
+          "http://www.w3.org/ns/shacl#lessThan"                 const/sh_lessThan
+          "http://www.w3.org/ns/shacl#lessThanOrEquals"         const/sh_lessThanOrEquals
+          "http://www.w3.org/ns/shacl#disjoint"                 const/sh_disjoint
+          "http://www.w3.org/ns/shacl#pattern"                  const/sh_pattern
+          "http://www.w3.org/ns/shacl#flags"                    const/sh_flags
+          "http://www.w3.org/ns/shacl#languageIn"               const/sh_languageIn
+          "http://www.w3.org/ns/shacl#uniqueLang"               const/sh_uniqueLang
+          "http://www.w3.org/ns/shacl#class"                    const/sh_class
+          "http://www.w3.org/ns/shacl#hasValue"                 const/sh_hasValue
+          "http://www.w3.org/ns/shacl#in"                       const/sh_in
+          "http://www.w3.org/ns/shacl#minExclusive"             const/sh_minExclusive
+          "http://www.w3.org/ns/shacl#minInclusive"             const/sh_minInclusive
+          "http://www.w3.org/ns/shacl#maxExclusive"             const/sh_maxExclusive
+          "http://www.w3.org/ns/shacl#maxInclusive"             const/sh_maxInclusive
+          "http://www.w3.org/ns/shacl#not"                      const/sh_not
+          "http://www.w3.org/ns/shacl#and"                      const/sh_and
+          "http://www.w3.org/ns/shacl#or"                       const/sh_or
+          "http://www.w3.org/ns/shacl#xone"                     const/sh_xone
+          "http://www.w3.org/ns/shacl#qualifiedValueShape"      const/sh_qualifiedValueShape
+          "http://www.w3.org/ns/shacl#qualifiedMinCount"        const/sh_qualifiedMinCount
+          "http://www.w3.org/ns/shacl#qualifiedMaxCount"        const/sh_qualifiedMaxCount
+          "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint" const/sh_qualifiedValueShapesDisjoint
           ;; fluree
           const/iri-role                                        const/$f:role
           const/iri-target-class                                const/$fluree:targetClass}))
@@ -114,20 +114,20 @@
     const/$rdfs:Class
     const/$rdfs:subClassOf
     const/$rdfs:subPropertyOf
-    const/$sh:alternativePath
-    const/$sh:class
-    const/$sh:datatype
-    const/$sh:disjoint
-    const/$sh:equals
-    const/$sh:ignoredProperties
-    const/$sh:inversePath
-    const/$sh:lessThan
-    const/$sh:lessThanOrEquals
-    const/$sh:oneOrMorePath
-    const/$sh:path
-    const/$sh:targetClass
-    const/$sh:targetObjectsOf
-    const/$sh:targetSubjectsOf
-    const/$sh:zeroOrMorePath
-    const/$sh:zeroOrOnePath
+    const/sh_alternativePath
+    const/sh_class
+    const/sh_datatype
+    const/sh_disjoint
+    const/sh_equals
+    const/sh_ignoredProperties
+    const/sh_inversePath
+    const/sh_lessThan
+    const/sh_lessThanOrEquals
+    const/sh_oneOrMorePath
+    const/sh_path
+    const/sh_targetClass
+    const/sh_targetObjectsOf
+    const/sh_targetSubjectsOf
+    const/sh_zeroOrMorePath
+    const/sh_zeroOrOnePath
     const/$rdf:type})

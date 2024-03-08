@@ -196,7 +196,7 @@
 (defn validate-nodekind-constraint
   [db {:keys [node-kind logical-constraint] :as _p-shape} p-flakes]
   (go-try
-    (if (= node-kind const/$sh:Literal)
+    (if (= node-kind const/sh_Literal)
       ;; don't need to do a lookup to check for literals
       (if (every? #(not= (flake/dt %) const/$xsd:anyURI) p-flakes)
         [true "sh:not sh:nodekind: every value must not be a literal"]
@@ -213,23 +213,23 @@
                 iri?     (not (or literal? bnode?))
                 [valid? :as result]
                 (condp = node-kind
-                  const/$sh:BlankNode
+                  const/sh_BlankNode
                   (if bnode?
                     [true "sh:not sh:nodekind: every value must not be a blank node identifier"]
                     [false "sh:nodekind: every value must be a blank node identifier"])
-                  const/$sh:IRI
+                  const/sh_IRI
                   (if bnode?
                     [true "sh:not sh:nodekind: every value must not be an IRI"]
                     [false "sh:nodekind: every value must be an IRI"])
-                  const/$sh:BlankNodeOrIRI
+                  const/sh_BlankNodeOrIRI
                   (if (or bnode? iri?)
                     [true "sh:not sh:nodekind: every value must not be a blank node identifier or an IRI"]
                     [false "sh:nodekind: every value must be a blank node identifier or an IRI"])
-                  const/$sh:IRIOrLiteral
+                  const/sh_IRIOrLiteral
                   (if (or iri? literal?)
                     [true "sh:not sh:nodekind: every value must not be an IRI or a literal"]
                     [false "sh:nodekind: every value must be an IRI or a literal"])
-                  const/$sh:BlankNodeOrLiteral
+                  const/sh_BlankNodeOrLiteral
                   (if (or bnode? literal?)
                     [true "sh:not sh:nodekind: every value must not be a blank node identifier or a literal"]
                     [false "sh:nodekind: every value must be a blank node identifier or a literal"]))]
@@ -418,11 +418,11 @@
     (let [q-shape-flakes (<? (query-range/index-range db :spot = [qualified-value-shape]))
           node-shape?    (some (fn [f]
                                  (and (= (flake/p f) const/$rdf:type)
-                                      (= (flake/o f) const/$sh:NodeShape)))
+                                      (= (flake/o f) const/sh_NodeShape)))
                                q-shape-flakes)
           q-shape        (if node-shape?
                            (<? (build-node-shape db q-shape-flakes))
-                           (<? (build-property-shape db const/$sh:qualifiedValueShape q-shape-flakes)))]
+                           (<? (build-property-shape db const/sh_qualifiedValueShape q-shape-flakes)))]
       (loop [[f & r]    p-flakes
              conforming #{}]
         (if f
@@ -558,90 +558,90 @@
       (fn [acc property-flake]
         (let [o (flake/o property-flake)]
           (condp = (flake/p property-flake)
-            const/$sh:path
+            const/sh_path
             (update acc :path (fnil conj []) o)
 
             ;; The datatype of all value nodes (e.g., xsd:integer).
             ;; A shape has at most one value for sh:datatype.
-            const/$sh:datatype
+            const/sh_datatype
             (assoc acc :datatype o)
 
-            const/$sh:minCount
+            const/sh_minCount
             (assoc acc :min-count o)
 
-            const/$sh:maxCount
+            const/sh_maxCount
             (assoc acc :max-count o)
 
             ;; values of sh:nodeKind in a shape are one of the following six instances of the
             ;; class sh:NodeKind: sh:BlankNode, sh:IRI, sh:Literal sh:BlankNodeOrIRI,
             ;; sh:BlankNodeOrLiteral and sh:IRIOrLiteral.
             ;; A shape has at most one value for sh:nodeKind.
-            const/$sh:nodeKind
+            const/sh_nodeKind
             (assoc acc :node-kind o)
 
             ;; Note that multiple values for sh:class are interpreted as a conjunction,
             ;; i.e. the values need to be SHACL instances of all of them.
-            const/$sh:class
+            const/sh_class
             (update acc :class (fnil conj #{}) o)
 
-            const/$sh:pattern
+            const/sh_pattern
             (assoc acc :pattern o)
 
-            const/$sh:minLength
+            const/sh_minLength
             (assoc acc :min-length o)
 
-            const/$sh:maxLength
+            const/sh_maxLength
             (assoc acc :max-length o)
 
-            const/$sh:flags
+            const/sh_flags
             (update acc :flags (fnil conj []) o)
 
-            const/$sh:languageIn
+            const/sh_languageIn
             (assoc acc :language-in o)
 
-            const/$sh:uniqueLang
+            const/sh_uniqueLang
             (assoc acc :unique-lang o)
 
-            const/$sh:hasValue
+            const/sh_hasValue
             (assoc acc :has-value o)
 
-            const/$sh:in
+            const/sh_in
             (update acc :in (fnil conj []) o)
 
-            const/$sh:minExclusive
+            const/sh_minExclusive
             (assoc acc :min-exclusive o)
 
-            const/$sh:minInclusive
+            const/sh_minInclusive
             (assoc acc :min-inclusive o)
 
-            const/$sh:maxExclusive
+            const/sh_maxExclusive
             (assoc acc :max-exclusive o)
 
-            const/$sh:maxInclusive
+            const/sh_maxInclusive
             (assoc acc :max-inclusive o)
 
-            const/$sh:equals
+            const/sh_equals
             (assoc acc :pair-constraint :equals :rhs-property o)
 
-            const/$sh:disjoint
+            const/sh_disjoint
             (assoc acc :pair-constraint :disjoint :rhs-property o)
 
-            const/$sh:lessThan
+            const/sh_lessThan
             (assoc acc :pair-constraint :lessThan :rhs-property o)
 
-            const/$sh:lessThanOrEquals
+            const/sh_lessThanOrEquals
             (assoc acc :pair-constraint :lessThanOrEquals :rhs-property o)
 
-            const/$sh:node
+            const/sh_node
             (assoc acc :node o)
 
-            const/$sh:qualifiedValueShape
+            const/sh_qualifiedValueShape
             (assoc acc :qualified-value-shape o)
-            const/$sh:qualifiedMinCount
+            const/sh_qualifiedMinCount
             (assoc acc :qualified-min-count o)
-            const/$sh:qualifiedMaxCount
+            const/sh_qualifiedMaxCount
             (assoc acc :qualified-max-count o)
-            const/$sh:qualifiedValueShapesDisjoint
+            const/sh_qualifiedValueShapesDisjoint
             (assoc acc :qualified-value-shapes-disjoint o)
 
             ;; else
@@ -668,36 +668,36 @@
   [{:keys [dt validate-fn] :as dt-map} {:keys [class node-kind path] :as property-shape}]
   (let [dt-map* (condp = node-kind
 
-                  const/$sh:BlankNode
+                  const/sh_BlankNode
                   {:dt          const/$xsd:anyURI
                    :class       class
                    :validate-fn (fn [x] (and (string? x)
                                              (str/starts-with? x "_:")))}
 
                   ;; common case, has to be an IRI
-                  const/$sh:IRI
+                  const/sh_IRI
                   {:dt          const/$xsd:anyURI
                    :class       class
                    :validate-fn (fn [x] (and (string? x)
                                              (not (str/starts-with? x "_:"))))}
 
-                  const/$sh:BlankNodeOrIRI
+                  const/sh_BlankNodeOrIRI
                   {:dt          const/$xsd:anyURI
                    :class       class
                    :validate-fn nil}
 
-                  const/$sh:IRIOrLiteral
+                  const/sh_IRIOrLiteral
                   {:dt          nil
                    :class       class
                    :validate-fn nil}
 
-                  const/$sh:BlankNodeOrLiteral
+                  const/sh_BlankNodeOrLiteral
                   {:dt          nil
                    :class       class
                    :validate-fn nil}
 
                   ;; means it *cannot* be an IRI, but any literal is OK
-                  const/$sh:Literal
+                  const/sh_Literal
                   {:dt          nil
                    :validate-fn nil})]
     (when (and dt
@@ -776,11 +776,11 @@
       (let [o (flake/o path-flake)
             p (flake/p path-flake)]
         (uc/case p
-          const/$sh:inversePath [o :inverse]
-          const/$sh:alternativePath [o :alternative]
-          const/$sh:zeroOrMorePath [o :zero-plus]
-          const/$sh:oneOrMorePath [o :one-plus]
-          const/$sh:zeroOrOnePath [o :zero-one]
+          const/sh_inversePath [o :inverse]
+          const/sh_alternativePath [o :alternative]
+          const/sh_zeroOrMorePath [o :zero-plus]
+          const/sh_oneOrMorePath [o :one-plus]
+          const/sh_zeroOrOnePath [o :zero-one]
           [path-pid :predicate]))
       [path-pid :predicate])))
 
@@ -800,7 +800,7 @@
           base*    (<? (resolve-path-types base db))]
       (cond-> base*
         (:pattern base) (build-pattern)
-        (= p const/$sh:not) (assoc :logical-constraint :not)))))
+        (= p const/sh_not) (assoc :logical-constraint :not)))))
 
 (defn build-node-shape
   [db shape-flakes]
@@ -811,20 +811,20 @@
       (if flake
         (let [p (flake/p flake)
               o (flake/o flake)]
-          (if (#{const/$sh:property const/$sh:not} p)
+          (if (#{const/sh_property const/sh_not} p)
             (let [p-shape-flakes (<? (query-range/index-range db :spot = [o]))
                   p-shape (<? (build-property-shape db p p-shape-flakes))]
               (recur r' shape (conj p-shapes p-shape)))
             (let [shape* (condp = p
-                           const/$sh:targetClass
+                           const/sh_targetClass
                            (assoc shape :target-class o)
 
-                           const/$sh:closed
+                           const/sh_closed
                            (if (true? o)
                              (assoc shape :closed? true)
                              shape)
 
-                           const/$sh:ignoredProperties
+                           const/sh_ignoredProperties
                            (update shape :ignored-properties (fnil conj #{}) o)
 
                            ;; else
@@ -854,7 +854,7 @@
   "Given a class SID, returns class shape"
   [db class-sid]
   (go-try
-    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetClass [class-sid const/$xsd:anyURI]]
+    (let [shape-sids (<? (query-range/index-range db :post = [const/sh_targetClass [class-sid const/$xsd:anyURI]]
                                                   {:flake-xf (map flake/s)}))]
       (map (fn [shape]
              (assoc shape :target-class class-sid))
@@ -881,7 +881,7 @@
   "Given a pred SID, returns shape"
   [db pred-sid]
   (go-try
-    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetObjectsOf [pred-sid const/$xsd:anyURI]]
+    (let [shape-sids (<? (query-range/index-range db :post = [const/sh_targetObjectsOf [pred-sid const/$xsd:anyURI]]
                                                   {:flake-xf (map flake/s)}))]
       (map (fn [shape]
              (assoc shape :target-objects-of pred-sid))
@@ -912,4 +912,4 @@
   (-> db
       :schema
       :pred
-      (contains? const/$sh:targetObjectsOf)))
+      (contains? const/sh_targetObjectsOf)))
