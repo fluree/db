@@ -100,6 +100,7 @@
 ;; shacl
 (def ^:const $sh:NodeShape (iri/iri->sid "http://www.w3.org/ns/shacl#NodeShape"))
 (def ^:const $sh:PropertyShape (iri/iri->sid "http://www.w3.org/ns/shacl#PropertyShape"))
+(def ^:const $sh:deactivated (iri/iri->sid "http://www.w3.org/ns/shacl#deactivated"))
 (def ^:const $sh:path (iri/iri->sid "http://www.w3.org/ns/shacl#path"))
 
 (def ^:const $sh:alternativePath (iri/iri->sid "http://www.w3.org/ns/shacl#alternativePath"))
