@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.migrate.sid
   (:require [fluree.db.constants :as const]
-            [fluree.db.indexer.storage :as storage]
             [fluree.db.query.exec.update :as update]
             [fluree.db.json-ld.commit :as commit]
             [fluree.db.json-ld.commit-data :as commit-data]
@@ -8,7 +7,6 @@
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.indexer.default :as indexer]
-            [fluree.db.index :as index]
             [fluree.db.db.json-ld :as db]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
@@ -44,6 +42,7 @@
     (let [db-address (-> commit
                          (get-first const/iri-data)
                          (get-first-value const/iri-address))
+          _ (log/info "Migrating commit at address:" db-address)
           db-data    (<? (reify/read-db conn db-address))
           t-new      (reify/db-t db-data)
           ns-mapping (db->namespace-mapping db)
