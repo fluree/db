@@ -176,21 +176,37 @@
                        o-pred-shapes)))
           subj-mods)))))
 
+(defn modified-subjects
+  "Returns a map of sid to s-flakes for each modified subject."
+  [db flakes]
+  (go-try
+    (loop [[s-flakes & r] (partition-by flake/s flakes)
+           sid->s-flakes  {}]
+      (if s-flakes
+        (let [sid             (some-> s-flakes first flake/s)
+              existing-flakes (<? (query-range/index-range db :spot = [sid]))]
+          (recur r (assoc sid->s-flakes sid (into (set s-flakes) existing-flakes))))
+        sid->s-flakes))))
+
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
   [db new-flakes {:keys [stage-update? policy t txn author-did] :as _tx-state}]
-  (let [[add remove] (if stage-update?
-                       (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
-                       [new-flakes nil])
-        db-after  (-> db
-                      (update :staged conj [txn author-did])
-                      (assoc :policy policy) ;; re-apply policy to db-after
-                      (assoc :t t)
-                      (commit-data/update-novelty add remove)
-                      (commit-data/add-tt-id)
-                      (vocab/hydrate-schema add))]
-    {:add add :remove remove :db-after db-after}))
+  (go-try
+    (let [[add remove] (if stage-update?
+                         (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
+                         [new-flakes nil])
+
+          mods (<? (modified-subjects db add))
+
+          db-after  (-> db
+                        (update :staged conj [txn author-did])
+                        (assoc :policy policy) ;; re-apply policy to db-after
+                        (assoc :t t)
+                        (commit-data/update-novelty add remove)
+                        (commit-data/add-tt-id)
+                        (vocab/hydrate-schema add))]
+      {:add add :remove remove :db-after db-after :mods mods})))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
@@ -202,9 +218,10 @@
           ;; TODO: remove the atom wrapper once subj-mods is no longer shared code
           tx-state* (assoc tx-state :subj-mods (atom subj-mods))]
       (-> (final-db db flakes tx-state)
+          <?
           (validate-rules tx-state*)
           <?
-          (policy/allowed? tx-state*)
+          (policy/allowed?)
           <?
           dbproto/-rootdb))))
 
