@@ -10,6 +10,7 @@
 (def ^:const $owl-FunctionalProperty "http://www.w3.org/2002/07/owl#FunctionalProperty")
 (def ^:const $owl-InverseFunctionalProperty "http://www.w3.org/2002/07/owl#InverseFunctionalProperty")
 (def ^:const $owl-SymetricProperty "http://www.w3.org/2002/07/owl#SymetricProperty")
+(def ^:const $owl-TransitiveProperty "http://www.w3.org/2002/07/owl#TransitiveProperty")
 
 (def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
 (def ^:const $owl-equivalentClass "http://www.w3.org/2002/07/owl#equivalentClass")
@@ -56,9 +57,9 @@
   (let [domain   (->> (get owl-statement $rdfs-domain)
                       (mapv :id))
         property (:id owl-statement)
-        rule     {"where"  {"@id"    "?s",
-                            property nil},
-                  "insert" {"@id"   "?s",
+        rule     {"where"  {"@id"    "?s"
+                            property nil}
+                  "insert" {"@id"   "?s"
                             "@type" domain}}]
     ;; rule-id *is* the property
     (conj all-rules [(str property "(prp-dom)") rule])))
@@ -69,8 +70,8 @@
                       (mapv :id))
         property (:id owl-statement)
         rule     {"where"  {"@id"    nil,
-                            property "?ps"},
-                  "insert" {"@id"   "?ps",
+                            property "?ps"}
+                  "insert" {"@id"   "?ps"
                             "@type" range}}]
     ;; rule-id *is* the property
     (conj all-rules [(str property "(prp-rng)") rule])))
@@ -80,10 +81,22 @@
   (let [symp (:id owl-statement)
         rule {"where"  [{"@id" "?x"
                          symp  "?y"}]
-              "insert" {"@id" "?y",
+              "insert" {"@id" "?y"
                         symp  "?x"}}]
     ;; rule-id *is* the property
     (conj all-rules [(str $owl-SymetricProperty "(" symp ")") rule])))
+
+(defmethod to-datalog ::prp-trp
+  [_ _ owl-statement all-rules]
+  (let [trp  (:id owl-statement)
+        rule {"where"  [{"@id" "?x"
+                         trp   "?y"}
+                        {"@id" "?y"
+                         trp   "?z"}]
+              "insert" {"@id" "?x"
+                        trp   "?z"}}]
+    ;; rule-id *is* the property
+    (conj all-rules [(str $owl-TransitiveProperty "(" trp ")") rule])))
 
 
 (defmethod to-datalog :default
@@ -94,17 +107,17 @@
   [
    ;; eq-sym
    [$owl-sameAs
-    {"where"  {"@id"       "?s",
-               $owl-sameAs "?ps"},
-     "insert" {"@id"       "?ps",
+    {"where"  {"@id"       "?s"
+               $owl-sameAs "?ps"}
+     "insert" {"@id"       "?ps"
                $owl-sameAs "?s"}}]
    ;; eq-trans
    [(str $owl-sameAs "(trans)")
-    {"where"  [{"@id"       "?s",
+    {"where"  [{"@id"       "?s"
                 $owl-sameAs "?same"}
-               {"@id"       "?same",
-                $owl-sameAs "?same-same"}],
-     "insert" {"@id"       "?s",
+               {"@id"       "?same"
+                $owl-sameAs "?same-same"}]
+     "insert" {"@id"       "?s"
                $owl-sameAs "?same-same"}}]])
 
 (defn statement->datalog
@@ -123,6 +136,9 @@
 
              (some #(= $owl-SymetricProperty %) (:type owl-statement))
              (to-datalog ::prp-symp inserts owl-statement)
+
+             (some #(= $owl-TransitiveProperty %) (:type owl-statement))
+             (to-datalog ::prp-trp inserts owl-statement)
 
              )))
 

@@ -234,10 +234,43 @@
               qry-sameAs   @(fluree/query db-prp-symp
                                           {:context {"ex" "http://example.org/"}
                                            :select  "?x"
-                                           :where   {"@id"          "ex:person-b",
+                                           :where   {"@id"          "ex:person-b"
                                                      "ex:livesWith" "?x"}})]
 
           (is (= #{"ex:person-a"}
                  (set qry-sameAs))
               "ex:person-b should also live with ex:person-a"))))))
+
+(deftest ^:integration transitive-properties
+  (testing "owl:TransitiveProperty tests  - rule: prp-trp"
+    (let [conn         (test-utils/create-conn)
+          ledger       @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base      @(fluree/stage (fluree/db ledger) reasoning-db-data)
+          db-livesWith @(fluree/stage db-base
+                                      {"@context" {"ex"   "http://example.org/"
+                                                   "owl"  "http://www.w3.org/2002/07/owl#"
+                                                   "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                       "insert"   [{"@id"          "ex:person-a"
+                                                    "ex:livesWith" {"@id" "ex:person-b"}}
+                                                   {"@id"          "ex:person-b"
+                                                    "ex:livesWith" {"@id" "ex:person-c"}}
+                                                   {"@id"          "ex:person-c"
+                                                    "ex:livesWith" {"@id" "ex:person-d"}}]})
+
+          db-prp-trp   @(fluree/reason
+                          db-livesWith :owl2rl
+                          [{"@context" {"ex"   "http://example.org/"
+                                        "owl"  "http://www.w3.org/2002/07/owl#"
+                                        "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                            "@id"      "ex:livesWith"
+                            "@type"    ["owl:ObjectProperty" "owl:TransitiveProperty"]}])
+          qry-trp      @(fluree/query db-prp-trp
+                                      {:context {"ex" "http://example.org/"}
+                                       :select  "?people"
+                                       :where   {"@id"          "ex:person-a"
+                                                 "ex:livesWith" "?people"}})]
+
+      (is (= #{"ex:person-b" "ex:person-c" "ex:person-d"}
+             (set qry-trp))
+          "ex:person-a should also live with ex:person-c and d (transitive)"))))
 
