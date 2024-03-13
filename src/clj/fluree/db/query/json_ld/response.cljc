@@ -71,6 +71,10 @@
               (contains? select-spec const/iri-id))
       (<? (validate/allow-iri? db sid)))))
 
+(defn list-element?
+  [flake]
+  (-> flake flake/m (contains? :i)))
+
 (defn type-value
   [db cache compact-fn type-flakes]
   (let [types (into []
@@ -99,7 +103,6 @@
             (let [ff    (first p-flakes)
                   p     (flake/p ff)
                   iri   (iri/decode-sid db p)
-                  list? (contains? (flake/m ff) :i)
                   spec  (or (get select-spec iri)
                             (when wildcard?
                               (or (wildcard-spec db cache compact-fn iri)
@@ -114,7 +117,7 @@
                           (type-value db cache compact-fn p-flakes)
 
                           :else ;; display all values
-                          (loop [[f & r] (if list?
+                          (loop [[f & r] (if (list-element? ff)
                                            (sort-by #(:i (flake/m %)) p-flakes)
                                            p-flakes)
                                  acc     []]
