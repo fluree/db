@@ -1,7 +1,6 @@
 (ns fluree.db.query.json-ld.response
-  (:require [fluree.db.util.async :refer [<? go-try merge-into?]]
+  (:require [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.permissions-validate :as validate]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.query.range :as query-range]
@@ -15,17 +14,19 @@
 
 (defn cache-sid->iri
   [db cache compact-fn sid]
-  (when-let [iri (or (some-> db :schema :pred (get sid) :iri compact-fn)
-                     (some-> (iri/decode-sid db sid) compact-fn))]
-    (vswap! cache assoc sid {:as iri})
-    {:as iri}))
+  (or (get @cache sid)
+      (when-let [iri (or (some-> db :schema :pred (get sid) :iri compact-fn)
+                         (some-> (iri/decode-sid db sid) compact-fn))]
+        (vswap! cache assoc sid {:as iri})
+        {:as iri})))
 
 (defn wildcard-spec
   [db cache compact-fn iri]
-  (when-let [spec (get-in db [:schema :pred iri])]
-    (let [spec* (assoc spec :as (compact-fn (:iri spec)))]
-      (vswap! cache assoc iri spec*)
-      spec*)))
+  (or (get @cache iri)
+      (when-let [spec (get-in db [:schema :pred iri])]
+        (let [spec* (assoc spec :as (compact-fn (:iri spec)))]
+          (vswap! cache assoc iri spec*)
+          spec*))))
 
 (defn rdf-type?
   [pid]
@@ -55,8 +56,7 @@
                                               ;; have a sub-selection
                                               (<? (crawl-ref-item db context compact-fn ref-sid spec cache fuel-vol max-fuel (inc depth-i)))
                                               ;; no sub-selection, just return IRI
-                                              (or (:as (get @cache ref-sid))
-                                                  (:as (cache-sid->iri db cache compact-fn ref-sid))))]
+                                              (:as (cache-sid->iri db cache compact-fn ref-sid)))]
                                  (recur r (conj acc-item result)))
                                (if (= 1 (count acc-item))
                                  (first acc-item)
@@ -91,8 +91,7 @@
                   list? (contains? (flake/m ff) :i)
                   spec  (or (get select-spec iri)
                             (when wildcard?
-                              (or (get @cache iri)
-                                  (wildcard-spec db cache compact-fn iri)
+                              (or (wildcard-spec db cache compact-fn iri)
                                   (cache-sid->iri db cache compact-fn p))))
                   p-iri (:as spec)
                   v     (cond
@@ -105,8 +104,7 @@
                                  acc                    []]
                             (if type-id
                               (recur rest-types
-                                     (conj acc (:as (or (get @cache type-id)
-                                                        (cache-sid->iri db cache compact-fn type-id)))))
+                                     (conj acc (:as (cache-sid->iri db cache compact-fn type-id))))
                               (if (= 1 (count acc))
                                 (first acc)
                                 acc)))
@@ -120,8 +118,7 @@
                               (let [res (cond
                                           (= const/$xsd:anyURI (flake/dt f))
                                           (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
-                                                id-key    (:as (or (get @cache const/$id)
-                                                                   (wildcard-spec db cache compact-fn const/$id)
+                                                id-key    (:as (or (wildcard-spec db cache compact-fn const/$id)
                                                                    (cache-sid->iri db cache compact-fn const/$id)))
                                                 oid       (flake/o f)
                                                 o-iri     (compact-fn (iri/decode-sid db oid))
