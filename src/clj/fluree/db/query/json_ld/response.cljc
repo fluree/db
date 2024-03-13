@@ -86,6 +86,32 @@
       (first types)
       types)))
 
+
+(defn display-reference
+  [db spec select-spec cache context compact-fn max-depth current-depth max-fuel fuel-vol oid]
+  (go-try
+    (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
+          id-key    (:as (or (wildcard-spec db cache compact-fn const/$id)
+                             (cache-sid->iri db cache compact-fn const/$id)))
+          o-iri     (compact-fn (iri/decode-sid db oid))
+          subselect (:spec spec)]
+      (cond
+        ;; have a specified sub-selection (graph crawl)
+        subselect
+        (let [ref-attrs (<? (crawl-ref-item db context compact-fn oid subselect cache fuel-vol max-fuel (inc current-depth)))]
+          (if (<? (includes-id? db oid subselect))
+            (assoc ref-attrs id-key o-iri)
+            ref-attrs))
+
+        ;; requested graph crawl depth has not yet been reached
+        (< current-depth max-depth)
+        (cond-> (<? (crawl-ref-item db context compact-fn oid select-spec cache fuel-vol max-fuel (inc current-depth)))
+          (<? (validate/allow-iri? db oid)) (assoc id-key o-iri))
+
+        :else
+        (when (<? (validate/allow-iri? db oid))
+          {id-key o-iri})))))
+
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
@@ -98,22 +124,22 @@
                               {(compact-fn const/iri-id) iri})
                             {})]
         (loop [[p-flakes & r] (partition-by flake/p s-flakes)
-               acc             initial-attrs]
+               acc            initial-attrs]
           (if p-flakes
             (let [ff    (first p-flakes)
-                  p     (flake/p ff)
-                  iri   (iri/decode-sid db p)
+                  pid   (flake/p ff)
+                  iri   (iri/decode-sid db pid)
                   spec  (or (get select-spec iri)
                             (when wildcard?
                               (or (wildcard-spec db cache compact-fn iri)
-                                  (cache-sid->iri db cache compact-fn p))))
+                                  (cache-sid->iri db cache compact-fn pid))))
                   p-iri (:as spec)
                   v     (cond
                           (nil? spec)
                           nil
 
                           ;; flake's .-o value is a rdf:type, resolve subject id to IRI then JSON-LD compact it
-                          (rdf-type? p)
+                          (rdf-type? pid)
                           (type-value db cache compact-fn p-flakes)
 
                           :else ;; display all values
@@ -124,28 +150,10 @@
                             (if f
                               (let [res (cond
                                           (= const/$xsd:anyURI (flake/dt f))
-                                          (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
-                                                id-key    (:as (or (wildcard-spec db cache compact-fn const/$id)
-                                                                   (cache-sid->iri db cache compact-fn const/$id)))
-                                                oid       (flake/o f)
-                                                o-iri     (compact-fn (iri/decode-sid db oid))
-                                                subselect (:spec spec)]
-                                            (cond
-                                              ;; have a specified sub-selection (graph crawl)
-                                              subselect
-                                              (let [ref-attrs (<? (crawl-ref-item db context compact-fn oid subselect cache fuel-vol max-fuel (inc depth-i)))]
-                                                (if (<? (includes-id? db oid subselect))
-                                                  (assoc ref-attrs id-key o-iri)
-                                                  ref-attrs))
-
-                                              ;; requested graph crawl depth has not yet been reached
-                                              (< depth-i depth)
-                                              (cond-> (<? (crawl-ref-item db context compact-fn (flake/o f) select-spec cache fuel-vol max-fuel (inc depth-i)))
-                                                (<? (validate/allow-iri? db oid)) (assoc id-key o-iri))
-
-                                              :else
-                                              (when (<? (validate/allow-iri? db oid))
-                                                {id-key o-iri})))
+                                          (let [oid (flake/o f)]
+                                            (<? (display-reference db spec select-spec cache
+                                                                   context compact-fn depth depth-i
+                                                                   max-fuel fuel-vol oid)))
 
                                           (= const/$rdf:json (flake/dt f))
                                           (json/parse (flake/o f) false)
