@@ -75,16 +75,24 @@
   [flake]
   (-> flake flake/m (contains? :i)))
 
+(defn unwrap-singleton
+  ([coll]
+   (if (= 1 (count coll))
+     (first coll)
+     coll))
+
+  ([iri context coll]
+   (if (#{:list :set} (-> context (get iri) :container))
+     coll
+     (unwrap-singleton coll))))
+
 (defn type-value
   [db cache compact-fn type-flakes]
-  (let [types (into []
-                    (comp (map flake/o)
-                          (map (partial cache-sid->iri db cache compact-fn))
-                          (map :as))
-                    type-flakes)]
-    (if (= 1 (count types))
-      (first types)
-      types)))
+  (->> type-flakes
+       (into [] (comp (map flake/o)
+                      (map (partial cache-sid->iri db cache compact-fn))
+                      (map :as)))
+       unwrap-singleton))
 
 
 (defn display-reference
@@ -148,23 +156,20 @@
                                            p-flakes)
                                  acc     []]
                             (if f
-                              (let [res (cond
+                              (let [oid (flake/o f)
+                                    res (cond
                                           (= const/$xsd:anyURI (flake/dt f))
-                                          (let [oid (flake/o f)]
-                                            (<? (display-reference db spec select-spec cache
-                                                                   context compact-fn depth depth-i
-                                                                   max-fuel fuel-vol oid)))
+                                          (<? (display-reference db spec select-spec cache
+                                                                 context compact-fn depth depth-i
+                                                                 max-fuel fuel-vol oid))
 
                                           (= const/$rdf:json (flake/dt f))
-                                          (json/parse (flake/o f) false)
+                                          (json/parse oid false)
 
                                           :else
-                                          (flake/o f))]
+                                          oid)]
                                 (recur r (conj acc res)))
-                              (if (and (= 1 (count acc))
-                                       (not (#{:list :set} (-> context (get p-iri) :container))))
-                                (first acc)
-                                acc))))]
+                              (unwrap-singleton p-iri context acc))))]
               (if (some? v)
                 (recur r (assoc acc p-iri v))
                 (recur r acc)))
