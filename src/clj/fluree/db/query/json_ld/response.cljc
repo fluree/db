@@ -71,6 +71,17 @@
               (contains? select-spec const/iri-id))
       (<? (validate/allow-iri? db sid)))))
 
+(defn type-value
+  [db cache compact-fn type-flakes]
+  (let [types (into []
+                    (comp (map flake/o)
+                          (map (partial cache-sid->iri db cache compact-fn))
+                          (map :as))
+                    type-flakes)]
+    (if (= 1 (count types))
+      (first types)
+      types)))
+
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
@@ -100,14 +111,7 @@
 
                           ;; flake's .-o value is a rdf:type, resolve subject id to IRI then JSON-LD compact it
                           (rdf-type? p)
-                          (loop [[type-id & rest-types] (map flake/o p-flakes)
-                                 acc                    []]
-                            (if type-id
-                              (recur rest-types
-                                     (conj acc (:as (cache-sid->iri db cache compact-fn type-id))))
-                              (if (= 1 (count acc))
-                                (first acc)
-                                acc)))
+                          (type-value db cache compact-fn p-flakes)
 
                           :else ;; display all values
                           (loop [[f & r] (if list?
