@@ -7,6 +7,9 @@
 (def ^:const $rdfs-domain "http://www.w3.org/2000/01/rdf-schema#domain")
 (def ^:const $rdfs-range "http://www.w3.org/2000/01/rdf-schema#range")
 (def ^:const $owl-sameAs "http://www.w3.org/2002/07/owl#sameAs")
+(def ^:const $owl-FunctionalProperty "http://www.w3.org/2002/07/owl#FunctionalProperty")
+(def ^:const $owl-InverseFunctionalProperty "http://www.w3.org/2002/07/owl#InverseFunctionalProperty")
+(def ^:const $owl-SymetricProperty "http://www.w3.org/2002/07/owl#SymetricProperty")
 
 (def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
 (def ^:const $owl-equivalentClass "http://www.w3.org/2002/07/owl#equivalentClass")
@@ -72,6 +75,17 @@
     ;; rule-id *is* the property
     (conj all-rules [(str property "(prp-rng)") rule])))
 
+(defmethod to-datalog ::prp-symp
+  [_ _ owl-statement all-rules]
+  (let [symp (:id owl-statement)
+        rule {"where"  [{"@id" "?x"
+                         symp  "?y"}]
+              "insert" {"@id" "?y",
+                        symp  "?x"}}]
+    ;; rule-id *is* the property
+    (conj all-rules [(str $owl-SymetricProperty "(" symp ")") rule])))
+
+
 (defmethod to-datalog :default
   [_ _ owl-statement all-rules]
   (throw (ex-info "Unsupported OWL statement" {:owl-statement owl-statement})))
@@ -105,7 +119,12 @@
              (to-datalog ::prp-dom inserts owl-statement)
 
              (contains? owl-statement $rdfs-range)
-             (to-datalog ::prp-rng inserts owl-statement))))
+             (to-datalog ::prp-rng inserts owl-statement)
+
+             (some #(= $owl-SymetricProperty %) (:type owl-statement))
+             (to-datalog ::prp-symp inserts owl-statement)
+
+             )))
 
 (defn owl->datalog
   [inserts owl-graph]
