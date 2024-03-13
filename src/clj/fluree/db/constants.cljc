@@ -99,8 +99,11 @@
 
 ;; shacl
 (def ^:const sh_NodeShape (iri/iri->sid "http://www.w3.org/ns/shacl#NodeShape"))
-(def ^:const sh_PropertyShape (iri/iri->sid "http://www.w3.org/ns/shacl#PropertyShape"))
 (def ^:const sh_deactivated (iri/iri->sid "http://www.w3.org/ns/shacl#deactivated"))
+(def ^:const sh_message (iri/iri->sid "http://www.w3.org/ns/shacl#message"))
+(def ^:const sh_severity (iri/iri->sid "http://www.w3.org/ns/shacl#severity"))
+
+(def ^:const sh_PropertyShape (iri/iri->sid "http://www.w3.org/ns/shacl#PropertyShape"))
 (def ^:const sh_path (iri/iri->sid "http://www.w3.org/ns/shacl#path"))
 
 (def ^:const sh_alternativePath (iri/iri->sid "http://www.w3.org/ns/shacl#alternativePath"))
