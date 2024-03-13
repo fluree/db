@@ -1,5 +1,6 @@
 (ns fluree.db.reasoner.core
   (:require [clojure.core.async :as async :refer [alts! go]]
+            [clojure.string :as str]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
@@ -8,6 +9,7 @@
             [fluree.db.json-ld.transact :as transact]
             [fluree.db.fuel :as fuel]
             [fluree.json-ld :as json-ld]
+            [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
             [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
 
@@ -46,6 +48,23 @@
   ([rules result-summary]
    (task-queue rules result-summary)))
 
+(defn reasoner-insert
+  "When triples from rules require explicit inserts, returns flakes."
+  [db fuel-tracker txn-id author-did rule-id insert-smt]
+  (go-try
+    (let [tx-state      (-> (transact/->tx-state db txn-id author-did rule-id)
+                            (assoc :stage-update? true))
+          flakes-ch     (transact/generate-flakes db fuel-tracker insert-smt tx-state)
+          fuel-error-ch (:error-ch fuel-tracker)
+          chans         (remove nil? [fuel-error-ch flakes-ch])
+          [flakes] (alts! chans :priority true)]
+      (if (util/exception? flakes)
+        (throw flakes)
+        (let [[db* new-flakes] flakes
+              tx-state* (assoc tx-state :stage-update? true)
+              {:keys [db-after add]} (transact/final-db db* new-flakes tx-state*)]
+          [db-after add])))))
+
 (defn reasoner-stage
   [db fuel-tracker txn-id author-did rule-id full-rule]
   (go-try
@@ -63,15 +82,32 @@
         (throw flakes))
       flakes)))
 
+;; TODO - can remove when filter function works for use case
+(defn filter-same-as-trans
+  "Note - this remove 'self' from sameAs transitive
+  rule. This would not be necessary if the filter function
+  allowed you to filter 'o' values that are equal to 's' values
+  but until that works. this addresses the issue."
+  [rule-id new-flakes]
+  (if (str/starts-with? rule-id (str owl-datalog/$owl-sameAs "(trans)"))
+    (reduce
+      (fn [acc new-flake]
+        (if (= (flake/s new-flake) (flake/o new-flake))
+          acc
+          (conj acc new-flake)))
+      (empty new-flakes)
+      new-flakes)
+    new-flakes))
+
 (defn execute-reasoner-rule
   [db rule-id reasoning-rules fuel-tracker {:keys [txn-id author-did] :as tx-state}]
   (go-try
     (let [[db reasoner-flakes] (<? (reasoner-stage db fuel-tracker txn-id author-did rule-id (get reasoning-rules rule-id)))
-          tx-state* (assoc tx-state :stage-update? true
-                                    :db-before db)]
-      (log/debug "reasoner flakes: " rule-id reasoner-flakes)
+          tx-state*        (assoc tx-state :stage-update? true)
+          reasoner-flakes* (filter-same-as-trans rule-id reasoner-flakes)]
+      (log/debug "reasoner flakes: " rule-id reasoner-flakes*)
       ;; returns map of :db-after, :add, :remove - but for reasoning we only support adds, so remove should be empty
-      (transact/final-db db reasoner-flakes tx-state*))))
+      (transact/final-db db reasoner-flakes* tx-state*))))
 
 (defn execute-reasoner
   "Executes the reasoner on the staged db-after and returns the updated db-after."
@@ -117,11 +153,11 @@
                   reasoned-db)))))
         db))))
 
-(defmulti rules-from-graph (fn [regime-type graph]
+(defmulti rules-from-graph (fn [regime-type inserts graph]
                              regime-type))
 
 (defmethod rules-from-graph :datalog
-  [_ graph]
+  [_ _ graph]
   (let [expanded (-> graph
                      json-ld/expand
                      util/sequential)]
@@ -136,41 +172,93 @@
       expanded)))
 
 (defmethod rules-from-graph :owl2rl
-  [_ graph]
+  [_ inserts graph]
   (let [expanded (-> graph
                      json-ld/expand
                      util/sequential)]
     (log/debug "OWL expanded rules: " expanded)
-    (owl-datalog/owl->datalog expanded)))
+    (owl-datalog/owl->datalog inserts expanded)))
 
 
 (defn all-rules
-  [regimes db graph]
+  [regimes db inserts graph]
   (go-try
     (loop [[regime & r] regimes
            rules []]
       (if regime
         (let [rules* (if graph
-                       (rules-from-graph regime graph)
-                       (<? (resolve/find-rules db)))] ;; TODO - need to make regime-specific
+                       (rules-from-graph regime inserts graph)
+                       (<? (resolve/find-rules db regime)))] ;; TODO - need to make regime-specific
 
           (recur r (into rules rules*)))
         rules))))
 
+(defn triples->map
+  "Turns triples from same subject (@id) originating from
+  raw inserts that might exist in reasoning graph (e.g. owl:sameAs)
+  into fluree/stage standard format."
+  [id triples]
+  (reduce
+    (fn [acc [_ p v]]
+      (update acc p (fn [ev]
+                      (if ev
+                        (conj ev v)
+                        [v]))))
+    {"@id" id}
+    triples))
+
+(defn inserts-by-rule
+  "Creates fluree/stage insert statements for each individual rule that created
+  triples. This is only used for raw inserts that are triggered from the reasoning
+  graph (e.g. owl:sameAs)"
+  [inserts]
+  (reduce-kv
+    (fn [acc rule-id triples]
+      (let [by-subj    (group-by first triples)
+            statements (reduce-kv
+                         (fn [acc* id triples]
+                           (conj acc* (triples->map id triples)))
+                         []
+                         by-subj)
+            parsed     (->> statements
+                            json-ld/expand
+                            (q-parse/parse-triples nil))]
+        (assoc acc rule-id {:insert parsed})))
+    {}
+    inserts))
+
+(defn process-inserts
+  "Processes any raw inserts that originate from the reasoning
+  graph (e.g. owl:sameAs statements)"
+  [db fuel-tracker inserts]
+  (go-try
+    (let [by-rule (inserts-by-rule inserts)]
+      (loop [[[rule-id insert] & r] by-rule
+             db* db]
+        (if rule-id
+          (let [[db** flakes] (<? (reasoner-insert db* fuel-tracker nil nil rule-id insert))]
+            (log/debug "Rule" rule-id "inserted new flakes:" flakes)
+            (recur r db**))
+          db*)))))
 
 (defn reason
-  [db regimes graph {:keys [max-fuel reasoner-max] :as opts}]
+  [db regimes graph {:keys [max-fuel reasoner-max]
+                     :or   {reasoner-max 10} :as opts}]
   (go-try
     (let [regimes         (set (util/sequential regimes))
           fuel-tracker    (fuel/tracker max-fuel)
           db*             (update db :reasoner #(into regimes %))
           tx-state        (transact/->tx-state db* nil nil nil)
-          raw-rules       (<? (all-rules regimes db* graph))
+          inserts         (atom nil)
+          raw-rules       (<? (all-rules regimes db* inserts graph))
           _               (log/debug "All parsed rules: " raw-rules)
           reasoning-rules (->> raw-rules
                                (resolve/rules->graph db*)
-                               add-rule-dependencies)]
+                               add-rule-dependencies)
+          db**            (if-let [inserts* @inserts]
+                            (<? (process-inserts db* fuel-tracker inserts*))
+                            db*)]
       (log/trace "Final parsed reasoning rules: " reasoning-rules)
       (if (empty? reasoning-rules)
         db
-        (<? (execute-reasoner db* reasoning-rules fuel-tracker reasoner-max tx-state))))))
+        (<? (execute-reasoner db** reasoning-rules fuel-tracker reasoner-max tx-state))))))

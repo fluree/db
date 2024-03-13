@@ -17,16 +17,98 @@
                                "ex:name"    "Carol"
                                "ex:age"     72
                                "ex:address" {"ex:country" {"@id" "ex:Singapore"}}
-                               "ex:brother" {"@id" "ex:mike"}}}
+                               "ex:brother" {"@id" "ex:mike"}}
+                "ex:mother"   [{"@id" "ex:carol"} {"@id" "ex:carol-lynn"}]}
                {"@id"     "ex:laura"
                 "ex:name" "Laura"}
                {"@id"       "ex:bob"
                 "ex:name"   "Bob"
                 "ex:gender" {"@id" "ex:Male"}}]})
 
+(deftest ^:integration equality-tests
+  (testing "owl equality semantics tests eq-sym and eq-trans"
+    (let [conn    (test-utils/create-conn)
+          ledger  @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+      (testing "Testing explicit owl:sameAs declaration"
+        (let [db-same     @(fluree/stage db-base
+                                         {"@context" {"ex"   "http://example.org/"
+                                                      "owl"  "http://www.w3.org/2002/07/owl#"
+                                                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                          "insert"   {"@id"        "ex:carol"
+                                                      "owl:sameAs" {"@id" "ex:carol-lynn"}}})
 
-(deftest ^:integration basic-owl-rule
-  (testing "Basic OWL rules"
+              db-reasoned @(fluree/reason db-same :owl2rl)
+
+              qry-sameAs  @(fluree/query db-reasoned
+                                         {:context {"ex"  "http://example.org/"
+                                                    "owl" "http://www.w3.org/2002/07/owl#"}
+                                          :select  "?same"
+                                          :where   {"@id"        "ex:carol-lynn",
+                                                    "owl:sameAs" "?same"}})]
+
+          (is (= #{"ex:carol"}
+                 (set qry-sameAs))
+              "ex:carol-lynn should be deemed the same as ex:carol")))
+
+      (testing "Testing owl:sameAs passed along as a reasoned rule"
+        (let [db-reasoned @(fluree/reason db-base :owl2rl
+                                          {"@context"   {"ex"  "http://example.org/"
+                                                         "owl" "http://www.w3.org/2002/07/owl#"}
+                                           "@id"        "ex:carol"
+                                           "owl:sameAs" {"@id" "ex:carol-lynn"}})
+              qry-sameAs  @(fluree/query db-reasoned
+                                         {:context {"ex"  "http://example.org/"
+                                                    "owl" "http://www.w3.org/2002/07/owl#"}
+                                          :select  "?same"
+                                          :where   {"@id"        "ex:carol-lynn",
+                                                    "owl:sameAs" "?same"}})]
+
+
+          (is (= #{"ex:carol"}
+                 (set qry-sameAs))
+              "ex:carol-lynn should be deemed the same as ex:carol")))
+
+
+      (testing "Testing owl:sameAs transitivity (eq-trans)"
+        (let [db-same     @(fluree/stage db-base
+                                         {"@context" {"ex"   "http://example.org/"
+                                                      "owl"  "http://www.w3.org/2002/07/owl#"
+                                                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                          "insert"   [{"@id"        "ex:carol"
+                                                       "owl:sameAs" {"@id" "ex:carol1"}}
+                                                      {"@id"        "ex:carol1"
+                                                       "owl:sameAs" {"@id" "ex:carol2"}}
+                                                      {"@id"        "ex:carol2"
+                                                       "owl:sameAs" {"@id" "ex:carol3"}}
+                                                      {"@id"        "ex:carol3"
+                                                       "owl:sameAs" {"@id" "ex:carol4"}}]})
+              db-reasoned @(fluree/reason db-same :owl2rl)
+              qry-carol   @(fluree/query db-reasoned
+                                         {:context {"ex"  "http://example.org/"
+                                                    "owl" "http://www.w3.org/2002/07/owl#"}
+                                          :select  "?same"
+                                          :where   {"@id"        "ex:carol",
+                                                    "owl:sameAs" "?same"}})
+              qry-carol4  @(fluree/query db-reasoned
+                                         {:context {"ex"  "http://example.org/"
+                                                    "owl" "http://www.w3.org/2002/07/owl#"}
+                                          :select  "?same"
+                                          :where   {"@id"        "ex:carol4",
+                                                    "owl:sameAs" "?same"}})]
+
+
+          (is (= #{"ex:carol1" "ex:carol2" "ex:carol3" "ex:carol4"}
+                 (set qry-carol))
+              "ex:carol should be sameAs all other carols")
+
+          (is (= #{"ex:carol" "ex:carol1" "ex:carol2" "ex:carol3"}
+                 (set qry-carol4))
+              "ex:carol4 should be sameAs all other carols"))))))
+
+
+(deftest ^:integration domain-and-range
+  (testing "rdfs:domain and rdfs:range tests"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/basic-owl" nil)
           db-base @(fluree/stage (fluree/db ledger) reasoning-db-data)]
@@ -37,8 +119,8 @@
                             [{"@context"    {"ex"   "http://example.org/"
                                              "owl"  "http://www.w3.org/2002/07/owl#"
                                              "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                              "@id"         "ex:parent",
-                              "@type"       ["owl:ObjectProperty"],
+                              "@id"         "ex:parent"
+                              "@type"       ["owl:ObjectProperty"]
                               "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]}])
               qry-subj   @(fluree/query db-prp-dom
                                         {:context {"ex" "http://example.org/"}
@@ -66,8 +148,8 @@
                             [{"@context"   {"ex"   "http://example.org/"
                                             "owl"  "http://www.w3.org/2002/07/owl#"
                                             "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                              "@id"        "ex:parent",
-                              "@type"      ["owl:ObjectProperty"],
+                              "@id"        "ex:parent"
+                              "@type"      ["owl:ObjectProperty"]
                               "rdfs:range" [{"@id" "ex:Person"} {"@id" "ex:Parent"}]}])
               qry-subj   @(fluree/query db-prp-rng
                                         {:context {"ex" "http://example.org/"}
@@ -96,9 +178,9 @@
                                 [{"@context"    {"ex"   "http://example.org/"
                                                  "owl"  "http://www.w3.org/2002/07/owl#"
                                                  "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                  "@id"         "ex:parent",
-                                  "@type"       ["owl:ObjectProperty"],
-                                  "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]
+                                  "@id"         "ex:parent"
+                                  "@type"       ["owl:ObjectProperty"]
+                                  "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]
                                   "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:Parent"}]}])
               qry-child      @(fluree/query db-prp-dom+rng
                                             {:context {"ex" "http://example.org/"}
@@ -127,3 +209,4 @@
           (is (= #{"ex:brian" "ex:carol"}
                  (set qry-person))
               "ex:brian and ex:carol should be of type ex:Person"))))))
+

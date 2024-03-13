@@ -1,11 +1,13 @@
 (ns fluree.db.reasoner.resolve
-  (:require [fluree.db.constants :as const]
+  (:require [clojure.core.async :as async]
+            [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.exec.where :as exec-where]
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql :as fql]
+            [fluree.db.reasoner.owl-datalog :as owl-datalog]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -57,8 +59,8 @@
                                 json-ld/parse-context)
         where           (get rule "where")
         insert          (get rule "insert")
-        rule-parsed (q-parse/parse-txn  {const/iri-where  [{:value where}]
-                                         const/iri-insert [{:value insert}]} context)
+        rule-parsed     (q-parse/parse-txn {const/iri-where  [{:value where}]
+                                            const/iri-insert [{:value insert}]} context)
         where-patterns  (extract-pattern* (::exec-where/patterns (:where rule-parsed)))
         insert-patterns (extract-pattern* (:insert rule-parsed))]
     {:deps        where-patterns
@@ -85,9 +87,11 @@
 
 (defn find-rules
   "Returns core async channel with rules query result"
-  [db]
-  (fql/query db nil
-             {:select ["?s" "?rule"]
-              :where  {"@id"                           "?s",
-                       "http://flur.ee/ns/ledger#rule" "?rule"}}))
+  [db regime]
+  (case regime
+    :datalog (fql/query db nil
+                        {:select ["?s" "?rule"]
+                         :where  {"@id"                           "?s",
+                                  "http://flur.ee/ns/ledger#rule" "?rule"}})
+    :owl2rl (async/go owl-datalog/base-rules)))
 
