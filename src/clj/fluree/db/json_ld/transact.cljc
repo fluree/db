@@ -206,7 +206,7 @@
                         (assoc :t t)
                         (commit-data/update-novelty add remove)
                         (commit-data/add-tt-id)
-                        (vocab/hydrate-schema add))]
+                        (vocab/hydrate-schema add mods))]
       {:add add :remove remove :db-after db-after :mods mods})))
 
 (defn flakes->final-db
