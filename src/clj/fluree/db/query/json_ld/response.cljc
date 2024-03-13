@@ -136,42 +136,36 @@
           (if p-flakes
             (let [ff    (first p-flakes)
                   pid   (flake/p ff)
-                  iri   (iri/decode-sid db pid)
-                  spec  (or (get select-spec iri)
-                            (when wildcard?
-                              (or (wildcard-spec db cache compact-fn iri)
-                                  (cache-sid->iri db cache compact-fn pid))))
-                  p-iri (:as spec)
-                  v     (cond
-                          (nil? spec)
-                          nil
+                  iri   (iri/decode-sid db pid)]
+              (if-let [spec  (or (get select-spec iri)
+                                 (when wildcard?
+                                   (or (wildcard-spec db cache compact-fn iri)
+                                       (cache-sid->iri db cache compact-fn pid))))]
+                (let [p-iri (:as spec)
+                      v     (if (rdf-type? pid)
+                              (type-value db cache compact-fn p-flakes)
+                              (loop [[f & r] (if (list-element? ff)
+                                               (sort-by #(:i (flake/m %)) p-flakes)
+                                               p-flakes)
+                                     acc     []]
+                                (if f
+                                  (let [obj (flake/o f)
+                                        res (cond
+                                              (= const/$xsd:anyURI (flake/dt f))
+                                              (<? (display-reference db spec select-spec cache
+                                                                     context compact-fn depth depth-i
+                                                                     max-fuel fuel-vol obj))
 
-                          ;; flake's .-o value is a rdf:type, resolve subject id to IRI then JSON-LD compact it
-                          (rdf-type? pid)
-                          (type-value db cache compact-fn p-flakes)
+                                              (= const/$rdf:json (flake/dt f))
+                                              (json/parse obj false)
 
-                          :else ;; display all values
-                          (loop [[f & r] (if (list-element? ff)
-                                           (sort-by #(:i (flake/m %)) p-flakes)
-                                           p-flakes)
-                                 acc     []]
-                            (if f
-                              (let [oid (flake/o f)
-                                    res (cond
-                                          (= const/$xsd:anyURI (flake/dt f))
-                                          (<? (display-reference db spec select-spec cache
-                                                                 context compact-fn depth depth-i
-                                                                 max-fuel fuel-vol oid))
-
-                                          (= const/$rdf:json (flake/dt f))
-                                          (json/parse oid false)
-
-                                          :else
-                                          oid)]
-                                (recur r (conj acc res)))
-                              (unwrap-singleton p-iri context acc))))]
-              (if (some? v)
-                (recur r (assoc acc p-iri v))
+                                              :else
+                                              obj)]
+                                    (recur r (conj acc res)))
+                                  (unwrap-singleton p-iri context acc))))]
+                  (if (some? v)
+                    (recur r (assoc acc p-iri v))
+                    (recur r acc)))
                 (recur r acc)))
             (if reverse
               (merge acc (<? (add-reverse-specs db cache context compact-fn fuel-vol max-fuel select-spec depth-i s-flakes)))
