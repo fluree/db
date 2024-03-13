@@ -124,13 +124,9 @@
                      result
                      [@db-vol result]))))))
 
-(defn class-flake?
-  [f]
-  (-> f flake/p (= const/$rdf:type)))
-
 (def extract-class-xf
   (comp
-    (filter class-flake?)
+    (filter flake/class-flake?)
     (map flake/o)))
 
 (defn extract-classes
