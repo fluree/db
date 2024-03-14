@@ -1,8 +1,13 @@
 (ns fluree.db.query.json-ld.response
   (:require [fluree.db.util.async :refer [<? go-try]]
+            [clojure.core.async :as async]
             [fluree.db.permissions-validate :as validate]
+            [fluree.db.conn.cache :as conn-cache]
             [fluree.db.flake :as flake]
+            [fluree.db.fuel :as fuel]
             [fluree.db.constants :as const]
+            [fluree.db.query.dataset :as dataset]
+            [fluree.db.index :as index]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.json :as json]
@@ -206,3 +211,43 @@
           (merge resolved-attrs (<? (add-reverse-specs db cache context compact-fn select-spec
                                                        depth-i s-flakes)))
           resolved-attrs)))))
+
+(defn track-fuel
+  [fuel-tracker error-ch]
+  (when fuel-tracker
+    (fuel/track fuel-tracker error-ch)))
+
+(defn subject-bounds
+  [db sid]
+  (let [[start-test start-match end-test end-match]
+        (query-range/expand-range-interval :spot = [sid])
+
+        [s1 p1 o1 t1 op1 m1]
+        (query-range/match->flake-parts db :spot start-match)
+
+        [s2 p2 o2 t2 op2 m2]
+        (query-range/match->flake-parts db :spot end-match)
+
+        start-flake (query-range/resolve-match-flake start-test s1 p1 o1 t1 op1 m1)
+        end-flake   (query-range/resolve-match-flake end-test s2 p2 o2 t2 op2 m2)]
+    [start-flake end-flake]))
+
+(defn resolve-subject-properties
+  [{:keys [conn t] :as db} iri initial-attrs cache context compact-fn select-spec fuel-tracker error-ch]
+  (let [spot-root               (get db :spot)
+        spot-novelty            (get-in db [:novelty :spot])
+        sid                     (iri/encode-iri db iri)
+        [start-flake end-flake] (subject-bounds db sid)
+        range-opts              {:from-t      t
+                                 :to-t        t
+                                 :start-flake start-flake
+                                 :end-flake   end-flake
+                                 :flake-xf    (track-fuel fuel-tracker error-ch)}
+        flake-slices            (query-range/resolve-flake-slices conn spot-root spot-novelty
+                                                                  error-ch range-opts)
+        property-xf             (comp cat
+                                      (partition-by flake/p)
+                                      (map (partial format-property db cache context
+                                                    compact-fn select-spec))
+                                      (remove nil?))]
+    (async/transduce property-xf into initial-attrs flake-slices)))

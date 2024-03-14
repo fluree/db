@@ -22,7 +22,7 @@
     pred))
 
 
-(defn- match->flake-parts
+(defn match->flake-parts
   "Takes a match from index-range, and based on the index
   returns flake-ordered components of [s p o t op m].
   Coerces idents and string predicate names."
