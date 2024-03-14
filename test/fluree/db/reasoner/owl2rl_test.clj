@@ -274,3 +274,57 @@
              (set qry-trp))
           "ex:person-a should also live with ex:person-c and d (transitive)"))))
 
+(deftest ^:integration prop-chain-axiom
+  (testing "owl:propertyChainAxiom tests  - rule: prp-spo2"
+    (let [conn        (test-utils/create-conn)
+          ledger      @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base     @(fluree/stage (fluree/db ledger)
+                                     {"@context" {"ex" "http://example.org/"}
+                                      "insert"   [{"@id"       "ex:person-a"
+                                                   "ex:parent" [{"@id" "ex:mom"} {"@id" "ex:dad"}]}
+                                                  {"@id"       "ex:mom"
+                                                   "ex:parent" [{"@id" "ex:mom-mom"} {"@id" "ex:mom-dad"}]}
+                                                  {"@id"       "ex:dad"
+                                                   "ex:parent" [{"@id" "ex:dad-mom"} {"@id" "ex:dad-dad"}]}
+                                                  {"@id"       "ex:mom-mom"
+                                                   "ex:parent" [{"@id" "ex:mom-mom-mom"} {"@id" "ex:mom-mom-dad"}]}]})
+          db-reasoned @(fluree/reason
+                         db-base :owl2rl
+                         [{"@context"               {"ex"  "http://example.org/"
+                                                     "owl" "http://www.w3.org/2002/07/owl#"}
+                           "@id"                    "ex:grandparent"
+                           "@type"                  ["owl:ObjectProperty"]
+                           "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parent"} {"@id" "ex:parent"}]}}
+                          {"@context"               {"ex"  "http://example.org/"
+                                                     "owl" "http://www.w3.org/2002/07/owl#"}
+                           "@id"                    "ex:greatGrandparent"
+                           "@type"                  ["owl:ObjectProperty"]
+                           "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parent"} {"@id" "ex:parent"} {"@id" "ex:parent"}]}}])
+          qry-gp1     @(fluree/query db-reasoned
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?people"
+                                      :where   {"@id"            "ex:person-a"
+                                                "ex:grandparent" "?people"}})
+
+          qry-gp2     @(fluree/query db-reasoned
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?people"
+                                      :where   {"@id"            "ex:mom"
+                                                "ex:grandparent" "?people"}})
+          qry-ggp     @(fluree/query db-reasoned
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?people"
+                                      :where   {"@id"                 "ex:person-a"
+                                                "ex:greatGrandparent" "?people"}})]
+
+      (is (= #{"ex:mom-mom" "ex:mom-dad" "ex:dad-mom" "ex:dad-dad"}
+             (set qry-gp1))
+          "all four of ex:person-a's grandparents should be found")
+
+      (is (= #{"ex:mom-mom-mom" "ex:mom-mom-dad"}
+             (set qry-gp2))
+          "all two of ex:mom's grandparents should be found")
+
+      (is (= #{"ex:mom-mom-mom" "ex:mom-mom-dad"}
+             (set qry-ggp))
+          "all two of ex:person-a's great grandparents should be found"))))
