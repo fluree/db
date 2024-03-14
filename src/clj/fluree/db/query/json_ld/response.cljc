@@ -190,18 +190,22 @@
   [db cache context compact-fn fuel-vol max-fuel {:keys [reverse] :as select-spec} depth-i s-flakes]
   (go-try
     (when (not-empty s-flakes)
-      (let [sid           (->> s-flakes first flake/s)
-            initial-attrs (if (<? (includes-id? db sid select-spec))
-                            (let [iri (compact-fn (iri/decode-sid db sid))]
-                              {(compact-fn const/iri-id) iri})
-                            {})]
-        (loop [[p-flakes & r] (partition-by flake/p s-flakes)
-               acc            initial-attrs]
-          (if p-flakes
-            (if-let [[p-iri v] (format-property db cache context compact-fn select-spec p-flakes)]
-              (recur r (assoc acc p-iri v))
-              (recur r acc))
-            (let [attrs (<? (resolve-references db cache context compact-fn fuel-vol max-fuel select-spec depth-i acc))]
-              (if reverse
-                (merge attrs (<? (add-reverse-specs db cache context compact-fn fuel-vol max-fuel select-spec depth-i s-flakes)))
-                attrs))))))))
+      (let [sid             (->> s-flakes first flake/s)
+            initial-attrs   (if (<? (includes-id? db sid select-spec))
+                              (let [iri (compact-fn (iri/decode-sid db sid))]
+                                {(compact-fn const/iri-id) iri})
+                              {})
+            formatted-attrs (into initial-attrs
+                                  (comp (partition-by flake/p)
+                                        (map (partial format-property db cache context
+                                                      compact-fn select-spec))
+                                        (remove nil?))
+                                  s-flakes)
+            resolved-attrs  (<? (resolve-references db cache context compact-fn
+                                                    fuel-vol max-fuel select-spec
+                                                    depth-i formatted-attrs))]
+        (if reverse
+          (merge resolved-attrs (<? (add-reverse-specs db cache context compact-fn
+                                                       fuel-vol max-fuel select-spec
+                                                       depth-i s-flakes)))
+          resolved-attrs)))))
