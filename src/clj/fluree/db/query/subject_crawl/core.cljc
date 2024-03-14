@@ -60,7 +60,7 @@
   (c) filter subjects based on subsequent where clause(s)
   (d) apply offset/limit for (c)
   (e) send result into :select graph crawl"
-  [db {:keys [vars where limit offset fuel rel-binding?
+  [db {:keys [vars where limit offset rel-binding?
               order-by opts] :as parsed-query}]
   (log/trace "Running simple subject crawl query:" parsed-query)
   (let [error-ch    (async/chan)
@@ -68,7 +68,6 @@
         rdf-type?   (= :type (:type f-where))
         filter-map  (:s-filter (second where))
         cache       (volatile! {})
-        fuel-vol    (volatile! 0)
         select-spec (retrieve-select-spec db parsed-query)
         context     (:context parsed-query)
         compact-fn  (json-ld/compact-fn context)
@@ -77,8 +76,6 @@
                      :db            db
                      :cache         cache
                      :compact-fn    compact-fn
-                     :fuel-vol      fuel-vol
-                     :max-fuel      fuel
                      :select-spec   select-spec
                      :error-ch      error-ch
                      :vars          vars

@@ -34,14 +34,14 @@
 
 (declare flakes->res)
 (defn crawl-ref-item
-  [db context compact-fn flake-sid sub-select cache fuel-vol max-fuel depth-i]
+  [db context compact-fn flake-sid sub-select cache depth-i]
   (go-try
     (let [sub-flakes (<? (query-range/index-range db :spot = [flake-sid]))]
-      (<? (flakes->res db cache context compact-fn fuel-vol max-fuel sub-select depth-i sub-flakes)))))
+      (<? (flakes->res db cache context compact-fn sub-select depth-i sub-flakes)))))
 
 (defn add-reverse-specs
   "When @reverse variables are present, crawl for the reverse specs."
-  [db cache context compact-fn fuel-vol max-fuel {:keys [reverse] :as select-spec} depth-i flakes]
+  [db cache context compact-fn {:keys [reverse] :as select-spec} depth-i flakes]
   (go-try
     (let [sid (flake/s (first flakes))]
       (loop [[reverse-item & r] (vals reverse)
@@ -54,7 +54,7 @@
                              (if ref-sid
                                (let [result (if spec
                                               ;; have a sub-selection
-                                              (<? (crawl-ref-item db context compact-fn ref-sid spec cache fuel-vol max-fuel (inc depth-i)))
+                                              (<? (crawl-ref-item db context compact-fn ref-sid spec cache (inc depth-i)))
                                               ;; no sub-selection, just return IRI
                                               (:as (cache-sid->iri db cache compact-fn ref-sid)))]
                                  (recur r (conj acc-item result)))
@@ -96,7 +96,7 @@
 
 
 (defn display-reference
-  [db spec select-spec cache context compact-fn current-depth max-fuel fuel-vol oid]
+  [db spec select-spec cache context compact-fn current-depth oid]
   (go-try
     (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
           max-depth (:depth select-spec)
@@ -107,14 +107,14 @@
       (cond
         ;; have a specified sub-selection (graph crawl)
         subselect
-        (let [ref-attrs (<? (crawl-ref-item db context compact-fn oid subselect cache fuel-vol max-fuel (inc current-depth)))]
+        (let [ref-attrs (<? (crawl-ref-item db context compact-fn oid subselect cache (inc current-depth)))]
           (if (<? (includes-id? db oid subselect))
             (assoc ref-attrs id-key o-iri)
             ref-attrs))
 
         ;; requested graph crawl depth has not yet been reached
         (< current-depth max-depth)
-        (cond-> (<? (crawl-ref-item db context compact-fn oid select-spec cache fuel-vol max-fuel (inc current-depth)))
+        (cond-> (<? (crawl-ref-item db context compact-fn oid select-spec cache (inc current-depth)))
           (<? (validate/allow-iri? db oid)) (assoc id-key o-iri))
 
         :else
@@ -122,17 +122,16 @@
           {id-key o-iri})))))
 
 (defn resolve-reference
-  [db cache context compact-fn fuel-vol max-fuel select-spec current-depth v]
+  [db cache context compact-fn select-spec current-depth v]
   (go-try
     (if-let [{:keys [sid spec]} (::reference v)]
       (let [ref (<? (display-reference db spec select-spec cache context
-                                       compact-fn current-depth
-                                       max-fuel fuel-vol sid))]
+                                       compact-fn current-depth sid))]
         (not-empty ref))
       v)))
 
 (defn resolve-references
-  [db cache context compact-fn fuel-vol max-fuel select-spec current-depth attrs]
+  [db cache context compact-fn select-spec current-depth attrs]
   (go-try
     (loop [[[prop v] & r] attrs
            resolved-attrs   {}]
@@ -141,11 +140,11 @@
                    (loop [[value & r] v
                           resolved-values   []]
                      (if value
-                       (if-let [resolved (<? (resolve-reference db cache context compact-fn fuel-vol max-fuel select-spec current-depth value))]
+                       (if-let [resolved (<? (resolve-reference db cache context compact-fn select-spec current-depth value))]
                          (recur r (conj resolved-values resolved))
                          (recur r resolved-values))
                        (not-empty resolved-values)))
-                   (<? (resolve-reference db cache context compact-fn fuel-vol max-fuel select-spec current-depth v)))]
+                   (<? (resolve-reference db cache context compact-fn select-spec current-depth v)))]
           (if (some? v')
             (recur r (assoc resolved-attrs prop v'))
             (recur r resolved-attrs)))
@@ -187,7 +186,7 @@
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
-  [db cache context compact-fn fuel-vol max-fuel {:keys [reverse] :as select-spec} depth-i s-flakes]
+  [db cache context compact-fn {:keys [reverse] :as select-spec} depth-i s-flakes]
   (go-try
     (when (not-empty s-flakes)
       (let [sid             (->> s-flakes first flake/s)
@@ -201,11 +200,9 @@
                                                       compact-fn select-spec))
                                         (remove nil?))
                                   s-flakes)
-            resolved-attrs  (<? (resolve-references db cache context compact-fn
-                                                    fuel-vol max-fuel select-spec
+            resolved-attrs  (<? (resolve-references db cache context compact-fn select-spec
                                                     depth-i formatted-attrs))]
         (if reverse
-          (merge resolved-attrs (<? (add-reverse-specs db cache context compact-fn
-                                                       fuel-vol max-fuel select-spec
+          (merge resolved-attrs (<? (add-reverse-specs db cache context compact-fn select-spec
                                                        depth-i s-flakes)))
           resolved-attrs)))))

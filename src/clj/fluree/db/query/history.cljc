@@ -125,10 +125,10 @@
   "Build a subject map out a set of flakes with the same subject.
 
   {:id :ex/foo :ex/x 1 :ex/y 2}"
-  [db cache context compact fuel error-ch s-flakes]
+  [db cache context compact error-ch s-flakes]
   (go
     (try*
-      (<? (json-ld-resp/flakes->res db cache context compact fuel 1000000
+      (<? (json-ld-resp/flakes->res db cache context compact
                                     {:wildcard? true, :depth 0}
                                     0 s-flakes))
       (catch* e
@@ -140,7 +140,7 @@
 
   [{:id :ex/foo :ex/x 1 :ex/y 2}...]
   "
-  [db context compact cache fuel error-ch t-flakes]
+  [db context compact cache error-ch t-flakes]
   (let [s-flakes-ch (->> t-flakes
                          (group-by flake/s)
                          (vals)
@@ -152,7 +152,7 @@
      s-out-ch
      (fn [assert-flakes ch]
        (-> db
-           (s-flakes->json-ld cache context compact fuel error-ch assert-flakes)
+           (s-flakes->json-ld cache context compact error-ch assert-flakes)
            (async/pipe ch)))
      s-flakes-ch)
     s-out-ch))
@@ -164,8 +164,7 @@
   [{:id :ex/foo :f/assert [{},,,} :f/retract [{},,,]]}]
   "
   [db context error-ch flakes]
-  (let [fuel        (volatile! 0)
-        cache       (volatile! {})
+  (let [cache       (volatile! {})
 
         compact     (json-ld/compact-fn context)
 
@@ -192,14 +191,12 @@
                     t        (flake/t (first t-flakes))
 
                     asserts  (->> assert-flakes
-                                  (t-flakes->json-ld db context compact cache
-                                   fuel error-ch)
+                                  (t-flakes->json-ld db context compact cache error-ch)
                                   (async/into [])
                                   <!)
 
                     retracts (->> retract-flakes
-                                  (t-flakes->json-ld db context compact cache
-                                   fuel error-ch)
+                                  (t-flakes->json-ld db context compact cache error-ch)
                                   (async/into [])
                                   <!)]
                 {t-key       t
@@ -263,7 +260,7 @@
 
 (defn commit-t-flakes->json-ld
   "Build a commit maps given a set of all flakes with the same t."
-  [db context compact cache fuel error-ch t-flakes]
+  [db context compact cache error-ch t-flakes]
   (go
     (try*
      (let [{commit-wrapper-flakes :commit-wrapper
@@ -289,24 +286,22 @@
                          :else
                          :ignore-flakes))
                      t-flakes)
-           commit-wrapper-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
+           commit-wrapper-chan (json-ld-resp/flakes->res db cache context compact
                                                          {:wildcard? true, :depth 0}
                                                          0 commit-wrapper-flakes)
 
-           commit-meta-chan    (json-ld-resp/flakes->res db cache context compact fuel 1000000
+           commit-meta-chan    (json-ld-resp/flakes->res db cache context compact
                                                          {:wildcard? true, :depth 0}
                                                          0 commit-meta-flakes)
 
            commit-wrapper      (<? commit-wrapper-chan)
            commit-meta         (<? commit-meta-chan)
            asserts             (->> assert-flakes
-                                    (t-flakes->json-ld db context compact cache
-                                                       fuel error-ch)
+                                    (t-flakes->json-ld db context compact cache error-ch)
                                     (async/into [])
                                     <!)
            retracts            (->> retract-flakes
-                                    (t-flakes->json-ld db context compact cache
-                                                       fuel error-ch)
+                                    (t-flakes->json-ld db context compact cache error-ch)
                                     (async/into [])
                                     <!)
 
@@ -325,8 +320,7 @@
 (defn commit-flakes->json-ld
   "Create a collection of commit maps."
   [db context error-ch flake-slice-ch]
-  (let [fuel        (volatile! 0)
-        cache       (volatile! {})
+  (let [cache       (volatile! {})
         compact     (json-ld/compact-fn context)
 
         t-flakes-ch (async/chan 1 (comp cat (partition-by flake/t)))
@@ -337,7 +331,7 @@
      2
      out-ch
      (fn [t-flakes ch]
-       (-> (commit-t-flakes->json-ld db context compact cache fuel error-ch
+       (-> (commit-t-flakes->json-ld db context compact cache error-ch
                                      t-flakes)
            (async/pipe ch)))
      t-flakes-ch)
