@@ -121,6 +121,36 @@
         (when (<? (validate/allow-iri? db oid))
           {id-key o-iri})))))
 
+(defn resolve-reference
+  [db cache context compact-fn fuel-vol max-fuel select-spec current-depth v]
+  (go-try
+    (if-let [{:keys [sid spec]} (::reference v)]
+      (let [ref (<? (display-reference db spec select-spec cache context
+                                       compact-fn current-depth
+                                       max-fuel fuel-vol sid))]
+        (not-empty ref))
+      v)))
+
+(defn resolve-references
+  [db cache context compact-fn fuel-vol max-fuel select-spec current-depth attrs]
+  (go-try
+    (loop [[[prop v] & r] attrs
+           resolved-attrs   {}]
+      (if prop
+        (let [v' (if (sequential? v)
+                   (loop [[value & r] v
+                          resolved-values   []]
+                     (if value
+                       (if-let [resolved (<? (resolve-reference db cache context compact-fn fuel-vol max-fuel select-spec current-depth value))]
+                         (recur r (conj resolved-values resolved))
+                         (recur r resolved-values))
+                       (not-empty resolved-values)))
+                   (<? (resolve-reference db cache context compact-fn fuel-vol max-fuel select-spec current-depth v)))]
+          (if (some? v')
+            (recur r (assoc resolved-attrs prop v'))
+            (recur r resolved-attrs)))
+        resolved-attrs))))
+
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
@@ -145,29 +175,25 @@
                 (let [p-iri (:as spec)
                       v     (if (rdf-type? pid)
                               (type-value db cache compact-fn p-flakes)
-                              (loop [[f & r] (if (list-element? ff)
-                                               (sort-by #(:i (flake/m %)) p-flakes)
-                                               p-flakes)
-                                     acc     []]
-                                (if f
-                                  (let [obj (flake/o f)
-                                        res (cond
-                                              (= const/$xsd:anyURI (flake/dt f))
-                                              (<? (display-reference db spec select-spec cache
-                                                                     context compact-fn depth-i
-                                                                     max-fuel fuel-vol obj))
+                              (let [p-flakes* (if (list-element? ff)
+                                                (sort-by (comp :i flake/m) p-flakes)
+                                                p-flakes)]
+                                (->> p-flakes*
+                                     (mapv (fn [f]
+                                             (let [obj (flake/o f)]
+                                               (cond
+                                                 (= const/$xsd:anyURI (flake/dt f))
+                                                 {::reference {:sid  obj
+                                                               :spec spec}}
 
-                                              (= const/$rdf:json (flake/dt f))
-                                              (json/parse obj false)
+                                                 (= const/$rdf:json (flake/dt f))
+                                                 (json/parse obj false)
 
-                                              :else
-                                              obj)]
-                                    (recur r (conj acc res)))
-                                  (unwrap-singleton p-iri context acc))))]
-                  (if (some? v)
-                    (recur r (assoc acc p-iri v))
-                    (recur r acc)))
+                                                 :else obj))))
+                                     (unwrap-singleton p-iri context))))]
+                  (recur r (assoc acc p-iri v)))
                 (recur r acc)))
-            (if reverse
-              (merge acc (<? (add-reverse-specs db cache context compact-fn fuel-vol max-fuel select-spec depth-i s-flakes)))
-              acc)))))))
+            (let [attrs (<? (resolve-references db cache context compact-fn fuel-vol max-fuel select-spec depth-i acc))]
+              (if reverse
+                (merge attrs (<? (add-reverse-specs db cache context compact-fn fuel-vol max-fuel select-spec depth-i s-flakes)))
+                attrs))))))))
