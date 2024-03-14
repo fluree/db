@@ -151,10 +151,43 @@
             (recur r resolved-attrs)))
         resolved-attrs))))
 
+(defn format-object
+  [spec f]
+  (let [obj (flake/o f)]
+    (cond
+      (= const/$xsd:anyURI (flake/dt f))
+      {::reference {:sid  obj
+                    :spec spec}}
+
+      (= const/$rdf:json (flake/dt f))
+      (json/parse obj false)
+
+      :else obj)))
+
+(defn format-property
+  [db cache context compact-fn {:keys [wildcard?] :as select-spec} p-flakes]
+  (let [ff  (first p-flakes)
+        pid (flake/p ff)
+        iri (iri/decode-sid db pid)]
+    (when-let [spec (or (get select-spec iri)
+                        (when wildcard?
+                          (or (wildcard-spec db cache compact-fn iri)
+                              (cache-sid->iri db cache compact-fn pid))))]
+      (let [p-iri (:as spec)
+            v     (if (rdf-type? pid)
+                    (type-value db cache compact-fn p-flakes)
+                    (let [p-flakes* (if (list-element? ff)
+                                      (sort-by (comp :i flake/m) p-flakes)
+                                      p-flakes)]
+                      (->> p-flakes*
+                           (mapv (partial format-object spec))
+                           (unwrap-singleton p-iri context))))]
+        [p-iri v]))))
+
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
-  [db cache context compact-fn fuel-vol max-fuel {:keys [wildcard? reverse] :as select-spec} depth-i s-flakes]
+  [db cache context compact-fn fuel-vol max-fuel {:keys [reverse] :as select-spec} depth-i s-flakes]
   (go-try
     (when (not-empty s-flakes)
       (let [sid           (->> s-flakes first flake/s)
@@ -165,34 +198,9 @@
         (loop [[p-flakes & r] (partition-by flake/p s-flakes)
                acc            initial-attrs]
           (if p-flakes
-            (let [ff  (first p-flakes)
-                  pid (flake/p ff)
-                  iri (iri/decode-sid db pid)]
-              (if-let [spec (or (get select-spec iri)
-                                (when wildcard?
-                                  (or (wildcard-spec db cache compact-fn iri)
-                                      (cache-sid->iri db cache compact-fn pid))))]
-                (let [p-iri (:as spec)
-                      v     (if (rdf-type? pid)
-                              (type-value db cache compact-fn p-flakes)
-                              (let [p-flakes* (if (list-element? ff)
-                                                (sort-by (comp :i flake/m) p-flakes)
-                                                p-flakes)]
-                                (->> p-flakes*
-                                     (mapv (fn [f]
-                                             (let [obj (flake/o f)]
-                                               (cond
-                                                 (= const/$xsd:anyURI (flake/dt f))
-                                                 {::reference {:sid  obj
-                                                               :spec spec}}
-
-                                                 (= const/$rdf:json (flake/dt f))
-                                                 (json/parse obj false)
-
-                                                 :else obj))))
-                                     (unwrap-singleton p-iri context))))]
-                  (recur r (assoc acc p-iri v)))
-                (recur r acc)))
+            (if-let [[p-iri v] (format-property db cache context compact-fn select-spec p-flakes)]
+              (recur r (assoc acc p-iri v))
+              (recur r acc))
             (let [attrs (<? (resolve-references db cache context compact-fn fuel-vol max-fuel select-spec depth-i acc))]
               (if reverse
                 (merge attrs (<? (add-reverse-specs db cache context compact-fn fuel-vol max-fuel select-spec depth-i s-flakes)))
