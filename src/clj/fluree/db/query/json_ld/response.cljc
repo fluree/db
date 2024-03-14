@@ -96,9 +96,10 @@
 
 
 (defn display-reference
-  [db spec select-spec cache context compact-fn max-depth current-depth max-fuel fuel-vol oid]
+  [db spec select-spec cache context compact-fn current-depth max-fuel fuel-vol oid]
   (go-try
     (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
+          max-depth (:depth select-spec)
           id-key    (:as (or (wildcard-spec db cache compact-fn const/$id)
                              (cache-sid->iri db cache compact-fn const/$id)))
           o-iri     (compact-fn (iri/decode-sid db oid))
@@ -123,7 +124,7 @@
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
-  [db cache context compact-fn fuel-vol max-fuel {:keys [wildcard? depth reverse] :as select-spec} depth-i s-flakes]
+  [db cache context compact-fn fuel-vol max-fuel {:keys [wildcard? reverse] :as select-spec} depth-i s-flakes]
   (go-try
     (when (not-empty s-flakes)
       (let [sid           (->> s-flakes first flake/s)
@@ -134,13 +135,13 @@
         (loop [[p-flakes & r] (partition-by flake/p s-flakes)
                acc            initial-attrs]
           (if p-flakes
-            (let [ff    (first p-flakes)
-                  pid   (flake/p ff)
-                  iri   (iri/decode-sid db pid)]
-              (if-let [spec  (or (get select-spec iri)
-                                 (when wildcard?
-                                   (or (wildcard-spec db cache compact-fn iri)
-                                       (cache-sid->iri db cache compact-fn pid))))]
+            (let [ff  (first p-flakes)
+                  pid (flake/p ff)
+                  iri (iri/decode-sid db pid)]
+              (if-let [spec (or (get select-spec iri)
+                                (when wildcard?
+                                  (or (wildcard-spec db cache compact-fn iri)
+                                      (cache-sid->iri db cache compact-fn pid))))]
                 (let [p-iri (:as spec)
                       v     (if (rdf-type? pid)
                               (type-value db cache compact-fn p-flakes)
@@ -153,7 +154,7 @@
                                         res (cond
                                               (= const/$xsd:anyURI (flake/dt f))
                                               (<? (display-reference db spec select-spec cache
-                                                                     context compact-fn depth depth-i
+                                                                     context compact-fn depth-i
                                                                      max-fuel fuel-vol obj))
 
                                               (= const/$rdf:json (flake/dt f))
