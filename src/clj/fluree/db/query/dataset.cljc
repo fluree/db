@@ -30,6 +30,12 @@
       (:default ds)
       (-> ds :named (get active-graph)))))
 
+(defn all
+  [ds]
+  (-> ds
+      :default
+      (concat (-> ds :named vals))))
+
 (defn names
   [ds]
   (-> ds :named keys))
