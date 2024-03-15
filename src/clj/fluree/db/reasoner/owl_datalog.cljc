@@ -78,20 +78,37 @@
     ;; rule-id *is* the property
     (conj all-rules [(str property "(prp-rng)") rule])))
 
+;; TODO - re-enable once filter function bug is fixed
 (defmethod to-datalog ::prp-fp
   [_ _ owl-statement all-rules]
   (do
     (log/warn "FunctionalProperty not supported yet")
     all-rules)
   #_(let [fp   (:id owl-statement)
-        rule {"where"  [{"@id" "?s"
-                         fp    "?fp-vals"}
-                        {"@id" "?s"
-                         fp    "?fp-vals2"}
-                        ["filter" "(not= ?fp-vals ?fp-vals2)"]]
-              "insert" {"@id"       "?fp-vals"
-                        $owl-sameAs "?fp-vals2"}}]
-    (conj all-rules [(str $owl-FunctionalProperty "(" fp ")") rule])))
+          rule {"where"  [{"@id" "?s"
+                           fp    "?fp-vals"}
+                          {"@id" "?s"
+                           fp    "?fp-vals2"}
+                          ["filter" "(not= ?fp-vals ?fp-vals2)"]]
+                "insert" {"@id"       "?fp-vals"
+                          $owl-sameAs "?fp-vals2"}}]
+      (conj all-rules [(str $owl-FunctionalProperty "(" fp ")") rule])))
+
+;; TODO - re-enable once filter function bug is fixed
+(defmethod to-datalog ::prp-ifp
+  [_ _ owl-statement all-rules]
+  (do
+    (log/warn "InverseFunctionalProperty not supported yet")
+    all-rules)
+  (let [ifp  (:id owl-statement)
+        rule {"where"  [{"@id" "?x1"
+                         ifp   "?y"}
+                        {"@id" "?x2"
+                         ifp   "?y"}
+                        ["filter" "(not= ?x1 ?x2)"]]
+              "insert" {"@id"       "?x1"
+                        $owl-sameAs "?x2"}}]
+    (conj all-rules [(str $owl-InverseFunctionalProperty "(" ifp ")") rule])))
 
 (defmethod to-datalog ::prp-symp
   [_ _ owl-statement all-rules]
@@ -112,7 +129,6 @@
               "insert" {"@id" "?x"
                         trp   "?z"}}]
     (conj all-rules [(str $owl-TransitiveProperty "(" trp ")") rule])))
-
 
 ;; turns list of properties into:
 ;; [{"@id" "?u0", "?p1" "?u1"}, {"@id" "?u2", "?p2" "?u3"} ... ]
@@ -148,7 +164,6 @@
       (conj all-rules [(str $owl-propertyChainAxiom "(" prop "}") rule]))
     (catch* e (log/warn (str "Ignoring OWL rule " (ex-message e)))
             all-rules)))
-
 
 (defmethod to-datalog :default
   [_ _ owl-statement all-rules]
@@ -187,6 +202,12 @@
 
              (contains? owl-statement $owl-propertyChainAxiom)
              (to-datalog ::prp-spo2 inserts owl-statement)
+
+             (some #(= $owl-FunctionalProperty %) (:type owl-statement))
+             (to-datalog ::prp-fp inserts owl-statement)
+
+             (some #(= $owl-InverseFunctionalProperty %) (:type owl-statement))
+             (to-datalog ::prp-ifp inserts owl-statement)
 
              (some #(= $owl-SymetricProperty %) (:type owl-statement))
              (to-datalog ::prp-symp inserts owl-statement)
