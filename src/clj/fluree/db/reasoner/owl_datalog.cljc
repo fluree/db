@@ -14,6 +14,7 @@
 (def ^:const $owl-TransitiveProperty "http://www.w3.org/2002/07/owl#TransitiveProperty")
 (def ^:const $owl-propertyChainAxiom "http://www.w3.org/2002/07/owl#propertyChainAxiom")
 (def ^:const $owl-inverseOf "http://www.w3.org/2002/07/owl#inverseOf")
+(def ^:const $owl-hasKey "http://www.w3.org/2002/07/owl#hasKey")
 
 (def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
 (def ^:const $owl-equivalentClass "http://www.w3.org/2002/07/owl#equivalentClass")
@@ -101,15 +102,15 @@
   (do
     (log/warn "InverseFunctionalProperty not supported yet")
     all-rules)
-  (let [ifp  (:id owl-statement)
-        rule {"where"  [{"@id" "?x1"
-                         ifp   "?y"}
-                        {"@id" "?x2"
-                         ifp   "?y"}
-                        ["filter" "(not= ?x1 ?x2)"]]
-              "insert" {"@id"       "?x1"
-                        $owl-sameAs "?x2"}}]
-    (conj all-rules [(str $owl-InverseFunctionalProperty "(" ifp ")") rule])))
+  #_(let [ifp  (:id owl-statement)
+          rule {"where"  [{"@id" "?x1"
+                           ifp   "?y"}
+                          {"@id" "?x2"
+                           ifp   "?y"}
+                          ["filter" "(not= ?x1 ?x2)"]]
+                "insert" {"@id"       "?x1"
+                          $owl-sameAs "?x2"}}]
+      (conj all-rules [(str $owl-InverseFunctionalProperty "(" ifp ")") rule])))
 
 (defmethod to-datalog ::prp-symp
   [_ _ owl-statement all-rules]
@@ -182,6 +183,30 @@
         (conj [(str $owl-inverseOf "(prp-inv1)") rule1])
         (conj [(str $owl-inverseOf "(prp-inv2)") rule2]))))
 
+;; TODO - re-enable once filter function bug is fixed
+(defmethod to-datalog ::prp-key
+  [_ _ owl-statement all-rules]
+  (do
+    (log/warn "InverseFunctionalProperty not supported yet")
+    all-rules)
+  #_(let [class     (:id owl-statement)
+          props     (get owl-statement $owl-hasKey)
+          ;; support props in either @list form, or just as a set of values
+          prop-list (or (some->> props first :list (map :id))
+                        (map props :id))
+          where     (->> prop-list
+                         (map-indexed (fn [idx prop]
+                                        [prop (str "?z" idx)]))
+                         (into {"@type" class}))
+          rule      {"where"  [(assoc where "@id" "?x")
+                               (assoc where "@id" "?y")
+                               ["filter" "(not= ?x ?y)"]]
+                     "insert" [{"@id"       "?x"
+                                $owl-sameAs "?y"}
+                               {"@id"       "?y"
+                                $owl-sameAs "?x"}]}]
+      (conj all-rules [(str $owl-hasKey "(" class ")") rule])))
+
 (defmethod to-datalog :default
   [_ _ owl-statement all-rules]
   (throw (ex-info "Unsupported OWL statement" {:owl-statement owl-statement})))
@@ -222,6 +247,9 @@
 
              (contains? owl-statement $owl-inverseOf)
              (to-datalog ::prp-inv inserts owl-statement)
+
+             (contains? owl-statement $owl-hasKey)
+             (to-datalog ::prp-key inserts owl-statement)
 
              (some #(= $owl-FunctionalProperty %) (:type owl-statement))
              (to-datalog ::prp-fp inserts owl-statement)

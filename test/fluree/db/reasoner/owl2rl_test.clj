@@ -210,6 +210,7 @@
                  (set qry-person))
               "ex:brian and ex:carol should be of type ex:Person"))))))
 
+;; TODO - re-enable once filter function bug is fixed
 #_(deftest ^:integration functional-properties
     (testing "owl:FunctionalProperty tests"
       (let [conn        (test-utils/create-conn)
@@ -268,47 +269,48 @@
                (set qry-anne2))
             "ex:anne should be deemed the same as ex:anne2"))))
 
+;; TODO - re-enable once filter function bug is fixed
 #_(deftest ^:integration inverse-functional-properties
-  (testing "owl:InverseFunctionalProperty tests"
-    (let [conn        (test-utils/create-conn)
-          ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
-                                     {"@context" {"ex" "http://example.org/"}
-                                      "insert"   [{"@id"      "ex:brian"
-                                                   "ex:email" "brian@example.org"}
-                                                  {"@id"      "ex:brian2"
-                                                   "ex:email" "brian@example.org"}
-                                                  {"@id"      "ex:ralph"
-                                                   "ex:email" "ralph@example.org"}
-                                                  {"@id"      "ex:ralph2"
-                                                   "ex:email" "ralph@example.org"}]})
-          db-reasoned @(fluree/reason
-                         db-base :owl2rl
-                         [{"@context" {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                           "@id"      "ex:email"
-                           "@type"    ["owl:ObjectProperty" "owl:InverseFunctionalProperty"]}])
+    (testing "owl:InverseFunctionalProperty tests"
+      (let [conn        (test-utils/create-conn)
+            ledger      @(fluree/create conn "reasoner/basic-owl" nil)
+            db-base     @(fluree/stage (fluree/db ledger)
+                                       {"@context" {"ex" "http://example.org/"}
+                                        "insert"   [{"@id"      "ex:brian"
+                                                     "ex:email" "brian@example.org"}
+                                                    {"@id"      "ex:brian2"
+                                                     "ex:email" "brian@example.org"}
+                                                    {"@id"      "ex:ralph"
+                                                     "ex:email" "ralph@example.org"}
+                                                    {"@id"      "ex:ralph2"
+                                                     "ex:email" "ralph@example.org"}]})
+            db-reasoned @(fluree/reason
+                           db-base :owl2rl
+                           [{"@context" {"ex"  "http://example.org/"
+                                         "owl" "http://www.w3.org/2002/07/owl#"}
+                             "@id"      "ex:email"
+                             "@type"    ["owl:ObjectProperty" "owl:InverseFunctionalProperty"]}])
 
-          qry-brian   @(fluree/query db-reasoned
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?same"
-                                      :where   {"@id"        "ex:brian",
-                                                "owl:sameAs" "?same"}})
-          qry-ralph   @(fluree/query db-reasoned
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?same"
-                                      :where   {"@id"        "ex:ralph",
-                                                "owl:sameAs" "?same"}})]
+            qry-brian   @(fluree/query db-reasoned
+                                       {:context {"ex"  "http://example.org/"
+                                                  "owl" "http://www.w3.org/2002/07/owl#"}
+                                        :select  "?same"
+                                        :where   {"@id"        "ex:brian",
+                                                  "owl:sameAs" "?same"}})
+            qry-ralph   @(fluree/query db-reasoned
+                                       {:context {"ex"  "http://example.org/"
+                                                  "owl" "http://www.w3.org/2002/07/owl#"}
+                                        :select  "?same"
+                                        :where   {"@id"        "ex:ralph",
+                                                  "owl:sameAs" "?same"}})]
 
-      (is (= #{"ex:brian2"}
-             (set qry-brian))
-          "ex:carol should be deemed the same as ex:carol2")
+        (is (= #{"ex:brian2"}
+               (set qry-brian))
+            "ex:carol should be deemed the same as ex:carol2")
 
-      (is (= #{"ex:ralph2"}
-             (set qry-ralph))
-          "ex:carol2 should be deemed the same as ex:carol"))))
+        (is (= #{"ex:ralph2"}
+               (set qry-ralph))
+            "ex:carol2 should be deemed the same as ex:carol"))))
 
 (deftest ^:integration symetric-properties
   (testing "owl:SymetricProperty tests"
@@ -475,3 +477,73 @@
 
       (is (= ["ex:alice"] qry-bob)
           "ex:alice should be the parent of ex:bob"))))
+
+;; TODO - re-enable once filter function bug is fixed
+#_(deftest ^:integration hasKey-properties
+    (testing "owl:hasKey tests"
+      (let [conn        (test-utils/create-conn)
+            ledger      @(fluree/create conn "reasoner/basic-owl" nil)
+            db-base     @(fluree/stage (fluree/db ledger)
+                                       {"@context" {"ex" "http://example.org/"}
+                                        "insert"   [{"@id"                "ex:brian"
+                                                     "@type"              ["ex:RegisteredPatient"]
+                                                     "ex:hasWaitingListN" "123-45-6789"}
+                                                    {"@id"                "ex:brian2"
+                                                     "@type"              ["ex:RegisteredPatient"]
+                                                     "ex:hasWaitingListN" "123-45-6789"}
+                                                    {"@id"                "ex:bob"
+                                                     "@type"              ["ex:RegisteredPatient"]
+                                                     "ex:hasWaitingListN" "444-44-4444"}
+
+                                                    {"@id"            "ex:t1"
+                                                     "@type"          ["ex:Transplantation"]
+                                                     "ex:donorId"     {"@id" "ex:brian"}
+                                                     "ex:recipientId" {"@id" "ex:alice"}
+                                                     "ex:ofOrgan"     "liver"}
+                                                    {"@id"            "ex:t2"
+                                                     "@type"          ["ex:Transplantation"]
+                                                     "ex:donorId"     {"@id" "ex:brian"}
+                                                     "ex:recipientId" {"@id" "ex:alice"}
+                                                     "ex:ofOrgan"     "liver"}
+                                                    {"@id"            "ex:t3"
+                                                     "@type"          ["ex:Transplantation"]
+                                                     "ex:donorId"     {"@id" "ex:brian"}
+                                                     "ex:recipientId" {"@id" "ex:alice"}
+                                                     "ex:ofOrgan"     "heart"}
+                                                    {"@id"            "ex:t4"
+                                                     "@type"          ["ex:Transplantation"]
+                                                     "ex:donorId"     {"@id" "ex:bob"}
+                                                     "ex:recipientId" {"@id" "ex:alice"}
+                                                     "ex:ofOrgan"     "liver"}]})
+
+            db-reasoned @(fluree/reason db-base :owl2rl
+                                        [{"@context"   {"ex"  "http://example.org/"
+                                                        "owl" "http://www.w3.org/2002/07/owl#"}
+                                          "@id"        "ex:RegisteredPatient"
+                                          "@type"      ["owl:ObjectProperty"]
+                                          "owl:haskey" {"@id" "ex:hasWaitingListN"}} ;; single cardinality
+                                         {"@context"   {"ex"  "http://example.org/"
+                                                        "owl" "http://www.w3.org/2002/07/owl#"}
+                                          "@id"        "ex:Transplantation"
+                                          "@type"      ["owl:ObjectProperty"]
+                                          "owl:haskey" [{"@list" [{"@id" "ex:donorId"} ;; multi as @list
+                                                                  {"@id" "ex:recipientId"}
+                                                                  {"@id" "ex:ofOrgan"}]}]}])
+
+            qry-brian   @(fluree/query db-reasoned
+                                       {:context {"ex" "http://example.org/"}
+                                        :select  "?x"
+                                        :where   {"@id"       "ex:brian"
+                                                  "ex:sameAs" "?x"}})
+
+            qry-t1      @(fluree/query db-reasoned
+                                       {:context {"ex" "http://example.org/"}
+                                        :select  "?x"
+                                        :where   {"@id"       "ex:t1"
+                                                  "ex:sameAs" "?x"}})]
+
+        (is (= ["ex:brian2"] qry-brian)
+            "ex:brian should be the same as ex:brian2 because ex:hasWaitingListN is identical")
+
+        (is (= ["ex:t2"] qry-t1)
+            "ex:t1 should be same as ex:t2 because ex:donorId, ex:recipientId, and ex:ofOrgan are identical"))))
