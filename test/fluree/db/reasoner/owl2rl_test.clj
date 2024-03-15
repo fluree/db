@@ -428,3 +428,50 @@
       (is (= #{"ex:mom-mom-mom" "ex:mom-mom-dad"}
              (set qry-ggp))
           "all two of ex:person-a's great grandparents should be found"))))
+
+(deftest ^:integration inverseOf-properties
+  (testing "owl:inverseOf tests"
+    (let [conn        (test-utils/create-conn)
+          ledger      @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base     @(fluree/stage (fluree/db ledger)
+                                     {"@context" {"ex" "http://example.org/"}
+                                      "insert"   [{"@id"       "ex:son"
+                                                   "ex:parent" [{"@id" "ex:mom"} {"@id" "ex:dad"}]}
+                                                  {"@id"       "ex:mom"
+                                                   "ex:parent" [{"@id" "ex:mom-mom"} {"@id" "ex:mom-dad"}]}
+                                                  {"@id"      "ex:alice"
+                                                   "ex:child" {"@id" "ex:bob"}}]})
+
+          db-reasoned @(fluree/reason db-base :owl2rl
+                                      [{"@context"      {"ex"   "http://example.org/"
+                                                         "owl"  "http://www.w3.org/2002/07/owl#"
+                                                         "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                        "@id"           "ex:child"
+                                        "@type"         ["owl:ObjectProperty"]
+                                        "owl:inverseOf" {"@id" "ex:parent"}}])
+
+          qry-mom     @(fluree/query db-reasoned
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?x"
+                                      :where   {"@id"      "ex:mom"
+                                                "ex:child" "?x"}})
+
+          qry-mom-mom @(fluree/query db-reasoned
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?x"
+                                      :where   {"@id"      "ex:mom-mom"
+                                                "ex:child" "?x"}})
+          qry-bob     @(fluree/query db-reasoned
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?x"
+                                      :where   {"@id"       "ex:bob"
+                                                "ex:parent" "?x"}})]
+
+      (is (= ["ex:son"] qry-mom)
+          "ex:son should be the child of ex:mom")
+
+      (is (= ["ex:mom"] qry-mom-mom)
+          "ex:mom should be the child of ex:mom-mom")
+
+      (is (= ["ex:alice"] qry-bob)
+          "ex:alice should be the parent of ex:bob"))))

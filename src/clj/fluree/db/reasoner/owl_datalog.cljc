@@ -13,6 +13,7 @@
 (def ^:const $owl-SymetricProperty "http://www.w3.org/2002/07/owl#SymetricProperty")
 (def ^:const $owl-TransitiveProperty "http://www.w3.org/2002/07/owl#TransitiveProperty")
 (def ^:const $owl-propertyChainAxiom "http://www.w3.org/2002/07/owl#propertyChainAxiom")
+(def ^:const $owl-inverseOf "http://www.w3.org/2002/07/owl#inverseOf")
 
 (def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
 (def ^:const $owl-equivalentClass "http://www.w3.org/2002/07/owl#equivalentClass")
@@ -165,6 +166,22 @@
     (catch* e (log/warn (str "Ignoring OWL rule " (ex-message e)))
             all-rules)))
 
+(defmethod to-datalog ::prp-inv
+  [_ _ owl-statement all-rules]
+  (let [prop     (util/get-first-id owl-statement $owl-inverseOf)
+        inv-prop (:id owl-statement)
+        rule1    {"where"  [{"@id" "?x"
+                             prop  "?y"}]
+                  "insert" {"@id"    "?y"
+                            inv-prop "?x"}}
+        rule2    {"where"  [{"@id"    "?x"
+                             inv-prop "?y"}]
+                  "insert" {"@id" "?y"
+                            prop  "?x"}}]
+    (-> all-rules
+        (conj [(str $owl-inverseOf "(prp-inv1)") rule1])
+        (conj [(str $owl-inverseOf "(prp-inv2)") rule2]))))
+
 (defmethod to-datalog :default
   [_ _ owl-statement all-rules]
   (throw (ex-info "Unsupported OWL statement" {:owl-statement owl-statement})))
@@ -202,6 +219,9 @@
 
              (contains? owl-statement $owl-propertyChainAxiom)
              (to-datalog ::prp-spo2 inserts owl-statement)
+
+             (contains? owl-statement $owl-inverseOf)
+             (to-datalog ::prp-inv inserts owl-statement)
 
              (some #(= $owl-FunctionalProperty %) (:type owl-statement))
              (to-datalog ::prp-fp inserts owl-statement)
