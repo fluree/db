@@ -210,6 +210,64 @@
                  (set qry-person))
               "ex:brian and ex:carol should be of type ex:Person"))))))
 
+#_(deftest ^:integration functional-properties
+  (testing "owl:FunctionalProperty and owl:InverseFunctionalProperty tests"
+    (let [conn        (test-utils/create-conn)
+          ledger      @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base     @(fluree/stage (fluree/db ledger)
+                                     {"@context" {"ex" "http://example.org/"}
+                                      "insert"   [{"@id"       "ex:brian"
+                                                   "ex:mother" [{"@id" "ex:carol"} {"@id" "ex:carol2"}]}
+                                                  {"@id"       "ex:ralph"
+                                                   "ex:mother" [{"@id" "ex:anne"} {"@id" "ex:anne2"}]}]})
+          db-reasoned @(fluree/reason
+                         db-base :owl2rl
+                         [{"@context" {"ex"  "http://example.org/"
+                                       "owl" "http://www.w3.org/2002/07/owl#"}
+                           "@id"      "ex:mother"
+                           "@type"    ["owl:ObjectProperty" "owl:FunctionalProperty"]}])
+
+          qry-carol   @(fluree/query db-reasoned
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol",
+                                                "owl:sameAs" "?same"}})
+          qry-carol2  @(fluree/query db-reasoned
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol2",
+                                                "owl:sameAs" "?same"}})
+          qry-anne    @(fluree/query db-reasoned
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:anne",
+                                                "owl:sameAs" "?same"}})
+          qry-anne2   @(fluree/query db-reasoned
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:anne2",
+                                                "owl:sameAs" "?same"}})]
+
+      (is (= #{"ex:carol2"}
+             (set qry-carol))
+          "ex:carol should be deemed the same as ex:carol2")
+
+      (is (= #{"ex:carol"}
+             (set qry-carol2))
+          "ex:carol2 should be deemed the same as ex:carol")
+
+      (is (= #{"ex:anne2"}
+             (set qry-anne))
+          "ex:anne2 should be deemed the same as ex:anne")
+
+      (is (= #{"ex:anne"}
+             (set qry-anne2))
+          "ex:anne should be deemed the same as ex:anne2"))))
+
 (deftest ^:integration symetric-properties
   (testing "owl:SymetricProperty tests"
     (let [conn    (test-utils/create-conn)

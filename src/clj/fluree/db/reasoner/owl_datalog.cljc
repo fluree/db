@@ -78,6 +78,21 @@
     ;; rule-id *is* the property
     (conj all-rules [(str property "(prp-rng)") rule])))
 
+(defmethod to-datalog ::prp-fp
+  [_ _ owl-statement all-rules]
+  (do
+    (log/warn "FunctionalProperty not supported yet")
+    all-rules)
+  #_(let [fp   (:id owl-statement)
+        rule {"where"  [{"@id" "?s"
+                         fp    "?fp-vals"}
+                        {"@id" "?s"
+                         fp    "?fp-vals2"}
+                        ["filter" "(not= ?fp-vals ?fp-vals2)"]]
+              "insert" {"@id"       "?fp-vals"
+                        $owl-sameAs "?fp-vals2"}}]
+    (conj all-rules [(str $owl-FunctionalProperty "(" fp ")") rule])))
+
 (defmethod to-datalog ::prp-symp
   [_ _ owl-statement all-rules]
   (let [symp (:id owl-statement)
