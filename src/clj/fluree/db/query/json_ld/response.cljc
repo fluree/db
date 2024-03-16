@@ -3,12 +3,10 @@
             [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.permissions-validate :as validate]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.conn.cache :as conn-cache]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.constants :as const]
             [fluree.db.query.dataset :as dataset]
-            [fluree.db.index :as index]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.json :as json]
@@ -40,14 +38,14 @@
 
 (declare flakes->res)
 (defn crawl-ref-item
-  [db context compact-fn flake-sid sub-select cache depth-i]
+  [db context compact-fn flake-sid sub-select cache depth-i error-ch]
   (go-try
     (let [sub-flakes (<? (query-range/index-range db :spot = [flake-sid]))]
-      (<? (flakes->res db cache context compact-fn sub-select depth-i sub-flakes)))))
+      (<? (flakes->res db cache context compact-fn sub-select depth-i error-ch sub-flakes)))))
 
 (defn add-reverse-specs
   "When @reverse variables are present, crawl for the reverse specs."
-  [db cache context compact-fn {:keys [reverse] :as select-spec} depth-i flakes]
+  [db cache context compact-fn {:keys [reverse] :as select-spec} depth-i error-ch flakes]
   (go-try
     (let [sid (flake/s (first flakes))]
       (loop [[reverse-item & r] (vals reverse)
@@ -60,7 +58,7 @@
                              (if ref-sid
                                (let [result (if spec
                                               ;; have a sub-selection
-                                              (<? (crawl-ref-item db context compact-fn ref-sid spec cache (inc depth-i)))
+                                              (<! (crawl-ref-item db context compact-fn ref-sid spec cache (inc depth-i) error-ch))
                                               ;; no sub-selection, just return IRI
                                               (:as (cache-sid->iri db cache compact-fn ref-sid)))]
                                  (recur r (conj acc-item result)))
@@ -102,7 +100,7 @@
 
 
 (defn display-reference
-  [db spec select-spec cache context compact-fn current-depth oid]
+  [db spec select-spec cache context compact-fn current-depth error-ch oid]
   (go-try
     (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
           max-depth (:depth select-spec)
@@ -113,14 +111,14 @@
       (cond
         ;; have a specified sub-selection (graph crawl)
         subselect
-        (let [ref-attrs (<? (crawl-ref-item db context compact-fn oid subselect cache (inc current-depth)))]
+        (let [ref-attrs (<! (crawl-ref-item db context compact-fn oid subselect cache (inc current-depth) error-ch))]
           (if (<? (includes-id? db oid subselect))
             (assoc ref-attrs id-key o-iri)
             ref-attrs))
 
         ;; requested graph crawl depth has not yet been reached
         (< current-depth max-depth)
-        (cond-> (<? (crawl-ref-item db context compact-fn oid select-spec cache (inc current-depth)))
+        (cond-> (<! (crawl-ref-item db context compact-fn oid select-spec cache (inc current-depth) error-ch))
           (<? (validate/allow-iri? db oid)) (assoc id-key o-iri))
 
         :else
@@ -128,16 +126,16 @@
           {id-key o-iri})))))
 
 (defn resolve-reference
-  [db cache context compact-fn select-spec current-depth v]
+  [db cache context compact-fn select-spec current-depth error-ch v]
   (go-try
     (if-let [{:keys [sid spec]} (::reference v)]
       (let [ref (<? (display-reference db spec select-spec cache context
-                                       compact-fn current-depth sid))]
+                                       compact-fn current-depth error-ch sid))]
         (not-empty ref))
       v)))
 
 (defn resolve-references
-  [db cache context compact-fn select-spec current-depth attrs]
+  [db cache context compact-fn select-spec current-depth error-ch attrs]
   (go-try
     (loop [[[prop v] & r] attrs
            resolved-attrs   {}]
@@ -146,11 +144,11 @@
                    (loop [[value & r] v
                           resolved-values   []]
                      (if value
-                       (if-let [resolved (<? (resolve-reference db cache context compact-fn select-spec current-depth value))]
+                       (if-let [resolved (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch value))]
                          (recur r (conj resolved-values resolved))
                          (recur r resolved-values))
                        (not-empty resolved-values)))
-                   (<? (resolve-reference db cache context compact-fn select-spec current-depth v)))]
+                   (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch v)))]
           (if (some? v')
             (recur r (assoc resolved-attrs prop v'))
             (recur r resolved-attrs)))
@@ -189,10 +187,19 @@
                            (unwrap-singleton p-iri context))))]
         [p-iri v]))))
 
+(defn format-subject-flakes
+  [db cache context compact-fn select-spec initial-attrs flakes]
+  (into initial-attrs
+        (comp (partition-by flake/p)
+              (map (partial format-property db cache context
+                            compact-fn select-spec))
+              (remove nil?))
+        flakes))
+
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
-  [db cache context compact-fn {:keys [reverse] :as select-spec} depth-i s-flakes]
+  [db cache context compact-fn {:keys [reverse] :as select-spec} depth-i error-ch s-flakes]
   (go-try
     (when (not-empty s-flakes)
       (let [sid             (->> s-flakes first flake/s)
@@ -200,17 +207,12 @@
                               (let [iri (compact-fn (iri/decode-sid db sid))]
                                 {(compact-fn const/iri-id) iri})
                               {})
-            formatted-attrs (into initial-attrs
-                                  (comp (partition-by flake/p)
-                                        (map (partial format-property db cache context
-                                                      compact-fn select-spec))
-                                        (remove nil?))
-                                  s-flakes)
+            formatted-attrs (format-subject-flakes db cache context compact-fn select-spec initial-attrs s-flakes)
             resolved-attrs  (<? (resolve-references db cache context compact-fn select-spec
-                                                    depth-i formatted-attrs))]
+                                                    depth-i error-ch formatted-attrs))]
         (if reverse
           (merge resolved-attrs (<? (add-reverse-specs db cache context compact-fn select-spec
-                                                       depth-i s-flakes)))
+                                                       depth-i error-ch s-flakes)))
           resolved-attrs)))))
 
 (defn track-fuel
@@ -245,10 +247,6 @@
                                  :end-flake   end-flake
                                  :flake-xf    (track-fuel fuel-tracker error-ch)}
         flake-slices            (query-range/resolve-flake-slices conn spot-root spot-novelty
-                                                                  error-ch range-opts)
-        property-xf             (comp cat
-                                      (partition-by flake/p)
-                                      (map (partial format-property db cache context
-                                                    compact-fn select-spec))
-                                      (remove nil?))]
-    (async/transduce property-xf (completing conj) initial-attrs flake-slices)))
+                                                                  error-ch range-opts)]
+    (async/reduce (partial format-subject-flakes db cache context compact-fn select-spec)
+                  initial-attrs flake-slices)))

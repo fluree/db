@@ -88,14 +88,10 @@
   [{:keys [db cache context compact-fn select-spec error-ch] :as _opts}]
   (fn [flakes port]
     (go
-      (try*
-        (let [result (<? (json-ld-resp/flakes->res db cache context compact-fn select-spec 0 flakes))]
-          (when (not-empty result)
-            (>! port result)))
-        (async/close! port)
-        (catch* e
-                (log/error e "Error processing subject query result")
-                (>! error-ch e))))))
+      (let [result (<! (json-ld-resp/flakes->res db cache context compact-fn select-spec 0 error-ch flakes))]
+        (when (not-empty result)
+          (>! port result)))
+      (async/close! port))))
 
 (defn subj-crawl
   [{:keys [db error-ch f-where limit offset parallelism vars finish-fn] :as opts}]

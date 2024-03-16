@@ -123,17 +123,11 @@
 
 (defn s-flakes->json-ld
   "Build a subject map out a set of flakes with the same subject.
-
   {:id :ex/foo :ex/x 1 :ex/y 2}"
   [db cache context compact error-ch s-flakes]
-  (go
-    (try*
-      (<? (json-ld-resp/flakes->res db cache context compact
-                                    {:wildcard? true, :depth 0}
-                                    0 s-flakes))
-      (catch* e
-        (log/error e "Error transforming s-flakes.")
-        (>! error-ch e)))))
+  (json-ld-resp/flakes->res db cache context compact
+                            {:wildcard? true, :depth 0}
+                            0 error-ch s-flakes))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
@@ -288,14 +282,14 @@
                      t-flakes)
            commit-wrapper-chan (json-ld-resp/flakes->res db cache context compact
                                                          {:wildcard? true, :depth 0}
-                                                         0 commit-wrapper-flakes)
+                                                         0 error-ch commit-wrapper-flakes)
 
            commit-meta-chan    (json-ld-resp/flakes->res db cache context compact
                                                          {:wildcard? true, :depth 0}
-                                                         0 commit-meta-flakes)
+                                                         0 error-ch commit-meta-flakes)
 
-           commit-wrapper      (<? commit-wrapper-chan)
-           commit-meta         (<? commit-meta-chan)
+           commit-wrapper      (<! commit-wrapper-chan)
+           commit-meta         (<! commit-meta-chan)
            asserts             (->> assert-flakes
                                     (t-flakes->json-ld db context compact cache error-ch)
                                     (async/into [])
