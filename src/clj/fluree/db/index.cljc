@@ -260,16 +260,20 @@
       (resolve node-resolver node)
       (resolve-t-range node-resolver node novelty from-t to-t))))
 
-(defrecord CachedTRangeResolver [node-resolver novelty from-t to-t lru-cache-atom]
+(defrecord CachedTRangeResolver [node-resolver novelty from-t to-t cache]
   Resolver
   (resolve [_ {:keys [id tempid tt-id] :as node}]
     (if (branch? node)
       (resolve node-resolver node)
       (conn-cache/lru-lookup
-        lru-cache-atom
+        cache
         [::t-range id tempid tt-id from-t to-t]
         (fn [_]
           (resolve-t-range node-resolver node novelty from-t to-t))))))
+
+(defn conn->t-range-resolver
+  [{:keys [lru-cache-atom] :as conn} novelty from-t to-t]
+  (->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom))
 
 (defn history-t-range
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."

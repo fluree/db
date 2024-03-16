@@ -95,9 +95,9 @@
   "Returns a channel that will contain a stream of chunked flake collections that
   contain the flakes between `start-flake` and `end-flake` and are within the
   transaction range starting at `from-t` and ending at `to-t`."
-  [{:keys [lru-cache-atom] :as conn} root novelty error-ch
+  [conn root novelty error-ch
    {:keys [from-t to-t start-flake end-flake] :as opts}]
-  (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom)
+  (let [resolver  (index/conn->t-range-resolver conn novelty from-t to-t)
         query-xf  (extract-query-flakes opts)]
     (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)))
 

@@ -36,7 +36,7 @@
                           cat
                           (map flake/s)
                           (distinct))
-        resolver    (index/->CachedTRangeResolver conn novelty t t (:lru-cache-atom conn))]
+        resolver    (index/conn->t-range-resolver conn novelty t t)]
     (index/tree-chan resolver idx-root first-flake last-flake any? 10 query-xf error-ch)))
 
 (defn permissioned-db?
