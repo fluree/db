@@ -251,4 +251,4 @@
                                       (map (partial format-property db cache context
                                                     compact-fn select-spec))
                                       (remove nil?))]
-    (async/transduce property-xf into initial-attrs flake-slices)))
+    (async/transduce property-xf (completing conj) initial-attrs flake-slices)))
