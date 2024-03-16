@@ -415,8 +415,7 @@
 
 (defmethod match-pattern :tuple
   [ds fuel-tracker solution pattern filters error-ch]
-  (let [active-graph (cond-> ds
-                       (dataset/dataset? ds) dataset/active)]
+  (let [active-graph (dataset/active ds)]
     (if (sequential? active-graph)
       (->> active-graph
            (map (fn [graph]
@@ -477,8 +476,7 @@
 (defmethod match-pattern :class
   [ds fuel-tracker solution pattern filters error-ch]
   (let [triple       (val pattern)
-        active-graph (cond-> ds
-                       (dataset/dataset? ds) dataset/active)]
+        active-graph (dataset/active ds)]
     (if (sequential? active-graph)
       (->> active-graph
            (map (fn [graph]

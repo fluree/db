@@ -25,16 +25,20 @@
 
 (defn active
   [ds]
-  (let [active-graph (:active ds)]
-    (if (#{::default} active-graph)
-      (:default ds)
-      (-> ds :named (get active-graph)))))
+  (if (dataset? ds)
+    (let [active-graph (:active ds)]
+      (if (#{::default} active-graph)
+        (:default ds)
+        (-> ds :named (get active-graph))))
+    ds))
 
 (defn all
   [ds]
-  (-> ds
-      :default
-      (concat (-> ds :named vals))))
+  (if (dataset? ds)
+    (-> ds
+        :default
+        (concat (-> ds :named vals)))
+    [ds]))
 
 (defn names
   [ds]
