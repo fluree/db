@@ -1,7 +1,8 @@
 (ns fluree.db.query.json-ld.response
   (:require [fluree.db.util.async :refer [<? go-try]]
-            [clojure.core.async :as async]
+            [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.permissions-validate :as validate]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
@@ -217,16 +218,16 @@
   (when fuel-tracker
     (fuel/track fuel-tracker error-ch)))
 
-(defn subject-bounds
-  [db sid]
+(defn flake-bounds
+  [db idx match]
   (let [[start-test start-match end-test end-match]
-        (query-range/expand-range-interval :spot = [sid])
+        (query-range/expand-range-interval idx = match)
 
         [s1 p1 o1 t1 op1 m1]
-        (query-range/match->flake-parts db :spot start-match)
+        (query-range/match->flake-parts db idx start-match)
 
         [s2 p2 o2 t2 op2 m2]
-        (query-range/match->flake-parts db :spot end-match)
+        (query-range/match->flake-parts db idx end-match)
 
         start-flake (query-range/resolve-match-flake start-test s1 p1 o1 t1 op1 m1)
         end-flake   (query-range/resolve-match-flake end-test s2 p2 o2 t2 op2 m2)]
@@ -237,7 +238,7 @@
   (let [spot-root               (get db :spot)
         spot-novelty            (get-in db [:novelty :spot])
         sid                     (iri/encode-iri db iri)
-        [start-flake end-flake] (subject-bounds db sid)
+        [start-flake end-flake] (flake-bounds db :spot [sid])
         range-opts              {:from-t      t
                                  :to-t        t
                                  :start-flake start-flake
