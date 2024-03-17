@@ -114,6 +114,47 @@
           (json/parse obj false)
           obj)))))
 
+(defn format-property
+  [db cache context compact-fn {:keys [wildcard?] :as select-spec} p-flakes]
+  (let [ff  (first p-flakes)
+        pid (flake/p ff)
+        iri (iri/decode-sid db pid)]
+    (when-let [spec (or (get select-spec iri)
+                        (when wildcard?
+                          (or (wildcard-spec db cache compact-fn iri)
+                              (cache-sid->iri db cache compact-fn pid))))]
+      (let [p-iri (:as spec)
+            v     (if (rdf-type? pid)
+                    (type-value db cache compact-fn p-flakes)
+                    (let [p-flakes* (if (list-element? ff)
+                                      (sort-by (comp :i flake/m) p-flakes)
+                                      p-flakes)]
+                      (->> p-flakes*
+                           (mapv (partial format-object spec))
+                           (unwrap-singleton p-iri context))))]
+        [p-iri v]))))
+
+(defn format-subject-flakes
+  [db cache context compact-fn select-spec initial-attrs flakes]
+  (into initial-attrs
+        (comp (partition-by flake/p)
+              (map (partial format-property db cache context
+                            compact-fn select-spec))
+              (remove nil?))
+        flakes))
+
+(defn format-subject
+  [db cache context compact-fn select-spec sid error-ch flakes]
+  (go (try*
+        (let [initial-attrs (if (<? (includes-id? db sid select-spec))
+                              (let [iri (compact-fn (iri/decode-sid db sid))]
+                                {(compact-fn const/iri-id) iri})
+                              {})]
+          (format-subject-flakes db cache context compact-fn select-spec initial-attrs flakes))
+        (catch* e
+                (log/error e "Error formatting subject")
+                (>! error-ch e)))))
+
 
 (defn reference?
   [v]
@@ -182,34 +223,7 @@
 
       :else obj)))
 
-(defn format-property
-  [db cache context compact-fn {:keys [wildcard?] :as select-spec} p-flakes]
-  (let [ff  (first p-flakes)
-        pid (flake/p ff)
-        iri (iri/decode-sid db pid)]
-    (when-let [spec (or (get select-spec iri)
-                        (when wildcard?
-                          (or (wildcard-spec db cache compact-fn iri)
-                              (cache-sid->iri db cache compact-fn pid))))]
-      (let [p-iri (:as spec)
-            v     (if (rdf-type? pid)
-                    (type-value db cache compact-fn p-flakes)
-                    (let [p-flakes* (if (list-element? ff)
-                                      (sort-by (comp :i flake/m) p-flakes)
-                                      p-flakes)]
-                      (->> p-flakes*
-                           (mapv (partial format-object spec))
-                           (unwrap-singleton p-iri context))))]
-        [p-iri v]))))
 
-(defn format-subject-flakes
-  [db cache context compact-fn select-spec initial-attrs flakes]
-  (into initial-attrs
-        (comp (partition-by flake/p)
-              (map (partial format-property db cache context
-                            compact-fn select-spec))
-              (remove nil?))
-        flakes))
 
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
