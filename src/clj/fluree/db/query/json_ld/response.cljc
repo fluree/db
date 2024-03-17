@@ -212,30 +212,28 @@
                        compact-fn current-depth error-ch sid)))
 
 (defn resolve-references
-  [db cache context compact-fn select-spec current-depth error-ch attrs]
-  (go-loop [[[prop v] & r] attrs
-            resolved-attrs {}]
-    (if prop
-      (let [v' (if (sequential? v)
-                 (loop [[value & r]     v
-                        resolved-values []]
-                   (if value
-                     (if (reference? value)
-                       (if-let [resolved (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch value))]
-                         (recur r (conj resolved-values resolved))
-                         (recur r resolved-values))
-                       (recur r (conj resolved-values value)))
-                     (not-empty resolved-values)))
-                 (if (reference? v)
-                   (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch v))
-                   v))]
-        (if (some? v')
-          (recur r (assoc resolved-attrs prop v'))
-          (recur r resolved-attrs)))
-      resolved-attrs)))
-
-
-      :else obj)))
+  [db cache context compact-fn select-spec current-depth error-ch attr-ch]
+  (go (when-let [attrs (<! attr-ch)]
+        (loop [[[prop v] & r] attrs
+               resolved-attrs {}]
+          (if prop
+            (let [v' (if (sequential? v)
+                       (loop [[value & r]     v
+                              resolved-values []]
+                         (if value
+                           (if (reference? value)
+                             (if-let [resolved (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch value))]
+                               (recur r (conj resolved-values resolved))
+                               (recur r resolved-values))
+                             (recur r (conj resolved-values value)))
+                           (not-empty resolved-values)))
+                       (if (reference? v)
+                         (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch v))
+                         v))]
+              (if (some? v')
+                (recur r (assoc resolved-attrs prop v'))
+                (recur r resolved-attrs)))
+            resolved-attrs)))))
 
 
 
