@@ -246,17 +246,13 @@
   (go-try
     (when (not-empty s-flakes)
       (let [sid             (->> s-flakes first flake/s)
-            initial-attrs   (if (<? (includes-id? db sid select-spec))
-                              (let [iri (compact-fn (iri/decode-sid db sid))]
-                                {(compact-fn const/iri-id) iri})
-                              {})
-            formatted-attrs (format-subject-flakes db cache context compact-fn select-spec initial-attrs s-flakes)
-            resolved-attrs  (<? (resolve-references db cache context compact-fn select-spec
-                                                    depth-i error-ch formatted-attrs))]
+            formatted-attrs (<! (->> s-flakes
+                                     (format-subject db cache context compact-fn select-spec sid error-ch)
+                                     (resolve-references db cache context compact-fn select-spec depth-i error-ch)))]
         (if reverse
-          (merge resolved-attrs (<? (add-reverse-specs db cache context compact-fn select-spec
+          (merge formatted-attrs (<? (add-reverse-specs db cache context compact-fn select-spec
                                                        depth-i error-ch s-flakes)))
-          resolved-attrs)))))
+          formatted-attrs)))))
 
 (defn resolve-subject-properties
   [{:keys [conn t] :as db} iri initial-attrs cache context compact-fn select-spec fuel-tracker error-ch]
