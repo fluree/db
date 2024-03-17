@@ -155,6 +155,20 @@
                 (log/error e "Error formatting subject")
                 (>! error-ch e)))))
 
+(defn flake-bounds
+  [db idx match]
+  (let [[start-test start-match end-test end-match]
+        (query-range/expand-range-interval idx = match)
+
+        [s1 p1 o1 t1 op1 m1]
+        (query-range/match->flake-parts db idx start-match)
+
+        [s2 p2 o2 t2 op2 m2]
+        (query-range/match->flake-parts db idx end-match)
+
+        start-flake (query-range/resolve-match-flake start-test s1 p1 o1 t1 op1 m1)
+        end-flake   (query-range/resolve-match-flake end-test s2 p2 o2 t2 op2 m2)]
+    [start-flake end-flake]))
 
 (defn reference?
   [v]
@@ -244,26 +258,6 @@
                                                        depth-i error-ch s-flakes)))
           resolved-attrs)))))
 
-(defn track-fuel
-  [fuel-tracker error-ch]
-  (when fuel-tracker
-    (fuel/track fuel-tracker error-ch)))
-
-(defn flake-bounds
-  [db idx match]
-  (let [[start-test start-match end-test end-match]
-        (query-range/expand-range-interval idx = match)
-
-        [s1 p1 o1 t1 op1 m1]
-        (query-range/match->flake-parts db idx start-match)
-
-        [s2 p2 o2 t2 op2 m2]
-        (query-range/match->flake-parts db idx end-match)
-
-        start-flake (query-range/resolve-match-flake start-test s1 p1 o1 t1 op1 m1)
-        end-flake   (query-range/resolve-match-flake end-test s2 p2 o2 t2 op2 m2)]
-    [start-flake end-flake]))
-
 (defn resolve-subject-properties
   [{:keys [conn t] :as db} iri initial-attrs cache context compact-fn select-spec fuel-tracker error-ch]
   (let [spot-root               (get db :spot)
@@ -274,7 +268,8 @@
                                  :to-t        t
                                  :start-flake start-flake
                                  :end-flake   end-flake
-                                 :flake-xf    (track-fuel fuel-tracker error-ch)}
+                                 :flake-xf    (when fuel-tracker
+                                                (fuel/track fuel-tracker error-ch))}
         flake-slices            (query-range/resolve-flake-slices conn spot-root spot-novelty
                                                                   error-ch range-opts)]
     (async/reduce (partial format-subject-flakes db cache context compact-fn select-spec)
