@@ -1,6 +1,6 @@
 (ns fluree.db.query.json-ld.response
   (:require [fluree.db.util.async :refer [<? go-try]]
-            [clojure.core.async :as async :refer [<! >! go]]
+            [clojure.core.async :as async :refer [<! >! go go-loop]]
             [fluree.db.permissions-validate :as validate]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.flake :as flake]
@@ -99,60 +99,69 @@
        unwrap-singleton))
 
 
+(defn reference?
+  [v]
+  (some? (::reference v)))
+
 (defn display-reference
   [db spec select-spec cache context compact-fn current-depth error-ch oid]
-  (go-try
-    (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
-          max-depth (:depth select-spec)
-          id-key    (:as (or (wildcard-spec db cache compact-fn const/$id)
-                             (cache-sid->iri db cache compact-fn const/$id)))
-          o-iri     (compact-fn (iri/decode-sid db oid))
-          subselect (:spec spec)]
-      (cond
-        ;; have a specified sub-selection (graph crawl)
-        subselect
-        (let [ref-attrs (<! (crawl-ref-item db context compact-fn oid subselect cache (inc current-depth) error-ch))]
-          (if (<? (includes-id? db oid subselect))
-            (assoc ref-attrs id-key o-iri)
-            ref-attrs))
+  (go
+    (try*
+      (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
+            max-depth (:depth select-spec)
+            id-key    (:as (or (wildcard-spec db cache compact-fn const/$id)
+                               (cache-sid->iri db cache compact-fn const/$id)))
+            o-iri     (compact-fn (iri/decode-sid db oid))
+            subselect (:spec spec)
+            ref       (cond
+                        ;; have a specified sub-selection (graph crawl)
+                        subselect
+                        (let [ref-attrs (<! (crawl-ref-item db context compact-fn oid subselect cache (inc current-depth) error-ch))]
+                          (if (<? (includes-id? db oid subselect))
+                            (assoc ref-attrs id-key o-iri)
+                            ref-attrs))
 
-        ;; requested graph crawl depth has not yet been reached
-        (< current-depth max-depth)
-        (cond-> (<! (crawl-ref-item db context compact-fn oid select-spec cache (inc current-depth) error-ch))
-          (<? (validate/allow-iri? db oid)) (assoc id-key o-iri))
+                        ;; requested graph crawl depth has not yet been reached
+                        (< current-depth max-depth)
+                        (cond-> (<! (crawl-ref-item db context compact-fn oid select-spec cache (inc current-depth) error-ch))
+                          (<? (validate/allow-iri? db oid)) (assoc id-key o-iri))
 
-        :else
-        (when (<? (validate/allow-iri? db oid))
-          {id-key o-iri})))))
+                        :else
+                        (when (<? (validate/allow-iri? db oid))
+                          {id-key o-iri}))]
+        (not-empty ref))
+      (catch* e
+              (log/error e "Error resolving reference")
+              (>! error-ch e)))))
 
 (defn resolve-reference
   [db cache context compact-fn select-spec current-depth error-ch v]
-  (go-try
-    (if-let [{:keys [sid spec]} (::reference v)]
-      (let [ref (<? (display-reference db spec select-spec cache context
-                                       compact-fn current-depth error-ch sid))]
-        (not-empty ref))
-      v)))
+  (let [{:keys [sid spec]} (::reference v)]
+    (display-reference db spec select-spec cache context
+                       compact-fn current-depth error-ch sid)))
 
 (defn resolve-references
   [db cache context compact-fn select-spec current-depth error-ch attrs]
-  (go-try
-    (loop [[[prop v] & r] attrs
-           resolved-attrs   {}]
-      (if prop
-        (let [v' (if (sequential? v)
-                   (loop [[value & r] v
-                          resolved-values   []]
-                     (if value
+  (go-loop [[[prop v] & r] attrs
+            resolved-attrs {}]
+    (if prop
+      (let [v' (if (sequential? v)
+                 (loop [[value & r]     v
+                        resolved-values []]
+                   (if value
+                     (if (reference? value)
                        (if-let [resolved (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch value))]
                          (recur r (conj resolved-values resolved))
                          (recur r resolved-values))
-                       (not-empty resolved-values)))
-                   (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch v)))]
-          (if (some? v')
-            (recur r (assoc resolved-attrs prop v'))
-            (recur r resolved-attrs)))
-        resolved-attrs))))
+                       (recur r (conj resolved-values value)))
+                     (not-empty resolved-values)))
+                 (if (reference? v)
+                   (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch v))
+                   v))]
+        (if (some? v')
+          (recur r (assoc resolved-attrs prop v'))
+          (recur r resolved-attrs)))
+      resolved-attrs)))
 
 (defn format-object
   [spec f]
