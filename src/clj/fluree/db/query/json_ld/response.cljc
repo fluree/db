@@ -98,6 +98,22 @@
                       (map :as)))
        unwrap-singleton))
 
+(defn format-reference
+  [spec f]
+  (let [obj (flake/o f)]
+    {::reference {:sid  obj
+                  :spec spec}}))
+
+(defn format-object
+  [spec f]
+  (let [dt (flake/dt f)]
+    (if (= const/$xsd:anyURI dt)
+      (format-reference spec f)
+      (let [obj (flake/o f)]
+        (if (= const/$rdf:json dt)
+          (json/parse obj false)
+          obj)))))
+
 
 (defn reference?
   [v]
@@ -163,16 +179,6 @@
           (recur r resolved-attrs)))
       resolved-attrs)))
 
-(defn format-object
-  [spec f]
-  (let [obj (flake/o f)]
-    (cond
-      (= const/$xsd:anyURI (flake/dt f))
-      {::reference {:sid  obj
-                    :spec spec}}
-
-      (= const/$rdf:json (flake/dt f))
-      (json/parse obj false)
 
       :else obj)))
 
