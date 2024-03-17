@@ -99,16 +99,16 @@
        unwrap-singleton))
 
 (defn format-reference
-  [spec f]
-  (let [obj (flake/o f)]
-    {::reference {:sid  obj
-                  :spec spec}}))
+  [spec sid]
+  {::reference {:sid  sid
+                :spec spec}})
 
 (defn format-object
   [spec f]
-  (let [dt (flake/dt f)]
+  (let [obj (flake/o f)
+        dt (flake/dt f)]
     (if (= const/$xsd:anyURI dt)
-      (format-reference spec f)
+      (format-reference spec obj)
       (let [obj (flake/o f)]
         (if (= const/$rdf:json dt)
           (json/parse obj false)
