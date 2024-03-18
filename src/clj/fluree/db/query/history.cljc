@@ -127,7 +127,7 @@
   [db cache context compact error-ch s-flakes]
   (json-ld-resp/flakes->res db cache context compact
                             {:wildcard? true, :depth 0}
-                            0 error-ch s-flakes))
+                            0 nil error-ch s-flakes))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
@@ -282,11 +282,11 @@
                      t-flakes)
            commit-wrapper-chan (json-ld-resp/flakes->res db cache context compact
                                                          {:wildcard? true, :depth 0}
-                                                         0 error-ch commit-wrapper-flakes)
+                                                         0 nil error-ch commit-wrapper-flakes)
 
            commit-meta-chan    (json-ld-resp/flakes->res db cache context compact
                                                          {:wildcard? true, :depth 0}
-                                                         0 error-ch commit-meta-flakes)
+                                                         0 nil error-ch commit-meta-flakes)
 
            commit-wrapper      (<! commit-wrapper-chan)
            commit-meta         (<! commit-meta-chan)

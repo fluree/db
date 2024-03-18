@@ -88,7 +88,7 @@
   [{:keys [db cache context compact-fn select-spec error-ch] :as _opts}]
   (fn [flakes port]
     (go
-      (let [result (<! (json-ld-resp/flakes->res db cache context compact-fn select-spec 0 error-ch flakes))]
+      (let [result (<! (json-ld-resp/flakes->res db cache context compact-fn select-spec 0 nil error-ch flakes))]
         (when (not-empty result)
           (>! port result)))
       (async/close! port))))

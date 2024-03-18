@@ -38,35 +38,10 @@
 
 (declare flakes->res)
 (defn crawl-ref-item
-  [db context compact-fn flake-sid sub-select cache depth-i error-ch]
+  [db context compact-fn flake-sid sub-select cache depth-i fuel-tracker error-ch]
   (go-try
     (let [sub-flakes (<? (query-range/index-range db :spot = [flake-sid]))]
-      (<? (flakes->res db cache context compact-fn sub-select depth-i error-ch sub-flakes)))))
-
-(defn add-reverse-specs
-  "When @reverse variables are present, crawl for the reverse specs."
-  [db cache context compact-fn {:keys [reverse] :as select-spec} depth-i error-ch flakes]
-  (go-try
-    (let [sid (flake/s (first flakes))]
-      (loop [[reverse-item & r] (vals reverse)
-             acc {}]
-        (if reverse-item
-          (let [{:keys [id as spec]} reverse-item
-                sub-flakes (<? (query-range/index-range db :opst = [sid id]))
-                result     (loop [[ref-sid & r] (map flake/s sub-flakes)
-                                  acc-item []]
-                             (if ref-sid
-                               (let [result (if spec
-                                              ;; have a sub-selection
-                                              (<! (crawl-ref-item db context compact-fn ref-sid spec cache (inc depth-i) error-ch))
-                                              ;; no sub-selection, just return IRI
-                                              (:as (cache-sid->iri db cache compact-fn ref-sid)))]
-                                 (recur r (conj acc-item result)))
-                               (if (= 1 (count acc-item))
-                                 (first acc-item)
-                                 acc-item)))]
-            (recur r (assoc acc as result)))
-          acc)))))
+      (<? (flakes->res db cache context compact-fn sub-select depth-i fuel-tracker error-ch sub-flakes)))))
 
 (defn includes-id?
   [db sid {:keys [wildcard?] :as select-spec}]
@@ -175,7 +150,7 @@
   (some? (::reference v)))
 
 (defn display-reference
-  [db spec select-spec cache context compact-fn current-depth error-ch oid]
+  [db spec select-spec cache context compact-fn current-depth fuel-tracker error-ch oid]
   (go
     (try*
       (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
@@ -187,14 +162,14 @@
             ref       (cond
                         ;; have a specified sub-selection (graph crawl)
                         subselect
-                        (let [ref-attrs (<! (crawl-ref-item db context compact-fn oid subselect cache (inc current-depth) error-ch))]
+                        (let [ref-attrs (<! (crawl-ref-item db context compact-fn oid subselect cache (inc current-depth) fuel-tracker error-ch))]
                           (if (<? (includes-id? db oid subselect))
                             (assoc ref-attrs id-key o-iri)
                             ref-attrs))
 
                         ;; requested graph crawl depth has not yet been reached
                         (< current-depth max-depth)
-                        (cond-> (<! (crawl-ref-item db context compact-fn oid select-spec cache (inc current-depth) error-ch))
+                        (cond-> (<! (crawl-ref-item db context compact-fn oid select-spec cache (inc current-depth) fuel-tracker error-ch))
                           (<? (validate/allow-iri? db oid)) (assoc id-key o-iri))
 
                         :else
@@ -206,13 +181,13 @@
               (>! error-ch e)))))
 
 (defn resolve-reference
-  [db cache context compact-fn select-spec current-depth error-ch v]
+  [db cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
   (let [{:keys [sid spec]} (::reference v)]
     (display-reference db spec select-spec cache context
-                       compact-fn current-depth error-ch sid)))
+                       compact-fn current-depth fuel-tracker error-ch sid)))
 
 (defn resolve-references
-  [db cache context compact-fn select-spec current-depth error-ch attr-ch]
+  [db cache context compact-fn select-spec current-depth fuel-tracker error-ch attr-ch]
   (go (when-let [attrs (<! attr-ch)]
         (loop [[[prop v] & r] attrs
                resolved-attrs {}]
@@ -222,41 +197,48 @@
                               resolved-values []]
                          (if value
                            (if (reference? value)
-                             (if-let [resolved (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch value))]
+                             (if-let [resolved (<! (resolve-reference db cache context compact-fn select-spec current-depth fuel-tracker error-ch value))]
                                (recur r (conj resolved-values resolved))
                                (recur r resolved-values))
                              (recur r (conj resolved-values value)))
                            (not-empty resolved-values)))
                        (if (reference? v)
-                         (<! (resolve-reference db cache context compact-fn select-spec current-depth error-ch v))
+                         (<! (resolve-reference db cache context compact-fn select-spec current-depth fuel-tracker error-ch v))
                          v))]
               (if (some? v')
                 (recur r (assoc resolved-attrs prop v'))
                 (recur r resolved-attrs)))
             resolved-attrs)))))
 
-
-
-(defn flakes->res
-  "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
-  the requested depth within the select-spec"
-  [db cache context compact-fn {:keys [reverse] :as select-spec} depth-i error-ch s-flakes]
+(defn add-reverse-specs
+  "When @reverse variables are present, crawl for the reverse specs."
+  [db cache context compact-fn {:keys [reverse] :as select-spec} depth-i fuel-tracker error-ch flakes]
   (go-try
-    (when (not-empty s-flakes)
-      (let [sid             (->> s-flakes first flake/s)
-            formatted-attrs (<! (->> s-flakes
-                                     (format-subject db cache context compact-fn select-spec sid error-ch)
-                                     (resolve-references db cache context compact-fn select-spec depth-i error-ch)))]
-        (if reverse
-          (merge formatted-attrs (<? (add-reverse-specs db cache context compact-fn select-spec
-                                                       depth-i error-ch s-flakes)))
-          formatted-attrs)))))
+    (let [sid (flake/s (first flakes))]
+      (loop [[reverse-item & r] (vals reverse)
+             acc {}]
+        (if reverse-item
+          (let [{:keys [id as spec]} reverse-item
+                sub-flakes (<? (query-range/index-range db :opst = [sid id]))
+                result     (loop [[ref-sid & r] (map flake/s sub-flakes)
+                                  acc-item []]
+                             (if ref-sid
+                               (let [result (if spec
+                                              ;; have a sub-selection
+                                              (<! (crawl-ref-item db context compact-fn ref-sid spec cache (inc depth-i) fuel-tracker error-ch))
+                                              ;; no sub-selection, just return IRI
+                                              (:as (cache-sid->iri db cache compact-fn ref-sid)))]
+                                 (recur r (conj acc-item result)))
+                               (if (= 1 (count acc-item))
+                                 (first acc-item)
+                                 acc-item)))]
+            (recur r (assoc acc as result)))
+          acc)))))
 
 (defn resolve-subject-properties
-  [{:keys [conn t] :as db} iri initial-attrs cache context compact-fn select-spec fuel-tracker error-ch]
+  [{:keys [conn t] :as db} sid initial-attrs cache context compact-fn select-spec fuel-tracker error-ch]
   (let [spot-root               (get db :spot)
         spot-novelty            (get-in db [:novelty :spot])
-        sid                     (iri/encode-iri db iri)
         [start-flake end-flake] (flake-bounds db :spot [sid])
         range-opts              {:from-t      t
                                  :to-t        t
@@ -268,3 +250,18 @@
                                                                   error-ch range-opts)]
     (async/reduce (partial format-subject-flakes db cache context compact-fn select-spec)
                   initial-attrs flake-slices)))
+(defn flakes->res
+  "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
+  the requested depth within the select-spec"
+  [db cache context compact-fn {:keys [reverse] :as select-spec} depth-i fuel-tracker error-ch s-flakes]
+  (go-try
+    (when (not-empty s-flakes)
+      (let [sid             (->> s-flakes first flake/s)
+            formatted-attrs (<! (->> s-flakes
+                                     (format-subject db cache context compact-fn select-spec sid error-ch)
+                                     (resolve-references db cache context compact-fn select-spec depth-i fuel-tracker error-ch)))]
+        (if reverse
+          (merge formatted-attrs (<? (add-reverse-specs db cache context compact-fn select-spec
+                                                       depth-i fuel-tracker error-ch s-flakes)))
+          formatted-attrs)))))
+
