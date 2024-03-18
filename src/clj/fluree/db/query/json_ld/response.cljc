@@ -210,22 +210,6 @@
                 (recur r resolved-attrs)))
             resolved-attrs)))))
 
-(defn resolve-subject-properties
-  [{:keys [conn t] :as db} sid initial-attrs cache context compact-fn select-spec fuel-tracker error-ch]
-  (let [spot-root               (get db :spot)
-        spot-novelty            (get-in db [:novelty :spot])
-        [start-flake end-flake] (flake-bounds db :spot [sid])
-        range-opts              {:from-t      t
-                                 :to-t        t
-                                 :start-flake start-flake
-                                 :end-flake   end-flake
-                                 :flake-xf    (when fuel-tracker
-                                                (fuel/track fuel-tracker error-ch))}
-        flake-slices            (query-range/resolve-flake-slices conn spot-root spot-novelty
-                                                                  error-ch range-opts)]
-    (async/reduce (partial format-subject-flakes db cache context compact-fn select-spec)
-                  initial-attrs flake-slices)))
-
 (defn reverse-property
   [{:keys [conn t] :as db} cache context compact-fn oid {:keys [as spec], p-iri :iri, :as reverse-spec} current-depth fuel-tracker error-ch]
   (let [pid                     (iri/encode-iri db p-iri)
