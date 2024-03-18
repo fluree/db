@@ -211,7 +211,7 @@
             resolved-attrs)))))
 
 (defn reverse-property
-  [{:keys [conn t] :as db} cache context compact-fn oid {:keys [as spec], p-iri :iri, :as reverse-spec} current-depth fuel-tracker error-ch]
+  [{:keys [conn t] :as db} cache compact-fn oid {:keys [as spec], p-iri :iri, :as reverse-spec} fuel-tracker error-ch]
   (let [pid                     (iri/encode-iri db p-iri)
         opst-root               (:opst db)
         opst-novelty            (get-in db [:novelty :opst])
@@ -240,14 +240,14 @@
                      range-ch)))
 
 (defn reverse-properties
-  [db oid cache context compact-fn reverse-map current-depth fuel-tracker error-ch]
+  [db oid cache compact-fn reverse-map fuel-tracker error-ch]
   (let [out-ch (async/chan 32)]
 
     (async/pipeline-async 32
                           out-ch
                           (fn [reverse-spec ch]
                             (-> db
-                                (reverse-property cache context compact-fn oid reverse-spec current-depth fuel-tracker error-ch)
+                                (reverse-property cache compact-fn oid reverse-spec fuel-tracker error-ch)
                                 (async/pipe ch)))
                           (async/to-chan! (vals reverse-map)))
 
@@ -261,7 +261,7 @@
     (let [sid        (->> s-flakes first flake/s)
           forward-ch (format-subject db cache context compact-fn select-spec sid error-ch s-flakes)
           subject-ch (if reverse
-                       (let [reverse-ch (reverse-properties db sid cache context compact-fn reverse current-depth fuel-tracker error-ch)]
+                       (let [reverse-ch (reverse-properties db sid cache compact-fn reverse fuel-tracker error-ch)]
                          (->> [forward-ch reverse-ch]
                               async/merge
                               (async/reduce merge {})))
