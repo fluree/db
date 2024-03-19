@@ -271,3 +271,10 @@
                 (zipmap expected actual))
 
         :else false)))
+
+(defn deterministic-blank-node-fixture
+  [f]
+  (let [counter (atom 0)
+        deterministic-new-blank-node-id (fn [] (str "_:fdb-" (swap! counter inc)))]
+    (with-redefs [fluree.db.json-ld.iri/new-blank-node-id deterministic-new-blank-node-id]
+      (f))))
