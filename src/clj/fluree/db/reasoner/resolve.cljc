@@ -23,25 +23,24 @@
   [rules post-flakes]
   :TODO)
 
-(defn extract-pattern*
-  [patterns]
-  (reduce
-    (fn [acc triple-pattern]
-      (conj acc
-            (mapv
-              (fn [individual]
-                (if (contains? individual ::exec-where/var)
-                  nil
-                  (::exec-where/iri individual)))
-              triple-pattern)))
-    #{}
-    patterns))
-
 (defn extract-pattern
-  [rule-statement context]
-  (let [patterns (-> (parse/parse-where-clause rule-statement nil context)
-                     ::exec-where/patterns)]
-    (extract-pattern* patterns)))
+  [triple-pattern]
+  (mapv
+    (fn [individual]
+      (if (contains? individual ::exec-where/var)
+        nil
+        (::exec-where/iri individual)))
+    triple-pattern))
+
+(defn extract-patterns
+  [where-patterns]
+  (reduce
+    (fn [acc pattern]
+      (if (= :class (first pattern))
+        (conj acc (extract-pattern (second pattern)))
+        (conj acc (extract-pattern pattern))))
+    #{}
+    where-patterns))
 
 (defn flake-tests
   "Generates 'test' flakes to test if any patterns in this rule match
@@ -61,8 +60,8 @@
         insert          (get rule "insert")
         rule-parsed     (q-parse/parse-txn {const/iri-where  [{:value where}]
                                             const/iri-insert [{:value insert}]} context)
-        where-patterns  (extract-pattern* (::exec-where/patterns (:where rule-parsed)))
-        insert-patterns (extract-pattern* (:insert rule-parsed))]
+        where-patterns  (extract-patterns (::exec-where/patterns (:where rule-parsed)))
+        insert-patterns (extract-patterns (:insert rule-parsed))]
     {:deps        where-patterns
      :gens        insert-patterns
      :flake-tests (flake-tests where-patterns)

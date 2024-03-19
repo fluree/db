@@ -5,6 +5,7 @@
 
 ;; conversions of owl statements to datalog
 
+;; property expressions
 (def ^:const $rdfs-domain "http://www.w3.org/2000/01/rdf-schema#domain")
 (def ^:const $rdfs-range "http://www.w3.org/2000/01/rdf-schema#range")
 (def ^:const $owl-sameAs "http://www.w3.org/2002/07/owl#sameAs")
@@ -16,8 +17,12 @@
 (def ^:const $owl-inverseOf "http://www.w3.org/2002/07/owl#inverseOf")
 (def ^:const $owl-hasKey "http://www.w3.org/2002/07/owl#hasKey")
 
-(def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
+;; class expressions
 (def ^:const $owl-equivalentClass "http://www.w3.org/2002/07/owl#equivalentClass")
+(def ^:const $owl-intersectionOf "http://www.w3.org/2002/07/owl#intersectionOf")
+
+(def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
+
 (def ^:const $owl-Restriction "http://www.w3.org/2002/07/owl#Restriction")
 (def ^:const $owl-hasValue "http://www.w3.org/2002/07/owl#hasValue")
 (def ^:const $owl-someValuesFrom "http://www.w3.org/2002/07/owl#someValuesFrom")
@@ -183,6 +188,26 @@
         (conj [(str $owl-inverseOf "(prp-inv1)") rule1])
         (conj [(str $owl-inverseOf "(prp-inv2)") rule2]))))
 
+(defmethod to-datalog ::cax-eqc
+  [_ _ owl-statement all-rules]
+  (let [c1    (:id owl-statement) ;; the class which is the subject
+        ;; combine with all other equivalent classes for a set of 2+ total classes
+        c-all (->> (get owl-statement $owl-equivalentClass)
+                   (map :id)
+                   (into #{c1}))
+        ;; every class needs to have every other class added
+        rules (map-indexed (fn [idx cn]
+                             (let [rule-id (str c1 "(owl:equivalentClass-" idx ")")
+                                   rule    {"where"  {"@id"   "?x"
+                                                      "@type" cn}
+                                            "insert" {"@id"   "?x"
+                                                      "@type" (into [] (disj c-all cn))}}]
+
+                               [rule-id rule]))
+                           c-all)]
+    (into all-rules rules)))
+
+
 ;; TODO - re-enable once filter function bug is fixed
 (defmethod to-datalog ::prp-key
   [_ _ owl-statement all-rules]
@@ -250,6 +275,9 @@
 
              (contains? owl-statement $owl-hasKey)
              (to-datalog ::prp-key inserts owl-statement)
+
+             (contains? owl-statement $owl-equivalentClass)
+             (to-datalog ::cax-eqc inserts owl-statement)
 
              (some #(= $owl-FunctionalProperty %) (:type owl-statement))
              (to-datalog ::prp-fp inserts owl-statement)
