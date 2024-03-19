@@ -8,6 +8,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
+            [fluree.json-ld :as json-ld]
             [clojure.string :as str]
             [clojure.set :as set]
             [clojure.core.async :as async])
@@ -1080,7 +1081,7 @@
         :path       path
         :value      n
         :expect     max
-        :message    (str "count " n " is greater than maximum count of" max)
+        :message    (str "count " n " is greater than maximum count of " max)
         :constraint const/sh_maxCount
         :shape      shape-id}])))
 
@@ -1151,26 +1152,28 @@
 
 (defn explain-result
   [{:keys [subject constraint shape path message]}]
-  (str  subject " " path " violates " constraint " constraint of shape " shape ": " message "."))
+  (str  subject " " path " violates " constraint " constraint of shape " shape " - " message "."))
 
 (defn format-result
-  [ns-codes result]
-  (-> result
-      (update :subject #(iri/sid->iri % ns-codes))
-      (update :path (fn [path] (mapv #(iri/sid->iri % ns-codes) path)))
-      (update :constraint #(iri/sid->iri % ns-codes))
-      (update :shape #(iri/sid->iri % ns-codes))))
+  [ns-codes context result]
+  (let [compact-iri (fn [sid] (-> (iri/sid->iri sid ns-codes)
+                                  (json-ld/compact context)))]
+    (-> result
+        (update :subject compact-iri)
+        (update :path (fn [path] (mapv compact-iri path)))
+        (update :constraint compact-iri)
+        (update :shape compact-iri))))
 
 (defn throw-shacl-violation
-  [db results]
+  [{ns-codes :namespace-codes} context results]
   (println "DEP throw-shacl-violation" (count results))
   (def r results)
-  (let [formatted (mapv (partial format-result (:namespace-codes db)) results)
-        message (->> (mapv explain-result formatted)
-                     (str/join "\n"))]
+  (let [formatted (mapv (partial format-result ns-codes context) results)
+        message   (->> (mapv explain-result formatted)
+                       (str/join "\n"))]
     (throw (ex-info message
                     {:status 400
-                     :error :shacl/violation
+                     :error  :shacl/violation
                      :report formatted}))))
 
 (defn all-node-shape-ids
@@ -1187,7 +1190,7 @@
   the shapes in the shape-db.
 
   `modified-subjects` is a sequence of s-flakes of modified subjects."
-  [shape-db data-db modified-subjects]
+  [shape-db data-db modified-subjects context]
   (def sg shape-db)
   (def dg data-db)
   (def mods modified-subjects)
@@ -1203,4 +1206,4 @@
             (let [results (validate-node-shape shape-db data-db shape subject s-flakes)]
               (println "DEP report" (pr-str results))
               (when results
-                (throw-shacl-violation data-db results)))))))))
+                (throw-shacl-violation data-db context results)))))))))

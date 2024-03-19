@@ -59,11 +59,11 @@
               staged-map)))))))
 
 (defn validate
-  [{:keys [db-after db-before mods] :as staged-map}]
+  [{:keys [db-after db-before mods context] :as staged-map}]
   (def sm staged-map)
   (go-try
     (let [root-db (dbproto/-rootdb db-after)]
-      (<? (shacl/validate! db-before root-db (vals mods)))
+      (<? (shacl/validate! db-before root-db (vals mods) context))
       staged-map)))
 
 ;; TODO - can use transient! below
@@ -88,23 +88,24 @@
   "Generates a state map for transaction processing. When optional
   reasoned-from-IRI is provided, will mark any new flakes as reasoned from the
   provided value in the flake's metadata (.-m) as :reasoned key."
-  ([db txn author-did]
-   (->tx-state db txn author-did nil))
+  ([db context txn author-did]
+   (->tx-state db context txn author-did nil))
 
-  ([db txn author-did reasoned-from-iri]
+  ([db context txn author-did reasoned-from-iri]
   (let [{:keys [policy], db-t :t} db
 
         commit-t  (-> db :commit commit-data/t)
         t         (flake/next-t commit-t)
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before
+     :context       context
      :txn           txn
      :author-did    author-did
      :policy        policy
-     :stage-update? (= t db-t) ; if a previously staged db is getting updated
-                               ; again before committed
+     :stage-update? (= t db-t)          ; if a previously staged db is getting updated
+                                        ; again before committed
      :t             t
-     :reasoner-max  10 ; maximum number of reasoner iterations before exception
+     :reasoner-max  10          ; maximum number of reasoner iterations before exception
      :reasoned      reasoned-from-iri})))
 
 (defn into-flakeset
@@ -199,7 +200,7 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [db new-flakes {:keys [stage-update? policy t txn author-did db-before] :as _tx-state}]
+  [db new-flakes {:keys [stage-update? policy t txn author-did db-before context] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
@@ -214,7 +215,7 @@
                         (commit-data/update-novelty add remove)
                         (commit-data/add-tt-id)
                         (vocab/hydrate-schema add mods))]
-      {:add add :remove remove :db-after db-after :db-before db-before :mods mods})))
+      {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
@@ -246,6 +247,6 @@
            db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                         (<? (perm/wrap-policy db policy-identity))
                         db)
-           tx-state   (->tx-state db* raw-txn did)
+           tx-state   (->tx-state db* context raw-txn did)
            flakes     (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
        (<? (flakes->final-db fuel-tracker tx-state flakes))))))
