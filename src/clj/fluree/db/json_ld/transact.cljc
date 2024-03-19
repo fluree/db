@@ -62,11 +62,11 @@
               staged-map)))))))
 
 (defn validate
-  [{:keys [db-after db-before mods] :as staged-map}]
+  [{:keys [db-after db-before mods context] :as staged-map}]
   (def sm staged-map)
   (go-try
     (let [root-db (dbproto/-rootdb db-after)]
-      (<? (shacl/validate! db-before root-db (vals mods)))
+      (<? (shacl/validate! db-before root-db (vals mods) context))
       staged-map)))
 
 ;; TODO - can use transient! below
@@ -88,17 +88,18 @@
       [(not-empty adds) (not-empty removes)])))
 
 (defn ->tx-state
-  [db txn-id author-did]
+  [db context txn-id author-did]
   (let [{:keys [branch ledger policy], db-t :t} db
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t         (inc commit-t)
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before
-     :txn-id                   txn-id
-     :author-did               author-did
+     :context       context
+     :txn-id        txn-id
+     :author-did    author-did
      :policy        policy
-     :stage-update? (= t db-t) ; if a previously staged db is getting updated
-                               ; again before committed
+     :stage-update? (= t db-t)          ; if a previously staged db is getting updated
+                                        ; again before committed
      :t             t}))
 
 (defn into-flakeset
@@ -193,7 +194,7 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [db new-flakes {:keys [stage-update? policy t txn-id author-did db-before] :as _tx-state}]
+  [db new-flakes {:keys [stage-update? policy t txn-id author-did db-before context] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
@@ -208,7 +209,7 @@
                         (commit-data/update-novelty add remove)
                         (commit-data/add-tt-id)
                         (vocab/hydrate-schema add mods))]
-      {:add add :remove remove :db-after db-after :db-before db-before :mods mods})))
+      {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
@@ -244,6 +245,6 @@
            {txn-id :address}
            (<? (conn-proto/-txn-write conn ledger raw-txn))
 
-           tx-state (->tx-state db* txn-id did)
+           tx-state (->tx-state db* context txn-id did)
            flakes   (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
        (<? (flakes->final-db tx-state flakes))))))

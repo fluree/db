@@ -1,9 +1,11 @@
 (ns fluree.db.shacl.shacl-basic-test
   (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]))
+
+(use-fixtures :each test-utils/deterministic-blank-node-fixture)
 
 (deftest ^:integration using-pre-defined-types-as-classes
   (testing "Class not used as class initially can still be used as one."
@@ -75,13 +77,31 @@
                              :schema/name     ["John", "Johnny"]
                              :schema/callSign "j-rock"}})
                          (catch Exception e e))]
-      (is (util/exception? db-no-names)
-          "Exception, because :schema/name requires at least 1 value.")
-      (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+      (is (= {:status 400,
+              :error :shacl/violation
+              :report
+              [{:subject :ex/john
+                :path [:schema/name]
+                :value 0
+                :expect 1
+                :constraint :sh/minCount
+                :message "count 0 is less than minimum count of 1"
+                :shape "_:fdb-2"}]}
+             (ex-data db-no-names)))
+      (is (= ":ex/john [:schema/name] violates :sh/minCount constraint of shape _:fdb-2 - count 0 is less than minimum count of 1."
              (ex-message db-no-names)))
-      (is (util/exception? db-two-names)
-          "Exception, because :schema/name can have at most 1 value.")
-      (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+      (is (= {:status 400,
+              :error :shacl/violation
+              :report
+              [{:subject :ex/john
+                :path [:schema/name]
+                :value 2
+                :expect 1
+                :message "count 2 is greater than maximum count of 1"
+                :constraint :sh/maxCount
+                :shape "_:fdb-2"}]}
+            (ex-data db-two-names)))
+      (is (= ":ex/john [:schema/name] violates :sh/maxCount constraint of shape _:fdb-2 - count 2 is greater than maximum count of 1."
              (ex-message db-two-names)))
       (is (= [{:id              :ex/john,
                :type            :ex/User,
