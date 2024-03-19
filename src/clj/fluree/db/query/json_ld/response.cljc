@@ -109,13 +109,17 @@
                            (unwrap-singleton p-iri context))))]
         [p-iri v]))))
 
+(defn format-subject-xf
+  [db cache context compact-fn select-spec]
+  (comp (partition-by flake/p)
+        (map (partial format-property db cache context
+                      compact-fn select-spec))
+        (remove nil?)))
+
 (defn format-subject-flakes
   [db cache context compact-fn select-spec initial-attrs flakes]
   (into initial-attrs
-        (comp (partition-by flake/p)
-              (map (partial format-property db cache context
-                            compact-fn select-spec))
-              (remove nil?))
+        (format-subject-xf db cache context compact-fn select-spec)
         flakes))
 
 (defn format-subject
