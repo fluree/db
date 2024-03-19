@@ -35,9 +35,9 @@
 (defn all
   [ds]
   (if (dataset? ds)
-    (-> ds
-        :default
-        (concat (-> ds :named vals)))
+    (->> (:default ds)
+         (concat (-> ds :named vals))
+         (into [] (distinct)))
     [ds]))
 
 (defn names
