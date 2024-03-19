@@ -49,7 +49,7 @@
 (defn reasoner-stage
   [db fuel-tracker txn-id author-did rule-id full-rule]
   (go-try
-    (let [tx-state   (transact/->tx-state db txn-id author-did rule-id)
+    (let [tx-state   (transact/->tx-state db {} txn-id author-did rule-id)
           parsed-txn (:rule-parsed full-rule)
           _          (when-not (:where parsed-txn)
                        (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
@@ -135,7 +135,7 @@
     (let [regimes         (set (util/sequential regimes))
           fuel-tracker    (fuel/tracker max-fuel)
           db*             (update db :reasoner #(into regimes %))
-          tx-state        (transact/->tx-state db* nil nil nil)
+          tx-state        (transact/->tx-state db* {} nil nil nil)
           raw-rules       (if graph
                             (rules-from-graph graph)
                             (<? (resolve/find-rules db*)))
