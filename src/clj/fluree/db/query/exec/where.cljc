@@ -342,8 +342,8 @@
                       :start-flake start-flake
                       :end-flake   end-flake
                       :flake-xf    flake-xf*}]
-     (-> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
-         (->> (query-range/filter-authorized db start-flake end-flake error-ch))))))
+     (->> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
+          (query-range/filter-authorized db start-flake end-flake error-ch)))))
 
 
 (defn compute-sid
