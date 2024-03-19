@@ -61,6 +61,14 @@
                 (vocab/reset-shapes (:schema db-after)))
               staged-map)))))))
 
+(defn validate
+  [{:keys [db-after db-before mods] :as staged-map}]
+  (def sm staged-map)
+  (go-try
+    (let [root-db (dbproto/-rootdb db-after)]
+      (<? (shacl/validate! db-before root-db (vals mods)))
+      staged-map)))
+
 ;; TODO - can use transient! below
 (defn stage-update-novelty
   "If a db is staged more than once, any retractions in a previous stage will
@@ -192,7 +200,7 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [db new-flakes {:keys [stage-update? policy t txn-id author-did] :as _tx-state}]
+  [db new-flakes {:keys [stage-update? policy t txn-id author-did db-before] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
@@ -207,7 +215,7 @@
                         (commit-data/update-novelty add remove)
                         (commit-data/add-tt-id)
                         (vocab/hydrate-schema add mods))]
-      {:add add :remove remove :db-after db-after :mods mods})))
+      {:add add :remove remove :db-after db-after :db-before db-before :mods mods})))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
@@ -219,6 +227,8 @@
           ;; TODO: remove the atom wrapper once subj-mods is no longer shared code
           tx-state* (assoc tx-state :subj-mods (atom subj-mods))]
       (-> (final-db db flakes tx-state)
+          <?
+          validate
           <?
           (validate-rules tx-state*)
           <?
