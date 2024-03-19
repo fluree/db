@@ -605,3 +605,7 @@
 (defn class-flake?
   [f]
   (= const/$rdf:type (p f)))
+
+(defn ref-flake?
+  [f]
+  (= const/$xsd:anyURI (dt f)))
