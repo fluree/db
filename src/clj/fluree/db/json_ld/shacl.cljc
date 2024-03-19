@@ -913,3 +913,294 @@
       :schema
       :pred
       (contains? const/sh_targetObjectsOf)))
+
+(defn build-shape-node
+  [db shape-sid]
+  (go-try
+    (let [flakes (<? (query-range/index-range db :spot = [shape-sid]))]
+      (if (seq flakes)
+        (loop [[f & r] flakes
+               node {const/$id shape-sid}]
+          (if f
+            (recur r (update node (flake/p f) (fnil conj [])
+                             (if (flake/ref-flake? f)
+                               (<? (build-shape-node db (flake/o f)))
+                               (flake/o f))))
+            node))
+        shape-sid))))
+
+(defn build-shape
+  [db shape-sid]
+  (go-try
+    (let [shapes-cache (-> db :schema :shapes)]
+      (if-let [shape (get @shapes-cache shape-sid)]
+        shape
+        (let [shape (<? (build-shape-node db shape-sid))]
+          (swap! shapes-cache assoc shape-sid shape)
+          shape)))))
+
+(defmulti validate-constraint
+  "A constraint whose focus nodes conform returns nil. A constraint that doesn't returns a
+  sequence of result maps."
+  (fn [shape-db data-db shape constraint subject focus-flakes]
+    (println "DEP validate-constraint dispatch" (pr-str constraint))
+    constraint))
+(defmethod validate-constraint :default [_ _ _ _ _ _] nil)
+
+(defn resolve-path-flakes2
+  [data-db path focus-flakes]
+  (println "DEP resolve-path-flakes path" (pr-str path))
+  (let [[segment] path]
+    (if (iri/sid? segment)
+      (filterv #(= (flake/p %) segment) focus-flakes)
+      (throw (ex-info "Unsupported property path." {:segment segment :path path})))))
+
+(defn validate-constraints
+  [shape-db data-db shape subject focus-flakes]
+  (println "DEP validate-constraints")
+  (loop [[[constraint] & r] shape
+         results []]
+    (if constraint
+      (if-let [results* (validate-constraint shape-db data-db shape constraint subject focus-flakes)]
+        (recur r (into results results*))
+        (recur r results))
+      (not-empty results))))
+
+(defn validate-property-shape
+  [shape-db data-db shape subject focus-flakes]
+  (let [{path const/sh_path} shape
+        ;; TODO: there can be multiple path-flakes after resolution, need to loop here...
+        path-flakes (resolve-path-flakes2 data-db path focus-flakes)]
+    (println "DEP property path flakes" (pr-str path-flakes))
+    (validate-constraints shape-db data-db shape subject path-flakes)))
+
+(defn target-node-target?
+  [shape s-flakes]
+  (let [sid        (some-> s-flakes first flake/s)
+        target-sid (first (get shape const/sh_targetNode))]
+    (println "DEP target-node-target?" (pr-str target-sid))
+    (= sid target-sid)))
+
+(defn target-class-target?
+  [shape s-flakes]
+  (def shape shape)
+  (def s-flakes s-flakes)
+  (let [target-class (first (get shape const/sh_targetClass))]
+    (println "DEP target-class-target?" (pr-str target-class))
+    (some (fn [f]
+            (and (flake/class-flake? f)
+                 (= (flake/o f) target-class)))
+          s-flakes)))
+
+(defn target-subjects-of-target?
+  [shape s-flakes]
+  (let [target-pid (first (get shape const/sh_targetSubjectsOf))]
+    (println "DEP target-subjects-of-target?" (pr-str target-pid))
+    (some (fn [f] (= (flake/p f) target-pid))
+          s-flakes)))
+
+(defn implicit-target?
+  "If a sh:NodeShape has a class it implicitly targets that node."
+  ;; https://www.w3.org/TR/shacl/#implicit-targetClass
+  [shape s-flakes]
+  (let [shape-classes (set (get shape const/$rdf:type))]
+    (println "DEP implicit-target?" (pr-str shape-classes))
+    (some (fn [f] (and (flake/class-flake? f)
+                       (contains? shape-classes (flake/o f))))
+          s-flakes)))
+
+(defn target-objects-of-target
+  [db shape s-flakes]
+  (go-try
+    (when-let [target-pid (first (get shape const/sh_targetObjectsOf))]
+      (println "DEP target-objects-of-target?" (pr-str target-pid))
+      (let [sid             (some-> s-flakes first flake/s)
+            referring-pids  (not-empty (<? (query-range/index-range db :opst = [sid] {:flake-xf (map flake/p)})))
+            p-flakes        (not-empty (filterv (fn [f] (= (flake/p f) target-pid)) s-flakes))]
+        [p-flakes (when referring-pids s-flakes)]))))
+
+(defn resolve-focus-flakes
+  "Return a sequence of focus flakes for the given node shape target."
+  [db shape s-flakes]
+  (go-try
+    (let [res
+          (cond (target-node-target? shape s-flakes)        [s-flakes]
+                (target-class-target? shape s-flakes)       [s-flakes]
+                (target-subjects-of-target? shape s-flakes) [s-flakes]
+                (implicit-target? shape s-flakes)           [s-flakes]
+                :else
+                ;; may target either s-flakes or p-flakes, or neither, or both
+                (<? (target-objects-of-target db shape s-flakes)))]
+      (println "DEP focus-flakes" (count res))
+      res)))
+
+(defn validate-node-shape
+  [shape-db data-db shape subject s-flakes]
+  (def shape shape)
+  (println "DEP validate-node-shape" (pr-str (get shape const/$id)) s-flakes)
+  (loop [[focus-flakes & r] (async/<!! (resolve-focus-flakes data-db shape s-flakes))
+         results []]
+    (if focus-flakes
+      (if-let [results* (validate-constraints shape-db data-db shape subject focus-flakes)]
+        (recur r (into results results*))
+        (recur r results))
+      (not-empty results))))
+
+;; value type constraints
+(defmethod validate-constraint const/sh_class [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_datatype [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_nodeKind [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+
+;; cardinality constraints
+(defmethod validate-constraint const/sh_minCount [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint) (pr-str subject))
+  (let [{expect const/sh_maxCount shape-id const/$id path const/sh_path} shape
+
+        [min] expect
+        n     (count focus-flakes)]
+    (when (< n min)
+      [{:subject    subject
+        :path       path
+        :value      n
+        :expect     min
+        :constraint const/sh_minCount
+        :message    (str "count " n " is less than minimum count of " min)
+        :shape      shape-id}])))
+(defmethod validate-constraint const/sh_maxCount [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint) )
+  (let [{expect const/sh_maxCount shape-id const/$id path const/sh_path} shape
+
+        [max] expect
+        n     (count focus-flakes)]
+    (when (> n max)
+      [{:subject    subject
+        :path       path
+        :value      n
+        :expect     max
+        :message    (str "count " n " is greater than maximum count of" max)
+        :constraint const/sh_maxCount
+        :shape      shape-id}])))
+
+;; value range constraints
+(defmethod validate-constraint const/sh_minExclusive [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_maxExclusive [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_minInclusive [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_maxInclusive [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+
+;; string-based constraints
+(defmethod validate-constraint const/sh_minLength [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_maxLength [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_pattern [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_languageIn [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_uniqueLang [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+
+;; property pair constraints
+(defmethod validate-constraint const/sh_equals [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_disjoint [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_lessThan [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_lessThanOrEquals [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+
+;; logical constraints
+(defmethod validate-constraint const/sh_not [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_and [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_or [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_xone [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+
+;; shape-based constraints
+(defmethod validate-constraint const/sh_node [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_property [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (loop [[p-shape & r] (get shape const/sh_property)
+         results []]
+    (if p-shape
+      (if-let [results* (validate-property-shape shape-db data-db p-shape subject focus-flakes)]
+        (recur r (into results results*))
+        (recur r results))
+      (not-empty results))))
+(defmethod validate-constraint const/sh_qualifiedValueShape [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+
+;; other constraints
+(defmethod validate-constraint const/sh_closed [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_hasValue [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_in [shape-db data-db shape constraint subject focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint)))
+
+(defn explain-result
+  [{:keys [subject constraint shape path message]}]
+  (str  subject " " path " violates " constraint " constraint of shape " shape ": " message "."))
+
+(defn format-result
+  [ns-codes result]
+  (-> result
+      (update :subject #(iri/sid->iri % ns-codes))
+      (update :path (fn [path] (mapv #(iri/sid->iri % ns-codes) path)))
+      (update :constraint #(iri/sid->iri % ns-codes))
+      (update :shape #(iri/sid->iri % ns-codes))))
+
+(defn throw-shacl-violation
+  [db results]
+  (println "DEP throw-shacl-violation" (count results))
+  (def r results)
+  (let [formatted (mapv (partial format-result (:namespace-codes db)) results)
+        message (->> (mapv explain-result formatted)
+                     (str/join "\n"))]
+    (throw (ex-info message
+                    {:status 400
+                     :error :shacl/violation
+                     :report formatted}))))
+
+(defn all-node-shape-ids
+  [db]
+  (def db db)
+  (query-range/index-range db :post = [const/$rdf:type const/sh_NodeShape]
+                           {:flake-xf (map flake/s)}))
+
+(defn validate!
+  "Will throw an exception if any of the modified subjects fails to conform to a shape that targets it.
+
+  The `shape-db` is the db-before, since newly transacted shapes are not applied to the
+  transaction they appear in. The `data-db` is the db after, and it has to conform to
+  the shapes in the shape-db.
+
+  `modified-subjects` is a sequence of s-flakes of modified subjects."
+  [shape-db data-db modified-subjects]
+  (def sg shape-db)
+  (def dg data-db)
+  (def mods modified-subjects)
+  (println "DEP validate!" (pr-str modified-subjects))
+  (go-try
+    (doseq [s-flakes modified-subjects]
+      (doseq [shape-sid (<? (all-node-shape-ids shape-db))]
+        (let [subject (-> s-flakes first flake/s)
+              shape (<? (build-shape shape-db shape-sid))]
+          (println "DEP shape" (pr-str shape-sid))
+          ;; only enforce activated shapes
+          (when (not (get shape const/sh_deactivated))
+            (let [results (validate-node-shape shape-db data-db shape subject s-flakes)]
+              (println "DEP report" (pr-str results))
+              (when results
+                (throw-shacl-violation data-db results)))))))))
