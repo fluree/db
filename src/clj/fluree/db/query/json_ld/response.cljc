@@ -226,9 +226,9 @@
                      range-ch)))
 
 (defn reverse-properties
-  [db oid cache compact-fn reverse-map fuel-tracker error-ch]
-  (let [out-ch (async/chan 32)]
-
+  [db iri cache compact-fn reverse-map fuel-tracker error-ch]
+  (let [out-ch (async/chan 32)
+        oid    (iri/encode-iri db iri)]
     (async/pipeline-async 32
                           out-ch
                           (fn [reverse-spec ch]
@@ -259,11 +259,12 @@
   [db cache context compact-fn {:keys [reverse] :as select-spec} current-depth fuel-tracker error-ch s-flakes]
   (if (not-empty s-flakes)
     (let [sid           (->> s-flakes first flake/s)
+          s-iri         (iri/decode-sid db sid)
           subject-attrs (into {}
                               (format-subject-xf db cache context compact-fn select-spec)
                               s-flakes)
           subject-ch    (if reverse
-                          (let [reverse-ch (reverse-properties db sid cache compact-fn reverse fuel-tracker error-ch)]
+                          (let [reverse-ch (reverse-properties db s-iri cache compact-fn reverse fuel-tracker error-ch)]
                             (async/reduce conj subject-attrs reverse-ch))
                           (go subject-attrs))]
       (->> subject-ch
