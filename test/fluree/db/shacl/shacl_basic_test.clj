@@ -201,9 +201,19 @@
                               :schema/name  "John"
                               :schema/email "john@flur.ee"}})
                           (catch Exception e e))]
-      (is (util/exception? db-extra-prop))
-      (is (= (ex-message db-extra-prop)
-             "SHACL shape is closed, extra properties not allowed: [\"http://schema.org/email\"]"))
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/john,
+                :constraint :sh/closed,
+                :shape :ex/UserShape,
+                :path [:schema/email],
+                :value ["john@flur.ee"],
+                :expect [:type :schema/name],
+                :message "disallowed path :schema/email with values john@flur.ee"}]}
+             (ex-data db-extra-prop)))
+      (is (= ":ex/john [:schema/email] violates :sh/closed constraint of shape :ex/UserShape - disallowed path :schema/email with values john@flur.ee."
+             (ex-message db-extra-prop)))
 
       (is (= [{:id          :ex/john
                :type        :ex/User
