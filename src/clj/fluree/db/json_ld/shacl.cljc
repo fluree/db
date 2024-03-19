@@ -943,10 +943,10 @@
 (defmulti validate-constraint
   "A constraint whose focus nodes conform returns nil. A constraint that doesn't returns a
   sequence of result maps."
-  (fn [shape-db data-db shape constraint subject focus-flakes]
+  (fn [v-ctx constraint focus-flakes]
     (println "DEP validate-constraint dispatch" (pr-str constraint))
     constraint))
-(defmethod validate-constraint :default [_ _ _ _ _ _] nil)
+(defmethod validate-constraint :default [_ _ _] nil)
 
 (defn resolve-path-flakes2
   [data-db path focus-flakes]
@@ -957,23 +957,23 @@
       (throw (ex-info "Unsupported property path." {:segment segment :path path})))))
 
 (defn validate-constraints
-  [shape-db data-db shape subject focus-flakes]
+  [{:keys [shape] :as v-ctx} focus-flakes]
   (println "DEP validate-constraints")
   (loop [[[constraint] & r] shape
          results []]
     (if constraint
-      (if-let [results* (validate-constraint shape-db data-db shape constraint subject focus-flakes)]
+      (if-let [results* (validate-constraint v-ctx constraint focus-flakes)]
         (recur r (into results results*))
         (recur r results))
       (not-empty results))))
 
 (defn validate-property-shape
-  [shape-db data-db shape subject focus-flakes]
+  [{:keys [data-db shape] :as v-ctx} focus-flakes]
   (let [{path const/sh_path} shape
         ;; TODO: there can be multiple path-flakes after resolution, need to loop here...
         path-flakes (resolve-path-flakes2 data-db path focus-flakes)]
     (println "DEP property path flakes" (pr-str path-flakes))
-    (validate-constraints shape-db data-db shape subject path-flakes)))
+    (validate-constraints v-ctx path-flakes)))
 
 (defn target-node-target?
   [shape s-flakes]
@@ -1036,151 +1036,182 @@
       res)))
 
 (defn validate-node-shape
-  [shape-db data-db shape subject s-flakes]
+  [{:keys [data-db shape] :as v-ctx} s-flakes]
   (def shape shape)
   (println "DEP validate-node-shape" (pr-str (get shape const/$id)) s-flakes)
   (loop [[focus-flakes & r] (async/<!! (resolve-focus-flakes data-db shape s-flakes))
          results []]
     (if focus-flakes
-      (if-let [results* (validate-constraints shape-db data-db shape subject focus-flakes)]
+      (if-let [results* (validate-constraints v-ctx focus-flakes)]
         (recur r (into results results*))
         (recur r results))
       (not-empty results))))
 
+(defn base-result
+  [{:keys [subject display shape] :as v-ctx} constraint ]
+  {:subject (display subject)
+   :constraint (display constraint)
+   :shape (-> shape (get const/$id) display)})
+
 ;; value type constraints
-(defmethod validate-constraint const/sh_class [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_class [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_datatype [shape-db data-db shape constraint subject focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_nodeKind [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_datatype [{:keys [shape subject display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [datatype] expect
+        values     (mapv flake-value focus-flakes)
+        violations (remove (fn [[v dt]] (= dt datatype)) values)]
+    (when (not-empty violations)
+      [(-> (base-result v-ctx constraint)
+           (assoc :path (mapv display path)
+                  :value (mapv display violations)
+                  :expect (display datatype)
+                  :message (str " the following values do not have expected datatype " (display datatype) ": "
+                                (->> values
+                                     (map (comp display first))
+                                     (str/join ",")))))])))
+(defmethod validate-constraint const/sh_nodeKind [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
 
 ;; cardinality constraints
-(defmethod validate-constraint const/sh_minCount [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_minCount [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint) (pr-str subject))
-  (let [{expect const/sh_maxCount shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
 
         [min] expect
         n     (count focus-flakes)]
     (when (< n min)
-      [{:subject    subject
-        :path       path
-        :value      n
-        :expect     min
-        :constraint const/sh_minCount
-        :message    (str "count " n " is less than minimum count of " min)
-        :shape      shape-id}])))
-(defmethod validate-constraint const/sh_maxCount [shape-db data-db shape constraint subject focus-flakes]
+      [(-> (base-result v-ctx constraint)
+           (assoc :path (mapv display path)
+                  :value n
+                  :expect min
+                  :message (str "count " n " is less than minimum count of " min)))])))
+(defmethod validate-constraint const/sh_maxCount [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint) )
-  (let [{expect const/sh_maxCount shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
 
         [max] expect
         n     (count focus-flakes)]
     (when (> n max)
-      [{:subject    subject
-        :path       path
-        :value      n
-        :expect     max
-        :message    (str "count " n " is greater than maximum count of " max)
-        :constraint const/sh_maxCount
-        :shape      shape-id}])))
+      [(-> (base-result v-ctx constraint)
+           (assoc :path (mapv display path)
+                  :value n
+                  :expect max
+                  :message (str "count " n " is greater than maximum count of " max)))])))
 
 ;; value range constraints
-(defmethod validate-constraint const/sh_minExclusive [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_minExclusive [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_maxExclusive [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_maxExclusive [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_minInclusive [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_minInclusive [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_maxInclusive [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_maxInclusive [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
 
 ;; string-based constraints
-(defmethod validate-constraint const/sh_minLength [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_minLength [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_maxLength [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_maxLength [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_pattern [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_pattern [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_languageIn [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_languageIn [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_uniqueLang [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_uniqueLang [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
 
 ;; property pair constraints
-(defmethod validate-constraint const/sh_equals [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_equals [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_disjoint [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_disjoint [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_lessThan [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_lessThan [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_lessThanOrEquals [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_lessThanOrEquals [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
 
 ;; logical constraints
-(defmethod validate-constraint const/sh_not [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_not [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_and [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_and [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_or [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_or [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_xone [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_xone [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
 
 ;; shape-based constraints
-(defmethod validate-constraint const/sh_node [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_node [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_property [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_property [{:keys [shape] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
   (loop [[p-shape & r] (get shape const/sh_property)
          results []]
     (if p-shape
-      (if-let [results* (validate-property-shape shape-db data-db p-shape subject focus-flakes)]
+      (if-let [results* (validate-property-shape (assoc v-ctx :shape p-shape) focus-flakes)]
         (recur r (into results results*))
         (recur r results))
       (not-empty results))))
-(defmethod validate-constraint const/sh_qualifiedValueShape [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_qualifiedValueShape [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
 
 ;; other constraints
-(defmethod validate-constraint const/sh_closed [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_closed [{:keys [shape subject data-db display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id ignored const/sh_ignoredProperties properties const/sh_property} shape
+
+        [closed?]   expect
+        constrained (into #{} (map #(-> % (get const/sh_path) first) properties))
+        allowed     (into constrained ignored)
+        present     (into #{} (map flake/p) focus-flakes)
+        not-allowed (set/difference present allowed)]
+    (println "DEP closed" (pr-str allowed) (pr-str present) (pr-str not-allowed))
+    (when (not-empty not-allowed)
+      (let [pid->flakes (group-by flake/p focus-flakes)]
+        (mapv (fn [path]
+                (let [values (->> (get pid->flakes path)
+                                  (mapv #(if (flake/ref-flake? %)
+                                           (display (flake/o %))
+                                           (flake/o %))))]
+                  (-> (base-result v-ctx constraint)
+                      (assoc :path (mapv display (util/sequential path))
+                             :value values
+                             :expect (mapv display allowed)
+                             :message (str "disallowed path " (display path) " with values " (str/join "," values))))))
+              not-allowed)))))
+(defmethod validate-constraint const/sh_hasValue [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_hasValue [shape-db data-db shape constraint subject focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_in [shape-db data-db shape constraint subject focus-flakes]
+(defmethod validate-constraint const/sh_in [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
 
 (defn explain-result
   [{:keys [subject constraint shape path message]}]
   (str  subject " " path " violates " constraint " constraint of shape " shape " - " message "."))
 
-(defn format-result
-  [ns-codes context result]
-  (let [compact-iri (fn [sid] (-> (iri/sid->iri sid ns-codes)
-                                  (json-ld/compact context)))]
-    (-> result
-        (update :subject compact-iri)
-        (update :path (fn [path] (mapv compact-iri path)))
-        (update :constraint compact-iri)
-        (update :shape compact-iri))))
-
 (defn throw-shacl-violation
   [{ns-codes :namespace-codes} context results]
   (println "DEP throw-shacl-violation" (count results))
   (def r results)
-  (let [formatted (mapv (partial format-result ns-codes context) results)
-        message   (->> (mapv explain-result formatted)
+  (let [message   (->> (mapv explain-result results)
                        (str/join "\n"))]
     (throw (ex-info message
                     {:status 400
                      :error  :shacl/violation
-                     :report formatted}))))
+                     :report results}))))
 
 (defn all-node-shape-ids
   [db]
   (def db db)
   (query-range/index-range db :post = [const/$rdf:type const/sh_NodeShape]
                            {:flake-xf (map flake/s)}))
+
+(defn sid->compact-iri
+  [ns-codes context sid]
+  (-> (iri/sid->iri sid ns-codes)
+      (json-ld/compact context)))
 
 (defn validate!
   "Will throw an exception if any of the modified subjects fails to conform to a shape that targets it.
@@ -1199,11 +1230,17 @@
     (doseq [s-flakes modified-subjects]
       (doseq [shape-sid (<? (all-node-shape-ids shape-db))]
         (let [subject (-> s-flakes first flake/s)
-              shape (<? (build-shape shape-db shape-sid))]
+              shape   (<? (build-shape shape-db shape-sid))
+
+              v-ctx {:display (partial sid->compact-iri (:namespace-codes data-db) context)
+                     :subject subject
+                     :shape shape
+                     :shape-db shape-db
+                     :data-db data-db}]
           (println "DEP shape" (pr-str shape-sid))
           ;; only enforce activated shapes
           (when (not (get shape const/sh_deactivated))
-            (let [results (validate-node-shape shape-db data-db shape subject s-flakes)]
+            (let [results (validate-node-shape v-ctx s-flakes)]
               (println "DEP report" (pr-str results))
               (when results
                 (throw-shacl-violation data-db context results)))))))))
