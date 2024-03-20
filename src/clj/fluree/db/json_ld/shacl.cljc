@@ -1124,8 +1124,24 @@
   (println "DEP validate-constraint " (pr-str constraint)))
 
 ;; property pair constraints
-(defmethod validate-constraint const/sh_equals [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_equals [{:keys [shape subject display data-db] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [equals]       expect
+        equals-flakes  (async/<!! (query-range/index-range data-db :spot = [subject equals]))
+        equals-objects (into #{} (map flake/o) equals-flakes)
+        focus-objects  (into #{} (map flake/o) focus-flakes)]
+    (when (not= equals-objects focus-objects)
+      (let [displayed-path (mapv display path)
+            values         (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
+            expects        (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) equals-flakes)]
+        [(-> (base-result v-ctx constraint)
+             (assoc :path displayed-path
+                    :value values
+                    :expect expects
+                    :message (str "path " displayed-path " values " (str/join ", " values) " do not equal "
+                                  (display equals) " values " (str/join ", " expects))))]))))
 (defmethod validate-constraint const/sh_disjoint [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
 (defmethod validate-constraint const/sh_lessThan [v-ctx constraint focus-flakes]
