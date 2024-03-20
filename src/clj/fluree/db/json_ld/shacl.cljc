@@ -1102,14 +1102,74 @@
                   :message (str "count " n " is greater than maximum count of " max)))])))
 
 ;; value range constraints
-(defmethod validate-constraint const/sh_minExclusive [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_maxExclusive [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_minInclusive [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_maxInclusive [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_minExclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [min-ex] expect
+        result (-> (base-result v-ctx constraint)
+                   (assoc :path (mapv display path)
+                          :expect min-ex))]
+    (->> focus-flakes
+         (remove (fn [f]
+                   (and (contains? numeric-types (flake/dt f))
+                        (> (flake/o f) min-ex))))
+         (mapv (fn [[_ _ o :as f]]
+                 (let [value (if (flake/ref-flake? f) (display o) o)]
+                   (assoc result
+                          :value value
+                          :message (str "value " value " is less than exclusive minimum " min-ex))))))))
+(defmethod validate-constraint const/sh_maxExclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [max-ex] expect
+        result (-> (base-result v-ctx constraint)
+                   (assoc :path (mapv display path)
+                          :expect max-ex))]
+    (->> focus-flakes
+         (remove (fn [f]
+                   (and (contains? numeric-types (flake/dt f))
+                        (< (flake/o f) max-ex))))
+         (mapv (fn [[_ _ o :as f]]
+                 (let [value (if (flake/ref-flake? f) (display o) o)]
+                   (assoc result
+                          :value value
+                          :message (str "value " value " is greater than exclusive maximum " max-ex))))))))
+(defmethod validate-constraint const/sh_minInclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [min-in] expect
+        result (-> (base-result v-ctx constraint)
+                   (assoc :path (mapv display path)
+                          :expect min-in))]
+    (->> focus-flakes
+         (remove (fn [f]
+                   (and (contains? numeric-types (flake/dt f))
+                        (>= (flake/o f) min-in))))
+         (mapv (fn [[_ _ o :as f]]
+                 (let [value (if (flake/ref-flake? f) (display o) o)]
+                   (assoc result
+                          :value value
+                          :message (str "value " value " is less than inclusive minimum " min-in))))))))
+(defmethod validate-constraint const/sh_maxInclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [max-in] expect
+        result (-> (base-result v-ctx constraint)
+                   (assoc :path (mapv display path)
+                          :expect max-in))]
+    (->> focus-flakes
+         (remove (fn [f]
+                   (and (contains? numeric-types (flake/dt f))
+                        (<= (flake/o f) max-in))))
+         (mapv (fn [[_ _ o :as f]]
+                 (let [value (if (flake/ref-flake? f) (display o) o)]
+                   (assoc result
+                          :value value
+                          :message (str "value " value " is greater than inclusive maximum " max-in))))))))
 
 ;; string-based constraints
 (defmethod validate-constraint const/sh_minLength [v-ctx constraint focus-flakes]
