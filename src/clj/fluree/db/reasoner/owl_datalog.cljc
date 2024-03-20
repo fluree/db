@@ -25,10 +25,11 @@
 (def ^:const $owl-onProperty "http://www.w3.org/2002/07/owl#onProperty")
 (def ^:const $owl-hasValue "http://www.w3.org/2002/07/owl#hasValue")
 (def ^:const $owl-someValuesFrom "http://www.w3.org/2002/07/owl#someValuesFrom")
+(def ^:const $owl-allValuesFrom "http://www.w3.org/2002/07/owl#allValuesFrom")
 
 (def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
+(def ^:const $owl-Thing "http://www.w3.org/2002/07/owl#Thing")
 
-(def ^:const $f:rule "http://flur.ee/ns/ledger#rule")
 
 (defn blank-node
   []
@@ -70,7 +71,7 @@
                   "insert" {"@id"   "?s"
                             "@type" domain}}]
     ;; rule-id *is* the property
-    (conj all-rules [(str property "(prp-dom)") rule])))
+    (conj all-rules [(str property "(rdfs:domain)") rule])))
 
 (defmethod to-datalog ::prp-rng
   [_ _ owl-statement all-rules]
@@ -82,7 +83,7 @@
                   "insert" {"@id"   "?ps"
                             "@type" range}}]
     ;; rule-id *is* the property
-    (conj all-rules [(str property "(prp-rng)") rule])))
+    (conj all-rules [(str property "(rdfs:range)") rule])))
 
 ;; TODO - re-enable once filter function bug is fixed
 (defmethod to-datalog ::prp-fp
@@ -123,7 +124,7 @@
                          symp  "?y"}]
               "insert" {"@id" "?y"
                         symp  "?x"}}]
-    (conj all-rules [(str $owl-SymetricProperty "(" symp ")") rule])))
+    (conj all-rules [(str symp "(owl:SymetricProperty)") rule])))
 
 (defmethod to-datalog ::prp-trp
   [_ _ owl-statement all-rules]
@@ -134,7 +135,7 @@
                          trp   "?z"}]
               "insert" {"@id" "?x"
                         trp   "?z"}}]
-    (conj all-rules [(str $owl-TransitiveProperty "(" trp ")") rule])))
+    (conj all-rules [(str trp "(owl:TransitiveProperty)") rule])))
 
 ;; turns list of properties into:
 ;; [{"@id" "?u0", "?p1" "?u1"}, {"@id" "?u2", "?p2" "?u3"} ... ]
@@ -167,7 +168,7 @@
                              " - is not property defined. Value should be of "
                              "type @list and it likely is defined as a set.")
                         {:owl-statement owl-statement})))
-      (conj all-rules [(str $owl-propertyChainAxiom "(" prop "}") rule]))
+      (conj all-rules [(str prop "(owl:propertyChainAxiom)") rule]))
     (catch* e (log/warn (str "Ignoring OWL rule " (ex-message e)))
             all-rules)))
 
@@ -184,24 +185,9 @@
                   "insert" {"@id" "?y"
                             prop  "?x"}}]
     (-> all-rules
-        (conj [(str $owl-inverseOf "(prp-inv1)") rule1])
-        (conj [(str $owl-inverseOf "(prp-inv2)") rule2]))))
+        (conj [(str inv-prop "(owl:inverseOf-1)") rule1])
+        (conj [(str inv-prop "(owl:inverseOf-2)") rule2]))))
 
-(defn equiv-class-type
-  [equiv-class-statement]
-  (cond (some #(= % $owl-Restriction) (:type equiv-class-statement))
-        :restrictions
-
-        (contains? equiv-class-statement $owl-intersectionOf)
-        :intersections
-
-        (contains? equiv-class-statement $owl-unionOf)
-        :unions
-
-        (contains? equiv-class-statement :id)
-        :classes
-
-        :else nil))
 
 (defn equiv-class-rules
   "Maps every class equivalence to every other class in the set"
@@ -218,7 +204,39 @@
                      [rule-id rule]))
                  c-set)))
 
-(defn equiv-class-restrictions
+(defn equiv-class-some-value
+  "Handles rules cls-svf1, cls-svf2"
+  [rule-class restrictions]
+  (reduce
+    (fn [acc restriction]
+      (let [property (util/get-first-id restriction $owl-onProperty)
+            some-val (util/get-first-id restriction $owl-someValuesFrom)
+            rule     (if (= $owl-Thing some-val)
+                       ;; special case where someValuesFrom is owl:Thing, means
+                       ;; everything with property should be in the class (cls-svf2)
+                       {"where"  {"@id"    "?x"
+                                  property nil}
+                        "insert" {"@id"   "?x"
+                                  "@type" rule-class}}
+                       ;; normal case where someValuesFrom is a class (cls-svf1)
+                       {"where"  [{"@id"    "?x"
+                                   property "?y"}
+                                  {"@id"   "?y"
+                                   "@type" some-val}]
+                        "insert" {"@id"   "?x"
+                                  "@type" rule-class}})]
+        (if (and property some-val)
+          (conj acc [(str rule-class "(owl:someValuesFrom-" property ")") rule])
+          (do (log/warn "owl:Restriction for class" rule-class
+                        "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
+                        "and owl:someValuesFrom is:" (util/get-first restriction $owl-someValuesFrom)
+                        ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
+                        "someValuesFrom must exist and must be an IRI.")
+              acc))))
+    []
+    restrictions))
+
+(defn equiv-class-has-value
   "Handles rules cls-hv1, cls-hv2"
   [rule-class restrictions]
   (reduce
@@ -241,21 +259,54 @@
               (conj [(str rule-class "(owl:Restriction-" property "-1)") rule1])
               (conj [(str rule-class "(owl:Restriction-" property "-2)") rule2]))
           (do (log/warn "owl:Restriction for class" rule-class
-                        "is not properly defined. owl:onProperty is:" property
-                        "and owl:hasValue is:" one-val ". onProperty must exist and be an IRI."
+                        "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
+                        "and owl:hasValue is:" (util/get-first restriction $owl-hasValue)
+                        ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
                         "hasValue must exist, but can be an IRI or literal value.")
               acc))))
     []
     restrictions))
 
+(defn equiv-class-type
+  [equiv-class-statement]
+  (cond (some #(= % $owl-Restriction) (:type equiv-class-statement))
+        (cond
+          (contains? equiv-class-statement $owl-hasValue)
+          :has-value
+
+          (contains? equiv-class-statement $owl-someValuesFrom)
+          :some-values
+
+          (contains? equiv-class-statement $owl-allValuesFrom)
+          :all-values
+
+          :else
+          (do
+            (log/warn "Unsupported owl:Restriction" equiv-class-statement)
+            nil))
+
+        (contains? equiv-class-statement $owl-intersectionOf)
+        :intersection-of
+
+        (contains? equiv-class-statement $owl-unionOf)
+        :union-of
+
+        (contains? equiv-class-statement :id)
+        :classes
+
+        :else nil))
+
 (defmethod to-datalog ::cax-eqc
   [_ _ owl-statement all-rules]
   (let [c1 (:id owl-statement) ;; the class which is the subject
         ;; combine with all other equivalent classes for a set of 2+ total classes
-        {:keys [restrictions classes unions classes]} (group-by equiv-class-type (get owl-statement $owl-equivalentClass))]
+        {:keys [classes intersection-of union-of
+                has-value some-values all-values]} (group-by equiv-class-type (get owl-statement $owl-equivalentClass))]
     (cond-> all-rules
-            classes (into (equiv-class-rules c1 classes))
-            restrictions (into (equiv-class-restrictions c1 restrictions)))))
+            classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
+            has-value (into (equiv-class-has-value c1 has-value)) ;; cls-hv1, cls-hv1
+            some-values (into (equiv-class-some-value c1 some-values)) ;; cls-svf1, cls-svf2
+            )))
 
 
 ;; TODO - re-enable once filter function bug is fixed

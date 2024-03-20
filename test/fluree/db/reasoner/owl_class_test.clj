@@ -84,10 +84,10 @@
                  (set qry-humanb))
               "ex:brian, ex:laura and ex:alice should be of type ex:HumanBeing"))))))
 
-(deftest ^:integration owl-restriction
-  (testing "owl:Restriction test"
+(deftest ^:integration owl-restriction-has-value
+  (testing "owl:Restriction hasValue test - cls-hv1, cls-hv2"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/owl-restrict" nil)
+          ledger  @(fluree/create conn "reasoner/owl-cls-hv" nil)
           db-base @(fluree/stage (fluree/db ledger)
                                  {"@context" {"ex" "http://example.org/"}
                                   "insert"   [{"@id"           "ex:alice"
@@ -145,4 +145,51 @@
           (is (= ["ex:susan"]
                  qry-customer)
               "Rule warning should be logged and no inference should be made."))))))
+
+
+(deftest ^:integration owl-restriction-some-values-from,
+  (testing "owl:Restriction owl:someValuesFrom test - cls-svf1, cls-svf2"
+    (let [conn    (test-utils/create-conn)
+          ledger  @(fluree/create conn "reasoner/owl-cls-svf" nil)
+          db-base @(fluree/stage (fluree/db ledger)
+                                 {"@context" {"ex" "http://example.org/"}
+                                  "insert"   [{"@id"   "ex:winery1"
+                                               "@type" "ex:Winery"}
+                                              {"@id"   "ex:textile-company"
+                                               "@type" "ex:TextileFactory"}
+                                              {"@id"   "ex:winery2"
+                                               "@type" "ex:Winery"}
+                                              {"@id"         "ex:maybe-a-wine"
+                                               "@type"       "ex:Product"
+                                               "ex:hasMaker" [{"@id" "ex:winery1"}
+                                                              {"@id" "ex:ex:textile-company"}]}
+                                              {"@id"         "ex:a-wine-1"
+                                               "@type"       "ex:Product"
+                                               "ex:hasMaker" [{"@id" "ex:winery1"}
+                                                              {"@id" "ex:winery2"}]}
+                                              {"@id"         "ex:a-wine-2"
+                                               "@type"       "ex:Product"
+                                               "ex:hasMaker" {"@id" "ex:winery2"}}
+                                              {"@id"         "ex:not-a-wine-1"
+                                               "@type"       "ex:Product"
+                                               "ex:hasMaker" {"@id" "ex:ex:textile-company"}}]})]
+
+      (testing "Testing single owl:Restriction someValuesFrom for a property value"
+        (let [db-equiv  @(fluree/reason db-base :owl2rl
+                                        [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                 "ex"  "http://example.org/"}
+                                          "@id"                 "ex:Wine",
+                                          "@type"               ["owl:Class"],
+                                          "owl:equivalentClass" [{"@type"              "owl:Restriction"
+                                                                  "owl:onProperty"     {"@id" "ex:hasMaker"}
+                                                                  "owl:someValuesFrom" {"@id" "ex:Winery"}}]}])
+              qry-wines @(fluree/query db-equiv
+                                       {:context {"ex" "http://example.org/"}
+                                        :select  "?s"
+                                        :where   {"@id"   "?s",
+                                                  "@type" "ex:Wine"}})]
+          (is (= #{"ex:maybe-a-wine" "ex:a-wine-1" "ex:a-wine-2"}
+                 (set qry-wines))
+              "only one hasMaker must be a winery to qualify as an ex:Wine"))))))
+
 
