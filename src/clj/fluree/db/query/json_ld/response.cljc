@@ -36,12 +36,7 @@
   [pid]
   (= const/$rdf:type pid))
 
-(declare flakes->res)
-(defn crawl-ref-item
-  [db context compact-fn flake-sid sub-select cache depth-i fuel-tracker error-ch]
-  (go-try
-    (let [sub-flakes (<? (query-range/index-range db :spot = [flake-sid]))]
-      (<? (flakes->res db cache context compact-fn sub-select depth-i fuel-tracker error-ch sub-flakes)))))
+(declare format-subgraph)
 
 (defn includes-id?
   [db sid {:keys [wildcard?] :as select-spec}]
@@ -140,27 +135,28 @@
   (go
     (try*
       (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
-            max-depth (:depth select-spec)
-            id-key    (:as (or (wildcard-spec db cache compact-fn const/$id)
-                               (cache-sid->iri db cache compact-fn const/$id)))
-            o-iri     (compact-fn (iri/decode-sid db oid))
-            subselect (:spec spec)
-            ref       (cond
-                        ;; have a specified sub-selection (graph crawl)
-                        subselect
-                        (let [ref-attrs (<! (crawl-ref-item db context compact-fn oid subselect cache (inc current-depth) fuel-tracker error-ch))]
-                          (if (<? (includes-id? db oid subselect))
-                            (assoc ref-attrs id-key o-iri)
-                            ref-attrs))
+            max-depth     (:depth select-spec)
+            id-key        (:as (or (wildcard-spec db cache compact-fn const/$id)
+                                   (cache-sid->iri db cache compact-fn const/$id)))
+            o-iri         (iri/decode-sid db oid)
+            o-iri-compact (compact-fn o-iri)
+            subselect     (:spec spec)
+            ref           (cond
+                            ;; have a specified sub-selection (graph crawl)
+                            subselect
+                            (let [ref-attrs (<! (format-subgraph db o-iri context compact-fn subselect cache (inc current-depth) fuel-tracker error-ch))]
+                              (if (<? (includes-id? db oid subselect))
+                                (assoc ref-attrs id-key o-iri-compact)
+                                ref-attrs))
 
-                        ;; requested graph crawl depth has not yet been reached
-                        (< current-depth max-depth)
-                        (cond-> (<! (crawl-ref-item db context compact-fn oid select-spec cache (inc current-depth) fuel-tracker error-ch))
-                          (<? (validate/allow-iri? db oid)) (assoc id-key o-iri))
+                            ;; requested graph crawl depth has not yet been reached
+                            (< current-depth max-depth)
+                            (cond-> (<! (format-subgraph db o-iri context compact-fn select-spec cache (inc current-depth) fuel-tracker error-ch))
+                              (<? (validate/allow-iri? db oid)) (assoc id-key o-iri-compact))
 
-                        :else
-                        (when (<? (validate/allow-iri? db oid))
-                          {id-key o-iri}))]
+                            :else
+                            (when (<? (validate/allow-iri? db oid))
+                              {id-key o-iri-compact}))]
         (not-empty ref))
       (catch* e
               (log/error e "Error resolving reference")
@@ -271,3 +267,38 @@
            (resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
            (append-id db sid select-spec compact-fn error-ch)))
     (go)))
+
+(defn format-forward-properties
+  [{:keys [conn t] :as db} iri context compact-fn select-spec cache fuel-tracker error-ch]
+  (let [sid                     (iri/encode-iri db iri)
+        spot-root               (:spot db)
+        spot-novelty            (-> db :novelty :spot)
+        [start-flake end-flake] (flake-bounds db :spot [sid])
+        flake-xf                (when fuel-tracker
+                                  (comp (fuel/track fuel-tracker error-ch)))
+        range-opts              {:from-t      t
+                                 :to-t        t
+                                 :start-flake start-flake
+                                 :end-flake   end-flake
+                                 :flake-xf    flake-xf}
+        flake-slice-ch          (->> (query-range/resolve-flake-slices conn spot-root spot-novelty
+                                                                       error-ch range-opts)
+                                     (query-range/filter-authorized db start-flake end-flake error-ch))
+        subj-xf                 (comp cat
+                                      (format-subject-xf db cache context compact-fn
+                                                         select-spec))]
+    (async/transduce subj-xf (completing conj) {} flake-slice-ch)))
+
+(defn format-subgraph
+  [db iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
+  (let [sid        (iri/encode-iri db iri)
+        forward-ch (format-forward-properties db iri context compact-fn select-spec cache fuel-tracker error-ch)
+        subject-ch (if reverse
+                     (let [reverse-ch (reverse-properties db iri cache compact-fn reverse fuel-tracker error-ch)]
+                       (->> [forward-ch reverse-ch]
+                            async/merge
+                            (async/reduce merge {})))
+                     forward-ch)]
+    (->> subject-ch
+         (resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
+         (append-id db sid select-spec compact-fn error-ch))))
