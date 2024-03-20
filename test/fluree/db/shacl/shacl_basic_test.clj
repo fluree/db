@@ -1231,22 +1231,44 @@
                                        :type         :ex/User
                                        :ex/birthYear :ex/ref}})
                                    (catch Exception e e))]
-      (is (util/exception? db-wrong-case-greeting)
-          "Exception, because :ex/greeting does not match pattern")
-      (is (= "SHACL PropertyShape exception - sh:pattern: value HELLO
-WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"s\" \"x\"] or it is not a literal value."
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/alice,
+                :constraint :sh/pattern,
+                :shape "_:fdb-2",
+                :path [:ex/greeting],
+                :expect "hello   (.*?)world",
+                :value "HELLO
+WORLD!",
+                :message (str "value "
+                              (pr-str "HELLO
+WORLD!")
+                              " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x")}]}
+             (ex-data db-wrong-case-greeting)))
+      (is (= (str "Subject :ex/alice path [:ex/greeting] violates constraint :sh/pattern of shape _:fdb-2 - value "
+                  (pr-str "HELLO
+WORLD!")
+                  " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x.")
              (ex-message db-wrong-case-greeting)))
-      (is (= "SHACL PropertyShape exception - sh:pattern: value HELLO
-WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"s\" \"x\"] or it is not a literal value."
-             (ex-message db-wrong-case-greeting)))
-      (is (util/exception? db-wrong-birth-year)
-          "Exception, because :ex/birthYear does not match pattern")
-      (is (= "SHACL PropertyShape exception - sh:pattern: value 1776 does not match pattern \"(19|20)[0-9][0-9]\" or it is not a literal value."
+
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/alice,
+                :constraint :sh/pattern,
+                :shape "_:fdb-3",
+                :path [:ex/birthYear],
+                :expect "(19|20)[0-9][0-9]",
+                :value 1776,
+                :message "value \"1776\" does not match pattern \"(19|20)[0-9][0-9]\""}]}
+             (ex-data db-wrong-birth-year)))
+      (is (= "Subject :ex/alice path [:ex/birthYear] violates constraint :sh/pattern of shape _:fdb-3 - value \"1776\" does not match pattern \"(19|20)[0-9][0-9]\"."
              (ex-message db-wrong-birth-year)))
       (is (util/exception? db-ref-value)
           "Exception, because :schema/name is not a literal value")
-      (is (str/starts-with? (ex-message db-ref-value)
-                            "SHACL PropertyShape exception - sh:pattern: value "))
+      (is (= "Subject :ex/john path [:ex/birthYear] violates constraint :sh/pattern of shape _:fdb-3 - value :ex/ref does not match pattern \"(19|20)[0-9][0-9]\"."
+             (ex-message db-ref-value)))
       (is (= [{:id          :ex/brian
                :type        :ex/User
                :ex/greeting "hello\nworld!"}]

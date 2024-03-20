@@ -1212,12 +1212,31 @@
                      (assoc result
                             :value o
                             :message (str "value " value " has string length greater than maximum length " max-length)))))))))
-(defmethod validate-constraint const/sh_pattern [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_languageIn [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_uniqueLang [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_pattern [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint flags const/sh_flags path const/sh_path} shape
+
+        [pattern-str] expect
+        valid-flags   (mapv get-regex-flag flags)
+        pattern       #?(:clj (Pattern/compile pattern-str (apply + valid-flags))
+                         :cljs (js/RegExp. pattern-str (apply str valid-flags)))
+        result        (-> (base-result v-ctx constraint)
+                          (assoc :path (mapv display path)
+                                 :expect pattern-str))]
+    (println "DEP flags" (pr-str flags) (pr-str valid-flags))
+    (->> focus-flakes
+         (remove (fn [f] (re-find pattern (str (flake/o f)))))
+         (mapv (fn [[_ _ o dt :as f]]
+                 (let [value (if (flake/ref-flake? f)
+                               (display o)
+                               (pr-str (str o)))]
+                   (assoc result
+                          :value o
+                          :message (str "value " value " does not match pattern " (pr-str pattern-str)
+                                        (when (seq valid-flags)
+                                          (str " with " (display const/sh_flags) " " (str/join ", " flags)))))))))))
+#_(defmethod validate-constraint const/sh_languageIn [v-ctx constraint focus-flakes]) ; not supported
+#_(defmethod validate-constraint const/sh_uniqueLang [v-ctx constraint focus-flakes]) ; not supported
 
 ;; property pair constraints
 (defmethod validate-constraint const/sh_equals [{:keys [shape subject display data-db] :as v-ctx} constraint focus-flakes]
