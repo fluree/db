@@ -1058,7 +1058,7 @@
   (println "DEP validate-constraint " (pr-str constraint)))
 (defmethod validate-constraint const/sh_datatype [{:keys [shape subject display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [datatype] expect
         values     (mapv flake-value focus-flakes)
@@ -1078,7 +1078,7 @@
 ;; cardinality constraints
 (defmethod validate-constraint const/sh_minCount [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint) (pr-str subject))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [min] expect
         n     (count focus-flakes)]
@@ -1090,7 +1090,7 @@
                   :message (str "count " n " is less than minimum count of " min)))])))
 (defmethod validate-constraint const/sh_maxCount [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint) )
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [max] expect
         n     (count focus-flakes)]
@@ -1104,7 +1104,7 @@
 ;; value range constraints
 (defmethod validate-constraint const/sh_minExclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [min-ex] expect
         result (-> (base-result v-ctx constraint)
@@ -1121,7 +1121,7 @@
                           :message (str "value " value " is less than exclusive minimum " min-ex))))))))
 (defmethod validate-constraint const/sh_maxExclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [max-ex] expect
         result (-> (base-result v-ctx constraint)
@@ -1138,7 +1138,7 @@
                           :message (str "value " value " is greater than exclusive maximum " max-ex))))))))
 (defmethod validate-constraint const/sh_minInclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [min-in] expect
         result (-> (base-result v-ctx constraint)
@@ -1155,7 +1155,7 @@
                           :message (str "value " value " is less than inclusive minimum " min-in))))))))
 (defmethod validate-constraint const/sh_maxInclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [max-in] expect
         result (-> (base-result v-ctx constraint)
@@ -1174,7 +1174,7 @@
 ;; string-based constraints
 (defmethod validate-constraint const/sh_minLength [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [min-length] expect
         result (-> (base-result v-ctx constraint)
@@ -1194,7 +1194,7 @@
                             :message (str "value " value " has string length less than minimum length " min-length)))))))))
 (defmethod validate-constraint const/sh_maxLength [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [max-length] expect
         result (-> (base-result v-ctx constraint)
@@ -1222,7 +1222,7 @@
 ;; property pair constraints
 (defmethod validate-constraint const/sh_equals [{:keys [shape subject display data-db] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [equals]       expect
         equals-flakes  (async/<!! (query-range/index-range data-db :spot = [subject equals]))
@@ -1240,7 +1240,7 @@
                                   (display equals) " values " (str/join ", " expects))))]))))
 (defmethod validate-constraint const/sh_disjoint [{:keys [shape data-db display subject] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [disjoint]       expect
         disjoint-flakes  (async/<!! (query-range/index-range data-db :spot = [subject disjoint]))
@@ -1258,7 +1258,7 @@
                                   (display disjoint) " values " (str/join ", " expects))))]))))
 (defmethod validate-constraint const/sh_lessThan [{:keys [shape subject data-db display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [less-than]       expect
         less-than-flakes  (async/<!! (query-range/index-range data-db :spot = [subject less-than]))
@@ -1283,7 +1283,7 @@
                                    (display less-than) " values " (str/join ", " expects)))])))
 (defmethod validate-constraint const/sh_lessThanOrEquals [{:keys [shape subject data-db display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+  (let [{expect constraint path const/sh_path} shape
 
         [less-than]       expect
         less-than-flakes  (async/<!! (query-range/index-range data-db :spot = [subject less-than]))
