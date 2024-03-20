@@ -125,7 +125,7 @@
   "Build a subject map out a set of flakes with the same subject.
   {:id :ex/foo :ex/x 1 :ex/y 2}"
   [db cache context compact error-ch s-flakes]
-  (json-ld-resp/flakes->res db cache context compact
+  (json-ld-resp/format-subject-flakes db cache context compact
                             {:wildcard? true, :depth 0}
                             0 nil error-ch s-flakes))
 
@@ -280,11 +280,11 @@
                          :else
                          :ignore-flakes))
                      t-flakes)
-           commit-wrapper-chan (json-ld-resp/flakes->res db cache context compact
+           commit-wrapper-chan (json-ld-resp/format-subject-flakes db cache context compact
                                                          {:wildcard? true, :depth 0}
                                                          0 nil error-ch commit-wrapper-flakes)
 
-           commit-meta-chan    (json-ld-resp/flakes->res db cache context compact
+           commit-meta-chan    (json-ld-resp/format-subject-flakes db cache context compact
                                                          {:wildcard? true, :depth 0}
                                                          0 nil error-ch commit-meta-flakes)
 

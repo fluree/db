@@ -157,7 +157,7 @@
                          where/get-iri)
                      subj)]
       ;; TODO: Replace these nils with fuel values when we turn fuel back on
-      (json-ld-resp/format-subgraph db iri context compact spec iri-cache 0 fuel-tracker error-ch))))
+      (json-ld-resp/format-node db iri context compact spec iri-cache 0 fuel-tracker error-ch))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied

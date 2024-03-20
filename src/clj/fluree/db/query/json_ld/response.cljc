@@ -36,7 +36,7 @@
   [pid]
   (= const/$rdf:type pid))
 
-(declare format-subgraph)
+(declare format-node)
 
 (defn includes-id?
   [db sid {:keys [wildcard?] :as select-spec}]
@@ -144,14 +144,14 @@
             ref           (cond
                             ;; have a specified sub-selection (graph crawl)
                             subselect
-                            (let [ref-attrs (<! (format-subgraph db o-iri context compact-fn subselect cache (inc current-depth) fuel-tracker error-ch))]
+                            (let [ref-attrs (<! (format-node db o-iri context compact-fn subselect cache (inc current-depth) fuel-tracker error-ch))]
                               (if (<? (includes-id? db oid subselect))
                                 (assoc ref-attrs id-key o-iri-compact)
                                 ref-attrs))
 
                             ;; requested graph crawl depth has not yet been reached
                             (< current-depth max-depth)
-                            (cond-> (<! (format-subgraph db o-iri context compact-fn select-spec cache (inc current-depth) fuel-tracker error-ch))
+                            (cond-> (<! (format-node db o-iri context compact-fn select-spec cache (inc current-depth) fuel-tracker error-ch))
                               (<? (validate/allow-iri? db oid)) (assoc id-key o-iri-compact))
 
                             :else
@@ -249,25 +249,6 @@
               (log/info e "Error appending subject iri")
               (>! error-ch e)))))
 
-(defn flakes->res
-  "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
-  the requested depth within the select-spec"
-  [db cache context compact-fn {:keys [reverse] :as select-spec} current-depth fuel-tracker error-ch s-flakes]
-  (if (not-empty s-flakes)
-    (let [sid           (->> s-flakes first flake/s)
-          s-iri         (iri/decode-sid db sid)
-          subject-attrs (into {}
-                              (format-subject-xf db cache context compact-fn select-spec)
-                              s-flakes)
-          subject-ch    (if reverse
-                          (let [reverse-ch (reverse-properties db s-iri cache compact-fn reverse fuel-tracker error-ch)]
-                            (async/reduce conj subject-attrs reverse-ch))
-                          (go subject-attrs))]
-      (->> subject-ch
-           (resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-           (append-id db sid select-spec compact-fn error-ch)))
-    (go)))
-
 (defn format-forward-properties
   [{:keys [conn t] :as db} iri context compact-fn select-spec cache fuel-tracker error-ch]
   (let [sid                     (iri/encode-iri db iri)
@@ -289,7 +270,7 @@
                                                          select-spec))]
     (async/transduce subj-xf (completing conj) {} flake-slice-ch)))
 
-(defn format-subgraph
+(defn format-node
   [db iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
   (let [sid        (iri/encode-iri db iri)
         forward-ch (format-forward-properties db iri context compact-fn select-spec cache fuel-tracker error-ch)
@@ -302,3 +283,22 @@
     (->> subject-ch
          (resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
          (append-id db sid select-spec compact-fn error-ch))))
+
+(defn format-subject-flakes
+  "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
+  the requested depth within the select-spec"
+  [db cache context compact-fn {:keys [reverse] :as select-spec} current-depth fuel-tracker error-ch s-flakes]
+  (if (not-empty s-flakes)
+    (let [sid           (->> s-flakes first flake/s)
+          s-iri         (iri/decode-sid db sid)
+          subject-attrs (into {}
+                              (format-subject-xf db cache context compact-fn select-spec)
+                              s-flakes)
+          subject-ch    (if reverse
+                          (let [reverse-ch (reverse-properties db s-iri cache compact-fn reverse fuel-tracker error-ch)]
+                            (async/reduce conj subject-attrs reverse-ch))
+                          (go subject-attrs))]
+      (->> subject-ch
+           (resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
+           (append-id db sid select-spec compact-fn error-ch)))
+    (go)))
