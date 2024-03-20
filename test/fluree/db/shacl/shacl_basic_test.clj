@@ -878,68 +878,105 @@
                                    :type       :ex/User
                                    :schema/age 100}})
                                (catch Exception e e))]
-          (is (util/exception? db-too-low)
-              "Exception, because :schema/age is below the minimum")
-          (is (= "SHACL PropertyShape exception - sh:minExclusive: value 1 is either non-numeric or lower than exclusive minimum of 1."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/john,
+                    :constraint :sh/minExclusive,
+                    :shape "_:fdb-2",
+                    :path [:schema/age],
+                    :expect 1,
+                    :value 1,
+                    :message "value 1 is less than exclusive minimum 1"}]}
+                 (ex-data db-too-low)))
+          (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/minExclusive of shape _:fdb-2 - value 1 is less than exclusive minimum 1."
                  (ex-message db-too-low)))
 
-          (is (util/exception? db-too-high)
-              "Exception, because :schema/age is above the maximum")
-          (is (= "SHACL PropertyShape exception - sh:maxExclusive: value 100 is either non-numeric or higher than exclusive maximum of 100."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/john,
+                    :constraint :sh/maxExclusive,
+                    :shape "_:fdb-2",
+                    :path [:schema/age],
+                    :expect 100,
+                    :value 100,
+                    :message "value 100 is greater than exclusive maximum 100"}]}
+                 (ex-data db-too-high)))
+          (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxExclusive of shape _:fdb-2 - value 100 is greater than exclusive maximum 100."
                  (ex-message db-too-high)))
 
-          (is (= @(fluree/query db-ok user-query)
-                 [{:id         :ex/john
+          (is (= [{:id         :ex/john
                    :type       :ex/User
-                   :schema/age 2}]))))
+                   :schema/age 2}]
+                 @(fluree/query db-ok user-query)))))
       (testing "inclusive constraints"
         (let [db          @(fluree/stage
-                            (fluree/db ledger)
-                            {"@context" ["https://ns.flur.ee" context]
-                             "insert"
-                             {:id             :ex/InclusiveNumRangeShape
-                              :type           :sh/NodeShape
-                              :sh/targetClass :ex/User
-                              :sh/property    [{:sh/path         :schema/age
-                                                :sh/minInclusive 1
-                                                :sh/maxInclusive 100}]}})
+                             (fluree/db ledger)
+                             {"@context" ["https://ns.flur.ee" context]
+                              "insert"
+                              {:id             :ex/InclusiveNumRangeShape
+                               :type           :sh/NodeShape
+                               :sh/targetClass :ex/User
+                               :sh/property    [{:sh/path         :schema/age
+                                                 :sh/minInclusive 1
+                                                 :sh/maxInclusive 100}]}})
               db-ok       @(fluree/stage
-                            db
-                            {"@context" ["https://ns.flur.ee" context]
-                             "insert"
-                             {:id         :ex/brian
-                              :type       :ex/User
-                              :schema/age 1}})
+                             db
+                             {"@context" ["https://ns.flur.ee" context]
+                              "insert"
+                              {:id         :ex/brian
+                               :type       :ex/User
+                               :schema/age 1}})
               db-ok2      @(fluree/stage
-                            db-ok
-                            {"@context" ["https://ns.flur.ee" context]
-                             "insert"
-                             {:id         :ex/alice
-                              :type       :ex/User
-                              :schema/age 100}})
+                             db-ok
+                             {"@context" ["https://ns.flur.ee" context]
+                              "insert"
+                              {:id         :ex/alice
+                               :type       :ex/User
+                               :schema/age 100}})
               db-too-low  @(fluree/stage
-                            db
-                            {"@context" ["https://ns.flur.ee" context]
-                             "insert"
-                             {:id         :ex/alice
-                              :type       :ex/User
-                              :schema/age 0}})
+                             db
+                             {"@context" ["https://ns.flur.ee" context]
+                              "insert"
+                              {:id         :ex/alice
+                               :type       :ex/User
+                               :schema/age 0}})
               db-too-high @(fluree/stage
-                            db
-                            {"@context" ["https://ns.flur.ee" context]
-                             "insert"
-                             {:id         :ex/alice
-                              :type       :ex/User
-                              :schema/age 101}})]
-          (is (util/exception? db-too-low)
-              "Exception, because :schema/age is below the minimum")
-          (is (= "SHACL PropertyShape exception - sh:minInclusive: value 0 is either non-numeric or lower than minimum of 1."
+                             db
+                             {"@context" ["https://ns.flur.ee" context]
+                              "insert"
+                              {:id         :ex/alice
+                               :type       :ex/User
+                               :schema/age 101}})]
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/minInclusive,
+                    :shape "_:fdb-7",
+                    :path [:schema/age],
+                    :expect 1,
+                    :value 0,
+                    :message "value 0 is less than inclusive minimum 1"}]}
+                 (ex-data db-too-low)))
+          (is (= "Subject :ex/alice path [:schema/age] violates constraint :sh/minInclusive of shape _:fdb-7 - value 0 is less than inclusive minimum 1."
                  (ex-message db-too-low)))
 
-          (is (util/exception? db-too-high)
-              "Exception, because :schema/age is above the maximum")
-          (is (= "SHACL PropertyShape exception - sh:maxInclusive: value 101 is either non-numeric or higher than maximum of 100."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/maxInclusive,
+                    :shape "_:fdb-7",
+                    :path [:schema/age],
+                    :expect 100,
+                    :value 101,
+                    :message "value 101 is greater than inclusive maximum 100"}]}
+                 (ex-data db-too-high)))
+          (is (= "Subject :ex/alice path [:schema/age] violates constraint :sh/maxInclusive of shape _:fdb-7 - value 101 is greater than inclusive maximum 100."
                  (ex-message db-too-high)))
+
           (is (= [{:id         :ex/alice
                    :type       :ex/User
                    :schema/age 100}
@@ -973,14 +1010,32 @@
                                   :type       :ex/User
                                   :schema/age "10"}})
                               (catch Exception e e))]
-          (is (util/exception? db-subj-id)
-              "Exception, because :schema/age is not a number")
-          (is (= "SHACL PropertyShape exception - sh:minExclusive: value 10 is either non-numeric or lower than exclusive minimum of 0."
-                 (ex-message db-string)))
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/minExclusive,
+                    :shape "_:fdb-13",
+                    :path [:schema/age],
+                    :expect 0,
+                    :value :ex/brian,
+                    :message "value :ex/brian is less than exclusive minimum 0"}]}
+                 (ex-data db-subj-id)))
+          (is (= "Subject :ex/alice path [:schema/age] violates constraint :sh/minExclusive of shape _:fdb-13 - value :ex/brian is less than exclusive minimum 0."
+                 (ex-message db-subj-id)))
 
-          (is (util/exception? db-string)
-              "Exception, because :schema/age is not a number")
-          (is (= "SHACL PropertyShape exception - sh:minExclusive: value 10 is either non-numeric or lower than exclusive minimum of 0."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/minExclusive,
+                    :shape "_:fdb-13",
+                    :path [:schema/age],
+                    :expect 0,
+                    :value "10",
+                    :message "value 10 is less than exclusive minimum 0"}]}
+                 (ex-data db-string)))
+          (is (= "Subject :ex/alice path [:schema/age] violates constraint :sh/minExclusive of shape _:fdb-13 - value 10 is less than exclusive minimum 0."
                  (ex-message db-string))))))))
 
 (deftest ^:integration shacl-string-length-constraints
