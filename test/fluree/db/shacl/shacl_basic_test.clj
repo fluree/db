@@ -492,12 +492,12 @@
                     :constraint :sh/disjoint,
                     :shape "_:fdb-14",
                     :path [:ex/favNums],
-                    :value [11 31 17],
+                    :value [11 17 31],
                     :expect [11],
-                    :message "path [:ex/favNums] values 11, 31, 17 are not disjoint with :ex/luckyNums values 11"}]}
+                    :message "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11"}]}
                  (ex-data db-not-disjoint2))
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
-          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11, 31, 17 are not disjoint with :ex/luckyNums values 11."
+          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11."
                  (ex-message db-not-disjoint2)))
 
           (is (= {:status 400,
@@ -507,12 +507,12 @@
                     :constraint :sh/disjoint,
                     :shape "_:fdb-14",
                     :path [:ex/favNums],
-                    :value [11 31 17],
+                    :value [11 17 31],
                     :expect [11 13 18],
-                    :message "path [:ex/favNums] values 11, 31, 17 are not disjoint with :ex/luckyNums values 11, 13, 18"}]}
+                    :message "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18"}]}
                  (ex-data db-not-disjoint3))
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
-          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11, 31, 17 are not disjoint with :ex/luckyNums values 11, 13, 18."
+          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18."
                  (ex-message db-not-disjoint3)))
 
           (is (= [{:id           :ex/alice
@@ -643,11 +643,11 @@
                     :constraint :sh/lessThan,
                     :shape "_:fdb-20",
                     :path [:ex/p1],
-                    :value [17 12],
+                    :value [12 17],
                     :expect [10 18],
-                    :message "path [:ex/p1] values 17, 12 are not all less than :ex/p2 values 10, 18"}]}
+                    :message "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18"}]}
                  (ex-data db-fail3)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 17, 12 are not all less than :ex/p2 values 10, 18."
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18."
                  (ex-message db-fail3)))
 
           (is (= {:status 400,
@@ -803,11 +803,11 @@
                     :constraint :sh/lessThanOrEquals,
                     :shape "_:fdb-29",
                     :path [:ex/p1],
-                    :value [17 12],
+                    :value [12 17],
                     :expect [10 17],
-                    :message "path [:ex/p1] values 17, 12 are not all less than :ex/p2 values 10, 17"}]}
+                    :message "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17"}]}
                  (ex-data db-fail3)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 17, 12 are not all less than :ex/p2 values 10, 17."
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17."
                  (ex-message db-fail3)))
 
           (is (= {:status 400,
