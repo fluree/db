@@ -1172,10 +1172,46 @@
                           :message (str "value " value " is greater than inclusive maximum " max-in))))))))
 
 ;; string-based constraints
-(defmethod validate-constraint const/sh_minLength [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_maxLength [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_minLength [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [min-length] expect
+        result (-> (base-result v-ctx constraint)
+                   (assoc :path (mapv display path)
+                          :expect min-length))]
+    (->> focus-flakes
+         (remove (fn [f] (>= (count (str (flake/o f))) min-length)))
+         (mapv (fn [[_ _ o dt :as f]]
+                 (if (flake/ref-flake? f)
+                   (let [value (if (flake/ref-flake? f) (display o) (pr-str o))]
+                     (assoc result
+                            :value o
+                            :message (str "value " value " is not a literal value")))
+                   (let [value (pr-str (str o))]
+                     (assoc result
+                            :value o
+                            :message (str "value " value " has string length less than minimum length " min-length)))))))))
+(defmethod validate-constraint const/sh_maxLength [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [max-length] expect
+        result (-> (base-result v-ctx constraint)
+                   (assoc :path (mapv display path)
+                          :expect max-length))]
+    (->> focus-flakes
+         (remove (fn [f] (<= (count (str (flake/o f))) max-length)))
+         (mapv (fn [[_ _ o dt :as f]]
+                 (if (flake/ref-flake? f)
+                   (let [value (if (flake/ref-flake? f) (display o) (pr-str o))]
+                     (assoc result
+                            :value o
+                            :message (str "value " value " is not a literal value")))
+                   (let [value (pr-str (str o))]
+                     (assoc result
+                            :value o
+                            :message (str "value " value " has string length greater than maximum length " max-length)))))))))
 (defmethod validate-constraint const/sh_pattern [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
 (defmethod validate-constraint const/sh_languageIn [v-ctx constraint focus-flakes]
