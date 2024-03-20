@@ -1357,17 +1357,57 @@ WORLD!")
                            :schema/name  "John"
                            :schema/age   40
                            :schema/email 42}})]
-      (is (util/exception? db-no-name))
-      (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/john,
+                :constraint :sh/minCount,
+                :shape "_:fdb-2",
+                :path [:schema/name],
+                :value 0,
+                :expect 1,
+                :message "count 0 is less than minimum count of 1"}]}
+             (ex-data db-no-name)))
+      (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/minCount of shape _:fdb-2 - count 0 is less than minimum count of 1."
              (ex-message db-no-name)))
-      (is (util/exception? db-two-names))
-      (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/john,
+                :constraint :sh/maxCount,
+                :shape "_:fdb-2",
+                :path [:schema/name],
+                :value 2,
+                :expect 1,
+                :message "count 2 is greater than maximum count of 1"}]}
+             (ex-data db-two-names)))
+      (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxCount of shape _:fdb-2 - count 2 is greater than maximum count of 1."
              (ex-message db-two-names)))
-      (is (util/exception? db-too-old))
-      (is (= "SHACL PropertyShape exception - sh:maxInclusive: value 140 is either non-numeric or higher than maximum of 130."
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/john,
+                :constraint :sh/maxInclusive,
+                :shape "_:fdb-3",
+                :path [:schema/age],
+                :expect 130,
+                :value 140,
+                :message "value 140 is greater than inclusive maximum 130"}]}
+             (ex-data db-too-old)))
+      (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxInclusive of shape _:fdb-3 - value 140 is greater than inclusive maximum 130."
              (ex-message db-too-old)))
-      (is (util/exception? db-two-ages))
-      (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/john,
+                :constraint :sh/maxCount,
+                :shape "_:fdb-3",
+                :path [:schema/age],
+                :value 2,
+                :expect 1,
+                :message "count 2 is greater than maximum count of 1"}]}
+             (ex-data db-two-ages)))
+      (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxCount of shape _:fdb-3 - count 2 is greater than maximum count of 1."
              (ex-message db-two-ages)))
       (is (util/exception? db-num-email))
       (is (= "Value 42 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
