@@ -58,16 +58,17 @@
        unwrap-singleton))
 
 (defn format-reference
-  [spec sid]
-  {::reference {:sid  sid
-                :spec spec}})
+  [db spec sid]
+  (let [iri (iri/decode-sid db sid)]
+    {::reference {:iri  iri
+                  :spec spec}}))
 
 (defn format-object
-  [spec f]
+  [db spec f]
   (let [obj (flake/o f)
         dt (flake/dt f)]
     (if (= const/$xsd:anyURI dt)
-      (format-reference spec obj)
+      (format-reference db spec obj)
       (let [obj (flake/o f)]
         (if (= const/$rdf:json dt)
           (json/parse obj false)
@@ -89,7 +90,7 @@
                                       (sort-by (comp :i flake/m) p-flakes)
                                       p-flakes)]
                       (->> p-flakes*
-                           (mapv (partial format-object spec))
+                           (mapv (partial format-object db spec))
                            (unwrap-singleton p-iri context))))]
         [p-iri v]))))
 
@@ -149,9 +150,8 @@
                (>! error-ch e))))))
 
 (defn display-reference
-  [db spec select-spec cache context compact-fn current-depth fuel-tracker error-ch oid]
+  [db o-iri spec select-spec cache context compact-fn current-depth fuel-tracker error-ch]
   (let [max-depth (:depth select-spec)
-        o-iri     (iri/decode-sid db oid)
         subselect (:spec spec)]
     (cond
       ;; have a specified sub-selection (graph crawl)
@@ -163,13 +163,14 @@
       (format-node db o-iri context compact-fn select-spec cache (inc current-depth) fuel-tracker error-ch)
 
       :else
-      (append-id db oid cache compact-fn error-ch))))
+      (let [oid (iri/encode-iri db o-iri)]
+        (append-id db oid cache compact-fn error-ch)))))
 
 (defn resolve-reference
   [db cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
-  (let [{:keys [sid spec]} (::reference v)]
-    (display-reference db spec select-spec cache context
-                       compact-fn current-depth fuel-tracker error-ch sid)))
+  (let [{:keys [iri spec]} (::reference v)]
+    (display-reference db iri spec select-spec cache context
+                       compact-fn current-depth fuel-tracker error-ch)))
 
 (defn resolve-references
   [db cache context compact-fn select-spec current-depth fuel-tracker error-ch attr-ch]
@@ -213,7 +214,7 @@
         range-ch                (query-range/resolve-flake-slices conn opst-root opst-novelty
                                                                   error-ch range-opts)
         sid-xf                  (if spec
-                                  (map (partial format-reference reverse-spec))
+                                  (map (partial format-reference db reverse-spec))
                                   (comp (map (partial cache-sid->iri db cache compact-fn))
                                         (map :as)))]
 
