@@ -258,9 +258,19 @@
                                  :schema/name  "John"
                                  :ex/firstName "Jack"}})
                              (catch Exception e e))]
-          (is (util/exception? db-not-equal)
-              "Exception, because :schema/name does not equal :ex/firstName")
-          (is (= "SHACL PropertyShape exception - sh:equals: [\"John\"] not equal to [\"Jack\"]."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/john,
+                    :constraint :sh/equals,
+                    :shape "_:fdb-2",
+                    :path [:schema/name],
+                    :value ["John"],
+                    :expect ["Jack"],
+                    :message
+                    "path [:schema/name] values John do not equal :ex/firstName values Jack"}]}
+                 (ex-data db-not-equal)))
+          (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/equals of shape _:fdb-2 - path [:schema/name] values John do not equal :ex/firstName values Jack."
                  (ex-message db-not-equal)))
 
           (is (= [{:id           :ex/alice
@@ -342,21 +352,58 @@
                                   :ex/favNums   [11 17]
                                   :ex/luckyNums ["11" "17"]}})
                               (catch Exception e e))]
-          (is (util/exception? db-not-equal1)
-              "Exception, because :ex/favNums does not equal :ex/luckyNums")
-          (is (= (ex-message db-not-equal1)
-                 "SHACL PropertyShape exception - sh:equals: [11 17] not equal to [13 18]."))
-          (is (util/exception? db-not-equal2)
-              "Exception, because :ex/favNums does not equal :ex/luckyNums")
-          (is (= "SHACL PropertyShape exception - sh:equals: [11 17] not equal to [11]."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/brian,
+                    :constraint :sh/equals,
+                    :shape "_:fdb-6",
+                    :path [:ex/favNums],
+                    :value [11 17],
+                    :expect [13 18],
+                    :message "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 13, 18"}]}
+                 (ex-data db-not-equal1)))
+          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 13, 18."
+                 (ex-message db-not-equal1)))
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/brian,
+                    :constraint :sh/equals,
+                    :shape "_:fdb-6",
+                    :path [:ex/favNums],
+                    :value [11 17],
+                    :expect [11],
+                    :message
+                    "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11"}]}
+                 (ex-data db-not-equal2)))
+          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11."
                  (ex-message db-not-equal2)))
-          (is (util/exception? db-not-equal3)
-              "Exception, because :ex/favNums does not equal :ex/luckyNums")
-          (is (= "SHACL PropertyShape exception - sh:equals: [11 17] not equal to [11 17 18]."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/brian,
+                    :constraint :sh/equals,
+                    :shape "_:fdb-6",
+                    :path [:ex/favNums],
+                    :value [11 17],
+                    :expect [11 17 18],
+                    :message "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17, 18"}]}
+                 (ex-data db-not-equal3)))
+          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17, 18."
                  (ex-message db-not-equal3)))
-          (is (util/exception? db-not-equal4)
-              "Exception, because :ex/favNums does not equal :ex/luckyNums")
-          (is (= "SHACL PropertyShape exception - sh:equals: [11 17] not equal to [\"11\" \"17\"]."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/brian,
+                    :constraint :sh/equals,
+                    :shape "_:fdb-6",
+                    :path [:ex/favNums],
+                    :value [11 17],
+                    :expect ["11" "17"],
+                    :message "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17"}]}
+                 (ex-data db-not-equal4)))
+          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17."
                  (ex-message db-not-equal4)))
           (is (= [{:id           :ex/alice
                    :type         :ex/User
