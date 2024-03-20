@@ -1,6 +1,6 @@
 (ns fluree.db.query.json-ld.response
-  (:require [fluree.db.util.async :refer [<? go-try]]
-            [clojure.core.async :as async :refer [<! >! go go-loop]]
+  (:require [fluree.db.util.async :refer [<?]]
+            [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.permissions-validate :as validate]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.flake :as flake]
@@ -11,8 +11,6 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.json :as json]
             [fluree.db.json-ld.iri :as iri]))
-
-;; handles :select response map for JSON-LD based queries
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -197,7 +195,7 @@
                 (recur r resolved-attrs)))
             resolved-attrs)))))
 
-(defn reverse-property
+(defn format-reverse-property
   [{:keys [conn t] :as db} cache compact-fn oid {:keys [as spec], p-iri :iri, :as reverse-spec} fuel-tracker error-ch]
   (let [pid                     (iri/encode-iri db p-iri)
         opst-root               (:opst db)
@@ -226,7 +224,7 @@
                      []
                      range-ch)))
 
-(defn reverse-properties
+(defn format-reverse-properties
   [db iri cache compact-fn reverse-map fuel-tracker error-ch]
   (let [out-ch (async/chan 32)
         oid    (iri/encode-iri db iri)]
@@ -234,7 +232,7 @@
                           out-ch
                           (fn [reverse-spec ch]
                             (-> db
-                                (reverse-property cache compact-fn oid reverse-spec fuel-tracker error-ch)
+                                (format-reverse-property cache compact-fn oid reverse-spec fuel-tracker error-ch)
                                 (async/pipe ch)))
                           (async/to-chan! (vals reverse-map)))
 
@@ -266,7 +264,7 @@
   (let [sid        (iri/encode-iri db iri)
         forward-ch (format-forward-properties db iri context compact-fn select-spec cache fuel-tracker error-ch)
         subject-ch (if reverse
-                     (let [reverse-ch (reverse-properties db iri cache compact-fn reverse fuel-tracker error-ch)]
+                     (let [reverse-ch (format-reverse-properties db iri cache compact-fn reverse fuel-tracker error-ch)]
                        (->> [forward-ch reverse-ch]
                             async/merge
                             (async/reduce merge {})))
@@ -286,7 +284,7 @@
                               (format-subject-xf db cache context compact-fn select-spec)
                               s-flakes)
           subject-ch    (if reverse
-                          (let [reverse-ch (reverse-properties db s-iri cache compact-fn reverse fuel-tracker error-ch)]
+                          (let [reverse-ch (format-reverse-properties db s-iri cache compact-fn reverse fuel-tracker error-ch)]
                             (async/reduce conj subject-attrs reverse-ch))
                           (go subject-attrs))]
       (->> subject-ch
