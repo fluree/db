@@ -1133,21 +1133,83 @@
         equals-objects (into #{} (map flake/o) equals-flakes)
         focus-objects  (into #{} (map flake/o) focus-flakes)]
     (when (not= equals-objects focus-objects)
-      (let [displayed-path (mapv display path)
-            values         (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
-            expects        (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) equals-flakes)]
+      (let [iri-path (mapv display path)
+            values   (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
+            expects  (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) equals-flakes)]
         [(-> (base-result v-ctx constraint)
-             (assoc :path displayed-path
+             (assoc :path iri-path
                     :value values
                     :expect expects
-                    :message (str "path " displayed-path " values " (str/join ", " values) " do not equal "
+                    :message (str "path " iri-path " values " (str/join ", " values) " do not equal "
                                   (display equals) " values " (str/join ", " expects))))]))))
-(defmethod validate-constraint const/sh_disjoint [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_lessThan [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_lessThanOrEquals [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_disjoint [{:keys [shape data-db display subject] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [disjoint]       expect
+        disjoint-flakes  (async/<!! (query-range/index-range data-db :spot = [subject disjoint]))
+        disjoint-objects (into #{} (map flake/o) disjoint-flakes)
+        focus-objects    (into #{} (map flake/o) focus-flakes)]
+    (when (not-empty (set/intersection focus-objects disjoint-objects))
+      (let [iri-path (mapv display path)
+            values   (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
+            expects  (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) disjoint-flakes)]
+        [(-> (base-result v-ctx constraint)
+             (assoc :path iri-path
+                    :value values
+                    :expect expects
+                    :message (str "path " iri-path " values " (str/join ", " values) " are not disjoint with "
+                                  (display disjoint) " values " (str/join ", " expects))))]))))
+(defmethod validate-constraint const/sh_lessThan [{:keys [shape subject data-db display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [less-than]       expect
+        less-than-flakes  (async/<!! (query-range/index-range data-db :spot = [subject less-than]))
+        less-than-objects (into #{} (map flake/o) less-than-flakes)
+        focus-objects     (into #{} (map flake/o) focus-flakes)
+
+        iri-path (mapv display path)
+        values   (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
+        expects  (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) less-than-flakes)
+        result   (-> (base-result v-ctx constraint)
+                           (assoc :path iri-path
+                                  :value values
+                                  :expect expects))]
+    (if (or (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
+                 (every? (fn [f] (contains? numeric-types (flake/dt f))) focus-flakes))
+            (and (every? (fn [f] (contains? time-types (flake/dt f))) less-than-flakes)
+                 (every? (fn [f] (contains? time-types (flake/dt f))) focus-flakes)))
+      (when-not (every? (fn [o] (apply < o (sort less-than-objects))) focus-objects)
+        [(assoc result :message (str "path " iri-path " values " (str/join ", " values) " are not all less than "
+                                     (display less-than) " values " (str/join ", " expects)))])
+      [(assoc result :message (str "path " iri-path " values " (str/join ", " values) " are not all comparable with "
+                                   (display less-than) " values " (str/join ", " expects)))])))
+(defmethod validate-constraint const/sh_lessThanOrEquals [{:keys [shape subject data-db display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint shape-id const/$id path const/sh_path} shape
+
+        [less-than]       expect
+        less-than-flakes  (async/<!! (query-range/index-range data-db :spot = [subject less-than]))
+        less-than-objects (into #{} (map flake/o) less-than-flakes)
+        focus-objects     (into #{} (map flake/o) focus-flakes)
+
+        iri-path (mapv display path)
+        values   (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
+        expects  (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) less-than-flakes)
+        result   (-> (base-result v-ctx constraint)
+                           (assoc :path iri-path
+                                  :value values
+                                  :expect expects))]
+    (if (or (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
+                 (every? (fn [f] (contains? numeric-types (flake/dt f))) focus-flakes))
+            (and (every? (fn [f] (contains? time-types (flake/dt f))) less-than-flakes)
+                 (every? (fn [f] (contains? time-types (flake/dt f))) focus-flakes)))
+      (when-not (every? (fn [o] (apply <= o (sort less-than-objects))) focus-objects)
+        [(assoc result :message (str "path " iri-path " values " (str/join ", " values) " are not all less than "
+                                     (display less-than) " values " (str/join ", " expects)))])
+      [(assoc result :message (str "path " iri-path " values " (str/join ", " values) " are not all comparable with "
+                                   (display less-than) " values " (str/join ", " expects)))])))
 
 ;; logical constraints
 (defmethod validate-constraint const/sh_not [v-ctx constraint focus-flakes]

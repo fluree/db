@@ -471,19 +471,48 @@
                                      :ex/favNums   [11 17 31]
                                      :ex/luckyNums [13 18 11]}})
                                  (catch Exception e e))]
-          (is (util/exception? db-not-disjoint1)
-              "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
-          (is (= "SHACL PropertyShape exception - sh:disjoint: [11] not disjoint from [11]."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/brian,
+                    :constraint :sh/disjoint,
+                    :shape "_:fdb-14",
+                    :path [:ex/favNums],
+                    :value [11],
+                    :expect [11],
+                    :message "path [:ex/favNums] values 11 are not disjoint with :ex/luckyNums values 11"}]}
+                 (ex-data db-not-disjoint1)))
+          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11 are not disjoint with :ex/luckyNums values 11."
                  (ex-message db-not-disjoint1)))
 
-          (is (util/exception? db-not-disjoint2)
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/brian,
+                    :constraint :sh/disjoint,
+                    :shape "_:fdb-14",
+                    :path [:ex/favNums],
+                    :value [11 31 17],
+                    :expect [11],
+                    :message "path [:ex/favNums] values 11, 31, 17 are not disjoint with :ex/luckyNums values 11"}]}
+                 (ex-data db-not-disjoint2))
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
-          (is (= "SHACL PropertyShape exception - sh:disjoint: [11 17 31] not disjoint from [11]."
+          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11, 31, 17 are not disjoint with :ex/luckyNums values 11."
                  (ex-message db-not-disjoint2)))
 
-          (is (util/exception? db-not-disjoint3)
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/brian,
+                    :constraint :sh/disjoint,
+                    :shape "_:fdb-14",
+                    :path [:ex/favNums],
+                    :value [11 31 17],
+                    :expect [11 13 18],
+                    :message "path [:ex/favNums] values 11, 31, 17 are not disjoint with :ex/luckyNums values 11, 13, 18"}]}
+                 (ex-data db-not-disjoint3))
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
-          (is (= "SHACL PropertyShape exception - sh:disjoint: [11 17 31] not disjoint from [11 13 18]."
+          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11, 31, 17 are not disjoint with :ex/luckyNums values 11, 13, 18."
                  (ex-message db-not-disjoint3)))
 
           (is (= [{:id           :ex/alice
@@ -579,30 +608,75 @@
                                 :ex/p1       :ex/brian
                                 :ex/p2       :ex/john}})
                             (catch Exception e e))]
-          (is (util/exception? db-fail1)
-              "Exception, because :ex/p1 is not less than :ex/p2")
-          (is (= "SHACL PropertyShape exception - sh:lessThan: 17 not less than 17, or values are not valid for comparison."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/lessThan,
+                    :shape "_:fdb-20",
+                    :path [:ex/p1],
+                    :value [11 17],
+                    :expect [17],
+                    :message "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17"}]}
+                 (ex-data db-fail1)))
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17."
                  (ex-message db-fail1)))
 
-          (is (util/exception? db-fail2)
-              "Exception, because :ex/p1 is not less than :ex/p2")
-          (is (= "SHACL PropertyShape exception - sh:lessThan: 17 not less than 19, or values are not valid for comparison; sh:lessThan: 17 not less than 18, or values are not valid for comparison; sh:lessThan: 11 not less than 19, or values are not valid for comparison; sh:lessThan: 11 not less than 18, or values are not valid for comparison."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/lessThan,
+                    :shape "_:fdb-20",
+                    :path [:ex/p1],
+                    :value [11 17],
+                    :expect ["18" "19"],
+                    :message "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19"}]}
+                 (ex-data db-fail2)))
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19."
                  (ex-message db-fail2)))
 
-          (is (util/exception? db-fail3)
-              "Exception, because :ex/p1 is not less than :ex/p2")
-          (is (= "SHACL PropertyShape exception - sh:lessThan: 17 not less than 10, or values are not valid for comparison; sh:lessThan: 12 not less than 10, or values are not valid for comparison."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/lessThan,
+                    :shape "_:fdb-20",
+                    :path [:ex/p1],
+                    :value [17 12],
+                    :expect [10 18],
+                    :message "path [:ex/p1] values 17, 12 are not all less than :ex/p2 values 10, 18"}]}
+                 (ex-data db-fail3)))
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 17, 12 are not all less than :ex/p2 values 10, 18."
                  (ex-message db-fail3)))
 
-          (is (util/exception? db-fail4)
-              "Exception, because :ex/p1 is not less than :ex/p2")
-          (is (= "SHACL PropertyShape exception - sh:lessThan: 17 not less than 16, or values are not valid for comparison; sh:lessThan: 17 not less than 12, or values are not valid for comparison."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/lessThan,
+                    :shape "_:fdb-20",
+                    :path [:ex/p1],
+                    :value [11 17],
+                    :expect [12 16],
+                    :message "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16"}]}
+                 (ex-data db-fail4)))
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16."
                  (ex-message db-fail4)))
 
-          (is (util/exception? db-iris)
-              "Exception, because :ex/p1 and :ex/p2 are iris, and not valid for comparison")
-          (is (str/starts-with? (ex-message db-iris)
-                                "SHACL PropertyShape exception - sh:lessThan:"))
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/lessThan,
+                    :shape "_:fdb-20",
+                    :path [:ex/p1],
+                    :value [:ex/brian],
+                    :expect [:ex/john],
+                    :message "path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john"}]}
+                 (ex-data db-iris)))
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john."
+                 (ex-message db-iris)))
 
           (is (= [{:id          :ex/alice
                    :type        :ex/User
@@ -694,24 +768,60 @@
                              :ex/p2       [12 16]}})
                          (catch Exception e e))]
 
-          (is (util/exception? db-fail1)
-              "Exception, because :ex/p1 is not less than or equal to :ex/p2")
-          (is (= "SHACL PropertyShape exception - sh:lessThanOrEquals: 17 not less than or equal to 10, or values are not valid for comparison; sh:lessThanOrEquals: 11 not less than or equal to 10, or values are not valid for comparison."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/lessThanOrEquals,
+                    :shape "_:fdb-29",
+                    :path [:ex/p1],
+                    :value [11 17],
+                    :expect [10],
+                    :message "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10"}]}
+                 (ex-data db-fail1)))
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10."
                  (ex-message db-fail1)))
 
-          (is (util/exception? db-fail2)
-              "Exception, because :ex/p1 is not less than or equal to :ex/p2")
-          (is (= "SHACL PropertyShape exception - sh:lessThanOrEquals: 17 not less than or equal to 19, or values are not valid for comparison; sh:lessThanOrEquals: 17 not less than or equal to 17, or values are not valid for comparison; sh:lessThanOrEquals: 11 not less than or equal to 19, or values are not valid for comparison; sh:lessThanOrEquals: 11 not less than or equal to 17, or values are not valid for comparison."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/lessThanOrEquals,
+                    :shape "_:fdb-29",
+                    :path [:ex/p1],
+                    :value [11 17],
+                    :expect ["17" "19"],
+                    :message "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19"}]}
+                 (ex-data db-fail2)))
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19."
                  (ex-message db-fail2)))
 
-          (is (util/exception? db-fail3)
-              "Exception, because :ex/p1 is not less than or equal to :ex/p2")
-          (is (= "SHACL PropertyShape exception - sh:lessThanOrEquals: 17 not less than or equal to 10, or values are not valid for comparison; sh:lessThanOrEquals: 12 not less than or equal to 10, or values are not valid for comparison."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/lessThanOrEquals,
+                    :shape "_:fdb-29",
+                    :path [:ex/p1],
+                    :value [17 12],
+                    :expect [10 17],
+                    :message "path [:ex/p1] values 17, 12 are not all less than :ex/p2 values 10, 17"}]}
+                 (ex-data db-fail3)))
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 17, 12 are not all less than :ex/p2 values 10, 17."
                  (ex-message db-fail3)))
 
-          (is (util/exception? db-fail4)
-              "Exception, because :ex/p1 is not less than or equal to :ex/p2")
-          (is (= "SHACL PropertyShape exception - sh:lessThanOrEquals: 17 not less than or equal to 16, or values are not valid for comparison; sh:lessThanOrEquals: 17 not less than or equal to 12, or values are not valid for comparison."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject :ex/alice,
+                    :constraint :sh/lessThanOrEquals,
+                    :shape "_:fdb-29",
+                    :path [:ex/p1],
+                    :value [11 17],
+                    :expect [12 16],
+                    :message "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16"}]}
+                 (ex-data db-fail4)))
+          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16."
                  (ex-message db-fail4)))
           (is (= [{:id          :ex/alice
                    :type        :ex/User
