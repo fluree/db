@@ -88,7 +88,7 @@
                 :message "count 0 is less than minimum count of 1"
                 :shape "_:fdb-2"}]}
              (ex-data db-no-names)))
-      (is (= ":ex/john [:schema/name] violates :sh/minCount constraint of shape _:fdb-2 - count 0 is less than minimum count of 1."
+      (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/minCount of shape _:fdb-2 - count 0 is less than minimum count of 1."
              (ex-message db-no-names)))
       (is (= {:status 400,
               :error :shacl/violation
@@ -101,7 +101,7 @@
                 :constraint :sh/maxCount
                 :shape "_:fdb-2"}]}
             (ex-data db-two-names)))
-      (is (= ":ex/john [:schema/name] violates :sh/maxCount constraint of shape _:fdb-2 - count 2 is greater than maximum count of 1."
+      (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxCount of shape _:fdb-2 - count 2 is greater than maximum count of 1."
              (ex-message db-two-names)))
       (is (= [{:id              :ex/john,
                :type            :ex/User,
@@ -212,7 +212,7 @@
                 :expect [:type :schema/name],
                 :message "disallowed path :schema/email with values john@flur.ee"}]}
              (ex-data db-extra-prop)))
-      (is (= ":ex/john [:schema/email] violates :sh/closed constraint of shape :ex/UserShape - disallowed path :schema/email with values john@flur.ee."
+      (is (= "Subject :ex/john path [:schema/email] violates constraint :sh/closed of shape :ex/UserShape - disallowed path :schema/email with values john@flur.ee."
              (ex-message db-extra-prop)))
 
       (is (= [{:id          :ex/john
