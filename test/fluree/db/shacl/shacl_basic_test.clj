@@ -1108,22 +1108,58 @@
                                     :type        :ex/User
                                     :schema/name :ex/ref}})
                                 (catch Exception e e))]
-      (is (util/exception? db-too-short-str)
-          "Exception, because :schema/name is shorter than minimum string length")
-      (is (= "SHACL PropertyShape exception - sh:minLength: value Al has string length smaller than minimum: 4 or it is not a literal value."
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/al,
+                :constraint :sh/minLength,
+                :shape "_:fdb-2",
+                :path [:schema/name],
+                :expect 4,
+                :value "Al",
+                :message "value \"Al\" has string length less than minimum length 4"}]}
+             (ex-data db-too-short-str)))
+      (is (= "Subject :ex/al path [:schema/name] violates constraint :sh/minLength of shape _:fdb-2 - value \"Al\" has string length less than minimum length 4."
              (ex-message db-too-short-str)))
-      (is (util/exception? db-too-long-str)
-          "Exception, because :schema/name is longer than maximum string length")
-      (is (= "SHACL PropertyShape exception - sh:maxLength: value Jean-Claude has string length larger than 10 or it is not a literal value."
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/jean-claude,
+                :constraint :sh/maxLength,
+                :shape "_:fdb-2",
+                :path [:schema/name],
+                :expect 10,
+                :value "Jean-Claude",
+                :message "value \"Jean-Claude\" has string length greater than maximum length 10"}]}
+             (ex-data db-too-long-str)))
+      (is (= "Subject :ex/jean-claude path [:schema/name] violates constraint :sh/maxLength of shape _:fdb-2 - value \"Jean-Claude\" has string length greater than maximum length 10."
              (ex-message db-too-long-str)))
-      (is (util/exception? db-too-long-non-str)
-          "Exception, because :schema/name is longer than maximum string length")
-      (is (= "SHACL PropertyShape exception - sh:maxLength: value 12345678910 has string length larger than 10 or it is not a literal value."
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/john,
+                :constraint :sh/maxLength,
+                :shape "_:fdb-2",
+                :path [:schema/name],
+                :expect 10,
+                :value 12345678910,
+                :message "value \"12345678910\" has string length greater than maximum length 10"}]}
+             (ex-data db-too-long-non-str)))
+      (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxLength of shape _:fdb-2 - value \"12345678910\" has string length greater than maximum length 10."
              (ex-message db-too-long-non-str)))
-      (is (util/exception? db-ref-value)
-          "Exception, because :schema/name is not a literal value")
-      (is (str/starts-with? (ex-message db-ref-value)
-                            "SHACL PropertyShape exception - sh:maxLength: value "))
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/john,
+                :constraint :sh/maxLength,
+                :shape "_:fdb-2",
+                :path [:schema/name],
+                :expect 10,
+                :value #fluree/SID [101 "ref"],
+                :message "value :ex/ref is not a literal value"}]}
+             (ex-data db-ref-value)))
+      (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxLength of shape _:fdb-2 - value :ex/ref is not a literal value."
+             (ex-message db-ref-value)))
       (is (= [{:id          :ex/john
                :type        :ex/User
                :schema/name "John"}]
