@@ -20,14 +20,13 @@
 ;; class expressions
 (def ^:const $owl-equivalentClass "http://www.w3.org/2002/07/owl#equivalentClass")
 (def ^:const $owl-intersectionOf "http://www.w3.org/2002/07/owl#intersectionOf")
-
-(def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
-
+(def ^:const $owl-unionOf "http://www.w3.org/2002/07/owl#unionOf")
 (def ^:const $owl-Restriction "http://www.w3.org/2002/07/owl#Restriction")
+(def ^:const $owl-onProperty "http://www.w3.org/2002/07/owl#onProperty")
 (def ^:const $owl-hasValue "http://www.w3.org/2002/07/owl#hasValue")
 (def ^:const $owl-someValuesFrom "http://www.w3.org/2002/07/owl#someValuesFrom")
-(def ^:const $owl-onProperty "http://www.w3.org/2002/07/owl#onProperty")
 
+(def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
 
 (def ^:const $f:rule "http://flur.ee/ns/ledger#rule")
 
@@ -188,24 +187,75 @@
         (conj [(str $owl-inverseOf "(prp-inv1)") rule1])
         (conj [(str $owl-inverseOf "(prp-inv2)") rule2]))))
 
+(defn equiv-class-type
+  [equiv-class-statement]
+  (cond (some #(= % $owl-Restriction) (:type equiv-class-statement))
+        :restrictions
+
+        (contains? equiv-class-statement $owl-intersectionOf)
+        :intersections
+
+        (contains? equiv-class-statement $owl-unionOf)
+        :unions
+
+        (contains? equiv-class-statement :id)
+        :classes
+
+        :else nil))
+
+(defn equiv-class-rules
+  "Maps every class equivalence to every other class in the set"
+  [rule-class class-statements]
+  (let [c-set (->> class-statements
+                   (map :id)
+                   (into #{rule-class}))]
+    (map-indexed (fn [idx cn]
+                   (let [rule-id (str rule-class "(owl:equivalentClass-" idx ")")
+                         rule    {"where"  {"@id"   "?x"
+                                            "@type" cn}
+                                  "insert" {"@id"   "?x"
+                                            "@type" (into [] (disj c-set cn))}}]
+                     [rule-id rule]))
+                 c-set)))
+
+(defn equiv-class-restrictions
+  "Handles rules cls-hv1, cls-hv2"
+  [rule-class restrictions]
+  (reduce
+    (fn [acc restriction]
+      (let [property (util/get-first-id restriction $owl-onProperty)
+            one-val  (if-let [one-val (util/get-first restriction $owl-hasValue)]
+                       (if-let [one-val-id (:id one-val)]
+                         {"@id" one-val-id}
+                         (:value one-val)))
+            rule1    {"where"  {"@id"    "?x"
+                                property one-val}
+                      "insert" {"@id"   "?x"
+                                "@type" rule-class}}
+            rule2    {"where"  {"@id"   "?x"
+                                "@type" rule-class}
+                      "insert" {"@id"    "?x"
+                                property one-val}}]
+        (if (and property one-val)
+          (-> acc
+              (conj [(str rule-class "(owl:Restriction-" property "-1)") rule1])
+              (conj [(str rule-class "(owl:Restriction-" property "-2)") rule2]))
+          (do (log/warn "owl:Restriction for class" rule-class
+                        "is not properly defined. owl:onProperty is:" property
+                        "and owl:hasValue is:" one-val ". onProperty must exist and be an IRI."
+                        "hasValue must exist, but can be an IRI or literal value.")
+              acc))))
+    []
+    restrictions))
+
 (defmethod to-datalog ::cax-eqc
   [_ _ owl-statement all-rules]
-  (let [c1    (:id owl-statement) ;; the class which is the subject
+  (let [c1 (:id owl-statement) ;; the class which is the subject
         ;; combine with all other equivalent classes for a set of 2+ total classes
-        c-all (->> (get owl-statement $owl-equivalentClass)
-                   (map :id)
-                   (into #{c1}))
-        ;; every class needs to have every other class added
-        rules (map-indexed (fn [idx cn]
-                             (let [rule-id (str c1 "(owl:equivalentClass-" idx ")")
-                                   rule    {"where"  {"@id"   "?x"
-                                                      "@type" cn}
-                                            "insert" {"@id"   "?x"
-                                                      "@type" (into [] (disj c-all cn))}}]
-
-                               [rule-id rule]))
-                           c-all)]
-    (into all-rules rules)))
+        {:keys [restrictions classes unions classes]} (group-by equiv-class-type (get owl-statement $owl-equivalentClass))]
+    (cond-> all-rules
+            classes (into (equiv-class-rules c1 classes))
+            restrictions (into (equiv-class-restrictions c1 restrictions)))))
 
 
 ;; TODO - re-enable once filter function bug is fixed
