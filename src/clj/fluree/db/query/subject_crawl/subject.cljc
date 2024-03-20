@@ -87,11 +87,10 @@
 (defn result-af
   [{:keys [db cache context compact-fn select-spec error-ch] :as _opts}]
   (fn [flakes port]
-    (go
-      (let [result (<! (json-ld-resp/format-subject-flakes db cache context compact-fn select-spec 0 nil error-ch flakes))]
-        (when (not-empty result)
-          (>! port result)))
-      (async/close! port))))
+    (-> db
+        (json-ld-resp/format-subject-flakes cache context compact-fn select-spec
+                                            0 nil error-ch flakes)
+        (async/pipe port))))
 
 (defn subj-crawl
   [{:keys [db error-ch f-where limit offset parallelism vars finish-fn] :as opts}]
