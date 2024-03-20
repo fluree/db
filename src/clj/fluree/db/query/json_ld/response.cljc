@@ -36,15 +36,6 @@
   [pid]
   (= const/$rdf:type pid))
 
-(declare format-node)
-
-(defn includes-id?
-  [db sid {:keys [wildcard?] :as select-spec}]
-  (go-try
-    (when (or wildcard?
-              (contains? select-spec const/iri-id))
-      (<? (validate/allow-iri? db sid)))))
-
 (defn list-element?
   [flake]
   (-> flake flake/m (contains? :i)))
@@ -130,37 +121,51 @@
   [v]
   (some? (::reference v)))
 
+(declare format-node)
+
+(defn append-id
+  ([db sid cache compact-fn error-ch]
+   (append-id db sid nil cache compact-fn error-ch nil))
+  ([db sid {:keys [wildcard?] :as select-spec} cache compact-fn error-ch node-ch]
+   (go
+     (try*
+       (let [node  (if (nil? node-ch)
+                     {}
+                     (<! node-ch))
+             node* (if (and (or (nil? select-spec)
+                                wildcard?
+                                (contains? select-spec const/iri-id))
+                            (<? (validate/allow-iri? db sid)))
+
+                     (let [;; TODO: we generate id-key here every time, this
+                           ;; should be done in the :spec once beforehand and
+                           ;; used from there
+                           id-key (:as (or (wildcard-spec db cache compact-fn const/$id)
+                                           (cache-sid->iri db cache compact-fn const/$id)))
+                           iri    (compact-fn (iri/decode-sid db sid))]
+                       (assoc node id-key iri))
+                     node)]
+         (not-empty node*))
+       (catch* e
+               (log/info e "Error appending subject iri")
+               (>! error-ch e))))))
+
 (defn display-reference
   [db spec select-spec cache context compact-fn current-depth fuel-tracker error-ch oid]
-  (go
-    (try*
-      (let [;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
-            max-depth     (:depth select-spec)
-            id-key        (:as (or (wildcard-spec db cache compact-fn const/$id)
-                                   (cache-sid->iri db cache compact-fn const/$id)))
-            o-iri         (iri/decode-sid db oid)
-            o-iri-compact (compact-fn o-iri)
-            subselect     (:spec spec)
-            ref           (cond
-                            ;; have a specified sub-selection (graph crawl)
-                            subselect
-                            (let [ref-attrs (<! (format-node db o-iri context compact-fn subselect cache (inc current-depth) fuel-tracker error-ch))]
-                              (if (<? (includes-id? db oid subselect))
-                                (assoc ref-attrs id-key o-iri-compact)
-                                ref-attrs))
+  (let [max-depth (:depth select-spec)
+        o-iri     (iri/decode-sid db oid)
+        subselect (:spec spec)]
+    (cond
+      ;; have a specified sub-selection (graph crawl)
+      subselect
+      (format-node db o-iri context compact-fn subselect cache (inc current-depth) fuel-tracker error-ch)
 
-                            ;; requested graph crawl depth has not yet been reached
-                            (< current-depth max-depth)
-                            (cond-> (<! (format-node db o-iri context compact-fn select-spec cache (inc current-depth) fuel-tracker error-ch))
-                              (<? (validate/allow-iri? db oid)) (assoc id-key o-iri-compact))
+      ;; requested graph crawl depth has not yet been reached
+      (< current-depth max-depth)
+      (format-node db o-iri context compact-fn select-spec cache (inc current-depth) fuel-tracker error-ch)
 
-                            :else
-                            (when (<? (validate/allow-iri? db oid))
-                              {id-key o-iri-compact}))]
-        (not-empty ref))
-      (catch* e
-              (log/error e "Error resolving reference")
-              (>! error-ch e)))))
+      :else
+      (append-id db oid cache compact-fn error-ch))))
 
 (defn resolve-reference
   [db cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
@@ -235,20 +240,6 @@
 
     (async/reduce conj {} out-ch)))
 
-(defn append-id
-  [db sid select-spec compact-fn error-ch subgraph-ch]
-  (go
-    (try*
-      (let [subgraph (<! subgraph-ch)
-            node     (if (<? (includes-id? db sid select-spec))
-                       (let [iri (compact-fn (iri/decode-sid db sid))]
-                         (assoc subgraph (compact-fn const/iri-id) iri))
-                       subgraph)]
-        (not-empty node))
-      (catch* e
-              (log/info e "Error appending subject iri")
-              (>! error-ch e)))))
-
 (defn format-forward-properties
   [{:keys [conn t] :as db} iri context compact-fn select-spec cache fuel-tracker error-ch]
   (let [sid                     (iri/encode-iri db iri)
@@ -282,7 +273,7 @@
                      forward-ch)]
     (->> subject-ch
          (resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-         (append-id db sid select-spec compact-fn error-ch))))
+         (append-id db sid select-spec cache compact-fn error-ch))))
 
 (defn format-subject-flakes
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
@@ -300,5 +291,5 @@
                           (go subject-attrs))]
       (->> subject-ch
            (resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-           (append-id db sid select-spec compact-fn error-ch)))
+           (append-id db sid select-spec cache compact-fn error-ch)))
     (go)))
