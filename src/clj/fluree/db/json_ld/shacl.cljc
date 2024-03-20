@@ -1189,7 +1189,7 @@
 
 (defn explain-result
   [{:keys [subject constraint shape path message]}]
-  (str  subject " " path " violates " constraint " constraint of shape " shape " - " message "."))
+  (str "Subject " subject " path " path " violates constraint " constraint " of shape " shape " - " message "."))
 
 (defn throw-shacl-violation
   [{ns-codes :namespace-codes} context results]
