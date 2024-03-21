@@ -1582,12 +1582,32 @@ WORLD!")
                                                  "https://example.com/name"    "Jenny Tutone"}]})]
     (is (not (util/exception? db2)))
     (is (not (util/exception? db3)))
-    (is (util/exception? db4))
-    (is (str/starts-with? (ex-message db4)
-                          "SHACL PropertyShape exception - sh:class: class(es) "))
-    (is (util/exception? db5))
-    (is (str/starts-with? (ex-message db5)
-                          "SHACL PropertyShape exception - sh:class: class(es) "))))
+    (is (= {:status 400,
+            :error  :shacl/violation,
+            :report
+            [{:subject    "https://example.com/Actor/1001",
+              :constraint "sh:class",
+              :shape      "_:fdb-5",
+              :path       ["https://example.com/country"],
+              :expect     ["https://example.com/Country"],
+              :value      ["https://example.com/FakeCountry"],
+              :message    "missing required class https://example.com/Country"}]}
+           (ex-data db4)))
+    (is (= "Subject https://example.com/Actor/1001 path [\"https://example.com/country\"] violates constraint sh:class of shape _:fdb-5 - missing required class https://example.com/Country."
+                          (ex-message db4)))
+    (is (= {:status 400,
+            :error  :shacl/violation,
+            :report
+            [{:subject    "https://example.com/Actor/8675309",
+              :constraint "sh:class",
+              :shape      "_:fdb-5",
+              :path       ["https://example.com/country"],
+              :expect     ["https://example.com/Country"],
+              :value      ["https://example.com/FakeCountry"],
+              :message    "missing required class https://example.com/Country"}]}
+           (ex-data db5)))
+    (is (= "Subject https://example.com/Actor/8675309 path [\"https://example.com/country\"] violates constraint sh:class of shape _:fdb-5 - missing required class https://example.com/Country."
+           (ex-message db5)))))
 
 (deftest ^:integration shacl-in-test
   (testing "value nodes"
