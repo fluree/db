@@ -197,10 +197,8 @@
             resolved-attrs)))))
 
 (defn format-reverse-property
-  [{:keys [conn t] :as db} cache compact-fn oid {:keys [as spec], p-iri :iri, :as reverse-spec} fuel-tracker error-ch]
+  [{:keys [t] :as db} cache compact-fn oid {:keys [as spec], p-iri :iri, :as reverse-spec} fuel-tracker error-ch]
   (let [pid                     (iri/encode-iri db p-iri)
-        opst-root               (:opst db)
-        opst-novelty            (get-in db [:novelty :opst])
         [start-flake end-flake] (flake-bounds db :opst [oid pid])
         flake-xf                (if fuel-tracker
                                   (comp (fuel/track fuel-tracker error-ch)
@@ -215,9 +213,7 @@
                                   (map (partial format-reference db reverse-spec))
                                   (comp (map (partial cache-sid->iri db cache compact-fn))
                                         (map :as)))]
-
-    (->> (query-range/resolve-flake-slices conn opst-root opst-novelty error-ch range-opts)
-         (query-range/filter-authorized db start-flake end-flake error-ch)
+    (->> (query-range/resolve-flake-slices db :opst error-ch range-opts)
          (async/transduce (comp cat sid-xf)
                           (completing conj
                                       (fn [result]
@@ -239,10 +235,8 @@
     (async/reduce conj {} out-ch)))
 
 (defn format-forward-properties
-  [{:keys [conn t] :as db} iri context compact-fn select-spec cache fuel-tracker error-ch]
+  [{:keys [t] :as db} iri context compact-fn select-spec cache fuel-tracker error-ch]
   (let [sid                     (iri/encode-iri db iri)
-        spot-root               (:spot db)
-        spot-novelty            (-> db :novelty :spot)
         [start-flake end-flake] (flake-bounds db :spot [sid])
         flake-xf                (when fuel-tracker
                                   (comp (fuel/track fuel-tracker error-ch)))
@@ -254,8 +248,7 @@
         subj-xf                 (comp cat
                                       (format-subject-xf db cache context compact-fn
                                                          select-spec))]
-    (->> (query-range/resolve-flake-slices conn spot-root spot-novelty error-ch range-opts)
-         (query-range/filter-authorized db start-flake end-flake error-ch)
+    (->> (query-range/resolve-flake-slices db :spot error-ch range-opts)
          (async/transduce subj-xf (completing conj) {}))))
 
 (defn format-node

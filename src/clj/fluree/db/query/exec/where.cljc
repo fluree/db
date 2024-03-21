@@ -310,8 +310,6 @@
                            (catch* e
                              (log/error e "Error resolving flake range")
                              (async/put! error-ch e)))
-         idx-root    (get db idx)
-         novelty     (get-in db [:novelty idx])
          [o* o-fn*]  (augment-object-fn idx s p o o-fn alias)
          start-flake (flake/create s p o* o-dt nil nil util/min-integer)
          end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
@@ -342,8 +340,7 @@
                       :start-flake start-flake
                       :end-flake   end-flake
                       :flake-xf    flake-xf*}]
-     (->> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
-          (query-range/filter-authorized db start-flake end-flake error-ch)))))
+     (query-range/resolve-flake-slices db idx error-ch opts))))
 
 
 (defn compute-sid
