@@ -211,19 +211,18 @@
                                  :start-flake start-flake
                                  :end-flake   end-flake
                                  :flake-xf    flake-xf}
-        range-ch                (query-range/resolve-flake-slices conn opst-root opst-novelty
-                                                                  error-ch range-opts)
         sid-xf                  (if spec
                                   (map (partial format-reference db reverse-spec))
                                   (comp (map (partial cache-sid->iri db cache compact-fn))
                                         (map :as)))]
 
-    (async/transduce (comp cat sid-xf)
-                     (completing conj
-                                 (fn [result]
-                                   [as (unwrap-singleton result)]))
-                     []
-                     range-ch)))
+    (->> (query-range/resolve-flake-slices conn opst-root opst-novelty error-ch range-opts)
+         (query-range/filter-authorized db start-flake end-flake error-ch)
+         (async/transduce (comp cat sid-xf)
+                          (completing conj
+                                      (fn [result]
+                                        [as (unwrap-singleton result)]))
+                          []))))
 
 (defn format-reverse-properties
   [db iri cache compact-fn reverse-map fuel-tracker error-ch]
@@ -252,13 +251,12 @@
                                  :start-flake start-flake
                                  :end-flake   end-flake
                                  :flake-xf    flake-xf}
-        flake-slice-ch          (->> (query-range/resolve-flake-slices conn spot-root spot-novelty
-                                                                       error-ch range-opts)
-                                     (query-range/filter-authorized db start-flake end-flake error-ch))
         subj-xf                 (comp cat
                                       (format-subject-xf db cache context compact-fn
                                                          select-spec))]
-    (async/transduce subj-xf (completing conj) {} flake-slice-ch)))
+    (->> (query-range/resolve-flake-slices conn spot-root spot-novelty error-ch range-opts)
+         (query-range/filter-authorized db start-flake end-flake error-ch)
+         (async/transduce subj-xf (completing conj) {}))))
 
 (defn format-node
   [db iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
