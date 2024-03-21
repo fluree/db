@@ -1054,8 +1054,32 @@
    :shape (-> shape (get const/$id) display)})
 
 ;; value type constraints
-(defmethod validate-constraint const/sh_class [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_class [{:keys [shape subject display data-db] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint path const/sh_path} shape
+
+        expected-classes (into #{} expect)
+
+        result (-> (base-result v-ctx constraint)
+                   (assoc :path (mapv display path)
+                          :expect (mapv display expect)))]
+    (loop [[f & r] focus-flakes
+           results []]
+      (if f
+        (let [ref-flakes (async/<!! (query-range/index-range data-db :spot = [(flake/o f) const/$rdf:type]))
+              classes (if (flake/ref-flake? f)
+                        (->>
+                          (async/<!! (query-range/index-range data-db :spot = [(flake/o f) const/$rdf:type]))
+                          (into #{} (map flake/o)))
+                        #{})
+              missing-classes (set/difference expected-classes classes)]
+          (recur r (into results
+                         (mapv (fn [missing-class]
+                                 (assoc result
+                                        :value (mapv display classes)
+                                        :message (str "missing required class " (display missing-class))))
+                               missing-classes))))
+        (not-empty results)))))
 (defmethod validate-constraint const/sh_datatype [{:keys [shape subject display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
   (let [{expect constraint path const/sh_path} shape
