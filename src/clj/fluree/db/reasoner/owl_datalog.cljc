@@ -26,6 +26,7 @@
 (def ^:const $owl-hasValue "http://www.w3.org/2002/07/owl#hasValue")
 (def ^:const $owl-someValuesFrom "http://www.w3.org/2002/07/owl#someValuesFrom")
 (def ^:const $owl-allValuesFrom "http://www.w3.org/2002/07/owl#allValuesFrom")
+(def ^:const $owl-maxCardinality "http://www.w3.org/2002/07/owl#maxCardinality")
 
 (def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
 (def ^:const $owl-Thing "http://www.w3.org/2002/07/owl#Thing")
@@ -204,6 +205,36 @@
                      [rule-id rule]))
                  c-set)))
 
+;; TODO - re-enable once filter function bug is fixed
+(defn equiv-class-max-cardinality
+  "Handles rule cls-maxc2"
+  [rule-class restrictions]
+  (do
+    (log/warn "owl:maxCardinality not supported yet")
+    [])
+  #_(reduce
+    (fn [acc restriction]
+      (let [property (util/get-first-id restriction $owl-onProperty)
+            max-val  (util/get-first-value restriction $owl-maxCardinality)
+            rule     {"where"  [{"@id"    "?x"
+                                 "@type"  rule-class
+                                 property "?y1"}
+                                {"@id"    "?x"
+                                 "@type"  rule-class
+                                 property "?y2"}
+                                ["filter" "(not= ?y1 ?y2)"]]
+                      "insert" {"@id"       "?y1"
+                                $owl-sameAs "?y2"}}]
+        (if (and property (= 1 max-val))
+          (conj acc [(str rule-class "(owl:maxCardinality-" property ")") rule])
+          (do (log/info "owl:Restriction for class" rule-class
+                        "is being ignored. owl:maxCardinality can only infer "
+                        "new facts when owl:maxCardinality=1. Property " property
+                        "has owl:maxCardinality equal to: " max-val)
+              acc))))
+    []
+    restrictions))
+
 (defn equiv-class-all-values
   "Handles rules cls-avf"
   [rule-class restrictions]
@@ -302,6 +333,9 @@
           (contains? equiv-class-statement $owl-allValuesFrom)
           :all-values
 
+          (contains? equiv-class-statement $owl-maxCardinality)
+          :max-cardinality
+
           :else
           (do
             (log/warn "Unsupported owl:Restriction" equiv-class-statement)
@@ -323,12 +357,14 @@
   (let [c1 (:id owl-statement) ;; the class which is the subject
         ;; combine with all other equivalent classes for a set of 2+ total classes
         {:keys [classes intersection-of union-of
-                has-value some-values all-values]} (group-by equiv-class-type (get owl-statement $owl-equivalentClass))]
+                has-value some-values all-values
+                max-cardinality]} (group-by equiv-class-type (get owl-statement $owl-equivalentClass))]
     (cond-> all-rules
             classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
             has-value (into (equiv-class-has-value c1 has-value)) ;; cls-hv1, cls-hv1
             some-values (into (equiv-class-some-values c1 some-values)) ;; cls-svf1, cls-svf2
             all-values (into (equiv-class-all-values c1 all-values)) ;; cls-svf1, cls-svf2
+            max-cardinality (into (equiv-class-max-cardinality c1 max-cardinality)) ;; cls-maxc2
             )))
 
 
