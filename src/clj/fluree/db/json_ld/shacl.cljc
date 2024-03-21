@@ -948,14 +948,6 @@
     constraint))
 (defmethod validate-constraint :default [_ _ _] nil)
 
-(defn resolve-path-flakes2
-  [data-db path focus-flakes]
-  (println "DEP resolve-path-flakes path" (pr-str path))
-  (let [[segment] path]
-    (if (iri/sid? segment)
-      (filterv #(= (flake/p %) segment) focus-flakes)
-      (throw (ex-info "Unsupported property path." {:segment segment :path path})))))
-
 (defn validate-constraints
   [{:keys [shape] :as v-ctx} focus-flakes]
   (println "DEP validate-constraints")
@@ -966,6 +958,14 @@
         (recur r (into results results*))
         (recur r results))
       (not-empty results))))
+
+(defn resolve-path-flakes2
+  [data-db path focus-flakes]
+  (println "DEP resolve-path-flakes path" (pr-str path))
+  (let [[segment] path]
+    (if (iri/sid? segment)
+      (filterv #(= (flake/p %) segment) focus-flakes)
+      (throw (ex-info "Unsupported property path." {:segment segment :path path})))))
 
 (defn validate-property-shape
   [{:keys [data-db shape] :as v-ctx} focus-flakes]
@@ -1048,7 +1048,7 @@
       (not-empty results))))
 
 (defn base-result
-  [{:keys [subject display shape] :as v-ctx} constraint ]
+  [{:keys [subject display shape] :as v-ctx} constraint]
   {:subject (display subject)
    :constraint (display constraint)
    :shape (-> shape (get const/$id) display)})
@@ -1068,7 +1068,7 @@
            (assoc :path (mapv display path)
                   :value (mapv display violations)
                   :expect (display datatype)
-                  :message (str " the following values do not have expected datatype " (display datatype) ": "
+                  :message (str "the following values do not have expected datatype " (display datatype) ": "
                                 (->> values
                                      (map (comp display first))
                                      (str/join ",")))))])))
