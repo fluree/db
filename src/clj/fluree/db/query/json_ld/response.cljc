@@ -164,30 +164,30 @@
                (>! error-ch e))))))
 
 (defn display-reference
-  [db o-iri spec select-spec cache context compact-fn current-depth fuel-tracker error-ch]
+  [ds o-iri spec select-spec cache context compact-fn current-depth fuel-tracker error-ch]
   (let [max-depth (:depth select-spec)
         subselect (:spec spec)]
     (cond
       ;; have a specified sub-selection (graph crawl)
       subselect
-      (format-node db o-iri context compact-fn subselect cache (inc current-depth) fuel-tracker error-ch)
+      (format-node ds o-iri context compact-fn subselect cache (inc current-depth) fuel-tracker error-ch)
 
       ;; requested graph crawl depth has not yet been reached
       (< current-depth max-depth)
-      (format-node db o-iri context compact-fn select-spec cache (inc current-depth) fuel-tracker error-ch)
+      (format-node ds o-iri context compact-fn select-spec cache (inc current-depth) fuel-tracker error-ch)
 
       :else
-      (let [oid (iri/encode-iri db o-iri)]
-        (append-id db oid cache compact-fn error-ch)))))
+      (let [oid (iri/encode-iri ds o-iri)]
+        (append-id ds oid cache compact-fn error-ch)))))
 
 (defn resolve-reference
-  [db cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
+  [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
   (let [{:keys [iri spec]} (::reference v)]
-    (display-reference db iri spec select-spec cache context
-                       compact-fn current-depth fuel-tracker error-ch)))
+    (display-reference ds iri spec select-spec cache context compact-fn current-depth
+                       fuel-tracker error-ch)))
 
 (defn resolve-references
-  [db cache context compact-fn select-spec current-depth fuel-tracker error-ch attr-ch]
+  [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch attr-ch]
   (go (when-let [attrs (<! attr-ch)]
         (loop [[[prop v] & r] attrs
                resolved-attrs {}]
@@ -197,13 +197,13 @@
                               resolved-values []]
                          (if value
                            (if (reference? value)
-                             (if-let [resolved (<! (resolve-reference db cache context compact-fn select-spec current-depth fuel-tracker error-ch value))]
+                             (if-let [resolved (<! (resolve-reference ds cache context compact-fn select-spec current-depth fuel-tracker error-ch value))]
                                (recur r (conj resolved-values resolved))
                                (recur r resolved-values))
                              (recur r (conj resolved-values value)))
                            (not-empty resolved-values)))
                        (if (reference? v)
-                         (<! (resolve-reference db cache context compact-fn select-spec current-depth fuel-tracker error-ch v))
+                         (<! (resolve-reference ds cache context compact-fn select-spec current-depth fuel-tracker error-ch v))
                          v))]
               (if (some? v')
                 (recur r (assoc resolved-attrs prop v'))
