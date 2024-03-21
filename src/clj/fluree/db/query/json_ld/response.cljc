@@ -137,12 +137,13 @@
 (declare format-node)
 
 (defn append-id
-  ([db sid cache compact-fn error-ch]
-   (append-id db sid nil cache compact-fn error-ch nil))
-  ([db sid {:keys [wildcard?] :as select-spec} cache compact-fn error-ch node-ch]
+  ([db iri cache compact-fn error-ch]
+   (append-id db iri nil cache compact-fn error-ch nil))
+  ([db iri {:keys [wildcard?] :as select-spec} cache compact-fn error-ch node-ch]
    (go
      (try*
-       (let [node  (if (nil? node-ch)
+       (let [sid   (iri/encode-iri db iri)
+             node  (if (nil? node-ch)
                      {}
                      (<! node-ch))
              node* (if (and (or (nil? select-spec)
@@ -177,8 +178,7 @@
       (format-node ds o-iri context compact-fn select-spec cache (inc current-depth) fuel-tracker error-ch)
 
       :else
-      (let [oid (iri/encode-iri ds o-iri)]
-        (append-id ds oid cache compact-fn error-ch)))))
+      (append-id ds o-iri cache compact-fn error-ch))))
 
 (defn resolve-reference
   [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
@@ -312,7 +312,7 @@
                      forward-ch)]
     (->> subject-ch
          (resolve-references ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-         (append-id ds sid select-spec cache compact-fn error-ch))))
+         (append-id ds iri select-spec cache compact-fn error-ch))))
 
 (defn format-subject-flakes
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
@@ -330,5 +330,5 @@
                           (go subject-attrs))]
       (->> subject-ch
            (resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-           (append-id db sid select-spec cache compact-fn error-ch)))
+           (append-id db s-iri select-spec cache compact-fn error-ch)))
     (go)))
