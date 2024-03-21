@@ -162,7 +162,7 @@
                                               {"@id"         "ex:maybe-a-wine"
                                                "@type"       "ex:Product"
                                                "ex:hasMaker" [{"@id" "ex:winery1"}
-                                                              {"@id" "ex:ex:textile-company"}]}
+                                                              {"@id" "ex:textile-company"}]}
                                               {"@id"         "ex:a-wine-1"
                                                "@type"       "ex:Product"
                                                "ex:hasMaker" [{"@id" "ex:winery1"}
@@ -172,24 +172,44 @@
                                                "ex:hasMaker" {"@id" "ex:winery2"}}
                                               {"@id"         "ex:not-a-wine-1"
                                                "@type"       "ex:Product"
-                                               "ex:hasMaker" {"@id" "ex:ex:textile-company"}}]})]
+                                               "ex:hasMaker" {"@id" "ex:textile-company"}}]})]
 
       (testing "Testing single owl:Restriction someValuesFrom for a property value"
-        (let [db-equiv  @(fluree/reason db-base :owl2rl
-                                        [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
-                                                                 "ex"  "http://example.org/"}
-                                          "@id"                 "ex:Wine",
-                                          "@type"               ["owl:Class"],
-                                          "owl:equivalentClass" [{"@type"              "owl:Restriction"
-                                                                  "owl:onProperty"     {"@id" "ex:hasMaker"}
-                                                                  "owl:someValuesFrom" {"@id" "ex:Winery"}}]}])
-              qry-wines @(fluree/query db-equiv
-                                       {:context {"ex" "http://example.org/"}
-                                        :select  "?s"
-                                        :where   {"@id"   "?s",
-                                                  "@type" "ex:Wine"}})]
+        (let [db-some-val @(fluree/reason db-base :owl2rl
+                                          [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                   "ex"  "http://example.org/"}
+                                            "@id"                 "ex:Wine",
+                                            "@type"               ["owl:Class"],
+                                            "owl:equivalentClass" [{"@type"              "owl:Restriction"
+                                                                    "owl:onProperty"     {"@id" "ex:hasMaker"}
+                                                                    "owl:someValuesFrom" {"@id" "ex:Winery"}}]}])
+              qry-wines   @(fluree/query db-some-val
+                                         {:context {"ex" "http://example.org/"}
+                                          :select  "?s"
+                                          :where   {"@id"   "?s",
+                                                    "@type" "ex:Wine"}})]
           (is (= #{"ex:maybe-a-wine" "ex:a-wine-1" "ex:a-wine-2"}
                  (set qry-wines))
-              "only one hasMaker must be a winery to qualify as an ex:Wine"))))))
+              "only one hasMaker must be a winery to qualify as an ex:Wine")))
+
+      (testing "Testing single owl:Restriction allValuesFrom for a property value"
+        (let [db-all-val @(fluree/reason db-base :owl2rl
+                                         [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                  "ex"  "http://example.org/"}
+                                           "@id"                 "ex:Wine",
+                                           "@type"               ["owl:Class"],
+                                           "owl:equivalentClass" [{"@type"             "owl:Restriction"
+                                                                   "owl:onProperty"    {"@id" "ex:hasMaker"}
+                                                                   "owl:allValuesFrom" {"@id" "ex:Winery"}}]}])
+              qry-winery @(fluree/query db-all-val
+                                        {:context {"ex" "http://example.org/"}
+                                         :select  "?s"
+                                         :where   {"@id"   "?s",
+                                                   "@type" "ex:Winery"}})]
+          (is (= #{"ex:winery1" "ex:textile-company" "ex:winery2"}
+                 (set qry-winery))
+              "because every hasMaker must be a winery, they are all wineries"))))))
+
+
 
 

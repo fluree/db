@@ -204,7 +204,29 @@
                      [rule-id rule]))
                  c-set)))
 
-(defn equiv-class-some-value
+(defn equiv-class-all-values
+  "Handles rules cls-avf"
+  [rule-class restrictions]
+  (reduce
+    (fn [acc restriction]
+      (let [property (util/get-first-id restriction $owl-onProperty)
+            all-val  (util/get-first-id restriction $owl-allValuesFrom)
+            rule     {"where"  {"@id"    "?x"
+                                property "?y"}
+                      "insert" {"@id"   "?y"
+                                "@type" all-val}}]
+        (if (and property all-val)
+          (conj acc [(str rule-class "(owl:allValuesFrom-" property ")") rule])
+          (do (log/warn "owl:Restriction for class" rule-class
+                        "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
+                        "and owl:allValuesFrom is:" (util/get-first restriction $owl-allValuesFrom)
+                        ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
+                        "allValuesFrom must exist and must be an IRI.")
+              acc))))
+    []
+    restrictions))
+
+(defn equiv-class-some-values
   "Handles rules cls-svf1, cls-svf2"
   [rule-class restrictions]
   (reduce
@@ -305,7 +327,8 @@
     (cond-> all-rules
             classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
             has-value (into (equiv-class-has-value c1 has-value)) ;; cls-hv1, cls-hv1
-            some-values (into (equiv-class-some-value c1 some-values)) ;; cls-svf1, cls-svf2
+            some-values (into (equiv-class-some-values c1 some-values)) ;; cls-svf1, cls-svf2
+            all-values (into (equiv-class-all-values c1 all-values)) ;; cls-svf1, cls-svf2
             )))
 
 
