@@ -16,11 +16,12 @@
 
 (defn cache-sid->iri
   [db cache compact-fn sid]
-  (or (get @cache sid)
-      (when-let [iri (or (some-> db :schema :pred (get sid) :iri compact-fn)
-                         (some-> (iri/decode-sid db sid) compact-fn))]
-        (vswap! cache assoc sid {:as iri})
-        {:as iri})))
+  (let [cache-key [(:alias db) sid]]
+    (or (get @cache cache-key)
+        (when-let [iri (or (some-> db :schema :pred (get sid) :iri compact-fn)
+                           (some-> (iri/decode-sid db sid) compact-fn))]
+          (vswap! cache assoc cache-key {:as iri})
+          {:as iri}))))
 
 (defn wildcard-spec
   [db cache compact-fn iri]
