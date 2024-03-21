@@ -210,9 +210,10 @@
                 (recur r resolved-attrs)))
             resolved-attrs)))))
 
-(defn format-reverse-property
-  [{:keys [t] :as db} cache compact-fn oid {:keys [as spec], p-iri :iri, :as reverse-spec} fuel-tracker error-ch]
-  (let [pid                     (iri/encode-iri db p-iri)
+(defn reverse-property
+  [{:keys [t] :as db} o-iri {:keys [as spec], p-iri :iri, :as reverse-spec} compact-fn cache fuel-tracker error-ch]
+  (let [oid                     (iri/encode-iri db o-iri)
+        pid                     (iri/encode-iri db p-iri)
         [start-flake end-flake] (flake-bounds db :opst [oid pid])
         flake-xf                (if fuel-tracker
                                   (comp (fuel/track fuel-tracker error-ch)
@@ -234,15 +235,35 @@
                                         [as (unwrap-singleton result)]))
                           []))))
 
+(defn format-reverse-property
+  [ds o-iri reverse-spec compact-fn cache fuel-tracker error-ch]
+  (if (dataset/dataset? ds)
+    (let [db-ch   (->> ds dataset/all async/to-chan!)
+          prop-ch (async/chan)]
+      (async/pipeline-async 2
+                            prop-ch
+                            (fn [db ch]
+                              (-> (reverse-property db o-iri reverse-spec compact-fn cache fuel-tracker error-ch)
+                                  (async/pipe ch)))
+                            db-ch)
+      (async/reduce (fn [combined-prop db-prop]
+                      (let [[as results] combined-prop]
+                        (if results
+                          (let [[_as next-result] db-prop]
+                            [as (combine-objects results next-result)])
+                          db-prop)))
+                    []
+                    prop-ch))
+    (reverse-property ds o-iri reverse-spec compact-fn cache fuel-tracker error-ch)))
+
 (defn format-reverse-properties
-  [db iri cache compact-fn reverse-map fuel-tracker error-ch]
-  (let [out-ch (async/chan 32)
-        oid    (iri/encode-iri db iri)]
+  [ds iri reverse-map compact-fn cache fuel-tracker error-ch]
+  (let [out-ch (async/chan 32)]
     (async/pipeline-async 32
                           out-ch
                           (fn [reverse-spec ch]
-                            (-> db
-                                (format-reverse-property cache compact-fn oid reverse-spec fuel-tracker error-ch)
+                            (-> ds
+                                (format-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
                                 (async/pipe ch)))
                           (async/to-chan! (vals reverse-map)))
 
@@ -284,7 +305,7 @@
   (let [sid        (iri/encode-iri ds iri)
         forward-ch (format-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
         subject-ch (if reverse
-                     (let [reverse-ch (format-reverse-properties ds iri cache compact-fn reverse fuel-tracker error-ch)]
+                     (let [reverse-ch (format-reverse-properties ds iri reverse compact-fn cache fuel-tracker error-ch)]
                        (->> [forward-ch reverse-ch]
                             async/merge
                             (async/reduce merge {})))
@@ -304,7 +325,7 @@
                               (format-subject-xf db cache context compact-fn select-spec)
                               s-flakes)
           subject-ch    (if reverse
-                          (let [reverse-ch (format-reverse-properties db s-iri cache compact-fn reverse fuel-tracker error-ch)]
+                          (let [reverse-ch (format-reverse-properties db s-iri reverse compact-fn cache fuel-tracker error-ch)]
                             (async/reduce conj subject-attrs reverse-ch))
                           (go subject-attrs))]
       (->> subject-ch
