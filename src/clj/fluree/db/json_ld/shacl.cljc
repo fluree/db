@@ -978,9 +978,9 @@
 (defn target-node-target?
   [shape s-flakes]
   (let [sid        (some-> s-flakes first flake/s)
-        target-sid (first (get shape const/sh_targetNode))]
-    (println "DEP target-node-target?" (pr-str target-sid))
-    (= sid target-sid)))
+        target-sids (->> (get shape const/sh_targetNode) (into #{}))]
+    (println "DEP target-node-target?" (pr-str target-sids))
+    (contains? target-sids sid)))
 
 (defn target-class-target?
   [shape s-flakes]
