@@ -24,6 +24,7 @@
 (def ^:const $owl-Restriction "http://www.w3.org/2002/07/owl#Restriction")
 (def ^:const $owl-onProperty "http://www.w3.org/2002/07/owl#onProperty")
 (def ^:const $owl-onClass "http://www.w3.org/2002/07/owl#onClass")
+(def ^:const $owl-oneOf "http://www.w3.org/2002/07/owl#oneOf")
 (def ^:const $owl-hasValue "http://www.w3.org/2002/07/owl#hasValue")
 (def ^:const $owl-someValuesFrom "http://www.w3.org/2002/07/owl#someValuesFrom")
 (def ^:const $owl-allValuesFrom "http://www.w3.org/2002/07/owl#allValuesFrom")
@@ -149,7 +150,7 @@
           p-chain (->> (get owl-statement $owl-propertyChainAxiom)
                        first
                        :list
-                       (mapv :id))
+                       (keep :id))
           where   (->> p-chain
                        (map-indexed (fn [idx p-n]
                                       (if p-n
@@ -338,6 +339,30 @@
     []
     restrictions))
 
+(defn equiv-class-one-of
+  "Handles rule cls-oo"
+  [rule-class one-of-statements]
+  (reduce
+    (fn [acc one-of-statement]
+      (let [one-of     (get one-of-statement $owl-oneOf)
+            class-list (or (some->> one-of
+                                    first
+                                    :list
+                                    (keep :id))
+                           (keep :id one-of))
+            ;; it could be more efficient to have a single rule with optional clauses instead of a separate rule for each item
+            rules      (map
+                         (fn [c]
+                           (let [rule {"where"  {"@id"   "?x"
+                                                 "@type" c}
+                                       "insert" {"@id"   "?x"
+                                                 "@type" rule-class}}]
+                             [(str rule-class "(owl:oneOf-" c ")") rule]))
+                         class-list)]
+        (into acc rules)))
+    []
+    one-of-statements))
+
 (defn equiv-class-has-value
   "Handles rules cls-hv1, cls-hv2"
   [rule-class restrictions]
@@ -393,6 +418,9 @@
             (log/warn "Unsupported owl:Restriction" equiv-class-statement)
             nil))
 
+        (contains? equiv-class-statement $owl-oneOf)
+        :one-of
+
         (contains? equiv-class-statement $owl-intersectionOf)
         :intersection-of
 
@@ -408,11 +436,12 @@
   [_ _ owl-statement all-rules]
   (let [c1 (:id owl-statement) ;; the class which is the subject
         ;; combine with all other equivalent classes for a set of 2+ total classes
-        {:keys [classes intersection-of union-of
+        {:keys [classes intersection-of union-of one-of
                 has-value some-values all-values
                 max-cardinality max-qual-cardinality]} (group-by equiv-class-type (get owl-statement $owl-equivalentClass))]
     (cond-> all-rules
             classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
+            one-of (into (equiv-class-one-of c1 one-of)) ;; cls-oo
             has-value (into (equiv-class-has-value c1 has-value)) ;; cls-hv1, cls-hv1
             some-values (into (equiv-class-some-values c1 some-values)) ;; cls-svf1, cls-svf2
             all-values (into (equiv-class-all-values c1 all-values)) ;; cls-svf1, cls-svf2
@@ -430,8 +459,12 @@
   #_(let [class     (:id owl-statement)
           props     (get owl-statement $owl-hasKey)
           ;; support props in either @list form, or just as a set of values
-          prop-list (or (some->> props first :list (map :id))
-                        (map props :id))
+          prop-list (or (some->> props
+                                 first
+                                 :list
+                                 (keep :id))
+                        (keep #(when-let [id (:id %)]
+                                 id) props))
           where     (->> prop-list
                          (map-indexed (fn [idx prop]
                                         [prop (str "?z" idx)]))
