@@ -42,7 +42,7 @@
     (let [db-address (-> commit
                          (get-first const/iri-data)
                          (get-first-value const/iri-address))
-          _ (log/info "Migrating commit at address:" db-address)
+          _          (log/info "Migrating commit at address:" db-address)
           db-data    (<? (reify/read-db conn db-address))
           t-new      (reify/db-t db-data)
           ns-mapping (db->namespace-mapping db)
