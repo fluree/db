@@ -64,7 +64,8 @@
 (defn lookup
   [local-path ledger-address]
   (go-try
-    (file-address (<? (read-address local-path ledger-address)))))
+    (when-let [read-address (read-address local-path ledger-address)]
+      (file-address read-address))))
 
 
 (defrecord FileNameService
