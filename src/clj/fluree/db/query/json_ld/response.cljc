@@ -309,17 +309,19 @@
     (forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)))
 
 (defn format-node
-  [ds iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
-  (let [forward-ch (format-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
-        subject-ch (if reverse
-                     (let [reverse-ch (format-reverse-properties ds iri reverse compact-fn cache fuel-tracker error-ch)]
-                       (->> [forward-ch reverse-ch]
-                            async/merge
-                            (async/reduce merge {})))
-                     forward-ch)]
-    (->> subject-ch
-         (resolve-references ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-         (append-id ds iri select-spec cache compact-fn error-ch))))
+  ([ds iri context compact-fn {:keys [reverse] :as select-spec} cache fuel-tracker error-ch]
+   (format-node ds iri context compact-fn {:keys [reverse] :as select-spec} cache 0 fuel-tracker error-ch))
+  ([ds iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
+   (let [forward-ch (format-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
+         subject-ch (if reverse
+                      (let [reverse-ch (format-reverse-properties ds iri reverse compact-fn cache fuel-tracker error-ch)]
+                        (->> [forward-ch reverse-ch]
+                             async/merge
+                             (async/reduce merge {})))
+                      forward-ch)]
+     (->> subject-ch
+          (resolve-references ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
+          (append-id ds iri select-spec cache compact-fn error-ch)))))
 
 (defn format-subject-flakes
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to

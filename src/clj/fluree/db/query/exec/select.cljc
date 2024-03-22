@@ -156,8 +156,8 @@
                          (get subj)
                          where/get-iri)
                      subj)]
-      ;; TODO: Replace these nils with fuel values when we turn fuel back on
-      (json-ld-resp/format-node ds iri context compact spec iri-cache 0 fuel-tracker error-ch))))
+      (json-ld-resp/format-node ds iri context compact spec iri-cache
+                                fuel-tracker error-ch))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied
@@ -175,11 +175,13 @@
     (go-loop [selectors selectors
               values []]
       (if-let [selector (first selectors)]
-        (let [value (<! (format-value selector db iri-cache context compact fuel-tracker error-ch solution))]
+        (let [value (<! (format-value selector db iri-cache context compact
+                                      fuel-tracker error-ch solution))]
           (recur (rest selectors)
                  (conj values value)))
         values))
-    (format-value selectors db iri-cache context compact fuel-tracker error-ch solution)))
+    (format-value selectors db iri-cache context compact fuel-tracker
+                  error-ch solution)))
 
 (defn format
   "Formats each solution within the stream of solutions in `solution-ch` according
@@ -209,7 +211,8 @@
                           format-ch
                           (fn [solution ch]
                             (log/trace "select/format solution:" solution)
-                            (-> (format-values selectors db iri-cache context compact fuel-tracker error-ch solution)
+                            (-> (format-values selectors db iri-cache context compact
+                                               fuel-tracker error-ch solution)
                                 (async/pipe ch)))
                           in-ch)
     format-ch))
