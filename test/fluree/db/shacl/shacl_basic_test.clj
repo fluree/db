@@ -1624,8 +1624,18 @@ WORLD!")
                                       "insert"   {"id"       "ex:YellowPony"
                                                   "type"     "ex:Pony"
                                                   "ex:color" "yellow"}})]
-      (is (util/exception? db2))
-      (is (= "SHACL PropertyShape exception - sh:in: value must be one of [\"cyan\" \"magenta\"]."
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject "ex:YellowPony",
+                :constraint "sh:in",
+                :shape "_:fdb-3",
+                :path ["ex:color"],
+                :expect ["cyan" "magenta"],
+                :value "yellow",
+                :message "value \"yellow\" is not in [\"cyan\" \"magenta\"]"}]}
+             (ex-data db2)))
+      (is (= "Subject ex:YellowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-3 - value \"yellow\" is not in [\"cyan\" \"magenta\"]."
              (ex-message db2)))))
   (testing "node refs"
     (let [conn    @(fluree/connect {:method :memory})
@@ -1654,9 +1664,19 @@ WORLD!")
                                                    "type"     "ex:Pony"
                                                    "ex:color" [{"id" "ex:Pink"}
                                                                {"id" "ex:Purple"}]}]})]
-      (is (util/exception? db2))
-      (is (str/starts-with? (ex-message db2)
-                            "SHACL PropertyShape exception - sh:in: value must be one of "))
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject "ex:RainbowPony",
+                :constraint "sh:in",
+                :shape "_:fdb-7",
+                :path ["ex:color"],
+                :expect ["ex:Pink" "ex:Purple"],
+                :value #fluree/SID [101 "Green"],
+                :message "value ex:Green is not in [\"ex:Pink\" \"ex:Purple\"]"}]}
+             (ex-data db2)))
+      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-7 - value ex:Green is not in [\"ex:Pink\" \"ex:Purple\"]."
+            (ex-message db2)))
 
       (is (not (util/exception? db3)))
       (is (= {"id"       "ex:PastelPony"
@@ -1685,9 +1705,19 @@ WORLD!")
                                                   "type"     "ex:Pony"
                                                   "ex:color" [{"id" "ex:Pink"}
                                                               {"id" "ex:Green"}]}})]
-      (is (util/exception? db2))
-      (is (str/starts-with? (ex-message db2)
-                            "SHACL PropertyShape exception - sh:in: value must be one of ")))))
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject "ex:RainbowPony",
+                :constraint "sh:in",
+                :shape "_:fdb-12",
+                :path ["ex:color"],
+                :expect ["ex:Pink" "ex:Purple" "green"],
+                :value #fluree/SID [101 "Green"],
+                :message "value ex:Green is not in [\"ex:Pink\" \"ex:Purple\" \"green\"]"}]}
+             (ex-data db2)))
+      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-12 - value ex:Green is not in [\"ex:Pink\" \"ex:Purple\" \"green\"]."
+             (ex-message db2))))))
 
 (deftest ^:integration shacl-targetobjectsof-test
   (testing "subject and object of constrained predicate in the same txn"
