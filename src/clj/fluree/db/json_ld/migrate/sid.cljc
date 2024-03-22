@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.migrate.sid
   (:require [fluree.db.constants :as const]
-            [fluree.db.indexer.storage :as storage]
             [fluree.db.query.exec.update :as update]
             [fluree.db.json-ld.commit :as commit]
             [fluree.db.json-ld.commit-data :as commit-data]
@@ -8,7 +7,6 @@
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.indexer.default :as indexer]
-            [fluree.db.index :as index]
             [fluree.db.db.json-ld :as db]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
@@ -44,6 +42,7 @@
     (let [db-address (-> commit
                          (get-first const/iri-data)
                          (get-first-value const/iri-address))
+          _          (log/info "Migrating commit at address:" db-address)
           db-data    (<? (reify/read-db conn db-address))
           t-new      (reify/db-t db-data)
           ns-mapping (db->namespace-mapping db)
@@ -95,17 +94,21 @@
           (assoc :commit commit-metadata)))))
 
 (defn merge-commits
-  [{:keys [conn] :as ledger} commit-tuples]
+  [{:keys [conn indexer] :as ledger} commit-opts tuples-chans]
   (go-try
-    (loop [[commit-tuple & r] commit-tuples
-           db                 (db/create ledger)]
+    (loop [[[commit-tuple ch] & r] tuples-chans
+           db                      (db/create ledger)]
       (if commit-tuple
-        (let [new-db (<? (merge-commit conn db commit-tuple))]
-          (recur r new-db))
+        (let [merged-db     (<? (merge-commit conn db commit-tuple))
+              update-commit (commit/update-commit-fn merged-db commit-opts)
+              indexed-db    (<? (indexer/do-index indexer merged-db
+                                                  {:changes-ch    ch
+                                                   :update-commit update-commit}))]
+          (recur r indexed-db))
         db))))
 
 (defn migrate
-  [conn address changes-ch commit-opts]
+  [conn address commit-opts changes-ch]
   (go-try
     (let [last-commit-addr  (<? (nameservice/lookup-commit conn address))
           last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
@@ -115,11 +118,14 @@
           branch            (or (keyword (get-first-value first-commit const/iri-branch))
                                 :main)
           ledger            (<? (jld-ledger/->ledger conn ledger-alias {:branch branch}))
-          indexer           (:indexer ledger)
-          db                (<? (merge-commits ledger all-commit-tuples))
           commit-opts*      (assoc commit-opts :branch branch)
-          update-commit     (commit/update-commit-fn db commit-opts*)
-          indexed-db        (<? (indexer/do-index indexer db {:changes-ch    changes-ch
-                                                              :update-commit update-commit}))]
-      (ledger/-db-update ledger indexed-db)
+          tuples-chans      (map (fn [commit-tuple]
+                                   [commit-tuple (async/chan)])
+                                 all-commit-tuples)
+          changes-chs       (map second tuples-chans)
+          _                 (-> changes-chs
+                                async/merge
+                                (async/pipe changes-ch))
+          db                (<? (merge-commits ledger commit-opts* tuples-chans))]
+      (ledger/-db-update ledger db)
       ledger)))
