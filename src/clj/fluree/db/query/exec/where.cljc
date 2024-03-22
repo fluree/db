@@ -412,13 +412,14 @@
 
 (defmethod match-pattern :tuple
   [ds fuel-tracker solution pattern filters error-ch]
-  (let [active-graph (dataset/active ds)]
+  (if-let [active-graph (dataset/active ds)]
     (if (sequential? active-graph)
       (->> active-graph
            (map (fn [graph]
                   (match-tuple graph fuel-tracker solution pattern filters error-ch)))
            async/merge)
-      (match-tuple active-graph fuel-tracker solution pattern filters error-ch))))
+      (match-tuple active-graph fuel-tracker solution pattern filters error-ch))
+    (go)))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
@@ -472,14 +473,16 @@
 
 (defmethod match-pattern :class
   [ds fuel-tracker solution pattern filters error-ch]
-  (let [triple       (val pattern)
-        active-graph (dataset/active ds)]
-    (if (sequential? active-graph)
-      (->> active-graph
-           (map (fn [graph]
-                  (match-class graph fuel-tracker solution triple filters error-ch)))
-           async/merge)
-      (match-class active-graph fuel-tracker solution triple filters error-ch))))
+  (if-let [active-graph (dataset/active ds)]
+    (let [triple (val pattern)]
+      (log/info "active graph:" active-graph)
+      (if (sequential? active-graph)
+        (->> active-graph
+             (map (fn [graph]
+                    (match-class graph fuel-tracker solution triple filters error-ch)))
+             async/merge)
+        (match-class active-graph fuel-tracker solution triple filters error-ch)))
+    (go)))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the

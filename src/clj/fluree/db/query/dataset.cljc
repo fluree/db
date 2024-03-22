@@ -7,7 +7,7 @@
 
 (defn combine
   [named-map defaults]
-  (let [default-graph (util/sequential defaults)]
+  (let [default-graph (some->> defaults util/sequential)]
     (->DataSet named-map default-graph ::default)))
 
 (defn dataset?
