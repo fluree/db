@@ -119,9 +119,9 @@
                                 :main)
           ledger            (<? (jld-ledger/->ledger conn ledger-alias {:branch branch}))
           commit-opts*      (assoc commit-opts :branch branch)
-          tuples-chans      (->> all-commit-tuples
-                                 (map (fn [commit-tuple]
-                                        [commit-tuple (async/chan)])))
+          tuples-chans      (map (fn [commit-tuple]
+                                   [commit-tuple (async/chan)])
+                                 all-commit-tuples)
           changes-chs       (map second tuples-chans)
           _                 (-> (async/merge changes-chs)
                                 (async/pipe changes-ch))
