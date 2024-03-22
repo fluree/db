@@ -309,8 +309,8 @@
     (forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)))
 
 (defn format-node
-  ([ds iri context compact-fn {:keys [reverse] :as select-spec} cache fuel-tracker error-ch]
-   (format-node ds iri context compact-fn {:keys [reverse] :as select-spec} cache 0 fuel-tracker error-ch))
+  ([ds iri context compact-fn select-spec cache fuel-tracker error-ch]
+   (format-node ds iri context compact-fn select-spec cache 0 fuel-tracker error-ch))
   ([ds iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
    (let [forward-ch (format-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
          subject-ch (if reverse
