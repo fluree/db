@@ -324,8 +324,8 @@
           (append-id ds iri select-spec cache compact-fn error-ch)))))
 
 (defn format-subject-flakes
-  "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
-  the requested depth within the select-spec"
+  "current-depth param is the depth of the graph crawl. Each successive 'ref'
+  increases the graph depth, up to the requested depth within the select-spec"
   [db cache context compact-fn {:keys [reverse] :as select-spec} current-depth fuel-tracker error-ch s-flakes]
   (if (not-empty s-flakes)
     (let [sid           (->> s-flakes first flake/s)
