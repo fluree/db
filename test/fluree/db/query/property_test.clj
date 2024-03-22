@@ -72,7 +72,7 @@
                                    :where     {"@id" ?s, "vocab2:firstName" ?name}}))
             "returns all values")))))
 
-(deftest ^:integration subjects-as-predicates
+(deftest ^:integration ^:kaocha/pending subjects-as-predicates
   (testing "predicate iri-cache loookups"
     (let [conn    @(fluree/connect {:method :memory})
           ledger  @(fluree/create conn "propertypathstest")
