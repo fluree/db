@@ -1401,8 +1401,25 @@
               not-allowed)))))
 (defmethod validate-constraint const/sh_hasValue [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
-(defmethod validate-constraint const/sh_in [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_in [{:keys [shape subject display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint path const/sh_path} shape
+
+        expected  (into #{} expect)
+        pretty-expect (mapv #(if (iri/sid? %) (display %) %) expect)
+
+        result (-> (base-result v-ctx constraint)
+                   (assoc :path (mapv display path)
+                          :expect pretty-expect))]
+    (->> focus-flakes
+         (remove (fn [f] (contains? expected (flake/o f))))
+         (mapv (fn [[_ _ o dt :as f]]
+                 (let [value (if (flake/ref-flake? f)
+                               (display o)
+                               (pr-str (str o)))]
+                   (assoc result
+                          :value o
+                          :message (str "value " value " is not in " pretty-expect))))))))
 
 (defn explain-result
   [{:keys [subject constraint shape path message]}]
