@@ -123,7 +123,8 @@
                                    [commit-tuple (async/chan)])
                                  all-commit-tuples)
           changes-chs       (map second tuples-chans)
-          _                 (-> (async/merge changes-chs)
+          _                 (-> changes-chs
+                                async/merge
                                 (async/pipe changes-ch))
           db                (<? (merge-commits ledger commit-opts* tuples-chans))]
       (ledger/-db-update ledger db)
