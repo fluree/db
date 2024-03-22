@@ -138,31 +138,36 @@
 (declare format-node)
 
 (defn append-id
-  ([db iri cache compact-fn error-ch]
-   (append-id db iri nil cache compact-fn error-ch nil))
-  ([db iri {:keys [wildcard?] :as select-spec} cache compact-fn error-ch node-ch]
+  ([ds iri cache compact-fn error-ch]
+   (append-id ds iri nil cache compact-fn error-ch nil))
+  ([ds iri {:keys [wildcard?] :as select-spec} cache compact-fn error-ch node-ch]
    (go
      (try*
-       (let [sid   (iri/encode-iri db iri)
-             node  (if (nil? node-ch)
+       (let [node  (if (nil? node-ch)
                      {}
                      (<! node-ch))
-             node* (if (and (or (nil? select-spec)
-                                wildcard?
-                                (contains? select-spec const/iri-id))
-                            (<? (validate/allow-iri? db sid)))
-
-                     (let [;; TODO: we generate id-key here every time, this
-                           ;; should be done in the :spec once beforehand and
-                           ;; used from there
-                           id-key (:as (or (wildcard-spec db cache compact-fn const/$id)
-                                           (cache-sid->iri db cache compact-fn const/$id)))
-                           iri    (compact-fn (iri/decode-sid db sid))]
-                       (assoc node id-key iri))
+             node* (if (or (nil? select-spec)
+                           wildcard?
+                           (contains? select-spec const/iri-id))
+                     (if-let [allowing-db (loop [[db & r] (dataset/all ds)]
+                                            (if db
+                                              (let [sid (iri/encode-iri db iri)]
+                                                (if (<? (validate/allow-iri? db sid))
+                                                  db
+                                                  (recur r)))
+                                              nil))]
+                       (let [;; TODO: we generate id-key here every time, this
+                             ;; should be done in the :spec once beforehand and
+                             ;; used from there
+                             id-key (:as (or (wildcard-spec allowing-db cache compact-fn const/$id)
+                                             (cache-sid->iri allowing-db cache compact-fn const/$id)))
+                             iri*   (compact-fn iri)]
+                         (assoc node id-key iri*))
+                       node)
                      node)]
          (not-empty node*))
        (catch* e
-               (log/info e "Error appending subject iri")
+               (log/error e "Error appending subject iri")
                (>! error-ch e))))))
 
 (defn display-reference
@@ -172,11 +177,13 @@
     (cond
       ;; have a specified sub-selection (graph crawl)
       subselect
-      (format-node ds o-iri context compact-fn subselect cache (inc current-depth) fuel-tracker error-ch)
+      (format-node ds o-iri context compact-fn subselect cache (inc current-depth)
+                   fuel-tracker error-ch)
 
       ;; requested graph crawl depth has not yet been reached
       (< current-depth max-depth)
-      (format-node ds o-iri context compact-fn select-spec cache (inc current-depth) fuel-tracker error-ch)
+      (format-node ds o-iri context compact-fn select-spec cache (inc current-depth)
+                   fuel-tracker error-ch)
 
       :else
       (append-id ds o-iri cache compact-fn error-ch))))
@@ -303,8 +310,7 @@
 
 (defn format-node
   [ds iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
-  (let [sid        (iri/encode-iri ds iri)
-        forward-ch (format-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
+  (let [forward-ch (format-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
         subject-ch (if reverse
                      (let [reverse-ch (format-reverse-properties ds iri reverse compact-fn cache fuel-tracker error-ch)]
                        (->> [forward-ch reverse-ch]

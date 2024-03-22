@@ -150,14 +150,14 @@
   ValueSelector
   (implicit-grouping? [_] false)
   (format-value
-    [_ db iri-cache context compact fuel-tracker error-ch solution]
+    [_ ds iri-cache context compact fuel-tracker error-ch solution]
     (when-let [iri (if (where/variable? subj)
                      (-> solution
                          (get subj)
                          where/get-iri)
                      subj)]
       ;; TODO: Replace these nils with fuel values when we turn fuel back on
-      (json-ld-resp/format-node db iri context compact spec iri-cache 0 fuel-tracker error-ch))))
+      (json-ld-resp/format-node ds iri context compact spec iri-cache 0 fuel-tracker error-ch))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied
