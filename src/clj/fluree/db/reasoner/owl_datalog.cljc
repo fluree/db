@@ -347,23 +347,29 @@
     restrictions))
 
 (defn equiv-intersection-of
+  "Handles rules cls-int1, cls-int2"
   [rule-class intersection-of-statements]
   (reduce
     (fn [acc intersection-of-statement]
       (let [class-list (-> intersection-of-statement
                            (get $owl-intersectionOf)
                            get-all-ids)
-            where      (reduce
-                         (fn [acc c]
-                           (conj acc
-                                 {"@id"   "?y"
-                                  "@type" c}))
-                         []
-                         class-list)
-            rule       {"where"  where
+            cls-int1   {"where"  (reduce
+                                   (fn [acc c]
+                                     (conj acc
+                                           {"@id"   "?y"
+                                            "@type" c}))
+                                   []
+                                   class-list)
                         "insert" {"@id"   "?y"
-                                  "@type" rule-class}}]
-        (conj acc [(str rule-class "(owl:intersectionOf)#" (hash class-list)) rule])))
+                                  "@type" rule-class}}
+            cls-int2   {"where"  {"@id"   "?y"
+                                  "@type" rule-class}
+                        "insert" {"@id"   "?y"
+                                  "@type" (into [] class-list)}}]
+        (-> acc
+            (conj [(str rule-class "(owl:intersectionOf-1)#" (hash class-list)) cls-int1])
+            (conj [(str rule-class "(owl:intersectionOf-2)#" (hash class-list)) cls-int2]))))
     []
     intersection-of-statements))
 

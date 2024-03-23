@@ -469,10 +469,12 @@
                                  {"@context" {"ex" "http://example.org/"}
                                   "insert"   [{"@id"   "ex:carol"
                                                "@type" ["ex:Woman" "ex:Parent"]}
-                                              {"@id"   "ex:Alice"
+                                              {"@id"   "ex:alice"
                                                "@type" "ex:Woman"}
                                               {"@id"   "ex:bob"
-                                               "@type" ["ex:Parent" "ex:Father"]}]})]
+                                               "@type" ["ex:Parent" "ex:Father"]}
+                                              {"@id"   "ex:jen"
+                                               "@type" ["ex:Mother"]}]})]
 
       (testing "Testing owl:intersectionOf declaration"
         (let [db-reasoned @(fluree/reason db-base :owl2rl
@@ -488,8 +490,18 @@
                                          {:context {"ex" "http://example.org/"}
                                           :select  "?s"
                                           :where   {"@id"   "?s",
-                                                    "@type" "ex:Mother"}})]
+                                                    "@type" "ex:Mother"}})
 
-          (is (= ["ex:carol"]
-                 qry-mother)
-              "ex:carol has explicit types ex:Woman and ex:Parent, so should be inferred as ex:Mother"))))))
+              qry-woman   @(fluree/query db-reasoned
+                                         {:context {"ex" "http://example.org/"}
+                                          :select  "?s"
+                                          :where   {"@id"   "?s",
+                                                    "@type" "ex:Woman"}})]
+
+          (is (= #{"ex:carol" "ex:jen"}
+                 (set qry-mother))
+              "ex:carol has explicit types ex:Woman and ex:Parent, so should be inferred as ex:Mother, ex:jen is explicitly declared as ex:Mother")
+
+          (is (= #{"ex:carol" "ex:alice" "ex:jen"}
+                 (set qry-woman))
+              "ex:carol and ex:alice has explicit type ex:Woman and ex:jen is inferred from being ex:Mother"))))))
