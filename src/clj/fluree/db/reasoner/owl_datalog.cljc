@@ -35,9 +35,15 @@
 (def ^:const $owl-Thing "http://www.w3.org/2002/07/owl#Thing")
 
 
-(defn blank-node
-  []
-  (str "_:" (rand-int 2147483647)))
+(defn get-all-ids
+  "Returns all @id values from either an ordered list or a set of objects.
+  Filters out any scalar (@value) values"
+  [vals]
+  (or (some->> vals
+               first
+               :list
+               (keep :id))
+      (keep :id vals)))
 
 (defmulti to-datalog (fn [rule-type inserts owl-statement all-rules]
                        rule-type))
@@ -46,11 +52,11 @@
   [_ inserts owl-statement all-rules]
   ;; note any owl:sameAs are just inserts into the current db
   ;; the owl:sameAs rule is a base rule for any existing owl:sameAs
-  ;; that might already existing in the current db
+  ;; that might already exist in the current db
   (let [id      (:id owl-statement)
-        sa-ids  (->> (get owl-statement $owl-sameAs)
-                     util/sequential
-                     (mapv :id))
+        sa-ids  (-> owl-statement
+                    (get $owl-sameAs)
+                    get-all-ids)
         rule-id (str $owl-sameAs "(" id ")")
         triples (->> sa-ids
                      (mapcat (fn [sa-id]
@@ -67,8 +73,9 @@
 
 (defmethod to-datalog ::prp-dom
   [_ _ owl-statement all-rules]
-  (let [domain   (->> (get owl-statement $rdfs-domain)
-                      (mapv :id))
+  (let [domain   (-> owl-statement
+                     (get $rdfs-domain)
+                     get-all-ids)
         property (:id owl-statement)
         rule     {"where"  {"@id"    "?s"
                             property nil}
@@ -79,8 +86,9 @@
 
 (defmethod to-datalog ::prp-rng
   [_ _ owl-statement all-rules]
-  (let [range    (->> (get owl-statement $rdfs-range)
-                      (mapv :id))
+  (let [range    (-> owl-statement
+                     (get $rdfs-range)
+                     get-all-ids)
         property (:id owl-statement)
         rule     {"where"  {"@id"    nil,
                             property "?ps"}
@@ -147,10 +155,9 @@
   [_ _ owl-statement all-rules]
   (try*
     (let [prop    (:id owl-statement)
-          p-chain (->> (get owl-statement $owl-propertyChainAxiom)
-                       first
-                       :list
-                       (keep :id))
+          p-chain (-> owl-statement
+                      (get $owl-propertyChainAxiom)
+                      get-all-ids)
           where   (->> p-chain
                        (map-indexed (fn [idx p-n]
                                       (if p-n
@@ -197,7 +204,7 @@
   "Maps every class equivalence to every other class in the set"
   [rule-class class-statements]
   (let [c-set (->> class-statements
-                   (map :id)
+                   get-all-ids
                    (into #{rule-class}))]
     (map-indexed (fn [idx cn]
                    (let [rule-id (str rule-class "(owl:equivalentClass-" idx ")")
@@ -339,17 +346,35 @@
     []
     restrictions))
 
+(defn equiv-intersection-of
+  [rule-class intersection-of-statements]
+  (reduce
+    (fn [acc intersection-of-statement]
+      (let [class-list (-> intersection-of-statement
+                           (get $owl-intersectionOf)
+                           get-all-ids)
+            where      (reduce
+                         (fn [acc c]
+                           (conj acc
+                                 {"@id"   "?y"
+                                  "@type" c}))
+                         []
+                         class-list)
+            rule       {"where"  where
+                        "insert" {"@id"   "?y"
+                                  "@type" rule-class}}]
+        (conj acc [(str rule-class "(owl:intersectionOf)#" (hash class-list)) rule])))
+    []
+    intersection-of-statements))
+
 (defn equiv-class-one-of
   "Handles rule cls-oo"
   [rule-class one-of-statements]
   (reduce
     (fn [acc one-of-statement]
-      (let [one-of     (get one-of-statement $owl-oneOf)
-            class-list (or (some->> one-of
-                                    first
-                                    :list
-                                    (keep :id))
-                           (keep :id one-of))
+      (let [class-list (-> one-of-statement
+                           (get $owl-oneOf)
+                           get-all-ids)
             ;; it could be more efficient to have a single rule with optional clauses instead of a separate rule for each item
             rules      (map
                          (fn [c]
@@ -441,6 +466,7 @@
                 max-cardinality max-qual-cardinality]} (group-by equiv-class-type (get owl-statement $owl-equivalentClass))]
     (cond-> all-rules
             classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
+            intersection-of (into (equiv-intersection-of c1 intersection-of)) ;; cls-int1, cls-int2
             one-of (into (equiv-class-one-of c1 one-of)) ;; cls-oo
             has-value (into (equiv-class-has-value c1 has-value)) ;; cls-hv1, cls-hv1
             some-values (into (equiv-class-some-values c1 some-values)) ;; cls-svf1, cls-svf2
@@ -457,14 +483,10 @@
     (log/warn "InverseFunctionalProperty not supported yet")
     all-rules)
   #_(let [class     (:id owl-statement)
-          props     (get owl-statement $owl-hasKey)
           ;; support props in either @list form, or just as a set of values
-          prop-list (or (some->> props
-                                 first
-                                 :list
-                                 (keep :id))
-                        (keep #(when-let [id (:id %)]
-                                 id) props))
+          prop-list (-> owl-statement
+                        (get $owl-hasKey)
+                        get-all-ids)
           where     (->> prop-list
                          (map-indexed (fn [idx prop]
                                         [prop (str "?z" idx)]))

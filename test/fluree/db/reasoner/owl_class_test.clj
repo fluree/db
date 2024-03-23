@@ -460,3 +460,36 @@
 
           (is (= #{"ex:redWidget" "ex:blueWidget"}
                  (set qry-RedOrBlue))))))))
+
+(deftest ^:integration owl-intersection-of
+  (testing "owl:intersectionOf tests"
+    (let [conn    (test-utils/create-conn)
+          ledger  @(fluree/create conn "reasoner/owl-intersection" nil)
+          db-base @(fluree/stage (fluree/db ledger)
+                                 {"@context" {"ex" "http://example.org/"}
+                                  "insert"   [{"@id"   "ex:carol"
+                                               "@type" ["ex:Woman" "ex:Parent"]}
+                                              {"@id"   "ex:Alice"
+                                               "@type" "ex:Woman"}
+                                              {"@id"   "ex:bob"
+                                               "@type" ["ex:Parent" "ex:Father"]}]})]
+
+      (testing "Testing owl:intersectionOf declaration"
+        (let [db-reasoned @(fluree/reason db-base :owl2rl
+                                          [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                   "ex"  "http://example.org/"}
+                                            "@id"                 "ex:Mother",
+                                            "@type"               ["owl:Class"],
+                                            "owl:equivalentClass" [{"@type"              ["owl:Class"],
+                                                                    "owl:intersectionOf" {"@list" [{"@id" "ex:Woman"}
+                                                                                                   {"@id" "ex:Parent"}]}}]}])
+
+              qry-mother  @(fluree/query db-reasoned
+                                         {:context {"ex" "http://example.org/"}
+                                          :select  "?s"
+                                          :where   {"@id"   "?s",
+                                                    "@type" "ex:Mother"}})]
+
+          (is (= ["ex:carol"]
+                 qry-mother)
+              "ex:carol has explicit types ex:Woman and ex:Parent, so should be inferred as ex:Mother"))))))
