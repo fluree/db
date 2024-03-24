@@ -462,7 +462,7 @@
                  (set qry-RedOrBlue))))))))
 
 (deftest ^:integration owl-intersection-of
-  (testing "owl:intersectionOf tests"
+  (testing "owl:intersectionOf tests - rules cls-int1, cls-int2"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/owl-intersection" nil)
           db-base @(fluree/stage (fluree/db ledger)
@@ -505,3 +505,36 @@
           (is (= #{"ex:carol" "ex:alice" "ex:jen"}
                  (set qry-woman))
               "ex:carol and ex:alice has explicit type ex:Woman and ex:jen is inferred from being ex:Mother"))))))
+
+(deftest ^:integration owl-union-of
+  (testing "owl:unionOf tests - rule cls-uni"
+    (let [conn    (test-utils/create-conn)
+          ledger  @(fluree/create conn "reasoner/owl-union" nil)
+          db-base @(fluree/stage (fluree/db ledger)
+                                 {"@context" {"ex" "http://example.org/"}
+                                  "insert"   [{"@id"   "ex:carol"
+                                               "@type" "ex:Mother"}
+                                              {"@id"   "ex:Alice"
+                                               "@type" "ex:Woman"}
+                                              {"@id"   "ex:bob"
+                                               "@type" "ex:Father"}]})]
+
+      (testing "Testing owl:unionOf declaration"
+        (let [db-reasoned @(fluree/reason db-base :owl2rl
+                                          [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                   "ex"  "http://example.org/"}
+                                            "@id"                 "ex:Parent",
+                                            "@type"               ["owl:Class"],
+                                            "owl:equivalentClass" [{"@type"       ["owl:Class"],
+                                                                    "owl:unionOf" {"@list" [{"@id" "ex:Mother"}
+                                                                                            {"@id" "ex:Father"}]}}]}])
+
+              qry-parent  @(fluree/query db-reasoned
+                                         {:context {"ex" "http://example.org/"}
+                                          :select  "?s"
+                                          :where   {"@id"   "?s",
+                                                    "@type" "ex:Parent"}})]
+
+          (is (= #{"ex:carol" "ex:bob"}
+                 (set qry-parent))
+              "ex:carol (ex:Mother) and ex:bob (ex:Father) should be inferred as ex:Parent"))))))

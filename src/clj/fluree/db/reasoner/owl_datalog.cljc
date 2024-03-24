@@ -373,6 +373,30 @@
     []
     intersection-of-statements))
 
+(defn equiv-union-of
+  "Handles rules cls-uni"
+  [rule-class union-of-statements]
+  (reduce
+    (fn [acc union-of-statement]
+      (let [class-list (-> union-of-statement
+                           (get $owl-unionOf)
+                           get-all-ids)
+            ;; could do optional clauses instead of separate
+            ;; opted for separate for now to keep it simple
+            ;; and allow for possibly fewer rule triggers with
+            ;; updating data - but not sure what is best
+            rules      (map-indexed
+                         (fn [idx c]
+                           (let [rule {"where"  {"@id"   "?y"
+                                                 "@type" c}
+                                       "insert" {"@id"   "?y"
+                                                 "@type" rule-class}}]
+                             [(str rule-class "(owl:unionOf-" idx ")") rule]))
+                         class-list)]
+        (concat acc rules)))
+    []
+    union-of-statements))
+
 (defn equiv-class-one-of
   "Handles rule cls-oo"
   [rule-class one-of-statements]
@@ -390,7 +414,7 @@
                                                  "@type" rule-class}}]
                              [(str rule-class "(owl:oneOf-" c ")") rule]))
                          class-list)]
-        (into acc rules)))
+        (concat acc rules)))
     []
     one-of-statements))
 
@@ -473,6 +497,7 @@
     (cond-> all-rules
             classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
             intersection-of (into (equiv-intersection-of c1 intersection-of)) ;; cls-int1, cls-int2
+            union-of (into (equiv-union-of c1 union-of)) ;; cls-uni
             one-of (into (equiv-class-one-of c1 one-of)) ;; cls-oo
             has-value (into (equiv-class-has-value c1 has-value)) ;; cls-hv1, cls-hv1
             some-values (into (equiv-class-some-values c1 some-values)) ;; cls-svf1, cls-svf2
