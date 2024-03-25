@@ -349,7 +349,7 @@
 
 (defn equiv-intersection-of
   "Handles rules cls-int1, cls-int2"
-  [rule-class intersection-of-statements]
+  [rule-class intersection-of-statements inserts]
   (reduce
     (fn [acc intersection-of-statement]
       (let [class-list (-> intersection-of-statement
@@ -367,7 +367,17 @@
             cls-int2   {"where"  {"@id"   "?y"
                                   "@type" rule-class}
                         "insert" {"@id"   "?y"
-                                  "@type" (into [] class-list)}}]
+                                  "@type" (into [] class-list)}}
+
+            triples    (reduce
+                         (fn [et* c]
+                           (conj et* [rule-class $rdfs-subClassOf {"@id" c}]))
+                         []
+                         class-list)]
+
+        ;; intersectionOf inserts subClassOf rules (scm-int)
+        (swap! inserts assoc (str rule-class "(owl:intersectionOf-subclass)") triples)
+
         (-> acc
             (conj [(str rule-class "(owl:intersectionOf-1)#" (hash class-list)) cls-int1])
             (conj [(str rule-class "(owl:intersectionOf-2)#" (hash class-list)) cls-int2]))))
@@ -402,7 +412,7 @@
                          class-list)]
 
         ;; unionOf inserts subClassOf rules (scm-uni)
-        (swap! inserts assoc (str rule-class "(owl:unionOf)") triples)
+        (swap! inserts assoc (str rule-class "(owl:unionOf-subclass)") triples)
 
         (concat acc rules)))
     []
@@ -507,8 +517,8 @@
                 max-cardinality max-qual-cardinality]} (group-by equiv-class-type (get owl-statement $owl-equivalentClass))]
     (cond-> all-rules
             classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
-            intersection-of (into (equiv-intersection-of c1 intersection-of)) ;; cls-int1, cls-int2
-            union-of (into (equiv-union-of c1 union-of inserts)) ;; cls-uni
+            intersection-of (into (equiv-intersection-of c1 intersection-of inserts)) ;; cls-int1, cls-int2, scm-int
+            union-of (into (equiv-union-of c1 union-of inserts)) ;; cls-uni, scm-uni
             one-of (into (equiv-one-of c1 one-of)) ;; cls-oo
             has-value (into (equiv-has-value c1 has-value)) ;; cls-hv1, cls-hv1
             some-values (into (equiv-some-values c1 some-values)) ;; cls-svf1, cls-svf2
