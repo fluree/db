@@ -1931,7 +1931,18 @@ WORLD!")
                "ex:address" {"ex:postalCode" "12345"}}]
              @(fluree/query valid-person {"@context" context
                                           "select"   {"ex:Bob" ["*" {"ex:address" ["ex:postalCode"]}]}})))
-      (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject "ex:Reto",
+                :constraint "sh:node",
+                :shape "_:fdb-3",
+                :path ["ex:address"],
+                :expect ["ex:AddressShape"],
+                :value "_:fdb-7",
+                :message "node _:fdb-7 does not conform to shapes [\"ex:AddressShape\"]"}]}
+             (ex-data invalid-person)))
+      (is (= "Subject ex:Reto path [\"ex:address\"] violates constraint sh:node of shape _:fdb-3 - node _:fdb-7 does not conform to shapes [\"ex:AddressShape\"]."
              (ex-message invalid-person)))))
 
   (testing "sh:qualifiedValueShape property shape"

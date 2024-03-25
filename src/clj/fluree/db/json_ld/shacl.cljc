@@ -915,6 +915,20 @@
       :pred
       (contains? const/sh_targetObjectsOf)))
 
+(defn property-shape?
+  "Shapes are of two disjoint categories: sh:NodeShape and sh:PropertyShape. If a shape
+  has the sh:path as a predicate, it is a sh:PropertyShape."
+  [shape]
+  (boolean (get shape const/sh_path)))
+
+(defn qualified-value-shape?
+  "A qualified value shape has one value for sh:qualifiedValueShape and either a
+  sh:qualifiedMinCount or a sh:qualifiedMaxCount."
+  [shape]
+  (and (first (get shape const/sh_qualifiedValueShape))
+       (or (first (get shape const/sh_qualifiedMinCount))
+           (first (get shape const/sh_qualifiedMaxCount)))))
+
 (defn build-shape-node
   [db shape-sid]
   (go-try
@@ -968,6 +982,7 @@
       (throw (ex-info "Unsupported property path." {:segment segment :path path})))))
 
 (defn validate-property-shape
+  "Returns a sequence of validation results if conforming fails, otherwise nil."
   [{:keys [data-db shape] :as v-ctx} focus-flakes]
   (let [{path const/sh_path} shape
         ;; TODO: there can be multiple path-flakes after resolution, need to loop here...
@@ -984,8 +999,6 @@
 
 (defn target-class-target?
   [shape s-flakes]
-  (def shape shape)
-  (def s-flakes s-flakes)
   (let [target-class (first (get shape const/sh_targetClass))]
     (println "DEP target-class-target?" (pr-str target-class))
     (some (fn [f]
@@ -1004,23 +1017,27 @@
   "If a sh:NodeShape has a class it implicitly targets that node."
   ;; https://www.w3.org/TR/shacl/#implicit-targetClass
   [shape s-flakes]
-  (let [shape-classes (set (get shape const/$rdf:type))]
+  (let [shape-classes (-> (get shape const/$rdf:type) (set) (disj const/sh_NodeShape))]
     (println "DEP implicit-target?" (pr-str shape-classes))
     (some (fn [f] (and (flake/class-flake? f)
                        (contains? shape-classes (flake/o f))))
           s-flakes)))
 
+(defn target-objects-of-target?
+  [shape]
+  (first (get shape const/sh_targetObjectsOf)))
+
 (defn target-objects-of-target
   [db shape s-flakes]
   (go-try
-    (when-let [target-pid (first (get shape const/sh_targetObjectsOf))]
+    (let [target-pid (first (get shape const/sh_targetObjectsOf))]
       (println "DEP target-objects-of-target?" (pr-str target-pid))
       (let [sid             (some-> s-flakes first flake/s)
             referring-pids  (not-empty (<? (query-range/index-range db :opst = [sid] {:flake-xf (map flake/p)})))
             p-flakes        (not-empty (filterv (fn [f] (= (flake/p f) target-pid)) s-flakes))]
         [p-flakes (when referring-pids s-flakes)]))))
 
-(defn resolve-focus-flakes
+(defn resolve-target-flakes
   "Return a sequence of focus flakes for the given node shape target."
   [db shape s-flakes]
   (go-try
@@ -1029,23 +1046,29 @@
                 (target-class-target? shape s-flakes)       [s-flakes]
                 (target-subjects-of-target? shape s-flakes) [s-flakes]
                 (implicit-target? shape s-flakes)           [s-flakes]
+                (target-objects-of-target? shape)
+                (<? (target-objects-of-target db shape s-flakes))
                 :else
-                ;; may target either s-flakes or p-flakes, or neither, or both
-                (<? (target-objects-of-target db shape s-flakes)))]
+                ;; no target, no target-flakes
+                [])]
       (println "DEP focus-flakes" (count res))
       res)))
 
 (defn validate-node-shape
-  [{:keys [data-db shape] :as v-ctx} s-flakes]
-  (def shape shape)
-  (println "DEP validate-node-shape" (pr-str (get shape const/$id)) s-flakes)
-  (loop [[focus-flakes & r] (async/<!! (resolve-focus-flakes data-db shape s-flakes))
-         results []]
-    (if focus-flakes
-      (if-let [results* (validate-constraints v-ctx focus-flakes)]
-        (recur r (into results results*))
-        (recur r results))
-      (not-empty results))))
+  "Returns a sequence of validation results if conforming fails, otherwise nil."
+  ([v-ctx s-flakes]
+   (validate-node-shape v-ctx s-flakes nil))
+  ([{:keys [data-db shape] :as v-ctx} s-flakes provided-target-flakes]
+   (println "DEP validate-node-shape" (pr-str (get shape const/$id)) s-flakes provided-target-flakes)
+   (if provided-target-flakes
+     (validate-constraints v-ctx provided-target-flakes)
+     (loop [[target-flakes & r] (async/<!! (resolve-target-flakes data-db shape s-flakes))
+            results []]
+       (if target-flakes
+         (if-let [results* (validate-constraints v-ctx target-flakes)]
+           (recur r (into results results*))
+           (recur r results))
+         (not-empty results))))))
 
 (defn base-result
   [{:keys [subject display shape] :as v-ctx} constraint]
@@ -1337,9 +1360,9 @@
         values   (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
         expects  (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) less-than-flakes)
         result   (-> (base-result v-ctx constraint)
-                           (assoc :path iri-path
-                                  :value (sort values)
-                                  :expect (sort expects)))]
+                     (assoc :path iri-path
+                            :value (sort values)
+                            :expect (sort expects)))]
     (if (or (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
                  (every? (fn [f] (contains? numeric-types (flake/dt f))) focus-flakes))
             (and (every? (fn [f] (contains? time-types (flake/dt f))) less-than-flakes)
@@ -1361,8 +1384,40 @@
   (println "DEP validate-constraint " (pr-str constraint)))
 
 ;; shape-based constraints
-(defmethod validate-constraint const/sh_node [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_node [{:keys [shape display data-db shape-db] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint path const/sh_path} shape
+
+        pretty-expect (->> expect
+                           (mapv #(get % const/$id))
+                           (mapv display))
+        result (-> (base-result v-ctx constraint)
+                   (assoc :path (mapv display path))
+                   (assoc :expect pretty-expect))]
+    (println "DEP sh:node expect" (pr-str expect))
+    (loop [[f & r] focus-flakes
+           results []]
+      (if f
+        (if (flake/ref-flake? f)
+          (recur r (into results
+                         (loop [[node-shape & r] expect
+                                results []]
+                           (if node-shape
+                             (let [s-flakes (async/<!! (query-range/index-range data-db :spot = [(flake/o f)]))]
+                               (println "DEP node shape" (pr-str shape))
+                               (if-let [results* (validate-node-shape (assoc v-ctx :shape node-shape) nil s-flakes)]
+                                 (recur r (conj results (assoc result
+                                                               :value (display (flake/o f))
+                                                               :message (str "node " (display (flake/o f))
+                                                                             " does not conform to shapes "
+                                                                             pretty-expect))))
+                                 (recur r results)))
+                             results))))
+          (recur r (conj results (assoc result
+                                        :value (flake/o f)
+                                        :message (str "value " (flake/o f) " does not conform to shapes "
+                                                      pretty-expect)))))
+        (not-empty results)))))
 (defmethod validate-constraint const/sh_property [{:keys [shape] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
   (loop [[p-shape & r] (get shape const/sh_property)
@@ -1429,8 +1484,8 @@
   [{ns-codes :namespace-codes} context results]
   (println "DEP throw-shacl-violation" (count results))
   (def r results)
-  (let [message   (->> (mapv explain-result results)
-                       (str/join "\n"))]
+  (let [message (->> (mapv explain-result results)
+                     (str/join "\n"))]
     (throw (ex-info message
                     {:status 400
                      :error  :shacl/violation
