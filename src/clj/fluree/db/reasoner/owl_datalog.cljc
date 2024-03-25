@@ -8,6 +8,7 @@
 ;; property expressions
 (def ^:const $rdfs-domain "http://www.w3.org/2000/01/rdf-schema#domain")
 (def ^:const $rdfs-range "http://www.w3.org/2000/01/rdf-schema#range")
+(def ^:const $rdfs-subClassOf "http://www.w3.org/2000/01/rdf-schema#subClassOf")
 (def ^:const $owl-sameAs "http://www.w3.org/2002/07/owl#sameAs")
 (def ^:const $owl-FunctionalProperty "http://www.w3.org/2002/07/owl#FunctionalProperty")
 (def ^:const $owl-InverseFunctionalProperty "http://www.w3.org/2002/07/owl#InverseFunctionalProperty")
@@ -216,7 +217,7 @@
                  c-set)))
 
 ;; TODO - re-enable once filter function bug is fixed
-(defn equiv-class-max-qual-cardinality
+(defn equiv-max-qual-cardinality
   "Handles rule cls-maxqc3, cls-maxqc4"
   [rule-class restrictions]
   (do
@@ -263,7 +264,7 @@
       restrictions))
 
 ;; TODO - re-enable once filter function bug is fixed
-(defn equiv-class-max-cardinality
+(defn equiv-max-cardinality
   "Handles rule cls-maxc2"
   [rule-class restrictions]
   (do
@@ -292,7 +293,7 @@
       []
       restrictions))
 
-(defn equiv-class-all-values
+(defn equiv-all-values
   "Handles rules cls-avf"
   [rule-class restrictions]
   (reduce
@@ -314,7 +315,7 @@
     []
     restrictions))
 
-(defn equiv-class-some-values
+(defn equiv-some-values
   "Handles rules cls-svf1, cls-svf2"
   [rule-class restrictions]
   (reduce
@@ -374,8 +375,8 @@
     intersection-of-statements))
 
 (defn equiv-union-of
-  "Handles rules cls-uni"
-  [rule-class union-of-statements]
+  "Handles rules cls-uni, scm-uni"
+  [rule-class union-of-statements inserts]
   (reduce
     (fn [acc union-of-statement]
       (let [class-list (-> union-of-statement
@@ -392,12 +393,22 @@
                                        "insert" {"@id"   "?y"
                                                  "@type" rule-class}}]
                              [(str rule-class "(owl:unionOf-" idx ")") rule]))
+                         class-list)
+
+            triples    (reduce
+                         (fn [et* c]
+                           (conj et* [c $rdfs-subClassOf {"@id" rule-class}]))
+                         []
                          class-list)]
+
+        ;; unionOf inserts subClassOf rules (scm-uni)
+        (swap! inserts assoc (str rule-class "(owl:unionOf)") triples)
+
         (concat acc rules)))
     []
     union-of-statements))
 
-(defn equiv-class-one-of
+(defn equiv-one-of
   "Handles rule cls-oo"
   [rule-class one-of-statements]
   (reduce
@@ -418,7 +429,7 @@
     []
     one-of-statements))
 
-(defn equiv-class-has-value
+(defn equiv-has-value
   "Handles rules cls-hv1, cls-hv2"
   [rule-class restrictions]
   (reduce
@@ -488,7 +499,7 @@
         :else nil))
 
 (defmethod to-datalog ::cax-eqc
-  [_ _ owl-statement all-rules]
+  [_ inserts owl-statement all-rules]
   (let [c1 (:id owl-statement) ;; the class which is the subject
         ;; combine with all other equivalent classes for a set of 2+ total classes
         {:keys [classes intersection-of union-of one-of
@@ -497,13 +508,13 @@
     (cond-> all-rules
             classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
             intersection-of (into (equiv-intersection-of c1 intersection-of)) ;; cls-int1, cls-int2
-            union-of (into (equiv-union-of c1 union-of)) ;; cls-uni
-            one-of (into (equiv-class-one-of c1 one-of)) ;; cls-oo
-            has-value (into (equiv-class-has-value c1 has-value)) ;; cls-hv1, cls-hv1
-            some-values (into (equiv-class-some-values c1 some-values)) ;; cls-svf1, cls-svf2
-            all-values (into (equiv-class-all-values c1 all-values)) ;; cls-svf1, cls-svf2
-            max-cardinality (into (equiv-class-max-cardinality c1 max-cardinality)) ;; cls-maxc2
-            max-qual-cardinality (into (equiv-class-max-qual-cardinality c1 max-qual-cardinality)) ;; cls-maxqc3, cls-maxqc4
+            union-of (into (equiv-union-of c1 union-of inserts)) ;; cls-uni
+            one-of (into (equiv-one-of c1 one-of)) ;; cls-oo
+            has-value (into (equiv-has-value c1 has-value)) ;; cls-hv1, cls-hv1
+            some-values (into (equiv-some-values c1 some-values)) ;; cls-svf1, cls-svf2
+            all-values (into (equiv-all-values c1 all-values)) ;; cls-svf1, cls-svf2
+            max-cardinality (into (equiv-max-cardinality c1 max-cardinality)) ;; cls-maxc2
+            max-qual-cardinality (into (equiv-max-qual-cardinality c1 max-qual-cardinality)) ;; cls-maxqc3, cls-maxqc4
             )))
 
 

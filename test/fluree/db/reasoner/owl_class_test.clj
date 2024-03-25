@@ -507,7 +507,7 @@
               "ex:carol and ex:alice has explicit type ex:Woman and ex:jen is inferred from being ex:Mother"))))))
 
 (deftest ^:integration owl-union-of
-  (testing "owl:unionOf tests - rule cls-uni"
+  (testing "owl:unionOf tests - rules cls-uni, scm-uni"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/owl-union" nil)
           db-base @(fluree/stage (fluree/db ledger)
@@ -520,21 +520,32 @@
                                                "@type" "ex:Father"}]})]
 
       (testing "Testing owl:unionOf declaration"
-        (let [db-reasoned @(fluree/reason db-base :owl2rl
-                                          [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
-                                                                   "ex"  "http://example.org/"}
-                                            "@id"                 "ex:Parent",
-                                            "@type"               ["owl:Class"],
-                                            "owl:equivalentClass" [{"@type"       ["owl:Class"],
-                                                                    "owl:unionOf" {"@list" [{"@id" "ex:Mother"}
-                                                                                            {"@id" "ex:Father"}]}}]}])
+        (let [db-reasoned  @(fluree/reason db-base :owl2rl
+                                           [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                    "ex"  "http://example.org/"}
+                                             "@id"                 "ex:Parent"
+                                             "@type"               ["owl:Class"],
+                                             "owl:equivalentClass" [{"@type"       ["owl:Class"]
+                                                                     "owl:unionOf" {"@list" [{"@id" "ex:Mother"}
+                                                                                             {"@id" "ex:Father"}]}}]}])
 
-              qry-parent  @(fluree/query db-reasoned
-                                         {:context {"ex" "http://example.org/"}
-                                          :select  "?s"
-                                          :where   {"@id"   "?s",
-                                                    "@type" "ex:Parent"}})]
+              qry-parent   @(fluree/query db-reasoned
+                                          {:context {"ex" "http://example.org/"}
+                                           :select  "?s"
+                                           :where   {"@id"   "?s"
+                                                     "@type" "ex:Parent"}})
+
+              qry-subclass @(fluree/query db-reasoned
+                                          {:context {"ex"   "http://example.org/"
+                                                     "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                           :select  "?s"
+                                           :where   {"@id"             "?s"
+                                                     "rdfs:subClassOf" {"@id" "ex:Parent"}}})]
 
           (is (= #{"ex:carol" "ex:bob"}
                  (set qry-parent))
-              "ex:carol (ex:Mother) and ex:bob (ex:Father) should be inferred as ex:Parent"))))))
+              "ex:carol (ex:Mother) and ex:bob (ex:Father) should be inferred as ex:Parent - rule cls-uni")
+
+          (is (= #{"ex:Mother" "ex:Father"}
+                 (set qry-subclass))
+              "ex:carol (ex:Mother) and ex:bob (ex:Father) should be inferred as ex:Parent - rule scm-uni"))))))
