@@ -1427,8 +1427,132 @@
         (recur r (into results results*))
         (recur r results))
       (not-empty results))))
-(defmethod validate-constraint const/sh_qualifiedValueShape [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+
+
+(defn build-sibling-shapes
+  "Construct the sibling shapes of a shape with a sh:qualifiedValueShape. Siblings are
+  other qualified value shape constraints in the same property constraint"
+  [shape-db shape]
+  (def shape-db shape-db)
+  (def shape shape)
+  (let [{shape-id const/$id
+         [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
+         [{q-shape-id const/$id}] const/sh_qualifiedValueShape}
+        shape]
+    (if q-disjoint?
+      (let [parent-shape-id
+            (first (async/<!! (query-range/index-range shape-db :opst = [shape-id const/sh_property]
+                                                       {:flake-xf (map flake/s)})))
+            sibling-sids
+            (async/<!! (query-range/index-range shape-db :spot = [parent-shape-id const/sh_property]
+                                                {:flake-xf (map flake/o)}))]
+        (loop [[sib-sid & r] sibling-sids
+               sib-q-shapes []]
+          (if sib-sid
+            (if (= sib-sid q-shape-id)
+              ;; skip the original q-shape
+              (recur r sib-q-shapes)
+              ;; only add the siblings
+              (recur r (conj sib-q-shapes (async/<!! (build-shape shape-db sib-sid)))))
+            (->> sib-q-shapes
+                 (keep #(first (get % const/sh_qualifiedValueShape)))))))
+      [])))
+
+(defmethod validate-constraint const/sh_qualifiedValueShape [{:keys [shape display data-db shape-db] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (def v-ctx v-ctx)
+  (let [{expect constraint path const/sh_path
+         [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
+         [q-min-count] const/sh_qualifiedMinCount
+         [q-max-count] const/sh_qualifiedMaxCount} shape
+
+        [q-shape] expect
+
+
+        values (->> focus-flakes
+                    (mapv flake/o)
+                    (mapv #(if (iri/sid? %) (display %) %)))
+
+        result (-> (base-result v-ctx constraint)
+                   (assoc :path (mapv display path))
+                   (assoc :expect (display (get q-shape const/$id)))
+                   (assoc :value values))]
+    (println "DEP q-shape" (pr-str q-shape))
+    (loop [[f & r] focus-flakes
+           conforming []]
+      (println "DEP flake " (pr-str f) (pr-str conforming))
+      (if f
+        ;; build up conforming sids
+        (let [focus-flakes (if (flake/ref-flake? f)
+                             (async/<!! (query-range/index-range data-db :spot = [(flake/o f)]))
+                             [f])
+              result (if (property-shape? q-shape)
+                       (validate-property-shape (assoc v-ctx :shape q-shape) focus-flakes)
+                       (validate-node-shape (assoc v-ctx :shape q-shape) nil focus-flakes))]
+          (println "DEP q-shape result" (pr-str result))
+          (if result
+            (recur r conforming)
+            (recur r (conj conforming (flake/o f)))))
+
+        (do
+          (println "DEP end flake" (pr-str q-disjoint?) (pr-str conforming))
+          (if q-disjoint?
+            ;; disjoint requires subjects that conform to this q-shape cannot conform to any of the sibling q-shapes
+            (let [sibling-q-shapes (build-sibling-shapes shape-db shape)]
+              (loop [[conforming-sid & r] conforming
+                     non-disjoint-conformers #{}]
+                (println "DEP conforming-sid" (pr-str conforming-sid) (pr-str non-disjoint-conformers))
+                (if conforming-sid
+                  (loop [[sib-q-shape & r] sibling-q-shapes
+                         non-disjoint-conformers* []]
+                    (println "DEP sib-q-shape" (pr-str sib-q-shape) (pr-str non-disjoint-conformers*))
+                    (if sib-q-shape
+                      (let [focus-flakes (async/<!! (query-range/index-range data-db :spot = [conforming-sid]))
+                            result (if (property-shape? sib-q-shape)
+                                     (validate-property-shape (assoc v-ctx :shape sib-q-shape) focus-flakes)
+                                     (validate-node-shape (assoc v-ctx :shape sib-q-shape) nil focus-flakes))]
+                        (println "DEP sib-q-shape result" (pr-str result) )
+                        (if result
+                          (recur r non-disjoint-conformers*)
+                          (recur r (conj non-disjoint-conformers* conforming-sid))))
+                      (do
+                        (pr-str "DEP sib-q-shape end" (pr-str non-disjoint-conformers*))
+                        (into non-disjoint-conformers non-disjoint-conformers*))))
+
+
+                  (do
+                    (println "DEP conforming-sid end" (pr-str non-disjoint-conformers))
+                    (if (not-empty non-disjoint-conformers)
+                      ;; each non-disjoint sid produces a validation result
+                      (mapv
+                        (fn [non-disjoint-sid]
+                          (assoc result
+                                 :message (str "value " (display non-disjoint-sid) " conformed to multiple sibling qualified value shapes "
+                                               (mapv #(display (get % const/$id)) sibling-q-shapes) " in violation of the "
+                                               (display const/sh_qualifiedValueShapesDisjoint) " constraint.")))
+
+                        non-disjoint-conformers)
+
+                      ;; no non-disjoint conformers, validate count constraints
+                      (cond (and q-min-count (< (count conforming) q-min-count))
+                            [(assoc result
+                                    :message (str "values " values " conformed to " (display (get q-shape const/$id))
+                                                  " less than " (display const/sh_qualifiedMinCount) " " q-min-count " times"))]
+                            (and q-max-count (> (count conforming) q-max-count))
+                            [(assoc result
+                                    :message (str "values " values " conformed to " (display (get q-shape const/$id))
+                                                  " more than " (display const/sh_qualifiedMaxCount) " " q-max-count " times"))]))))))
+            ;; validate count constraints
+            (do
+              (println "DEP no disjoint check")
+              (cond (and q-min-count (< (count conforming) q-min-count))
+                    [(assoc result
+                            :message (str "values " values " conformed to " (display (get q-shape const/$id))
+                                          " less than " (display const/sh_qualifiedMinCount) " " q-min-count " times"))]
+                    (and q-max-count (> (count conforming) q-max-count))
+                    [(assoc result
+                            :message (str "values " values " conformed to " (display (get q-shape const/$id))
+                                          " more than " (display const/sh_qualifiedMaxCount) " " q-max-count " times"))]))))))))
 
 ;; other constraints
 (defmethod validate-constraint const/sh_closed [{:keys [shape subject data-db display] :as v-ctx} constraint focus-flakes]
