@@ -185,7 +185,7 @@
                       (update :txns (fnil conj []) [txn-id author-did])
                       (assoc :policy policy) ;; re-apply policy to db-after
                       (assoc :t t)
-                      (commit-data/update-novelty add remove)
+                      (commit-data/update-novelty add)
                       (commit-data/add-tt-id)
                       (vocab/hydrate-schema add))]
     {:add add :remove remove :db-after db-after}))
