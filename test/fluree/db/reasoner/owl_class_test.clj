@@ -469,8 +469,9 @@
                                  {"@context" {"ex" "http://example.org/"}
                                   "insert"   [{"@id"   "ex:carol"
                                                "@type" ["ex:Woman" "ex:Parent"]}
-                                              {"@id"   "ex:alice"
-                                               "@type" "ex:Woman"}
+                                              {"@id"    "ex:alice"
+                                               "@type"  "ex:Woman"
+                                               "ex:age" 21}
                                               {"@id"   "ex:bob"
                                                "@type" ["ex:Parent" "ex:Father"]}
                                               {"@id"   "ex:jen"
@@ -515,7 +516,29 @@
 
           (is (= #{"ex:Woman" "ex:Parent"}
                  (set qry-subclass))
-              "ex:Woman and ex:Parent should now be subclasses of ex:Mother - rule scm-int"))))))
+              "ex:Woman and ex:Parent should now be subclasses of ex:Mother - rule scm-int")))
+
+      (testing "Testing owl:intersectionOf with nested hasValue"
+        (let [db-reasoned  @(fluree/reason db-base :owl2rl
+                                           [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                    "ex"  "http://example.org/"}
+                                             "@id"                 "ex:Woman-21"
+                                             "@type"               ["owl:Class"]
+                                             "owl:equivalentClass" [{"@type"              ["owl:Class"]
+                                                                     "owl:intersectionOf" {"@list" [{"@id" "ex:Woman"}
+                                                                                                    {"@type"          ["owl:Restriction"]
+                                                                                                     "owl:onProperty" {"@id" "ex:age"}
+                                                                                                     "owl:hasValue"   21}]}}]}])
+
+              qry-woman-21 @(fluree/query db-reasoned
+                                          {:context {"ex" "http://example.org/"}
+                                           :select  "?s"
+                                           :where   {"@id"   "?s"
+                                                     "@type" "ex:Woman-21"}})]
+
+          (is (= ["ex:alice"]
+                 qry-woman-21)
+              "ex:alice is the only ex:Woman where ex:age is 21"))))))
 
 (deftest ^:integration owl-union-of
   (testing "owl:unionOf tests - rules cls-uni, scm-uni"
@@ -528,7 +551,10 @@
                                               {"@id"   "ex:Alice"
                                                "@type" "ex:Woman"}
                                               {"@id"   "ex:bob"
-                                               "@type" "ex:Father"}]})]
+                                               "@type" "ex:Father"}
+                                              {"@id"         "ex:sue"
+                                               "@type"       "ex:Woman"
+                                               "ex:isParent" true}]})]
 
       (testing "Testing owl:unionOf declaration"
         (let [db-reasoned  @(fluree/reason db-base :owl2rl
@@ -559,4 +585,27 @@
 
           (is (= #{"ex:Mother" "ex:Father"}
                  (set qry-subclass))
-              "ex:carol (ex:Mother) and ex:bob (ex:Father) should be inferred as ex:Parent - rule scm-uni"))))))
+              "ex:carol (ex:Mother) and ex:bob (ex:Father) should be inferred as ex:Parent - rule scm-uni")))
+
+      (testing "Testing owl:unionOf declaration with nested hasValue"
+        (let [db-reasoned @(fluree/reason db-base :owl2rl
+                                          [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                   "ex"  "http://example.org/"}
+                                            "@id"                 "ex:Parent"
+                                            "@type"               ["owl:Class"],
+                                            "owl:equivalentClass" [{"@type"       ["owl:Class"]
+                                                                    "owl:unionOf" {"@list" [{"@id" "ex:Mother"}
+                                                                                            {"@id" "ex:Father"}
+                                                                                            {"@type"          ["owl:Restriction"]
+                                                                                             "owl:onProperty" {"@id" "ex:isParent"}
+                                                                                             "owl:hasValue"   true}]}}]}])
+
+              qry-parent  @(fluree/query db-reasoned
+                                         {:context {"ex" "http://example.org/"}
+                                          :select  "?s"
+                                          :where   {"@id"   "?s"
+                                                    "@type" "ex:Parent"}})]
+
+          (is (= #{"ex:carol" "ex:bob" "ex:sue"}
+                 (set qry-parent))
+              "ex:sue (because ex:isParent=true), ex:carol (because ex:Mother) and ex:bob (because ex:Father)"))))))

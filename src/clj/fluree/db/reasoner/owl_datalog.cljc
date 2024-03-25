@@ -1,5 +1,6 @@
 (ns fluree.db.reasoner.owl-datalog
-  (:require [fluree.db.util.core :as util :refer [try* catch*]]
+  (:require [clojure.string :as str]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.util.json :as json]))
 
@@ -36,15 +37,66 @@
 (def ^:const $owl-Thing "http://www.w3.org/2002/07/owl#Thing")
 
 
+(defn unwrap-list
+  "If values are contained in an @list, unwraps them"
+  [vals]
+  (if-let [list-vals (:list (first vals))]
+    list-vals
+    vals))
+
+(defn blank-node?
+  [statement]
+  (when-let [id (:id statement)]
+    (str/starts-with? id "_:")))
+
 (defn get-all-ids
   "Returns all @id values from either an ordered list or a set of objects.
-  Filters out any scalar (@value) values"
+  Filters out any scalar (@value) values and blank nodes."
   [vals]
-  (or (some->> vals
-               first
-               :list
-               (keep :id))
-      (keep :id vals)))
+  (->> vals
+       unwrap-list
+       (remove blank-node?)
+       (map :id)))
+
+(defn equiv-class-type
+  [equiv-class-statement]
+  (cond (some #(= % $owl-Restriction) (:type equiv-class-statement))
+        (cond
+          (contains? equiv-class-statement $owl-hasValue)
+          :has-value
+
+          (contains? equiv-class-statement $owl-someValuesFrom)
+          :some-values
+
+          (contains? equiv-class-statement $owl-allValuesFrom)
+          :all-values
+
+          (contains? equiv-class-statement $owl-maxCardinality)
+          :max-cardinality
+
+          (contains? equiv-class-statement $owl-maxQualifiedCardinality)
+          :max-qual-cardinality
+
+          :else
+          (do
+            (log/warn "Unsupported owl:Restriction" equiv-class-statement)
+            nil))
+
+        (contains? equiv-class-statement $owl-oneOf)
+        :one-of
+
+        (contains? equiv-class-statement $owl-intersectionOf)
+        :intersection-of
+
+        (contains? equiv-class-statement $owl-unionOf)
+        :union-of
+
+        (contains? equiv-class-statement :id)
+        (if (blank-node? equiv-class-statement)
+          :blank-nodes
+          :classes)
+
+        :else nil))
 
 (defmulti to-datalog (fn [rule-type inserts owl-statement all-rules]
                        rule-type))
@@ -293,6 +345,37 @@
       []
       restrictions))
 
+(defn equiv-has-value
+  "Handles rules cls-hv1, cls-hv2"
+  [rule-class restrictions]
+  (reduce
+    (fn [acc restriction]
+      (let [property (util/get-first-id restriction $owl-onProperty)
+            one-val  (if-let [one-val (util/get-first restriction $owl-hasValue)]
+                       (if-let [one-val-id (:id one-val)]
+                         {"@id" one-val-id}
+                         (:value one-val)))
+            rule1    {"where"  {"@id"    "?x"
+                                property one-val}
+                      "insert" {"@id"   "?x"
+                                "@type" rule-class}}
+            rule2    {"where"  {"@id"   "?x"
+                                "@type" rule-class}
+                      "insert" {"@id"    "?x"
+                                property one-val}}]
+        (if (and property one-val)
+          (-> acc
+              (conj [(str rule-class "(owl:Restriction-" property "-1)") rule1])
+              (conj [(str rule-class "(owl:Restriction-" property "-2)") rule2]))
+          (do (log/warn "owl:Restriction for class" rule-class
+                        "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
+                        "and owl:hasValue is:" (util/get-first restriction $owl-hasValue)
+                        ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
+                        "hasValue must exist, but can be an IRI or literal value.")
+              acc))))
+    []
+    restrictions))
+
 (defn equiv-all-values
   "Handles rules cls-avf"
   [rule-class restrictions]
@@ -347,33 +430,55 @@
     []
     restrictions))
 
+(defn has-value-condition
+  "Used to build where statement for owl:hasValue restriction when the
+  parent clause is *not* an owl:equivalentClass, and therefore is part of a more complex
+  nested condition.
+
+  binding-var should be the variables that is being bound in the parent where statement
+  clause."
+  [binding-var has-value-statements]
+  (reduce
+    (fn [acc has-value-statement]
+      (let [property (util/get-first-id has-value-statement $owl-onProperty)
+            one-val  (if-let [one-val (util/get-first has-value-statement $owl-hasValue)]
+                       (if-let [one-val-id (:id one-val)]
+                         {"@id" one-val-id}
+                         (:value one-val)))]
+        (conj acc {"@id"    binding-var
+                   property one-val})))
+    []
+    has-value-statements))
+
 (defn equiv-intersection-of
   "Handles rules cls-int1, cls-int2"
   [rule-class intersection-of-statements inserts]
   (reduce
     (fn [acc intersection-of-statement]
-      (let [class-list (-> intersection-of-statement
-                           (get $owl-intersectionOf)
-                           get-all-ids)
-            cls-int1   {"where"  (reduce
-                                   (fn [acc c]
-                                     (conj acc
-                                           {"@id"   "?y"
-                                            "@type" c}))
-                                   []
-                                   class-list)
-                        "insert" {"@id"   "?y"
-                                  "@type" rule-class}}
-            cls-int2   {"where"  {"@id"   "?y"
-                                  "@type" rule-class}
-                        "insert" {"@id"   "?y"
-                                  "@type" (into [] class-list)}}
+      (let [intersections (unwrap-list (get intersection-of-statement $owl-intersectionOf))
+            {:keys [classes has-value]} (group-by equiv-class-type intersections)
+            restrictions  (cond->> []
+                                   has-value (into (has-value-condition "?y" has-value)))
+            class-list    (map :id classes)
+            cls-int1      {"where"  (reduce
+                                      (fn [acc c]
+                                        (conj acc
+                                              {"@id"   "?y"
+                                               "@type" c}))
+                                      restrictions
+                                      class-list)
+                           "insert" {"@id"   "?y"
+                                     "@type" rule-class}}
+            cls-int2      {"where"  {"@id"   "?y"
+                                     "@type" rule-class}
+                           "insert" {"@id"   "?y"
+                                     "@type" (into [] class-list)}}
 
-            triples    (reduce
-                         (fn [et* c]
-                           (conj et* [rule-class $rdfs-subClassOf {"@id" c}]))
-                         []
-                         class-list)]
+            triples       (reduce
+                            (fn [et* c]
+                              (conj et* [rule-class $rdfs-subClassOf {"@id" c}]))
+                            []
+                            class-list)]
 
         ;; intersectionOf inserts subClassOf rules (scm-int)
         (swap! inserts assoc (str rule-class "(owl:intersectionOf-subclass)") triples)
@@ -389,32 +494,40 @@
   [rule-class union-of-statements inserts]
   (reduce
     (fn [acc union-of-statement]
-      (let [class-list (-> union-of-statement
-                           (get $owl-unionOf)
-                           get-all-ids)
+      (let [unions            (unwrap-list (get union-of-statement $owl-unionOf))
+            {:keys [classes has-value]} (group-by equiv-class-type unions)
+            restrictions      (cond->> []
+                                       has-value (into (has-value-condition "?y" has-value)))
+            restriction-rules (map (fn [where]
+                                     [(str rule-class "(owl:unionOf->owl:hasValue)#" (hash where))
+                                      {"where"  where
+                                       "insert" {"@id"   "?y"
+                                                 "@type" rule-class}}])
+                                   restrictions)
+            class-list        (map :id classes)
             ;; could do optional clauses instead of separate
             ;; opted for separate for now to keep it simple
             ;; and allow for possibly fewer rule triggers with
             ;; updating data - but not sure what is best
-            rules      (map-indexed
-                         (fn [idx c]
-                           (let [rule {"where"  {"@id"   "?y"
-                                                 "@type" c}
-                                       "insert" {"@id"   "?y"
-                                                 "@type" rule-class}}]
-                             [(str rule-class "(owl:unionOf-" idx ")") rule]))
-                         class-list)
+            rules             (map-indexed
+                                (fn [idx c]
+                                  (let [rule {"where"  {"@id"   "?y"
+                                                        "@type" c}
+                                              "insert" {"@id"   "?y"
+                                                        "@type" rule-class}}]
+                                    [(str rule-class "(owl:unionOf-" idx ")") rule]))
+                                class-list)
 
-            triples    (reduce
-                         (fn [et* c]
-                           (conj et* [c $rdfs-subClassOf {"@id" rule-class}]))
-                         []
-                         class-list)]
+            triples           (reduce
+                                (fn [et* c]
+                                  (conj et* [c $rdfs-subClassOf {"@id" rule-class}]))
+                                []
+                                class-list)]
 
         ;; unionOf inserts subClassOf rules (scm-uni)
         (swap! inserts assoc (str rule-class "(owl:unionOf-subclass)") triples)
 
-        (concat acc rules)))
+        (concat acc rules restriction-rules)))
     []
     union-of-statements))
 
@@ -439,82 +552,15 @@
     []
     one-of-statements))
 
-(defn equiv-has-value
-  "Handles rules cls-hv1, cls-hv2"
-  [rule-class restrictions]
-  (reduce
-    (fn [acc restriction]
-      (let [property (util/get-first-id restriction $owl-onProperty)
-            one-val  (if-let [one-val (util/get-first restriction $owl-hasValue)]
-                       (if-let [one-val-id (:id one-val)]
-                         {"@id" one-val-id}
-                         (:value one-val)))
-            rule1    {"where"  {"@id"    "?x"
-                                property one-val}
-                      "insert" {"@id"   "?x"
-                                "@type" rule-class}}
-            rule2    {"where"  {"@id"   "?x"
-                                "@type" rule-class}
-                      "insert" {"@id"    "?x"
-                                property one-val}}]
-        (if (and property one-val)
-          (-> acc
-              (conj [(str rule-class "(owl:Restriction-" property "-1)") rule1])
-              (conj [(str rule-class "(owl:Restriction-" property "-2)") rule2]))
-          (do (log/warn "owl:Restriction for class" rule-class
-                        "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
-                        "and owl:hasValue is:" (util/get-first restriction $owl-hasValue)
-                        ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
-                        "hasValue must exist, but can be an IRI or literal value.")
-              acc))))
-    []
-    restrictions))
-
-(defn equiv-class-type
-  [equiv-class-statement]
-  (cond (some #(= % $owl-Restriction) (:type equiv-class-statement))
-        (cond
-          (contains? equiv-class-statement $owl-hasValue)
-          :has-value
-
-          (contains? equiv-class-statement $owl-someValuesFrom)
-          :some-values
-
-          (contains? equiv-class-statement $owl-allValuesFrom)
-          :all-values
-
-          (contains? equiv-class-statement $owl-maxCardinality)
-          :max-cardinality
-
-          (contains? equiv-class-statement $owl-maxQualifiedCardinality)
-          :max-qual-cardinality
-
-          :else
-          (do
-            (log/warn "Unsupported owl:Restriction" equiv-class-statement)
-            nil))
-
-        (contains? equiv-class-statement $owl-oneOf)
-        :one-of
-
-        (contains? equiv-class-statement $owl-intersectionOf)
-        :intersection-of
-
-        (contains? equiv-class-statement $owl-unionOf)
-        :union-of
-
-        (contains? equiv-class-statement :id)
-        :classes
-
-        :else nil))
-
 (defmethod to-datalog ::cax-eqc
   [_ inserts owl-statement all-rules]
   (let [c1 (:id owl-statement) ;; the class which is the subject
         ;; combine with all other equivalent classes for a set of 2+ total classes
         {:keys [classes intersection-of union-of one-of
                 has-value some-values all-values
-                max-cardinality max-qual-cardinality]} (group-by equiv-class-type (get owl-statement $owl-equivalentClass))]
+                max-cardinality max-qual-cardinality]} (->> (get owl-statement $owl-equivalentClass)
+                                                            unwrap-list
+                                                            (group-by equiv-class-type))]
     (cond-> all-rules
             classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
             intersection-of (into (equiv-intersection-of c1 intersection-of inserts)) ;; cls-int1, cls-int2, scm-int
