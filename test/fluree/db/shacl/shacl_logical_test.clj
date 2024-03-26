@@ -36,36 +36,30 @@
                                 :type            [:ex/User],
                                 :schema/name     "John"
                                 :schema/callSign "j-rock"}})
-          db-company-name  (try
-                             @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id                 :ex/john,
-                                  :type               [:ex/User],
-                                  :schema/companyName "WrongCo"
-                                  :schema/callSign    "j-rock"}})
-                             (catch Exception e e))
-          db-two-names     (try
-                             @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id                 :ex/john,
-                                  :type               [:ex/User],
-                                  :schema/companyName ["John", "Johnny"]
-                                  :schema/callSign    "j-rock"}})
-                             (catch Exception e e))
-          db-callsign-name (try
-                             @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id              :ex/john
-                                  :type            [:ex/User]
-                                  :schema/name     "Johnny Boy"
-                                  :schema/callSign "Johnny Boy"}})
-                             (catch Exception e e))
+          db-company-name  @(fluree/stage
+                              db
+                              {"@context" ["https://ns.flur.ee" context]
+                               "insert"
+                               {:id                 :ex/john,
+                                :type               [:ex/User],
+                                :schema/companyName "WrongCo"
+                                :schema/callSign    "j-rock"}})
+          db-two-names     @(fluree/stage
+                              db
+                              {"@context" ["https://ns.flur.ee" context]
+                               "insert"
+                               {:id                 :ex/john,
+                                :type               [:ex/User],
+                                :schema/companyName ["John", "Johnny"]
+                                :schema/callSign    "j-rock"}})
+          db-callsign-name @(fluree/stage
+                              db
+                              {"@context" ["https://ns.flur.ee" context]
+                               "insert"
+                               {:id              :ex/john
+                                :type            [:ex/User]
+                                :schema/name     "Johnny Boy"
+                                :schema/callSign "Johnny Boy"}})
           ok-results       @(fluree/query db-ok user-query)]
       (is (util/exception? db-company-name))
       (is (= "SHACL PropertyShape exception - sh:not sh:minCount of 1 requires lower count but actual count was 1."
@@ -206,30 +200,27 @@
                                     {:id          :ex/al,
                                      :type        :ex/User,
                                      :ex/greeting "HOWDY"}})
-          db-name-too-short     (try @(fluree/stage
-                                        db
-                                        {"@context" ["https://ns.flur.ee" context]
-                                         "insert"
-                                         {:id          :ex/john,
-                                          :type        [:ex/User],
-                                          :schema/name "John"}})
-                                     (catch Exception e e))
-          db-tag-too-long       (try @(fluree/stage
-                                        db
-                                        {"@context" ["https://ns.flur.ee" context]
-                                         "insert"
-                                         {:id     :ex/john,
-                                          :type   [:ex/User],
-                                          :ex/tag 12345}})
-                                     (catch Exception e e))
-          db-greeting-incorrect (try @(fluree/stage
-                                        db
-                                        {"@context" ["https://ns.flur.ee" context]
-                                         "insert"
-                                         {:id          :ex/john,
-                                          :type        [:ex/User],
-                                          :ex/greeting "hello!"}})
-                                     (catch Exception e e))]
+          db-name-too-short     @(fluree/stage
+                                   db
+                                   {"@context" ["https://ns.flur.ee" context]
+                                    "insert"
+                                    {:id          :ex/john,
+                                     :type        [:ex/User],
+                                     :schema/name "John"}})
+          db-tag-too-long       @(fluree/stage
+                                   db
+                                   {"@context" ["https://ns.flur.ee" context]
+                                    "insert"
+                                    {:id     :ex/john,
+                                     :type   [:ex/User],
+                                     :ex/tag 12345}})
+          db-greeting-incorrect @(fluree/stage
+                                   db
+                                   {"@context" ["https://ns.flur.ee" context]
+                                    "insert"
+                                    {:id          :ex/john,
+                                     :type        [:ex/User],
+                                     :ex/greeting "hello!"}})]
       (is (util/exception? db-name-too-short))
       (is (= "SHACL PropertyShape exception - sh:not sh:maxLength: value John must have string length greater than 10."
              (ex-message db-name-too-short)))
