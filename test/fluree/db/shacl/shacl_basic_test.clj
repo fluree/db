@@ -58,25 +58,21 @@
                            :schema/name     "John"
                            :schema/callSign "j-rock"}})
           ; no :schema/name
-          db-no-names  (try
-                         @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id              :ex/john
-                             :type            :ex/User
-                             :schema/callSign "j-rock"}})
-                         (catch Exception e e))
-          db-two-names (try
-                         @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id              :ex/john
-                             :type            :ex/User
-                             :schema/name     ["John", "Johnny"]
-                             :schema/callSign "j-rock"}})
-                         (catch Exception e e))]
+          db-no-names  @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id              :ex/john
+                            :type            :ex/User
+                            :schema/callSign "j-rock"}})
+          db-two-names @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id              :ex/john
+                            :type            :ex/User
+                            :schema/name     ["John", "Johnny"]
+                            :schema/callSign "j-rock"}})]
       (is (= {:status 400,
               :error :shacl/violation
               :report
@@ -191,16 +187,14 @@
                             :type        :ex/User
                             :schema/name "John"}})
           ; no :schema/name
-          db-extra-prop (try
-                          @(fluree/stage
-                            db
-                            {"@context" ["https://ns.flur.ee" context]
-                             "insert"
-                             {:id           :ex/john
-                              :type         :ex/User
-                              :schema/name  "John"
-                              :schema/email "john@flur.ee"}})
-                          (catch Exception e e))]
+          db-extra-prop @(fluree/stage
+                           db
+                           {"@context" ["https://ns.flur.ee" context]
+                            "insert"
+                            {:id           :ex/john
+                             :type         :ex/User
+                             :schema/name  "John"
+                             :schema/email "john@flur.ee"}})]
       (is (= {:status 400,
               :error :shacl/violation,
               :report
@@ -248,16 +242,14 @@
                         :schema/name  "Alice"
                         :ex/firstName "Alice"}})
 
-              db-not-equal (try
-                             @(fluree/stage
-                               db
-                               {"@context" ["https://ns.flur.ee" context]
-                                "insert"
-                                {:id           :ex/john
-                                 :type         :ex/User
-                                 :schema/name  "John"
-                                 :ex/firstName "Jack"}})
-                             (catch Exception e e))]
+              db-not-equal @(fluree/stage
+                              db
+                              {"@context" ["https://ns.flur.ee" context]
+                               "insert"
+                               {:id           :ex/john
+                                :type         :ex/User
+                                :schema/name  "John"
+                                :ex/firstName "Jack"}})]
           (is (= {:status 400,
                   :error :shacl/violation,
                   :report
@@ -308,50 +300,42 @@
                          :ex/favNums   [11 17]
                          :ex/luckyNums [17 11]}})
 
-              db-not-equal1 (try
-                              @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id           :ex/brian
-                                  :type         :ex/User
-                                  :schema/name  "Brian"
-                                  :ex/favNums   [11 17]
-                                  :ex/luckyNums [13 18]}})
-                              (catch Exception e e))
-              db-not-equal2 (try
-                              @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id           :ex/brian
-                                  :type         :ex/User
-                                  :schema/name  "Brian"
-                                  :ex/favNums   [11 17]
-                                  :ex/luckyNums [11]}})
-                              (catch Exception e e))
-              db-not-equal3 (try
-                              @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id           :ex/brian
-                                  :type         :ex/User
-                                  :schema/name  "Brian"
-                                  :ex/favNums   [11 17]
-                                  :ex/luckyNums [11 17 18]}})
-                              (catch Exception e e))
-              db-not-equal4 (try
-                              @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id           :ex/brian
-                                  :type         :ex/User
-                                  :schema/name  "Brian"
-                                  :ex/favNums   [11 17]
-                                  :ex/luckyNums ["11" "17"]}})
-                              (catch Exception e e))]
+              db-not-equal1 @(fluree/stage
+                               db
+                               {"@context" ["https://ns.flur.ee" context]
+                                "insert"
+                                {:id           :ex/brian
+                                 :type         :ex/User
+                                 :schema/name  "Brian"
+                                 :ex/favNums   [11 17]
+                                 :ex/luckyNums [13 18]}})
+              db-not-equal2 @(fluree/stage
+                               db
+                               {"@context" ["https://ns.flur.ee" context]
+                                "insert"
+                                {:id           :ex/brian
+                                 :type         :ex/User
+                                 :schema/name  "Brian"
+                                 :ex/favNums   [11 17]
+                                 :ex/luckyNums [11]}})
+              db-not-equal3 @(fluree/stage
+                               db
+                               {"@context" ["https://ns.flur.ee" context]
+                                "insert"
+                                {:id           :ex/brian
+                                 :type         :ex/User
+                                 :schema/name  "Brian"
+                                 :ex/favNums   [11 17]
+                                 :ex/luckyNums [11 17 18]}})
+              db-not-equal4 @(fluree/stage
+                               db
+                               {"@context" ["https://ns.flur.ee" context]
+                                "insert"
+                                {:id           :ex/brian
+                                 :type         :ex/User
+                                 :schema/name  "Brian"
+                                 :ex/favNums   [11 17]
+                                 :ex/luckyNums ["11" "17"]}})]
           (is (= {:status 400,
                   :error :shacl/violation,
                   :report
@@ -437,40 +421,34 @@
                         :ex/favNums   [11 17]
                         :ex/luckyNums 1}})
 
-              db-not-disjoint1 (try
-                                 @(fluree/stage
-                                   db
-                                   {"@context" ["https://ns.flur.ee" context]
-                                    "insert"
-                                    {:id           :ex/brian
-                                     :type         :ex/User
-                                     :schema/name  "Brian"
-                                     :ex/favNums   11
-                                     :ex/luckyNums 11}})
-                                 (catch Exception e e))
-              db-not-disjoint2 (try
-                                 @(fluree/stage
-                                   db
-                                   {"@context" ["https://ns.flur.ee" context]
-                                    "insert"
-                                    {:id           :ex/brian
-                                     :type         :ex/User
-                                     :schema/name  "Brian"
-                                     :ex/favNums   [11 17 31]
-                                     :ex/luckyNums 11}})
-                                 (catch Exception e e))
+              db-not-disjoint1 @(fluree/stage
+                                  db
+                                  {"@context" ["https://ns.flur.ee" context]
+                                   "insert"
+                                   {:id           :ex/brian
+                                    :type         :ex/User
+                                    :schema/name  "Brian"
+                                    :ex/favNums   11
+                                    :ex/luckyNums 11}})
+              db-not-disjoint2 @(fluree/stage
+                                  db
+                                  {"@context" ["https://ns.flur.ee" context]
+                                   "insert"
+                                   {:id           :ex/brian
+                                    :type         :ex/User
+                                    :schema/name  "Brian"
+                                    :ex/favNums   [11 17 31]
+                                    :ex/luckyNums 11}})
 
-              db-not-disjoint3 (try
-                                 @(fluree/stage
-                                   db
-                                   {"@context" ["https://ns.flur.ee" context]
-                                    "insert"
-                                    {:id           :ex/brian
-                                     :type         :ex/User
-                                     :schema/name  "Brian"
-                                     :ex/favNums   [11 17 31]
-                                     :ex/luckyNums [13 18 11]}})
-                                 (catch Exception e e))]
+              db-not-disjoint3 @(fluree/stage
+                                  db
+                                  {"@context" ["https://ns.flur.ee" context]
+                                   "insert"
+                                   {:id           :ex/brian
+                                    :type         :ex/User
+                                    :schema/name  "Brian"
+                                    :ex/favNums   [11 17 31]
+                                    :ex/luckyNums [13 18 11]}})]
           (is (= {:status 400,
                   :error :shacl/violation,
                   :report
@@ -551,63 +529,54 @@
                          :ex/p1       [11 17]
                          :ex/p2       [18]}})
 
-              db-fail1 (try
-                         @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id          :ex/alice
-                             :type        :ex/User
-                             :schema/name "Alice"
-                             :ex/p1       [11 17]
-                             :ex/p2       17}})
-                         (catch Exception e e))
+              db-fail1 @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id          :ex/alice
+                            :type        :ex/User
+                            :schema/name "Alice"
+                            :ex/p1       [11 17]
+                            :ex/p2       17}})
 
-              db-fail2 (try
-                         @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id          :ex/alice
-                             :type        :ex/User
-                             :schema/name "Alice"
-                             :ex/p1       [11 17]
-                             :ex/p2       ["18" "19"]}})
-                         (catch Exception e e))
+              db-fail2 @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id          :ex/alice
+                            :type        :ex/User
+                            :schema/name "Alice"
+                            :ex/p1       [11 17]
+                            :ex/p2       ["18" "19"]}})
 
-              db-fail3 (try
-                         @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id          :ex/alice
-                             :type        :ex/User
-                             :schema/name "Alice"
-                             :ex/p1       [12 17]
-                             :ex/p2       [10 18]}})
-                         (catch Exception e e))
+              db-fail3 @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id          :ex/alice
+                            :type        :ex/User
+                            :schema/name "Alice"
+                            :ex/p1       [12 17]
+                            :ex/p2       [10 18]}})
 
-              db-fail4 (try
-                         @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id          :ex/alice
-                             :type        :ex/User
-                             :schema/name "Alice"
-                             :ex/p1       [11 17]
-                             :ex/p2       [12 16]}})
-                         (catch Exception e e))
-              db-iris  (try @(fluree/stage
-                              db
-                              {"@context" ["https://ns.flur.ee" context]
-                               "insert"
-                               {:id          :ex/alice
-                                :type        :ex/User
-                                :schema/name "Alice"
-                                :ex/p1       :ex/brian
-                                :ex/p2       :ex/john}})
-                            (catch Exception e e))]
+              db-fail4 @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id          :ex/alice
+                            :type        :ex/User
+                            :schema/name "Alice"
+                            :ex/p1       [11 17]
+                            :ex/p2       [12 16]}})
+              db-iris  @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id          :ex/alice
+                            :type        :ex/User
+                            :schema/name "Alice"
+                            :ex/p1       :ex/brian
+                            :ex/p2       :ex/john}})]
           (is (= {:status 400,
                   :error :shacl/violation,
                   :report
@@ -720,53 +689,45 @@
                          :ex/p1       [11 17]
                          :ex/p2       17}})
 
-              db-fail1 (try
-                         @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id          :ex/alice
-                             :type        :ex/User
-                             :schema/name "Alice"
-                             :ex/p1       [11 17]
-                             :ex/p2       10}})
-                         (catch Exception e e))
+              db-fail1 @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id          :ex/alice
+                            :type        :ex/User
+                            :schema/name "Alice"
+                            :ex/p1       [11 17]
+                            :ex/p2       10}})
 
-              db-fail2 (try
-                         @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id          :ex/alice
-                             :type        :ex/User
-                             :schema/name "Alice"
-                             :ex/p1       [11 17]
-                             :ex/p2       ["17" "19"]}})
-                         (catch Exception e e))
+              db-fail2 @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id          :ex/alice
+                            :type        :ex/User
+                            :schema/name "Alice"
+                            :ex/p1       [11 17]
+                            :ex/p2       ["17" "19"]}})
 
-              db-fail3 (try
-                         @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id          :ex/alice
-                             :type        :ex/User
-                             :schema/name "Alice"
-                             :ex/p1       [12 17]
-                             :ex/p2       [10 17]}})
-                         (catch Exception e e))
+              db-fail3 @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id          :ex/alice
+                            :type        :ex/User
+                            :schema/name "Alice"
+                            :ex/p1       [12 17]
+                            :ex/p2       [10 17]}})
 
-              db-fail4 (try
-                         @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id          :ex/alice
-                             :type        :ex/User
-                             :schema/name "Alice"
-                             :ex/p1       [11 17]
-                             :ex/p2       [12 16]}})
-                         (catch Exception e e))]
+              db-fail4 @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id          :ex/alice
+                            :type        :ex/User
+                            :schema/name "Alice"
+                            :ex/p1       [11 17]
+                            :ex/p2       [12 16]}})]
 
           (is (= {:status 400,
                   :error :shacl/violation,
@@ -862,22 +823,20 @@
                              {:id         :ex/john
                               :type       :ex/User
                               :schema/age 2}})
-              db-too-low  (try @(fluree/stage
-                                 db
-                                 {"@context" ["https://ns.flur.ee" context]
-                                  "insert"
-                                  {:id         :ex/john
-                                   :type       :ex/User
-                                   :schema/age 1}})
-                               (catch Exception e e))
-              db-too-high (try @(fluree/stage
-                                 db
-                                 {"@context" ["https://ns.flur.ee" context]
-                                  "insert"
-                                  {:id         :ex/john
-                                   :type       :ex/User
-                                   :schema/age 100}})
-                               (catch Exception e e))]
+              db-too-low  @(fluree/stage
+                             db
+                             {"@context" ["https://ns.flur.ee" context]
+                              "insert"
+                              {:id         :ex/john
+                               :type       :ex/User
+                               :schema/age 1}})
+              db-too-high @(fluree/stage
+                             db
+                             {"@context" ["https://ns.flur.ee" context]
+                              "insert"
+                              {:id         :ex/john
+                               :type       :ex/User
+                               :schema/age 100}})]
           (is (= {:status 400,
                   :error :shacl/violation,
                   :report
@@ -994,22 +953,20 @@
                              :sh/targetClass :ex/User
                              :sh/property    [{:sh/path         :schema/age
                                                :sh/minExclusive 0}]}})
-              db-subj-id (try @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id         :ex/alice
-                                  :type       :ex/User
-                                  :schema/age :ex/brian}})
-                              (catch Exception e e))
-              db-string  (try @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id         :ex/alice
-                                  :type       :ex/User
-                                  :schema/age "10"}})
-                              (catch Exception e e))]
+              db-subj-id @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id         :ex/alice
+                              :type       :ex/User
+                              :schema/age :ex/brian}})
+              db-string  @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id         :ex/alice
+                              :type       :ex/User
+                              :schema/age "10"}})]
           (is (= {:status 400,
                   :error :shacl/violation,
                   :report
@@ -1072,42 +1029,34 @@
                             :type        :ex/User
                             :schema/name 12345}})
 
-          db-too-short-str    (try
-                                @(fluree/stage
-                                  db
-                                  {"@context" ["https://ns.flur.ee" context]
-                                   "insert"
-                                   {:id          :ex/al
-                                    :type        :ex/User
-                                    :schema/name "Al"}})
-                                (catch Exception e e))
-          db-too-long-str     (try
-                                @(fluree/stage
-                                  db
-                                  {"@context" ["https://ns.flur.ee" context]
-                                   "insert"
-                                   {:id          :ex/jean-claude
-                                    :type        :ex/User
-                                    :schema/name "Jean-Claude"}})
-                                (catch Exception e e))
-          db-too-long-non-str (try
-                                @(fluree/stage
-                                  db
-                                  {"@context" ["https://ns.flur.ee" context]
-                                   "insert"
-                                   {:id          :ex/john
-                                    :type        :ex/User
-                                    :schema/name 12345678910}})
-                                (catch Exception e e))
-          db-ref-value        (try
-                                @(fluree/stage
-                                  db
-                                  {"@context" ["https://ns.flur.ee" context]
-                                   "insert"
-                                   {:id          :ex/john
-                                    :type        :ex/User
-                                    :schema/name :ex/ref}})
-                                (catch Exception e e))]
+          db-too-short-str    @(fluree/stage
+                                 db
+                                 {"@context" ["https://ns.flur.ee" context]
+                                  "insert"
+                                  {:id          :ex/al
+                                   :type        :ex/User
+                                   :schema/name "Al"}})
+          db-too-long-str     @(fluree/stage
+                                 db
+                                 {"@context" ["https://ns.flur.ee" context]
+                                  "insert"
+                                  {:id          :ex/jean-claude
+                                   :type        :ex/User
+                                   :schema/name "Jean-Claude"}})
+          db-too-long-non-str @(fluree/stage
+                                 db
+                                 {"@context" ["https://ns.flur.ee" context]
+                                  "insert"
+                                  {:id          :ex/john
+                                   :type        :ex/User
+                                   :schema/name 12345678910}})
+          db-ref-value        @(fluree/stage
+                                 db
+                                 {"@context" ["https://ns.flur.ee" context]
+                                  "insert"
+                                  {:id          :ex/john
+                                   :type        :ex/User
+                                   :schema/name :ex/ref}})]
       (is (= {:status 400,
               :error :shacl/violation,
               :report
@@ -1204,33 +1153,27 @@
                                     {:id           :ex/john
                                      :type         :ex/User
                                      :ex/birthYear 1984}})
-          db-wrong-case-greeting (try
-                                   @(fluree/stage
-                                     db
-                                     {"@context" ["https://ns.flur.ee" context]
-                                      "insert"
-                                      {:id          :ex/alice
-                                       :type        :ex/User
-                                       :ex/greeting "HELLO\nWORLD!"}})
-                                   (catch Exception e e))
-          db-wrong-birth-year    (try
-                                   @(fluree/stage
-                                     db
-                                     {"@context" ["https://ns.flur.ee" context]
-                                      "insert"
-                                      {:id           :ex/alice
-                                       :type         :ex/User
-                                       :ex/birthYear 1776}})
-                                   (catch Exception e e))
-          db-ref-value           (try
-                                   @(fluree/stage
-                                     db
-                                     {"@context" ["https://ns.flur.ee" context]
-                                      "insert"
-                                      {:id           :ex/john
-                                       :type         :ex/User
-                                       :ex/birthYear :ex/ref}})
-                                   (catch Exception e e))]
+          db-wrong-case-greeting @(fluree/stage
+                                    db
+                                    {"@context" ["https://ns.flur.ee" context]
+                                     "insert"
+                                     {:id          :ex/alice
+                                      :type        :ex/User
+                                      :ex/greeting "HELLO\nWORLD!"}})
+          db-wrong-birth-year    @(fluree/stage
+                                    db
+                                    {"@context" ["https://ns.flur.ee" context]
+                                     "insert"
+                                     {:id           :ex/alice
+                                      :type         :ex/User
+                                      :ex/birthYear 1776}})
+          db-ref-value           @(fluree/stage
+                                    db
+                                    {"@context" ["https://ns.flur.ee" context]
+                                     "insert"
+                                     {:id           :ex/john
+                                      :type         :ex/User
+                                      :ex/birthYear :ex/ref}})]
       (is (= {:status 400,
               :error :shacl/violation,
               :report
