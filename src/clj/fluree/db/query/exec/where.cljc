@@ -1,6 +1,6 @@
 (ns fluree.db.query.exec.where
   (:require [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async :refer [go]]
+            [clojure.core.async :as async :refer [>! go]]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.index :as index]
@@ -483,6 +483,17 @@
              async/merge)
         (match-class active-graph fuel-tracker solution triple filters error-ch)))
     (go)))
+
+(defmethod match-pattern :filter
+  [_ds _fuel-tracker solution pattern _filters error-ch]
+  (go
+    (try*
+      (let [f (pattern-data pattern)]
+        (when (f solution)
+          solution))
+      (catch* e
+              (log/error e "Error applying filter")
+              (>! error-ch e)))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the

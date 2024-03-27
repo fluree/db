@@ -345,6 +345,14 @@
   [m _vars context]
   (parse-node-map m context))
 
+(defmethod parse-pattern :filter
+  [[_ & codes] _vars _context]
+  (let [f (->> codes
+               (map parse-code)
+               (map eval/compile)
+               (apply every-pred))]
+    [(where/->pattern :filter f)]))
+
 (defmethod parse-pattern :union
   [[_ & unions] vars context]
   (let [parsed (mapv (fn [clause]
