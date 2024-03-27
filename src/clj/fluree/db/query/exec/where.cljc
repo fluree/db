@@ -179,6 +179,12 @@
     (key pattern)
     :tuple))
 
+(defn pattern-data
+  [pattern]
+  (if (map-entry? pattern)
+    (val pattern)
+    pattern))
+
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
    `db` that are compatible with the initial solution `solution` and matches the
@@ -378,12 +384,12 @@
       not-empty))
 
 (defn match-tuple
-  [db fuel-tracker solution pattern filters error-ch]
+  [db fuel-tracker solution tuple filters error-ch]
   (let [matched-ch (async/chan 2 (comp cat
                                        (map (fn [flake]
-                                              (match-flake solution pattern db flake)))))
+                                              (match-flake solution tuple db flake)))))
         db-alias   (:alias db)
-        triple     (assign-matched-values pattern solution filters)]
+        triple     (assign-matched-values tuple solution filters)]
     (if-let [[s p o] (compute-sids db triple)]
       (let [pid (get-sid p db-alias)]
         (if-let [props (and pid (get-equivalent-properties db pid))]
@@ -405,14 +411,15 @@
 
 (defmethod match-pattern :tuple
   [ds fuel-tracker solution pattern filters error-ch]
-  (if-let [active-graph (dataset/active ds)]
-    (if (sequential? active-graph)
-      (->> active-graph
-           (map (fn [graph]
-                  (match-tuple graph fuel-tracker solution pattern filters error-ch)))
-           async/merge)
-      (match-tuple active-graph fuel-tracker solution pattern filters error-ch))
-    (go)))
+  (let [tuple (pattern-data pattern)]
+    (if-let [active-graph (dataset/active ds)]
+      (if (sequential? active-graph)
+        (->> active-graph
+             (map (fn [graph]
+                    (match-tuple graph fuel-tracker solution tuple filters error-ch)))
+             async/merge)
+        (match-tuple active-graph fuel-tracker solution tuple filters error-ch))
+      (go))))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
@@ -467,7 +474,7 @@
 (defmethod match-pattern :class
   [ds fuel-tracker solution pattern filters error-ch]
   (if-let [active-graph (dataset/active ds)]
-    (let [triple (val pattern)]
+    (let [triple (pattern-data pattern)]
       (log/info "active graph:" active-graph)
       (if (sequential? active-graph)
         (->> active-graph
@@ -510,7 +517,7 @@
 
 (defmethod match-pattern :graph
   [ds fuel-tracker solution pattern _filters error-ch]
-  (let [[g clause] (val pattern)]
+  (let [[g clause] (pattern-data pattern)]
     (if-let [v (::var g)]
       (if-let [v-match (get solution v)]
         (let [alias (or (::iri v-match)
@@ -530,7 +537,7 @@
 
 (defmethod match-pattern :union
   [db fuel-tracker solution pattern _ error-ch]
-  (let [clauses   (val pattern)
+  (let [clauses   (pattern-data pattern)
         clause-ch (async/to-chan! clauses)
         out-ch    (async/chan 2)]
     (async/pipeline-async 2
@@ -573,7 +580,7 @@
 
 (defmethod match-pattern :optional
   [db fuel-tracker solution pattern _ error-ch]
-  (let [clause (val pattern)
+  (let [clause (pattern-data pattern)
         opt-ch (async/chan 2 (with-default solution))]
     (-> (match-clause db fuel-tracker solution clause error-ch)
         (async/pipe opt-ch))))
@@ -588,7 +595,7 @@
 
 (defmethod match-pattern :bind
   [_db _fuel-tracker solution pattern _ error-ch]
-  (let [bind (val pattern)]
+  (let [bind (pattern-data pattern)]
     (go
       (let [result
             (reduce (fn [solution* b]
