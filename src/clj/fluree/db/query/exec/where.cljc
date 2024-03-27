@@ -1,6 +1,6 @@
 (ns fluree.db.query.exec.where
   (:require [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async :refer [go take! put!]]
+            [clojure.core.async :as async :refer [go]]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.index :as index]
@@ -68,13 +68,6 @@
           (matched-sid? mch))
     const/iri-anyURI
     (::datatype-iri mch)))
-
-(defn get-datatype-sid
-  [mch db-alias]
-  (if (or (matched-iri? mch)
-          (matched-sid? mch))
-    const/$xsd:anyURI
-    (get-in mch [::datatype-sids db-alias])))
 
 (defn matched?
   [match]
@@ -296,7 +289,7 @@
   ([db fuel-tracker error-ch components]
    (resolve-flake-range db fuel-tracker nil error-ch components))
 
-  ([{:keys [alias conn t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
+  ([{:keys [alias t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
    (let [s    (get-sid s-mch alias)
          s-fn (::fn s-mch)
          p    (get-sid p-mch alias)
