@@ -36,8 +36,17 @@
   [where-patterns]
   (reduce
     (fn [acc pattern]
-      (if (= :class (first pattern))
-        (conj acc (extract-pattern (second pattern)))
+      (case (first pattern)
+        :class (conj acc (extract-pattern (second pattern)))
+        :union (reduce
+                 (fn [acc* union-pattern]
+                   (into acc*
+                         (extract-patterns (::exec-where/patterns union-pattern))))
+                 acc
+                 (second pattern))
+        :optional (into acc (extract-patterns (::exec-where/patterns pattern)))
+        :bind acc ;; bind can only use patterns/vars already established, nothing to add
+        ;; else
         (conj acc (extract-pattern pattern))))
     #{}
     where-patterns))
