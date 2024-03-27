@@ -1374,8 +1374,17 @@
                                    (display less-than) " values " (str/join ", " (sort expects))))])))
 
 ;; logical constraints
-(defmethod validate-constraint const/sh_not [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_not [{:keys [shape subject display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (loop [[p-shape & r] (get shape const/sh_not)
+         results []]
+    (if p-shape
+      (if-let [results* (validate-property-shape (assoc v-ctx :shape p-shape) focus-flakes)]
+        (recur r results)
+        (recur r (conj results (assoc (base-result v-ctx constraint)
+                                      :value (display subject)
+                                      :message (str (display subject) " conforms to shape " (display (get p-shape const/$id)))))))
+      (not-empty results))))
 (defmethod validate-constraint const/sh_and [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
 (defmethod validate-constraint const/sh_or [v-ctx constraint focus-flakes]
@@ -1602,7 +1611,8 @@
 
 (defn explain-result
   [{:keys [subject constraint shape path message]}]
-  (str "Subject " subject " path " path " violates constraint " constraint " of shape " shape " - " message "."))
+  (str "Subject " subject (when path (str "  path " path))
+       " violates constraint " constraint " of shape " shape " - " message "."))
 
 (defn throw-shacl-violation
   [{ns-codes :namespace-codes} context results]
