@@ -144,7 +144,6 @@
                  qry-customer)
               "Rule warning should be logged and no inference should be made."))))))
 
-
 (deftest ^:integration owl-restriction-some-values-from,
   (testing "owl:Restriction owl:someValuesFrom test - cls-svf1, cls-svf2"
     (let [conn    (test-utils/create-conn)
@@ -157,6 +156,8 @@
                                                "@type" "ex:TextileFactory"}
                                               {"@id"   "ex:winery2"
                                                "@type" "ex:Winery"}
+                                              {"@id"   "ex:maybe-winery"
+                                               "@type" "ex:MaybeWinery"}
                                               {"@id"         "ex:maybe-a-wine"
                                                "@type"       "ex:Product"
                                                "ex:hasMaker" [{"@id" "ex:winery1"}
@@ -171,6 +172,7 @@
                                               {"@id"         "ex:not-a-wine-1"
                                                "@type"       "ex:Product"
                                                "ex:hasMaker" {"@id" "ex:textile-company"}}]})]
+
       (testing "Testing single owl:Restriction someValuesFrom for a property value"
         (let [db-some-val @(fluree/reason db-base :owl2rl
                                           [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
@@ -188,6 +190,26 @@
           (is (= #{"ex:maybe-a-wine" "ex:a-wine-1" "ex:a-wine-2"}
                  (set qry-wines))
               "only one hasMaker must be a winery to qualify as an ex:Wine")))
+
+      (testing "Testing single owl:Restriction someValuesFrom with owl:oneOf value"
+        (let [db-some-val @(fluree/reason db-base :owl2rl
+                                          [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                   "ex"  "http://example.org/"}
+                                            "@id"                 "ex:Wine"
+                                            "@type"               ["owl:Class"]
+                                            "owl:equivalentClass" [{"@type"              "owl:Restriction"
+                                                                    "owl:onProperty"     {"@id" "ex:hasMaker"}
+                                                                    "owl:someValuesFrom" {"@type"     "owl:Class"
+                                                                                          "owl:oneOf" {"@list" [{"@id" "ex:Winery"}
+                                                                                                                {"@id" "ex:TextileFactory"}]}}}]}])
+              qry-wines   @(fluree/query db-some-val
+                                         {:context {"ex" "http://example.org/"}
+                                          :select  "?s"
+                                          :where   {"@id"   "?s"
+                                                    "@type" "ex:Wine"}})]
+          (is (= #{"ex:maybe-a-wine" "ex:a-wine-1" "ex:a-wine-2" "ex:not-a-wine-1"}
+                 (set qry-wines))
+              "hasMaker ref can no be of either ex:Winery or ex:TextileFactory to qualify as an ex:Wine")))
 
       (testing "Testing single owl:Restriction allValuesFrom for a property value"
         (let [db-all-val @(fluree/reason db-base :owl2rl

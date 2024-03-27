@@ -398,38 +398,6 @@
     []
     restrictions))
 
-(defn equiv-some-values
-  "Handles rules cls-svf1, cls-svf2"
-  [rule-class restrictions]
-  (reduce
-    (fn [acc restriction]
-      (let [property (util/get-first-id restriction $owl-onProperty)
-            some-val (util/get-first-id restriction $owl-someValuesFrom)
-            rule     (if (= $owl-Thing some-val)
-                       ;; special case where someValuesFrom is owl:Thing, means
-                       ;; everything with property should be in the class (cls-svf2)
-                       {"where"  {"@id"    "?x"
-                                  property nil}
-                        "insert" {"@id"   "?x"
-                                  "@type" rule-class}}
-                       ;; normal case where someValuesFrom is a class (cls-svf1)
-                       {"where"  [{"@id"    "?x"
-                                   property "?y"}
-                                  {"@id"   "?y"
-                                   "@type" some-val}]
-                        "insert" {"@id"   "?x"
-                                  "@type" rule-class}})]
-        (if (and property some-val)
-          (conj acc [(str rule-class "(owl:someValuesFrom-" property ")") rule])
-          (do (log/warn "owl:Restriction for class" rule-class
-                        "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
-                        "and owl:someValuesFrom is:" (util/get-first restriction $owl-someValuesFrom)
-                        ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
-                        "someValuesFrom must exist and must be an IRI.")
-              acc))))
-    []
-    restrictions))
-
 (defn has-value-condition
   "Used to build where statement for owl:hasValue restriction when the
   parent clause is *not* an owl:equivalentClass, and therefore is part of a more complex
@@ -449,6 +417,59 @@
                    property one-val})))
     []
     has-value-statements))
+
+(defn one-of-condition
+  "Used to build union clause for owl:oneOf class.
+
+  Assume just a single one-of-statement is passed in, not a list."
+  [binding-var one-of-statement]
+  (let [classes (-> one-of-statement
+                    (get $owl-oneOf)
+                    get-all-ids)]
+    (reduce (fn [acc c]
+              (conj acc {"@id"   binding-var
+                         "@type" c}))
+            ["union"]
+            classes)))
+
+(defn equiv-some-values
+  "Handles rules cls-svf1, cls-svf2"
+  [rule-class restrictions]
+  (reduce
+    (fn [acc restriction]
+      (let [property     (util/get-first-id restriction $owl-onProperty)
+            {:keys [classes one-of]} (group-by equiv-class-type (get restriction $owl-someValuesFrom))
+            some-val     (when classes
+                           (-> classes first :id))
+            p-val-clause (if some-val
+                           {"@id"   "?y"
+                            "@type" some-val}
+                           (if one-of
+                             (one-of-condition "?y" (first one-of))
+                             nil))
+            rule         (if (= $owl-Thing some-val)
+                           ;; special case where someValuesFrom is owl:Thing, means
+                           ;; everything with property should be in the class (cls-svf2)
+                           {"where"  {"@id"    "?x"
+                                      property nil}
+                            "insert" {"@id"   "?x"
+                                      "@type" rule-class}}
+                           ;; normal case where someValuesFrom is a class (cls-svf1)
+                           {"where"  [{"@id"    "?x"
+                                       property "?y"}
+                                      p-val-clause]
+                            "insert" {"@id"   "?x"
+                                      "@type" rule-class}})]
+        (if (and property p-val-clause)
+          (conj acc [(str rule-class "(owl:someValuesFrom-" property ")") rule])
+          (do (log/warn "owl:Restriction for class" rule-class
+                        "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
+                        "and owl:someValuesFrom is:" (util/get-first restriction $owl-someValuesFrom)
+                        ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
+                        "someValuesFrom must exist and must be a Class.")
+              acc))))
+    []
+    restrictions))
 
 (defn equiv-intersection-of
   "Handles rules cls-int1, cls-int2"
@@ -539,16 +560,16 @@
       (let [class-list (-> one-of-statement
                            (get $owl-oneOf)
                            get-all-ids)
-            ;; it could be more efficient to have a single rule with optional clauses instead of a separate rule for each item
-            rules      (map
-                         (fn [c]
-                           (let [rule {"where"  {"@id"   "?x"
-                                                 "@type" c}
-                                       "insert" {"@id"   "?x"
-                                                 "@type" rule-class}}]
-                             [(str rule-class "(owl:oneOf-" c ")") rule]))
-                         class-list)]
-        (concat acc rules)))
+            union      (reduce (fn [acc c]
+                                 (conj acc
+                                       {"@id"   "?x"
+                                        "@type" c}))
+                               ["union"]
+                               class-list)
+            rule       {"where"  [union]
+                        "insert" {"@id"   "?x"
+                                  "@type" rule-class}}]
+        (conj acc [(str rule-class "(owl:oneOf)") rule])))
     []
     one-of-statements))
 
