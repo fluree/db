@@ -164,6 +164,11 @@
   [x]
   (instance? SID x))
 
+(defn bnode?
+  [x]
+  (and (sid? x)
+       (= (get-namespace x) (get default-namespaces "_:"))))
+
 (def min-sid
   (->sid 0 ""))
 

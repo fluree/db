@@ -1119,8 +1119,30 @@
                                 (->> values
                                      (map (comp display first))
                                      (str/join ",")))))])))
-(defmethod validate-constraint const/sh_nodeKind [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_nodeKind [{:keys [shape display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint path const/sh_path} shape
+
+        [nodekind] expect
+        result     (-> (base-result v-ctx constraint)
+                       (assoc :path (mapv display path)
+                              :expect (display nodekind)))]
+    (->> focus-flakes
+         (remove (fn [[_ _ o]]
+                   (let [iri?     (and (iri/sid? o) (not (iri/bnode? o)))
+                         bnode?   (iri/bnode? o)
+                         literal? (not (iri/sid? o))]
+                     (condp = nodekind
+                       const/sh_BlankNode          bnode?
+                       const/sh_IRI                iri?
+                       const/sh_BlankNodeOrIRI     (or iri? bnode?)
+                       const/sh_IRIOrLiteral       (or iri? literal?)
+                       const/sh_BlankNodeOrLiteral (or bnode? literal?)))))
+         (mapv (fn [[_ _ o]]
+                 (let [value (if (iri/sid? o) (display o) o)]
+                   (assoc result
+                          :value value
+                          :message (str "value " value " is is not of kind " (display nodekind)))))))))
 
 ;; cardinality constraints
 (defmethod validate-constraint const/sh_minCount [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
@@ -1587,8 +1609,20 @@
                              :expect (mapv display allowed)
                              :message (str "disallowed path " (display path) " with values " (str/join "," values))))))
               not-allowed)))))
-(defmethod validate-constraint const/sh_hasValue [v-ctx constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint)))
+(defmethod validate-constraint const/sh_hasValue [{:keys [shape display] :as v-ctx} constraint focus-flakes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint path const/sh_path} shape
+
+        [term] expect]
+    (when-not (some #(= term (flake/o %)) focus-flakes)
+      (let [value (mapv (fn [[_ _ o]] (if (iri/sid? o) (display o) o))
+                        focus-flakes)
+            expect (if (iri/sid? term) (display term) term)]
+        [(-> (base-result v-ctx constraint)
+             (assoc :path (mapv display path)
+                    :expect expect
+                    :value value
+                    :message "at least one value of " value " must be " expect))]))))
 (defmethod validate-constraint const/sh_in [{:keys [shape subject display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
   (let [{expect constraint path const/sh_path} shape
