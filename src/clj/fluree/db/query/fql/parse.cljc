@@ -193,13 +193,9 @@
   [clause vars context]
   (let [clause*  (util/sequential clause)
         patterns (->> clause*
-                      (remove filter-pattern?)
                       (mapcat (fn [pattern]
-                                (parse-pattern pattern vars context))))
-        filters  (->> clause*
-                      (filter filter-pattern?)
-                      (parse-filter-maps vars))]
-    (where/->where-clause patterns filters)))
+                                (parse-pattern pattern vars context))))]
+    (where/->where-clause patterns)))
 
 (defn expand-keys
   [m context]

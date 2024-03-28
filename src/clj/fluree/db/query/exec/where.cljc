@@ -164,14 +164,9 @@
 
 (defn ->where-clause
   "Build a pattern that matches all the patterns in the supplied `patterns`
-  collection and filters any matches for variables appearing as a key in the
-  supplied `filters` map with the filter specification found in the value of the
-  filters map for that variable, if the `filters` map is provided."
-  ([patterns]
-   {::patterns patterns})
-  ([patterns filters]
-   (cond-> (->where-clause patterns)
-     (seq filters) (assoc ::filters filters))))
+  collection."
+  [patterns]
+  {::patterns patterns})
 
 (defn pattern-type
   [pattern]
@@ -189,32 +184,21 @@
   "Return a channel that will contain all pattern match solutions from flakes in
    `db` that are compatible with the initial solution `solution` and matches the
    additional where-clause pattern `pattern`."
-  (fn [_ds _fuel-tracker _solution pattern _filters _error-ch]
+  (fn [_ds _fuel-tracker _solution pattern _error-ch]
     (pattern-type pattern)))
 
 (defn assign-matched-values
   "Assigns the value of any variables within the supplied `triple-pattern` that
   were previously matched in the supplied solution map `solution` to their
-  values from `solution`. If a variable in `triple-pattern` does not have a
-  match in `solution`, but does appear as a key in the filter specification map
-  `filters`, the variable's match filter function within `triple-pattern` is set
-  to the value associated with that variable from the `filter` specification
-  map."
-  ([triple-pattern solution]
-   (assign-matched-values triple-pattern solution nil))
-  ([triple-pattern solution filters]
-   (mapv (fn [component]
-           (if-let [variable (::var component)]
-             (if-let [match (get solution variable)]
-               match
-               (let [filter-fn (some->> (get filters variable)
-                                        (map ::fn)
-                                        (map (fn [f]
-                                               (partial f solution)))
-                                        (apply every-pred))]
-                 (assoc component ::fn filter-fn)))
-             component))
-         triple-pattern)))
+  values from `solution`."
+  [triple-pattern solution]
+  (mapv (fn [component]
+          (if-let [variable (::var component)]
+            (if-let [match (get solution variable)]
+              match
+              component)
+            component))
+        triple-pattern))
 
 (defn match-subject
   "Matches the subject of the supplied `flake` to the triple subject pattern
@@ -384,12 +368,12 @@
       not-empty))
 
 (defn match-tuple
-  [db fuel-tracker solution tuple filters error-ch]
+  [db fuel-tracker solution tuple error-ch]
   (let [matched-ch (async/chan 2 (comp cat
                                        (map (fn [flake]
                                               (match-flake solution tuple db flake)))))
         db-alias   (:alias db)
-        triple     (assign-matched-values tuple solution filters)]
+        triple     (assign-matched-values tuple solution)]
     (if-let [[s p o] (compute-sids db triple)]
       (let [pid (get-sid p db-alias)]
         (if-let [props (and pid (get-equivalent-properties db pid))]
@@ -410,15 +394,15 @@
     matched-ch))
 
 (defmethod match-pattern :tuple
-  [ds fuel-tracker solution pattern filters error-ch]
+  [ds fuel-tracker solution pattern error-ch]
   (let [tuple (pattern-data pattern)]
     (if-let [active-graph (dataset/active ds)]
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [graph]
-                    (match-tuple graph fuel-tracker solution tuple filters error-ch)))
+                    (match-tuple graph fuel-tracker solution tuple error-ch)))
              async/merge)
-        (match-tuple active-graph fuel-tracker solution tuple filters error-ch))
+        (match-tuple active-graph fuel-tracker solution tuple error-ch))
       (go))))
 
 (defn with-distinct-subjects
@@ -446,13 +430,13 @@
          (rf result))))))
 
 (defn match-class
-  [db fuel-tracker solution triple filters error-ch]
+  [db fuel-tracker solution triple error-ch]
   (let [matched-ch (async/chan 2 (comp cat
                                        (with-distinct-subjects)
                                        (map (fn [flake]
                                               (match-flake solution triple db flake)))))
         db-alias   (:alias db)
-        triple     (assign-matched-values triple solution filters)]
+        triple     (assign-matched-values triple solution)]
     (if-let [[s p o] (compute-sids db triple)]
       (let [cls        (get-sid o db-alias)
             sub-obj    (dissoc o ::sids ::iri)
@@ -472,20 +456,20 @@
     matched-ch))
 
 (defmethod match-pattern :class
-  [ds fuel-tracker solution pattern filters error-ch]
+  [ds fuel-tracker solution pattern error-ch]
   (if-let [active-graph (dataset/active ds)]
     (let [triple (pattern-data pattern)]
       (log/info "active graph:" active-graph)
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [graph]
-                    (match-class graph fuel-tracker solution triple filters error-ch)))
+                    (match-class graph fuel-tracker solution triple error-ch)))
              async/merge)
-        (match-class active-graph fuel-tracker solution triple filters error-ch)))
+        (match-class active-graph fuel-tracker solution triple error-ch)))
     (go)))
 
 (defmethod match-pattern :filter
-  [_ds _fuel-tracker solution pattern _filters error-ch]
+  [_ds _fuel-tracker solution pattern error-ch]
   (go
     (try*
       (let [f (pattern-data pattern)]
@@ -498,12 +482,12 @@
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
   solutions in `solution-ch` and also match the where-clause pattern `pattern`."
-  [ds fuel-tracker pattern filters error-ch solution-ch]
+  [ds fuel-tracker pattern error-ch solution-ch]
   (let [out-ch (async/chan 2)]
     (async/pipeline-async 2
                           out-ch
                           (fn [solution ch]
-                            (-> (match-pattern ds fuel-tracker solution pattern filters error-ch)
+                            (-> (match-pattern ds fuel-tracker solution pattern error-ch)
                                 (async/pipe ch)))
                           solution-ch)
     out-ch))
@@ -514,10 +498,9 @@
   parsed where clause collection `clause`."
   [ds fuel-tracker solution clause error-ch]
   (let [initial-ch (async/to-chan! [solution])
-        filters    (::filters clause)
         patterns   (::patterns clause)]
     (reduce (fn [solution-ch pattern]
-              (with-constraint ds fuel-tracker pattern filters error-ch solution-ch))
+              (with-constraint ds fuel-tracker pattern error-ch solution-ch))
             initial-ch patterns)))
 
 (defn match-alias
@@ -527,7 +510,7 @@
       (match-clause fuel-tracker solution clause error-ch)))
 
 (defmethod match-pattern :graph
-  [ds fuel-tracker solution pattern _filters error-ch]
+  [ds fuel-tracker solution pattern error-ch]
   (let [[g clause] (pattern-data pattern)]
     (if-let [v (::var g)]
       (if-let [v-match (get solution v)]
@@ -547,7 +530,7 @@
       (match-alias ds g fuel-tracker solution clause error-ch))))
 
 (defmethod match-pattern :union
-  [db fuel-tracker solution pattern _ error-ch]
+  [db fuel-tracker solution pattern error-ch]
   (let [clauses   (pattern-data pattern)
         clause-ch (async/to-chan! clauses)
         out-ch    (async/chan 2)]
@@ -590,7 +573,7 @@
                    rf))))))))
 
 (defmethod match-pattern :optional
-  [db fuel-tracker solution pattern _ error-ch]
+  [db fuel-tracker solution pattern error-ch]
   (let [clause (pattern-data pattern)
         opt-ch (async/chan 2 (with-default solution))]
     (-> (match-clause db fuel-tracker solution clause error-ch)
@@ -605,7 +588,7 @@
     (assoc solution var-name mch)))
 
 (defmethod match-pattern :bind
-  [_db _fuel-tracker solution pattern _ error-ch]
+  [_db _fuel-tracker solution pattern error-ch]
   (let [bind (pattern-data pattern)]
     (go
       (let [result

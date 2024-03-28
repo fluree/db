@@ -165,7 +165,10 @@
   [{:keys [where select vars] :as _parsed-query} db]
   (and (instance? SubgraphSelector select)
        ;;TODO, filtering not supported yet
-       (empty? (::where/filters where))
+       (->> (::where/patterns where)
+            (filter (fn [pattern]
+                      (= :filter (where/pattern-type pattern))))
+            empty?)
        ;;TODO: vars support not complete
        (empty? vars)
        (when-let [{select-var :subj} select]
