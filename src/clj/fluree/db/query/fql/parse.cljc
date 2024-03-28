@@ -108,13 +108,12 @@
   (let [non-assigned-vars (set/difference params vars)]
     (case (count non-assigned-vars)
       1 (first non-assigned-vars)
-      0 (throw (ex-info (str "Query filter function has no variable assigned to it, all parameters "
-                             "exist in the 'vars' map. Filter function params: " params ". "
-                             "Vars assigned in query: " vars ".")
+      0 (throw (ex-info (str "Variable filter function has no variable assigned to it, all parameters "
+                             "exist in the 'values' clause. Filter function params: " params ". "
+                             "Values assigned in query: " vars ".")
                         {:status 400
                          :error  :db/invalid-query}))
-      ;; else
-      (throw (ex-info (str "Vars used in a filter function are not included in the 'vars' map "
+      (throw (ex-info (str "Vars used in a filter function are not included in the 'values' clause "
                            "or as a binding. Should only be missing one var, but missing: " (vec non-assigned-vars) ".")
                       {:status 400
                        :error  :db/invalid-query})))))
@@ -127,13 +126,18 @@
 
 (defn parse-filter-function
   "Evals and returns filter function."
-  [fltr vars]
+  [fltr fltr-var vars]
   (let [code      (parse-code fltr)
         code-vars (or (not-empty (variables code))
                       (throw (ex-info (str "Filter function must contain a valid variable. Provided: " code)
                                       {:status 400 :error :db/invalid-query})))
         var-name  (find-filtered-var code-vars vars)]
-    (eval/compile-filter code var-name)))
+    (if (= var-name fltr-var)
+      (eval/compile-filter code var-name)
+      (throw (ex-info (str "Variable filter must only reference the variable bound in its value map: "
+                           fltr-var
+                           ". Provided:" code)
+                      {:status 400, :error :db/invalid-query})))))
 
 (defn parse-bind-function
   "Evals and returns bind function."
@@ -202,7 +206,9 @@
 (defn parse-variable-attributes
   [var attrs vars]
   (let [lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
-        filter-fn    (some-> attrs (get const/iri-filter) (parse-filter-function vars))]
+        filter-fn    (some-> attrs
+                             (get const/iri-filter)
+                             (parse-filter-function var vars))]
     (if-let [f (some->> [lang-matcher filter-fn]
                         (remove nil?)
                         not-empty
