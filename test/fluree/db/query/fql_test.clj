@@ -232,12 +232,14 @@
                      "insert"   [{"@id"        "ex:frank"
                                   "occupation" {"en" {"@value" "Ninja"}
                                                 "ja" "忍者"}}
-                                 {"@id"        "ex:bob"
-                                  "occupation" {"en" "Boss"
-                                                "fr" "Chef"}}
-                                 {"@id"        "ex:jack"
-                                  "occupation" {"en" {"@value" "Chef"}
-                                                "fr" {"@value" "Cuisinier"}}}]})]
+                                 {"@id"             "ex:bob"
+                                  "ex:nativeTongue" "en"
+                                  "occupation"      {"en" "Boss"
+                                                     "fr" "Chef"}}
+                                 {"@id"             "ex:jack"
+                                  "ex:nativeTongue" "fr"
+                                  "occupation"      {"en" {"@value" "Chef"}
+                                                     "fr" {"@value" "Cuisinier"}}}]})]
       (testing "with bound language tags"
         (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
                                       :select    [?job ?lang]
@@ -257,13 +259,24 @@
               "returns correctly filtered results")))
 
       (testing "filtering with value maps"
-        (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
-                                      :select    [?s]
-                                      :where     {"@id"           ?s
-                                                  "ex:occupation" {"@value"    "Chef"
-                                                                   "@language" "fr"}}})]
-          (is (= [["ex:bob"]] sut)
-              "returns correctly filtered results"))))))
+        (testing "with scalar language tag"
+          (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+                                        :select    [?s]
+                                        :where     {"@id"           ?s
+                                                    "ex:occupation" {"@value"    "Chef"
+                                                                     "@language" "fr"}}})]
+            (is (= [["ex:bob"]] sut)
+                "returns correctly filtered results")))
+
+        (testing "with variable language tag binding"
+          (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+                                        :select    [?s]
+                                        :where     {"@id"             ?s
+                                                    "ex:nativeTongue" ?lang
+                                                    "ex:occupation"   {"@value"    "Chef"
+                                                                       "@language" ?lang}}})]
+            (is (= [["ex:bob"]] sut)
+                "returns correctly filtered results")))))))
 
 (deftest ^:integration ^:pending datatype-test
   (let [conn   (test-utils/create-conn)
