@@ -107,6 +107,16 @@
                                                        :ex/favColor ?color}]
                                            [:filter "(not (bound ?color))"]]}))))
 
+    (testing "filtering bound variables"
+      (is (= ["Cam"]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '?name
+                                :where   '[{:type        :ex/User
+                                            :schema/name ?name}
+                                           [:bind ?nameLength "(strLen ?name)"]
+                                           [:filter "(> 4 ?nameLength)"]]}))))
+
     ;;TODO: simple-subject-crawl does not yet support filters.
     ;;these are being run as regular analytial queries
     (testing "simple-subject-crawl"
