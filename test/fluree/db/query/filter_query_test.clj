@@ -120,14 +120,16 @@
     (testing "value map filters"
       (is (= [["Brian" "Smith"]]
              @(fluree/query db {:context [test-utils/default-context
-                                          {:ex "http://example.org/ns/"}]
+                                          {:ex     "http://example.org/ns/"
+                                           :value  "@value"
+                                           :filter "@filter"}]
                                 :select  '[?name ?last]
                                 :where   '[{:type        :ex/User
-                                            :schema/age  {"@value"  ?age
-                                                          "@filter" "(> ?age 45)"}
+                                            :schema/age  {:value  ?age
+                                                          :filter "(> ?age 45)"}
                                             :schema/name ?name
-                                            :ex/last     {"@value" ?last
-                                                          "@filter" "(strEnds ?last \"ith\")"}}]}))))
+                                            :ex/last     {:value  ?last
+                                                          :filter "(strEnds ?last \"ith\")"}}]}))))
 
     ;;TODO: simple-subject-crawl does not yet support filters.
     ;;these are being run as regular analytial queries
