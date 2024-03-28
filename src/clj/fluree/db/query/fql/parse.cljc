@@ -159,26 +159,6 @@
   (fn [pattern _vars _context]
     (v/where-pattern-type pattern)))
 
-(defn filter-pattern?
-  [pattern]
-  (-> pattern v/where-pattern-type (= :filter)))
-
-(defn parse-filter-maps
-  [vars filters]
-  (let [vars (set vars)]
-    (->> filters
-         (mapcat rest)
-         flatten
-         (map (fn [fltr]
-                (parse-filter-function fltr vars)))
-         (reduce (fn [m fltr]
-                   (let [var-name (::where/var fltr)]
-                     (update m var-name (fn [var-fltrs]
-                                          (-> var-fltrs
-                                              (or [])
-                                              (conj fltr))))))
-                 {}))))
-
 (defn parse-bind-map
   [binds]
   (into {}
@@ -191,11 +171,11 @@
 
 (defn parse-where-clause
   [clause vars context]
-  (let [clause*  (util/sequential clause)
-        patterns (->> clause*
-                      (mapcat (fn [pattern]
-                                (parse-pattern pattern vars context))))]
-    (where/->where-clause patterns)))
+  (->> clause
+       util/sequential
+       (mapcat (fn [pattern]
+                 (parse-pattern pattern vars context)))
+       where/->where-clause))
 
 (defn expand-keys
   [m context]

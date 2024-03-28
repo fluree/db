@@ -166,7 +166,7 @@
   "Build a pattern that matches all the patterns in the supplied `patterns`
   collection."
   [patterns]
-  {::patterns patterns})
+  (vec patterns))
 
 (defn pattern-type
   [pattern]
@@ -497,11 +497,10 @@
   dataset `ds` extending from `solution` that also match all the patterns in the
   parsed where clause collection `clause`."
   [ds fuel-tracker solution clause error-ch]
-  (let [initial-ch (async/to-chan! [solution])
-        patterns   (::patterns clause)]
+  (let [initial-ch (async/to-chan! [solution])]
     (reduce (fn [solution-ch pattern]
               (with-constraint ds fuel-tracker pattern error-ch solution-ch))
-            initial-ch patterns)))
+            initial-ch clause)))
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
