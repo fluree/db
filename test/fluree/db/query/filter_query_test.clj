@@ -85,6 +85,18 @@
                                             :schema/name ?name}
                                            [:filter "(> ?age (/ (+ ?age 47) 2))"]]}))))
 
+    (testing "filtering for absence"
+      (is (= ["Brian" "David"]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '?name
+                                :where   '[{:id          ?s
+                                            :type        :ex/User
+                                            :schema/name ?name}
+                                           [:optional {:id          ?s
+                                                       :ex/favColor ?color}]
+                                           [:filter "(not (bound ?color))"]]}))))
+
     ;;TODO: simple-subject-crawl does not yet support filters.
     ;;these are being run as regular analytial queries
     (testing "simple-subject-crawl"
