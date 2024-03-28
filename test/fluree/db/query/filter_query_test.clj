@@ -55,6 +55,16 @@
                                             :schema/age  ?age
                                             :schema/name ?name}
                                            [:filter "(> ?age 45)"]]}))))
+    (testing "single filter, different vars"
+      (is (= [["Brian" "Smith"]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '[?name ?last]
+                                :where   '[{:type        :ex/User
+                                            :schema/age  ?age
+                                            :schema/name ?name
+                                            :ex/last     ?last}
+                                           [:filter "(and (> ?age 45) (strEnds ?last \"ith\"))"]]}))))
     (testing "multiple filters on same var"
       (is (= [["David" 46]]
              @(fluree/query db {:context [test-utils/default-context
