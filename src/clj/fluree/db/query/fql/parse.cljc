@@ -132,9 +132,8 @@
         code-vars (or (not-empty (variables code))
                       (throw (ex-info (str "Filter function must contain a valid variable. Provided: " code)
                                       {:status 400 :error :db/invalid-query})))
-        var-name  (find-filtered-var code-vars vars)
-        f         (eval/compile-filter code var-name)]
-    (where/->var-filter var-name f)))
+        var-name  (find-filtered-var code-vars vars)]
+    (eval/compile-filter code var-name)))
 
 (defn parse-bind-function
   "Evals and returns bind function."
@@ -193,6 +192,17 @@
       (where/->val-filter v matcher))
     (where/anonymous-value v)))
 
+(defn parse-variable-attributes
+  [var attrs vars]
+  (let [lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
+        filter-fn    (some-> attrs (get const/iri-filter) (parse-filter-function vars))]
+    (if-let [f (some->> [lang-matcher filter-fn]
+                        (remove nil?)
+                        not-empty
+                        (apply every-pred))]
+      (where/->var-filter var f)
+      (where/unmatched-var var))))
+
 (defn generate-subject-var
   "Generate a unique subject variable"
   []
@@ -244,12 +254,13 @@
     pattern))
 
 (defn parse-object-map
-  [s-mch p-mch o context]
+  [s-mch p-mch o vars context]
   (let [o* (expand-keys o context)]
     (if-let [v (get o* const/iri-value)]
-      ;; literal
       (let [attrs (dissoc o* const/iri-value)
-            o-mch (parse-value-attributes v attrs)]
+            o-mch (if-let [var (parse-var-name v)]
+                    (parse-variable-attributes var attrs vars)
+                    (parse-value-attributes v attrs))]
         [(flip-reverse-pattern [s-mch p-mch o-mch])])
       ;; ref
       (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
@@ -260,21 +271,21 @@
         ;; return a thunk wrapping the recursive call to preserve stack
         ;; space by delaying execution
         #(into [(flip-reverse-pattern [s-mch p-mch o-mch])]
-               (parse-statements o-mch o-attrs context))))))
+               (parse-statements o-mch o-attrs vars context))))))
 
 (defn parse-statement*
-  [s-mch p-mch o context]
+  [s-mch p-mch o vars context]
   (cond
     (v/variable? o)
     (let [o-mch (parse-variable o)]
       [(flip-reverse-pattern [s-mch p-mch o-mch])])
 
     (map? o)
-    (parse-object-map s-mch p-mch o context)
+    (parse-object-map s-mch p-mch o vars context)
 
     (sequential? o)
     #(mapcat (fn [o*]
-               (parse-statement s-mch p-mch o* context))
+               (parse-statement s-mch p-mch o* vars context))
              o)
 
     (type-pred-match? p-mch)
@@ -286,22 +297,22 @@
       [(flip-reverse-pattern [s-mch p-mch o-mch])])))
 
 (defn parse-statement
-  [s-mch p-mch o context]
-  (trampoline parse-statement* s-mch p-mch o context))
+  [s-mch p-mch o vars context]
+  (trampoline parse-statement* s-mch p-mch o vars context))
 
 (defn parse-statements*
-  [s-mch attrs context]
+  [s-mch attrs vars context]
   #(mapcat (fn [[p o]]
              (let [p-mch (parse-predicate p context)]
-               (parse-statement s-mch p-mch o context)))
+               (parse-statement s-mch p-mch o vars context)))
            attrs))
 
 (defn parse-statements
-  [s-mch attrs context]
-  (trampoline parse-statements* s-mch attrs context))
+  [s-mch attrs vars context]
+  (trampoline parse-statements* s-mch attrs vars context))
 
 (defn parse-id-map-pattern
-  [m context]
+  [m vars context]
   (let [s-mch (-> m
                   (get const/iri-id)
                   (parse-subject context))
@@ -309,17 +320,17 @@
     (if (empty? attrs)
       (let [o-mch (-> s-mch ::where/iri where/anonymous-value)]
         [[s-mch id-predicate-match o-mch]])
-      (parse-statements s-mch attrs context))))
+      (parse-statements s-mch attrs vars context))))
 
 (defn parse-node-map
-  [m context]
+  [m vars context]
   (-> m
       (with-id context)
-      (parse-id-map-pattern context)))
+      (parse-id-map-pattern vars context)))
 
 (defmethod parse-pattern :node
-  [m _vars context]
-  (parse-node-map m context))
+  [m vars context]
+  (parse-node-map m vars context))
 
 (defmethod parse-pattern :filter
   [[_ & codes] _vars _context]
