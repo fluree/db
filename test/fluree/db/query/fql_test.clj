@@ -218,8 +218,7 @@
         (is (= [["The Hitchhiker's Guide to the Galaxy"]]
                test-subject))))))
 
-;; TODO: for some reason the last test in this suite isn't passing
-(deftest ^:pending language-test
+(deftest language-test
   (testing "Querying ledgers loaded with language-tagged strings"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "jobs")
@@ -233,13 +232,15 @@
                                   "occupation" {"en" {"@value" "Ninja"}
                                                 "ja" "忍者"}}
                                  {"@id"             "ex:bob"
-                                  "ex:nativeTongue" "en"
-                                  "occupation"      {"en" "Boss"
-                                                     "fr" "Chef"}}
-                                 {"@id"             "ex:jack"
                                   "ex:nativeTongue" "fr"
+                                  "occupation"      {"en" "Boss"
+                                                     "fr" "Chef"
+                                                     "de" "Bossin"}}
+                                 {"@id"             "ex:jack"
+                                  "ex:nativeTongue" "de"
                                   "occupation"      {"en" {"@value" "Chef"}
-                                                     "fr" {"@value" "Cuisinier"}}}]})]
+                                                     "fr" {"@value" "Cuisinier"}
+                                                     "de" {"@value" "Köchin"}}}]})]
       (testing "with bound language tags"
         (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
                                       :select    [?job ?lang]

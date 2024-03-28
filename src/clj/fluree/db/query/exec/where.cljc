@@ -202,11 +202,10 @@
   values from `solution`."
   [triple-pattern solution]
   (mapv (fn [component]
-          (if-let [variable (::var component)]
-            (if-let [match (get solution variable)]
+          (let [component* (assign-solution-filter component solution)]
+            (if-let [match (some->> component ::var (get solution))]
               match
-              (assign-solution-filter component solution))
-            component))
+              component*)))
         triple-pattern))
 
 (defn match-subject
