@@ -192,6 +192,13 @@
       (where/->val-filter v matcher))
     (where/anonymous-value v)))
 
+(defn every-binary-pred
+  [& fs]
+  (fn [x y]
+    (every? (fn [f]
+              (f x y))
+            fs)))
+
 (defn parse-variable-attributes
   [var attrs vars]
   (let [lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
@@ -199,7 +206,7 @@
     (if-let [f (some->> [lang-matcher filter-fn]
                         (remove nil?)
                         not-empty
-                        (apply every-pred))]
+                        (apply every-binary-pred))]
       (where/->var-filter var f)
       (where/unmatched-var var))))
 

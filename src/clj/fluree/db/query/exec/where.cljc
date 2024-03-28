@@ -143,8 +143,11 @@
   "Return a function that returns true if the language metadata of a matched
   pattern equals the supplied language code `lang`."
   [lang]
-  (fn [mch]
-    (-> mch ::meta :lang (= lang))))
+  (fn [soln mch]
+    (let [lang* (if (variable? lang)
+                  (-> soln (get lang) get-value)
+                  lang)]
+      (-> mch ::meta :lang (= lang*)))))
 
 (defn ->val-filter
   "Build a query function specification for the explicit value `val` out of the
@@ -187,6 +190,12 @@
   (fn [_ds _fuel-tracker _solution pattern _error-ch]
     (pattern-type pattern)))
 
+(defn assign-solution-filter
+  [component solution]
+  (if (::fn component)
+    (update component ::fn partial solution)
+    component))
+
 (defn assign-matched-values
   "Assigns the value of any variables within the supplied `triple-pattern` that
   were previously matched in the supplied solution map `solution` to their
@@ -196,7 +205,7 @@
           (if-let [variable (::var component)]
             (if-let [match (get solution variable)]
               match
-              component)
+              (assign-solution-filter component solution))
             component))
         triple-pattern))
 

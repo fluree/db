@@ -117,6 +117,18 @@
                                            [:bind ?nameLength "(strLen ?name)"]
                                            [:filter "(> 4 ?nameLength)"]]}))))
 
+    (testing "value map filters"
+      (is (= [["Brian" "Smith"]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '[?name ?last]
+                                :where   '[{:type        :ex/User
+                                            :schema/age  {"@value"  ?age
+                                                          "@filter" "(> ?age 45)"}
+                                            :schema/name ?name
+                                            :ex/last     {"@value" ?last
+                                                          "@filter" "(strEnds ?last \"ith\")"}}]}))))
+
     ;;TODO: simple-subject-crawl does not yet support filters.
     ;;these are being run as regular analytial queries
     (testing "simple-subject-crawl"
