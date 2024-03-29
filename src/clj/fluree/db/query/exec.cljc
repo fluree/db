@@ -53,7 +53,7 @@
                          (group/combine q)
                          (having/filter q error-ch)
                          (order/arrange q)
-                         (select/format db q error-ch)
+                         (select/format db q fuel-tracker error-ch)
                          (drop-offset q)
                          (take-limit q)
                          (collect-results q))]

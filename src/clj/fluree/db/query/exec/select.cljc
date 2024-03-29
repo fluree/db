@@ -4,12 +4,9 @@
   (:refer-clojure :exclude [format])
   (:require [clojure.core.async :as async :refer [<! >! chan go go-loop]]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.query.exec.eval :as-alias eval]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.json-ld.response :as json-ld-resp]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
@@ -56,7 +53,7 @@
 (defprotocol ValueSelector
   (implicit-grouping? [this]
    "Returns true if this selector should have its values grouped together.")
-  (format-value [fmt db iri-cache context compact error-ch solution]
+  (format-value [fmt db iri-cache context compact fuel-tracker error-ch solution]
    "Formats a where search solution (map of pattern matches) by extracting and displaying relevant pattern matches."))
 
 ;; This exists because many different types of data structures in :select
@@ -64,7 +61,7 @@
 (extend-type #?(:clj Object :cljs object) ; https://cljs.github.io/api/cljs.core/extend-type
   ValueSelector
   (implicit-grouping? [_] false)
-  (format-value [_ _ _ _ _ _ _] nil))
+  (format-value [_ _ _ _ _ _ _ _] nil))
 
 (defprotocol SolutionModifier
   (update-solution [this solution]))
@@ -73,7 +70,7 @@
   ValueSelector
   (implicit-grouping? [_] false)
   (format-value
-    [_ db iri-cache _context compact error-ch solution]
+    [_ db iri-cache _context compact _fuel-tracker error-ch solution]
     (log/trace "VariableSelector format-value var:" var "solution:" solution)
     (-> solution
         (get var)
@@ -89,7 +86,7 @@
   ValueSelector
   (implicit-grouping? [_] false)
   (format-value
-   [_ db iri-cache _context compact error-ch solution]
+   [_ db iri-cache _context compact _fuel-tracker error-ch solution]
    (go-loop [ks        (keys solution)
              formatted {}]
      (let [k          (first ks)
@@ -112,7 +109,7 @@
   ValueSelector
   (implicit-grouping? [_] true)
   (format-value
-    [_ _ _ _ _ error-ch solution]
+    [_ _ _ _ _ _ error-ch solution]
     (go (try* (agg-fn solution)
               (catch* e
                 (log/error e "Error applying aggregate selector")
@@ -140,7 +137,7 @@
   ValueSelector
   (implicit-grouping? [_] aggregate?)
   (format-value
-    [_ _ _ _ _ _ solution]
+    [_ _ _ _ _ _ _ solution]
     (log/trace "AsSelector format-value solution:" solution)
     (go (let [match (get solution bind-var)]
           (where/get-value match)))))
@@ -153,21 +150,14 @@
   ValueSelector
   (implicit-grouping? [_] false)
   (format-value
-    [_ db iri-cache context compact error-ch solution]
-    (go
-      (try*
-        (let [db-alias (:alias db)]
-          (when-let [sid (if (where/variable? subj)
-                           (-> solution
-                               (get subj)
-                               (where/get-sid db-alias))
-                           (iri/encode-iri db subj))]
-            (let [flakes (<? (query-range/index-range db :spot = [sid]))]
-              ;; TODO: Replace these nils with fuel values when we turn fuel back on
-              (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))))
-        (catch* e
-                (log/error e "Error formatting subgraph for subject:" subj)
-                (>! error-ch e))))))
+    [_ ds iri-cache context compact fuel-tracker error-ch solution]
+    (when-let [iri (if (where/variable? subj)
+                     (-> solution
+                         (get subj)
+                         where/get-iri)
+                     subj)]
+      (json-ld-resp/format-node ds iri context compact spec iri-cache
+                                fuel-tracker error-ch))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied
@@ -180,21 +170,23 @@
 (defn format-values
   "Formats the values from the specified where search solution `solution`
   according to the selector or collection of selectors specified by `selectors`"
-  [selectors db iri-cache context compact error-ch solution]
+  [selectors db iri-cache context compact fuel-tracker error-ch solution]
   (if (sequential? selectors)
     (go-loop [selectors selectors
               values []]
       (if-let [selector (first selectors)]
-        (let [value (<! (format-value selector db iri-cache context compact error-ch solution))]
+        (let [value (<! (format-value selector db iri-cache context compact
+                                      fuel-tracker error-ch solution))]
           (recur (rest selectors)
                  (conj values value)))
         values))
-    (format-value selectors db iri-cache context compact error-ch solution)))
+    (format-value selectors db iri-cache context compact fuel-tracker
+                  error-ch solution)))
 
 (defn format
   "Formats each solution within the stream of solutions in `solution-ch` according
   to the selectors within the select clause of the supplied parsed query `q`."
-  [db q error-ch solution-ch]
+  [db q fuel-tracker error-ch solution-ch]
   (let [context             (:context q)
         compact             (json-ld/compact-fn context)
         selectors           (or (:select q)
@@ -219,7 +211,8 @@
                           format-ch
                           (fn [solution ch]
                             (log/trace "select/format solution:" solution)
-                            (-> (format-values selectors db iri-cache context compact error-ch solution)
+                            (-> (format-values selectors db iri-cache context compact
+                                               fuel-tracker error-ch solution)
                                 (async/pipe ch)))
                           in-ch)
     format-ch))

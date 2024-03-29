@@ -438,32 +438,77 @@
                                                          "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
                                                          "isBasedOn"                 {"id" "https://www.wikidata.org/wiki/Q2870"}}]})]
       (testing "with combined data sets"
-        (let [q '{"@context" "https://schema.org"
-                  :from      ["test/authors" "test/books" "test/movies"]
-                  :select    [?movieName ?bookIsbn ?authorName]
-                  :where     {"type"      "Movie"
-                              "name"      ?movieName
-                              "isBasedOn" {"isbn"   ?bookIsbn
-                                           "author" {"name" ?authorName}}}}]
+        (testing "directly selecting variables"
+          (let [q '{"@context" "https://schema.org"
+                    :from      ["test/authors" "test/books" "test/movies"]
+                    :select    [?movieName ?bookIsbn ?authorName]
+                    :where     {"type"      "Movie"
+                                "name"      ?movieName
+                                "isBasedOn" {"isbn"   ?bookIsbn
+                                             "author" {"name" ?authorName}}}}]
 
-          (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
-                  ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
-                 @(fluree/query-connection conn q))
-              "returns unified results from each component ledger")))
+            (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
+                    ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
+                   @(fluree/query-connection conn q))
+                "returns unified results from each component ledger")))
+        (testing "selecting subgraphs"
+          (let [q '{"context" "https://schema.org"
+                    :from     ["test/authors" "test/books" "test/movies"]
+                    :select   {?goneWithTheWind [:*]}
+                    :depth    3
+                    :where    {"@id"  ?goneWithTheWind
+                               "type" "Movie"
+                               "name" "Gone with the Wind"}}]
+            (is (= [{"type"                      "Movie",
+                     "disambiguatingDescription" "1939 film by Victor Fleming",
+                     "isBasedOn"                 {"type"   "Book",
+                                                  "author" {"type" "Person",
+                                                            "name" "Margaret Mitchell",
+                                                            "id"   "https://www.wikidata.org/wiki/Q173540"},
+                                                  "isbn"   "0-582-41805-4",
+                                                  "name"   "Gone with the Wind",
+                                                  "id"     "https://www.wikidata.org/wiki/Q2870"},
+                     "name"                      "Gone with the Wind",
+                     "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
+                     "id"                        "https://www.wikidata.org/wiki/Q2875"}]
+                   @(fluree/query-connection conn q))
+                "returns unified results for the requested subject"))))
       (testing "with separate data sets"
-        (let [q '{"@context"  "https://schema.org"
-                  :from-named ["test/authors" "test/books" "test/movies"]
-                  :select     [?movieName ?bookIsbn ?authorName]
-                  :where      [[:graph "test/movies" {"id"        ?movie
-                                                      "type"      "Movie"
-                                                      "name"      ?movieName
-                                                      "isBasedOn" ?book}]
-                               [:graph "test/books" {"id"     ?book
-                                                     "isbn"   ?bookIsbn
-                                                     "author" ?author}]
-                               [:graph "test/authors" {"id"   ?author
-                                                       "name" ?authorName}]]}]
-          (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
-                  ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
-                 @(fluree/query-connection conn q))
-              "returns unified results from each component ledger"))))))
+        (testing "directly selecting variables"
+          (let [q '{"@context"  "https://schema.org"
+                    :from-named ["test/authors" "test/books" "test/movies"]
+                    :select     [?movieName ?bookIsbn ?authorName]
+                    :where      [[:graph "test/movies" {"id"        ?movie
+                                                        "type"      "Movie"
+                                                        "name"      ?movieName
+                                                        "isBasedOn" ?book}]
+                                 [:graph "test/books" {"id"     ?book
+                                                       "isbn"   ?bookIsbn
+                                                       "author" ?author}]
+                                 [:graph "test/authors" {"id"   ?author
+                                                         "name" ?authorName}]]}]
+            (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
+                    ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
+                   @(fluree/query-connection conn q))
+                "returns unified results from each component ledger")))
+        (testing "selecting subgraphs"
+          (let [q '{"context"   "https://schema.org"
+                    :from-named ["test/authors" "test/books" "test/movies"]
+                    :select     {?goneWithTheWind [:*]}
+                    :depth      3
+                    :where      [[:graph "test/movies" {"@id"  ?goneWithTheWind
+                                                        "name" "Gone with the Wind"}]]}]
+            (is (= [{"type"                      "Movie",
+                     "disambiguatingDescription" "1939 film by Victor Fleming",
+                     "isBasedOn"                 {"type"   "Book",
+                                                  "author" {"type" "Person",
+                                                            "name" "Margaret Mitchell",
+                                                            "id"   "https://www.wikidata.org/wiki/Q173540"},
+                                                  "isbn"   "0-582-41805-4",
+                                                  "name"   "Gone with the Wind",
+                                                  "id"     "https://www.wikidata.org/wiki/Q2870"},
+                     "name"                      "Gone with the Wind",
+                     "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
+                     "id"                        "https://www.wikidata.org/wiki/Q2875"}]
+                   @(fluree/query-connection conn q))
+                "returns unified results for the requested subject")))))))

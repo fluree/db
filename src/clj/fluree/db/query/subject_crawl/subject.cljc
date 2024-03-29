@@ -1,5 +1,5 @@
 (ns fluree.db.query.subject-crawl.subject
-  (:require [clojure.core.async :refer [<! >!] :as async]
+  (:require [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.range :as query-range]
@@ -7,9 +7,9 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.query.subject-crawl.common :refer [result-af filter-subject]]
+            [fluree.db.query.subject-crawl.common :refer [filter-subject]]
             [fluree.db.permissions-validate :as validate :refer [filter-subject-flakes]]
-            [fluree.db.dbproto :as dbproto]
+            [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -36,7 +36,7 @@
                           cat
                           (map flake/s)
                           (distinct))
-        resolver    (index/->CachedTRangeResolver conn novelty t t (:lru-cache-atom conn))]
+        resolver    (index/conn->t-range-resolver conn novelty t t)]
     (index/tree-chan resolver idx-root first-flake last-flake any? 10 query-xf error-ch)))
 
 (defn permissioned-db?
@@ -84,6 +84,13 @@
       (async/close! return-ch))
     return-ch))
 
+(defn result-af
+  [{:keys [db cache context compact-fn select-spec error-ch] :as _opts}]
+  (fn [flakes port]
+    (-> db
+        (json-ld-resp/format-subject-flakes cache context compact-fn select-spec
+                                            0 nil error-ch flakes)
+        (async/pipe port))))
 
 (defn subj-crawl
   [{:keys [db error-ch f-where limit offset parallelism vars finish-fn] :as opts}]

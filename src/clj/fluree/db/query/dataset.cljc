@@ -7,7 +7,7 @@
 
 (defn combine
   [named-map defaults]
-  (let [default-graph (util/sequential defaults)]
+  (let [default-graph (some->> defaults util/sequential)]
     (->DataSet named-map default-graph ::default)))
 
 (defn dataset?
@@ -25,10 +25,20 @@
 
 (defn active
   [ds]
-  (let [active-graph (:active ds)]
-    (if (#{::default} active-graph)
-      (:default ds)
-      (-> ds :named (get active-graph)))))
+  (if (dataset? ds)
+    (let [active-graph (:active ds)]
+      (if (#{::default} active-graph)
+        (:default ds)
+        (-> ds :named (get active-graph))))
+    ds))
+
+(defn all
+  [ds]
+  (if (dataset? ds)
+    (->> (:default ds)
+         (concat (-> ds :named vals))
+         (into [] (distinct)))
+    [ds]))
 
 (defn names
   [ds]
