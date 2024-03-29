@@ -384,6 +384,10 @@
       (get-in [:schema :pred prop :equivalentProperty])
       not-empty))
 
+(def nil-channel
+  (doto (async/chan)
+    async/close!))
+
 (defn match-tuple
   [db fuel-tracker solution pattern filters error-ch]
   (let [matched-ch (async/chan 2 (comp cat
@@ -419,7 +423,7 @@
                   (match-tuple graph fuel-tracker solution pattern filters error-ch)))
            async/merge)
       (match-tuple active-graph fuel-tracker solution pattern filters error-ch))
-    (go)))
+    nil-channel))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
@@ -482,7 +486,7 @@
                     (match-class graph fuel-tracker solution triple filters error-ch)))
              async/merge)
         (match-class active-graph fuel-tracker solution triple filters error-ch)))
-    (go)))
+    nil-channel))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
