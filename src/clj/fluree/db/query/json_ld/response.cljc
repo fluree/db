@@ -70,10 +70,9 @@
         dt (flake/dt f)]
     (if (= const/$xsd:anyURI dt)
       (format-reference db spec obj)
-      (let [obj (flake/o f)]
-        (if (= const/$rdf:json dt)
-          (json/parse obj false)
-          obj)))))
+      (if (= const/$rdf:json dt)
+        (json/parse obj false)
+        obj))))
 
 (defn format-property
   [db cache context compact-fn {:keys [wildcard?] :as select-spec} p-flakes]
