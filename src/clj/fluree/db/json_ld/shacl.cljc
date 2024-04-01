@@ -954,12 +954,41 @@
           (swap! shapes-cache assoc shape-sid shape)
           shape)))))
 
+(defn build-sibling-shapes
+  "Construct the sibling shapes of a shape with a sh:qualifiedValueShape. Siblings are
+  other qualified value shape constraints in the same property constraint."
+  [shape-db shape]
+  (def shape-db shape-db)
+  (def shape shape)
+  (let [{shape-id const/$id
+         [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
+         [{q-shape-id const/$id}] const/sh_qualifiedValueShape}
+        shape]
+    (if q-disjoint?
+      (let [parent-shape-id
+            (first (async/<!! (query-range/index-range shape-db :opst = [shape-id const/sh_property]
+                                                       {:flake-xf (map flake/s)})))
+            sibling-sids
+            (async/<!! (query-range/index-range shape-db :spot = [parent-shape-id const/sh_property]
+                                                {:flake-xf (map flake/o)}))]
+        (loop [[sib-sid & r] sibling-sids
+               sib-q-shapes []]
+          (if sib-sid
+            (recur r (conj sib-q-shapes (async/<!! (build-shape shape-db sib-sid))))
+            (->> sib-q-shapes
+                 ;; only keep the qualified value shape of the sibling shape
+                 (keep #(first (get % const/sh_qualifiedValueShape)))
+                 ;; remove original q-shape
+                 (remove #(= (get % const/$id) q-shape-id))))))
+      [])))
+
 (defmulti validate-constraint
   "A constraint whose focus nodes conform returns nil. A constraint that doesn't returns a
   sequence of result maps."
   (fn [v-ctx constraint focus-flakes]
     (println "DEP validate-constraint dispatch" (pr-str constraint))
     constraint))
+
 (defmethod validate-constraint :default [_ _ _] nil)
 
 (defn validate-constraints
@@ -1458,37 +1487,6 @@
         (recur r (into results results*))
         (recur r results))
       (not-empty results))))
-
-
-(defn build-sibling-shapes
-  "Construct the sibling shapes of a shape with a sh:qualifiedValueShape. Siblings are
-  other qualified value shape constraints in the same property constraint"
-  [shape-db shape]
-  (def shape-db shape-db)
-  (def shape shape)
-  (let [{shape-id const/$id
-         [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
-         [{q-shape-id const/$id}] const/sh_qualifiedValueShape}
-        shape]
-    (if q-disjoint?
-      (let [parent-shape-id
-            (first (async/<!! (query-range/index-range shape-db :opst = [shape-id const/sh_property]
-                                                       {:flake-xf (map flake/s)})))
-            sibling-sids
-            (async/<!! (query-range/index-range shape-db :spot = [parent-shape-id const/sh_property]
-                                                {:flake-xf (map flake/o)}))]
-        (loop [[sib-sid & r] sibling-sids
-               sib-q-shapes []]
-          (if sib-sid
-            (if (= sib-sid q-shape-id)
-              ;; skip the original q-shape
-              (recur r sib-q-shapes)
-              ;; only add the siblings
-              (recur r (conj sib-q-shapes (async/<!! (build-shape shape-db sib-sid)))))
-            (->> sib-q-shapes
-                 (keep #(first (get % const/sh_qualifiedValueShape)))))))
-      [])))
-
 (defmethod validate-constraint const/sh_qualifiedValueShape [{:keys [shape display data-db shape-db] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
   (def v-ctx v-ctx)
@@ -1534,21 +1532,22 @@
                      non-disjoint-conformers #{}]
                 (println "DEP conforming-sid" (pr-str conforming-sid) (pr-str non-disjoint-conformers))
                 (if conforming-sid
-                  (loop [[sib-q-shape & r] sibling-q-shapes
-                         non-disjoint-conformers* []]
-                    (println "DEP sib-q-shape" (pr-str sib-q-shape) (pr-str non-disjoint-conformers*))
-                    (if sib-q-shape
-                      (let [focus-flakes (async/<!! (query-range/index-range data-db :spot = [conforming-sid]))
-                            result (if (property-shape? sib-q-shape)
-                                     (validate-property-shape (assoc v-ctx :shape sib-q-shape) focus-flakes)
-                                     (validate-node-shape (assoc v-ctx :shape sib-q-shape) nil focus-flakes))]
-                        (println "DEP sib-q-shape result" (pr-str result) )
-                        (if result
-                          (recur r non-disjoint-conformers*)
-                          (recur r (conj non-disjoint-conformers* conforming-sid))))
-                      (do
-                        (pr-str "DEP sib-q-shape end" (pr-str non-disjoint-conformers*))
-                        (into non-disjoint-conformers non-disjoint-conformers*))))
+                  (recur r
+                         (loop [[sib-q-shape & r] sibling-q-shapes
+                                non-disjoint-conformers* []]
+                           (println "DEP sib-q-shape" (pr-str sib-q-shape) (pr-str non-disjoint-conformers*))
+                           (if sib-q-shape
+                             (let [focus-flakes (async/<!! (query-range/index-range data-db :spot = [conforming-sid]))
+                                   q-result (if (property-shape? sib-q-shape)
+                                              (validate-property-shape (assoc v-ctx :shape sib-q-shape) focus-flakes)
+                                              (validate-node-shape (assoc v-ctx :shape sib-q-shape) nil focus-flakes))]
+                               (println "DEP sib-q-shape result" (pr-str q-result) )
+                               (if q-result
+                                 (recur r non-disjoint-conformers*)
+                                 (recur r (conj non-disjoint-conformers* conforming-sid))))
+                             (do
+                               (println "DEP sib-q-shape end" (pr-str non-disjoint-conformers*))
+                               (into non-disjoint-conformers non-disjoint-conformers*)))))
 
 
                   (do
@@ -1558,9 +1557,10 @@
                       (mapv
                         (fn [non-disjoint-sid]
                           (assoc result
-                                 :message (str "value " (display non-disjoint-sid) " conformed to multiple sibling qualified value shapes "
+                                 :value (display non-disjoint-sid)
+                                 :message (str "value " (display non-disjoint-sid) " conformed to a sibling qualified value shape "
                                                (mapv #(display (get % const/$id)) sibling-q-shapes) " in violation of the "
-                                               (display const/sh_qualifiedValueShapesDisjoint) " constraint.")))
+                                               (display const/sh_qualifiedValueShapesDisjoint) " constraint")))
 
                         non-disjoint-conformers)
 
