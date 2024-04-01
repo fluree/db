@@ -105,6 +105,11 @@
   [match]
   (::val match))
 
+(defn get-binding
+  [match]
+  (or (get-value match)
+      (get-iri match)))
+
 (defn get-meta
   [match]
   (::meta match))
@@ -471,7 +476,7 @@
   [ds fuel-tracker solution pattern error-ch]
   (if-let [active-graph (dataset/active ds)]
     (let [triple (pattern-data pattern)]
-      (log/info "active graph:" active-graph)
+      (log/debug "active graph:" active-graph)
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [graph]
@@ -485,6 +490,7 @@
   (go
     (try*
       (let [f (pattern-data pattern)]
+        (log/info "filtering solution:" solution)
         (when (f solution)
           solution))
       (catch* e
