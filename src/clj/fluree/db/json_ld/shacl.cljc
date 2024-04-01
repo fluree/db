@@ -1622,7 +1622,7 @@
              (assoc :path (mapv display path)
                     :expect expect
                     :value value
-                    :message "at least one value of " value " must be " expect))]))))
+                    :message (str "at least one value of " value " must be " expect)))]))))
 (defmethod validate-constraint const/sh_in [{:keys [shape subject display] :as v-ctx} constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint))
   (let [{expect constraint path const/sh_path} shape
@@ -1645,7 +1645,7 @@
 
 (defn explain-result
   [{:keys [subject constraint shape path message]}]
-  (str "Subject " subject (when path (str "  path " path))
+  (str "Subject " subject (when path (str " path " path))
        " violates constraint " constraint " of shape " shape " - " message "."))
 
 (defn throw-shacl-violation
