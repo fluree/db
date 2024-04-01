@@ -490,7 +490,6 @@
   (go
     (try*
       (let [f (pattern-data pattern)]
-        (log/info "filtering solution:" solution)
         (when (f solution)
           solution))
       (catch* e
