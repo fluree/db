@@ -117,6 +117,21 @@
                                            [:bind ?nameLength "(strLen ?name)"]
                                            [:filter "(> 4 ?nameLength)"]]}))))
 
+    (testing "filtering variables bound to iris"
+      (let [db-dads @(fluree/stage
+                       db
+                       {"@context" {"ex" "http://example.org/"}
+                        "insert"   {"@id"       "ex:bob"
+                                    "ex:father" [{"@id" "ex:alex-jr"}, {"@id" "ex:aj"}]}})]
+        (is (= [["ex:bob" "ex:aj" "ex:alex-jr"] ["ex:bob" "ex:alex-jr" "ex:aj"]]
+               @(fluree/query db-dads {:context {"ex" "http://example.org/"}
+                                       :select  '[?s ?f1 ?f2]
+                                       :where   '[{"@id"       ?s
+                                                   "ex:father" ?f1}
+                                                  {"@id"       ?s
+                                                   "ex:father" ?f2}
+                                                  ["filter" "(not= ?f1 ?f2)"]]})))))
+
     (testing "value map filters"
       (is (= [["Brian" "Smith"]]
              @(fluree/query db {:context [test-utils/default-context
