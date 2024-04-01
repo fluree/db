@@ -1927,15 +1927,15 @@ WORLD!")
                  first
                  (update "ex:parent" (partial sort-by #(get % "id"))))))
       (is (= {:status 400,
-              :error :shacl/violation,
+              :error  :shacl/violation,
               :report
-              [{:subject "ex:InvalidKid",
+              [{:subject    "ex:InvalidKid",
                 :constraint "sh:qualifiedValueShape",
-                :shape "_:fdb-9",
-                :path ["ex:parent"],
-                :expect "_:fdb-10",
-                :value ["ex:Zorba" "ex:Bob"],
-                :message "values [\"ex:Zorba\" \"ex:Bob\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times"}]}
+                :shape      "_:fdb-9",
+                :path       ["ex:parent"],
+                :expect     "_:fdb-10",
+                :value      ["ex:Zorba" "ex:Bob"],
+                :message    "values [\"ex:Zorba\" \"ex:Bob\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times"}]}
              (ex-data invalid-kid)))
       (is (= "Subject ex:InvalidKid path [\"ex:parent\"] violates constraint sh:qualifiedValueShape of shape _:fdb-9 - values [\"ex:Zorba\" \"ex:Bob\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times."
              (ex-message invalid-kid)))))
@@ -1954,11 +1954,10 @@ WORLD!")
                                                          "sh:minCount"          2
                                                          "sh:maxCount"          2
                                                          "sh:qualifiedValueShape"
-                                                         {"id"             "ex:ParentShape"
-                                                          "type"           "sh:NodeShape"
-                                                          "sh:targetClass" {"id" "ex:Parent"}
-                                                          "sh:property"    {"sh:path"    {"id" "ex:gender"}
-                                                                            "sh:pattern" "female"}}
+                                                         {"id"          "ex:ParentShape"
+                                                          "type"        "sh:NodeShape"
+                                                          "sh:property" {"sh:path"    {"id" "ex:gender"}
+                                                                         "sh:pattern" "female"}}
                                                          "sh:qualifiedMinCount" 1}]}
                                                       {"id"        "ex:Mom"
                                                        "type"      "ex:Parent"
@@ -1973,7 +1972,8 @@ WORLD!")
           invalid-kid @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
                                           "insert"   {"id"        "ex:InvalidKid"
                                                       "type"      "ex:Kid"
-                                                      "ex:parent" [{"id" "ex:Bob"}
+                                                      "ex:parent" [{"id"        "ex:Bob"
+                                                                    "ex:gender" "male"}
                                                                    {"id"        "ex:Zorba"
                                                                     "type"      "ex:Parent"
                                                                     "ex:gender" "alien"}]}})]
@@ -1984,80 +1984,100 @@ WORLD!")
              @(fluree/query valid-kid {"@context" context
                                        "select"   {"ex:ValidKid" ["*"]}})))
       (is (= {:status 400,
-              :error :shacl/violation,
+              :error  :shacl/violation,
               :report
-              [{:subject "ex:InvalidKid",
+              [{:subject    "ex:InvalidKid",
                 :constraint "sh:qualifiedValueShape",
-                :shape "_:fdb-14",
-                :path ["ex:parent"],
-                :expect "ex:ParentShape",
-                :value ["ex:Zorba" "ex:Bob"],
-                :message "values [\"ex:Zorba\" \"ex:Bob\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times"}]}
+                :shape      "_:fdb-14",
+                :path       ["ex:parent"],
+                :expect     "ex:ParentShape",
+                :value      ["ex:Zorba" "ex:Bob"],
+                :message    "values [\"ex:Zorba\" \"ex:Bob\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times"}]}
              (ex-data invalid-kid)))
       (is (= "Subject ex:InvalidKid path [\"ex:parent\"] violates constraint sh:qualifiedValueShape of shape _:fdb-14 - values [\"ex:Zorba\" \"ex:Bob\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times."
              (ex-message invalid-kid)))))
-  ;; TODO: sh:disjoint
-  #_(testing "sh:qualifiedValueShapesDisjoint"
-      (let [conn   @(fluree/connect {:method :memory})
-            ledger @(fluree/create conn "shape-constaints")
-            db0    (fluree/db ledger)
+  (testing "sh:qualifiedValueShapesDisjoint"
+    (let [conn   @(fluree/connect {:method :memory})
+          ledger @(fluree/create conn "shape-constraints")
+          db0    (fluree/db ledger)
 
-            context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-            db1     @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
-                                        "insert"   [{"id"      "ex:Digit"
-                                                     "ex:name" "Toe"}
-                                                    {"id"             "ex:HandShape"
-                                                     "type"           "sh:NodeShape"
-                                                     "sh:targetClass" {"id" "ex:Hand"}
-                                                     "sh:property"
-                                                     [{"sh:path"     {"id" "ex:digit"}
-                                                       "sh:maxCount" 5}
-                                                      {"sh:path"                         {"id" "ex:digit"}
-                                                       "sh:qualifiedValueShape"          {"sh:path"    {"id" "ex:name"}
-                                                                                          "sh:pattern" "Thumb"}
-                                                       "sh:qualifiedMinCount"            1
-                                                       "sh:qualifiedMaxCount"            1
-                                                       "sh:qualifiedValueShapesDisjoint" true}
-                                                      {"sh:path"                         {"id" "ex:digit"}
-                                                       "sh:qualifiedValueShape"          {"sh:path"    {"id" "ex:name"}
-                                                                                          "sh:pattern" "Finger"}
-                                                       "sh:qualifiedMinCount"            4
-                                                       "sh:qualifiedMaxCount"            4
-                                                       "sh:qualifiedValueShapesDisjoint" true}]}]})
+          context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
+          db1     @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+                                      "insert"
+                                      [{"id"      "ex:Digit"
+                                        "ex:name" "Toe"}
+                                       {"id"             "ex:HandShape"
+                                        "type"           "sh:NodeShape"
+                                        "sh:targetClass" {"id" "ex:Hand"}
+                                        "sh:property"
+                                        [{"sh:path"     {"id" "ex:digit"}
+                                          "sh:maxCount" 5}
+                                         {"sh:path"                         {"id" "ex:digit"}
+                                          "sh:qualifiedValueShape"          {"id"        "ex:thumbshape"
+                                                                             "sh:path"   {"id" "ex:name"}
+                                                                             "sh:hasValue" "Thumb"}
+                                          "sh:qualifiedMinCount"            1
+                                          "sh:qualifiedMaxCount"            1
+                                          "sh:qualifiedValueShapesDisjoint" true}
+                                         {"sh:path"                         {"id" "ex:digit"}
+                                          "sh:qualifiedValueShape"          {"id"        "ex:fingershape"
+                                                                             "sh:path"   {"id" "ex:name"}
+                                                                             "sh:hasValue" "Finger"}
+                                          "sh:qualifiedMinCount"            4
+                                          "sh:qualifiedMaxCount"            4
+                                          "sh:qualifiedValueShapesDisjoint" true}]}]})
 
-            valid-hand   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                             "insert"   {"id"       "ex:ValidHand"
-                                                         "type"     "ex:Hand"
-                                                         "ex:digit" [{"ex:name" "Thumb"}
-                                                                     {"ex:name" "Finger"}
-                                                                     {"ex:name" "Finger"}
-                                                                     {"ex:name" "Finger"}
-                                                                     {"ex:name" "Finger"}]}})
-            invalid-hand @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                             "insert"   {"id"       "ex:InvalidHand"
-                                                         "type"     "ex:Hand"
-                                                         "ex:digit" [{"ex:name" "Thumb"}
-                                                                     {"ex:name" "Finger"}
-                                                                     {"ex:name" "Finger"}
-                                                                     {"ex:name" "Finger"}
-                                                                     {"ex:name" ["Finger" "Thumb"]}]}})
-            ]
-        (is (= {"id"   "ex:ValidHand",
-                "type" "ex:Hand",
-                "ex:digit"
-                [{"ex:name" "Finger"}
-                 {"ex:name" "Finger"}
-                 {"ex:name" "Finger"}
-                 {"ex:name" "Finger"}
-                 {"ex:name" "Thumb"}]}
-               (-> @(fluree/query valid-hand {"@context" context
-                                              "select"   {"ex:ValidHand" ["*" {"ex:digit" ["ex:name"]}]}})
-                   first
-                   (update "ex:digit" (partial sort-by #(get % "ex:name"))))))
-        (is (= {}
-               (ex-data invalid-hand)))
-        (is (= "SHACL PropertyShape exception - path "
-               (ex-message invalid-hand))))))
+          valid-hand @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                         "insert"   {"id"       "ex:ValidHand"
+                                                     "type"     "ex:Hand"
+                                                     "ex:digit" [{"id" "ex:thumb" "ex:name" "Thumb"}
+                                                                 {"id" "ex:finger1" "ex:name" "Finger"}
+                                                                 {"id" "ex:finger2" "ex:name" "Finger"}
+                                                                 {"id" "ex:finger3" "ex:name" "Finger"}
+                                                                 {"id" "ex:finger4" "ex:name" "Finger"}]}})
+          invalid-hand @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                           "insert"   {"id"       "ex:InvalidHand"
+                                                       "type"     "ex:Hand"
+                                                       "ex:digit" [{"id" "ex:thumb" "ex:name" "Thumb"}
+                                                                   {"id" "ex:finger1" "ex:name" "Finger"}
+                                                                   {"id" "ex:finger2" "ex:name" "Finger"}
+                                                                   {"id" "ex:finger3" "ex:name" "Finger"}
+                                                                   {"id" "ex:finger4andthumb"
+                                                                    "ex:name" ["Finger" "Thumb"]}]}})
+          ]
+      (is (= [{"id"   "ex:ValidHand",
+               "type" "ex:Hand",
+               "ex:digit"
+               [{"ex:name" "Finger"}
+                {"ex:name" "Finger"}
+                {"ex:name" "Finger"}
+                {"ex:name" "Finger"}
+                {"ex:name" "Thumb"}]}]
+             @(fluree/query valid-hand {"@context" context
+                                        "select"   {"ex:ValidHand" ["*" {"ex:digit" ["ex:name"]}]}})))
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject "ex:InvalidHand",
+                :constraint "sh:qualifiedValueShape",
+                :shape "_:fdb-20",
+                :path ["ex:digit"],
+                :expect "ex:thumbshape",
+                :value "ex:finger4andthumb",
+                :message
+                "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint"}
+               {:subject "ex:InvalidHand",
+                :constraint "sh:qualifiedValueShape",
+                :shape "_:fdb-21",
+                :path ["ex:digit"],
+                :expect "ex:fingershape",
+                :value "ex:finger4andthumb",
+                :message
+                "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint"}]}
+             (ex-data invalid-hand)))
+      (is (= "Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-20 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint.
+Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-21 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint."
+             (ex-message invalid-hand))))))
 
 (deftest ^:integration post-processing-validation
   (let [conn    @(fluree/connect {:method :memory})
