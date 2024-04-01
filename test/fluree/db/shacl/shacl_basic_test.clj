@@ -1230,137 +1230,139 @@ WORLD!")
                         :select  {'?s [:*]}
                         :where   {:id '?s, :type :ex/User}}
           db           @(fluree/stage
-                         (fluree/db ledger)
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          {:id             :ex/UserShape
-                           :type           :sh/NodeShape
-                           :sh/targetClass :ex/User
-                           :sh/property    [{:sh/path     :schema/name
-                                             :sh/datatype :xsd/string
-                                             :sh/minCount 1
-                                             :sh/maxCount 1}
-                                            {:sh/path         :schema/age
-                                             :sh/minCount     1
-                                             :sh/maxCount     1
-                                             :sh/minInclusive 0
-                                             :sh/maxInclusive 130}
-                                            {:sh/path     :schema/email
-                                             :sh/datatype :xsd/string}]}})
-          db-ok        @(fluree/stage
-                         db
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          {:id           :ex/john
-                           :type         :ex/User
-                           :schema/name  "John"
-                           :schema/age   40
-                           :schema/email "john@example.org"}})
-          db-no-name   @(fluree/stage
-                         db
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          {:id           :ex/john
-                           :type         :ex/User
-                           :schema/age   40
-                           :schema/email "john@example.org"}})
-          db-two-names @(fluree/stage
-                         db
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          {:id           :ex/john
-                           :type         :ex/User
-                           :schema/name  ["John" "Billy"]
-                           :schema/age   40
-                           :schema/email "john@example.org"}})
-          db-too-old   @(fluree/stage
-                         db
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          {:id           :ex/john
-                           :type         :ex/User
-                           :schema/name  "John"
-                           :schema/age   140
-                           :schema/email "john@example.org"}})
-          db-two-ages  @(fluree/stage
-                         db
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          {:id           :ex/john
-                           :type         :ex/User
-                           :schema/name  "John"
-                           :schema/age   [40 21]
-                           :schema/email "john@example.org"}})
-          db-num-email @(fluree/stage
-                         db
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          {:id           :ex/john
-                           :type         :ex/User
-                           :schema/name  "John"
-                           :schema/age   40
-                           :schema/email 42}})]
-      (is (= {:status 400,
-              :error :shacl/violation,
-              :report
-              [{:subject :ex/john,
-                :constraint :sh/minCount,
-                :shape "_:fdb-2",
-                :path [:schema/name],
-                :value 0,
-                :expect 1,
-                :message "count 0 is less than minimum count of 1"}]}
-             (ex-data db-no-name)))
-      (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/minCount of shape _:fdb-2 - count 0 is less than minimum count of 1."
-             (ex-message db-no-name)))
-      (is (= {:status 400,
-              :error :shacl/violation,
-              :report
-              [{:subject :ex/john,
-                :constraint :sh/maxCount,
-                :shape "_:fdb-2",
-                :path [:schema/name],
-                :value 2,
-                :expect 1,
-                :message "count 2 is greater than maximum count of 1"}]}
-             (ex-data db-two-names)))
-      (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxCount of shape _:fdb-2 - count 2 is greater than maximum count of 1."
-             (ex-message db-two-names)))
-      (is (= {:status 400,
-              :error :shacl/violation,
-              :report
-              [{:subject :ex/john,
-                :constraint :sh/maxInclusive,
-                :shape "_:fdb-3",
-                :path [:schema/age],
-                :expect 130,
-                :value 140,
-                :message "value 140 is greater than inclusive maximum 130"}]}
-             (ex-data db-too-old)))
-      (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxInclusive of shape _:fdb-3 - value 140 is greater than inclusive maximum 130."
-             (ex-message db-too-old)))
-      (is (= {:status 400,
-              :error :shacl/violation,
-              :report
-              [{:subject :ex/john,
-                :constraint :sh/maxCount,
-                :shape "_:fdb-3",
-                :path [:schema/age],
-                :value 2,
-                :expect 1,
-                :message "count 2 is greater than maximum count of 1"}]}
-             (ex-data db-two-ages)))
-      (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxCount of shape _:fdb-3 - count 2 is greater than maximum count of 1."
-             (ex-message db-two-ages)))
-      (is (util/exception? db-num-email))
-      (is (= "Value 42 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
-             (ex-message db-num-email)))
-      (is (= [{:id           :ex/john
-               :type         :ex/User
-               :schema/age   40
-               :schema/email "john@example.org"
-               :schema/name  "John"}]
-             @(fluree/query db-ok user-query))))))
+                          (fluree/db ledger)
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id             :ex/UserShape
+                            :type           :sh/NodeShape
+                            :sh/targetClass :ex/User
+                            :sh/property    [{:sh/path     :schema/name
+                                              :sh/datatype :xsd/string
+                                              :sh/minCount 1
+                                              :sh/maxCount 1}
+                                             {:sh/path         :schema/age
+                                              :sh/minCount     1
+                                              :sh/maxCount     1
+                                              :sh/minInclusive 0
+                                              :sh/maxInclusive 130}
+                                             {:sh/path     :schema/email
+                                              :sh/datatype :xsd/string}]}})]
+      (let [db-ok @(fluree/stage
+                     db
+                     {"@context" ["https://ns.flur.ee" context]
+                      "insert"
+                      {:id :ex/john
+                       :type :ex/User
+                       :schema/name "John"
+                       :schema/age 40
+                       :schema/email "john@example.org"}})]
+        (is (= [{:id           :ex/john
+                 :type         :ex/User
+                 :schema/age   40
+                 :schema/email "john@example.org"
+                 :schema/name  "John"}]
+               @(fluree/query db-ok user-query))))
+
+      (let [db-no-name   @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id           :ex/john
+                              :type         :ex/User
+                              :schema/age   40
+                              :schema/email "john@example.org"}})]
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject :ex/john,
+                  :constraint :sh/minCount,
+                  :shape "_:fdb-2",
+                  :path [:schema/name],
+                  :value 0,
+                  :expect 1,
+                  :message "count 0 is less than minimum count of 1"}]}
+               (ex-data db-no-name)))
+        (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/minCount of shape _:fdb-2 - count 0 is less than minimum count of 1."
+               (ex-message db-no-name))))
+      (let [db-two-names @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id           :ex/john
+                              :type         :ex/User
+                              :schema/name  ["John" "Billy"]
+                              :schema/age   40
+                              :schema/email "john@example.org"}})]
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject :ex/john,
+                  :constraint :sh/maxCount,
+                  :shape "_:fdb-2",
+                  :path [:schema/name],
+                  :value 2,
+                  :expect 1,
+                  :message "count 2 is greater than maximum count of 1"}]}
+               (ex-data db-two-names)))
+        (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxCount of shape _:fdb-2 - count 2 is greater than maximum count of 1."
+               (ex-message db-two-names))))
+      (let [db-too-old @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id :ex/john
+                            :type :ex/User
+                            :schema/name "John"
+                            :schema/age 140
+                            :schema/email "john@example.org"}})]
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject :ex/john,
+                  :constraint :sh/maxInclusive,
+                  :shape "_:fdb-3",
+                  :path [:schema/age],
+                  :expect 130,
+                  :value 140,
+                  :message "value 140 is greater than inclusive maximum 130"}]}
+               (ex-data db-too-old)))
+        (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxInclusive of shape _:fdb-3 - value 140 is greater than inclusive maximum 130."
+               (ex-message db-too-old))))
+      (let [db-two-ages  @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id :ex/john
+                              :type :ex/User
+                              :schema/name "John"
+                              :schema/age [40 21]
+                              :schema/email "john@example.org"}})]
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject :ex/john,
+                  :constraint :sh/maxCount,
+                  :shape "_:fdb-3",
+                  :path [:schema/age],
+                  :value 2,
+                  :expect 1,
+                  :message "count 2 is greater than maximum count of 1"}]}
+               (ex-data db-two-ages)))
+        (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxCount of shape _:fdb-3 - count 2 is greater than maximum count of 1."
+               (ex-message db-two-ages))))
+      (let [db-num-email @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id           :ex/john
+                              :type         :ex/User
+                              :schema/name  "John"
+                              :schema/age   40
+                              :schema/email 42}})]
+        (is (= {:status 400, :error :db/value-coercion}
+               (ex-data db-num-email)))
+        (is (= "Value 42 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
+               (ex-message db-num-email)))))))
 
 (deftest ^:integration property-paths
   (let [conn    @(fluree/connect {:method :memory})
@@ -1875,15 +1877,15 @@ WORLD!")
              @(fluree/query valid-person {"@context" context
                                           "select"   {"ex:Bob" ["*" {"ex:address" ["ex:postalCode"]}]}})))
       (is (= {:status 400,
-              :error :shacl/violation,
+              :error  :shacl/violation,
               :report
-              [{:subject "ex:Reto",
+              [{:subject    "ex:Reto",
                 :constraint "sh:node",
-                :shape "_:fdb-3",
-                :path ["ex:address"],
-                :expect ["ex:AddressShape"],
-                :value "_:fdb-7",
-                :message "node _:fdb-7 does not conform to shapes [\"ex:AddressShape\"]"}]}
+                :shape      "_:fdb-3",
+                :path       ["ex:address"],
+                :expect     ["ex:AddressShape"],
+                :value      "_:fdb-7",
+                :message    "node _:fdb-7 does not conform to shapes [\"ex:AddressShape\"]"}]}
              (ex-data invalid-person)))
       (is (= "Subject ex:Reto path [\"ex:address\"] violates constraint sh:node of shape _:fdb-3 - node _:fdb-7 does not conform to shapes [\"ex:AddressShape\"]."
              (ex-message invalid-person)))))
