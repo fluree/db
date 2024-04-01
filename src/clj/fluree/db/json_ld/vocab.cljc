@@ -281,15 +281,9 @@
                                      (or (contains? pred-sids (flake/s f))
                                          (contains? jld-ledger/predicate-refs (flake/p f)))))
                            new-flakes)
-        {:keys [t refs pred shapes subclasses]}
-        (-> (build-schema db pred-sids vocab-flakes)
-            (add-pred-datatypes (pred-dt-constraints new-flakes)))]
-    (-> db
-        (assoc-in [:schema :t] t)
-        (update-in [:schema :refs] into refs)
-        (update-in [:schema :pred] (partial merge-with merge) pred)
-        (assoc-in [:schema :subclasses] subclasses)
-        (assoc-in [:schema :shapes] shapes))))
+        schema       (-> (build-schema db pred-sids vocab-flakes)
+                         (add-pred-datatypes (pred-dt-constraints new-flakes)))]
+    (assoc db :schema schema)))
 
 (defn load-schema
   [{:keys [preds t] :as db}]

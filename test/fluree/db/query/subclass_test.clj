@@ -166,3 +166,40 @@
              (set @(fluree/query db4 {"@context" context
                                       "where"    {"@id" "?s", "@type" "ex:Humanoid"}
                                       "select"   {"?s" ["*"]}})))))))
+
+(deftest ^:integration subclass-nested-stages
+  (testing "Multiple subClassOf dependencies which rely on each other staged independently"
+    (let [conn        (test-utils/create-conn)
+          ledger-name "subclass-nested-stage-test"
+          ledger      @(fluree/create conn ledger-name)
+          db0         (fluree/db ledger)
+          context     test-utils/default-str-context
+          db1         @(fluree/stage
+                         db0
+                         {"@context" {"ex" "http://example.org/"}
+                          "insert"   [{"@id"     "ex:brian"
+                                       "@type"   "ex:Person"
+                                       "ex:name" "Brian"}
+                                      {"@id"     "ex:laura"
+                                       "@type"   "ex:Employee"
+                                       "ex:name" "Laura"}
+                                      {"@id"     "ex:alice"
+                                       "@type"   "ex:Human"
+                                       "ex:name" "Alice"}]})
+          db2         @(fluree/stage
+                         db1
+                         {"@context" {"ex"   "http://example.org/"
+                                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                          "insert"   [{"@id"             "ex:Person"
+                                       "rdfs:subClassOf" {"@id" "ex:Human"}}]})
+          db3         @(fluree/stage
+                         db2
+                         {"@context" {"ex"   "http://example.org/"
+                                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                          "insert"   [{"@id"             "ex:Employee"
+                                       "rdfs:subClassOf" {"@id" "ex:Person"}}]})]
+      (is (= #{"ex:brian" "ex:laura" "ex:alice"}
+             (set @(fluree/query db3 {"@context" {"ex" "http://example.org/"}
+                                      "select"   "?s"
+                                      "where"    {"@id"   "?s"
+                                                  "@type" "ex:Human"}})))))))
