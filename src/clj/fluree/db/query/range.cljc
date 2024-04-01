@@ -1,6 +1,5 @@
 (ns fluree.db.query.range
-  (:require [fluree.db.constants :as const]
-            [fluree.db.index :as index]
+  (:require [fluree.db.index :as index]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -23,7 +22,7 @@
     pred))
 
 
-(defn- match->flake-parts
+(defn match->flake-parts
   "Takes a match from index-range, and based on the index
   returns flake-ordered components of [s p o t op m].
   Coerces idents and string predicate names."
@@ -87,21 +86,10 @@
   collections of flakes from the leaf nodes in the input stream, with one flake
   collection for each input leaf."
   [{:keys [flake-xf] :as _opts}]
-  (let [flake-xf* (or flake-xf identity)]
-    (comp (filter index/resolved-leaf?)
-          (map :flakes)
-          (map (fn [flakes]
-                 (into [] flake-xf* flakes))))))
-
-(defn resolve-flake-slices
-  "Returns a channel that will contain a stream of chunked flake collections that
-  contain the flakes between `start-flake` and `end-flake` and are within the
-  transaction range starting at `from-t` and ending at `to-t`."
-  [{:keys [lru-cache-atom] :as conn} root novelty error-ch
-   {:keys [from-t to-t start-flake end-flake] :as opts}]
-  (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom)
-        query-xf  (extract-query-flakes opts)]
-    (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)))
+  (let [xfs (cond-> [(filter index/resolved-leaf?) (map :flakes)]
+              flake-xf (conj (map (fn [flakes]
+                                    (into [] flake-xf flakes)))))]
+    (apply comp xfs)))
 
 (defn unauthorized?
   [f]
@@ -135,7 +123,7 @@
   containing only the schema flakes and the flakes validated by
   fluree.db.permissions-validate/allow-flake? function for the database `db`
   from the `flake-slices` channel"
-  [db start end error-ch flake-slices]
+  [db error-ch flake-slices]
   #?(:cljs
      flake-slices ; Note this bypasses all permissions in CLJS for now!
 
@@ -148,6 +136,19 @@
              out-ch  (chan)]
          (async/pipeline-async 2 out-ch auth-fn flake-slices)
          out-ch))))
+
+(defn resolve-flake-slices
+  "Returns a channel that will contain a stream of chunked flake collections that
+  contain the flakes between `start-flake` and `end-flake` and are within the
+  transaction range starting at `from-t` and ending at `to-t`."
+  [{:keys [conn] :as db} idx error-ch
+   {:keys [from-t to-t start-flake end-flake] :as opts}]
+  (let [root      (get db idx)
+        novelty   (get-in db [:novelty idx])
+        resolver  (index/conn->t-range-resolver conn novelty from-t to-t)
+        query-xf  (extract-query-flakes opts)]
+    (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
+         (filter-authorized db error-ch))))
 
 (defn filter-subject-page
   "Returns a transducer to filter a stream of flakes to only contain flakes from
@@ -176,15 +177,9 @@
 (defn index-range*
   "Return a channel that will eventually hold a sorted vector of the range of
   flakes from `db` that meet the criteria specified in the `opts` map."
-  [{:keys [ledger] :as db}
-   error-ch
-   {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
-  (let [{:keys [conn]} ledger
-        idx-root       (get db idx)
-        novelty        (get-in db [:novelty idx])]
-    (->> (resolve-flake-slices conn idx-root novelty error-ch opts)
-         (filter-authorized db start-flake end-flake error-ch)
-         (into-page limit offset flake-limit))))
+  [db error-ch {:keys [idx limit offset flake-limit] :as opts}]
+  (->> (resolve-flake-slices db idx error-ch opts)
+       (into-page limit offset flake-limit)))
 
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
@@ -244,7 +239,7 @@
      (go-try
        (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake
                                               in-range? 1 query-xf error-ch)
-                             (filter-authorized db start-flake end-flake error-ch)
+                             (filter-authorized db error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!
            error-ch ([e]

@@ -310,8 +310,6 @@
                            (catch* e
                              (log/error e "Error resolving flake range")
                              (async/put! error-ch e)))
-         idx-root    (get db idx)
-         novelty     (get-in db [:novelty idx])
          [o* o-fn*]  (augment-object-fn idx s p o o-fn alias)
          start-flake (flake/create s p o* o-dt nil nil util/min-integer)
          end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
@@ -342,8 +340,7 @@
                       :start-flake start-flake
                       :end-flake   end-flake
                       :flake-xf    flake-xf*}]
-     (-> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
-         (->> (query-range/filter-authorized db start-flake end-flake error-ch))))))
+     (query-range/resolve-flake-slices db idx error-ch opts))))
 
 
 (defn compute-sid
@@ -387,6 +384,10 @@
       (get-in [:schema :pred prop :equivalentProperty])
       not-empty))
 
+(def nil-channel
+  (doto (async/chan)
+    async/close!))
+
 (defn match-tuple
   [db fuel-tracker solution pattern filters error-ch]
   (let [matched-ch (async/chan 2 (comp cat
@@ -415,14 +416,14 @@
 
 (defmethod match-pattern :tuple
   [ds fuel-tracker solution pattern filters error-ch]
-  (let [active-graph (cond-> ds
-                       (dataset/dataset? ds) dataset/active)]
+  (if-let [active-graph (dataset/active ds)]
     (if (sequential? active-graph)
       (->> active-graph
            (map (fn [graph]
                   (match-tuple graph fuel-tracker solution pattern filters error-ch)))
            async/merge)
-      (match-tuple active-graph fuel-tracker solution pattern filters error-ch))))
+      (match-tuple active-graph fuel-tracker solution pattern filters error-ch))
+    nil-channel))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
@@ -476,15 +477,16 @@
 
 (defmethod match-pattern :class
   [ds fuel-tracker solution pattern filters error-ch]
-  (let [triple       (val pattern)
-        active-graph (cond-> ds
-                       (dataset/dataset? ds) dataset/active)]
-    (if (sequential? active-graph)
-      (->> active-graph
-           (map (fn [graph]
-                  (match-class graph fuel-tracker solution triple filters error-ch)))
-           async/merge)
-      (match-class active-graph fuel-tracker solution triple filters error-ch))))
+  (if-let [active-graph (dataset/active ds)]
+    (let [triple (val pattern)]
+      (log/info "active graph:" active-graph)
+      (if (sequential? active-graph)
+        (->> active-graph
+             (map (fn [graph]
+                    (match-class graph fuel-tracker solution triple filters error-ch)))
+             async/merge)
+        (match-class active-graph fuel-tracker solution triple filters error-ch)))
+    nil-channel))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the

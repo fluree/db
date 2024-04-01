@@ -37,7 +37,7 @@
   (assoc this :policy root-policy-map))
 
 (defn- jsonld-p-prop [{:keys [schema]} property predicate]
-  (assert (#{:name :id :iri :type :ref? :unique :multi :index :upsert :datatype
+  (assert (#{:name :id :iri :type :unique :multi :index :upsert :datatype
              :component :noHistory :spec :specDoc :txSpec :txSpecDoc :restrictTag
              :retractDuplicates :subclassOf :new?}
             property)
