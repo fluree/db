@@ -496,8 +496,8 @@
                                      "@type" (into [] class-list)}}
 
             triples       (reduce
-                            (fn [et* c]
-                              (conj et* [rule-class $rdfs-subClassOf {"@id" c}]))
+                            (fn [triples* c]
+                              (conj triples* [rule-class $rdfs-subClassOf {"@id" c}]))
                             []
                             class-list)]
 
@@ -540,8 +540,8 @@
                                 class-list)
 
             triples           (reduce
-                                (fn [et* c]
-                                  (conj et* [c $rdfs-subClassOf {"@id" rule-class}]))
+                                (fn [triples* c]
+                                  (conj triples* [c $rdfs-subClassOf {"@id" rule-class}]))
                                 []
                                 class-list)]
 
@@ -594,6 +594,24 @@
             max-qual-cardinality (into (equiv-max-qual-cardinality c1 max-qual-cardinality)) ;; cls-maxqc3, cls-maxqc4
             )))
 
+;; rdfs:subClassOf
+(defmethod to-datalog ::cax-sco
+  [_ inserts owl-statement all-rules]
+  (let [c1         (:id owl-statement) ;; the class which is the subject
+        class-list (-> owl-statement
+                       (get $rdfs-subClassOf)
+                       get-all-ids)
+        triples    (reduce
+                     (fn [triples* c]
+                       (conj triples* [c1 $rdfs-subClassOf {"@id" c}]))
+                     []
+                     class-list)]
+
+    ;; fluree handles subClassOf at query-time, so just need
+    ;; to insert the triples into the current db
+    (swap! inserts assoc (str c1 "(rdfs:subClassOf)") triples)
+
+    all-rules))
 
 ;; TODO - re-enable once filter function bug is fixed
 (defmethod to-datalog ::prp-key
@@ -662,6 +680,9 @@
 
              (contains? owl-statement $owl-hasKey)
              (to-datalog ::prp-key inserts owl-statement)
+
+             (contains? owl-statement $rdfs-subClassOf)
+             (to-datalog ::cax-sco inserts owl-statement)
 
              (contains? owl-statement $owl-equivalentClass)
              (to-datalog ::cax-eqc inserts owl-statement)

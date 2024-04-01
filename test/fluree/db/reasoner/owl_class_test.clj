@@ -5,6 +5,64 @@
 
 ;; tests for OWL class reasoning rules
 
+(deftest ^:integration rdfs-subclassof
+  (testing "adding subClassOf declarations within the reasoning data set"
+    (let [conn       (test-utils/create-conn)
+          ledger     @(fluree/create conn "reasoner/owl-equiv" nil)
+          db-base    @(fluree/stage (fluree/db ledger)
+                                    {"@context" {"ex" "http://example.org/"}
+                                     "insert"   [{"@id"     "ex:brian"
+                                                  "@type"   "ex:Person"
+                                                  "ex:name" "Brian"}
+                                                 {"@id"     "ex:laura"
+                                                  "@type"   "ex:Employee"
+                                                  "ex:name" "Laura"}
+                                                 {"@id"     "ex:alice"
+                                                  "@type"   "ex:Human"
+                                                  "ex:name" "Alice"}]})
+
+          db-reason  @(fluree/reason db-base :owl2rl
+                                     [{"@context"        {"owl"  "http://www.w3.org/2002/07/owl#"
+                                                          "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+                                                          "ex"   "http://example.org/"}
+                                       "@id"             "ex:Employee"
+                                       "@type"           ["owl:Class"],
+                                       "rdfs:subClassOf" {"@id" "ex:Person"}}
+                                      {"@context"        {"owl"  "http://www.w3.org/2002/07/owl#"
+                                                          "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+                                                          "ex"   "http://example.org/"}
+                                       "@id"             "ex:Person"
+                                       "@type"           ["owl:Class"],
+                                       "rdfs:subClassOf" {"@id" "ex:Human"}}])
+
+          qry-Person @(fluree/query db-reason
+                                    {:context {"ex" "http://example.org/"}
+                                     :select  "?s"
+                                     :where   {"@id"   "?s"
+                                               "@type" "ex:Person"}})
+
+          qry-Human  @(fluree/query db-reason
+                                    {:context {"ex" "http://example.org/"}
+                                     :select  "?s"
+                                     :where   {"@id"   "?s"
+                                               "@type" "ex:Human"}})]
+
+      (is (= ["ex:Human"]
+             @(fluree/query db-reason {:context {"ex"   "http://example.org/"
+                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                       :select  "?subclasses"
+                                       :where   {"@id"             "ex:Person"
+                                                 "rdfs:subClassOf" "?subclasses"}}))
+          "The subClassOf triple should be inserted into the current db")
+
+      (is (= #{"ex:brian" "ex:laura"}
+             (set qry-Person))
+          "ex:brian, ex:laura should be of type ex:Person")
+
+      (is (= #{"ex:brian" "ex:laura" "ex:alice"}
+             (set qry-Human))
+          "ex:brian, ex:laura, ex:alice should be of type ex:Human"))))
+
 (deftest ^:integration owl-equivalent-class
   (testing "owl:equivalentClass test"
     (let [conn    (test-utils/create-conn)

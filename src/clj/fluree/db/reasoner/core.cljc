@@ -237,7 +237,7 @@
              db* db]
         (if rule-id
           (let [[db** flakes] (<? (reasoner-insert db* fuel-tracker nil nil rule-id insert))]
-            (log/debug "Rule" rule-id "inserted new flakes:" flakes)
+            (log/debug "Rule Flake insert:" rule-id "flakes:" flakes)
             (recur r db**))
           db*)))))
 
@@ -260,5 +260,5 @@
                             db*)]
       (log/trace "Final parsed reasoning rules: " reasoning-rules)
       (if (empty? reasoning-rules)
-        db
+        db**
         (<? (execute-reasoner db** reasoning-rules fuel-tracker reasoner-max tx-state))))))
