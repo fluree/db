@@ -66,15 +66,6 @@
           (assoc acc iri subclasses)))
       subclass-map subclass-map)))
 
-(defn extract-ref-sids
-  [property-maps]
-  (into #{}
-        (keep (fn [p-map]
-                (when (-> p-map :ref? true?)
-                  (:id p-map))))
-        property-maps))
-
-
 (def property-sids #{const/$rdf:Property
                      const/$owl:DatatypeProperty
                      const/$owl:ObjectProperty})
@@ -83,13 +74,11 @@
   [db sid]
   (if (= sid const/$rdf:type)
     {:id    sid ; rdf:type is predefined, so flakes to build map won't be present.
-     :class false
-     :ref?  true}
+     :class false}
     (let [iri (iri/decode-sid db sid)]
       {:id                 sid
        :iri                iri
        :class              true ; default
-       :ref?               false ; could go from false->true if defined in vocab but hasn't been used yet
        :subclassOf         #{}
        :equivalentProperty #{}})))
 
@@ -137,10 +126,10 @@
       (= const/$rdf:type pid)
       (if (contains? property-sids obj)
         (if (= const/$owl:ObjectProperty obj)
-          (update pred-map sid with-properties :class false, :ref? true)
+          (update pred-map sid with-properties :class false)
           (update pred-map sid with-properties :class false))
         (if (= const/$xsd:anyURI obj)
-          (update pred-map sid with-properties :class false, :ref? true)
+          (update pred-map sid with-properties :class false)
           ;; it is a class, but we already did :class true as a default
           pred-map))
 
@@ -159,9 +148,8 @@
                  (if (iri/sid? k)
                    (assoc preds k v, (:iri v) v)
                    preds))
-               {"@type" {:iri  "@type"
-                         :ref? true
-                         :id   const/$rdf:type}}
+               {"@type" {:iri "@type"
+                         :id  const/$rdf:type}}
                new-pred-map)))
 
 (defn refresh-subclasses
@@ -177,18 +165,15 @@
 
 (defn base-schema
   []
-  (let [pred (map-pred-id+iri [{:iri  "@type"
-                                :ref? true
-                                :id   const/$rdf:type}
-                               {:iri  "http://www.w3.org/2000/01/rdf-schema#Class"
-                                :ref? true
-                                :id   const/$rdfs:Class}])]
-    {:t           0
-     :refs        #{}
-     :pred        pred
-     :shapes      (atom {:class {} ; TODO: Does this need to be an atom?
-                         :pred  {}})
-     :subclasses  (delay {})}))
+  (let [pred (map-pred-id+iri [{:iri "@type"
+                                :id  const/$rdf:type}
+                               {:iri "http://www.w3.org/2000/01/rdf-schema#Class"
+                                :id  const/$rdfs:Class}])]
+    {:t          0
+     :pred       pred
+     :shapes     (atom {:class {} ; TODO: Does this need to be an atom?
+                        :pred  {}})
+     :subclasses (delay {})}))
 
 (defn reset-shapes
   "Resets the shapes cache - called when new shapes added to db"
@@ -280,12 +265,11 @@
 
 (defn build-schema
   [db pids vocab-flakes]
-  (let [t        (:t db)
-        schema   (-> (base-schema)
-                     (update :pred (partial add-predicates db) pids)
-                     (as-> s (update-with s db t vocab-flakes)))
-        refs     (extract-ref-sids (:pred schema))]
-    (assoc schema :refs refs)))
+  (let [{:keys [schema t]} db
+        schema* (-> schema
+                    (update :pred (partial add-predicates db) pids)
+                    (as-> s (update-with s db t vocab-flakes)))]
+    schema*))
 
 (defn hydrate-schema
   "Updates the :schema key of db by processing just the vocabulary flakes out of
@@ -297,15 +281,9 @@
                                      (or (contains? pred-sids (flake/s f))
                                          (contains? jld-ledger/predicate-refs (flake/p f)))))
                            new-flakes)
-        {:keys [t refs pred shapes subclasses]}
-        (-> (build-schema db pred-sids vocab-flakes)
-            (add-pred-datatypes (pred-dt-constraints new-flakes)))]
-    (-> db
-        (assoc-in [:schema :t] t)
-        (update-in [:schema :refs] into refs)
-        (update-in [:schema :pred] (partial merge-with merge) pred)
-        (assoc-in [:schema :subclasses] subclasses)
-        (assoc-in [:schema :shapes] shapes))))
+        schema       (-> (build-schema db pred-sids vocab-flakes)
+                         (add-pred-datatypes (pred-dt-constraints new-flakes)))]
+    (assoc db :schema schema)))
 
 (defn load-schema
   [{:keys [preds t] :as db}]
