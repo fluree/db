@@ -15,41 +15,28 @@
   #?(:clj (:import (java.util.regex Pattern))))
 
 (comment
- ;; a raw SHACL shape looks something like this:
- {:id             :ex/UserShape,
-  :type       [:sh/NodeShape],
-  :sh/targetClass {:id :ex/User},
-  :sh/property    [{:id          "_:f211106232533000",
-                    :sh/path     {:id :schema/name},
-                    :sh/minCount 1,
-                    :sh/maxCount 1,
-                    :sh/datatype {:id :xsd/string}}
-                   {:id          "_:f211106232533002",
-                    :sh/path     {:id :schema/email},
-                    :sh/minCount 1,
-                    :sh/maxCount 1,
-                    :sh/nodeKind {:id :sh/IRI}}]})
+  ;; a raw SHACL shape looks something like this:
+  {#fluree/SID [1 "id"] #fluree/SID [101 "UserShape"]
+   #fluree/SID [3 "type"] [#fluree/SID [5 "NodeShape"]]
+   #fluree/SID [5 "targetClass"] [#fluree/SID [101 "User"]]
+   #fluree/SID [5 "property"]
+   [{#fluree/SID [1 "id"] #fluree/SID [24 "fdb-2"]
+     #fluree/SID [5 "datatype"] [#fluree/SID [2 "string"]]
+     #fluree/SID [5 "maxCount"] [1]
+     #fluree/SID [5 "minCount"] [1]
+     #fluree/SID [5 "path"] [#fluree/SID [17 "name"]]}
 
+    {#fluree/SID [1 "id"] #fluree/SID [24 "fdb-3"]
+     #fluree/SID [5 "maxCount"] [1]
+     #fluree/SID [5 "maxInclusive"] [130]
+     #fluree/SID [5 "minCount"] [1]
+     #fluree/SID [5 "minInclusive"] [0]
+     #fluree/SID [5 "path"] [#fluree/SID [17 "age"]]}
 
-
-
-;; property min & max
-;; -- if new, can just make sure for each property between min and max
-;; -- if existing, need to get existing counts
-
-;; property data type
-;; - any "adds" just coerce, ignore retractions
-
-;; sh:ignoredProperties - let pass through
-
-;; sh:closed true
-;; - have a set of allowed and reject if not in the list
-;; - set includes all properties from above + ignoredProperties
-
-
-(defn apply-flake-changes
-  [existing-flakes changed-flakes]
-  :TODO)
+    {#fluree/SID [1 "id"] #fluree/SID [24 "fdb-4"]
+     #fluree/SID [5 "datatype"] [#fluree/SID [2 "string"]]
+     #fluree/SID [5 "path"] [#fluree/SID [17 "email"]]}]}
+  ,)
 
 (def numeric-types
   #{const/$xsd:int
