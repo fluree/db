@@ -375,7 +375,7 @@
          (update-in [:novelty :opst] flake/revise ref-add ref-rem)
          (update-in [:novelty :tspo] flake/revise add rem)
          (update-in [:novelty :size] + flake-size)
-         (update-in [:stats :size] + flake-size)
+         (update-in [:stats :size] + (flake/size-bytes add))
          (update-in [:stats :flakes] + flake-count)))))
 
 (defn add-tt-id
