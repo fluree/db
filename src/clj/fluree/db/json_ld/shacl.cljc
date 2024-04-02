@@ -1064,7 +1064,7 @@
       (let [sid             (some-> s-flakes first flake/s)
             referring-pids  (not-empty (<? (query-range/index-range db :opst = [sid] {:flake-xf (map flake/p)})))
             p-flakes        (not-empty (filterv (fn [f] (= (flake/p f) target-pid)) s-flakes))]
-        [p-flakes (when referring-pids s-flakes)]))))
+        (remove nil? [p-flakes (when referring-pids s-flakes)])))))
 
 (defn resolve-target-flakes
   "Return a sequence of focus flakes for the given node shape target."
