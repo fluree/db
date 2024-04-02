@@ -425,7 +425,7 @@
                     `[mch#      (get ~soln-sym (quote ~var))
                       ~dt-var   (where/get-datatype-iri mch#)
                       ~lang-var (-> mch# ::where/meta :lang (or ""))
-                      ~var      (cond->> (where/get-value mch#)
+                      ~var      (cond->> (where/get-binding mch#)
                                   (= ~dt-var ::group/grouping)
                                   (mapv where/get-value))])))
         var-syms))

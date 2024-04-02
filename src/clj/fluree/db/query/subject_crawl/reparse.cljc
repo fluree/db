@@ -139,8 +139,7 @@
   If where does not end up meeting simple-subject-crawl criteria, returns nil
   so other strategies can be tried."
   [db {:keys [where vars] :as parsed-query}]
-  (let [{::where/keys [patterns]} where
-        [first-pattern & rest-patterns] patterns
+  (let [[first-pattern & rest-patterns] where
         reparsed-first-clause (re-parse-pattern db first-pattern)]
     (when-let [first-s (and (mergeable-where-clause? first-pattern)
                             (clause-subject-var first-pattern))]
@@ -165,17 +164,20 @@
   [{:keys [where select vars] :as _parsed-query} db]
   (and (instance? SubgraphSelector select)
        ;;TODO, filtering not supported yet
-       (empty? (::where/filters where))
+       (->> where
+            (filter (fn [pattern]
+                      (= :filter (where/pattern-type pattern))))
+            empty?)
        ;;TODO: vars support not complete
        (empty? vars)
        (when-let [{select-var :subj} select]
-         (let [{::where/keys [patterns]} where]
-           (every? (fn [pattern]
-                     (and (mergeable-where-clause? pattern)
-                          (let [pred (second pattern)]
-                            (and (= select-var (clause-subject-var pattern))
-                                 (not (has-equivalent-properties? db pattern))
-                                 (not (::where/fullText pred)))))) patterns)))))
+         (every? (fn [pattern]
+                   (and (mergeable-where-clause? pattern)
+                        (let [pred (second pattern)]
+                          (and (= select-var (clause-subject-var pattern))
+                               (not (has-equivalent-properties? db pattern))
+                               (not (::where/fullText pred))))))
+                 where))))
 
 (defn re-parse-as-simple-subj-crawl
   "Returns true if query contains a single subject crawl.
