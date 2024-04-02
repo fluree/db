@@ -1665,185 +1665,200 @@ WORLD!")
              (ex-message db2))))))
 
 (deftest ^:integration shacl-targetobjectsof-test
-  (testing "subject and object of constrained predicate in the same txn"
-    (testing "datatype constraint"
-      (let [conn               @(fluree/connect {:method :memory})
-            ledger             @(fluree/create conn "shacl-target-objects-of-test")
-            context            [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-            db1                @(fluree/stage (fluree/db ledger)
-                                              {"@context" ["https://ns.flur.ee" context]
-                                               "insert"
-                                               {"@id"                "ex:friendShape"
-                                                "type"               ["sh:NodeShape"]
-                                                "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                                "sh:property"        [{"sh:path"     {"@id" "ex:name"}
-                                                                       "sh:datatype" {"@id" "xsd:string"}}]}})
-            db-bad-friend-name @(fluree/stage db1
-                                              {"@context" ["https://ns.flur.ee" context]
-                                               "insert"
-                                               [{"id"        "ex:Alice"
-                                                 "ex:name"   "Alice"
-                                                 "type"      "ex:User"
-                                                 "ex:friend" {"@id" "ex:Bob"}}
-                                                {"id"      "ex:Bob"
-                                                 "ex:name" 123
-                                                 "type"    "ex:User"}]})]
-        (is (= "Value 123 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
-               (ex-message db-bad-friend-name)))))
-    (testing "maxCount"
-      (let [conn          @(fluree/connect {:method :memory})
-            ledger        @(fluree/create conn "shacl-target-objects-of-test")
-            context       [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-            db1           @(fluree/stage (fluree/db ledger)
-                                         {"@context" ["https://ns.flur.ee" context]
-                                          "insert"
-                                          {"@id"                "ex:friendShape"
-                                           "type"               ["sh:NodeShape"]
-                                           "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                           "sh:property"        [{"sh:path"     {"@id" "ex:ssn"}
-                                                                  "sh:maxCount" 1}]}})
-            db-excess-ssn @(fluree/stage db1
-                                         {"@context" ["https://ns.flur.ee" context]
-                                          "insert"
-                                          [{"id"        "ex:Alice"
-                                            "ex:name"   "Alice"
-                                            "type"      "ex:User"
-                                            "ex:friend" {"@id" "ex:Bob"}}
-                                           {"id"     "ex:Bob"
-                                            "ex:ssn" ["111-11-1111"
-                                                      "222-22-2222"]
-                                            "type"   "ex:User"}]})]
-        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
-               (ex-message db-excess-ssn)))))
-    (testing "required properties"
-      (let [conn          @(fluree/connect {:method :memory})
-            ledger        @(fluree/create conn "shacl-target-objects-of-test")
-            context       [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-            db1           @(fluree/stage (fluree/db ledger)
-                                         {"@context" ["https://ns.flur.ee" context]
-                                          "insert"
-                                          [{"@id"                "ex:friendShape"
-                                            "type"               ["sh:NodeShape"]
-                                            "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                            "sh:property"        [{"sh:path"     {"@id" "ex:ssn"}
-                                                                   "sh:minCount" 1}]}]})
-            db-just-alice @(fluree/stage db1
-                                         {"@context" ["https://ns.flur.ee" context]
-                                          "insert"
-                                          [{"id"        "ex:Alice"
-                                            "ex:name"   "Alice"
-                                            "type"      "ex:User"
-                                            "ex:friend" {"@id" "ex:Bob"}}]})]
-        (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
-               (ex-message db-just-alice)))))
-    (testing "combined with `sh:targetClass`"
-      (let [conn          @(fluree/connect {:method :memory})
-            ledger        @(fluree/create conn "shacl-target-objects-of-test")
-            context       [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-            db1           @(fluree/stage (fluree/db ledger)
-                                         {"@context" ["https://ns.flur.ee" context]
-                                          "insert"
-                                          [{"@id"            "ex:UserShape"
-                                            "type"           ["sh:NodeShape"]
-                                            "sh:targetClass" {"@id" "ex:User"}
-                                            "sh:property"    [{"sh:path"     {"@id" "ex:ssn"}
-                                                               "sh:maxCount" 1}]}
-                                           {"@id"                "ex:friendShape"
-                                            "type"               ["sh:NodeShape"]
-                                            "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                            "sh:property"        [{"sh:path"     {"@id" "ex:name"}
-                                                                   "sh:maxCount" 1}]}]})
-            db-bad-friend @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                              "insert"   [{"id"        "ex:Alice"
-                                                           "ex:name"   "Alice"
-                                                           "type"      "ex:User"
-                                                           "ex:friend" {"@id" "ex:Bob"}}
-                                                          {"id"      "ex:Bob"
-                                                           "ex:name" ["Bob" "Robert"]
-                                                           "ex:ssn"  "111-11-1111"
-                                                           "type"    "ex:User"}]})]
-        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
-               (ex-message db-bad-friend))))))
-  (testing "separate txns"
-    (testing "maxCount"
-      (let [conn   @(fluree/connect {:method :memory})
-            ledger @(fluree/create conn "shacl-target-objects-of-test")
+  (let [conn    @(fluree/connect {:method :memory})
+        ledger  @(fluree/create conn "shacl-target-objects-of-test")
+        context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
+        db0     (fluree/db ledger)]
+    (testing "subject and object of constrained predicate in the same txn"
+      (testing "datatype constraint"
+        (let [db1                @(fluree/stage db0
+                                                {"@context" ["https://ns.flur.ee" context]
+                                                 "insert"
+                                                 {"@id"                "ex:friendShape"
+                                                  "type"               ["sh:NodeShape"]
+                                                  "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                                  "sh:property"        [{"sh:path"     {"@id" "ex:name"}
+                                                                         "sh:datatype" {"@id" "xsd:string"}}]}})
+              db-bad-friend-name @(fluree/stage db1
+                                                {"@context" ["https://ns.flur.ee" context]
+                                                 "insert"
+                                                 [{"id"        "ex:Alice"
+                                                   "ex:name"   "Alice"
+                                                   "type"      "ex:User"
+                                                   "ex:friend" {"@id" "ex:Bob"}}
+                                                  {"id"      "ex:Bob"
+                                                   "ex:name" 123
+                                                   "type"    "ex:User"}]})]
+          (is (= "Value 123 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
+                 (ex-message db-bad-friend-name)))))
+      (testing "maxCount"
+        (let [db1           @(fluree/stage db0
+                                           {"@context" ["https://ns.flur.ee" context]
+                                            "insert"
+                                            {"@id"                "ex:friendShape"
+                                             "type"               ["sh:NodeShape"]
+                                             "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                             "sh:property"        [{"sh:path"     {"@id" "ex:ssn"}
+                                                                    "sh:maxCount" 1}]}})
+              db-excess-ssn @(fluree/stage db1
+                                           {"@context" ["https://ns.flur.ee" context]
+                                            "insert"
+                                            [{"id"        "ex:Alice"
+                                              "ex:name"   "Alice"
+                                              "type"      "ex:User"
+                                              "ex:friend" {"@id" "ex:Bob"}}
+                                             {"id"     "ex:Bob"
+                                              "ex:ssn" ["111-11-1111"
+                                                        "222-22-2222"]
+                                              "type"   "ex:User"}]})]
+          (is (= {:status 400,
+                  :error  :shacl/violation,
+                  :report
+                  [{:subject    "ex:Bob",
+                    :constraint "sh:maxCount",
+                    :shape      "_:fdb-5",
+                    :path       ["ex:ssn"],
+                    :value      2,
+                    :expect     1,
+                    :message    "count 2 is greater than maximum count of 1"}]}
+                 (ex-data db-excess-ssn)))
+          (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:maxCount of shape _:fdb-5 - count 2 is greater than maximum count of 1."
+                 (ex-message db-excess-ssn)))))
+      (testing "required properties"
+        (let [db1           @(fluree/stage db0
+                                           {"@context" ["https://ns.flur.ee" context]
+                                            "insert"
+                                            [{"@id"                "ex:friendShape"
+                                              "type"               ["sh:NodeShape"]
+                                              "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                              "sh:property"        [{"sh:path"     {"@id" "ex:ssn"}
+                                                                     "sh:minCount" 1}]}]})
+              db-just-alice @(fluree/stage db1
+                                           {"@context" ["https://ns.flur.ee" context]
+                                            "insert"
+                                            [{"id"        "ex:Alice"
+                                              "ex:name"   "Alice"
+                                              "type"      "ex:User"
+                                              "ex:friend" {"@id" "ex:Bob"}}]})]
+          (is (= {:status 400,
+                  :error  :shacl/violation,
+                  :report
+                  [{:subject    "ex:Alice",
+                    :constraint "sh:minCount",
+                    :shape      "_:fdb-8",
+                    :path       ["ex:ssn"],
+                    :value      0,
+                    :expect     1,
+                    :message    "count 0 is less than minimum count of 1"}]}
+                 (ex-data db-just-alice)))
+          (is (= "Subject ex:Alice path [\"ex:ssn\"] violates constraint sh:minCount of shape _:fdb-8 - count 0 is less than minimum count of 1."
+                 (ex-message db-just-alice)))))
+      (testing "combined with `sh:targetClass`"
+        (let [db1           @(fluree/stage db0
+                                           {"@context" ["https://ns.flur.ee" context]
+                                            "insert"
+                                            [{"@id"            "ex:UserShape"
+                                              "type"           ["sh:NodeShape"]
+                                              "sh:targetClass" {"@id" "ex:User"}
+                                              "sh:property"    [{"sh:path"     {"@id" "ex:ssn"}
+                                                                 "sh:maxCount" 1}]}
+                                             {"@id"                "ex:friendShape"
+                                              "type"               ["sh:NodeShape"]
+                                              "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                              "sh:property"        [{"sh:path"     {"@id" "ex:name"}
+                                                                     "sh:maxCount" 1}]}]})
+              db-bad-friend @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                                "insert"   [{"id"        "ex:Alice"
+                                                             "ex:name"   "Alice"
+                                                             "type"      "ex:User"
+                                                             "ex:friend" {"@id" "ex:Bob"}}
+                                                            {"id"      "ex:Bob"
+                                                             "ex:name" ["Bob" "Robert"]
+                                                             "ex:ssn"  "111-11-1111"
+                                                             "type"    "ex:User"}]})]
+          (is (= {:status 400,
+                  :error  :shacl/violation,
+                  :report
+                  [{:subject    "ex:Bob",
+                    :constraint "sh:maxCount",
+                    :shape      "_:fdb-12",
+                    :path       ["ex:name"],
+                    :value      2,
+                    :expect     1,
+                    :message    "count 2 is greater than maximum count of 1"}]}
+                 (ex-data db-bad-friend)))
+          (is (= "Subject ex:Bob path [\"ex:name\"] violates constraint sh:maxCount of shape _:fdb-12 - count 2 is greater than maximum count of 1."
+                 (ex-message db-bad-friend))))))
+    (testing "separate txns"
+      (testing "maxCount"
+        (let [db1                    @(fluree/stage db0
+                                                    {"@context" ["https://ns.flur.ee" context]
+                                                     "insert"
+                                                     [{"@id"                "ex:friendShape"
+                                                       "type"               ["sh:NodeShape"]
+                                                       "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                                       "sh:property"        [{"sh:path"     {"@id" "ex:ssn"}
+                                                                              "sh:maxCount" 1}]}]})
+              db2                    @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                                         "insert"   [{"id"     "ex:Bob"
+                                                                      "ex:ssn" ["111-11-1111" "222-22-2222"]
+                                                                      "type"   "ex:User"}]})
+              db-db-forbidden-friend @(fluree/stage db2
+                                                    {"@context" ["https://ns.flur.ee" context]
+                                                     "insert"
+                                                     {"id"        "ex:Alice"
+                                                      "type"      "ex:User"
+                                                      "ex:friend" {"@id" "ex:Bob"}}})]
+          (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+                 (ex-message db-db-forbidden-friend))))
+        (let [db1           @(fluree/stage db0
+                                           {"@context" ["https://ns.flur.ee" context]
+                                            "insert"
+                                            [{"@id"                "ex:friendShape"
+                                              "type"               ["sh:NodeShape"]
+                                              "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                              "sh:property"        [{"sh:path"     {"@id" "ex:ssn"}
+                                                                     "sh:maxCount" 1}]}]})
+              db2           @(fluree/stage db1
+                                           {"@context" ["https://ns.flur.ee" context]
+                                            "insert"
+                                            [{"id"        "ex:Alice"
+                                              "ex:name"   "Alice"
+                                              "type"      "ex:User"
+                                              "ex:friend" {"@id" "ex:Bob"}}
+                                             {"id"      "ex:Bob"
+                                              "ex:name" "Bob"
+                                              "type"    "ex:User"}]})
+              db-excess-ssn @(fluree/stage db2
+                                           {"@context" ["https://ns.flur.ee" context]
+                                            "insert"
+                                            {"id"     "ex:Bob"
+                                             "ex:ssn" ["111-11-1111"
+                                                       "222-22-2222"]}})]
+          (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+                 (ex-message db-excess-ssn)))))
+      (testing "datatype"
+        (let [db1     @(fluree/stage db0
+                                     {"@context" ["https://ns.flur.ee" context]
+                                      "insert"   {"@id"                "ex:friendShape"
+                                                  "type"               ["sh:NodeShape"]
+                                                  "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                                  "sh:property"        [{"sh:path"     {"@id" "ex:name"}
+                                                                         "sh:datatype" {"@id" "xsd:string"}}]}})
 
-            context                [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-            db1                    @(fluree/stage (fluree/db ledger)
-                                                  {"@context" ["https://ns.flur.ee" context]
-                                                   "insert"
-                                                   [{"@id"                "ex:friendShape"
-                                                     "type"               ["sh:NodeShape"]
-                                                     "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                                     "sh:property"        [{"sh:path"     {"@id" "ex:ssn"}
-                                                                            "sh:maxCount" 1}]}]})
-            db2                    @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                                       "insert"   [{"id"     "ex:Bob"
-                                                                    "ex:ssn" ["111-11-1111" "222-22-2222"]
-                                                                    "type"   "ex:User"}]})
-            db-db-forbidden-friend @(fluree/stage db2
-                                                  {"@context" ["https://ns.flur.ee" context]
-                                                   "insert"
-                                                   {"id"        "ex:Alice"
-                                                    "type"      "ex:User"
-                                                    "ex:friend" {"@id" "ex:Bob"}}})]
-        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
-               (ex-message db-db-forbidden-friend))))
-      (let [conn          @(fluree/connect {:method :memory})
-            ledger        @(fluree/create conn "shacl-target-objects-of-test")
-            context       [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-            db1           @(fluree/stage (fluree/db ledger)
-                                         {"@context" ["https://ns.flur.ee" context]
-                                          "insert"
-                                          [{"@id"                "ex:friendShape"
-                                            "type"               ["sh:NodeShape"]
-                                            "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                            "sh:property"        [{"sh:path"     {"@id" "ex:ssn"}
-                                                                   "sh:maxCount" 1}]}]})
-            db2           @(fluree/stage db1
-                                         {"@context" ["https://ns.flur.ee" context]
-                                          "insert"
-                                          [{"id"        "ex:Alice"
-                                            "ex:name"   "Alice"
-                                            "type"      "ex:User"
-                                            "ex:friend" {"@id" "ex:Bob"}}
-                                           {"id"      "ex:Bob"
-                                            "ex:name" "Bob"
-                                            "type"    "ex:User"}]})
-            db-excess-ssn @(fluree/stage db2
-                                         {"@context" ["https://ns.flur.ee" context]
-                                          "insert"
-                                          {"id"     "ex:Bob"
-                                           "ex:ssn" ["111-11-1111"
-                                                     "222-22-2222"]}})]
-        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
-               (ex-message db-excess-ssn)))))
-    (testing "datatype"
-      (let [conn    @(fluree/connect {:method :memory})
-            ledger  @(fluree/create conn "shacl-target-objects-of-test")
-            context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-            db1     @(fluree/stage (fluree/db ledger)
-                                   {"@context" ["https://ns.flur.ee" context]
-                                    "insert"   {"@id"                "ex:friendShape"
-                                                "type"               ["sh:NodeShape"]
-                                                "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                                "sh:property"        [{"sh:path"     {"@id" "ex:name"}
-                                                                       "sh:datatype" {"@id" "xsd:string"}}]}})
-
-            ;; need to specify type in order to avoid sh:datatype coercion
-            db2                 @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                                    "insert"   {"id"      "ex:Bob"
-                                                                "ex:name" {"@type" "xsd:integer" "@value" 123}
-                                                                "type"    "ex:User"}})
-            db-forbidden-friend @(fluree/stage db2
-                                               {"@context" ["https://ns.flur.ee" context]
-                                                "insert"
-                                                {"id"        "ex:Alice"
-                                                 "type"      "ex:User"
-                                                 "ex:friend" {"@id" "ex:Bob"}}})]
-        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be http://www.w3.org/2001/XMLSchema#string."
-               (ex-message db-forbidden-friend)))))))
+              ;; need to specify type in order to avoid sh:datatype coercion
+              db2                 @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                                      "insert"   {"id"      "ex:Bob"
+                                                                  "ex:name" {"@type" "xsd:integer" "@value" 123}
+                                                                  "type"    "ex:User"}})
+              db-forbidden-friend @(fluree/stage db2
+                                                 {"@context" ["https://ns.flur.ee" context]
+                                                  "insert"
+                                                  {"id"        "ex:Alice"
+                                                   "type"      "ex:User"
+                                                   "ex:friend" {"@id" "ex:Bob"}}})]
+          (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be http://www.w3.org/2001/XMLSchema#string."
+                 (ex-message db-forbidden-friend))))))))
 
 (deftest ^:integration shape-based-constraints
   (testing "sh:node"
