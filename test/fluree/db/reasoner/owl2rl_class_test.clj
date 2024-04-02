@@ -245,9 +245,9 @@
                                             "owl:equivalentClass" [{"@type"              "owl:Restriction"
                                                                     "owl:onProperty"     {"@id" "ex:hasMaker"}
                                                                     "owl:someValuesFrom" {"@type"     "owl:Class"
-                                                                                          "owl:oneOf" {"@list" [{"@id" "ex:Winery"}
-                                                                                                                {"@id" "ex:TextileFactory"}]}}}]}])]
-          (is (= #{"ex:maybe-a-wine" "ex:a-wine-1" "ex:a-wine-2" "ex:not-a-wine-1"}
+                                                                                          "owl:oneOf" {"@list" [{"@id" "ex:winery2"}
+                                                                                                                {"@id" "ex:winery1"}]}}}]}])]
+          (is (= #{"ex:maybe-a-wine" "ex:a-wine-1" "ex:a-wine-2"}
                  (set @(fluree/query db-some-val
                                      {:context {"ex" "http://example.org/"}
                                       :select  "?s"
@@ -459,12 +459,11 @@
           ledger  @(fluree/create conn "reasoner/owl-one-of" nil)
           db-base @(fluree/stage (fluree/db ledger)
                                  {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id"   "ex:greenWidget"
-                                               "@type" "ex:Green"}
-                                              {"@id"   "ex:blueWidget"
-                                               "@type" "ex:Blue"}
-                                              {"@id"   "ex:redWidget"
-                                               "@type" "ex:Red"}]})]
+                                  "insert"   [{"@id"      "ex:widget"
+                                               "ex:color" {"@id" "ex:Red"}}
+                                              {"@id" "ex:Green"}
+                                              {"@id" "ex:Blue"}
+                                              {"@id" "ex:Red"}]})]
 
       (testing "Testing owl:oneOf simple declaration as list"
         (let [db-equiv @(fluree/reason db-base :owl2rl
@@ -480,14 +479,14 @@
                                                      "owl:equivalentClass" [{"@type"     "owl:Class"
                                                                              "owl:oneOf" {"@list" [{"@id" "ex:Red"}
                                                                                                    {"@id" "ex:Blue"}]}}]}]})]
-          (is (= #{"ex:redWidget" "ex:greenWidget"}
+          (is (= #{"ex:Red" "ex:Green"}
                  (set @(fluree/query db-equiv
                                      {:context {"ex" "http://example.org/"}
                                       :select  "?s"
                                       :where   {"@id"   "?s"
                                                 "@type" "ex:RedOrGreen"}}))))
 
-          (is (= #{"ex:redWidget" "ex:blueWidget"}
+          (is (= #{"ex:Red" "ex:Blue"}
                  (set @(fluree/query db-equiv
                                      {:context {"ex" "http://example.org/"}
                                       :select  "?s"
@@ -495,34 +494,32 @@
                                                 "@type" "ex:RedOrBlue"}}))))))
 
       (testing "Testing owl:oneOf simple declaration as multi-cardinality"
-        (let [db-equiv       @(fluree/reason db-base :owl2rl
-                                             {"@context" {"owl" "http://www.w3.org/2002/07/owl#"
-                                                          "ex"  "http://example.org/"}
-                                              "@graph"   [{"@id"                 "ex:RedOrGreen"
-                                                           "@type"               ["owl:Class"]
-                                                           "owl:equivalentClass" [{"@type"     "owl:Class"
-                                                                                   "owl:oneOf" [{"@id" "ex:Red"}
-                                                                                                {"@id" "ex:Green"}]}]}
-                                                          {"@id"                 "ex:RedOrBlue"
-                                                           "@type"               ["owl:Class"]
-                                                           "owl:equivalentClass" [{"@type"     "owl:Class"
-                                                                                   "owl:oneOf" [{"@id" "ex:Red"}
-                                                                                                {"@id" "ex:Blue"}]}]}]})
-              qry-RedOrGreen @(fluree/query db-equiv
-                                            {:context {"ex" "http://example.org/"}
-                                             :select  "?s"
-                                             :where   {"@id"   "?s"
-                                                       "@type" "ex:RedOrGreen"}})
-              qry-RedOrBlue  @(fluree/query db-equiv
-                                            {:context {"ex" "http://example.org/"}
-                                             :select  "?s"
-                                             :where   {"@id"   "?s"
-                                                       "@type" "ex:RedOrBlue"}})]
-          (is (= #{"ex:redWidget" "ex:greenWidget"}
-                 (set qry-RedOrGreen)))
+        (let [db-equiv @(fluree/reason db-base :owl2rl
+                                       {"@context" {"owl" "http://www.w3.org/2002/07/owl#"
+                                                    "ex"  "http://example.org/"}
+                                        "@graph"   [{"@id"                 "ex:RedOrGreen"
+                                                     "@type"               ["owl:Class"]
+                                                     "owl:equivalentClass" [{"@type"     "owl:Class"
+                                                                             "owl:oneOf" [{"@id" "ex:Red"}
+                                                                                          {"@id" "ex:Green"}]}]}
+                                                    {"@id"                 "ex:RedOrBlue"
+                                                     "@type"               ["owl:Class"]
+                                                     "owl:equivalentClass" [{"@type"     "owl:Class"
+                                                                             "owl:oneOf" [{"@id" "ex:Red"}
+                                                                                          {"@id" "ex:Blue"}]}]}]})]
+          (is (= #{"ex:Red" "ex:Green"}
+                 (set @(fluree/query db-equiv
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?s"
+                                      :where   {"@id"   "?s"
+                                                "@type" "ex:RedOrGreen"}}))))
 
-          (is (= #{"ex:redWidget" "ex:blueWidget"}
-                 (set qry-RedOrBlue))))))))
+          (is (= #{"ex:Red" "ex:Blue"}
+                 (set @(fluree/query db-equiv
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?s"
+                                      :where   {"@id"   "?s"
+                                                "@type" "ex:RedOrBlue"}})))))))))
 
 (deftest ^:integration owl-intersection-of
   (testing "owl:intersectionOf tests - rules cls-int1, cls-int2, scm-int"

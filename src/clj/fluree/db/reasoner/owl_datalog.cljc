@@ -422,45 +422,50 @@
   "Used to build union clause for owl:oneOf class.
 
   Assume just a single one-of-statement is passed in, not a list."
-  [binding-var one-of-statement]
-  (let [classes (-> one-of-statement
-                    (get $owl-oneOf)
-                    get-all-ids)]
-    (reduce (fn [acc c]
-              (conj acc {"@id"   binding-var
-                         "@type" c}))
+  [binding-var property one-of-statement]
+  (let [individuals (-> one-of-statement
+                        (get $owl-oneOf)
+                        get-all-ids)]
+    (reduce (fn [acc i]
+              (conj acc {"@id"    binding-var
+                         property {"@id" i}}))
             ["union"]
-            classes)))
+            individuals)))
 
 (defn equiv-some-values
-  "Handles rules cls-svf1, cls-svf2"
+  "Handles rules cls-svf1, cls-svf2
+
+  Value of owl:someValuesFrom must be a single class, but that class can be
+  a owl:oneOf, etc which allows for multiple criteria to match."
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property     (util/get-first-id restriction $owl-onProperty)
+      (let [property (util/get-first-id restriction $owl-onProperty)
             {:keys [classes one-of]} (group-by equiv-class-type (get restriction $owl-someValuesFrom))
-            some-val     (when classes
-                           (-> classes first :id))
-            p-val-clause (if some-val
-                           {"@id"   "?y"
-                            "@type" some-val}
-                           (if one-of
-                             (one-of-condition "?y" (first one-of))
-                             nil))
-            rule         (if (= $owl-Thing some-val)
-                           ;; special case where someValuesFrom is owl:Thing, means
-                           ;; everything with property should be in the class (cls-svf2)
-                           {"where"  {"@id"    "?x"
-                                      property nil}
-                            "insert" {"@id"   "?x"
-                                      "@type" rule-class}}
-                           ;; normal case where someValuesFrom is a class (cls-svf1)
-                           {"where"  [{"@id"    "?x"
-                                       property "?y"}
-                                      p-val-clause]
-                            "insert" {"@id"   "?x"
-                                      "@type" rule-class}})]
-        (if (and property p-val-clause)
+            rule     (cond
+                       ;; special case where someValuesFrom is owl:Thing, means
+                       ;; everything with property should be in the class (cls-svf2)
+                       (and classes (= $owl-Thing (-> classes first :id)))
+                       {"where"  {"@id"    "?x"
+                                  property nil}
+                        "insert" {"@id"   "?x"
+                                  "@type" rule-class}}
+
+                       ;; an explicit class is defined for someValuesFrom (cls-svf1)
+                       classes
+                       {"where"  [{"@id"    "?x"
+                                   property "?y"}
+                                  {"@id"   "?y"
+                                   "@type" (-> classes first :id)}]
+                        "insert" {"@id"   "?x"
+                                  "@type" rule-class}}
+
+                       ;; one-of is defined for someValuesFrom (cls-svf1)
+                       one-of
+                       {"where"  [(one-of-condition "?x" property (first one-of))]
+                        "insert" {"@id"   "?x"
+                                  "@type" rule-class}})]
+        (if rule
           (conj acc [(str rule-class "(owl:someValuesFrom-" property ")") rule])
           (do (log/warn "owl:Restriction for class" rule-class
                         "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
@@ -554,24 +559,20 @@
 
 (defn equiv-one-of
   "Handles rule cls-oo"
-  [rule-class one-of-statements]
-  (reduce
-    (fn [acc one-of-statement]
-      (let [class-list (-> one-of-statement
-                           (get $owl-oneOf)
-                           get-all-ids)
-            union      (reduce (fn [acc c]
-                                 (conj acc
-                                       {"@id"   "?x"
-                                        "@type" c}))
-                               ["union"]
-                               class-list)
-            rule       {"where"  [union]
-                        "insert" {"@id"   "?x"
-                                  "@type" rule-class}}]
-        (conj acc [(str rule-class "(owl:oneOf)") rule])))
-    []
-    one-of-statements))
+  [rule-class one-of-statements inserts]
+  (let [triples (reduce (fn [acc one-of-statement]
+                          (let [individuals (-> one-of-statement
+                                                (get $owl-oneOf)
+                                                get-all-ids)
+                                triples     (map (fn [i]
+                                                   [i "@type" rule-class])
+                                                 individuals)]
+                            (into acc triples)))
+                        #{}
+                        one-of-statements)]
+    (swap! inserts assoc (str rule-class "(owl:oneOf)") triples)
+    ;; return empty rules, as the triples are inserted directly
+    []))
 
 (defmethod to-datalog ::cax-eqc
   [_ inserts owl-statement all-rules]
@@ -586,7 +587,7 @@
             classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
             intersection-of (into (equiv-intersection-of c1 intersection-of inserts)) ;; cls-int1, cls-int2, scm-int
             union-of (into (equiv-union-of c1 union-of inserts)) ;; cls-uni, scm-uni
-            one-of (into (equiv-one-of c1 one-of)) ;; cls-oo
+            one-of (into (equiv-one-of c1 one-of inserts)) ;; cls-oo
             has-value (into (equiv-has-value c1 has-value)) ;; cls-hv1, cls-hv1
             some-values (into (equiv-some-values c1 some-values)) ;; cls-svf1, cls-svf2
             all-values (into (equiv-all-values c1 all-values)) ;; cls-svf1, cls-svf2
