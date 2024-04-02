@@ -38,17 +38,15 @@
                                           "insert"   {"@id"        "ex:carol"
                                                       "owl:sameAs" {"@id" "ex:carol-lynn"}}})
 
-              db-reasoned @(fluree/reason db-same :owl2rl)
-
-              qry-sameAs  @(fluree/query db-reasoned
-                                         {:context {"ex"  "http://example.org/"
-                                                    "owl" "http://www.w3.org/2002/07/owl#"}
-                                          :select  "?same"
-                                          :where   {"@id"        "ex:carol-lynn",
-                                                    "owl:sameAs" "?same"}})]
+              db-reasoned @(fluree/reason db-same :owl2rl)]
 
           (is (= #{"ex:carol"}
-                 (set qry-sameAs))
+                 (set @(fluree/query db-reasoned
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol-lynn",
+                                                "owl:sameAs" "?same"}})))
               "ex:carol-lynn should be deemed the same as ex:carol")))
 
       (testing "Testing owl:sameAs passed along as a reasoned rule"
@@ -56,17 +54,15 @@
                                           {"@context"   {"ex"  "http://example.org/"
                                                          "owl" "http://www.w3.org/2002/07/owl#"}
                                            "@id"        "ex:carol"
-                                           "owl:sameAs" {"@id" "ex:carol-lynn"}})
-              qry-sameAs  @(fluree/query db-reasoned
-                                         {:context {"ex"  "http://example.org/"
-                                                    "owl" "http://www.w3.org/2002/07/owl#"}
-                                          :select  "?same"
-                                          :where   {"@id"        "ex:carol-lynn",
-                                                    "owl:sameAs" "?same"}})]
-
+                                           "owl:sameAs" {"@id" "ex:carol-lynn"}})]
 
           (is (= #{"ex:carol"}
-                 (set qry-sameAs))
+                 (set @(fluree/query db-reasoned
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol-lynn",
+                                                "owl:sameAs" "?same"}})))
               "ex:carol-lynn should be deemed the same as ex:carol")))
 
 
@@ -83,27 +79,24 @@
                                                        "owl:sameAs" {"@id" "ex:carol3"}}
                                                       {"@id"        "ex:carol3"
                                                        "owl:sameAs" {"@id" "ex:carol4"}}]})
-              db-reasoned @(fluree/reason db-same :owl2rl)
-              qry-carol   @(fluree/query db-reasoned
-                                         {:context {"ex"  "http://example.org/"
-                                                    "owl" "http://www.w3.org/2002/07/owl#"}
-                                          :select  "?same"
-                                          :where   {"@id"        "ex:carol",
-                                                    "owl:sameAs" "?same"}})
-              qry-carol4  @(fluree/query db-reasoned
-                                         {:context {"ex"  "http://example.org/"
-                                                    "owl" "http://www.w3.org/2002/07/owl#"}
-                                          :select  "?same"
-                                          :where   {"@id"        "ex:carol4",
-                                                    "owl:sameAs" "?same"}})]
-
+              db-reasoned @(fluree/reason db-same :owl2rl)]
 
           (is (= #{"ex:carol1" "ex:carol2" "ex:carol3" "ex:carol4"}
-                 (set qry-carol))
+                 (set @(fluree/query db-reasoned
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol",
+                                                "owl:sameAs" "?same"}})))
               "ex:carol should be sameAs all other carols")
 
           (is (= #{"ex:carol" "ex:carol1" "ex:carol2" "ex:carol3"}
-                 (set qry-carol4))
+                 (set @(fluree/query db-reasoned
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol4",
+                                                "owl:sameAs" "?same"}})))
               "ex:carol4 should be sameAs all other carols"))))))
 
 
@@ -121,25 +114,22 @@
                                              "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
                               "@id"         "ex:parent"
                               "@type"       ["owl:ObjectProperty"]
-                              "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]}])
-              qry-subj   @(fluree/query db-prp-dom
-                                        {:context {"ex" "http://example.org/"}
-                                         :select  "?t"
-                                         :where   {"@id"   "ex:brian",
-                                                   "@type" "?t"}})
-              qry-types  @(fluree/query db-prp-dom
-                                        {:context {"ex" "http://example.org/"}
-                                         :select  "?s"
-                                         :where   {"@id"   "?s",
-                                                   "@type" "ex:Child"}})]
-
+                              "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]}])]
 
           (is (= #{"ex:Child" "ex:Person"}
-                 (set qry-subj))
+                 (set @(fluree/query db-prp-dom
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?t"
+                                      :where   {"@id"   "ex:brian",
+                                                "@type" "?t"}})))
               "ex:brian should be of type ex:Person and ex:Child")
 
           (is (= #{"ex:brian"}
-                 (set qry-types))
+                 (set @(fluree/query db-prp-dom
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?s"
+                                      :where   {"@id"   "?s",
+                                                "@type" "ex:Child"}})))
               "ex:brian should be the only subject of type ex:Child")))
 
       (testing "Testing rdfs:range - rule: prp-rng"
@@ -150,25 +140,22 @@
                                             "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
                               "@id"        "ex:parent"
                               "@type"      ["owl:ObjectProperty"]
-                              "rdfs:range" [{"@id" "ex:Person"} {"@id" "ex:Parent"}]}])
-              qry-subj   @(fluree/query db-prp-rng
-                                        {:context {"ex" "http://example.org/"}
-                                         :select  "?t"
-                                         :where   {"@id"   "ex:carol",
-                                                   "@type" "?t"}})
-              qry-parent @(fluree/query db-prp-rng
-                                        {:context {"ex" "http://example.org/"}
-                                         :select  "?s"
-                                         :where   {"@id"   "?s",
-                                                   "@type" "ex:Parent"}})]
-
+                              "rdfs:range" [{"@id" "ex:Person"} {"@id" "ex:Parent"}]}])]
 
           (is (= #{"ex:Parent" "ex:Person"}
-                 (set qry-subj))
+                 (set @(fluree/query db-prp-rng
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?t"
+                                      :where   {"@id"   "ex:carol",
+                                                "@type" "?t"}})))
               "ex:carol should be of type ex:Person and ex:Parent")
 
           (is (= #{"ex:carol"}
-                 (set qry-parent))
+                 (set @(fluree/query db-prp-rng
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?s"
+                                      :where   {"@id"   "?s",
+                                                "@type" "ex:Parent"}})))
               "ex:carol should be the only subject of type ex:Parent")))
 
 
@@ -181,33 +168,30 @@
                                   "@id"         "ex:parent"
                                   "@type"       ["owl:ObjectProperty"]
                                   "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]
-                                  "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:Parent"}]}])
-              qry-child      @(fluree/query db-prp-dom+rng
-                                            {:context {"ex" "http://example.org/"}
-                                             :select  "?s"
-                                             :where   {"@id"   "?s",
-                                                       "@type" "ex:Child"}})
-              qry-parent     @(fluree/query db-prp-dom+rng
-                                            {:context {"ex" "http://example.org/"}
-                                             :select  "?s"
-                                             :where   {"@id"   "?s",
-                                                       "@type" "ex:Parent"}})
-              qry-person     @(fluree/query db-prp-dom+rng
-                                            {:context {"ex" "http://example.org/"}
-                                             :select  "?s"
-                                             :where   {"@id"   "?s",
-                                                       "@type" "ex:Person"}})]
+                                  "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:Parent"}]}])]
 
           (is (= #{"ex:brian"}
-                 (set qry-child))
+                 (set @(fluree/query db-prp-dom+rng
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?s"
+                                      :where   {"@id"   "?s",
+                                                "@type" "ex:Child"}})))
               "ex:brian should be the only subject of type ex:Child")
 
           (is (= #{"ex:carol"}
-                 (set qry-parent))
+                 (set @(fluree/query db-prp-dom+rng
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?s"
+                                      :where   {"@id"   "?s",
+                                                "@type" "ex:Parent"}})))
               "ex:carol should be the only subject of type ex:Parent")
 
           (is (= #{"ex:brian" "ex:carol"}
-                 (set qry-person))
+                 (set @(fluree/query db-prp-dom+rng
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?s"
+                                      :where   {"@id"   "?s",
+                                                "@type" "ex:Person"}})))
               "ex:brian and ex:carol should be of type ex:Person"))))))
 
 ;; TODO - re-enable once filter function bug is fixed
@@ -332,15 +316,14 @@
                                             "owl"  "http://www.w3.org/2002/07/owl#"
                                             "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
                                 "@id"      "ex:livesWith"
-                                "@type"    ["owl:ObjectProperty" "owl:SymetricProperty"]}])
-              qry-sameAs   @(fluree/query db-prp-symp
-                                          {:context {"ex" "http://example.org/"}
-                                           :select  "?x"
-                                           :where   {"@id"          "ex:person-b"
-                                                     "ex:livesWith" "?x"}})]
+                                "@type"    ["owl:ObjectProperty" "owl:SymetricProperty"]}])]
 
           (is (= #{"ex:person-a"}
-                 (set qry-sameAs))
+                 (set @(fluree/query db-prp-symp
+                                     {:context {"ex" "http://example.org/"}
+                                      :select  "?x"
+                                      :where   {"@id"          "ex:person-b"
+                                                "ex:livesWith" "?x"}})))
               "ex:person-b should also live with ex:person-a"))))))
 
 (deftest ^:integration transitive-properties
@@ -365,15 +348,14 @@
                                         "owl"  "http://www.w3.org/2002/07/owl#"
                                         "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
                             "@id"      "ex:livesWith"
-                            "@type"    ["owl:ObjectProperty" "owl:TransitiveProperty"]}])
-          qry-trp      @(fluree/query db-prp-trp
-                                      {:context {"ex" "http://example.org/"}
-                                       :select  "?people"
-                                       :where   {"@id"          "ex:person-a"
-                                                 "ex:livesWith" "?people"}})]
+                            "@type"    ["owl:ObjectProperty" "owl:TransitiveProperty"]}])]
 
       (is (= #{"ex:person-b" "ex:person-c" "ex:person-d"}
-             (set qry-trp))
+             (set @(fluree/query db-prp-trp
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?people"
+                                  :where   {"@id"          "ex:person-a"
+                                            "ex:livesWith" "?people"}})))
           "ex:person-a should also live with ex:person-c and d (transitive)"))))
 
 (deftest ^:integration prop-chain-axiom
@@ -401,34 +383,30 @@
                                                      "owl" "http://www.w3.org/2002/07/owl#"}
                            "@id"                    "ex:greatGrandparent"
                            "@type"                  ["owl:ObjectProperty"]
-                           "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parent"} {"@id" "ex:parent"} {"@id" "ex:parent"}]}}])
-          qry-gp1     @(fluree/query db-reasoned
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?people"
-                                      :where   {"@id"            "ex:person-a"
-                                                "ex:grandparent" "?people"}})
-
-          qry-gp2     @(fluree/query db-reasoned
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?people"
-                                      :where   {"@id"            "ex:mom"
-                                                "ex:grandparent" "?people"}})
-          qry-ggp     @(fluree/query db-reasoned
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?people"
-                                      :where   {"@id"                 "ex:person-a"
-                                                "ex:greatGrandparent" "?people"}})]
+                           "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parent"} {"@id" "ex:parent"} {"@id" "ex:parent"}]}}])]
 
       (is (= #{"ex:mom-mom" "ex:mom-dad" "ex:dad-mom" "ex:dad-dad"}
-             (set qry-gp1))
+             (set @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?people"
+                                  :where   {"@id"            "ex:person-a"
+                                            "ex:grandparent" "?people"}})))
           "all four of ex:person-a's grandparents should be found")
 
       (is (= #{"ex:mom-mom-mom" "ex:mom-mom-dad"}
-             (set qry-gp2))
+             (set @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?people"
+                                  :where   {"@id"            "ex:mom"
+                                            "ex:grandparent" "?people"}})))
           "all two of ex:mom's grandparents should be found")
 
       (is (= #{"ex:mom-mom-mom" "ex:mom-mom-dad"}
-             (set qry-ggp))
+             (set @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?people"
+                                  :where   {"@id"                 "ex:person-a"
+                                            "ex:greatGrandparent" "?people"}})))
           "all two of ex:person-a's great grandparents should be found"))))
 
 (deftest ^:integration inverseOf-properties
@@ -450,32 +428,30 @@
                                                          "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
                                         "@id"           "ex:child"
                                         "@type"         ["owl:ObjectProperty"]
-                                        "owl:inverseOf" {"@id" "ex:parent"}}])
+                                        "owl:inverseOf" {"@id" "ex:parent"}}])]
 
-          qry-mom     @(fluree/query db-reasoned
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?x"
-                                      :where   {"@id"      "ex:mom"
-                                                "ex:child" "?x"}})
-
-          qry-mom-mom @(fluree/query db-reasoned
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?x"
-                                      :where   {"@id"      "ex:mom-mom"
-                                                "ex:child" "?x"}})
-          qry-bob     @(fluree/query db-reasoned
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?x"
-                                      :where   {"@id"       "ex:bob"
-                                                "ex:parent" "?x"}})]
-
-      (is (= ["ex:son"] qry-mom)
+      (is (= ["ex:son"]
+             @(fluree/query db-reasoned
+                            {:context {"ex" "http://example.org/"}
+                             :select  "?x"
+                             :where   {"@id"      "ex:mom"
+                                       "ex:child" "?x"}}))
           "ex:son should be the child of ex:mom")
 
-      (is (= ["ex:mom"] qry-mom-mom)
+      (is (= ["ex:mom"]
+             @(fluree/query db-reasoned
+                            {:context {"ex" "http://example.org/"}
+                             :select  "?x"
+                             :where   {"@id"      "ex:mom-mom"
+                                       "ex:child" "?x"}}))
           "ex:mom should be the child of ex:mom-mom")
 
-      (is (= ["ex:alice"] qry-bob)
+      (is (= ["ex:alice"]
+             @(fluree/query db-reasoned
+                            {:context {"ex" "http://example.org/"}
+                             :select  "?x"
+                             :where   {"@id"       "ex:bob"
+                                       "ex:parent" "?x"}}))
           "ex:alice should be the parent of ex:bob"))))
 
 ;; TODO - re-enable once filter function bug is fixed
