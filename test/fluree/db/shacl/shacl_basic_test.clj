@@ -201,12 +201,11 @@
               [{:subject :ex/john,
                 :constraint :sh/closed,
                 :shape :ex/UserShape,
-                :path [:schema/email],
                 :value ["john@flur.ee"],
                 :expect [:type :schema/name],
                 :message "disallowed path :schema/email with values john@flur.ee"}]}
              (ex-data db-extra-prop)))
-      (is (= "Subject :ex/john path [:schema/email] violates constraint :sh/closed of shape :ex/UserShape - disallowed path :schema/email with values john@flur.ee."
+      (is (= "Subject :ex/john violates constraint :sh/closed of shape :ex/UserShape - disallowed path :schema/email with values john@flur.ee."
              (ex-message db-extra-prop)))
 
       (is (= [{:id          :ex/john
@@ -225,22 +224,15 @@
                       :where   {:id '?s, :type :ex/User}}]
       (testing "single-cardinality equals"
         (let [db    @(fluree/stage
-                      (fluree/db ledger)
-                      {"@context" ["https://ns.flur.ee" context]
-                       "insert"
-                       {:id             :ex/EqualNamesShape
-                        :type           :sh/NodeShape
-                        :sh/targetClass :ex/User
-                        :sh/property    [{:sh/path   :schema/name
-                                          :sh/equals :ex/firstName}]}})
-              db-ok @(fluree/stage
-                      db
-                      {"@context" ["https://ns.flur.ee" context]
-                       "insert"
-                       {:id           :ex/alice
-                        :type         :ex/User
-                        :schema/name  "Alice"
-                        :ex/firstName "Alice"}})
+                       (fluree/db ledger)
+                       {"@context" ["https://ns.flur.ee" context]
+                        "insert"
+                        {:id             :ex/EqualNamesShape
+                         :type           :sh/NodeShape
+                         :sh/targetClass :ex/User
+                         :sh/property    [{:sh/path   :schema/name
+                                           :sh/equals :ex/firstName}]}})
+
 
               db-not-equal @(fluree/stage
                               db
@@ -251,46 +243,171 @@
                                 :schema/name  "John"
                                 :ex/firstName "Jack"}})]
           (is (= {:status 400,
-                  :error :shacl/violation,
+                  :error  :shacl/violation,
                   :report
-                  [{:subject :ex/john,
+                  [{:subject    :ex/john,
                     :constraint :sh/equals,
-                    :shape "_:fdb-2",
-                    :path [:schema/name],
-                    :value ["John"],
-                    :expect ["Jack"],
-                    :message
-                    "path [:schema/name] values John do not equal :ex/firstName values Jack"}]}
+                    :shape      "_:fdb-2",
+                    :path       [:schema/name],
+                    :value      ["John"],
+                    :expect     ["Jack"],
+                    :message    "path [:schema/name] values John do not equal :ex/firstName values Jack"}]}
                  (ex-data db-not-equal)))
           (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/equals of shape _:fdb-2 - path [:schema/name] values John do not equal :ex/firstName values Jack."
                  (ex-message db-not-equal)))
-
-          (is (= [{:id           :ex/alice
-                   :type         :ex/User
-                   :schema/name  "Alice"
-                   :ex/firstName "Alice"}]
-                 @(fluree/query db-ok user-query)))))
+          (let [db-ok @(fluree/stage
+                         db
+                         {"@context" ["https://ns.flur.ee" context]
+                          "insert"
+                          {:id           :ex/alice
+                           :type         :ex/User
+                           :schema/name  "Alice"
+                           :ex/firstName "Alice"}})]
+            (is (= [{:id           :ex/alice
+                     :type         :ex/User
+                     :schema/name  "Alice"
+                     :ex/firstName "Alice"}]
+                   @(fluree/query db-ok user-query))))))
       (testing "multi-cardinality equals"
+        (let [db @(fluree/stage
+                    (fluree/db ledger)
+                    {"@context" ["https://ns.flur.ee" context]
+                     "insert"
+                     {:id :ex/EqualNamesShape
+                      :type :sh/NodeShape
+                      :sh/targetClass :ex/User
+                      :sh/property [{:sh/path :ex/favNums
+                                     :sh/equals :ex/luckyNums}]}})]
+          (let [db-not-equal1 @(fluree/stage
+                                 db
+                                 {"@context" ["https://ns.flur.ee" context]
+                                  "insert"
+                                  {:id           :ex/brian
+                                   :type         :ex/User
+                                   :schema/name  "Brian"
+                                   :ex/favNums   [11 17]
+                                   :ex/luckyNums [13 18]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/brian,
+                      :constraint :sh/equals,
+                      :shape      "_:fdb-6",
+                      :path       [:ex/favNums],
+                      :value      [11 17],
+                      :expect     [13 18],
+                      :message    "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 13, 18"}]}
+                   (ex-data db-not-equal1)))
+            (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 13, 18."
+                   (ex-message db-not-equal1))))
+          (let [db-not-equal2 @(fluree/stage
+                                 db
+                                 {"@context" ["https://ns.flur.ee" context]
+                                  "insert"
+                                  {:id           :ex/brian
+                                   :type         :ex/User
+                                   :schema/name  "Brian"
+                                   :ex/favNums   [11 17]
+                                   :ex/luckyNums [11]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/brian,
+                      :constraint :sh/equals,
+                      :shape      "_:fdb-6",
+                      :path       [:ex/favNums],
+                      :value      [11 17],
+                      :expect     [11],
+                      :message
+                      "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11"}]}
+                   (ex-data db-not-equal2)))
+            (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11."
+                   (ex-message db-not-equal2))))
+          (let [db-not-equal3 @(fluree/stage
+                                 db
+                                 {"@context" ["https://ns.flur.ee" context]
+                                  "insert"
+                                  {:id           :ex/brian
+                                   :type         :ex/User
+                                   :schema/name  "Brian"
+                                   :ex/favNums   [11 17]
+                                   :ex/luckyNums [11 17 18]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/brian,
+                      :constraint :sh/equals,
+                      :shape      "_:fdb-6",
+                      :path       [:ex/favNums],
+                      :value      [11 17],
+                      :expect     [11 17 18],
+                      :message    "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17, 18"}]}
+                   (ex-data db-not-equal3)))
+            (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17, 18."
+                   (ex-message db-not-equal3))))
+          (let [db-not-equal4 @(fluree/stage
+                                 db
+                                 {"@context" ["https://ns.flur.ee" context]
+                                  "insert"
+                                  {:id           :ex/brian
+                                   :type         :ex/User
+                                   :schema/name  "Brian"
+                                   :ex/favNums   [11 17]
+                                   :ex/luckyNums ["11" "17"]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/brian,
+                      :constraint :sh/equals,
+                      :shape      "_:fdb-6",
+                      :path       [:ex/favNums],
+                      :value      [11 17],
+                      :expect     ["11" "17"],
+                      :message    "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17"}]}
+                   (ex-data db-not-equal4)))
+            (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17."
+                   (ex-message db-not-equal4))))
+          (let [db-ok @(fluree/stage
+                         db
+                         {"@context" ["https://ns.flur.ee" context]
+                          "insert"
+                          {:id           :ex/alice
+                           :type         :ex/User
+                           :schema/name  "Alice"
+                           :ex/favNums   [11 17]
+                           :ex/luckyNums [11 17]}})]
+            (is (= [{:id           :ex/alice
+                     :type         :ex/User
+                     :schema/name  "Alice"
+                     :ex/favNums   [11 17]
+                     :ex/luckyNums [11 17]}]
+                   @(fluree/query db-ok user-query))))
+          (let [db-ok2 @(fluree/stage
+                          db
+                          {"@context" ["https://ns.flur.ee" context]
+                           "insert"
+                           {:id           :ex/alice
+                            :type         :ex/User
+                            :schema/name  "Alice"
+                            :ex/favNums   [11 17]
+                            :ex/luckyNums [17 11]}})]
+            (is (= [{:id           :ex/alice
+                     :type         :ex/User
+                     :schema/name  "Alice"
+                     :ex/favNums   [11 17]
+                     :ex/luckyNums [11 17]}]
+                   @(fluree/query db-ok2 user-query))))))
+      (testing "disjoint"
         (let [db    @(fluree/stage
-                      (fluree/db ledger)
-                      {"@context" ["https://ns.flur.ee" context]
-                       "insert"
-                       {:id             :ex/EqualNamesShape
-                        :type           :sh/NodeShape
-                        :sh/targetClass :ex/User
-                        :sh/property    [{:sh/path   :ex/favNums
-                                          :sh/equals :ex/luckyNums}]}})
+                       (fluree/db ledger)
+                       {"@context" ["https://ns.flur.ee" context]
+                        "insert"
+                        {:id             :ex/DisjointShape
+                         :type           :sh/NodeShape
+                         :sh/targetClass :ex/User
+                         :sh/property    [{:sh/path     :ex/favNums
+                                           :sh/disjoint :ex/luckyNums}]}})
               db-ok @(fluree/stage
-                      db
-                      {"@context" ["https://ns.flur.ee" context]
-                       "insert"
-                       {:id           :ex/alice
-                        :type         :ex/User
-                        :schema/name  "Alice"
-                        :ex/favNums   [11 17]
-                        :ex/luckyNums [11 17]}})
-
-              db-ok2 @(fluree/stage
                        db
                        {"@context" ["https://ns.flur.ee" context]
                         "insert"
@@ -298,128 +415,7 @@
                          :type         :ex/User
                          :schema/name  "Alice"
                          :ex/favNums   [11 17]
-                         :ex/luckyNums [17 11]}})
-
-              db-not-equal1 @(fluree/stage
-                               db
-                               {"@context" ["https://ns.flur.ee" context]
-                                "insert"
-                                {:id           :ex/brian
-                                 :type         :ex/User
-                                 :schema/name  "Brian"
-                                 :ex/favNums   [11 17]
-                                 :ex/luckyNums [13 18]}})
-              db-not-equal2 @(fluree/stage
-                               db
-                               {"@context" ["https://ns.flur.ee" context]
-                                "insert"
-                                {:id           :ex/brian
-                                 :type         :ex/User
-                                 :schema/name  "Brian"
-                                 :ex/favNums   [11 17]
-                                 :ex/luckyNums [11]}})
-              db-not-equal3 @(fluree/stage
-                               db
-                               {"@context" ["https://ns.flur.ee" context]
-                                "insert"
-                                {:id           :ex/brian
-                                 :type         :ex/User
-                                 :schema/name  "Brian"
-                                 :ex/favNums   [11 17]
-                                 :ex/luckyNums [11 17 18]}})
-              db-not-equal4 @(fluree/stage
-                               db
-                               {"@context" ["https://ns.flur.ee" context]
-                                "insert"
-                                {:id           :ex/brian
-                                 :type         :ex/User
-                                 :schema/name  "Brian"
-                                 :ex/favNums   [11 17]
-                                 :ex/luckyNums ["11" "17"]}})]
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/brian,
-                    :constraint :sh/equals,
-                    :shape "_:fdb-6",
-                    :path [:ex/favNums],
-                    :value [11 17],
-                    :expect [13 18],
-                    :message "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 13, 18"}]}
-                 (ex-data db-not-equal1)))
-          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 13, 18."
-                 (ex-message db-not-equal1)))
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/brian,
-                    :constraint :sh/equals,
-                    :shape "_:fdb-6",
-                    :path [:ex/favNums],
-                    :value [11 17],
-                    :expect [11],
-                    :message
-                    "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11"}]}
-                 (ex-data db-not-equal2)))
-          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11."
-                 (ex-message db-not-equal2)))
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/brian,
-                    :constraint :sh/equals,
-                    :shape "_:fdb-6",
-                    :path [:ex/favNums],
-                    :value [11 17],
-                    :expect [11 17 18],
-                    :message "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17, 18"}]}
-                 (ex-data db-not-equal3)))
-          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17, 18."
-                 (ex-message db-not-equal3)))
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/brian,
-                    :constraint :sh/equals,
-                    :shape "_:fdb-6",
-                    :path [:ex/favNums],
-                    :value [11 17],
-                    :expect ["11" "17"],
-                    :message "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17"}]}
-                 (ex-data db-not-equal4)))
-          (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17."
-                 (ex-message db-not-equal4)))
-          (is (= [{:id           :ex/alice
-                   :type         :ex/User
-                   :schema/name  "Alice"
-                   :ex/favNums   [11 17]
-                   :ex/luckyNums [11 17]}]
-                 @(fluree/query db-ok user-query)))
-          (is (= [{:id           :ex/alice
-                   :type         :ex/User
-                   :schema/name  "Alice"
-                   :ex/favNums   [11 17]
-                   :ex/luckyNums [11 17]}]
-                 @(fluree/query db-ok2 user-query)))))
-      (testing "disjoint"
-        (let [db    @(fluree/stage
-                      (fluree/db ledger)
-                      {"@context" ["https://ns.flur.ee" context]
-                       "insert"
-                       {:id             :ex/DisjointShape
-                        :type           :sh/NodeShape
-                        :sh/targetClass :ex/User
-                        :sh/property    [{:sh/path     :ex/favNums
-                                          :sh/disjoint :ex/luckyNums}]}})
-              db-ok @(fluree/stage
-                      db
-                      {"@context" ["https://ns.flur.ee" context]
-                       "insert"
-                       {:id           :ex/alice
-                        :type         :ex/User
-                        :schema/name  "Alice"
-                        :ex/favNums   [11 17]
-                        :ex/luckyNums 1}})
+                         :ex/luckyNums 1}})
 
               db-not-disjoint1 @(fluree/stage
                                   db
@@ -450,44 +446,44 @@
                                     :ex/favNums   [11 17 31]
                                     :ex/luckyNums [13 18 11]}})]
           (is (= {:status 400,
-                  :error :shacl/violation,
+                  :error  :shacl/violation,
                   :report
-                  [{:subject :ex/brian,
+                  [{:subject    :ex/brian,
                     :constraint :sh/disjoint,
-                    :shape "_:fdb-14",
-                    :path [:ex/favNums],
-                    :value [11],
-                    :expect [11],
-                    :message "path [:ex/favNums] values 11 are not disjoint with :ex/luckyNums values 11"}]}
+                    :shape      "_:fdb-14",
+                    :path       [:ex/favNums],
+                    :value      [11],
+                    :expect     [11],
+                    :message    "path [:ex/favNums] values 11 are not disjoint with :ex/luckyNums values 11"}]}
                  (ex-data db-not-disjoint1)))
           (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11 are not disjoint with :ex/luckyNums values 11."
                  (ex-message db-not-disjoint1)))
 
           (is (= {:status 400,
-                  :error :shacl/violation,
+                  :error  :shacl/violation,
                   :report
-                  [{:subject :ex/brian,
+                  [{:subject    :ex/brian,
                     :constraint :sh/disjoint,
-                    :shape "_:fdb-14",
-                    :path [:ex/favNums],
-                    :value [11 17 31],
-                    :expect [11],
-                    :message "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11"}]}
+                    :shape      "_:fdb-14",
+                    :path       [:ex/favNums],
+                    :value      [11 17 31],
+                    :expect     [11],
+                    :message    "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11"}]}
                  (ex-data db-not-disjoint2))
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
           (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11."
                  (ex-message db-not-disjoint2)))
 
           (is (= {:status 400,
-                  :error :shacl/violation,
+                  :error  :shacl/violation,
                   :report
-                  [{:subject :ex/brian,
+                  [{:subject    :ex/brian,
                     :constraint :sh/disjoint,
-                    :shape "_:fdb-14",
-                    :path [:ex/favNums],
-                    :value [11 17 31],
-                    :expect [11 13 18],
-                    :message "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18"}]}
+                    :shape      "_:fdb-14",
+                    :path       [:ex/favNums],
+                    :value      [11 17 31],
+                    :expect     [11 13 18],
+                    :message    "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18"}]}
                  (ex-data db-not-disjoint3))
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
           (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18."
@@ -501,152 +497,33 @@
                  @(fluree/query db-ok user-query)))))
       (testing "lessThan"
         (let [db     @(fluree/stage
-                       (fluree/db ledger)
-                       {"@context" ["https://ns.flur.ee" context]
-                        "insert"
-                        {:id             :ex/LessThanShape
-                         :type           :sh/NodeShape
-                         :sh/targetClass :ex/User
-                         :sh/property    [{:sh/path     :ex/p1
-                                           :sh/lessThan :ex/p2}]}})
+                        (fluree/db ledger)
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         {:id             :ex/LessThanShape
+                          :type           :sh/NodeShape
+                          :sh/targetClass :ex/User
+                          :sh/property    [{:sh/path     :ex/p1
+                                            :sh/lessThan :ex/p2}]}})
               db-ok1 @(fluree/stage
-                       db
-                       {"@context" ["https://ns.flur.ee" context]
-                        "insert"
-                        {:id          :ex/alice
-                         :type        :ex/User
-                         :schema/name "Alice"
-                         :ex/p1       [11 17]
-                         :ex/p2       [18 19]}})
+                        db
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         {:id          :ex/alice
+                          :type        :ex/User
+                          :schema/name "Alice"
+                          :ex/p1       [11 17]
+                          :ex/p2       [18 19]}})
 
               db-ok2 @(fluree/stage
-                       db
-                       {"@context" ["https://ns.flur.ee" context]
-                        "insert"
-                        {:id          :ex/alice
-                         :type        :ex/User
-                         :schema/name "Alice"
-                         :ex/p1       [11 17]
-                         :ex/p2       [18]}})
-
-              db-fail1 @(fluree/stage
-                          db
-                          {"@context" ["https://ns.flur.ee" context]
-                           "insert"
-                           {:id          :ex/alice
-                            :type        :ex/User
-                            :schema/name "Alice"
-                            :ex/p1       [11 17]
-                            :ex/p2       17}})
-
-              db-fail2 @(fluree/stage
-                          db
-                          {"@context" ["https://ns.flur.ee" context]
-                           "insert"
-                           {:id          :ex/alice
-                            :type        :ex/User
-                            :schema/name "Alice"
-                            :ex/p1       [11 17]
-                            :ex/p2       ["18" "19"]}})
-
-              db-fail3 @(fluree/stage
-                          db
-                          {"@context" ["https://ns.flur.ee" context]
-                           "insert"
-                           {:id          :ex/alice
-                            :type        :ex/User
-                            :schema/name "Alice"
-                            :ex/p1       [12 17]
-                            :ex/p2       [10 18]}})
-
-              db-fail4 @(fluree/stage
-                          db
-                          {"@context" ["https://ns.flur.ee" context]
-                           "insert"
-                           {:id          :ex/alice
-                            :type        :ex/User
-                            :schema/name "Alice"
-                            :ex/p1       [11 17]
-                            :ex/p2       [12 16]}})
-              db-iris  @(fluree/stage
-                          db
-                          {"@context" ["https://ns.flur.ee" context]
-                           "insert"
-                           {:id          :ex/alice
-                            :type        :ex/User
-                            :schema/name "Alice"
-                            :ex/p1       :ex/brian
-                            :ex/p2       :ex/john}})]
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/alice,
-                    :constraint :sh/lessThan,
-                    :shape "_:fdb-20",
-                    :path [:ex/p1],
-                    :value [11 17],
-                    :expect [17],
-                    :message "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17"}]}
-                 (ex-data db-fail1)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17."
-                 (ex-message db-fail1)))
-
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/alice,
-                    :constraint :sh/lessThan,
-                    :shape "_:fdb-20",
-                    :path [:ex/p1],
-                    :value [11 17],
-                    :expect ["18" "19"],
-                    :message "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19"}]}
-                 (ex-data db-fail2)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19."
-                 (ex-message db-fail2)))
-
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/alice,
-                    :constraint :sh/lessThan,
-                    :shape "_:fdb-20",
-                    :path [:ex/p1],
-                    :value [12 17],
-                    :expect [10 18],
-                    :message "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18"}]}
-                 (ex-data db-fail3)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18."
-                 (ex-message db-fail3)))
-
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/alice,
-                    :constraint :sh/lessThan,
-                    :shape "_:fdb-20",
-                    :path [:ex/p1],
-                    :value [11 17],
-                    :expect [12 16],
-                    :message "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16"}]}
-                 (ex-data db-fail4)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16."
-                 (ex-message db-fail4)))
-
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/alice,
-                    :constraint :sh/lessThan,
-                    :shape "_:fdb-20",
-                    :path [:ex/p1],
-                    :value [:ex/brian],
-                    :expect [:ex/john],
-                    :message "path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john"}]}
-                 (ex-data db-iris)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john."
-                 (ex-message db-iris)))
-
+                        db
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         {:id          :ex/alice
+                          :type        :ex/User
+                          :schema/name "Alice"
+                          :ex/p1       [11 17]
+                          :ex/p2       [18]}})]
           (is (= [{:id          :ex/alice
                    :type        :ex/User
                    :schema/name "Alice"
@@ -658,132 +535,147 @@
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       18}]
-                 @(fluree/query db-ok2 user-query)))))
+                 @(fluree/query db-ok2 user-query)))
+
+          (let [db-fail1 @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id          :ex/alice
+                              :type        :ex/User
+                              :schema/name "Alice"
+                              :ex/p1       [11 17]
+                              :ex/p2       17}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/alice,
+                      :constraint :sh/lessThan,
+                      :shape      "_:fdb-20",
+                      :path       [:ex/p1],
+                      :value      [11 17],
+                      :expect     [17],
+                      :message    "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17"}]}
+                   (ex-data db-fail1)))
+            (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17."
+                   (ex-message db-fail1))))
+          (let [db-fail2 @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id          :ex/alice
+                              :type        :ex/User
+                              :schema/name "Alice"
+                              :ex/p1       [11 17]
+                              :ex/p2       ["18" "19"]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/alice,
+                      :constraint :sh/lessThan,
+                      :shape      "_:fdb-20",
+                      :path       [:ex/p1],
+                      :value      [11 17],
+                      :expect     ["18" "19"],
+                      :message    "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19"}]}
+                   (ex-data db-fail2)))
+            (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19."
+                   (ex-message db-fail2))))
+          (let [db-fail3 @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id          :ex/alice
+                              :type        :ex/User
+                              :schema/name "Alice"
+                              :ex/p1       [12 17]
+                              :ex/p2       [10 18]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/alice,
+                      :constraint :sh/lessThan,
+                      :shape      "_:fdb-20",
+                      :path       [:ex/p1],
+                      :value      [12 17],
+                      :expect     [10 18],
+                      :message    "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18"}]}
+                   (ex-data db-fail3)))
+            (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18."
+                   (ex-message db-fail3))))
+          (let [db-fail4 @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id          :ex/alice
+                              :type        :ex/User
+                              :schema/name "Alice"
+                              :ex/p1       [11 17]
+                              :ex/p2       [12 16]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/alice,
+                      :constraint :sh/lessThan,
+                      :shape      "_:fdb-20",
+                      :path       [:ex/p1],
+                      :value      [11 17],
+                      :expect     [12 16],
+                      :message    "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16"}]}
+                   (ex-data db-fail4)))
+            (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16."
+                   (ex-message db-fail4))))
+          (let [db-iris  @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id          :ex/alice
+                              :type        :ex/User
+                              :schema/name "Alice"
+                              :ex/p1       :ex/brian
+                              :ex/p2       :ex/john}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/alice,
+                      :constraint :sh/lessThan,
+                      :shape      "_:fdb-20",
+                      :path       [:ex/p1],
+                      :value      [:ex/brian],
+                      :expect     [:ex/john],
+                      :message    "path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john"}]}
+                   (ex-data db-iris)))
+            (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john."
+                   (ex-message db-iris))))))
       (testing "lessThanOrEquals"
         (let [db     @(fluree/stage
-                       (fluree/db ledger)
-                       {"@context" ["https://ns.flur.ee" context]
-                        "insert"
-                        {:id             :ex/LessThanOrEqualsShape
-                         :type           :sh/NodeShape
-                         :sh/targetClass :ex/User
-                         :sh/property    [{:sh/path             :ex/p1
-                                           :sh/lessThanOrEquals :ex/p2}]}})
+                        (fluree/db ledger)
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         {:id             :ex/LessThanOrEqualsShape
+                          :type           :sh/NodeShape
+                          :sh/targetClass :ex/User
+                          :sh/property    [{:sh/path             :ex/p1
+                                            :sh/lessThanOrEquals :ex/p2}]}})
               db-ok1 @(fluree/stage
-                       db
-                       {"@context" ["https://ns.flur.ee" context]
-                        "insert"
-                        {:id          :ex/alice
-                         :type        :ex/User
-                         :schema/name "Alice"
-                         :ex/p1       [11 17]
-                         :ex/p2       [17 19]}})
+                        db
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         {:id          :ex/alice
+                          :type        :ex/User
+                          :schema/name "Alice"
+                          :ex/p1       [11 17]
+                          :ex/p2       [17 19]}})
 
               db-ok2 @(fluree/stage
-                       db
-                       {"@context" ["https://ns.flur.ee" context]
-                        "insert"
-                        {:id          :ex/alice
-                         :type        :ex/User
-                         :schema/name "Alice"
-                         :ex/p1       [11 17]
-                         :ex/p2       17}})
-
-              db-fail1 @(fluree/stage
-                          db
-                          {"@context" ["https://ns.flur.ee" context]
-                           "insert"
-                           {:id          :ex/alice
-                            :type        :ex/User
-                            :schema/name "Alice"
-                            :ex/p1       [11 17]
-                            :ex/p2       10}})
-
-              db-fail2 @(fluree/stage
-                          db
-                          {"@context" ["https://ns.flur.ee" context]
-                           "insert"
-                           {:id          :ex/alice
-                            :type        :ex/User
-                            :schema/name "Alice"
-                            :ex/p1       [11 17]
-                            :ex/p2       ["17" "19"]}})
-
-              db-fail3 @(fluree/stage
-                          db
-                          {"@context" ["https://ns.flur.ee" context]
-                           "insert"
-                           {:id          :ex/alice
-                            :type        :ex/User
-                            :schema/name "Alice"
-                            :ex/p1       [12 17]
-                            :ex/p2       [10 17]}})
-
-              db-fail4 @(fluree/stage
-                          db
-                          {"@context" ["https://ns.flur.ee" context]
-                           "insert"
-                           {:id          :ex/alice
-                            :type        :ex/User
-                            :schema/name "Alice"
-                            :ex/p1       [11 17]
-                            :ex/p2       [12 16]}})]
-
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/alice,
-                    :constraint :sh/lessThanOrEquals,
-                    :shape "_:fdb-29",
-                    :path [:ex/p1],
-                    :value [11 17],
-                    :expect [10],
-                    :message "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10"}]}
-                 (ex-data db-fail1)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10."
-                 (ex-message db-fail1)))
-
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/alice,
-                    :constraint :sh/lessThanOrEquals,
-                    :shape "_:fdb-29",
-                    :path [:ex/p1],
-                    :value [11 17],
-                    :expect ["17" "19"],
-                    :message "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19"}]}
-                 (ex-data db-fail2)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19."
-                 (ex-message db-fail2)))
-
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/alice,
-                    :constraint :sh/lessThanOrEquals,
-                    :shape "_:fdb-29",
-                    :path [:ex/p1],
-                    :value [12 17],
-                    :expect [10 17],
-                    :message "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17"}]}
-                 (ex-data db-fail3)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17."
-                 (ex-message db-fail3)))
-
-          (is (= {:status 400,
-                  :error :shacl/violation,
-                  :report
-                  [{:subject :ex/alice,
-                    :constraint :sh/lessThanOrEquals,
-                    :shape "_:fdb-29",
-                    :path [:ex/p1],
-                    :value [11 17],
-                    :expect [12 16],
-                    :message "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16"}]}
-                 (ex-data db-fail4)))
-          (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16."
-                 (ex-message db-fail4)))
+                        db
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         {:id          :ex/alice
+                          :type        :ex/User
+                          :schema/name "Alice"
+                          :ex/p1       [11 17]
+                          :ex/p2       17}})]
           (is (= [{:id          :ex/alice
                    :type        :ex/User
                    :schema/name "Alice"
@@ -795,7 +687,99 @@
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       17}]
-                 @(fluree/query db-ok2 user-query))))))))
+                 @(fluree/query db-ok2 user-query)))
+          (let [db-fail1 @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id          :ex/alice
+                              :type        :ex/User
+                              :schema/name "Alice"
+                              :ex/p1       [11 17]
+                              :ex/p2       10}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/alice,
+                      :constraint :sh/lessThanOrEquals,
+                      :shape      "_:fdb-29",
+                      :path       [:ex/p1],
+                      :value      [11 17],
+                      :expect     [10],
+                      :message    "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10"}]}
+                   (ex-data db-fail1)))
+            (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10."
+                   (ex-message db-fail1))))
+
+          (let [db-fail2 @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id          :ex/alice
+                              :type        :ex/User
+                              :schema/name "Alice"
+                              :ex/p1       [11 17]
+                              :ex/p2       ["17" "19"]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/alice,
+                      :constraint :sh/lessThanOrEquals,
+                      :shape      "_:fdb-29",
+                      :path       [:ex/p1],
+                      :value      [11 17],
+                      :expect     ["17" "19"],
+                      :message    "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19"}]}
+                   (ex-data db-fail2)))
+            (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19."
+                   (ex-message db-fail2))))
+
+          (let [db-fail3 @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id          :ex/alice
+                              :type        :ex/User
+                              :schema/name "Alice"
+                              :ex/p1       [12 17]
+                              :ex/p2       [10 17]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/alice,
+                      :constraint :sh/lessThanOrEquals,
+                      :shape      "_:fdb-29",
+                      :path       [:ex/p1],
+                      :value      [12 17],
+                      :expect     [10 17],
+                      :message    "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17"}]}
+                   (ex-data db-fail3)))
+            (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17."
+                   (ex-message db-fail3))))
+
+          (let [db-fail4 @(fluree/stage
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id          :ex/alice
+                              :type        :ex/User
+                              :schema/name "Alice"
+                              :ex/p1       [11 17]
+                              :ex/p2       [12 16]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    [{:subject    :ex/alice,
+                      :constraint :sh/lessThanOrEquals,
+                      :shape      "_:fdb-29",
+                      :path       [:ex/p1],
+                      :value      [11 17],
+                      :expect     [12 16],
+                      :message    "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16"}]}
+                   (ex-data db-fail4)))
+            (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16."
+                   (ex-message db-fail4))))
+          )))))
 
 (deftest ^:integration shacl-value-range
   (testing "shacl value range constraints"
@@ -1534,7 +1518,7 @@ WORLD!")
               :constraint "sh:class",
               :shape      "_:fdb-5",
               :path       ["https://example.com/country"],
-              :expect     ["https://example.com/Country"],
+              :expect     "https://example.com/Country",
               :value      ["https://example.com/FakeCountry"],
               :message    "missing required class https://example.com/Country"}]}
            (ex-data db4)))
@@ -1547,7 +1531,7 @@ WORLD!")
               :constraint "sh:class",
               :shape      "_:fdb-5",
               :path       ["https://example.com/country"],
-              :expect     ["https://example.com/Country"],
+              :expect     "https://example.com/Country",
               :value      ["https://example.com/FakeCountry"],
               :message    "missing required class https://example.com/Country"}]}
            (ex-data db5)))
@@ -1985,10 +1969,10 @@ WORLD!")
                 :shape      "_:fdb-9",
                 :path       ["ex:parent"],
                 :expect     "_:fdb-10",
-                :value      ["ex:Zorba" "ex:Bob"],
-                :message    "values [\"ex:Zorba\" \"ex:Bob\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times"}]}
+                :value      ["ex:Bob" "ex:Zorba"],
+                :message    "values [\"ex:Bob\" \"ex:Zorba\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times"}]}
              (ex-data invalid-kid)))
-      (is (= "Subject ex:InvalidKid path [\"ex:parent\"] violates constraint sh:qualifiedValueShape of shape _:fdb-9 - values [\"ex:Zorba\" \"ex:Bob\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times."
+      (is (= "Subject ex:InvalidKid path [\"ex:parent\"] violates constraint sh:qualifiedValueShape of shape _:fdb-9 - values [\"ex:Bob\" \"ex:Zorba\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times."
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShape node shape"
     (let [conn   @(fluree/connect {:method :memory})
@@ -2035,17 +2019,17 @@ WORLD!")
              @(fluree/query valid-kid {"@context" context
                                        "select"   {"ex:ValidKid" ["*"]}})))
       (is (= {:status 400,
-              :error  :shacl/violation,
+              :error :shacl/violation,
               :report
-              [{:subject    "ex:InvalidKid",
+              [{:subject "ex:InvalidKid",
                 :constraint "sh:qualifiedValueShape",
-                :shape      "_:fdb-14",
-                :path       ["ex:parent"],
-                :expect     "ex:ParentShape",
-                :value      ["ex:Zorba" "ex:Bob"],
-                :message    "values [\"ex:Zorba\" \"ex:Bob\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times"}]}
+                :shape "_:fdb-14",
+                :expect "ex:ParentShape",
+                :path ["ex:parent"],
+                :value ["ex:Bob" "ex:Zorba"],
+                :message "values [\"ex:Bob\" \"ex:Zorba\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times"}]}
              (ex-data invalid-kid)))
-      (is (= "Subject ex:InvalidKid path [\"ex:parent\"] violates constraint sh:qualifiedValueShape of shape _:fdb-14 - values [\"ex:Zorba\" \"ex:Bob\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times."
+      (is (= "Subject ex:InvalidKid path [\"ex:parent\"] violates constraint sh:qualifiedValueShape of shape _:fdb-14 - values [\"ex:Bob\" \"ex:Zorba\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times."
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn   @(fluree/connect {:method :memory})
