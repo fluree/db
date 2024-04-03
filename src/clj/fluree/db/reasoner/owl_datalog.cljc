@@ -150,37 +150,29 @@
     ;; rule-id *is* the property
     (conj all-rules [(str property "(rdfs:range)") rule])))
 
-;; TODO - re-enable once filter function bug is fixed
 (defmethod to-datalog ::prp-fp
   [_ _ owl-statement all-rules]
-  (do
-    (log/warn "FunctionalProperty not supported yet")
-    all-rules)
-  #_(let [fp   (:id owl-statement)
-          rule {"where"  [{"@id" "?s"
-                           fp    "?fp-vals"}
-                          {"@id" "?s"
-                           fp    "?fp-vals2"}
-                          ["filter" "(not= ?fp-vals ?fp-vals2)"]]
-                "insert" {"@id"       "?fp-vals"
-                          $owl-sameAs "?fp-vals2"}}]
-      (conj all-rules [(str $owl-FunctionalProperty "(" fp ")") rule])))
+  (let [fp   (:id owl-statement)
+        rule {"where"  [{"@id" "?s"
+                         fp    "?fp-vals"}
+                        {"@id" "?s"
+                         fp    "?fp-vals2"}
+                        ["filter" "(not= ?fp-vals ?fp-vals2)"]]
+              "insert" {"@id"       "?fp-vals"
+                        $owl-sameAs "?fp-vals2"}}]
+    (conj all-rules [(str $owl-FunctionalProperty "(" fp ")") rule])))
 
-;; TODO - re-enable once filter function bug is fixed
 (defmethod to-datalog ::prp-ifp
   [_ _ owl-statement all-rules]
-  (do
-    (log/warn "InverseFunctionalProperty not supported yet")
-    all-rules)
-  #_(let [ifp  (:id owl-statement)
-          rule {"where"  [{"@id" "?x1"
-                           ifp   "?y"}
-                          {"@id" "?x2"
-                           ifp   "?y"}
-                          ["filter" "(not= ?x1 ?x2)"]]
-                "insert" {"@id"       "?x1"
-                          $owl-sameAs "?x2"}}]
-      (conj all-rules [(str $owl-InverseFunctionalProperty "(" ifp ")") rule])))
+  (let [ifp  (:id owl-statement)
+        rule {"where"  [{"@id" "?x1"
+                         ifp   "?y"}
+                        {"@id" "?x2"
+                         ifp   "?y"}
+                        ["filter" "(not= ?x1 ?x2)"]]
+              "insert" {"@id"       "?x1"
+                        $owl-sameAs "?x2"}}]
+    (conj all-rules [(str $owl-InverseFunctionalProperty "(" ifp ")") rule])))
 
 (defmethod to-datalog ::prp-symp
   [_ _ owl-statement all-rules]
