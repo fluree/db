@@ -969,42 +969,48 @@
                  (remove #(= (get % const/$id) q-shape-id))))))
       [])))
 
+(defn value-node
+  "Take a flake and create a value node suitable for validation. A value node is a tuple of [value dt]."
+  [flake]
+  [(flake/o flake) (flake/dt flake)])
+
 (defmulti validate-constraint
   "A constraint whose focus nodes conform returns nil. A constraint that doesn't returns a
   sequence of result maps."
-  (fn [v-ctx constraint focus-flakes]
+  (fn [v-ctx shape constraint focus-node value-nodes]
     (println "DEP validate-constraint dispatch" (pr-str constraint))
     constraint))
 
-(defmethod validate-constraint :default [_ _ _] nil)
+(defmethod validate-constraint :default [_ _ _ _ _] nil)
 
 (defn validate-constraints
-  [{:keys [shape] :as v-ctx} focus-flakes]
+  [v-ctx shape focus-node value-nodes]
   (println "DEP validate-constraints")
   (loop [[[constraint] & r] shape
          results []]
     (if constraint
-      (if-let [results* (validate-constraint v-ctx constraint focus-flakes)]
+      (if-let [results* (validate-constraint v-ctx shape constraint focus-node value-nodes)]
         (recur r (into results results*))
         (recur r results))
       (not-empty results))))
 
 (defn resolve-path-flakes2
-  [data-db path focus-flakes]
-  (println "DEP resolve-path-flakes path" (pr-str path))
+  "Return the value nodes resolved via the path from the focus node."
+  [data-db focus-node path]
+  (println "DEP resolve-path-flakes path" (pr-str focus-node) (pr-str path))
   (let [[segment] path]
     (if (iri/sid? segment)
-      (filterv #(= (flake/p %) segment) focus-flakes)
+      (async/<!! (query-range/index-range data-db :spot = [focus-node segment] {:flake-xf (map value-node)}))
       (throw (ex-info "Unsupported property path." {:segment segment :path path})))))
 
 (defn validate-property-shape
   "Returns a sequence of validation results if conforming fails, otherwise nil."
-  [{:keys [data-db shape] :as v-ctx} focus-flakes]
+  [{:keys [data-db] :as v-ctx} shape focus-node]
   (let [{path const/sh_path} shape
         ;; TODO: there can be multiple path-flakes after resolution, need to loop here...
-        path-flakes (resolve-path-flakes2 data-db path focus-flakes)]
-    (println "DEP property path flakes" (pr-str path-flakes))
-    (validate-constraints v-ctx path-flakes)))
+        value-nodes (resolve-path-flakes2 data-db focus-node path)]
+    (println "DEP property path value-nodes" (pr-str value-nodes))
+    (validate-constraints v-ctx shape focus-node value-nodes)))
 
 (defn target-node-target?
   [shape s-flakes]
@@ -1043,72 +1049,81 @@
   [shape]
   (first (get shape const/sh_targetObjectsOf)))
 
-(defn target-objects-of-target
+(defn target-objects-of-focus-nodes
   [db shape s-flakes]
   (go-try
     (let [target-pid (first (get shape const/sh_targetObjectsOf))]
       (println "DEP target-objects-of-target?" (pr-str target-pid))
       (let [sid             (some-> s-flakes first flake/s)
             referring-pids  (not-empty (<? (query-range/index-range db :opst = [sid] {:flake-xf (map flake/p)})))
-            p-flakes        (not-empty (filterv (fn [f] (= (flake/p f) target-pid)) s-flakes))]
-        (remove nil? [p-flakes (when referring-pids s-flakes)])))))
+            p-flakes        (filterv (fn [f] (= (flake/p f) target-pid)) s-flakes)
+            focus-nodes     (mapv value-node p-flakes)]
+        ;; TODO: we don't know that these are sids, so we need to use a node layout for focus nodes
+        (cond-> (mapv flake/o p-flakes)
+          referring-pids (conj sid))))))
 
-(defn resolve-target-flakes
-  "Return a sequence of focus flakes for the given node shape target."
-  [db shape s-flakes]
+(defn resolve-focus-nodes
+  "Evaluate the target declarations of a NodeShape to see if the provided s-flakes contain
+  any focus nodes for the shape. Returns a sequence of focus nodes if targets are present."
+  [data-db shape s-flakes]
   (go-try
-    (let [res
-          (cond (target-node-target? shape s-flakes)        [s-flakes]
-                (target-class-target? shape s-flakes)       [s-flakes]
-                (target-subjects-of-target? shape s-flakes) [s-flakes]
-                (implicit-target? shape s-flakes)           [s-flakes]
-                (target-objects-of-target? shape)
-                (<? (target-objects-of-target db shape s-flakes))
-                :else
-                ;; no target, no target-flakes
-                [])]
-      (println "DEP focus-flakes" (count res))
-      res)))
+    (let [sid (some-> s-flakes first flake/s)]
+      (cond (target-node-target? shape s-flakes)        [sid]
+            (target-class-target? shape s-flakes)       [sid]
+            (target-subjects-of-target? shape s-flakes) [sid]
+            (implicit-target? shape s-flakes)           [sid]
+            (target-objects-of-target? shape)
+            (<? (target-objects-of-focus-nodes data-db shape s-flakes))
+            :else
+            ;; no target declaration, no focus nodes
+            []))))
 
 (defn validate-node-shape
-  "Returns a sequence of validation results if conforming fails, otherwise nil."
-  ([v-ctx s-flakes]
-   (validate-node-shape v-ctx s-flakes nil))
-  ([{:keys [data-db shape] :as v-ctx} s-flakes provided-target-flakes]
-   (println "DEP validate-node-shape" (pr-str (get shape const/$id)) s-flakes provided-target-flakes)
-   (if provided-target-flakes
-     (validate-constraints v-ctx provided-target-flakes)
-     (loop [[target-flakes & r] (async/<!! (resolve-target-flakes data-db shape s-flakes))
-            results []]
-       (if target-flakes
-         (if-let [results* (validate-constraints v-ctx target-flakes)]
+  ""
+  ([{:keys [data-db] :as v-ctx} shape s-flakes]
+   (loop [[focus-node & r] (async/<!! (resolve-focus-nodes data-db shape s-flakes))
+          results []]
+     (if focus-node
+       (let [value-nodes (if (= (some-> s-flakes first flake/s) focus-node)
+                           (mapv value-node s-flakes)
+                           (async/<!! (query-range/index-range data-db :spot = [focus-node] {:flake-xf (map value-node)})))]
+         (if-let [results* (validate-node-shape v-ctx shape focus-node value-nodes)]
            (recur r (into results results*))
-           (recur r results))
-         (not-empty results))))))
+           (recur r results)))
+       (not-empty results))))
+  ([v-ctx shape focus-node value-nodes]
+   (validate-constraints v-ctx shape focus-node value-nodes)))
 
 (defn base-result
-  [{:keys [subject display shape] :as v-ctx} constraint]
-  {:subject (display subject)
-   :constraint (display constraint)
-   :shape (-> shape (get const/$id) display)})
+  [{:keys [display] :as v-ctx} shape constraint focus-node]
+  (let [{id const/$id
+         path const/sh_path
+         expect constraint} shape
+
+        [single-expect :as pretty-expect]
+        (mapv #(if (iri/sid? %) (display %) %) expect)]
+    (cond-> {:subject (display focus-node)
+             :constraint (display constraint)
+             :shape (display id)
+             :expect (if (> (count expect) 1)
+                       pretty-expect
+                       single-expect)}
+      path (assoc :path (mapv display path)))))
 
 ;; value type constraints
-(defmethod validate-constraint const/sh_class [{:keys [shape subject display data-db] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_class [{:keys [display data-db] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         expected-classes (into #{} expect)
 
-        result (-> (base-result v-ctx constraint)
-                   (assoc :path (mapv display path)
-                          :expect (mapv display expect)))]
-    (loop [[f & r] focus-flakes
+        result (base-result v-ctx shape constraint focus-node)]
+    (loop [[[o dt] & r] value-nodes
            results []]
-      (if f
-        (let [ref-flakes (async/<!! (query-range/index-range data-db :spot = [(flake/o f) const/$rdf:type]))
-              classes (if (flake/ref-flake? f)
+      (if o
+        (let [classes (if (iri/sid? o)
                         (->>
-                          (async/<!! (query-range/index-range data-db :spot = [(flake/o f) const/$rdf:type]))
+                          (async/<!! (query-range/index-range data-db :spot = [o const/$rdf:type]))
                           (into #{} (map flake/o)))
                         #{})
               missing-classes (set/difference expected-classes classes)]
@@ -1119,204 +1134,179 @@
                                         :message (str "missing required class " (display missing-class))))
                                missing-classes))))
         (not-empty results)))))
-(defmethod validate-constraint const/sh_datatype [{:keys [shape subject display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_datatype [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [datatype] expect
-        values     (mapv flake-value focus-flakes)
-        violations (remove (fn [[v dt]] (= dt datatype)) values)]
+        violations (remove (fn [[_v dt]] (= dt datatype)) value-nodes)]
     (when (not-empty violations)
-      [(-> (base-result v-ctx constraint)
-           (assoc :path (mapv display path)
-                  :value (mapv display violations)
-                  :expect (display datatype)
+      [(-> (base-result v-ctx shape constraint focus-node)
+           (assoc :value (mapv (comp display second) violations)
                   :message (str "the following values do not have expected datatype " (display datatype) ": "
-                                (->> values
-                                     (map (comp display first))
+                                (->> violations
+                                     (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)))
                                      (str/join ",")))))])))
-(defmethod validate-constraint const/sh_nodeKind [{:keys [shape display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_nodeKind [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [nodekind] expect
-        result     (-> (base-result v-ctx constraint)
-                       (assoc :path (mapv display path)
-                              :expect (display nodekind)))]
-    (->> focus-flakes
-         (remove (fn [[_ _ o]]
-                   (let [iri?     (and (iri/sid? o) (not (iri/bnode? o)))
-                         bnode?   (iri/bnode? o)
-                         literal? (not (iri/sid? o))]
+        result     (base-result v-ctx shape constraint focus-node)]
+    (->> value-nodes
+         (remove (fn [[v _dt]]
+                   (let [iri?     (and (iri/sid? v) (not (iri/bnode? v)))
+                         bnode?   (iri/bnode? v)
+                         literal? (not (iri/sid? v))]
                      (condp = nodekind
                        const/sh_BlankNode          bnode?
                        const/sh_IRI                iri?
                        const/sh_BlankNodeOrIRI     (or iri? bnode?)
                        const/sh_IRIOrLiteral       (or iri? literal?)
                        const/sh_BlankNodeOrLiteral (or bnode? literal?)))))
-         (mapv (fn [[_ _ o]]
-                 (let [value (if (iri/sid? o) (display o) o)]
+         (mapv (fn [[v _dt]]
+                 (let [value (if (iri/sid? v) (display v) v)]
                    (assoc result
                           :value value
                           :message (str "value " value " is is not of kind " (display nodekind)))))))))
 
 ;; cardinality constraints
-(defmethod validate-constraint const/sh_minCount [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
-  (println "DEP validate-constraint " (pr-str constraint) (pr-str subject))
-  (let [{expect constraint path const/sh_path} shape
+(defmethod validate-constraint const/sh_minCount [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (println "DEP validate-constraint " (pr-str constraint))
+  (let [{expect constraint} shape
 
         [min] expect
-        n     (count focus-flakes)]
+        n     (count value-nodes)]
     (when (< n min)
-      [(-> (base-result v-ctx constraint)
-           (assoc :path (mapv display path)
-                  :value n
-                  :expect min
+      [(-> (base-result v-ctx shape constraint focus-node)
+           (assoc :value n
                   :message (str "count " n " is less than minimum count of " min)))])))
-(defmethod validate-constraint const/sh_maxCount [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_maxCount [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint) )
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [max] expect
-        n     (count focus-flakes)]
+        n     (count value-nodes)]
     (when (> n max)
-      [(-> (base-result v-ctx constraint)
-           (assoc :path (mapv display path)
-                  :value n
-                  :expect max
+      [(-> (base-result v-ctx shape constraint focus-node)
+           (assoc :value n
                   :message (str "count " n " is greater than maximum count of " max)))])))
 
 ;; value range constraints
-(defmethod validate-constraint const/sh_minExclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_minExclusive [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [min-ex] expect
-        result (-> (base-result v-ctx constraint)
-                   (assoc :path (mapv display path)
-                          :expect min-ex))]
-    (->> focus-flakes
-         (remove (fn [f]
-                   (and (contains? numeric-types (flake/dt f))
-                        (> (flake/o f) min-ex))))
-         (mapv (fn [[_ _ o :as f]]
-                 (let [value (if (flake/ref-flake? f) (display o) o)]
+        result   (base-result v-ctx shape constraint focus-node)]
+    (->> value-nodes
+         (remove (fn [[v dt]]
+                   (and (contains? numeric-types dt)
+                        (> v min-ex))))
+         (mapv (fn [[v dt]]
+                 (let [value (if (iri/sid? v) (display v) v)]
                    (assoc result
                           :value value
                           :message (str "value " value " is less than exclusive minimum " min-ex))))))))
-(defmethod validate-constraint const/sh_maxExclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_maxExclusive [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [max-ex] expect
-        result (-> (base-result v-ctx constraint)
-                   (assoc :path (mapv display path)
-                          :expect max-ex))]
-    (->> focus-flakes
-         (remove (fn [f]
-                   (and (contains? numeric-types (flake/dt f))
-                        (< (flake/o f) max-ex))))
-         (mapv (fn [[_ _ o :as f]]
-                 (let [value (if (flake/ref-flake? f) (display o) o)]
+        result  (base-result v-ctx shape constraint focus-node)]
+    (->> value-nodes
+         (remove (fn [[v dt]]
+                   (and (contains? numeric-types dt)
+                        (< v max-ex))))
+         (mapv (fn [[v _dt]]
+                 (let [value (if (iri/sid? v) (display v) v)]
                    (assoc result
                           :value value
                           :message (str "value " value " is greater than exclusive maximum " max-ex))))))))
-(defmethod validate-constraint const/sh_minInclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_minInclusive [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [min-in] expect
-        result (-> (base-result v-ctx constraint)
-                   (assoc :path (mapv display path)
-                          :expect min-in))]
-    (->> focus-flakes
-         (remove (fn [f]
-                   (and (contains? numeric-types (flake/dt f))
-                        (>= (flake/o f) min-in))))
-         (mapv (fn [[_ _ o :as f]]
-                 (let [value (if (flake/ref-flake? f) (display o) o)]
+        result   (base-result v-ctx shape constraint focus-node)]
+    (->> value-nodes
+         (remove (fn [[v dt]]
+                   (and (contains? numeric-types dt)
+                        (>= v min-in))))
+         (mapv (fn [[v _dt]]
+                 (let [value (if (iri/sid? v) (display v) v)]
                    (assoc result
                           :value value
                           :message (str "value " value " is less than inclusive minimum " min-in))))))))
-(defmethod validate-constraint const/sh_maxInclusive [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_maxInclusive [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [max-in] expect
-        result (-> (base-result v-ctx constraint)
-                   (assoc :path (mapv display path)
-                          :expect max-in))]
-    (->> focus-flakes
-         (remove (fn [f]
-                   (and (contains? numeric-types (flake/dt f))
-                        (<= (flake/o f) max-in))))
-         (mapv (fn [[_ _ o :as f]]
-                 (let [value (if (flake/ref-flake? f) (display o) o)]
+        result   (base-result v-ctx shape constraint focus-node)]
+    (->> value-nodes
+         (remove (fn [[v dt]]
+                   (and (contains? numeric-types dt)
+                        (<= v max-in))))
+         (mapv (fn [[v _dt]]
+                 (let [value (if (iri/sid? v) (display v) v)]
                    (assoc result
                           :value value
                           :message (str "value " value " is greater than inclusive maximum " max-in))))))))
 
 ;; string-based constraints
-(defmethod validate-constraint const/sh_minLength [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_minLength [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [min-length] expect
-        result (-> (base-result v-ctx constraint)
-                   (assoc :path (mapv display path)
-                          :expect min-length))]
-    (->> focus-flakes
-         (remove (fn [f] (>= (count (str (flake/o f))) min-length)))
-         (mapv (fn [[_ _ o dt :as f]]
-                 (if (flake/ref-flake? f)
-                   (let [value (if (flake/ref-flake? f) (display o) (pr-str o))]
+        result       (base-result v-ctx shape constraint focus-node)]
+    (->> value-nodes
+         (remove (fn [[v _dt]] (>= (count (str v)) min-length)))
+         (mapv (fn [[v _dt]]
+                 (if (iri/sid? v)
+                   (let [value (if (iri/sid? v) (display v) (pr-str v))]
                      (assoc result
-                            :value o
+                            :value v
                             :message (str "value " value " is not a literal value")))
-                   (let [value (pr-str (str o))]
+                   (let [value (pr-str (str v))]
                      (assoc result
-                            :value o
+                            :value v
                             :message (str "value " value " has string length less than minimum length " min-length)))))))))
-(defmethod validate-constraint const/sh_maxLength [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_maxLength [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [max-length] expect
-        result (-> (base-result v-ctx constraint)
-                   (assoc :path (mapv display path)
-                          :expect max-length))]
-    (->> focus-flakes
-         (remove (fn [f] (<= (count (str (flake/o f))) max-length)))
-         (mapv (fn [[_ _ o dt :as f]]
-                 (if (flake/ref-flake? f)
-                   (let [value (if (flake/ref-flake? f) (display o) (pr-str o))]
+        result       (base-result v-ctx shape constraint focus-node)]
+    (->> value-nodes
+         (remove (fn [[v _dt]] (<= (count (str v)) max-length)))
+         (mapv (fn [[v _dt]]
+                 (if (iri/sid? v)
+                   (let [value (if (iri/sid? v) (display v) (pr-str v))]
                      (assoc result
-                            :value o
+                            :value v
                             :message (str "value " value " is not a literal value")))
-                   (let [value (pr-str (str o))]
+                   (let [value (pr-str (str v))]
                      (assoc result
-                            :value o
+                            :value v
                             :message (str "value " value " has string length greater than maximum length " max-length)))))))))
-(defmethod validate-constraint const/sh_pattern [{:keys [subject shape display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_pattern [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint flags const/sh_flags path const/sh_path} shape
+  (let [{expect constraint flags const/sh_flags} shape
 
         [pattern-str] expect
         valid-flags   (mapv get-regex-flag flags)
         pattern       #?(:clj (Pattern/compile pattern-str (apply + valid-flags))
                          :cljs (js/RegExp. pattern-str (apply str valid-flags)))
-        result        (-> (base-result v-ctx constraint)
-                          (assoc :path (mapv display path)
-                                 :expect pattern-str))]
+        result        (base-result v-ctx shape constraint focus-node)]
     (println "DEP flags" (pr-str flags) (pr-str valid-flags))
-    (->> focus-flakes
-         (remove (fn [f] (re-find pattern (str (flake/o f)))))
-         (mapv (fn [[_ _ o dt :as f]]
-                 (let [value (if (flake/ref-flake? f)
-                               (display o)
-                               (pr-str (str o)))]
+    (->> value-nodes
+         (remove (fn [[v dt]] (re-find pattern (str v))))
+         (mapv (fn [[v _dt]]
+                 (let [value (if (iri/sid? v) (display v) (pr-str (str v)))]
                    (assoc result
-                          :value o
+                          :value v
                           :message (str "value " value " does not match pattern " (pr-str pattern-str)
                                         (when (seq valid-flags)
                                           (str " with " (display const/sh_flags) " " (str/join ", " flags)))))))))))
@@ -1324,87 +1314,88 @@
 #_(defmethod validate-constraint const/sh_uniqueLang [v-ctx constraint focus-flakes]) ; not supported
 
 ;; property pair constraints
-(defmethod validate-constraint const/sh_equals [{:keys [shape subject display data-db] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_equals [{:keys [display data-db] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [equals]       expect
-        equals-flakes  (async/<!! (query-range/index-range data-db :spot = [subject equals]))
+        equals-flakes  (async/<!! (query-range/index-range data-db :spot = [focus-node equals]))
         equals-objects (into #{} (map flake/o) equals-flakes)
-        focus-objects  (into #{} (map flake/o) focus-flakes)]
+        focus-objects  (into #{} (map first) value-nodes)]
     (when (not= equals-objects focus-objects)
-      (let [iri-path (mapv display path)
-            values   (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
-            expects  (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) equals-flakes)]
-        [(-> (base-result v-ctx constraint)
-             (assoc :path iri-path
-                    :value (sort values)
+      (let [result (base-result v-ctx shape constraint focus-node)
+            iri-path (:path result)
+            expects  (:expect result)
+            values   (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)) value-nodes)]
+        [(-> result
+             (assoc :value (sort values)
                     :expect (sort expects)
                     :message (str "path " iri-path " values " (str/join ", " (sort values)) " do not equal "
                                   (display equals) " values " (str/join ", " (sort expects)))))]))))
-(defmethod validate-constraint const/sh_disjoint [{:keys [shape data-db display subject] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_disjoint [{:keys [data-db display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [disjoint]       expect
-        disjoint-flakes  (async/<!! (query-range/index-range data-db :spot = [subject disjoint]))
+        disjoint-flakes  (async/<!! (query-range/index-range data-db :spot = [focus-node disjoint]))
         disjoint-objects (into #{} (map flake/o) disjoint-flakes)
-        focus-objects    (into #{} (map flake/o) focus-flakes)]
+        focus-objects    (into #{} (map first) value-nodes)]
     (when (not-empty (set/intersection focus-objects disjoint-objects))
-      (let [iri-path (mapv display path)
-            values   (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
-            expects  (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) disjoint-flakes)]
-        [(-> (base-result v-ctx constraint)
-             (assoc :path iri-path
-                    :value (sort values)
+      (let [result (base-result v-ctx shape constraint focus-node)
+            iri-path (:path result)
+            expects  (:expect result)
+            values   (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)) value-nodes)]
+        [(-> result
+             (assoc :value (sort values)
                     :expect (sort expects)
                     :message (str "path " iri-path " values " (str/join ", " (sort values)) " are not disjoint with "
                                   (display disjoint) " values " (str/join ", " (sort expects)))))]))))
-(defmethod validate-constraint const/sh_lessThan [{:keys [shape subject data-db display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_lessThan [{:keys [data-db display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [less-than]       expect
-        less-than-flakes  (async/<!! (query-range/index-range data-db :spot = [subject less-than]))
+        less-than-flakes  (async/<!! (query-range/index-range data-db :spot = [focus-node less-than]))
         less-than-objects (into #{} (map flake/o) less-than-flakes)
-        focus-objects     (into #{} (map flake/o) focus-flakes)
+        focus-objects     (into #{} (map first) value-nodes)
 
-        iri-path (mapv display path)
-        values   (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
-        expects  (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) less-than-flakes)
-        result   (-> (base-result v-ctx constraint)
-                           (assoc :path iri-path
-                                  :value (sort values)
-                                  :expect (sort expects)))]
+        result   (base-result v-ctx shape constraint focus-node)
+        iri-path (:path result)
+        expects  (:expect result)
+        values   (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)) value-nodes)
+
+        result (-> result
+                     (assoc :value (sort values)
+                            :expect (sort expects)))]
     (if (or (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
-                 (every? (fn [f] (contains? numeric-types (flake/dt f))) focus-flakes))
+                 (every? (fn [[v dt]] (contains? numeric-types dt)) value-nodes))
             (and (every? (fn [f] (contains? time-types (flake/dt f))) less-than-flakes)
-                 (every? (fn [f] (contains? time-types (flake/dt f))) focus-flakes)))
+                 (every? (fn [[v dt]] (contains? time-types dt)) value-nodes)))
       (when-not (every? (fn [o] (apply < o (sort less-than-objects))) focus-objects)
         [(assoc result :message (str "path " iri-path " values " (str/join ", " (sort values)) " are not all less than "
                                      (display less-than) " values " (str/join ", " (sort expects))))])
       [(assoc result :message (str "path " iri-path " values " (str/join ", " (sort values)) " are not all comparable with "
                                    (display less-than) " values " (str/join ", " (sort expects))))])))
-(defmethod validate-constraint const/sh_lessThanOrEquals [{:keys [shape subject data-db display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_lessThanOrEquals [{:keys [data-db display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [less-than]       expect
-        less-than-flakes  (async/<!! (query-range/index-range data-db :spot = [subject less-than]))
+        less-than-flakes  (async/<!! (query-range/index-range data-db :spot = [focus-node less-than]))
         less-than-objects (into #{} (map flake/o) less-than-flakes)
-        focus-objects     (into #{} (map flake/o) focus-flakes)
+        focus-objects     (into #{} (map first) value-nodes)
 
-        iri-path (mapv display path)
-        values   (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) focus-flakes)
-        expects  (mapv #(if (flake/ref-flake? %) (display (flake/o %)) (flake/o %)) less-than-flakes)
-        result   (-> (base-result v-ctx constraint)
-                     (assoc :path iri-path
-                            :value (sort values)
-                            :expect (sort expects)))]
+        result   (base-result v-ctx shape constraint focus-node)
+        iri-path (:path result)
+        expects  (:expect result)
+        values   (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)) value-nodes)
+        result   (assoc result
+                        :value (sort values)
+                        :expect (sort expects))]
     (if (or (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
-                 (every? (fn [f] (contains? numeric-types (flake/dt f))) focus-flakes))
+                 (every? (fn [[_ dt]] (contains? numeric-types dt)) value-nodes))
             (and (every? (fn [f] (contains? time-types (flake/dt f))) less-than-flakes)
-                 (every? (fn [f] (contains? time-types (flake/dt f))) focus-flakes)))
+                 (every? (fn [[_ dt]] (contains? time-types dt)) value-nodes)))
       (when-not (every? (fn [o] (apply <= o (sort less-than-objects))) focus-objects)
         [(assoc result :message (str "path " iri-path " values " (str/join ", " (sort values)) " are not all less than "
                                      (display less-than) " values " (str/join ", " (sort expects))))])
@@ -1412,16 +1403,16 @@
                                    (display less-than) " values " (str/join ", " (sort expects))))])))
 
 ;; logical constraints
-(defmethod validate-constraint const/sh_not [{:keys [shape subject display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_not [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
   (loop [[p-shape & r] (get shape const/sh_not)
          results []]
     (if p-shape
-      (if-let [results* (validate-property-shape (assoc v-ctx :shape p-shape) focus-flakes)]
+      (if-let [results* (validate-property-shape v-ctx p-shape focus-node)]
         (recur r results)
-        (recur r (conj results (assoc (base-result v-ctx constraint)
-                                      :value (display subject)
-                                      :message (str (display subject) " conforms to shape " (display (get p-shape const/$id)))))))
+        (recur r (conj results (assoc (base-result v-ctx shape constraint focus-node)
+                                      :value (display focus-node)
+                                      :message (str (display focus-node) " conforms to shape " (display (get p-shape const/$id)))))))
       (not-empty results))))
 (defmethod validate-constraint const/sh_and [v-ctx constraint focus-flakes]
   (println "DEP validate-constraint " (pr-str constraint)))
@@ -1431,84 +1422,82 @@
   (println "DEP validate-constraint " (pr-str constraint)))
 
 ;; shape-based constraints
-(defmethod validate-constraint const/sh_node [{:keys [shape display data-db shape-db] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_node [{:keys [display data-db shape-db] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         pretty-expect (->> expect
                            (mapv #(get % const/$id))
                            (mapv display))
-        result (-> (base-result v-ctx constraint)
-                   (assoc :path (mapv display path))
+        result (-> (base-result v-ctx shape constraint focus-node)
                    (assoc :expect pretty-expect))]
     (println "DEP sh:node expect" (pr-str expect))
-    (loop [[f & r] focus-flakes
+    (loop [[[v dt] & r] value-nodes
            results []]
-      (if f
-        (if (flake/ref-flake? f)
+      (if (some? v)
+        (if (iri/sid? v)
           (recur r (into results
                          (loop [[node-shape & r] expect
                                 results []]
                            (if node-shape
-                             (let [s-flakes (async/<!! (query-range/index-range data-db :spot = [(flake/o f)]))]
+                             (let [value-nodes (async/<!! (query-range/index-range data-db :spot = [v] {:flake-xf (map value-node)}))]
                                (println "DEP node shape" (pr-str shape))
-                               (if-let [results* (validate-node-shape (assoc v-ctx :shape node-shape) nil s-flakes)]
+                               (if-let [results* (validate-node-shape v-ctx node-shape v value-nodes)]
                                  (recur r (conj results (assoc result
-                                                               :value (display (flake/o f))
-                                                               :message (str "node " (display (flake/o f))
-                                                                             " does not conform to shapes "
+                                                               :value (display v)
+                                                               :message (str "node " (display v) " does not conform to shapes "
                                                                              pretty-expect))))
                                  (recur r results)))
                              results))))
           (recur r (conj results (assoc result
-                                        :value (flake/o f)
-                                        :message (str "value " (flake/o f) " does not conform to shapes "
+                                        :value v
+                                        :message (str "value " v " does not conform to shapes "
                                                       pretty-expect)))))
         (not-empty results)))))
-(defmethod validate-constraint const/sh_property [{:keys [shape] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_property [v-ctx shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
   (loop [[p-shape & r] (get shape const/sh_property)
          results []]
     (if p-shape
-      (if-let [results* (validate-property-shape (assoc v-ctx :shape p-shape) focus-flakes)]
+      (if-let [results* (validate-property-shape v-ctx p-shape focus-node)]
         (recur r (into results results*))
         (recur r results))
       (not-empty results))))
-(defmethod validate-constraint const/sh_qualifiedValueShape [{:keys [shape display data-db shape-db] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_qualifiedValueShape [{:keys [display data-db shape-db] :as v-ctx}
+                                                             shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
   (def v-ctx v-ctx)
-  (let [{expect constraint path const/sh_path
+  (let [{expect constraint
          [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
          [q-min-count] const/sh_qualifiedMinCount
          [q-max-count] const/sh_qualifiedMaxCount} shape
 
         [q-shape] expect
 
-
-        values (->> focus-flakes
-                    (mapv flake/o)
+        values (->> value-nodes
+                    (mapv first)
                     (mapv #(if (iri/sid? %) (display %) %)))
 
-        result (-> (base-result v-ctx constraint)
-                   (assoc :path (mapv display path))
+        result (-> (base-result v-ctx shape constraint focus-node)
                    (assoc :expect (display (get q-shape const/$id)))
                    (assoc :value values))]
     (println "DEP q-shape" (pr-str q-shape))
-    (loop [[f & r] focus-flakes
+    (loop [[[v _dt] & r] value-nodes
            conforming []]
-      (println "DEP flake " (pr-str f) (pr-str conforming))
-      (if f
+      (println "DEP flake " (pr-str v) (pr-str conforming))
+      (if (some? v)
         ;; build up conforming sids
-        (let [focus-flakes (if (flake/ref-flake? f)
-                             (async/<!! (query-range/index-range data-db :spot = [(flake/o f)]))
-                             [f])
+        (let [focus-node* (if (iri/sid? v) v focus-node)
+              value-nodes* (if (iri/sid? v)
+                             (async/<!! (query-range/index-range data-db :spot = [v] {:flake-xf (map value-node)}))
+                             value-nodes)
               result (if (property-shape? q-shape)
-                       (validate-property-shape (assoc v-ctx :shape q-shape) focus-flakes)
-                       (validate-node-shape (assoc v-ctx :shape q-shape) nil focus-flakes))]
+                       (validate-property-shape v-ctx q-shape focus-node*)
+                       (validate-node-shape v-ctx q-shape focus-node* value-nodes*))]
           (println "DEP q-shape result" (pr-str result))
           (if result
             (recur r conforming)
-            (recur r (conj conforming (flake/o f)))))
+            (recur r (conj conforming v))))
 
         (do
           (println "DEP end flake" (pr-str q-disjoint?) (pr-str conforming))
@@ -1524,10 +1513,11 @@
                                 non-disjoint-conformers* []]
                            (println "DEP sib-q-shape" (pr-str sib-q-shape) (pr-str non-disjoint-conformers*))
                            (if sib-q-shape
-                             (let [focus-flakes (async/<!! (query-range/index-range data-db :spot = [conforming-sid]))
+                             (let [value-nodes (async/<!! (query-range/index-range data-db :spot = [conforming-sid]
+                                                                                   {:flake-xf (map value-node)}))
                                    q-result (if (property-shape? sib-q-shape)
-                                              (validate-property-shape (assoc v-ctx :shape sib-q-shape) focus-flakes)
-                                              (validate-node-shape (assoc v-ctx :shape sib-q-shape) nil focus-flakes))]
+                                              (validate-property-shape v-ctx sib-q-shape conforming-sid)
+                                              (validate-node-shape v-ctx sib-q-shape conforming-sid value-nodes))]
                                (println "DEP sib-q-shape result" (pr-str q-result) )
                                (if q-result
                                  (recur r non-disjoint-conformers*)
@@ -1573,62 +1563,54 @@
                                           " more than " (display const/sh_qualifiedMaxCount) " " q-max-count " times"))]))))))))
 
 ;; other constraints
-(defmethod validate-constraint const/sh_closed [{:keys [shape subject data-db display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_closed [{:keys [data-db display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint shape-id const/$id ignored const/sh_ignoredProperties properties const/sh_property} shape
+  (let [{expect constraint ignored const/sh_ignoredProperties
+         properties const/sh_property} shape
 
         [closed?]   expect
         constrained (into #{} (map #(-> % (get const/sh_path) first) properties))
         allowed     (into constrained ignored)
-        present     (into #{} (map flake/p) focus-flakes)
+        present     (into #{} (map first) value-nodes)
         not-allowed (set/difference present allowed)]
     (println "DEP closed" (pr-str allowed) (pr-str present) (pr-str not-allowed))
     (when (not-empty not-allowed)
-      (let [pid->flakes (group-by flake/p focus-flakes)]
+      (let [pid->flakes (->> (async/<!! (query-range/index-range data-db :spot = [focus-node]))
+                             (group-by flake/p))]
         (mapv (fn [path]
                 (let [values (->> (get pid->flakes path)
                                   (mapv #(if (flake/ref-flake? %)
                                            (display (flake/o %))
                                            (flake/o %))))]
-                  (-> (base-result v-ctx constraint)
-                      (assoc :path (mapv display (util/sequential path))
-                             :value values
+                  (-> (base-result v-ctx shape constraint focus-node)
+                      (assoc :value values
                              :expect (mapv display allowed)
                              :message (str "disallowed path " (display path) " with values " (str/join "," values))))))
               not-allowed)))))
-(defmethod validate-constraint const/sh_hasValue [{:keys [shape display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_hasValue [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
         [term] expect]
-    (when-not (some #(= term (flake/o %)) focus-flakes)
-      (let [value (mapv (fn [[_ _ o]] (if (iri/sid? o) (display o) o))
-                        focus-flakes)
+    (when-not (some #(= term (first %)) value-nodes)
+      (let [value (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)) value-nodes)
             expect (if (iri/sid? term) (display term) term)]
-        [(-> (base-result v-ctx constraint)
-             (assoc :path (mapv display path)
-                    :expect expect
-                    :value value
+        [(-> (base-result v-ctx shape constraint focus-node)
+             (assoc :value value
                     :message (str "at least one value of " value " must be " expect)))]))))
-(defmethod validate-constraint const/sh_in [{:keys [shape subject display] :as v-ctx} constraint focus-flakes]
+(defmethod validate-constraint const/sh_in [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
-  (let [{expect constraint path const/sh_path} shape
+  (let [{expect constraint} shape
 
-        expected  (into #{} expect)
-        pretty-expect (mapv #(if (iri/sid? %) (display %) %) expect)
-
-        result (-> (base-result v-ctx constraint)
-                   (assoc :path (mapv display path)
-                          :expect pretty-expect))]
-    (->> focus-flakes
-         (remove (fn [f] (contains? expected (flake/o f))))
-         (mapv (fn [[_ _ o dt :as f]]
-                 (let [value (if (flake/ref-flake? f)
-                               (display o)
-                               (pr-str (str o)))]
+        expected (into #{} expect)
+        result   (base-result v-ctx shape constraint focus-node)]
+    (->> value-nodes
+         (remove (fn [[v dt]] (contains? expected v)))
+         (mapv (fn [[v dt]]
+                 (let [value (if (iri/sid? v) (display v) (pr-str (str v)))]
                    (assoc result
-                          :value o
-                          :message (str "value " value " is not in " pretty-expect))))))))
+                          :value v
+                          :message (str "value " value " is not in " (:expect result)))))))))
 
 (defn explain-result
   [{:keys [subject constraint shape path message]}]
@@ -1677,14 +1659,12 @@
               shape   (<? (build-shape shape-db shape-sid))
 
               v-ctx {:display (partial sid->compact-iri (:namespace-codes data-db) context)
-                     :subject subject
-                     :shape shape
                      :shape-db shape-db
                      :data-db data-db}]
           (println "DEP shape" (pr-str shape-sid))
           ;; only enforce activated shapes
           (when (not (get shape const/sh_deactivated))
-            (let [results (validate-node-shape v-ctx s-flakes)]
+            (let [results (validate-node-shape v-ctx shape s-flakes)]
               (println "DEP report" (pr-str results))
               (when results
                 (throw-shacl-violation data-db context results)))))))))
