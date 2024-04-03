@@ -574,8 +574,7 @@
     (let [cleared (reduce (fn [db* idx]
                             (update-in db* [:novelty idx]
                                        (fn [flakes]
-                                         ;; recall 't' is negative, and flakes newer than provided 't' are therefore < t
-                                         (filter (partial index/after-t? t) flakes))))
+                                         (index/flakes-after t flakes))))
                           db index/types)
           size    (flake/size-bytes (get-in cleared [:novelty :spot]))]
       (assoc-in cleared [:novelty :size] size))
