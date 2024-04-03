@@ -89,7 +89,7 @@
         commit-t       (commit-data/t db-commit)
         _              (when-not (= db-t commit-t)
                          (throw (ex-info (str "Unexpected Error. Db's t value and commit's t value are not the same: "
-                                              (- db-t) " and " commit-t " respectively.")
+                                              db-t " and " commit-t " respectively.")
                                          {:status 500 :error :db/invalid-db})))
         updated-index? (not= (commit-data/index-t branch-commit)
                              (commit-data/index-t db-commit))
