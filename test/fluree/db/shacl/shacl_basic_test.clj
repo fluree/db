@@ -1743,7 +1743,7 @@ WORLD!")
           (is (= {:status 400,
                   :error  :shacl/violation,
                   :report
-                  [{:subject    "ex:Alice",
+                  [{:subject    "ex:Bob",
                     :constraint "sh:minCount",
                     :shape      "_:fdb-8",
                     :path       ["ex:ssn"],
@@ -1751,7 +1751,7 @@ WORLD!")
                     :expect     1,
                     :message    "count 0 is less than minimum count of 1"}]}
                  (ex-data db-just-alice)))
-          (is (= "Subject ex:Alice path [\"ex:ssn\"] violates constraint sh:minCount of shape _:fdb-8 - count 0 is less than minimum count of 1."
+          (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:minCount of shape _:fdb-8 - count 0 is less than minimum count of 1."
                  (ex-message db-just-alice)))))
       (testing "combined with `sh:targetClass`"
         (let [db1           @(fluree/stage db0
@@ -1809,7 +1809,19 @@ WORLD!")
                                                      {"id"        "ex:Alice"
                                                       "type"      "ex:User"
                                                       "ex:friend" {"@id" "ex:Bob"}}})]
-          (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject "ex:Bob",
+                    :constraint "sh:maxCount",
+                    :shape "_:fdb-15",
+                    :expect 1,
+                    :path ["ex:ssn"],
+                    :value 2,
+                    :message "count 2 is greater than maximum count of 1"}]}
+                 (ex-data db-db-forbidden-friend)))
+          (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:maxCount of shape _:fdb-15 - count 2 is greater than maximum count of 1."
                  (ex-message db-db-forbidden-friend))))
         (let [db1           @(fluree/stage db0
                                            {"@context" ["https://ns.flur.ee" context]
@@ -1835,7 +1847,18 @@ WORLD!")
                                             {"id"     "ex:Bob"
                                              "ex:ssn" ["111-11-1111"
                                                        "222-22-2222"]}})]
-          (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject "ex:Bob",
+                    :constraint "sh:maxCount",
+                    :shape "_:fdb-19",
+                    :expect 1,
+                    :path ["ex:ssn"],
+                    :value 2,
+                    :message "count 2 is greater than maximum count of 1"}]}
+                 (ex-data db-excess-ssn)))
+          (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:maxCount of shape _:fdb-19 - count 2 is greater than maximum count of 1."
                  (ex-message db-excess-ssn)))))
       (testing "datatype"
         (let [db1     @(fluree/stage db0
@@ -1857,7 +1880,18 @@ WORLD!")
                                                   {"id"        "ex:Alice"
                                                    "type"      "ex:User"
                                                    "ex:friend" {"@id" "ex:Bob"}}})]
-          (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be http://www.w3.org/2001/XMLSchema#string."
+          (is (= {:status 400,
+                  :error :shacl/violation,
+                  :report
+                  [{:subject "ex:Bob",
+                    :constraint "sh:datatype",
+                    :shape "_:fdb-23",
+                    :expect "xsd:string",
+                    :path ["ex:name"],
+                    :value ["xsd:integer"],
+                    :message "the following values do not have expected datatype xsd:string: 123"}]}
+                 (ex-data db-forbidden-friend)))
+          (is (= "Subject ex:Bob path [\"ex:name\"] violates constraint sh:datatype of shape _:fdb-23 - the following values do not have expected datatype xsd:string: 123."
                  (ex-message db-forbidden-friend))))))))
 
 (deftest ^:integration shape-based-constraints
