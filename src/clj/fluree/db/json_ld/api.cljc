@@ -390,9 +390,11 @@
   NOTE: Currently returns internal fluree ids for subject, property and object.
   This will be changed to return IRIs in a future release.
 
-  Optional opts map can include:
-  :group-by - :rule (default), :subject, :property"
-  ([db] (reasoned-facts db {:group-by :rule}))
+  Optional opts map specified grouping, or no grouping (default):
+  {:group-by :rule} - group by rule IRI
+  {:group-by :subject} - group by the reasoned triples' subject
+  {:group-by ::property} - group by the reasoned triples' property IRI"
+  ([db] (reasoned-facts db nil))
   ([db opts]
    (let [group-fn (case (:group-by opts)
                     nil nil
@@ -401,9 +403,12 @@
                     :rule (fn [p] (nth p 3)))
          result   (->> db :novelty :spot
                        reasoner/reasoned-flakes
-                       (map (fn [flake] [(flake/s flake)
-                                         (flake/p flake)
-                                         (flake/o flake)
+                       (map (fn [flake] [(decode-iri db (flake/s flake))
+                                         (decode-iri db (flake/p flake))
+                                         (as-> (flake/o flake) o
+                                               (if (iri/sid? o)
+                                                 (decode-iri db o)
+                                                 o))
                                          (-> flake flake/m :reasoned)])))]
      (if group-fn
        (group-by group-fn result)
