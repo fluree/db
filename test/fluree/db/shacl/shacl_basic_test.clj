@@ -1211,8 +1211,17 @@ WORLD!")
              (ex-data db-wrong-birth-year)))
       (is (= "Subject :ex/alice path [:ex/birthYear] violates constraint :sh/pattern of shape _:fdb-3 - value \"1776\" does not match pattern \"(19|20)[0-9][0-9]\"."
              (ex-message db-wrong-birth-year)))
-      (is (util/exception? db-ref-value)
-          "Exception, because :schema/name is not a literal value")
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/john,
+                :constraint :sh/pattern,
+                :shape "_:fdb-3",
+                :expect "(19|20)[0-9][0-9]",
+                :path [:ex/birthYear],
+                :value #fluree/SID [101 "ref"],
+                :message "value :ex/ref does not match pattern \"(19|20)[0-9][0-9]\""}]}
+             (ex-data db-ref-value)))
       (is (= "Subject :ex/john path [:ex/birthYear] violates constraint :sh/pattern of shape _:fdb-3 - value :ex/ref does not match pattern \"(19|20)[0-9][0-9]\"."
              (ex-message db-ref-value)))
       (is (= [{:id          :ex/brian
@@ -1528,8 +1537,8 @@ WORLD!")
                                                  "https://example.com/gender"  "Female"
                                                  "@type"                       "https://example.com/Actor"
                                                  "https://example.com/name"    "Jenny Tutone"}]})]
-    (is (not (util/exception? db2)))
-    (is (not (util/exception? db3)))
+    (is (not (ex-data db2)))
+    (is (not (ex-data db3)))
     (is (= {:status 400,
             :error  :shacl/violation,
             :report
@@ -1626,7 +1635,7 @@ WORLD!")
       (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-7 - value ex:Green is not in [\"ex:Pink\" \"ex:Purple\"]."
             (ex-message db2)))
 
-      (is (not (util/exception? db3)))
+      (is (not (ex-data db3)))
       (is (= {"id"       "ex:PastelPony"
               "type"     "ex:Pony"
               "ex:color" [{"id" "ex:Pink"} {"id" "ex:Purple"}]}
