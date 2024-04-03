@@ -83,7 +83,7 @@
   [db txn-id author-did]
   (let [{:keys [branch ledger policy], db-t :t} db
         commit-t  (-> (ledger/-status ledger branch) branch/latest-commit-t)
-        t         (inc commit-t)
+        t         (flake/next-t commit-t)
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before
      :txn-id                   txn-id

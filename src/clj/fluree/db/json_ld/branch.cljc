@@ -1,6 +1,6 @@
 (ns fluree.db.json-ld.branch
-  (:require [fluree.db.util.core :as util]
-            [fluree.db.json-ld.commit-data :as commit-data]
+  (:require [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.flake :as flake]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log :include-macros true])
 
@@ -58,7 +58,7 @@
 (defn update-db
   "Updates the latest staged db and returns new branch data."
   [{:keys [t index] :as branch-data} {db-t :t, :as db}]
-  (if (or (= (inc t) db-t)
+  (if (or (= (flake/next-t t) db-t)
           (= t db-t)
           (zero? t)) ;; when loading a ledger from disk, 't' will be zero but ledger will be >= 1
     (let [db* (dbproto/-index-update db index)]

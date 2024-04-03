@@ -15,7 +15,8 @@
             [fluree.db.connection :as connection :refer [register-ledger release-ledger]]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [fluree.db.flake :as flake])
   (:refer-clojure :exclude [load]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -129,14 +130,14 @@
       ;; note, index updates will have same t value as current one, so still need to check if t = latest-t
       (cond
 
-        (= commit-t (inc latest-t))
+        (= commit-t (flake/next-t latest-t))
         (let [updated-db  (<? (jld-reify/merge-commit conn latest-db false [commit proof]))
               commit-map  (commit-data/json-ld->map commit (select-keys updated-db index/types))
               updated-db* (assoc updated-db :commit commit-map)]
           (commit-update ledger branch updated-db*))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
-        (> commit-t (inc latest-t))
+        (> commit-t (flake/next-t latest-t))
         (do
           (log/debug "Received commit update that is more than 1 ahead of current ledger state. "
                      "Will dump in-memory ledger and force a reload: " (:alias ledger))

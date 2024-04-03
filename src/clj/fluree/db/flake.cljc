@@ -395,6 +395,15 @@
   ([flake t]
    (->Flake (s flake) (p flake) (o flake) (dt flake) t (not (op flake)) (m flake))))
 
+(defn next-t
+  [t]
+  (inc t))
+
+(defn prev-t
+  [t]
+  (when (> t 0)
+    (dec t)))
+
 (defn match-tspo
   "Returns all matching flakes to a specific 't' value."
   [ss t]
