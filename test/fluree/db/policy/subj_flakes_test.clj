@@ -93,7 +93,7 @@
                                async/<!!)
 
           ssn-iri (fluree/expand-iri context :schema/ssn)
-          ssn-sid (fluree/internal-id db ssn-iri)]
+          ssn-sid (fluree/encode-iri db ssn-iri)]
       (is (= 0
              (count (filter #(= ssn-sid (flake/p %)) alice-db-john)))
           "Alice cannot see John's ssn.")
