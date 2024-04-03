@@ -130,28 +130,47 @@
                           {:id          :ex/john
                            :type        :ex/User
                            :schema/name "John"}})
-          ;; no :schema/name
+          ;; need to specify type inline in order to avoid coercion
           db-int-name  @(fluree/stage
                          db
                          {"@context" ["https://ns.flur.ee" context]
                           "insert"
                           {:id          :ex/john
                            :type        :ex/User
-                           :schema/name 42}})
+                           :schema/name {:type :xsd/integer :value 42}}})
           db-bool-name @(fluree/stage
                          db
                          {"@context" ["https://ns.flur.ee" context]
                           "insert"
                           {:id          :ex/john
                            :type        :ex/User
-                           :schema/name true}})]
-      (is (util/exception? db-int-name)
-          "Exception, because :schema/name is an integer and not a string.")
-      (is (= "Value 42 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
+                           :schema/name {:type :xsd/boolean :value true}}})]
+      (is (= {:status 400,
+           :error :shacl/violation,
+           :report
+           [{:subject :ex/john,
+             :constraint :sh/datatype,
+             :shape "_:fdb-2",
+             :expect :xsd/string,
+             :path [:schema/name],
+             :value [:xsd/integer],
+             :message "the following values do not have expected datatype :xsd/string: 42"}]}
+             (ex-data db-int-name)))
+      (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/datatype of shape _:fdb-2 - the following values do not have expected datatype :xsd/string: 42."
              (ex-message db-int-name)))
-      (is (util/exception? db-bool-name)
+      (is (= {:status 400,
+              :error :shacl/violation,
+              :report
+              [{:subject :ex/john,
+                :constraint :sh/datatype,
+                :shape "_:fdb-2",
+                :expect :xsd/string,
+                :path [:schema/name],
+                :value [:xsd/boolean],
+                :message "the following values do not have expected datatype :xsd/string: true"}]}
+             (ex-data db-bool-name))
           "Exception, because :schema/name is a boolean and not a string.")
-      (is (= "Value true cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
+      (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/datatype of shape _:fdb-2 - the following values do not have expected datatype :xsd/string: true."
              (ex-message db-bool-name)))
       (is (= @(fluree/query db-ok user-query)
              [{:id          :ex/john
