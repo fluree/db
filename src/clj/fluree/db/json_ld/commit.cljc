@@ -224,7 +224,7 @@
                           (ledger/-status branch)
                           branch/latest-commit-t)
           new-flakes  (commit-flakes db)]
-      (when (not= t (inc committed-t))
+      (when (not= t (flake/next-t committed-t))
         (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
                              " is no longer consistent with staged db 't' value of: " t ".")
                         {:status 400 :error :db/invalid-commit})))
@@ -264,8 +264,8 @@
   [ledger-commit db-commit]
   (let [ledger-t (commit-data/t ledger-commit)]
     (or (nil? ledger-t)
-        (> (commit-data/t db-commit)
-           ledger-t))))
+        (flake/t-after? (commit-data/t db-commit)
+                        ledger-t))))
 
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
@@ -293,6 +293,11 @@
        :push-res    push-res
        :db          db***})))
 
+(defn newer-commit?
+  [db commit]
+  (flake/t-after? (commit-data/t (:commit db))
+                  (commit-data/t commit)))
+
 (defn update-commit-fn
   "Returns a fn that receives a newly indexed db as its only argument.
   Will updated the provided committed-db with the new index, then create
@@ -300,9 +305,7 @@
   [committed-db commit-opts]
   (fn [indexed-db]
     (let [indexed-commit (:commit indexed-db)
-          commit-newer?  (> (commit-data/t (:commit committed-db))
-                            (commit-data/t indexed-commit))
-          new-db         (if commit-newer?
+          new-db         (if (newer-commit? committed-db indexed-commit)
                            (dbproto/-index-update committed-db (:index indexed-commit))
                            indexed-db)]
       (do-commit+push new-db commit-opts))))

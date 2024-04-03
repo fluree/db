@@ -57,18 +57,22 @@
                :tspo tspo)
         (assoc-in [:stats :indexed] index-t))))
 
+(defn newer-index?
+  [commit {data-map :data, :as _commit-index}]
+  (if data-map
+    (let [commit-index-t (commit-data/index-t commit)
+          index-t        (:t data-map)]
+      (or (nil? commit-index-t)
+          (flake/t-after? index-t commit-index-t)))
+    false))
+
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [commit] :as db} {data-map :data, :as commit-index}]
-  (let [index-t        (:t data-map)
-        commit-index-t (commit-data/index-t commit)
-        newer-index?   (and data-map
-                            (or (nil? commit-index-t)
-                                (> index-t commit-index-t)))]
-    (if newer-index?
-      (force-index-update db commit-index)
-      db)))
+  [{:keys [commit] :as db} commit-index]
+  (if (newer-index? commit commit-index)
+    (force-index-update db commit-index)
+    db))
 
 ;; ================ end Jsonld record support fns ============================
 

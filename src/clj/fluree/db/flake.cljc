@@ -404,6 +404,14 @@
   (when (> t 0)
     (dec t)))
 
+(defn t-before?
+  [t1 t2]
+  (< t1 t2))
+
+(defn t-after?
+  [t1 t2]
+  (> t1 t2))
+
 (defn match-tspo
   "Returns all matching flakes to a specific 't' value."
   [ss t]

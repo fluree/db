@@ -566,18 +566,16 @@
   "Empties novelty @ t value and earlier. If t is null, empties all novelty."
   [db t]
   (cond
-    (nil? t)
+    (or (nil? t)
+        (= t (:t db)))
     (empty-all-novelty db)
 
-    (= t (:t db))
-    (empty-all-novelty db)
-
-    (< t (:t db))
+    (flake/t-before? t (:t db))
     (let [cleared (reduce (fn [db* idx]
                             (update-in db* [:novelty idx]
                                        (fn [flakes]
                                          ;; recall 't' is negative, and flakes newer than provided 't' are therefore < t
-                                         (filter #(< (flake/t %) t) flakes))))
+                                         (filter (partial index/after-t? t) flakes))))
                           db index/types)
           size    (flake/size-bytes (get-in cleared [:novelty :spot]))]
       (assoc-in cleared [:novelty :size] size))
