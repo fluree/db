@@ -398,6 +398,45 @@
     []
     restrictions))
 
+(defn some-values-condition
+  "Used to build where statement for owl:someValuesFrom restriction when the
+  parent clause is *not* an owl:equivalentClass, and therefore is part of a more complex
+  nested condition.
+
+  binding-var should be the variables that is being bound in the parent where statement
+  clause."
+  [binding-var some-values-statements]
+  (reduce
+    (fn [acc some-values-statement]
+      (let [property (util/get-first-id some-values-statement $owl-onProperty)
+            {:keys [classes union-of]} (group-by equiv-class-type (get some-values-statement $owl-someValuesFrom))]
+        (log/warn "union-of" union-of)
+        (cond
+          classes
+          (-> acc
+              (conj {"@id"    binding-var
+                     property "?_some-val-rel"}) ;; choosing a binding var name unlikely to collide
+              (conj {"@id"   "?_some-val-rel"
+                     "@type" (-> classes first :id)}))
+
+          union-of
+          (-> acc
+              (conj {"@id"    binding-var
+                     property "?_some-val-rel"})
+              (conj (reduce (fn [acc i]
+                              (conj acc {"@id"   "?_some-val-rel"
+                                         "@type" {"@id" i}}))
+                            ["union"]
+                            (-> union-of first (get $owl-unionOf) get-all-ids))))
+
+          :else
+          (do (log/warn "Ignoring some rules from nested owl:someValuesFrom values."
+                        "Currently only support explicit classes and owl:unionOf values."
+                        "Please let us know if there is a rule you think should be supported.")
+              acc))))
+    []
+    some-values-statements))
+
 (defn has-value-condition
   "Used to build where statement for owl:hasValue restriction when the
   parent clause is *not* an owl:equivalentClass, and therefore is part of a more complex
@@ -477,14 +516,15 @@
     restrictions))
 
 (defn equiv-intersection-of
-  "Handles rules cls-int1, cls-int2"
+  "Handles owl:intersectionOf - rules cls-int1, cls-int2"
   [rule-class intersection-of-statements inserts]
   (reduce
     (fn [acc intersection-of-statement]
       (let [intersections (unwrap-list (get intersection-of-statement $owl-intersectionOf))
-            {:keys [classes has-value]} (group-by equiv-class-type intersections)
+            {:keys [classes has-value some-values]} (group-by equiv-class-type intersections)
             restrictions  (cond->> []
-                                   has-value (into (has-value-condition "?y" has-value)))
+                                   has-value (into (has-value-condition "?y" has-value))
+                                   some-values (into (some-values-condition "?y" some-values)))
             class-list    (map :id classes)
             cls-int1      {"where"  (reduce
                                       (fn [acc c]
