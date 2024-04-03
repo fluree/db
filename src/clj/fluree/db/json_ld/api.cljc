@@ -330,12 +330,28 @@
    (json-ld/expand-iri compact-iri
                        (json-ld/parse-context context))))
 
-(defn internal-id
-  "Returns the internal Fluree integer id for a given IRI.
+(defn encode-iri
+  "Returns the internal Fluree IRI identifier (a compact form).
   This can be used for doing range scans, slices and for other
   more advanced needs."
   [db iri]
   (iri/encode-iri db iri))
+
+(defn internal-id
+  "Deprecated, use encode-iri instead."
+  {:deprecated true}
+  [db iri]
+  (do
+    (println "WARNING: (internal-id db iri) is deprecated, use (encode-iri db iri).")
+    (encode-iri db iri)))
+
+(defn decode-iri
+  "Opposite of encode-iri. When doing more advanced features
+  like direct range-scans of indexes, IRIs are returned in their
+  internal compact format. This allows the IRI to be returned
+  as a full string IRI."
+  [db iri]
+  (iri/decode-sid db iri))
 
 ;; reasoning APIs
 
