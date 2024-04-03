@@ -55,6 +55,16 @@
                                             :schema/age  ?age
                                             :schema/name ?name}
                                            [:filter "(> ?age 45)"]]}))))
+    (testing "single filter, different vars"
+      (is (= [["Brian" "Smith"]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '[?name ?last]
+                                :where   '[{:type        :ex/User
+                                            :schema/age  ?age
+                                            :schema/name ?name
+                                            :ex/last     ?last}
+                                           [:filter "(and (> ?age 45) (strEnds ?last \"ith\"))"]]}))))
     (testing "multiple filters on same var"
       (is (= [["David" 46]]
              @(fluree/query db {:context [test-utils/default-context
@@ -84,6 +94,57 @@
                                             :schema/age  ?age
                                             :schema/name ?name}
                                            [:filter "(> ?age (/ (+ ?age 47) 2))"]]}))))
+
+    (testing "filtering for absence"
+      (is (= ["Brian" "David"]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '?name
+                                :where   '[{:id          ?s
+                                            :type        :ex/User
+                                            :schema/name ?name}
+                                           [:optional {:id          ?s
+                                                       :ex/favColor ?color}]
+                                           [:filter "(not (bound ?color))"]]}))))
+
+    (testing "filtering bound variables"
+      (is (= ["Cam"]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '?name
+                                :where   '[{:type        :ex/User
+                                            :schema/name ?name}
+                                           [:bind ?nameLength "(strLen ?name)"]
+                                           [:filter "(> 4 ?nameLength)"]]}))))
+
+    (testing "filtering variables bound to iris"
+      (let [db-dads @(fluree/stage
+                       db
+                       {"@context" {"ex" "http://example.org/"}
+                        "insert"   {"@id"       "ex:bob"
+                                    "ex:father" [{"@id" "ex:alex-jr"}, {"@id" "ex:aj"}]}})]
+        (is (= [["ex:bob" "ex:aj" "ex:alex-jr"] ["ex:bob" "ex:alex-jr" "ex:aj"]]
+               @(fluree/query db-dads {:context {"ex" "http://example.org/"}
+                                       :select  '[?s ?f1 ?f2]
+                                       :where   '[{"@id"       ?s
+                                                   "ex:father" ?f1}
+                                                  {"@id"       ?s
+                                                   "ex:father" ?f2}
+                                                  ["filter" "(not= ?f1 ?f2)"]]})))))
+
+    (testing "value map filters"
+      (is (= [["Brian" "Smith"]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex     "http://example.org/ns/"
+                                           :value  "@value"
+                                           :filter "@filter"}]
+                                :select  '[?name ?last]
+                                :where   '[{:type        :ex/User
+                                            :schema/age  {:value  ?age
+                                                          :filter "(> ?age 45)"}
+                                            :schema/name ?name
+                                            :ex/last     {:value  ?last
+                                                          :filter "(strEnds ?last \"ith\")"}}]}))))
 
     ;;TODO: simple-subject-crawl does not yet support filters.
     ;;these are being run as regular analytial queries
