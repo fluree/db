@@ -272,186 +272,187 @@
                                                 "@type" "ex:Winery"}})))
               "because every hasMaker must be a winery, they are all wineries"))))))
 
-;; TODO - re-enable once filter function bug is fixed
-#_(deftest ^:integration owl-max-cardinality
-    (testing "owl:maxCardinality test - rule cls-maxc2 (cls-maxc1 is 'false' and ignored)"
-      (let [conn    (test-utils/create-conn)
-            ledger  @(fluree/create conn "reasoner/owl-max-card" nil)
-            db-base @(fluree/stage (fluree/db ledger)
-                                   {"@context" {"ex" "http://example.org/"}
-                                    "insert"   [{"@id"       "ex:brian"
-                                                 "@type"     "ex:Person"
-                                                 "ex:mother" [{"@id" "ex:carol"}
-                                                              {"@id" "ex:carol2"}
-                                                              {"@id" "ex:carol3"}]}]})]
+(deftest ^:integration owl-max-cardinality
+  (testing "owl:maxCardinality test - rule cls-maxc2 (cls-maxc1 is 'false' and ignored)"
+    (let [conn    (test-utils/create-conn)
+          ledger  @(fluree/create conn "reasoner/owl-max-card" nil)
+          db-base @(fluree/stage (fluree/db ledger)
+                                 {"@context" {"ex" "http://example.org/"}
+                                  "insert"   [{"@id"       "ex:brian"
+                                               "@type"     "ex:Person"
+                                               "ex:mother" [{"@id" "ex:carol"}
+                                                            {"@id" "ex:carol2"}
+                                                            {"@id" "ex:carol3"}]}]})]
 
-        (testing "Testing owl:maxCardinality=1 declaration (rule cls-maxc2)"
-          (let [db-equiv   @(fluree/reason db-base :owl2rl
-                                           [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
-                                                                    "ex"  "http://example.org/"}
-                                             "@id"                 "ex:Person"
-                                             "owl:equivalentClass" [{"@type"              ["owl:Restriction"]
-                                                                     "owl:onProperty"     {"@id" "ex:mother"}
-                                                                     "owl:maxCardinality" 1}]}])
-                qry-carol  @(fluree/query db-equiv
-                                          {:context {"ex"  "http://example.org/"
-                                                     "owl" "http://www.w3.org/2002/07/owl#"}
-                                           :select  "?s"
-                                           :where   {"@id"        "ex:carol",
-                                                     "owl:sameAs" "?same"}})
-                qry-carol2 @(fluree/query db-equiv
-                                          {:context {"ex"  "http://example.org/"
-                                                     "owl" "http://www.w3.org/2002/07/owl#"}
-                                           :select  "?s"
-                                           :where   {"@id"        "ex:carol2",
-                                                     "owl:sameAs" "?same"}})
-                qry-carol3 @(fluree/query db-equiv
-                                          {:context {"ex"  "http://example.org/"
-                                                     "owl" "http://www.w3.org/2002/07/owl#"}
-                                           :select  "?s"
-                                           :where   {"@id"        "ex:carol3",
-                                                     "owl:sameAs" "?same"}})]
-            (is (= #{"ex:carol2" "ex:carol3"}
-                   (set qry-carol))
-                "ex:carol2 and ex:carol3 should be deemed the same as ex:carol")
+      (testing "Testing owl:maxCardinality=1 declaration (rule cls-maxc2)"
+        (let [db-equiv @(fluree/reason db-base :owl2rl
+                                       [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                "ex"  "http://example.org/"}
+                                         "@id"                 "ex:Person"
+                                         "owl:equivalentClass" [{"@type"              ["owl:Restriction"]
+                                                                 "owl:onProperty"     {"@id" "ex:mother"}
+                                                                 "owl:maxCardinality" 1}]}])]
 
-            (is (= #{"ex:carol" "ex:carol3"}
-                   (set qry-carol2))
-                "ex:carol and ex:carol3 should be deemed the same as ex:carol2")
+          (fluree.db.util.log/warn "REASONED FACTS: " (fluree/reasoned-facts db-equiv))
 
-            (is (= #{"ex:carol" "ex:carol2"}
-                   (set qry-carol3))
-                "ex:carol and ex:carol2 should be deemed the same as ex:carol3")))
+          (fluree.db.util.log/warn "QUERY RESULT:" @(fluree/query db-equiv
+                                                                  {:context {"ex"  "http://example.org/"
+                                                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                                                   :select  "?same"
+                                                                   :where   {"@id"        "ex:carol",
+                                                                             "owl:sameAs" "?same"}}))
 
-        (testing "Testing owl:maxCardinality > 1"
-          (let [db-42     @(fluree/reason db-base :owl2rl
-                                          [{"@context"           {"owl" "http://www.w3.org/2002/07/owl#"
-                                                                  "ex"  "http://example.org/"}
-                                            "@id"                "ex:Human"
-                                            "@type"              ["owl:Class"]
-                                            "owl:onProperty"     {"@id" "ex:mother"}
-                                            "owl:maxCardinality" 42}])
-                qry-carol @(fluree/query db-42
-                                         {:context {"ex"  "http://example.org/"
-                                                    "owl" "http://www.w3.org/2002/07/owl#"}
-                                          :select  "?s"
-                                          :where   {"@id"        "ex:carol",
-                                                    "owl:sameAs" "?same"}})]
-            (is (= []
-                   qry-carol)
-                "with maxCardinality > 1, no inferences can be made"))))))
+          (is (= #{"ex:carol2" "ex:carol3"}
+                 (set @(fluree/query db-equiv
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol",
+                                                "owl:sameAs" "?same"}})))
+              "ex:carol2 and ex:carol3 should be deemed the same as ex:carol")
 
-#_(deftest ^:integration owl-max-qual-cardinality
-    (testing "owl:maxQualifiedCardinality test - rules cls-maxqc3, cls-maxqc4"
-      (let [conn    (test-utils/create-conn)
-            ledger  @(fluree/create conn "reasoner/owl-max-qual-card" nil)
-            db-base @(fluree/stage (fluree/db ledger)
-                                   {"@context" {"ex" "http://example.org/"}
-                                    "insert"   [{"@id"       "ex:brian"
-                                                 "@type"     "ex:Person"
-                                                 "ex:mother" [{"@id"   "ex:carol"
-                                                               "@type" "ex:Parent"}
-                                                              {"@id"   "ex:carol2"
-                                                               "@type" "ex:Parent"}
-                                                              {"@id"   "ex:carol-not"
-                                                               "@type" "ex:NotParent"}]}]})]
+          (is (= #{"ex:carol" "ex:carol3"}
+                 (set @(fluree/query db-equiv
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol2",
+                                                "owl:sameAs" "?same"}})))
+              "ex:carol and ex:carol3 should be deemed the same as ex:carol2")
 
-        (testing "Testing owl:maxQualifiedCardinality=1 declaration (rule cls-maxqc3)"
-          (let [db-equiv      @(fluree/reason db-base :owl2rl
-                                              [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
-                                                                       "ex"  "http://example.org/"}
-                                                "@id"                 "ex:Parent"
-                                                "@type"               ["owl:Class"]
-                                                "owl:equivalentClass" [{"owl:onProperty"              {"@id" "ex:mother"}
-                                                                        "owl:onClass"                 {"@id" "ex:Parent"}
-                                                                        "owl:maxQualifiedCardinality" 1}]}])
-                qry-carol     @(fluree/query db-equiv
-                                             {:context {"ex"  "http://example.org/"
-                                                        "owl" "http://www.w3.org/2002/07/owl#"}
-                                              :select  "?s"
-                                              :where   {"@id"        "ex:carol",
-                                                        "owl:sameAs" "?same"}})
-                qry-carol2    @(fluree/query db-equiv
-                                             {:context {"ex"  "http://example.org/"
-                                                        "owl" "http://www.w3.org/2002/07/owl#"}
-                                              :select  "?s"
-                                              :where   {"@id"        "ex:carol2",
-                                                        "owl:sameAs" "?same"}})
-                qry-carol-not @(fluree/query db-equiv
-                                             {:context {"ex"  "http://example.org/"
-                                                        "owl" "http://www.w3.org/2002/07/owl#"}
-                                              :select  "?s"
-                                              :where   {"@id"        "ex:carol-not",
-                                                        "owl:sameAs" "?same"}})]
-            (is (= ["ex:carol2"]
-                   qry-carol)
-                "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
+          (is (= #{"ex:carol" "ex:carol2"}
+                 (set @(fluree/query db-equiv
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol3",
+                                                "owl:sameAs" "?same"}})))
+              "ex:carol and ex:carol2 should be deemed the same as ex:carol3")))
 
-            (is (= ["ex:carol"]
-                   qry-carol2)
-                "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
+      (testing "Testing owl:maxCardinality > 1"
+        (let [db-42 @(fluree/reason db-base :owl2rl
+                                    [{"@context"           {"owl" "http://www.w3.org/2002/07/owl#"
+                                                            "ex"  "http://example.org/"}
+                                      "@id"                "ex:Human"
+                                      "@type"              ["owl:Class"]
+                                      "owl:onProperty"     {"@id" "ex:mother"}
+                                      "owl:maxCardinality" 42}])]
+          (is (= []
+                 @(fluree/query db-42
+                                {:context {"ex"  "http://example.org/"
+                                           "owl" "http://www.w3.org/2002/07/owl#"}
+                                 :select  "?s"
+                                 :where   {"@id"        "ex:carol",
+                                           "owl:sameAs" "?same"}}))
+              "with maxCardinality > 1, no inferences can be made"))))))
 
-            (is (= []
-                   qry-carol-not)
-                "ex:carol-not is a different class and therefore not equivalent to anyone else")))
+(deftest ^:integration owl-max-qual-cardinality
+  (testing "owl:maxQualifiedCardinality test - rules cls-maxqc3, cls-maxqc4"
+    (let [conn    (test-utils/create-conn)
+          ledger  @(fluree/create conn "reasoner/owl-max-qual-card" nil)
+          db-base @(fluree/stage (fluree/db ledger)
+                                 {"@context" {"ex" "http://example.org/"}
+                                  "insert"   [{"@id"       "ex:brian"
+                                               "@type"     "ex:Person"
+                                               "ex:mother" [{"@id"   "ex:carol"
+                                                             "@type" "ex:Parent"}
+                                                            {"@id"   "ex:carol2"
+                                                             "@type" "ex:Parent"}
+                                                            {"@id"   "ex:carol-not"
+                                                             "@type" "ex:NotParent"}]}]})]
 
-        (testing "Testing owl:maxQualifiedCardinality=1 declaration where owl:onClass = owl:Thing (rule cls-maxqc4)"
-          (let [db-equiv      @(fluree/reason db-base :owl2rl
-                                              [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
-                                                                       "ex"  "http://example.org/"}
-                                                "@id"                 "ex:Parent"
-                                                "@type"               ["owl:Class"]
-                                                "owl:equivalentClass" [{"owl:onProperty"              {"@id" "ex:mother"}
-                                                                        "owl:onClass"                 {"@id" "owl:Thing"}
-                                                                        "owl:maxQualifiedCardinality" 1}]}])
-                qry-carol     @(fluree/query db-equiv
-                                             {:context {"ex"  "http://example.org/"
-                                                        "owl" "http://www.w3.org/2002/07/owl#"}
-                                              :select  "?s"
-                                              :where   {"@id"        "ex:carol",
-                                                        "owl:sameAs" "?same"}})
-                qry-carol2    @(fluree/query db-equiv
-                                             {:context {"ex"  "http://example.org/"
-                                                        "owl" "http://www.w3.org/2002/07/owl#"}
-                                              :select  "?s"
-                                              :where   {"@id"        "ex:carol2",
-                                                        "owl:sameAs" "?same"}})
-                qry-carol-not @(fluree/query db-equiv
-                                             {:context {"ex"  "http://example.org/"
-                                                        "owl" "http://www.w3.org/2002/07/owl#"}
-                                              :select  "?s"
-                                              :where   {"@id"        "ex:carol-not",
-                                                        "owl:sameAs" "?same"}})]
-            (is (= #{"ex:carol" "ex:carol2" "ex:carol-not"}
-                   (set qry-carol))
-                "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")
+      (testing "Testing owl:maxQualifiedCardinality=1 declaration (rule cls-maxqc3)"
+        (let [db-equiv @(fluree/reason db-base :owl2rl
+                                       [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                "ex"  "http://example.org/"}
+                                         "@id"                 "ex:Person"
+                                         "@type"               ["owl:Class"]
+                                         "owl:equivalentClass" [{"@type"                       ["owl:Restriction"]
+                                                                 "owl:onProperty"              {"@id" "ex:mother"}
+                                                                 "owl:onClass"                 {"@id" "ex:Parent"}
+                                                                 "owl:maxQualifiedCardinality" 1}]}])]
+          (is (= #{"ex:carol2"}
+                 (set @(fluree/query db-equiv
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol",
+                                                "owl:sameAs" "?same"}})))
+              "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
 
-            (is (= #{"ex:carol" "ex:carol2" "ex:carol-not"}
-                   (set qry-carol2))
-                "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")
+          (is (= #{"ex:carol"}
+                 (set @(fluree/query db-equiv
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol2",
+                                                "owl:sameAs" "?same"}})))
+              "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
 
-            (is (= #{"ex:carol" "ex:carol2" "ex:carol-not"}
-                   (set qry-carol-not))
-                "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")))
+          (is (= []
+                 @(fluree/query db-equiv
+                                {:context {"ex"  "http://example.org/"
+                                           "owl" "http://www.w3.org/2002/07/owl#"}
+                                 :select  "?same"
+                                 :where   {"@id"        "ex:carol-not",
+                                           "owl:sameAs" "?same"}}))
+              "ex:carol-not is a different class and therefore not equivalent to anyone else")))
 
-        (testing "Testing owl:maxQualifiedCardinality > 1"
-          (let [db-42     @(fluree/reason db-base :owl2rl
-                                          [{"@context"                    {"owl" "http://www.w3.org/2002/07/owl#"
-                                                                           "ex"  "http://example.org/"}
-                                            "@id"                         "ex:Human"
-                                            "@type"                       ["owl:Class"]
-                                            "owl:onProperty"              {"@id" "ex:mother"}
-                                            "owl:onClass"                 {"@id" "owl:Thing"}
-                                            "owl:maxQualifiedCardinality" 42}])
-                qry-carol @(fluree/query db-42
-                                         {:context {"ex"  "http://example.org/"
-                                                    "owl" "http://www.w3.org/2002/07/owl#"}
-                                          :select  "?s"
-                                          :where   {"@id"        "ex:carol",
-                                                    "owl:sameAs" "?same"}})]
-            (is (= []
-                   qry-carol)
-                "with maxQualifiedCardinality > 1, no inferences can be made"))))))
+      (testing "Testing owl:maxQualifiedCardinality=1 declaration where owl:onClass = owl:Thing (rule cls-maxqc4)"
+        (let [db-equiv @(fluree/reason db-base :owl2rl
+                                       [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                "ex"  "http://example.org/"}
+                                         "@id"                 "ex:Person"
+                                         "@type"               ["owl:Class"]
+                                         "owl:equivalentClass" [{"@type"                       ["owl:Restriction"]
+                                                                 "owl:onProperty"              {"@id" "ex:mother"}
+                                                                 "owl:onClass"                 {"@id" "owl:Thing"}
+                                                                 "owl:maxQualifiedCardinality" 1}]}])]
+          (is (= #{"ex:carol2" "ex:carol-not"}
+                 (set @(fluree/query db-equiv
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol",
+                                                "owl:sameAs" "?same"}})))
+              "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")
+
+          (is (= #{"ex:carol" "ex:carol-not"}
+                 (set @(fluree/query db-equiv
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol2",
+                                                "owl:sameAs" "?same"}})))
+              "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")
+
+          (is (= #{"ex:carol" "ex:carol2"}
+                 (set @(fluree/query db-equiv
+                                     {:context {"ex"  "http://example.org/"
+                                                "owl" "http://www.w3.org/2002/07/owl#"}
+                                      :select  "?same"
+                                      :where   {"@id"        "ex:carol-not",
+                                                "owl:sameAs" "?same"}})))
+              "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")))
+
+      (testing "Testing owl:maxQualifiedCardinality > 1"
+        (let [db-42     @(fluree/reason db-base :owl2rl
+                                        [{"@context"                    {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                         "ex"  "http://example.org/"}
+                                          "@id"                         "ex:Human"
+                                          "@type"                       ["owl:Class"]
+                                          "owl:onProperty"              {"@id" "ex:mother"}
+                                          "owl:onClass"                 {"@id" "owl:Thing"}
+                                          "owl:maxQualifiedCardinality" 42}])
+              qry-carol @(fluree/query db-42
+                                       {:context {"ex"  "http://example.org/"
+                                                  "owl" "http://www.w3.org/2002/07/owl#"}
+                                        :select  "?s"
+                                        :where   {"@id"        "ex:carol",
+                                                  "owl:sameAs" "?same"}})]
+          (is (= []
+                 qry-carol)
+              "with maxQualifiedCardinality > 1, no inferences can be made"))))))
 
 (deftest ^:integration owl-one-of
   (testing "owl:oneOf test - rule cls-oo"
