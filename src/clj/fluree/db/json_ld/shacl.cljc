@@ -917,19 +917,24 @@
            (first (get shape const/sh_qualifiedMaxCount)))))
 
 (defn build-shape-node
-  [db shape-sid]
-  (go-try
-    (let [flakes (<? (query-range/index-range db :spot = [shape-sid]))]
-      (if (seq flakes)
-        (loop [[f & r] flakes
-               node {const/$id shape-sid}]
-          (if f
-            (recur r (update node (flake/p f) (fnil conj [])
-                             (if (flake/ref-flake? f)
-                               (<? (build-shape-node db (flake/o f)))
-                               (flake/o f))))
-            node))
-        shape-sid))))
+  ([db shape-sid]
+   (build-shape-node db shape-sid #{shape-sid}))
+  ([db shape-sid built-nodes]
+   (go-try
+     (let [flakes (<? (query-range/index-range db :spot = [shape-sid]))]
+       (if (seq flakes)
+         (loop [[f & r] flakes
+                node {const/$id shape-sid}]
+           (if f
+             (recur r (update node (flake/p f) (fnil conj [])
+                              (if (flake/ref-flake? f)
+                                (let [ref (flake/o f)]
+                                  (if (contains? built-nodes ref)
+                                    ref
+                                    (<? (build-shape-node db ref (conj built-nodes ref)))))
+                                (flake/o f))))
+             node))
+         shape-sid)))))
 
 (defn build-shape
   [db shape-sid]
