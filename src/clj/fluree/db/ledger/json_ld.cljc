@@ -137,7 +137,7 @@
           (commit-update ledger branch updated-db*))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
-        (> commit-t (flake/next-t latest-t))
+        (flake/t-after? commit-t (flake/next-t latest-t))
         (do
           (log/debug "Received commit update that is more than 1 ahead of current ledger state. "
                      "Will dump in-memory ledger and force a reload: " (:alias ledger))
@@ -150,10 +150,10 @@
                     " however we already have this commit so not applying: " latest-t)
           false)
 
-        (< commit-t latest-t)
+        (flake/t-before? commit-t latest-t)
         (do
           (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
-                    " however, latest-t is more current: " latest-t)
+                    " however, latest t is more current: " latest-t)
           false)))))
 
 (defrecord JsonLDLedger [id address alias did indexer state cache conn]
