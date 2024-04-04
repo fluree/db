@@ -69,14 +69,6 @@
                          t " however new db t value is: " db-t ".")
                     {:status 500 :error :db/invalid-time}))))
 
-(defn update-commit-with-index
-  "If an update-commit-fn exists in state, calls it."
-  [index new-index]
-  (when-let [commit-fn (:update-commit-fn index)]
-    (if (fn? commit-fn)
-      (commit-fn new-index)
-      (log/warn "update-commit-fn in ledger's state index was not a function: " index))))
-
 (defn update-commit
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
@@ -113,11 +105,6 @@
   "Returns latest db from branch data"
   [branch-data]
   (:latest-db branch-data))
-
-(defn latest-commit-db
-  "Returns latest committed db"
-  [branch-data]
-  (:commit-db branch-data))
 
 (defn latest-commit
   "Returns latest commit info from branch-data"
