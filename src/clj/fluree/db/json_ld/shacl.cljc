@@ -958,7 +958,7 @@
         shape]
     (if q-disjoint?
       (let [parent-shape-id
-            (first (async/<!! (query-range/index-range shape-db :opst = [shape-id const/sh_property]
+            (first (async/<!! (query-range/index-range shape-db :opst = [[shape-id const/$xsd:anyURI] const/sh_property]
                                                        {:flake-xf (map flake/s)})))
             sibling-sids
             (async/<!! (query-range/index-range shape-db :spot = [parent-shape-id const/sh_property]
@@ -1012,7 +1012,7 @@
       (async/<!! (query-range/index-range data-db :spot = [focus-node segment] {:flake-xf (map value-node)}))
       (let [{[inverse-path] const/sh_inversePath} segment]
         (cond inverse-path
-              (async/<!! (query-range/index-range data-db :opst = [focus-node inverse-path] {:flake-xf (map subject-node)}))
+              (async/<!! (query-range/index-range data-db :opst = [[focus-node const/$xsd:anyURI] inverse-path] {:flake-xf (map subject-node)}))
               :else
               (throw (ex-info "Unsupported property path." {:segment segment :path path})))))))
 
@@ -1068,7 +1068,8 @@
     (let [target-pid (first (get shape const/sh_targetObjectsOf))]
       (println "DEP target-objects-of-target?" (pr-str target-pid))
       (let [sid             (some-> s-flakes first flake/s)
-            referring-pids  (not-empty (<? (query-range/index-range db :opst = [sid] {:flake-xf (map flake/p)})))
+            referring-pids  (not-empty (<? (query-range/index-range db :opst = [[sid const/$xsd:anyURI]]
+                                                                    {:flake-xf (map flake/p)})))
             p-flakes        (filterv (fn [f] (= (flake/p f) target-pid)) s-flakes)
             focus-nodes     (mapv value-node p-flakes)]
         ;; TODO: we don't know that these are sids, so we need to use a node layout for focus nodes
@@ -1647,7 +1648,7 @@
 (defn all-node-shape-ids
   [db]
   (def db db)
-  (query-range/index-range db :post = [const/$rdf:type const/sh_NodeShape]
+  (query-range/index-range db :post = [const/$rdf:type [const/sh_NodeShape const/$xsd:anyURI]]
                            {:flake-xf (map flake/s)}))
 
 (defn sid->compact-iri
