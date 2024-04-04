@@ -974,6 +974,10 @@
   [flake]
   [(flake/o flake) (flake/dt flake)])
 
+(defn subject-node
+  [flake]
+  [(flake/s flake) const/$xsd:anyURI])
+
 (defmulti validate-constraint
   "A constraint whose focus nodes conform returns nil. A constraint that doesn't returns a
   sequence of result maps."
@@ -1001,7 +1005,11 @@
   (let [[segment] path]
     (if (iri/sid? segment)
       (async/<!! (query-range/index-range data-db :spot = [focus-node segment] {:flake-xf (map value-node)}))
-      (throw (ex-info "Unsupported property path." {:segment segment :path path})))))
+      (let [{[inverse-path] const/sh_inversePath} segment]
+        (cond inverse-path
+              (async/<!! (query-range/index-range data-db :opst = [focus-node inverse-path] {:flake-xf (map subject-node)}))
+              :else
+              (throw (ex-info "Unsupported property path." {:segment segment :path path})))))))
 
 (defn validate-property-shape
   "Returns a sequence of validation results if conforming fails, otherwise nil."
@@ -1108,7 +1116,12 @@
              :expect (if (> (count expect) 1)
                        pretty-expect
                        single-expect)}
-      path (assoc :path (mapv display path)))))
+      path (assoc :path (mapv (fn [segment]
+                                (if (iri/sid? segment)
+                                  (display segment)
+                                  (let [[[k [v]]] (seq (dissoc segment const/$id))]
+                                    {(display k) (display v)})))
+                              path)))))
 
 ;; value type constraints
 (defmethod validate-constraint const/sh_class [{:keys [display data-db] :as v-ctx} shape constraint focus-node value-nodes]
