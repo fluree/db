@@ -285,7 +285,7 @@
           db**          (if (new-t? ledger-commit commit)
                           (commit-data/add-commit-flakes (:prev-commit db) db*)
                           db*)
-          db***         (ledger/-commit-update ledger branch (dissoc db** :txns))
+          db***         (ledger/-commit-update! ledger branch (dissoc db** :txns))
           push-res      (<? (nameservice/push! conn (assoc new-commit**
                                                            :meta commit-res
                                                            :ledger-state state)))]

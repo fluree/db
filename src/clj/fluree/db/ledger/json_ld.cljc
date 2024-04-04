@@ -60,7 +60,8 @@
     (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                          "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
                     {:status 400 :error :db/invalid-branch})))
-  (-> (swap! state update-in [:branches branch-name] branch/update-commit db)
+  (-> state
+      (swap! update-in [:branches branch-name] branch/update-commit db)
       (get-in [:branches branch-name :commit-db])))
 
 (defn status
@@ -168,7 +169,7 @@
   (-db-update [ledger db] (db-update ledger db))
   (-branch [ledger] (branch-meta ledger nil))
   (-branch [ledger branch] (branch-meta ledger branch))
-  (-commit-update [ledger branch db] (commit-update ledger branch db))
+  (-commit-update! [ledger branch db] (commit-update ledger branch db))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))
   (-did [_] did)
@@ -314,7 +315,7 @@
           ledger       (<? (create* conn ledger-alias {:branch branch}))
           db           (ledger/-db ledger)
           db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
-      (ledger/-commit-update ledger branch db*)
+      (ledger/-commit-update! ledger branch db*)
       (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
       (async/put! ledger-chan ledger) ; note, ledger can be an exception!
       ledger)))
