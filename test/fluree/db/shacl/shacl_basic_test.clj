@@ -1407,9 +1407,18 @@ WORLD!")
                @(fluree/query valid-parent {"@context" context
                                             "select"   {"ex:Luke" ["*" {"ex:parent" ["*"]}]}})))
 
-        (is (util/exception? invalid-pal))
-
-        (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject "ex:bad-parent",
+                  :constraint "sh:minCount",
+                  :shape "_:fdb-2",
+                  :expect 1,
+                  :path [{"sh:inversePath" "ex:parent"}],
+                  :value 0,
+                  :message "count 0 is less than minimum count of 1"}]}
+               (ex-data invalid-pal)))
+        (is (= "Subject ex:bad-parent path [{\"sh:inversePath\" \"ex:parent\"}] violates constraint sh:minCount of shape _:fdb-2 - count 0 is less than minimum count of 1."
                (ex-message invalid-pal)))))
     (testing "sequence paths"
       (let [;; a valid Pal is anybody who has a pal with a name
