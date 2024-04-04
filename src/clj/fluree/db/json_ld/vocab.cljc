@@ -91,10 +91,10 @@
   (update prop-map :equivalentProperty conj prop))
 
 (defn update-equivalent-property
-  [db prop-map sid prop]
-  (let [initial-map              (initial-property-map db sid)
+  [db prop-map parent-prop child-prop]
+  (let [initial-map              (initial-property-map db parent-prop)
         with-equivalent-property (fnil add-equivalent-property initial-map)]
-    (update prop-map sid with-equivalent-property prop)))
+    (update prop-map parent-prop with-equivalent-property child-prop)))
 
 (defn update-all-equivalent-properties
   [db prop-map sid o-props]
@@ -104,7 +104,7 @@
               (update-equivalent-property db props o-prop sid)))
           prop-map o-props))
 
-(defn update-equivalent-properties
+(defn update-owl-equivalent-property
   [db pred-map sid obj]
   (let [s-props (-> pred-map
                     (get-in [sid :equivalentProperty])
@@ -115,6 +115,37 @@
     (reduce (fn [p-map s-prop]
               (update-all-equivalent-properties db p-map s-prop o-props))
             pred-map s-props)))
+
+(defn update-equivalent-properties
+  "Adds owl:equivalentProperty and rdfs:subPropertyOf rules to the schema map as the
+  appropriate equivalent properties for query purposes only.
+
+  For owl:equivalentProperty, the relationships go both ways. e.g.:
+  [ex:givenName owl:equivalentProperty ex:firstName]
+  Means that two entries must be made for equivalence
+   - ex:givenName -> ex:firstName
+   - ex:firstName -> ex:givenName.
+
+  For subPropertyOf, the relationship is one way. e.g.:
+  [ex:father rdfs:subPropertyOf ex:parent]
+   - ex:parent -> ex:father"
+  [db pred-map sid pid obj]
+  (if (iri/sid? obj)
+    (if (= const/$owl:equivalentProperty pid)
+      (update-owl-equivalent-property db pred-map sid obj)
+      (update-equivalent-property db pred-map obj sid))
+    (do
+      (log/warn (str "Triple of ["
+                     (iri/decode-sid db sid) " "
+                     (iri/decode-sid db pid) " "
+                     obj "] is not being enforced because "
+                     obj " is not an IRI."
+                     (when (string? obj)
+                       (str
+                         " It is a string, and likely was intended to be "
+                         "input as {\"@id\": \"" obj "\"} instead of as a "
+                         "string datatype."))))
+      pred-map)))
 
 (defn update-pred-map
   [db pred-map vocab-flake]
@@ -136,8 +167,9 @@
       (= const/$rdfs:subClassOf pid)
       (update pred-map sid with-subclass obj)
 
-      (= const/$owl:equivalentProperty pid)
-      (update-equivalent-properties db pred-map sid obj)
+      (or (= const/$owl:equivalentProperty pid)
+          (= const/$rdfs:subPropertyOf pid))
+      (update-equivalent-properties db pred-map sid pid obj)
 
       :else pred-map)))
 
