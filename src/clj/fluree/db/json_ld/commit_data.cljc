@@ -294,7 +294,7 @@
 
       ;; new-index is nil but there is an old index, or old index is newer
       (or (nil? new-index)
-          (< (index-t new-commit) (index-t old-commit)))
+          (flake/t-before? (index-t new-commit) (index-t old-commit)))
       (assoc new-commit :index old-index)
 
       ;; index in new-commit is newer, no changes to new commit

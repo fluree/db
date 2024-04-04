@@ -510,15 +510,15 @@
 (defn do-index
   "Performs an index operation and returns a promise-channel of the latest db once complete"
   [indexer {:keys [t branch] :as db} {:keys [update-commit changes-ch] :as opts}]
-  (let [[lock? index-state] (lock-indexer (:state-atom indexer) branch t update-commit)
+  (let [[lock? index-state]   (lock-indexer (:state-atom indexer) branch t update-commit)
         {:keys [tempid port]} index-state]
     (if lock?
       ;; when we have a lock, reindex and put updated db onto pc.
       (go
         (try*
           (push-index-event indexer :index-start index-state)
-          (let [indexed-db   (<? (refresh indexer db opts))
-                index-state* (unlock-indexer (:state-atom indexer) branch tempid indexed-db)
+          (let [indexed-db                      (<? (refresh indexer db opts))
+                index-state*                    (unlock-indexer (:state-atom indexer) branch tempid indexed-db)
                 {:keys [update-commit-fn port]} index-state*]
             ;; in case event listener wanted final indexed db, put on established port
             (when (fn? update-commit-fn)
