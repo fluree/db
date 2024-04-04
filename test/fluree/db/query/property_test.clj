@@ -72,6 +72,39 @@
                                    :where     {"@id" ?s, "vocab2:firstName" ?name}}))
             "returns all values")))))
 
+(deftest ^:integration rdfs-subpropertyof-test
+  (testing "Sub-properties - rdfs:subPropertyOf"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "query/rdfs-subpropertyof")
+          db     (-> ledger
+                     (fluree/db)
+                     (fluree/stage {"@context" {"ex"   "http://example.org/ns/"
+                                                "rdf"  "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                    "insert"   [{"@id"   "ex:parent"
+                                                 "@type" "rdf:Property"}
+                                                {"@id"                "ex:mother"
+                                                 "@type"              "rdf:Property"
+                                                 "rdfs:subPropertyOf" {"@id" "ex:parent"}}
+                                                {"@id"                "ex:father"
+                                                 "@type"              "rdf:Property"
+                                                 "rdfs:subPropertyOf" {"@id" "ex:parent"}}]})
+                     deref
+                     (fluree/stage {"@context" {"ex" "http://example.org/ns/"}
+                                    "insert"   [{"@id"       "ex:bob"
+                                                 "ex:mother" {"@id" "ex:alice"}
+                                                 "ex:father" {"@id" "ex:george"}}]})
+                     deref)]
+      (testing "querying for the the parent property"
+        (is (= ["ex:alice" "ex:george"]
+               (vec
+                 (sort
+                   @(fluree/query db '{"@context" {"ex" "http://example.org/ns/"}
+                                       :select    ?parent
+                                       :where     {"@id"       "ex:bob"
+                                                   "ex:parent" ?parent}}))))
+            "returns all sub properties of ex:parent property")))))
+
 (deftest ^:integration ^:kaocha/pending subjects-as-predicates
   (testing "predicate iri-cache loookups"
     (let [conn    @(fluree/connect {:method :memory})
