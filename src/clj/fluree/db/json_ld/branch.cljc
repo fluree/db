@@ -89,7 +89,8 @@
                          (assoc db :commit (commit-data/use-latest-index db-commit branch-commit))
                          db)]
     (when-not (or (nil? ledger-t)
-                  (and updated-index? (<= ledger-t commit-t)) ;; index update may come after multiple commits
+                  (and updated-index?
+                       (not (flake/t-after? commit-t ledger-t))) ; index update may come after multiple commits
                   (= commit-t (inc ledger-t)))
       (throw (ex-info (str "Commit failed, latest committed db is " ledger-t
                            " and you are trying to commit at db at t value of: "
