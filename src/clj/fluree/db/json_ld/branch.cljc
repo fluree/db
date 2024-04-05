@@ -34,12 +34,12 @@
   "Returns a new branch name for specified branch name off of
   supplied current-branch."
   [current-branch-map alias branch ns-addresses]
-  (let [{:keys [t commit]
+  (let [{:keys [t latest-db]
          :or   {t 0}} current-branch-map]
     {:name      branch
      :t         t
      :commit    (commit-data/blank-commit alias branch ns-addresses)
-     :latest-db nil ; latest committed db
+     :latest-db latest-db
      :from      (-> current-branch-map
                     (select-keys [:name :t :commit]))}))
 
