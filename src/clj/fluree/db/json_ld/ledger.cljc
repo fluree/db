@@ -112,6 +112,7 @@
     const/$owl:equivalentProperty
     const/$rdfs:Class
     const/$rdfs:subClassOf
+    const/$rdfs:subPropertyOf
     const/$sh:alternativePath
     const/$sh:class
     const/$sh:datatype

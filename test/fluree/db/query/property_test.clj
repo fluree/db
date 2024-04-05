@@ -8,51 +8,49 @@
   (testing "Equivalent properties"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "query/equivalent-properties")
-          context {"vocab1" "http://vocab1.example.org/"
-                   "vocab2" "http://vocab2.example.org/"
-                   "vocab3" "http://vocab3.example.fr/"
-                   "ex"     "http://example.org/ns/"
-                   "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-                   "owl"    "http://www.w3.org/2002/07/owl#"}
           db      (-> ledger
                       (fluree/db)
-                      (fluree/stage {"@context" ["https://ns.flur.ee" context]
-                                      "insert"   [{"@id"   "vocab1:givenName"
-                                                   "@type" "rdf:Property"}
-                                                  {"@id"                    "vocab2:firstName"
-                                                   "@type"                  "rdf:Property"
-                                                   "owl:equivalentProperty" {"@id" "vocab1:givenName"}}
-                                                  {"@id"                    "vocab3:prenom"
-                                                   "@type"                  "rdf:Property"
-                                                   "owl:equivalentProperty" {"@id" "vocab2:firstName"}}]})
+                      (fluree/stage {"@context" {"vocab1" "http://vocab1.example.org/"
+                                                 "vocab2" "http://vocab2.example.org/"
+                                                 "vocab3" "http://vocab3.example.fr/"
+                                                 "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                                                 "owl"    "http://www.w3.org/2002/07/owl#"}
+                                     "insert"   [{"@id"   "vocab1:givenName"
+                                                  "@type" "rdf:Property"}
+                                                 {"@id"                    "vocab2:firstName"
+                                                  "@type"                  "rdf:Property"
+                                                  "owl:equivalentProperty" {"@id" "vocab1:givenName"}}
+                                                 {"@id"                    "vocab3:prenom"
+                                                  "@type"                  "rdf:Property"
+                                                  "owl:equivalentProperty" {"@id" "vocab2:firstName"}}]})
                       deref
-                      (fluree/stage {"@context" ["https://ns.flur.ee" context]
-                                      "insert"   [{"@id"              "ex:brian"
-                                                   "ex:age"           50
-                                                   "vocab1:givenName" "Brian"}
-                                                  {"@id"              "ex:ben"
-                                                   "vocab2:firstName" "Ben"}
-                                                  {"@id"           "ex:francois"
-                                                   "vocab3:prenom" "Francois"}]})
+                      (fluree/stage {"@context" {"vocab1" "http://vocab1.example.org/"
+                                                 "vocab2" "http://vocab2.example.org/"
+                                                 "vocab3" "http://vocab3.example.fr/"
+                                                 "ex"     "http://example.org/ns/"}
+                                     "insert"   [{"@id"              "ex:brian"
+                                                  "ex:age"           50
+                                                  "vocab1:givenName" "Brian"}
+                                                 {"@id"              "ex:ben"
+                                                  "vocab2:firstName" "Ben"}
+                                                 {"@id"           "ex:francois"
+                                                  "vocab3:prenom" "Francois"}]})
                       deref)]
       (testing "querying for the property defined to be equivalent"
         (is (= [["Ben"] ["Brian"] ["Francois"]]
-               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                               "vocab2" "http://vocab2.example.org/"}
+               @(fluree/query db '{"@context" {"vocab2" "http://vocab2.example.org/"}
                                    :select    [?name]
                                    :where     {"vocab2:firstName" ?name}}))
             "returns all values"))
       (testing "querying for the symmetric property"
         (is (= [["Ben"] ["Brian"] ["Francois"]]
-               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                               "vocab2" "http://vocab2.example.org/"}
+               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"}
                                    :select    [?name]
                                    :where     {"vocab1:givenName" ?name}}))
             "returns all values"))
       (testing "querying for the transitive properties"
         (is (= [["Ben"] ["Brian"] ["Francois"]]
-               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                               "vocab3" "http://vocab3.example.fr/"}
+               @(fluree/query db '{"@context" {"vocab3" "http://vocab3.example.fr/"}
                                    :select    [?name]
                                    :where     {"vocab3:prenom" ?name}}))
             "returns all values"))
@@ -81,22 +79,61 @@
                      (fluree/stage {"@context" {"ex"   "http://example.org/ns/"
                                                 "rdf"  "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                    "insert"   [{"@id"   "ex:parent"
-                                                 "@type" "rdf:Property"}
-                                                {"@id"                "ex:mother"
+                                    "insert"   [{"@id"                "ex:biologicalMother"
+                                                 "@type"              "rdf:Property"
+                                                 "rdfs:subPropertyOf" [{"@id" "ex:mother"} {"@id" "ex:biologicalParent"}]}
+                                                {"@id"                "ex:biologicalFather"
+                                                 "@type"              "rdf:Property"
+                                                 "rdfs:subPropertyOf" [{"@id" "ex:father"} {"@id" "ex:biologicalParent"}]}]})
+                     deref
+                     (fluree/stage {"@context" {"ex"   "http://example.org/ns/"
+                                                "rdf"  "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                    "insert"   [{"@id"                "ex:biologicalParent"
                                                  "@type"              "rdf:Property"
                                                  "rdfs:subPropertyOf" {"@id" "ex:parent"}}
+                                                {"@id"                "ex:stepParent"
+                                                   "@type"              "rdf:Property"
+                                                   "rdfs:subPropertyOf" {"@id" "ex:parent"}}
                                                 {"@id"                "ex:father"
                                                  "@type"              "rdf:Property"
-                                                 "rdfs:subPropertyOf" {"@id" "ex:parent"}}]})
+                                                 "rdfs:subPropertyOf" {"@id" "ex:parent"}}
+                                                {"@id"                "ex:stepFather"
+                                                   "@type"              "rdf:Property"
+                                                   "rdfs:subPropertyOf" {"@id" "ex:stepParent"}}
+                                                {"@id"                "ex:stepMother"
+                                                   "@type"              "rdf:Property"
+                                                   "rdfs:subPropertyOf" {"@id" "ex:stepParent"}}]})
+                     deref
+                     (fluree/stage {"@context" {"ex"   "http://example.org/ns/"
+                                                "rdf"  "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+                                                "owl"  "http://www.w3.org/2002/07/owl#"}
+                                    "insert"   [{"@id"                    "ex:stepDad"
+                                                 "@type"                  "rdf:Property"
+                                                 "owl:equivalentProperty" {"@id" "ex:stepFather"}}]})
                      deref
                      (fluree/stage {"@context" {"ex" "http://example.org/ns/"}
-                                    "insert"   [{"@id"       "ex:bob"
-                                                 "ex:mother" {"@id" "ex:alice"}
-                                                 "ex:father" {"@id" "ex:george"}}]})
+                                    "insert"   [{"@id"                 "ex:bob"
+                                                 "ex:biologicalMother" {"@id" "ex:alice"}
+                                                 "ex:biologicalFather" {"@id" "ex:george"}
+                                                 "ex:stepFather"       {"@id" "ex:john"}
+                                                 "ex:stepDad"          {"@id" "ex:jerry"}
+                                                 "ex:stepMother"       {"@id" "ex:mary"}}]})
                      deref)]
-      (testing "querying for the the parent property"
+
+      (testing "querying one-level up in subproperty hierarchy"
         (is (= ["ex:alice" "ex:george"]
+               (vec
+                 (sort
+                   @(fluree/query db '{"@context" {"ex" "http://example.org/ns/"}
+                                       :select    ?parent
+                                       :where     {"@id"                 "ex:bob"
+                                                   "ex:biologicalParent" ?parent}}))))
+            "returns all sub properties of ex:parent property"))
+
+      (testing "querying the top level property which includes equivalent property"
+        (is (= ["ex:alice" "ex:george" "ex:jerry" "ex:john" "ex:mary"]
                (vec
                  (sort
                    @(fluree/query db '{"@context" {"ex" "http://example.org/ns/"}
