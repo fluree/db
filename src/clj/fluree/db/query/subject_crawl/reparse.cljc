@@ -155,7 +155,7 @@
 (defn has-equivalent-properties?
   [db pattern]
   (if-let [p-val (get-in pattern [1 ::where/val])]
-    (some? (where/get-equivalent-properties db p-val))
+    (some? (where/get-child-properties db p-val))
     false))
 
 (defn simple-subject-crawl?

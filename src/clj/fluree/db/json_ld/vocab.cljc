@@ -76,45 +76,67 @@
     {:id    sid ; rdf:type is predefined, so flakes to build map won't be present.
      :class false}
     (let [iri (iri/decode-sid db sid)]
-      {:id                 sid
-       :iri                iri
-       :class              true ; default
-       :subclassOf         #{}
-       :equivalentProperty #{}})))
+      {:id          sid
+       :iri         iri
+       :class       true ; default
+       :subclassOf  #{}
+       :parentProps #{}
+       :childProps  #{}})))
 
 (defn add-subclass
   [prop-map subclass]
   (update prop-map :subclassOf conj subclass))
 
-(defn add-equivalent-property
-  [prop-map prop]
-  (update prop-map :equivalentProperty conj prop))
+(defn add-child-properties
+  [prop-map child-properties]
+  (update prop-map :childProps into child-properties))
 
-(defn update-equivalent-property
-  [db prop-map parent-prop child-prop]
-  (let [initial-map              (initial-property-map db parent-prop)
-        with-equivalent-property (fnil add-equivalent-property initial-map)]
-    (update prop-map parent-prop with-equivalent-property child-prop)))
+(defn add-parent-properties
+  [prop-map parent-properties]
+  (update prop-map :parentProps into parent-properties))
 
-(defn update-all-equivalent-properties
-  [db prop-map sid o-props]
-  (reduce (fn [p-map o-prop]
-            (as-> p-map props
-              (update-equivalent-property db props sid o-prop)
-              (update-equivalent-property db props o-prop sid)))
-          prop-map o-props))
+(defn update-parent-with-children
+  [db prop-map parent-prop child-props]
+  (let [initial-map       (initial-property-map db parent-prop)
+        with-new-children (fnil add-child-properties initial-map)]
+    (update prop-map parent-prop with-new-children child-props)))
 
-(defn update-owl-equivalent-property
-  [db pred-map sid obj]
-  (let [s-props (-> pred-map
-                    (get-in [sid :equivalentProperty])
-                    (conj sid))
-        o-props (-> pred-map
-                    (get-in [obj :equivalentProperty])
-                    (conj obj))]
-    (reduce (fn [p-map s-prop]
-              (update-all-equivalent-properties db p-map s-prop o-props))
-            pred-map s-props)))
+(defn update-child-with-parents
+  [db prop-map child-prop parent-props]
+  (let [initial-map      (initial-property-map db child-prop)
+        with-new-parents (fnil add-parent-properties initial-map)]
+    (update prop-map child-prop with-new-parents parent-props)))
+
+(defn add-new-children-to-parents
+  "Adds new :childProps to parents in the schema map all the way up
+  the hierarchy"
+  [db pred-map all-parents new-child-properties]
+  (reduce (fn [p-map parent-prop]
+            (update-parent-with-children db p-map parent-prop new-child-properties))
+          pred-map all-parents))
+
+(defn add-new-parents-to-children
+  "Adds new :parentProps to children in the schema map all the way down
+  the hierarchy"
+  [db pred-map all-children new-parent-properties]
+  (reduce (fn [p-map child-prop]
+            (update-child-with-parents db p-map child-prop new-parent-properties))
+          pred-map all-children))
+
+(defn update-rdfs-subproperty-of
+  "Updates the schema map with the rdfs:subPropertyOf relationship
+  between parent and child properties.
+
+  owl:equivalentProperty also uses this, as an equivalent property
+  relationship is where each property is a subproperty of the other."
+  [db pred-map parent-prop child-prop]
+  (let [parent-parents      (get-in pred-map [parent-prop :parentProps])
+        child-children      (get-in pred-map [child-prop :childProps])
+        new-parent-children (conj child-children child-prop)
+        new-child-parents   (conj parent-parents parent-prop)]
+    (as-> pred-map props
+          (add-new-children-to-parents db props new-child-parents new-parent-children)
+          (add-new-parents-to-children db props new-parent-children new-child-parents))))
 
 (defn update-equivalent-properties
   "Adds owl:equivalentProperty and rdfs:subPropertyOf rules to the schema map as the
@@ -132,8 +154,10 @@
   [db pred-map sid pid obj]
   (if (iri/sid? obj)
     (if (= const/$owl:equivalentProperty pid)
-      (update-owl-equivalent-property db pred-map sid obj)
-      (update-equivalent-property db pred-map obj sid))
+      (as-> pred-map props
+            (update-rdfs-subproperty-of db props sid obj)
+            (update-rdfs-subproperty-of db props obj sid))
+      (update-rdfs-subproperty-of db pred-map obj sid))
     (do
       (log/warn (str "Triple of ["
                      (iri/decode-sid db sid) " "
