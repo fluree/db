@@ -10,7 +10,6 @@
 (defprotocol iLedger
   ;; retrieving/updating DBs
   (-db [ledger] [ledger opts] "Returns queryable db with specified options")
-  (-db-update [ledger db] "Updates ledger state with new DB, and optional branch. Returns updated db (which might be modified with newer index).")
   ;; branching
   (-branch [ledger] [ledger branch] "Returns all branch metadata, or metadata for just specified branch. :default branch is always current default.")
   ;; committing

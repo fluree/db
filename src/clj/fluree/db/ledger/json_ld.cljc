@@ -166,7 +166,6 @@
   ledger/iLedger
   (-db [ledger] (db ledger nil))
   (-db [ledger opts] (db ledger opts))
-  (-db-update [ledger db] (db-update ledger db))
   (-branch [ledger] (branch-meta ledger nil))
   (-branch [ledger branch] (branch-meta ledger branch))
   (-commit-update! [ledger branch db] (commit-update ledger branch db))
@@ -256,8 +255,8 @@
        (if (seq include)
          ;; includes other ledgers - experimental
          (let [db* (<? (include-dbs conn db include))]
-           (ledger/-db-update ledger db*))
-         (ledger/-db-update ledger db))))))
+           (db-update ledger db*))
+         (db-update ledger db))))))
 
 (defn create*
   [conn ledger-alias {:keys [include] :as opts}]

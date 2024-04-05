@@ -127,5 +127,5 @@
                                 async/merge
                                 (async/pipe changes-ch))
           db                (<? (merge-commits ledger commit-opts* tuples-chans))]
-      (ledger/-db-update ledger db)
+      (jld-ledger/db-update ledger db)
       ledger)))
