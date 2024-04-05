@@ -35,16 +35,13 @@
   supplied current-branch."
   [current-branch-map alias branch ns-addresses]
   (let [{:keys [t commit]
-         :or   {t 0}} current-branch-map
-        ;; is current branch uncommitted? If so, when committing new branch we must commit current-branch too
-        uncommitted? (and commit (> t (-> commit :db :t)))]
+         :or   {t 0}} current-branch-map]
     {:name      branch
      :t         t
      :commit    (commit-data/blank-commit alias branch ns-addresses)
      :latest-db nil ; latest committed db
      :from      (-> current-branch-map
-                    (select-keys [:name :t])
-                    (assoc :uncommitted? uncommitted?))}))
+                    (select-keys [:name :t :commit]))}))
 
 (defn update-db
   "Updates the latest staged db and returns new branch data."
