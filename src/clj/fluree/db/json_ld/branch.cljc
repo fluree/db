@@ -41,14 +41,6 @@
     {:name      branch
      :t         t
      :commit    (commit-data/blank-commit alias branch ns-addresses)
-     ;:index     {:id               nil                      ;; unique id (hash of root) of index
-     ;            :address          nil                      ;; address to get to index 'root'
-     ;            :db               {}                       ;; db commit-map object of indexed db
-     ;            :update-commit-fn nil                      ;; function to call when index is updated to create a new commit with updated index address
-     ;            :spot             nil                      ;; top level branch of each index , eliminates file lookup of index root
-     ;            :post             nil
-     ;            :opst             nil
-     ;            :tspo             nil}
      :latest-db nil ;; latest staged db (if different from commit-db)
      :commit-db nil ;; latest committed db
      :from      (-> current-branch-map
@@ -57,14 +49,13 @@
 
 (defn update-db
   "Updates the latest staged db and returns new branch data."
-  [{:keys [t index] :as branch-data} {db-t :t, :as db}]
+  [{:keys [t] :as branch-data} {db-t :t, :as db}]
   (if (or (= (flake/next-t t) db-t)
           (= t db-t)
           (zero? t)) ;; when loading a ledger from disk, 't' will be zero but ledger will be >= 1
-    (let [db* (dbproto/-index-update db index)]
-      (-> branch-data
-          (assoc :t db-t
-                 :latest-db db*)))
+    (-> branch-data
+        (assoc :t db-t
+               :latest-db db))
     (throw (ex-info (str "Unable to create new DB version on ledger, latest 't' value is: "
                          t " however new db t value is: " db-t ".")
                     {:status 500 :error :db/invalid-time}))))

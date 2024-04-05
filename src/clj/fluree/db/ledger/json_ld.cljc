@@ -45,7 +45,8 @@
   Returns original db, or if index has since been updated then
   updated db with new index point."
   [{:keys [state] :as _ledger} {:keys [branch] :as db}]
-  (-> (swap! state update-in [:branches branch] branch/update-db db)
+  (-> state
+      (swap! update-in [:branches branch] branch/update-db db)
       (get-in [:branches branch :latest-db])))
 
 (defn commit-update
