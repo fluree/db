@@ -357,13 +357,12 @@
 
           {db**             :db
            commit-file-meta :commit-res}
-          (<? (do-commit+push db* opts*))
+          (<? (do-commit+push db* opts*))]
 
-          ;; if an indexing process is kicked off, returns a channel that contains a stream of updates for consensus
-          indexing-ch       (run-index indexer db** opts* index-files-ch)]
+      (run-index indexer db** opts* index-files-ch)
+
       (if file-data?
         {:data-file-meta   ledger-update-res
          :commit-file-meta commit-file-meta
-         :indexing-ch      indexing-ch
          :db               db**}
         db**))))
