@@ -994,11 +994,6 @@
         (recur r results))
       (not-empty results))))
 
-(defn value-node
-  "Take a flake and create a value node suitable for validation. A value node is a tuple of [value dt]."
-  [flake]
-  [(flake/o flake) (flake/dt flake)])
-
 (defn sid-node
   [sid]
   [sid const/$xsd:anyURI])
@@ -1006,6 +1001,12 @@
 (defn subject-node
   [flake]
   (sid-node (flake/s flake)))
+
+;; TODO: rename to object-node
+(defn value-node
+  "Take a flake and create a value node suitable for validation. A value node is a tuple of [value dt]."
+  [flake]
+  [(flake/o flake) (flake/dt flake)])
 
 (defn resolve-predicate-path
   [data-db focus-node pred-path]
@@ -1028,9 +1029,17 @@
   [data-db focus-node path]
   (println "DEP resolve-value-nodes" (pr-str focus-node) (pr-str path))
   (loop [[segment & segments] path
+         focus-nodes [(sid-node focus-node)]
          value-nodes []]
     (if segment
-      (recur segments (conj value-nodes (async/<!! (resolve-segment data-db focus-node segment))))
+      (let [vns (loop [[[sid :as f-node] & r] focus-nodes
+                       v-nodes []]
+                  (if f-node
+                    (recur r (conj v-nodes (async/<!! (resolve-segment data-db sid segment))))
+                    v-nodes))]
+        (recur segments
+               (apply concat vns)
+               vns))
       value-nodes)))
 
 (defn validate-property-shape
