@@ -63,7 +63,7 @@
                     {:status 400 :error :db/invalid-branch})))
   (-> state
       (swap! update-in [:branches branch-name] branch/update-commit db)
-      (get-in [:branches branch-name :commit-db])))
+      (get-in [:branches branch-name :latest-db])))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"

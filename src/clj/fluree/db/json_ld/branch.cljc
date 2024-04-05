@@ -41,8 +41,7 @@
     {:name      branch
      :t         t
      :commit    (commit-data/blank-commit alias branch ns-addresses)
-     :latest-db nil ;; latest staged db (if different from commit-db)
-     :commit-db nil ;; latest committed db
+     :latest-db nil ; latest committed db
      :from      (-> current-branch-map
                     (select-keys [:name :t])
                     (assoc :uncommitted? uncommitted?))}))
@@ -90,8 +89,7 @@
                       {:status 400 :error :db/invalid-commit})))
     (-> branch-data
         (update-db db*)
-        (assoc :commit (:commit db*)
-               :commit-db db*))))
+        (assoc :commit (:commit db*)))))
 
 (defn latest-db
   "Returns latest db from branch data"
