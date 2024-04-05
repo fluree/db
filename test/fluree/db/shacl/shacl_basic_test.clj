@@ -1408,25 +1408,27 @@ WORLD!")
                                             "select"   {"ex:Luke" ["*" {"ex:parent" ["*"]}]}})))
 
         (is (= {:status 400,
-                :error :shacl/violation,
+                :error  :shacl/violation,
                 :report
-                [{:subject "ex:bad-parent",
+                [{:subject    "ex:bad-parent",
                   :constraint "sh:minCount",
-                  :shape "_:fdb-2",
-                  :expect 1,
-                  :path [{"sh:inversePath" "ex:parent"}],
-                  :value 0,
-                  :message "count 0 is less than minimum count of 1"}]}
+                  :shape      "_:fdb-2",
+                  :expect     1,
+                  :path       [{"sh:inversePath" "ex:parent"}],
+                  :value      0,
+                  :message    "count 0 is less than minimum count of 1"}]}
                (ex-data invalid-pal)))
         (is (= "Subject ex:bad-parent path [{\"sh:inversePath\" \"ex:parent\"}] violates constraint sh:minCount of shape _:fdb-2 - count 0 is less than minimum count of 1."
                (ex-message invalid-pal)))))
-    #_(testing "sequence paths"
+    (testing "sequence paths"
       (let [ ;; a valid Pal is anybody who has a pal with a name
             db1         @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                             "insert"   {"@type"          "sh:NodeShape"
                                                         "sh:targetClass" {"@id" "ex:Pal"}
-                                                        "sh:property"    [{"sh:path"     {"@list" [{"id" "ex:pal"} {"id" "schema:name"}]}
-                                                                           "sh:minCount" 1}]}})
+                                                        "sh:property"
+                                                        [{"sh:path"
+                                                          {"@list" [{"id" "ex:pal"} {"id" "schema:name"}]}
+                                                          "sh:minCount" 1}]}})
             valid-pal   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
                                             "insert"   {"id"          "ex:good-pal"
                                                         "type"        "ex:Pal"
@@ -1447,41 +1449,121 @@ WORLD!")
                                              "select"   {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})
                    first
                    (update "ex:pal" set))))
-        (is (= {}
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject "ex:bad-pal",
+                  :constraint "sh:minCount",
+                  :shape "_:fdb-8",
+                  :expect 1,
+                  :path ["ex:pal" "schema:name"],
+                  :value 0,
+                  :message "count 0 is less than minimum count of 1"}]}
                (ex-data invalid-pal)))
-        (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+        (is (= "Subject ex:bad-pal path [\"ex:pal\" \"schema:name\"] violates constraint sh:minCount of shape _:fdb-8 - count 0 is less than minimum count of 1."
                (ex-message invalid-pal)))))
-    #_(testing "inverse sequence path"
-      (let [;; a valid Princess is anybody who is the child of someone's queen
-            db1              @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
-                                                 "insert"   {"@type"          "sh:NodeShape"
-                                                             "id"             "ex:PrincessShape"
-                                                             "sh:targetClass" {"@id" "ex:Princess"}
-                                                             "sh:property"    [{"sh:path"     {"@list" [{"sh:inversePath" {"id" "ex:child"}}
-                                                                                                        {"sh:inversePath" {"id" "ex:queen"}}]}
-                                                                                "sh:minCount" 1}]}})
-            valid-princess   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                                 "insert"   {"id"          "ex:Pleb"
-                                                             "schema:name" "Pleb"
-                                                             "ex:queen"    {"id"          "ex:Buttercup"
-                                                                            "schema:name" "Buttercup"
-                                                                            "ex:child"    {"id"          "ex:Mork"
-                                                                                           "type"        "ex:Princess"
-                                                                                           "schema:name" "Mork"}}}})
-            invalid-princess @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                                 "insert"   {"id"          "ex:Pleb"
-                                                             "schema:name" "Pleb"
-                                                             "ex:child"    {"id"          "ex:Gerb"
-                                                                            "type"        "ex:Princess"
-                                                                            "schema:name" "Gerb"}}})]
-        (is (= [{"id" "ex:Mork", "type" "ex:Princess", "schema:name" "Mork"}]
-               @(fluree/query valid-princess {"@context" context
-                                              "select"   {"ex:Mork" ["*"]}})))
+    (testing "sequence paths"
+      (let [db1         @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+                                            "insert"   [{"@type"          "sh:NodeShape"
+                                                         "sh:targetClass" {"@id" "ex:Pal"}
+                                                         "sh:property"
+                                                         [{"sh:path"
+                                                           {"@list" [{"id" "ex:pal"} {"id" "ex:name"}]}
+                                                           "sh:minCount" 1}]}]})
+            valid-pal   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                            "insert"   {"id"      "ex:jd"
+                                                        "type"    "ex:Pal"
+                                                        "ex:name" "J.D."
+                                                        "ex:pal"  [{"ex:name" "Turk"}
+                                                                   {"ex:name" "Rowdy"}]}})
 
-        (is (= {}
-               (ex-data invalid-princess)))
-        (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
-               (ex-message invalid-princess)))))))
+
+            invalid-pal @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                            "insert"   {"id"      "ex:jd"
+                                                        "type"    "ex:Pal"
+                                                        "ex:name" "J.D."
+                                                        "ex:pal"  [{"id" "ex:not-pal"
+                                                                    "ex:not-name" "noname"}
+                                                                   {"id" "ex:turk"
+                                                                    "ex:name" "Turk"}
+                                                                   {"id" "ex:rowdy"
+                                                                    "ex:name" "Rowdy"}]}})]
+
+        (is (= [{"id" "ex:jd",
+                 "type" "ex:Pal",
+                 "ex:name" "J.D.",
+                 "ex:pal" [{"ex:name" "Turk"} {"ex:name" "Rowdy"}]}]
+               @(fluree/query valid-pal {"@context" context
+                                         "select"   {"ex:jd" ["*" {"ex:pal" ["ex:name"]}]}})))
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject "ex:jd",
+                  :constraint "sh:minCount",
+                  :shape "_:fdb-3",
+                  :expect 1,
+                  :path ["ex:pal" "ex:name"],
+                  :value 0,
+                  :message "count 0 is less than minimum count of 1"}]}
+               (ex-data invalid-pal)))
+        (is (= "Subject ex:jd path [\"ex:pal\" \"ex:name\"] violates constraint sh:minCount of shape _:fdb-3 - count 0 is less than minimum count of 1."
+               (ex-message invalid-pal)))))
+
+    (testing "predicate-path"
+      (let [db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+                                    "insert" [{"@type" "sh:NodeShape"
+                                               "sh:targetClass" {"@id" "ex:Named"}
+                                               "sh:property"
+                                               [{"sh:path"
+                                                 {"@list" [{"id" "ex:name"}]}
+                                                 "sh:datatype" {"id" "xsd:string"}}]}]})
+            valid-named   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                              "insert"   {"id"      "ex:good-pal"
+                                                          "type"    "ex:Named"
+                                                          "ex:name" {"@value" 123
+                                                                     "@type" "xsd:integer"}}})]
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject "ex:good-pal",
+                  :constraint "sh:datatype",
+                  :shape "_:fdb-16",
+                  :expect "xsd:string",
+                  :path ["ex:name"],
+                  :value ["xsd:integer"],
+                  :message "the following values do not have expected datatype xsd:string: 123"}]}
+               (ex-data valid-named)))))
+    #_(testing "inverse sequence path"
+        (let [ ;; a valid Princess is anybody who is the child of someone's queen
+              db1              @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+                                                   "insert"   {"@type"          "sh:NodeShape"
+                                                               "id"             "ex:PrincessShape"
+                                                               "sh:targetClass" {"@id" "ex:Princess"}
+                                                               "sh:property"    [{"sh:path"     {"@list" [{"sh:inversePath" {"id" "ex:child"}}
+                                                                                                          {"sh:inversePath" {"id" "ex:queen"}}]}
+                                                                                  "sh:minCount" 1}]}})
+              valid-princess   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                                   "insert"   {"id"          "ex:Pleb"
+                                                               "schema:name" "Pleb"
+                                                               "ex:queen"    {"id"          "ex:Buttercup"
+                                                                              "schema:name" "Buttercup"
+                                                                              "ex:child"    {"id"          "ex:Mork"
+                                                                                             "type"        "ex:Princess"
+                                                                                             "schema:name" "Mork"}}}})
+              invalid-princess @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                                   "insert"   {"id"          "ex:Pleb"
+                                                               "schema:name" "Pleb"
+                                                               "ex:child"    {"id"          "ex:Gerb"
+                                                                              "type"        "ex:Princess"
+                                                                              "schema:name" "Gerb"}}})]
+          (is (= [{"id" "ex:Mork", "type" "ex:Princess", "schema:name" "Mork"}]
+                 @(fluree/query valid-princess {"@context" context
+                                                "select"   {"ex:Mork" ["*"]}})))
+
+          (is (= {}
+                 (ex-data invalid-princess)))
+          (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+                 (ex-message invalid-princess)))))))
 
 (deftest ^:integration shacl-class-test
   (let [conn    @(fluree/connect {:method :memory})
