@@ -974,15 +974,6 @@
                  (remove #(= (get % const/$id) q-shape-id))))))
       [])))
 
-(defn value-node
-  "Take a flake and create a value node suitable for validation. A value node is a tuple of [value dt]."
-  [flake]
-  [(flake/o flake) (flake/dt flake)])
-
-(defn subject-node
-  [flake]
-  [(flake/s flake) const/$xsd:anyURI])
-
 (defmulti validate-constraint
   "A constraint whose focus nodes conform returns nil. A constraint that doesn't returns a
   sequence of result maps."
@@ -1003,27 +994,57 @@
         (recur r results))
       (not-empty results))))
 
-(defn resolve-path-flakes2
+(defn value-node
+  "Take a flake and create a value node suitable for validation. A value node is a tuple of [value dt]."
+  [flake]
+  [(flake/o flake) (flake/dt flake)])
+
+(defn sid-node
+  [sid]
+  [sid const/$xsd:anyURI])
+
+(defn subject-node
+  [flake]
+  (sid-node (flake/s flake)))
+
+(defn resolve-predicate-path
+  [data-db focus-node pred-path]
+  (query-range/index-range data-db :spot = [focus-node pred-path] {:flake-xf (map value-node)}))
+
+(defn resolve-inverse-path
+  [data-db focus-node inverse-path]
+  (query-range/index-range data-db :opst = [focus-node inverse-path] {:flake-xf (map subject-node)}))
+
+(defn resolve-segment
+  [data-db focus-node segment]
+  (if (iri/sid? segment)
+    (resolve-predicate-path data-db focus-node segment)
+    (let [{[inverse-path] const/sh_inversePath} segment]
+      (cond inverse-path (resolve-inverse-path data-db focus-node inverse-path)
+            :else (throw (ex-info "Unsupported property path segment." {:segment segment}))))))
+
+(defn resolve-value-nodes
   "Return the value nodes resolved via the path from the focus node."
   [data-db focus-node path]
-  (println "DEP resolve-path-flakes path" (pr-str focus-node) (pr-str path))
-  (let [[segment] path]
-    (if (iri/sid? segment)
-      (async/<!! (query-range/index-range data-db :spot = [focus-node segment] {:flake-xf (map value-node)}))
-      (let [{[inverse-path] const/sh_inversePath} segment]
-        (cond inverse-path
-              (async/<!! (query-range/index-range data-db :opst = [[focus-node const/$xsd:anyURI] inverse-path] {:flake-xf (map subject-node)}))
-              :else
-              (throw (ex-info "Unsupported property path." {:segment segment :path path})))))))
+  (println "DEP resolve-value-nodes" (pr-str focus-node) (pr-str path))
+  (loop [[segment & segments] path
+         value-nodes []]
+    (if segment
+      (recur segments (conj value-nodes (async/<!! (resolve-segment data-db focus-node segment))))
+      value-nodes)))
 
 (defn validate-property-shape
   "Returns a sequence of validation results if conforming fails, otherwise nil."
-  [{:keys [data-db] :as v-ctx} shape focus-node]
-  (let [{path const/sh_path} shape
-        ;; TODO: there can be multiple path-flakes after resolution, need to loop here...
-        value-nodes (resolve-path-flakes2 data-db focus-node path)]
-    (println "DEP property path value-nodes" (pr-str value-nodes))
-    (validate-constraints v-ctx shape focus-node value-nodes)))
+  [{:keys [data-db] :as v-ctx} {path const/sh_path :as shape} focus-node]
+  (let [{path const/sh_path} shape]
+    (loop [[value-nodes & r] (resolve-value-nodes data-db focus-node path)
+           results []]
+      (println "DEP property path value-nodes" (pr-str value-nodes))
+      (if value-nodes
+        (if-let [results* (validate-constraints v-ctx shape focus-node value-nodes)]
+          (recur r (into results results*))
+          (recur r results))
+        (not-empty results)))))
 
 (defn target-node-target?
   [shape s-flakes]
@@ -1674,7 +1695,7 @@
       (doseq [shape-sid (<? (all-node-shape-ids shape-db))]
         (let [subject (-> s-flakes first flake/s)
               shape   (<? (build-shape shape-db shape-sid))
-
+              ;; TODO: add sid? check to display
               v-ctx {:display (partial sid->compact-iri (:namespace-codes data-db) context)
                      :shape-db shape-db
                      :data-db data-db}]
