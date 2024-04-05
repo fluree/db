@@ -923,7 +923,7 @@
    (go-try
      (let [flakes (<? (query-range/index-range db :spot = [shape-sid]))]
        (if (seq flakes)
-         (loop [[f & r] flakes
+         (loop [[f & r] (reverse flakes)
                 node {const/$id shape-sid}]
            (if f
              (recur r (update node (flake/p f) (fnil conj [])
