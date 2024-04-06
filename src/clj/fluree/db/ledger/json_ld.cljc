@@ -105,14 +105,6 @@
   (reset! cache {})
   (release-ledger conn alias)) ;; remove ledger from conn cache
 
-;; TODO - finalize in-memory db update along with logic to ensure consistent state
-(defn update-local-db
-  "Returns true if update was successful, else false or exception
-  if unexpected exception occurs."
-  [ledger updated-db]
-
-  true)
-
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because
   the provided commit was not the next expected commit.
