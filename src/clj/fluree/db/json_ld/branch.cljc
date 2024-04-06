@@ -91,14 +91,3 @@
   "Returns latest db from branch data"
   [branch-data]
   (:latest-db branch-data))
-
-;; TODO
-#_(defn branch
-    "Creates, or changes, a ledger's branch"
-    [ledger branch]
-    (let [{:keys [state]} ledger
-          {:keys [branches branch]} @state
-          [branch-t [branch-current branch-commit]] branch
-          branch*     (util/str->keyword branch)
-          new?        (contains? branches branch*)
-          is-current? (= branch)]))

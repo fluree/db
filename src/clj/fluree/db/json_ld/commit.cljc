@@ -81,52 +81,6 @@
         (recur r next-acc)
         next-acc))))
 
-(defn generate-commit
-  "Generates assertion and retraction flakes for a given set of flakes
-  which is assumed to be for a single (t) transaction.
-
-  Returns a map of
-  :assert - assertion flakes
-  :retract - retraction flakes
-  :refs-ctx - context that must be included with final context, for refs (@id) values
-  :flakes - all considered flakes, for any downstream processes that need it"
-  [flakes db {:keys [compact-fn id-key type-key] :as _opts}]
-  (log/trace "generate-commit flakes:" flakes)
-  (let [ctx (volatile! {})]
-    (loop [[s-flakes & r] (partition-by flake/s flakes)
-           assert         []
-           retract        []]
-      (if s-flakes
-        (let [sid   (flake/s (first s-flakes))
-              s-iri (get-s-iri sid db compact-fn)
-              [assert* retract*]
-              (if (and (= 1 (count s-flakes))
-                       (= const/$rdfs:Class (->> s-flakes first flake/o))
-                       (= const/$rdf:type (->> s-flakes first flake/p)))
-                ;; we don't output auto-generated rdfs:Class definitions for classes
-                ;; (they are implied when used in rdf:type statements)
-                [assert retract]
-                (let [{assert-flakes  true,
-                       retract-flakes false}
-                      (group-by flake/op s-flakes)
-
-                      s-assert  (when assert-flakes
-                                  (-> (subject-block assert-flakes db ctx compact-fn)
-                                      (assoc id-key s-iri)))
-                      s-retract (when retract-flakes
-                                  (-> (subject-block retract-flakes db ctx compact-fn)
-                                      (assoc id-key s-iri)))]
-                  [(cond-> assert
-                     s-assert (conj s-assert))
-                   (cond-> retract
-                     s-retract (conj s-retract))]))]
-          (recur r assert* retract*))
-        {:refs-ctx (dissoc @ctx type-key) ; @type will be marked as @type: @id, which is implied
-         :assert   assert
-         :retract  retract
-         :flakes   flakes}))))
-
-
 (defn- did-from-private
   [private-key]
   (let [acct-id (crypto/account-id-from-private private-key)]
@@ -210,23 +164,57 @@
       (flake/match-tspo t)
       not-empty))
 
-(defn commit-opts->data
-  "Convert the novelty flakes into the json-ld shape."
-  [{:keys [ledger branch t] :as db} opts]
-  (let [committed-t (ledger/latest-commit-t ledger branch)
-        new-flakes  (commit-flakes db)]
-    (when (not= t (flake/next-t committed-t))
-      (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
-                           " is no longer consistent with staged db 't' value of: " t ".")
-                      {:status 400 :error :db/invalid-commit})))
-    (when new-flakes
-      (generate-commit new-flakes db opts))))
+(defn generate-commit
+  "Generates assertion and retraction flakes for a given set of flakes
+  which is assumed to be for a single (t) transaction.
+
+  Returns a map of
+  :assert - assertion flakes
+  :retract - retraction flakes
+  :refs-ctx - context that must be included with final context, for refs (@id) values
+  :flakes - all considered flakes, for any downstream processes that need it"
+  [db {:keys [compact-fn id-key type-key] :as _opts}]
+  (when-let [flakes  (commit-flakes db)]
+    (log/trace "generate-commit flakes:" flakes)
+    (let [ctx (volatile! {})]
+      (loop [[s-flakes & r] (partition-by flake/s flakes)
+             assert         []
+             retract        []]
+        (if s-flakes
+          (let [sid   (flake/s (first s-flakes))
+                s-iri (get-s-iri sid db compact-fn)
+                [assert* retract*]
+                (if (and (= 1 (count s-flakes))
+                         (= const/$rdfs:Class (->> s-flakes first flake/o))
+                         (= const/$rdf:type (->> s-flakes first flake/p)))
+                  ;; we don't output auto-generated rdfs:Class definitions for classes
+                  ;; (they are implied when used in rdf:type statements)
+                  [assert retract]
+                  (let [{assert-flakes  true,
+                         retract-flakes false}
+                        (group-by flake/op s-flakes)
+
+                        s-assert  (when assert-flakes
+                                    (-> (subject-block assert-flakes db ctx compact-fn)
+                                        (assoc id-key s-iri)))
+                        s-retract (when retract-flakes
+                                    (-> (subject-block retract-flakes db ctx compact-fn)
+                                        (assoc id-key s-iri)))]
+                    [(cond-> assert
+                       s-assert (conj s-assert))
+                     (cond-> retract
+                       s-retract (conj s-retract))]))]
+            (recur r assert* retract*))
+          {:refs-ctx (dissoc @ctx type-key) ; @type will be marked as @type: @id, which is implied
+           :assert   assert
+           :retract  retract
+           :flakes   flakes})))))
 
 (defn ledger-update-jsonld
   "Creates the JSON-LD map containing a new ledger update"
   [{:keys [commit] :as db} {:keys [type-key compact ctx-used-atom t v id-key stats] :as commit-opts}]
   (let [prev-dbid   (commit-data/data-id commit)
-        {:keys [assert retract refs-ctx]} (commit-opts->data db commit-opts)
+        {:keys [assert retract refs-ctx]} (generate-commit db commit-opts)
         prev-db-key (compact const/iri-previous)
         assert-key  (compact const/iri-assert)
         retract-key (compact const/iri-retract)

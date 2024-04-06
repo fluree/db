@@ -72,8 +72,8 @@
         branch-data (if requested-branch
                       (get branches requested-branch)
                       (get branches branch))
-        {:keys [latest-db commit]} branch-data
-        {:keys [stats t]} latest-db
+        {:keys [latest-db]} branch-data
+        {:keys [commit stats t]} latest-db
         {:keys [size flakes]} stats]
     {:address address
      :alias   alias
@@ -92,8 +92,14 @@
 
 (defn commit!
   [ledger db opts]
-  (let [opts* (normalize-opts opts)
-        db*   (or db (ledger/-db ledger (:branch opts*)))]
+  (let [{:keys [branch] :as opts*}
+        (normalize-opts opts)
+        {:keys [t] :as db*} (or db (ledger/-db ledger (:branch opts*)))
+        committed-t         (ledger/latest-commit-t ledger branch)]
+    (when (not= t (flake/next-t committed-t))
+      (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
+                           " is no longer consistent with staged db 't' value of: " t ".")
+                      {:status 400 :error :db/invalid-commit})))
     (jld-commit/commit ledger db* opts*)))
 
 
