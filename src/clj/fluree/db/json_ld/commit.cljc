@@ -232,11 +232,10 @@
                       (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
                       (:size stats) (assoc (compact const/iri-size) (:size stats)))
         ;; TODO - this is re-normalized below, can try to do it just once
-        dbid        (-> db-json json-ld/normalize-data db-json->db-id)
-        db-json*    (-> db-json
-                        (assoc id-key dbid)
-                        (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
-    (with-meta db-json* {:dbid dbid})))
+        dbid        (-> db-json json-ld/normalize-data db-json->db-id)]
+    (-> db-json
+        (assoc id-key dbid)
+        (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))))
 
 (defn new-t?
   [ledger-commit db-commit]
@@ -312,7 +311,7 @@
     (let [{:keys [id-key did message tag file-data? index-files-ch] :as opts*}
           (enrich-commit-opts db opts)
 
-          ledger-update     (ledger-update-jsonld db opts*) ;; writes :dbid as meta on return object for -c-write to leverage
+          ledger-update     (ledger-update-jsonld db opts*)
           dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
           ledger-update-res (<? (connection/-c-write conn ledger ledger-update)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
