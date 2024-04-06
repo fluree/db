@@ -10,7 +10,6 @@
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.connection :as connection]
             [fluree.db.ledger :as ledger]
-            [fluree.db.json-ld.branch :as branch]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
@@ -214,9 +213,7 @@
 (defn commit-opts->data
   "Convert the novelty flakes into the json-ld shape."
   [{:keys [ledger branch t] :as db} opts]
-  (let [committed-t (-> ledger
-                        (ledger/-status branch)
-                        branch/latest-commit-t)
+  (let [committed-t (ledger/latest-commit-t ledger branch)
         new-flakes  (commit-flakes db)]
     (when (not= t (flake/next-t committed-t))
       (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t

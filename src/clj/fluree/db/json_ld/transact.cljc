@@ -1,5 +1,5 @@
 (ns fluree.db.json-ld.transact
-  (:require [clojure.core.async :as async :refer [alts! go]]
+  (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.util.log :as log]
             [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
@@ -7,7 +7,6 @@
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
@@ -82,7 +81,7 @@
 (defn ->tx-state
   [db txn-id author-did]
   (let [{:keys [branch ledger policy], db-t :t} db
-        commit-t  (-> (ledger/-status ledger branch) branch/latest-commit-t)
+        commit-t  (ledger/latest-commit-t ledger branch)
         t         (flake/next-t commit-t)
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before

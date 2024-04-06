@@ -1,7 +1,6 @@
 (ns fluree.db.json-ld.branch
   (:require [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.flake :as flake]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log :include-macros true])
 
   (:refer-clojure :exclude [name]))
@@ -92,17 +91,6 @@
   "Returns latest db from branch data"
   [branch-data]
   (:latest-db branch-data))
-
-(defn latest-commit
-  "Returns latest commit info from branch-data"
-  [branch-data]
-  (:commit branch-data))
-
-(defn latest-commit-t
-  "Returns the latest commit 't' value from branch-data, or 0 (zero) if no commit yet."
-  [branch-data]
-  (or (commit-data/t (latest-commit branch-data))
-      0))
 
 ;; TODO
 #_(defn branch

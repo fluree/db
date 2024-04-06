@@ -1,4 +1,5 @@
-(ns fluree.db.ledger)
+(ns fluree.db.ledger
+  (:require [fluree.db.json-ld.commit-data :as commit-data]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -22,3 +23,18 @@
   (-alias [ledger] "Returns the ledger local alias / graph name")
   (-address [ledger] "Returns the permanent ledger address")
   (-close [ledger] "Shuts down ledger processes and clears used resources."))
+
+(defn latest-commit
+  "Returns latest commit info from branch-data"
+  [ledger branch]
+  (-> ledger
+      (-status branch)
+      :commit))
+
+(defn latest-commit-t
+  "Returns the latest commit 't' value from branch-data, or 0 (zero) if no commit yet."
+  [ledger branch]
+  (-> ledger
+      (latest-commit branch)
+      commit-data/t
+      (or 0)))
