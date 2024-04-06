@@ -78,7 +78,7 @@
     {:address address
      :alias   alias
      :branch  branch
-     :t       (when t (- t))
+     :t       t
      :size    size
      :flakes  flakes
      :commit  commit}))
@@ -118,7 +118,7 @@
                         (get-first const/iri-data)
                         (get-first-value const/iri-t))
           latest-db (ledger/-db ledger {:branch branch})
-          latest-t  (- (:t latest-db))]
+          latest-t  (:t latest-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
                  "where current cached db t value is:" latest-t)
       ;; note, index updates will have same t value as current one, so still need to check if t = latest-t
