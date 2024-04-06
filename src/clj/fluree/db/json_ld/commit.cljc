@@ -210,7 +210,7 @@
            :retract  retract
            :flakes   flakes})))))
 
-(defn ledger-update-jsonld
+(defn db->jsonld
   "Creates the JSON-LD map containing a new ledger update"
   [{:keys [commit] :as db} {:keys [type-key compact ctx-used-atom t v id-key stats] :as commit-opts}]
   (let [prev-dbid   (commit-data/data-id commit)
@@ -311,7 +311,7 @@
     (let [{:keys [id-key did message tag file-data? index-files-ch] :as opts*}
           (enrich-commit-opts db opts)
 
-          ledger-update     (ledger-update-jsonld db opts*)
+          ledger-update     (db->jsonld db opts*)
           dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
           ledger-update-res (<? (connection/-c-write conn ledger ledger-update)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file

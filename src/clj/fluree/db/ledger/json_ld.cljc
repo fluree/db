@@ -94,12 +94,15 @@
   [ledger db opts]
   (let [{:keys [branch] :as opts*}
         (normalize-opts opts)
-        {:keys [t] :as db*} (or db (ledger/-db ledger (:branch opts*)))
-        committed-t         (ledger/latest-commit-t ledger branch)]
-    (when (not= t (flake/next-t committed-t))
+        {:keys [t commit] :as db*} (or db (ledger/-db ledger (:branch opts*)))
+        current-commit              (ledger/latest-commit ledger branch)
+        committed-t                (ledger/latest-commit-t ledger branch)]
+    (when-not (and (= t (flake/next-t committed-t))
+                   (= commit current-commit))
       (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
                            " is no longer consistent with staged db 't' value of: " t ".")
                       {:status 400 :error :db/invalid-commit})))
+
     (jld-commit/commit ledger db* opts*)))
 
 
