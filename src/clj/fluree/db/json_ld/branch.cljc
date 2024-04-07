@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.branch
   (:require [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.flake :as flake]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log :include-macros true])
 
   (:refer-clojure :exclude [name]))
@@ -42,56 +43,82 @@
      :from      (-> current-branch-map
                     (select-keys [:name :t :commit]))}))
 
+(defn skipped-t?
+  [new-t current-t]
+  (and (not (or (nil? current-t)
+                (zero? current-t))) ; when loading a ledger from disk, 't' will
+                                    ; be zero but ledger 't' will be >= 1
+       (flake/t-after? new-t (flake/next-t current-t))))
+
 (defn updated-index?
   [current-commit new-commit]
   (flake/t-before? (commit-data/index-t current-commit)
                    (commit-data/index-t new-commit)))
 
+(defn use-latest
+  [new-db current-db]
+  (let [new-t     (:t new-db)
+        current-t (:t current-db)]
+    (if (skipped-t? new-t current-t)
+      (throw (ex-info (str "Unable to create new DB version on ledger. "
+                           "current 't' value is: " current-t
+                           " however new t value is: " new-t
+                           ". Successive 't' values must be contiguous.")
+                      {:status 500 :error :db/invalid-time}))
+      (let [current-commit (:commit current-db)]
+        (if (flake/t-before? new-t current-t)
+          (let [outdated-commit (:commit new-db)
+                latest-commit   (commit-data/use-latest-index current-commit outdated-commit)]
+            (if (updated-index? current-commit latest-commit)
+              (dbproto/-index-update current-db (:index latest-commit))
+              current-db))
+          (let [new-commit    (:commit new-db)
+                latest-commit (commit-data/use-latest-index new-commit current-commit)]
+            (if (updated-index? new-commit latest-commit)
+              (dbproto/-index-update new-db (:index latest-commit))
+              new-db)))))))
+
 (defn update-db
   "Updates the latest staged db and returns new branch data."
-  [{:keys [t] :as branch-data} {db-t :t, :as db}]
-  (if (or (= (flake/next-t t) db-t)
-          (= t db-t)
-          (zero? t)) ;; when loading a ledger from disk, 't' will be zero but ledger will be >= 1
-    (-> branch-data
-        (assoc :t db-t
-               :latest-db db))
-    (throw (ex-info (str "Unable to create new DB version on ledger, latest 't' value is: "
-                         t " however new db t value is: " db-t ".")
-                    {:status 500 :error :db/invalid-time}))))
+  [{:keys [latest-db] :as branch-data} db]
+  (let [{:keys [t commit] :as latest-db*} (use-latest db latest-db)]
+    (assoc branch-data
+           :t t
+           :commit commit
+           :latest-db latest-db*)))
+
+(defn updatable-commit?
+  [current-commit new-commit]
+  (let [current-t (commit-data/t current-commit)
+        new-t     (commit-data/t new-commit)]
+    (or (nil? current-t)
+        (and (updated-index? current-commit new-commit)
+             (not (flake/t-after? new-t current-t))) ; index update may come after multiple commits
+        (= new-t (inc current-t)))))
 
 (defn update-commit
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
-  [branch-data db]
-  (let [{db-commit :commit, db-t :t} db
-        {branch-commit :commit} branch-data
-        ledger-t       (commit-data/t branch-commit)
-        commit-t       (commit-data/t db-commit)
-        _              (when-not (= db-t commit-t)
-                         (throw (ex-info (str "Unexpected Error. Db's t value and commit's t value are not the same: "
-                                              db-t " and " commit-t " respectively.")
-                                         {:status 500 :error :db/invalid-db})))
-        index-updated? (updated-index? branch-commit db-commit)
-        db*            (if index-updated?
-                         (assoc db :commit (commit-data/use-latest-index db-commit branch-commit))
-                         db)]
-    (when-not (or (nil? ledger-t)
-                  (and index-updated?
-                       (not (flake/t-after? commit-t ledger-t))) ; index update may come after multiple commits
-                  (= commit-t (inc ledger-t)))
-      (throw (ex-info (str "Commit failed, latest committed db is " ledger-t
-                           " and you are trying to commit at db at t value of: "
-                           commit-t ". These should be one apart. Likely db was "
-                           "updated by another user or process.")
-                      {:status 400 :error :db/invalid-commit})))
-    (-> branch-data
-        (update-db db*)
-        (assoc :commit (:commit db*)))))
+  [branch-map {new-commit :commit, db-t :t, :as db}]
+  (let [{current-commit :commit} branch-map
+        current-t                (commit-data/t current-commit)
+        new-t                    (commit-data/t new-commit)]
+    (if (= db-t new-t)
+      (if (updatable-commit? current-commit new-commit)
+        (update-db branch-map db)
+        (throw (ex-info (str "Commit failed, latest committed db is " current-t
+                             " and you are trying to commit at db at t value of: "
+                             new-t ". These should be one apart. Likely db was "
+                             "updated by another user or process.")
+                        {:status 400 :error :db/invalid-commit})))
+      (throw (ex-info (str "Unexpected Error updating commit database. "
+                           "New database has an inconsistent t from it's commit:"
+                           db-t " and " new-t " respectively.")
+                      {:status 500 :error :db/invalid-db})))))
 
 (defn latest-db
   "Returns latest db from branch data"
-  [branch-data]
-  (:latest-db branch-data))
+  [branch-map]
+  (:latest-db branch-map))
