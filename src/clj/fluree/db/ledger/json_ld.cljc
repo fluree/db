@@ -56,7 +56,7 @@
   If index in provided db is newer, updates latest index held in ledger state."
   [{:keys [state] :as ledger} branch-name db]
   (log/debug "Attempting to update ledger's db with new commit:"
-             (:alias ledger) "branch:" branch-name)
+             (:alias ledger) "branch:" branch-name "to t" (:t db))
   (when-not (get-in @state [:branches branch-name])
     (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                          "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
@@ -94,16 +94,13 @@
   [ledger db opts]
   (let [{:keys [branch] :as opts*}
         (normalize-opts opts)
-        {:keys [t commit] :as db*} (or db (ledger/-db ledger (:branch opts*)))
-        current-commit              (ledger/latest-commit ledger branch)
+        {:keys [t] :as db*} (or db (ledger/-db ledger (:branch opts*)))
         committed-t                (ledger/latest-commit-t ledger branch)]
-    (if (and (= t (flake/next-t committed-t))
-             (= commit current-commit))
+    (if (= t (flake/next-t committed-t))
       (jld-commit/commit ledger db* opts*)
       (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
                            " is no longer consistent with staged db 't' value of: " t ".")
                       {:status 400 :error :db/invalid-commit})))))
-
 
 (defn close-ledger
   "Shuts down ledger and resources."
