@@ -397,20 +397,24 @@
 
 (defn next-t
   [t]
-  (inc t))
+  (inc (or t 0)))
 
 (defn prev-t
   [t]
-  (when (> t 0)
+  (when (and t (> t 0))
     (dec t)))
 
 (defn t-before?
   [t1 t2]
-  (< t1 t2))
+  (if (and t1 t2)
+    (< t1 t2)
+    (nil? t1)))
 
 (defn t-after?
   [t1 t2]
-  (> t1 t2))
+  (if (and t1 t2)
+    (> t1 t2)
+    (some? t1)))
 
 (defn match-tspo
   "Returns all matching flakes to a specific 't' value."
