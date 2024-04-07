@@ -44,13 +44,43 @@
           (str "Invalid predicate property: " (pr-str property)))
   (get-in schema [:pred predicate property]))
 
+(defn empty-all-novelty
+  [db]
+  (let [cleared (reduce (fn [db* idx]
+                          (update-in db* [:novelty idx] empty))
+                        db index/types)]
+    (assoc-in cleared [:novelty :size] 0)))
+
+(defn empty-novelty
+  "Empties novelty @ t value and earlier. If t is null, empties all novelty."
+  [db t]
+  (cond
+    (or (nil? t)
+        (= t (:t db)))
+    (empty-all-novelty db)
+
+    (flake/t-before? t (:t db))
+    (let [cleared (reduce (fn [db* idx]
+                            (update-in db* [:novelty idx]
+                                       (fn [flakes]
+                                         (index/flakes-after t flakes))))
+                          db index/types)
+          size    (flake/size-bytes (get-in cleared [:novelty :spot]))]
+      (assoc-in cleared [:novelty :size] size))
+
+    :else
+    (throw (ex-info (str "Request to empty novelty at t value: " t
+                         ", however provided db is only at t value: " (:t db))
+                    {:status 500 :error :db/indexing}))))
+
 (defn force-index-update
-  [{:keys [ledger commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
+  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
   (let [index-t (:t data-map)
         commit* (assoc commit :index commit-index)]
     (-> db
+        (empty-novelty index-t)
         (assoc :commit commit*
-               :novelty* (indexer/-empty-novelty (:indexer ledger) db index-t)
+               :novelty* (empty-novelty db index-t)
                :spot spot
                :post post
                :opst opst

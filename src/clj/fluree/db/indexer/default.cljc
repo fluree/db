@@ -441,13 +441,6 @@
         async/merge
         (async/reduce tally {:db db, :indexes [], :garbage #{}}))))
 
-(defn empty-all-novelty
-  [db]
-  (let [cleared (reduce (fn [db* idx]
-                          (update-in db* [:novelty idx] empty))
-                        db index/types)]
-    (assoc-in cleared [:novelty :size] 0)))
-
 (defn refresh
   [indexer
    {:keys [novelty t alias] :as db}
@@ -471,26 +464,25 @@
 
                 refresh-ch
                 ([{:keys [garbage], refreshed-db :db, :as _status}]
-                 (let [indexed-db  (-> (indexer/-empty-novelty indexer refreshed-db)
-                                       (assoc-in [:stats :indexed] t))
+                 (let [refreshed-db* (assoc-in refreshed-db [:stats :indexed] t)
                        ;; TODO - ideally issue garbage/root writes to RAFT together
                        ;;        as a tx, currently requires waiting for both
                        ;;        through raft sync
-                       garbage-res (when (seq garbage)
-                                     (let [write-res (<? (storage/write-garbage indexed-db garbage))]
-                                       (<! (notify-new-index-file write-res :garbage t changes-ch))
-                                       write-res))
+                       garbage-res   (when (seq garbage)
+                                       (let [write-res (<? (storage/write-garbage refreshed-db* garbage))]
+                                         (<! (notify-new-index-file write-res :garbage t changes-ch))
+                                         write-res))
                        ;; TODO - WRITE GARBAGE INTO INDEX ROOT!!!
-                       db-root-res (<? (storage/write-db-root indexed-db))
-                       _           (<! (notify-new-index-file db-root-res :root t changes-ch))
+                       db-root-res   (<? (storage/write-db-root refreshed-db*))
+                       _             (<! (notify-new-index-file db-root-res :root t changes-ch))
 
                        index-address (:address db-root-res)
                        index-id      (str "fluree:index:sha256:" (:hash db-root-res))
-                       commit-index  (commit-data/new-index (-> indexed-db :commit :data)
+                       commit-index  (commit-data/new-index (-> refreshed-db* :commit :data)
                                                             index-id
                                                             index-address
-                                                            (select-keys indexed-db index/types))
-                       indexed-db*   (dbproto/-index-update indexed-db commit-index)
+                                                            (select-keys refreshed-db* index/types))
+                       indexed-db    (dbproto/-index-update refreshed-db* commit-index)
                        duration      (- (util/current-time-millis) start-time-ms)
                        end-stats     (assoc init-stats
                                             :end-time (util/current-time-iso)
@@ -498,7 +490,7 @@
                                             :address (:address db-root-res)
                                             :garbage (:address garbage-res))]
                    (log/info "Index refresh complete:" end-stats)
-                   indexed-db*)))))
+                   indexed-db)))))
         db))))
 
 (defn push-index-event
@@ -562,29 +554,6 @@
      :indexed   indexed
      :queued    queued}))
 
-(defn empty-novelty
-  "Empties novelty @ t value and earlier. If t is null, empties all novelty."
-  [db t]
-  (cond
-    (or (nil? t)
-        (= t (:t db)))
-    (empty-all-novelty db)
-
-    (flake/t-before? t (:t db))
-    (let [cleared (reduce (fn [db* idx]
-                            (update-in db* [:novelty idx]
-                                       (fn [flakes]
-                                         (index/flakes-after t flakes))))
-                          db index/types)
-          size    (flake/size-bytes (get-in cleared [:novelty :spot]))]
-      (assoc-in cleared [:novelty :size] size))
-
-    :else
-    (throw (ex-info (str "Request to empty novelty at t value: " t
-                         ", however provided db is only at t value: " (:t db))
-                    {:status 500 :error :db/indexing}))))
-
-
 (defrecord IndexerDefault [reindex-min-bytes reindex-max-bytes state-atom]
   indexer/iIndex
   (-index [indexer db] (index indexer db nil))
@@ -594,8 +563,6 @@
   (-push-event [_ event-data] (send-watch-event state-atom event-data))
   (-close [indexer] (close indexer))
   (-status [indexer] (status indexer))
-  (-empty-novelty [_ db] (empty-novelty db nil))
-  (-empty-novelty [_ db t] (empty-novelty db t))
   (-reindex [indexer db] :TODO))
 
 
