@@ -189,7 +189,7 @@
 
 (defn flakes-after
   [t flakes]
-  (->> flakes-after
+  (->> flakes
        (filter-before (flake/next-t t))
        (flake/disj-all flakes)))
 
