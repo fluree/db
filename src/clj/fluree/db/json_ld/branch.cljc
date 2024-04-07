@@ -42,6 +42,11 @@
      :from      (-> current-branch-map
                     (select-keys [:name :t :commit]))}))
 
+(defn updated-index?
+  [current-commit new-commit]
+  (flake/t-before? (commit-data/index-t current-commit)
+                   (commit-data/index-t new-commit)))
+
 (defn update-db
   "Updates the latest staged db and returns new branch data."
   [{:keys [t] :as branch-data} {db-t :t, :as db}]
@@ -69,13 +74,12 @@
                          (throw (ex-info (str "Unexpected Error. Db's t value and commit's t value are not the same: "
                                               db-t " and " commit-t " respectively.")
                                          {:status 500 :error :db/invalid-db})))
-        updated-index? (not= (commit-data/index-t branch-commit)
-                             (commit-data/index-t db-commit))
-        db*            (if updated-index?
+        index-updated? (updated-index? branch-commit db-commit)
+        db*            (if index-updated?
                          (assoc db :commit (commit-data/use-latest-index db-commit branch-commit))
                          db)]
     (when-not (or (nil? ledger-t)
-                  (and updated-index?
+                  (and index-updated?
                        (not (flake/t-after? commit-t ledger-t))) ; index update may come after multiple commits
                   (= commit-t (inc ledger-t)))
       (throw (ex-info (str "Commit failed, latest committed db is " ledger-t
