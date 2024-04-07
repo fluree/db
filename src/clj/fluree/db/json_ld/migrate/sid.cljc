@@ -11,7 +11,6 @@
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log :include-macros true]
             [clojure.core.async :as async]))
 

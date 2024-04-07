@@ -33,12 +33,16 @@
 (defn new-branch-map
   "Returns a new branch name for specified branch name off of
   supplied current-branch."
-  [current-branch-map alias branch ns-addresses]
-  (let [{:keys [latest-db]} current-branch-map]
-    {:name      branch
-     :commit    (commit-data/blank-commit alias branch ns-addresses)
-     :latest-db latest-db
-     :from      (select-keys current-branch-map [:name :commit])}))
+  ([ledger-alias branch-name ns-addresses]
+   (new-branch-map nil ledger-alias branch-name ns-addresses))
+  ([current-branch-map ledger-alias branch-name ns-addresses]
+   (let [{:keys [latest-db]} current-branch-map]
+     (let [initial-commit (commit-data/blank-commit ledger-alias branch-name ns-addresses)]
+       (cond-> {:name      branch-name
+                :commit    initial-commit
+                :latest-db latest-db}
+         (not-empty current-branch-map)
+         (assoc :from (select-keys current-branch-map [:name :commit])))))))
 
 (defn skipped-t?
   [new-t current-t]

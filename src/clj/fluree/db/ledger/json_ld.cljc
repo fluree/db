@@ -226,7 +226,7 @@
           address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
           ;; map of all branches and where they are branched from
-          branches      {branch (branch/new-branch-map nil ledger-alias* branch ns-addresses)}]
+          branches      {branch (branch/new-branch-map ledger-alias* branch ns-addresses)}]
       (map->JsonLDLedger
         {:id      (random-uuid)
          :did     did*
