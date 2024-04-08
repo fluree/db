@@ -216,6 +216,8 @@
                         (<? (perm/wrap-policy db policy-identity))
                         db)
 
+           ;; TODO: Writing transactions should wait until commit time. We
+           ;; should save the transaction documents on the staged db instead.
            {txn-id :address}
            (<? (connection/-txn-write conn ledger raw-txn))
 
