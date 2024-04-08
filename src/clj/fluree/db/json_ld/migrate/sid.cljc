@@ -99,7 +99,7 @@
            db                      (db/create ledger)]
       (if commit-tuple
         (let [merged-db     (<? (merge-commit conn db commit-tuple))
-              update-commit (commit/update-commit-fn merged-db commit-opts)
+              update-commit (commit/update-commit-fn ledger merged-db commit-opts)
               indexed-db    (<? (indexer/do-index indexer merged-db
                                                   {:changes-ch    ch
                                                    :update-commit update-commit}))]
