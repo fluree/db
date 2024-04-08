@@ -10,7 +10,6 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.ledger :as ledger]
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.exec.update :as update]
@@ -80,8 +79,8 @@
 
 (defn ->tx-state
   [db txn-id author-did]
-  (let [{:keys [branch ledger policy], db-t :t} db
-        commit-t  (ledger/latest-commit-t ledger branch)
+  (let [{:keys [policy], db-t :t} db
+        commit-t  (-> db :commit commit-data/t)
         t         (flake/next-t commit-t)
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before

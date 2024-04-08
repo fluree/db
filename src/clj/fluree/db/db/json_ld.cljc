@@ -10,7 +10,6 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.transact :as jld-transact]
-            [fluree.db.indexer :as indexer]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.commit-data :as commit-data])
   #?(:clj (:import (java.io Writer))))

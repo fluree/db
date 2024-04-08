@@ -82,7 +82,7 @@
 (defn update-db
   "Updates the latest staged db and returns new branch data."
   [{:keys [latest-db] :as branch-data} db]
-  (let [{:keys [t commit] :as latest-db*} (use-latest db latest-db)]
+  (let [{:keys [commit] :as latest-db*} (use-latest db latest-db)]
     (assoc branch-data
            :commit commit
            :latest-db latest-db*)))
