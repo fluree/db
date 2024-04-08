@@ -43,20 +43,22 @@
                                                  "rdfs:subClassOf" "?subclasses"}}))
           "The subClassOf triple should be inserted into the current db")
 
-      (is (= #{"ex:brian" "ex:laura"}
-             (set @(fluree/query db-reason
-                                 {:context {"ex" "http://example.org/"}
-                                  :select  "?s"
-                                  :where   {"@id"   "?s"
-                                            "@type" "ex:Person"}})))
+      (is (= (list "ex:brian" "ex:laura")
+             (sort
+               @(fluree/query db-reason
+                              {:context {"ex" "http://example.org/"}
+                               :select  "?s"
+                               :where   {"@id"   "?s"
+                                         "@type" "ex:Person"}})))
           "ex:brian, ex:laura should be of type ex:Person")
 
-      (is (= #{"ex:brian" "ex:laura" "ex:alice"}
-             (set @(fluree/query db-reason
-                                 {:context {"ex" "http://example.org/"}
-                                  :select  "?s"
-                                  :where   {"@id"   "?s"
-                                            "@type" "ex:Human"}})))
+      (is (= (list "ex:alice" "ex:brian" "ex:laura")
+             (sort
+               @(fluree/query db-reason
+                              {:context {"ex" "http://example.org/"}
+                               :select  "?s"
+                               :where   {"@id"   "?s"
+                                         "@type" "ex:Human"}})))
           "ex:brian, ex:laura, ex:alice should be of type ex:Human"))))
 
 (deftest ^:integration owl-equivalent-class
@@ -82,22 +84,24 @@
                                          "@id"                 "ex:Human"
                                          "@type"               ["owl:Class"],
                                          "owl:equivalentClass" {"@id" "ex:Person"}}])]
-          (is (= #{"ex:brian" "ex:laura"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Person"}})))
+          (is (= (list "ex:brian" "ex:laura")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Person"}})))
               "both ex:brian and ex:laura should be of type ex:Person")
 
-          (is (= #{"ex:brian" "ex:laura"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Human"}})))
+          (is (= (list "ex:brian" "ex:laura")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Human"}})))
               "both ex:brian and ex:laura should be of type ex:Human")))
 
       (testing "Testing multiple owl:equivalentClass declaration"
@@ -107,28 +111,31 @@
                                          "@id"                 "ex:Person"
                                          "@type"               ["owl:Class"]
                                          "owl:equivalentClass" [{"@id" "ex:Human"} {"@id" "ex:HumanBeing"}]}])]
-          (is (= #{"ex:brian" "ex:laura" "ex:alice"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Person"}})))
+          (is (= (list "ex:alice" "ex:brian" "ex:laura")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Person"}})))
               "ex:brian, ex:laura and ex:alice should be of type ex:Person")
 
-          (is (= #{"ex:brian" "ex:laura" "ex:alice"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Human"}})))
+          (is (= (list "ex:alice" "ex:brian" "ex:laura")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Human"}})))
               "ex:brian, ex:laura and ex:alice should be of type ex:Human")
 
-          (is (= #{"ex:brian" "ex:laura" "ex:alice"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:HumanBeing"}})))
+          (is (= (list "ex:alice" "ex:brian" "ex:laura")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:HumanBeing"}})))
               "ex:brian, ex:laura and ex:alice should be of type ex:HumanBeing"))))))
 
 (deftest ^:integration owl-restriction-has-value
@@ -157,20 +164,22 @@
                                          "owl:equivalentClass" [{"@type"          "owl:Restriction"
                                                                  "owl:onProperty" {"@id" "ex:hasAccount"}
                                                                  "owl:hasValue"   true}]}])]
-          (is (= #{"ex:alice" "ex:susan"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Customer"}})))
+          (is (= (list "ex:alice" "ex:susan")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Customer"}})))
               "ex:alice has property ex:hasAccount with value true, ex:susan was explicitly declared as ex:Customer")
 
-          (is (= #{"ex:alice" "ex:susan"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"           "?s"
-                                                "ex:hasAccount" true}})))
+          (is (= (list "ex:alice" "ex:susan")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"           "?s"
+                                             "ex:hasAccount" true}})))
               "ex:susan should have ex:hasAccount: true inferred based on declared class.")))
 
       (testing "Testing single owl:Restriction where property value is not an IRI"
@@ -228,12 +237,13 @@
                                             "owl:equivalentClass" [{"@type"              "owl:Restriction"
                                                                     "owl:onProperty"     {"@id" "ex:hasMaker"}
                                                                     "owl:someValuesFrom" {"@id" "ex:Winery"}}]}])]
-          (is (= #{"ex:maybe-a-wine" "ex:a-wine-1" "ex:a-wine-2"}
-                 (set @(fluree/query db-some-val
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Wine"}})))
+          (is (= (list "ex:a-wine-1" "ex:a-wine-2" "ex:maybe-a-wine")
+                 (sort
+                   @(fluree/query db-some-val
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Wine"}})))
               "only one hasMaker must be a winery to qualify as an ex:Wine")))
 
       (testing "Testing single owl:Restriction someValuesFrom with owl:oneOf value"
@@ -247,12 +257,13 @@
                                                                     "owl:someValuesFrom" {"@type"     "owl:Class"
                                                                                           "owl:oneOf" {"@list" [{"@id" "ex:winery2"}
                                                                                                                 {"@id" "ex:winery1"}]}}}]}])]
-          (is (= #{"ex:maybe-a-wine" "ex:a-wine-1" "ex:a-wine-2"}
-                 (set @(fluree/query db-some-val
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Wine"}})))
+          (is (= (list "ex:a-wine-1" "ex:a-wine-2" "ex:maybe-a-wine")
+                 (sort
+                   @(fluree/query db-some-val
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Wine"}})))
               "hasMaker ref can no be of either ex:Winery or ex:TextileFactory to qualify as an ex:Wine")))
 
       (testing "Testing single owl:Restriction allValuesFrom for a property value"
@@ -264,12 +275,13 @@
                                            "owl:equivalentClass" [{"@type"             "owl:Restriction"
                                                                    "owl:onProperty"    {"@id" "ex:hasMaker"}
                                                                    "owl:allValuesFrom" {"@id" "ex:Winery"}}]}])]
-          (is (= #{"ex:winery1" "ex:textile-company" "ex:winery2"}
-                 (set @(fluree/query db-all-val
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Winery"}})))
+          (is (= (list "ex:textile-company" "ex:winery1" "ex:winery2")
+                 (sort
+                   @(fluree/query db-all-val
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Winery"}})))
               "because every hasMaker must be a winery, they are all wineries"))))))
 
 (deftest ^:integration owl-max-cardinality
@@ -293,40 +305,34 @@
                                                                  "owl:onProperty"     {"@id" "ex:mother"}
                                                                  "owl:maxCardinality" 1}]}])]
 
-          (fluree.db.util.log/warn "REASONED FACTS: " (fluree/reasoned-facts db-equiv))
-
-          (fluree.db.util.log/warn "QUERY RESULT:" @(fluree/query db-equiv
-                                                                  {:context {"ex"  "http://example.org/"
-                                                                             "owl" "http://www.w3.org/2002/07/owl#"}
-                                                                   :select  "?same"
-                                                                   :where   {"@id"        "ex:carol",
-                                                                             "owl:sameAs" "?same"}}))
-
-          (is (= #{"ex:carol2" "ex:carol3"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?same"
-                                      :where   {"@id"        "ex:carol",
-                                                "owl:sameAs" "?same"}})))
+          (is (= (list "ex:carol2" "ex:carol3")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?same"
+                                   :where   {"@id"        "ex:carol",
+                                             "owl:sameAs" "?same"}})))
               "ex:carol2 and ex:carol3 should be deemed the same as ex:carol")
 
-          (is (= #{"ex:carol" "ex:carol3"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?same"
-                                      :where   {"@id"        "ex:carol2",
-                                                "owl:sameAs" "?same"}})))
+          (is (= (list "ex:carol" "ex:carol3")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?same"
+                                   :where   {"@id"        "ex:carol2",
+                                             "owl:sameAs" "?same"}})))
               "ex:carol and ex:carol3 should be deemed the same as ex:carol2")
 
-          (is (= #{"ex:carol" "ex:carol2"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?same"
-                                      :where   {"@id"        "ex:carol3",
-                                                "owl:sameAs" "?same"}})))
+          (is (= (list "ex:carol" "ex:carol2")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?same"
+                                   :where   {"@id"        "ex:carol3",
+                                             "owl:sameAs" "?same"}})))
               "ex:carol and ex:carol2 should be deemed the same as ex:carol3")))
 
       (testing "Testing owl:maxCardinality > 1"
@@ -371,22 +377,22 @@
                                                                  "owl:onProperty"              {"@id" "ex:mother"}
                                                                  "owl:onClass"                 {"@id" "ex:Parent"}
                                                                  "owl:maxQualifiedCardinality" 1}]}])]
-          (is (= #{"ex:carol2"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?same"
-                                      :where   {"@id"        "ex:carol",
-                                                "owl:sameAs" "?same"}})))
+          (is (= ["ex:carol2"]
+                 @(fluree/query db-equiv
+                                {:context {"ex"  "http://example.org/"
+                                           "owl" "http://www.w3.org/2002/07/owl#"}
+                                 :select  "?same"
+                                 :where   {"@id"        "ex:carol",
+                                           "owl:sameAs" "?same"}}))
               "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
 
-          (is (= #{"ex:carol"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?same"
-                                      :where   {"@id"        "ex:carol2",
-                                                "owl:sameAs" "?same"}})))
+          (is (= ["ex:carol"]
+                 @(fluree/query db-equiv
+                                {:context {"ex"  "http://example.org/"
+                                           "owl" "http://www.w3.org/2002/07/owl#"}
+                                 :select  "?same"
+                                 :where   {"@id"        "ex:carol2",
+                                           "owl:sameAs" "?same"}}))
               "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
 
           (is (= []
@@ -408,50 +414,52 @@
                                                                  "owl:onProperty"              {"@id" "ex:mother"}
                                                                  "owl:onClass"                 {"@id" "owl:Thing"}
                                                                  "owl:maxQualifiedCardinality" 1}]}])]
-          (is (= #{"ex:carol2" "ex:carol-not"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?same"
-                                      :where   {"@id"        "ex:carol",
-                                                "owl:sameAs" "?same"}})))
+          (is (= (list "ex:carol-not" "ex:carol2")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?same"
+                                   :where   {"@id"        "ex:carol",
+                                             "owl:sameAs" "?same"}})))
               "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")
 
-          (is (= #{"ex:carol" "ex:carol-not"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?same"
-                                      :where   {"@id"        "ex:carol2",
-                                                "owl:sameAs" "?same"}})))
+          (is (= (list "ex:carol" "ex:carol-not")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?same"
+                                   :where   {"@id"        "ex:carol2",
+                                             "owl:sameAs" "?same"}})))
               "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")
 
-          (is (= #{"ex:carol" "ex:carol2"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex"  "http://example.org/"
-                                                "owl" "http://www.w3.org/2002/07/owl#"}
-                                      :select  "?same"
-                                      :where   {"@id"        "ex:carol-not",
-                                                "owl:sameAs" "?same"}})))
+          (is (= (list "ex:carol" "ex:carol2")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?same"
+                                   :where   {"@id"        "ex:carol-not",
+                                             "owl:sameAs" "?same"}})))
               "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")))
 
       (testing "Testing owl:maxQualifiedCardinality > 1"
-        (let [db-42     @(fluree/reason db-base :owl2rl
-                                        [{"@context"                    {"owl" "http://www.w3.org/2002/07/owl#"
-                                                                         "ex"  "http://example.org/"}
-                                          "@id"                         "ex:Human"
-                                          "@type"                       ["owl:Class"]
-                                          "owl:onProperty"              {"@id" "ex:mother"}
-                                          "owl:onClass"                 {"@id" "owl:Thing"}
-                                          "owl:maxQualifiedCardinality" 42}])
-              qry-carol @(fluree/query db-42
-                                       {:context {"ex"  "http://example.org/"
-                                                  "owl" "http://www.w3.org/2002/07/owl#"}
-                                        :select  "?s"
-                                        :where   {"@id"        "ex:carol",
-                                                  "owl:sameAs" "?same"}})]
+        (let [db-42 @(fluree/reason db-base :owl2rl
+                                    [{"@context"                    {"owl" "http://www.w3.org/2002/07/owl#"
+                                                                     "ex"  "http://example.org/"}
+                                      "@id"                         "ex:Human"
+                                      "@type"                       ["owl:Class"]
+                                      "owl:onProperty"              {"@id" "ex:mother"}
+                                      "owl:onClass"                 {"@id" "owl:Thing"}
+                                      "owl:maxQualifiedCardinality" 42}])]
           (is (= []
-                 qry-carol)
+                 @(fluree/query db-42
+                                {:context {"ex"  "http://example.org/"
+                                           "owl" "http://www.w3.org/2002/07/owl#"}
+                                 :select  "?s"
+                                 :where   {"@id"        "ex:carol",
+                                           "owl:sameAs" "?same"}}))
               "with maxQualifiedCardinality > 1, no inferences can be made"))))))
 
 (deftest ^:integration owl-one-of
@@ -480,19 +488,21 @@
                                                      "owl:equivalentClass" [{"@type"     "owl:Class"
                                                                              "owl:oneOf" {"@list" [{"@id" "ex:Red"}
                                                                                                    {"@id" "ex:Blue"}]}}]}]})]
-          (is (= #{"ex:Red" "ex:Green"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:RedOrGreen"}}))))
+          (is (= (list "ex:Green" "ex:Red")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:RedOrGreen"}}))))
 
-          (is (= #{"ex:Red" "ex:Blue"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:RedOrBlue"}}))))))
+          (is (= (list "ex:Blue" "ex:Red")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:RedOrBlue"}}))))))
 
       (testing "Testing owl:oneOf simple declaration as multi-cardinality"
         (let [db-equiv @(fluree/reason db-base :owl2rl
@@ -508,19 +518,21 @@
                                                      "owl:equivalentClass" [{"@type"     "owl:Class"
                                                                              "owl:oneOf" [{"@id" "ex:Red"}
                                                                                           {"@id" "ex:Blue"}]}]}]})]
-          (is (= #{"ex:Red" "ex:Green"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:RedOrGreen"}}))))
+          (is (= (list "ex:Green" "ex:Red")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:RedOrGreen"}}))))
 
-          (is (= #{"ex:Red" "ex:Blue"}
-                 (set @(fluree/query db-equiv
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:RedOrBlue"}})))))))))
+          (is (= (list "ex:Blue" "ex:Red")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:RedOrBlue"}})))))))))
 
 (deftest ^:integration owl-intersection-of
   (testing "owl:intersectionOf tests - rules cls-int1, cls-int2, scm-int"
@@ -548,29 +560,32 @@
                                                                     "owl:intersectionOf" {"@list" [{"@id" "ex:Woman"}
                                                                                                    {"@id" "ex:Parent"}]}}]}])]
 
-          (is (= #{"ex:carol" "ex:jen"}
-                 (set @(fluree/query db-reasoned
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Mother"}})))
+          (is (= (list "ex:carol" "ex:jen")
+                 (sort
+                   @(fluree/query db-reasoned
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Mother"}})))
               "ex:carol has explicit types ex:Woman and ex:Parent, so should be inferred as ex:Mother, ex:jen is explicitly declared as ex:Mother")
 
-          (is (= #{"ex:carol" "ex:alice" "ex:jen"}
-                 (set @(fluree/query db-reasoned
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Woman"}})))
+          (is (= (list "ex:alice" "ex:carol" "ex:jen")
+                 (sort
+                   @(fluree/query db-reasoned
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Woman"}})))
               "ex:carol and ex:alice has explicit type ex:Woman and ex:jen is inferred from being ex:Mother")
 
-          (is (= #{"ex:Woman" "ex:Parent"}
-                 (set @(fluree/query db-reasoned
-                                     {:context {"ex"   "http://example.org/"
-                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                      :select  "?subclasses"
-                                      :where   {"@id"             "ex:Mother"
-                                                "rdfs:subClassOf" "?subclasses"}})))
+          (is (= (list "ex:Parent" "ex:Woman")
+                 (sort
+                   @(fluree/query db-reasoned
+                                  {:context {"ex"   "http://example.org/"
+                                             "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                   :select  "?subclasses"
+                                   :where   {"@id"             "ex:Mother"
+                                             "rdfs:subClassOf" "?subclasses"}})))
               "ex:Woman and ex:Parent should now be subclasses of ex:Mother - rule scm-int")))
 
       (testing "Testing owl:intersectionOf with nested hasValue"
@@ -619,21 +634,23 @@
                                                                     "owl:unionOf" {"@list" [{"@id" "ex:Mother"}
                                                                                             {"@id" "ex:Father"}]}}]}])]
 
-          (is (= #{"ex:carol" "ex:bob"}
-                 (set @(fluree/query db-reasoned
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Parent"}})))
+          (is (= (list "ex:bob" "ex:carol")
+                 (sort
+                   @(fluree/query db-reasoned
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Parent"}})))
               "ex:carol (ex:Mother) and ex:bob (ex:Father) should be inferred as ex:Parent - rule cls-uni")
 
-          (is (= #{"ex:Mother" "ex:Father"}
-                 (set @(fluree/query db-reasoned
-                                     {:context {"ex"   "http://example.org/"
-                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                      :select  "?s"
-                                      :where   {"@id"             "?s"
-                                                "rdfs:subClassOf" {"@id" "ex:Parent"}}})))
+          (is (= (list "ex:Father" "ex:Mother")
+                 (sort
+                   @(fluree/query db-reasoned
+                                  {:context {"ex"   "http://example.org/"
+                                             "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                   :select  "?s"
+                                   :where   {"@id"             "?s"
+                                             "rdfs:subClassOf" {"@id" "ex:Parent"}}})))
               "ex:carol (ex:Mother) and ex:bob (ex:Father) should be inferred as ex:Parent - rule scm-uni")))
 
       (testing "Testing owl:unionOf declaration with nested hasValue"
@@ -649,10 +666,11 @@
                                                                                              "owl:onProperty" {"@id" "ex:isParent"}
                                                                                              "owl:hasValue"   true}]}}]}])]
 
-          (is (= #{"ex:carol" "ex:bob" "ex:sue"}
-                 (set @(fluree/query db-reasoned
-                                     {:context {"ex" "http://example.org/"}
-                                      :select  "?s"
-                                      :where   {"@id"   "?s"
-                                                "@type" "ex:Parent"}})))
+          (is (= (list "ex:bob" "ex:carol" "ex:sue")
+                 (sort
+                   @(fluree/query db-reasoned
+                                  {:context {"ex" "http://example.org/"}
+                                   :select  "?s"
+                                   :where   {"@id"   "?s"
+                                             "@type" "ex:Parent"}})))
               "ex:sue (because ex:isParent=true), ex:carol (because ex:Mother) and ex:bob (because ex:Father)"))))))
