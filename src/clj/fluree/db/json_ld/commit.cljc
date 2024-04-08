@@ -248,7 +248,7 @@
 
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
-  [{:keys [ledger commit] :as db} {:keys [branch did private] :as _opts}]
+  [ledger {:keys [commit] :as db} {:keys [branch did private] :as _opts}]
   (go-try
     (let [{:keys [conn state]} ledger
           ledger-commit (:commit (ledger/-status ledger branch))
@@ -281,13 +281,13 @@
   "Returns a fn that receives a newly indexed db as its only argument.
   Will updated the provided committed-db with the new index, then create
   a new commit and push to the name service(s) if configured to do so."
-  [committed-db commit-opts]
+  [ledger committed-db commit-opts]
   (fn [indexed-db]
     (let [indexed-commit (:commit indexed-db)
           new-db         (if (newer-commit? committed-db indexed-commit)
                            (dbproto/-index-update committed-db (:index indexed-commit))
                            indexed-db)]
-      (do-commit+push new-db commit-opts))))
+      (do-commit+push ledger new-db commit-opts))))
 
 (defn run-index
   "Runs indexer. Will update the latest commit file with new index point
@@ -295,10 +295,10 @@
 
   If optional changes-ch is provided, will stream indexing updates to it
   so it can be replicated via consensus to other servers as needed."
-  ([indexer db commit-opts]
-   (run-index indexer db commit-opts nil))
-  ([indexer db commit-opts changes-ch]
-   (let [update-fn (update-commit-fn db commit-opts)]
+  ([ledger db commit-opts]
+   (run-index ledger db commit-opts nil))
+  ([{:keys [indexer] :as ledger} db commit-opts changes-ch]
+   (let [update-fn (update-commit-fn ledger db commit-opts)]
      ;; call indexing process with update-commit-fn to push out an updated commit once complete
      (indexer/-index indexer db {:update-commit update-fn
                                  :changes-ch    changes-ch}))))
@@ -308,7 +308,7 @@
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [conn indexer] :as ledger} {:keys [t stats commit txns] :as db} opts]
+  [{:keys [conn] :as ledger} {:keys [t stats commit txns] :as db} opts]
   (go-try
     (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
           (enrich-commit-opts ledger db opts)
@@ -335,9 +335,9 @@
 
           {db**             :db
            commit-file-meta :commit-res}
-          (<? (do-commit+push db* opts*))]
+          (<? (do-commit+push ledger db* opts*))]
 
-      (run-index indexer db** opts* index-files-ch)
+      (run-index ledger db** opts* index-files-ch)
 
       (if file-data?
         {:data-file-meta   ledger-update-res
