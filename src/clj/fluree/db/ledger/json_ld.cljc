@@ -38,7 +38,7 @@
     (when-not branch-meta
       (throw (ex-info (str "Invalid branch: " branch ".")
                       {:status 400 :error :db/invalid-branch})))
-    (branch/latest-db branch-meta)))
+    (branch/current-db branch-meta)))
 
 (defn db-update
   "Updates db, will throw if not next 't' from current db.
@@ -47,7 +47,7 @@
   [{:keys [state] :as _ledger} {:keys [branch] :as db}]
   (-> state
       (swap! update-in [:branches branch] branch/update-db db)
-      (get-in [:branches branch :latest-db])))
+      (get-in [:branches branch :current-db])))
 
 (defn commit-update
   "Updates both latest db and commit db. If latest registered index is
@@ -63,7 +63,7 @@
                     {:status 400 :error :db/invalid-branch})))
   (-> state
       (swap! update-in [:branches branch-name] branch/update-commit db)
-      (get-in [:branches branch-name :latest-db])))
+      (get-in [:branches branch-name :current-db])))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
@@ -72,8 +72,8 @@
         branch-data (if requested-branch
                       (get branches requested-branch)
                       (get branches branch))
-        {:keys [latest-db]} branch-data
-        {:keys [commit stats t]} latest-db
+        {:keys [current-db]} branch-data
+        {:keys [commit stats t]} current-db
         {:keys [size flakes]} stats]
     {:address address
      :alias   alias
@@ -122,37 +122,37 @@
           commit-t  (-> expanded-commit
                         (get-first const/iri-data)
                         (get-first-value const/iri-t))
-          latest-db (ledger/-db ledger {:branch branch})
-          latest-t  (:t latest-db)]
+          current-db (ledger/-db ledger {:branch branch})
+          current-t  (:t current-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
-                 "where current cached db t value is:" latest-t)
-      ;; note, index updates will have same t value as current one, so still need to check if t = latest-t
+                 "where current cached db t value is:" current-t)
+      ;; note, index updates will have same t value as current one, so still need to check if t = current-t
       (cond
 
-        (= commit-t (flake/next-t latest-t))
-        (let [updated-db  (<? (jld-reify/merge-commit conn latest-db false [commit proof]))
+        (= commit-t (flake/next-t current-t))
+        (let [updated-db  (<? (jld-reify/merge-commit conn current-db false [commit proof]))
               commit-map  (commit-data/json-ld->map commit (select-keys updated-db index/types))
               updated-db* (assoc updated-db :commit commit-map)]
           (commit-update ledger branch updated-db*))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
-        (flake/t-after? commit-t (flake/next-t latest-t))
+        (flake/t-after? commit-t (flake/next-t current-t))
         (do
           (log/debug "Received commit update that is more than 1 ahead of current ledger state. "
                      "Will dump in-memory ledger and force a reload: " (:alias ledger))
           (close-ledger ledger)
           false)
 
-        (= commit-t latest-t)
+        (= commit-t current-t)
         (do
           (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
-                    " however we already have this commit so not applying: " latest-t)
+                    " however we already have this commit so not applying: " current-t)
           false)
 
-        (flake/t-before? commit-t latest-t)
+        (flake/t-before? commit-t current-t)
         (do
           (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
-                    " however, latest t is more current: " latest-t)
+                    " however, latest t is more current: " current-t)
           false)))))
 
 (defrecord JsonLDLedger [id address alias did indexer state cache conn]

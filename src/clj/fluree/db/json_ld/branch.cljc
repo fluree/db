@@ -36,11 +36,11 @@
   ([ledger-alias branch-name ns-addresses]
    (new-branch-map nil ledger-alias branch-name ns-addresses))
   ([current-branch-map ledger-alias branch-name ns-addresses]
-   (let [{:keys [latest-db]} current-branch-map]
+   (let [{:keys [current-db]} current-branch-map]
      (let [initial-commit (commit-data/blank-commit ledger-alias branch-name ns-addresses)]
        (cond-> {:name      branch-name
                 :commit    initial-commit
-                :latest-db latest-db}
+                :current-db current-db}
          (not-empty current-branch-map)
          (assoc :from (select-keys current-branch-map [:name :commit])))))))
 
@@ -81,11 +81,11 @@
 
 (defn update-db
   "Updates the latest staged db and returns new branch data."
-  [{:keys [latest-db] :as branch-data} db]
-  (let [{:keys [commit] :as latest-db*} (use-latest db latest-db)]
+  [{:keys [current-db] :as branch-data} db]
+  (let [{:keys [commit] :as current-db*} (use-latest db current-db)]
     (assoc branch-data
            :commit commit
-           :latest-db latest-db*)))
+           :current-db current-db*)))
 
 (defn updatable-commit?
   [current-commit new-commit]
@@ -118,7 +118,7 @@
                            db-t " and " new-t " respectively.")
                       {:status 500 :error :db/invalid-db})))))
 
-(defn latest-db
+(defn current-db
   "Returns latest db from branch data"
   [branch-map]
-  (:latest-db branch-map))
+  (:current-db branch-map))
