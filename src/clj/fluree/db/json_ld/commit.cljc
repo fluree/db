@@ -303,20 +303,30 @@
      (indexer/-index indexer db {:update-commit update-fn
                                  :changes-ch    changes-ch}))))
 
+(defn write-transactions!
+  [conn ledger staged]
+  (go-try
+    (loop [[[txn author-did] & r] staged
+           results                []]
+      (if txn
+        (let [{txn-id :address} (<? (connection/-txn-write conn ledger txn))]
+          (recur r (conj results [txn-id author-did])))
+        results))))
 
 (defn commit
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [conn] :as ledger} {:keys [t stats commit txns] :as db} opts]
+  [{:keys [conn] :as ledger} {:keys [t stats commit staged] :as db} opts]
   (go-try
     (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
           (enrich-commit-opts ledger db opts)
 
+          txns              (<? (write-transactions! conn ledger staged))
+          [[txn-id author]] txns
           [dbid db-jsonld]  (db->jsonld db opts*)
           ledger-update-res (<? (connection/-c-write conn ledger db-jsonld)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
-          [[txn-id author]] txns
           base-commit-map   {:old-commit commit
                              :issuer     did
                              :message    message
@@ -329,9 +339,10 @@
                              :flakes     (:flakes stats)
                              :size       (:size stats)}
           new-commit        (commit-data/new-db-commit-map base-commit-map)
-          db*               (assoc db
-                                   :commit new-commit
-                                   :prev-commit commit)
+          db*               (-> db
+                                (update :staged empty)
+                                (assoc :commit new-commit
+                                       :prev-commit commit))
 
           {db**             :db
            commit-file-meta :commit-res}

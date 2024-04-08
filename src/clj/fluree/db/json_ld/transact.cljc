@@ -78,14 +78,15 @@
       [(not-empty adds) (not-empty removes)])))
 
 (defn ->tx-state
-  [db txn-id author-did]
+  [db txn author-did]
   (let [{:keys [policy], db-t :t} db
+
         commit-t  (-> db :commit commit-data/t)
         t         (flake/next-t commit-t)
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before
-     :txn-id                   txn-id
-     :author-did               author-did
+     :txn           txn
+     :author-did    author-did
      :policy        policy
      :stage-update? (= t db-t) ; if a previously staged db is getting updated
                                ; again before committed
@@ -175,12 +176,12 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [db new-flakes {:keys [stage-update? policy t txn-id author-did] :as _tx-state}]
+  [db new-flakes {:keys [stage-update? policy t txn author-did] :as _tx-state}]
   (let [[add remove] (if stage-update?
                        (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                        [new-flakes nil])
         db-after  (-> db
-                      (update :txns (fnil conj []) [txn-id author-did])
+                      (update :staged conj [txn author-did])
                       (assoc :policy policy) ;; re-apply policy to db-after
                       (assoc :t t)
                       (commit-data/update-novelty add remove)
@@ -207,7 +208,7 @@
 (defn stage
   ([db txn parsed-opts]
    (stage db nil txn parsed-opts))
-  ([{:keys [conn ledger] :as db} fuel-tracker txn parsed-opts]
+  ([db fuel-tracker txn parsed-opts]
    (go-try
      (let [{:keys [context raw-txn did]} parsed-opts
 
@@ -215,12 +216,6 @@
            db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                         (<? (perm/wrap-policy db policy-identity))
                         db)
-
-           ;; TODO: Writing transactions should wait until commit time. We
-           ;; should save the transaction documents on the staged db instead.
-           {txn-id :address}
-           (<? (connection/-txn-write conn ledger raw-txn))
-
-           tx-state (->tx-state db* txn-id did)
-           flakes   (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
+           tx-state   (->tx-state db* raw-txn did)
+           flakes     (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
        (<? (flakes->final-db tx-state flakes))))))
