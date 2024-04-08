@@ -109,7 +109,8 @@
 
 (defn- enrich-commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
-  [{:keys [ledger branch schema t commit stats] :as _db}
+  [ledger
+   {:keys [branch schema t commit stats] :as _db}
    {:keys [context did private message tag file-data? index-files-ch] :as _opts}]
   (let [context*      (-> (if context
                             (json-ld/parse-context (:context schema) context)
@@ -310,7 +311,7 @@
   [{:keys [conn indexer] :as ledger} {:keys [t stats commit txns] :as db} opts]
   (go-try
     (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
-          (enrich-commit-opts db opts)
+          (enrich-commit-opts ledger db opts)
 
           [dbid db-jsonld]  (db->jsonld db opts*)
           ledger-update-res (<? (connection/-c-write conn ledger db-jsonld)) ;; write commit data
