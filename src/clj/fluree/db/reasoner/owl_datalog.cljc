@@ -659,29 +659,25 @@
 
     all-rules))
 
-;; TODO - re-enable once filter function bug is fixed
 (defmethod to-datalog ::prp-key
   [_ _ owl-statement all-rules]
-  (do
-    (log/warn "InverseFunctionalProperty not supported yet")
-    all-rules)
-  #_(let [class     (:id owl-statement)
-          ;; support props in either @list form, or just as a set of values
-          prop-list (-> owl-statement
-                        (get $owl-hasKey)
-                        get-all-ids)
-          where     (->> prop-list
-                         (map-indexed (fn [idx prop]
-                                        [prop (str "?z" idx)]))
-                         (into {"@type" class}))
-          rule      {"where"  [(assoc where "@id" "?x")
-                               (assoc where "@id" "?y")
-                               ["filter" "(not= ?x ?y)"]]
-                     "insert" [{"@id"       "?x"
-                                $owl-sameAs "?y"}
-                               {"@id"       "?y"
-                                $owl-sameAs "?x"}]}]
-      (conj all-rules [(str $owl-hasKey "(" class ")") rule])))
+  (let [class     (:id owl-statement)
+        ;; support props in either @list form, or just as a set of values
+        prop-list (-> owl-statement
+                      (get $owl-hasKey)
+                      get-all-ids)
+        where     (->> prop-list
+                       (map-indexed (fn [idx prop]
+                                      [prop (str "?z" idx)]))
+                       (into {"@type" class}))
+        rule      {"where"  [(assoc where "@id" "?x")
+                             (assoc where "@id" "?y")
+                             ["filter" "(not= ?x ?y)"]]
+                   "insert" [{"@id"       "?x"
+                              $owl-sameAs "?y"}
+                             {"@id"       "?y"
+                              $owl-sameAs "?x"}]}]
+    (conj all-rules [(str class "(owl:hasKey)#" (hash prop-list)) rule])))
 
 (defmethod to-datalog :default
   [_ _ owl-statement all-rules]
