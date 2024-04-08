@@ -45,7 +45,7 @@
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  "?same"
-                                 :where   {"@id"        "ex:carol-lynn",
+                                 :where   {"@id"        "ex:carol-lynn"
                                            "owl:sameAs" "?same"}}))
               "ex:carol-lynn should be deemed the same as ex:carol")))
 
@@ -61,7 +61,7 @@
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  "?same"
-                                 :where   {"@id"        "ex:carol-lynn",
+                                 :where   {"@id"        "ex:carol-lynn"
                                            "owl:sameAs" "?same"}}))
               "ex:carol-lynn should be deemed the same as ex:carol")))
 
@@ -87,7 +87,7 @@
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
-                                   :where   {"@id"        "ex:carol",
+                                   :where   {"@id"        "ex:carol"
                                              "owl:sameAs" "?same"}})))
               "ex:carol should be sameAs all other carols")
 
@@ -97,7 +97,7 @@
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
-                                   :where   {"@id"        "ex:carol4",
+                                   :where   {"@id"        "ex:carol4"
                                              "owl:sameAs" "?same"}})))
               "ex:carol4 should be sameAs all other carols"))))))
 
@@ -122,7 +122,7 @@
                    @(fluree/query db-prp-dom
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?t"
-                                   :where   {"@id"   "ex:brian",
+                                   :where   {"@id"   "ex:brian"
                                              "@type" "?t"}})))
               "ex:brian should be of type ex:Person and ex:Child")
 
@@ -130,7 +130,7 @@
                  @(fluree/query db-prp-dom
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?s"
-                                 :where   {"@id"   "?s",
+                                 :where   {"@id"   "?s"
                                            "@type" "ex:Child"}}))
               "ex:brian should be the only subject of type ex:Child")))
 
@@ -149,7 +149,7 @@
                    @(fluree/query db-prp-rng
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?t"
-                                   :where   {"@id"   "ex:carol",
+                                   :where   {"@id"   "ex:carol"
                                              "@type" "?t"}})))
               "ex:carol should be of type ex:Person and ex:Parent")
 
@@ -157,7 +157,7 @@
                  @(fluree/query db-prp-rng
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?s"
-                                 :where   {"@id"   "?s",
+                                 :where   {"@id"   "?s"
                                            "@type" "ex:Parent"}}))
               "ex:carol should be the only subject of type ex:Parent")))
 
@@ -177,7 +177,7 @@
                  @(fluree/query db-prp-dom+rng
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?s"
-                                 :where   {"@id"   "?s",
+                                 :where   {"@id"   "?s"
                                            "@type" "ex:Child"}}))
               "ex:brian should be the only subject of type ex:Child")
 
@@ -185,7 +185,7 @@
                  @(fluree/query db-prp-dom+rng
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?s"
-                                 :where   {"@id"   "?s",
+                                 :where   {"@id"   "?s"
                                            "@type" "ex:Parent"}}))
               "ex:carol should be the only subject of type ex:Parent")
 
@@ -194,7 +194,7 @@
                    @(fluree/query db-prp-dom+rng
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
-                                   :where   {"@id"   "?s",
+                                   :where   {"@id"   "?s"
                                              "@type" "ex:Person"}})))
               "ex:brian and ex:carol should be of type ex:Person"))))))
 
@@ -220,7 +220,7 @@
                             {:context {"ex"  "http://example.org/"
                                        "owl" "http://www.w3.org/2002/07/owl#"}
                              :select  "?same"
-                             :where   {"@id"        "ex:carol",
+                             :where   {"@id"        "ex:carol"
                                        "owl:sameAs" "?same"}}))
           "ex:carol should be deemed the same as ex:carol2")
 
@@ -229,7 +229,7 @@
                             {:context {"ex"  "http://example.org/"
                                        "owl" "http://www.w3.org/2002/07/owl#"}
                              :select  "?same"
-                             :where   {"@id"        "ex:carol2",
+                             :where   {"@id"        "ex:carol2"
                                        "owl:sameAs" "?same"}}))
           "ex:carol2 should be deemed the same as ex:carol")
 
@@ -238,7 +238,7 @@
                             {:context {"ex"  "http://example.org/"
                                        "owl" "http://www.w3.org/2002/07/owl#"}
                              :select  "?same"
-                             :where   {"@id"        "ex:anne",
+                             :where   {"@id"        "ex:anne"
                                        "owl:sameAs" "?same"}}))
           "ex:anne2 should be deemed the same as ex:anne")
 
@@ -247,7 +247,7 @@
                             {:context {"ex"  "http://example.org/"
                                        "owl" "http://www.w3.org/2002/07/owl#"}
                              :select  "?same"
-                             :where   {"@id"        "ex:anne2",
+                             :where   {"@id"        "ex:anne2"
                                        "owl:sameAs" "?same"}}))
           "ex:anne should be deemed the same as ex:anne2"))))
 
@@ -277,7 +277,7 @@
                             {:context {"ex"  "http://example.org/"
                                        "owl" "http://www.w3.org/2002/07/owl#"}
                              :select  "?same"
-                             :where   {"@id"        "ex:brian",
+                             :where   {"@id"        "ex:brian"
                                        "owl:sameAs" "?same"}}))
           "ex:carol should be deemed the same as ex:carol2")
 
@@ -286,7 +286,7 @@
                             {:context {"ex"  "http://example.org/"
                                        "owl" "http://www.w3.org/2002/07/owl#"}
                              :select  "?same"
-                             :where   {"@id"        "ex:ralph",
+                             :where   {"@id"        "ex:ralph"
                                        "owl:sameAs" "?same"}}))
           "ex:carol2 should be deemed the same as ex:carol"))))
 

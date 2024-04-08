@@ -26,13 +26,13 @@
                                                          "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
                                                          "ex"   "http://example.org/"}
                                       "@id"             "ex:Employee"
-                                      "@type"           ["owl:Class"],
+                                      "@type"           ["owl:Class"]
                                       "rdfs:subClassOf" {"@id" "ex:Person"}}
                                      {"@context"        {"owl"  "http://www.w3.org/2002/07/owl#"
                                                          "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
                                                          "ex"   "http://example.org/"}
                                       "@id"             "ex:Person"
-                                      "@type"           ["owl:Class"],
+                                      "@type"           ["owl:Class"]
                                       "rdfs:subClassOf" {"@id" "ex:Human"}}])]
 
       (is (= ["ex:Human"]
@@ -82,7 +82,7 @@
                                        [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
                                                                 "ex"  "http://example.org/"}
                                          "@id"                 "ex:Human"
-                                         "@type"               ["owl:Class"],
+                                         "@type"               ["owl:Class"]
                                          "owl:equivalentClass" {"@id" "ex:Person"}}])]
           (is (= (list "ex:brian" "ex:laura")
                  (sort
@@ -270,8 +270,8 @@
         (let [db-all-val @(fluree/reason db-base :owl2rl
                                          [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
                                                                   "ex"  "http://example.org/"}
-                                           "@id"                 "ex:Wine",
-                                           "@type"               ["owl:Class"],
+                                           "@id"                 "ex:Wine"
+                                           "@type"               ["owl:Class"]
                                            "owl:equivalentClass" [{"@type"             "owl:Restriction"
                                                                    "owl:onProperty"    {"@id" "ex:hasMaker"}
                                                                    "owl:allValuesFrom" {"@id" "ex:Winery"}}]}])]
@@ -311,7 +311,7 @@
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
-                                   :where   {"@id"        "ex:carol",
+                                   :where   {"@id"        "ex:carol"
                                              "owl:sameAs" "?same"}})))
               "ex:carol2 and ex:carol3 should be deemed the same as ex:carol")
 
@@ -321,7 +321,7 @@
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
-                                   :where   {"@id"        "ex:carol2",
+                                   :where   {"@id"        "ex:carol2"
                                              "owl:sameAs" "?same"}})))
               "ex:carol and ex:carol3 should be deemed the same as ex:carol2")
 
@@ -331,7 +331,7 @@
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
-                                   :where   {"@id"        "ex:carol3",
+                                   :where   {"@id"        "ex:carol3"
                                              "owl:sameAs" "?same"}})))
               "ex:carol and ex:carol2 should be deemed the same as ex:carol3")))
 
@@ -348,7 +348,7 @@
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  "?s"
-                                 :where   {"@id"        "ex:carol",
+                                 :where   {"@id"        "ex:carol"
                                            "owl:sameAs" "?same"}}))
               "with maxCardinality > 1, no inferences can be made"))))))
 
@@ -382,7 +382,7 @@
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  "?same"
-                                 :where   {"@id"        "ex:carol",
+                                 :where   {"@id"        "ex:carol"
                                            "owl:sameAs" "?same"}}))
               "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
 
@@ -391,7 +391,7 @@
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  "?same"
-                                 :where   {"@id"        "ex:carol2",
+                                 :where   {"@id"        "ex:carol2"
                                            "owl:sameAs" "?same"}}))
               "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
 
@@ -400,7 +400,7 @@
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  "?same"
-                                 :where   {"@id"        "ex:carol-not",
+                                 :where   {"@id"        "ex:carol-not"
                                            "owl:sameAs" "?same"}}))
               "ex:carol-not is a different class and therefore not equivalent to anyone else")))
 
@@ -420,7 +420,7 @@
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
-                                   :where   {"@id"        "ex:carol",
+                                   :where   {"@id"        "ex:carol"
                                              "owl:sameAs" "?same"}})))
               "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")
 
@@ -430,7 +430,7 @@
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
-                                   :where   {"@id"        "ex:carol2",
+                                   :where   {"@id"        "ex:carol2"
                                              "owl:sameAs" "?same"}})))
               "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")
 
@@ -440,7 +440,7 @@
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
-                                   :where   {"@id"        "ex:carol-not",
+                                   :where   {"@id"        "ex:carol-not"
                                              "owl:sameAs" "?same"}})))
               "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")))
 
@@ -458,7 +458,7 @@
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  "?s"
-                                 :where   {"@id"        "ex:carol",
+                                 :where   {"@id"        "ex:carol"
                                            "owl:sameAs" "?same"}}))
               "with maxQualifiedCardinality > 1, no inferences can be made"))))))
 
@@ -629,7 +629,7 @@
                                           [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
                                                                    "ex"  "http://example.org/"}
                                             "@id"                 "ex:Parent"
-                                            "@type"               ["owl:Class"],
+                                            "@type"               ["owl:Class"]
                                             "owl:equivalentClass" [{"@type"       ["owl:Class"]
                                                                     "owl:unionOf" {"@list" [{"@id" "ex:Mother"}
                                                                                             {"@id" "ex:Father"}]}}]}])]
@@ -658,7 +658,7 @@
                                           [{"@context"            {"owl" "http://www.w3.org/2002/07/owl#"
                                                                    "ex"  "http://example.org/"}
                                             "@id"                 "ex:Parent"
-                                            "@type"               ["owl:Class"],
+                                            "@type"               ["owl:Class"]
                                             "owl:equivalentClass" [{"@type"       ["owl:Class"]
                                                                     "owl:unionOf" {"@list" [{"@id" "ex:Mother"}
                                                                                             {"@id" "ex:Father"}
