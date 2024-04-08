@@ -311,7 +311,7 @@
           branch       (keyword (get-first-value commit const/iri-branch))
           ledger       (<? (create* conn ledger-alias {:branch branch}))
           db           (ledger/-db ledger)
-          db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
+          db*          (<? (jld-reify/load-db-idx ledger db commit commit-addr false))]
       (ledger/-commit-update! ledger branch db*)
       (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
       (async/put! ledger-chan ledger) ; note, ledger can be an exception!

@@ -396,7 +396,7 @@
 
 
 (defn load-db-idx
-  [{:keys [ledger] :as db} latest-commit commit-address merged-db?]
+  [ledger db latest-commit commit-address merged-db?]
   (go-try
     (let [{:keys [conn]} ledger
           idx-meta   (get-first latest-commit const/iri-index) ; get persistent
