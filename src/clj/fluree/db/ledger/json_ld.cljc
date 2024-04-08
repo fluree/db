@@ -183,17 +183,6 @@
     (subs ledger-alias 1)
     ledger-alias))
 
-(defn include-dbs
-  [conn db include]
-  (go-try
-    (loop [[commit-address & r] include
-           db* db]
-      (if commit-address
-        (let [commit-tuple (jld-reify/read-commit conn commit-address)
-              db**         (<? (jld-reify/load-db db* commit-tuple true))]
-          (recur r db**))
-        db*))))
-
 
 (defn ->ledger
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
@@ -245,22 +234,15 @@
          :conn    conn}))))
 
 (defn initialize-db!
-  ([ledger]
-   (initialize-db! ledger nil))
-  ([{:keys [conn] :as ledger} include]
-   (go-try
-     (let [db (jld-db/create ledger)]
-       (if (seq include)
-         ;; includes other ledgers - experimental
-         (let [db* (<? (include-dbs conn db include))]
-           (db-update ledger db*))
-         (db-update ledger db))))))
+  [ledger]
+  (let [db (jld-db/create ledger)]
+    (db-update ledger db)))
 
 (defn create*
-  [conn ledger-alias {:keys [include] :as opts}]
+  [conn ledger-alias opts]
   (go-try
     (let [ledger (<? (->ledger conn ledger-alias opts))]
-      (<? (initialize-db! ledger include))
+      (initialize-db! ledger)
       ledger)))
 
 (defn create
