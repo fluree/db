@@ -138,7 +138,7 @@
           (add-new-children-to-parents db props new-child-parents new-parent-children)
           (add-new-parents-to-children db props new-parent-children new-child-parents))))
 
-(defn update-equivalent-properties
+(defn update-related-properties
   "Adds owl:equivalentProperty and rdfs:subPropertyOf rules to the schema map as the
   appropriate equivalent properties for query purposes only.
 
@@ -193,7 +193,7 @@
 
       (or (= const/$owl:equivalentProperty pid)
           (= const/$rdfs:subPropertyOf pid))
-      (update-equivalent-properties db pred-map sid pid obj)
+      (update-related-properties db pred-map sid pid obj)
 
       :else pred-map)))
 

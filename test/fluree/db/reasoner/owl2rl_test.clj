@@ -348,6 +348,39 @@
                                             "ex:livesWith" "?people"}})))
           "ex:person-a should also live with ex:person-c and d (transitive)"))))
 
+(deftest ^:integration owl2rl-rdfs-subPropertyOf
+  (testing "rdfs:subPropertyOf tests  - rule: prp-spo1"
+    (let [conn        (test-utils/create-conn)
+          ledger      @(fluree/create conn "reasoner/owl2rl-rdfs-subPropertyOf" nil)
+          db-base     @(fluree/stage (fluree/db ledger)
+                                     {"@context" {"ex" "http://example.org/"}
+                                      "insert"   [{"@id"       "ex:bob"
+                                                   "ex:mother" {"@id" "ex:alice-mom"}
+                                                   "ex:father" {"@id" "ex:greg-dad"}}]})
+          db-reasoned @(fluree/reason
+                         db-base :owl2rl
+                         [{"@context"           {"ex"   "http://example.org/"
+                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+                                                 "owl"  "http://www.w3.org/2002/07/owl#"}
+                           "@id"                "ex:mother"
+                           "@type"              ["owl:ObjectProperty"]
+                           "rdfs:subPropertyOf" {"@id" "ex:parent"}}
+                          {"@context"           {"ex"   "http://example.org/"
+                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+                                                 "owl"  "http://www.w3.org/2002/07/owl#"}
+                           "@id"                "ex:father"
+                           "@type"              ["owl:ObjectProperty"]
+                           "rdfs:subPropertyOf" {"@id" "ex:parent"}}])]
+
+      (is (= (list "ex:alice-mom" "ex:greg-dad")
+             (sort
+               @(fluree/query db-reasoned
+                              {:context {"ex" "http://example.org/"}
+                               :select  "?parents"
+                               :where   {"@id"       "ex:bob"
+                                         "ex:parent" "?parents"}})))
+          "all values from ex:mother and ex:father are now show for ex:parent"))))
+
 (deftest ^:integration prop-chain-axiom
   (testing "owl:propertyChainAxiom tests  - rule: prp-spo2"
     (let [conn        (test-utils/create-conn)

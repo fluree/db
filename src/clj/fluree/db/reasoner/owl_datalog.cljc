@@ -10,6 +10,7 @@
 (def ^:const $rdfs-domain "http://www.w3.org/2000/01/rdf-schema#domain")
 (def ^:const $rdfs-range "http://www.w3.org/2000/01/rdf-schema#range")
 (def ^:const $rdfs-subClassOf "http://www.w3.org/2000/01/rdf-schema#subClassOf")
+(def ^:const $rdfs-subPropertyOf "http://www.w3.org/2000/01/rdf-schema#subPropertyOf")
 (def ^:const $owl-sameAs "http://www.w3.org/2002/07/owl#sameAs")
 (def ^:const $owl-FunctionalProperty "http://www.w3.org/2002/07/owl#FunctionalProperty")
 (def ^:const $owl-InverseFunctionalProperty "http://www.w3.org/2002/07/owl#InverseFunctionalProperty")
@@ -193,6 +194,27 @@
               "insert" {"@id" "?x"
                         trp   "?z"}}]
     (conj all-rules [(str trp "(owl:TransitiveProperty)") rule])))
+
+;; rdfs:subPropertyOf
+(defmethod to-datalog ::prp-spo1
+  [_ inserts owl-statement all-rules]
+  (let [child-prop   (:id owl-statement)
+        parent-props (-> owl-statement
+                         (get $rdfs-subPropertyOf)
+                         get-all-ids)
+        triples      (mapv (fn [parent-prop]
+                             [child-prop $rdfs-subPropertyOf {"@id" parent-prop}])
+                           parent-props)
+        rule-id      (str child-prop "(rdfs:subPropertyOf)")]
+
+    ;; insert subPropertyOf triples directly into db, as there is native support
+    ;; in Fluree for subPropertyOf already
+    (when parent-props
+      (swap! inserts update rule-id (fn [et]
+                                      (into triples et))))
+
+    ;; no new rules, just inserted triples
+    all-rules))
 
 ;; turns list of properties into:
 ;; [{"@id" "?u0", "?p1" "?u1"}, {"@id" "?u2", "?p2" "?u3"} ... ]
@@ -695,6 +717,9 @@
 
              (contains? owl-statement $rdfs-range)
              (to-datalog ::prp-rng inserts owl-statement)
+
+             (contains? owl-statement $rdfs-subPropertyOf)
+             (to-datalog ::prp-spo1 inserts owl-statement)
 
              (contains? owl-statement $owl-propertyChainAxiom)
              (to-datalog ::prp-spo2 inserts owl-statement)
