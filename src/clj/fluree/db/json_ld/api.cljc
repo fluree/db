@@ -374,7 +374,7 @@
   [db]
   (let [spot (-> db :novelty :spot)]
     (reduce (fn [n flake]
-              (if (-> flake flake/m :reasoned)
+              (if (reasoner/reasoned-rule flake)
                 (inc n)
                 n))
             0 spot)))
@@ -407,7 +407,7 @@
                                (if (iri/sid? o)
                                  (decode-iri db o)
                                  o))
-                        #(-> % flake/m :reasoned))
+                        #(reasoner/reasoned-rule %))
          result   (->> db :novelty :spot
                        reasoner/reasoned-flakes
                        (mapv triples+))]

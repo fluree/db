@@ -61,27 +61,35 @@
                   (ensure-namespace db ns)))
         (build-sid ns nme))))
 
+(defn create-flake-iri-object
+  [db-vol sid pid o-mch t m]
+  (let [o-iri (where/get-iri o-mch)
+        oid   (generate-sid! db-vol o-iri)
+        dt    const/$xsd:anyURI]
+    (flake/create sid pid oid dt t true m)))
+
+(defn create-flake-scalar-object
+  [db-vol p-iri sid pid o-mch t m]
+  (let [v  (where/get-value o-mch)
+        dt (or (some-> o-mch
+                       where/get-datatype-iri
+                       (->> (generate-sid! db-vol)))
+               (dbproto/-p-prop @db-vol :datatype p-iri)
+               (datatype/infer v))
+        v* (datatype/coerce-value v dt)]
+    (flake/create sid pid v* dt t true m)))
+
 (defn build-flake
   [db-vol t reasoned [s-mch p-mch o-mch]]
-  (let [m     (cond-> (where/get-meta o-mch)
-                      reasoned (assoc :reasoned reasoned))
+  (let [m     (where/get-meta o-mch)
         s-iri (where/get-iri s-mch)
         sid   (generate-sid! db-vol s-iri)
         p-iri (where/get-iri p-mch)
         pid   (generate-sid! db-vol p-iri)]
-    (if (where/matched-iri? o-mch)
-      (let [o-iri (where/get-iri o-mch)
-            oid   (generate-sid! db-vol o-iri)
-            dt    const/$xsd:anyURI]
-        (flake/create sid pid oid dt t true m))
-      (let [v  (where/get-value o-mch)
-            dt (or (some-> o-mch
-                           where/get-datatype-iri
-                           (->> (generate-sid! db-vol)))
-                   (dbproto/-p-prop @db-vol :datatype p-iri)
-                   (datatype/infer v))
-            v* (datatype/coerce-value v dt)]
-        (flake/create sid pid v* dt t true m)))))
+    (cond-> (if (where/matched-iri? o-mch)
+              (create-flake-iri-object db-vol sid pid o-mch t m)
+              (create-flake-scalar-object db-vol p-iri sid pid o-mch t m))
+            reasoned (with-meta {:reasoned reasoned}))))
 
 (defn insert
   [db-vol txn {:keys [t reasoned]} solution-ch]
