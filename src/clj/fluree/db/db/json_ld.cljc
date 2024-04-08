@@ -106,7 +106,7 @@
 ;; ================ end Jsonld record support fns ============================
 
 (defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot post opst
-                     tspo schema comparators novelty policy namespaces
+                     tspo schema comparators staged novelty policy namespaces
                      namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
@@ -183,6 +183,7 @@
                     :tspo            tspo
                     :schema          schema
                     :comparators     index/default-comparators
+                    :staged          []
                     :novelty         novelty
                     :policy          root-policy-map
                     :namespaces      iri/default-namespaces
