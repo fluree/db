@@ -9,6 +9,7 @@
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
             [fluree.db.indexer :as indexer]
+            [fluree.db.indexer.default :as idx-default]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
@@ -207,10 +208,10 @@
                                     {:status 400 :error :db/invalid-indexer}))
 
                     :else
-                    (connection/-new-indexer
-                      conn (util/without-nils
-                             {:reindex-min-bytes reindex-min-bytes
-                              :reindex-max-bytes reindex-max-bytes})))
+                    (idx-default/create
+                      (util/without-nils
+                        {:reindex-min-bytes reindex-min-bytes
+                         :reindex-max-bytes reindex-max-bytes})))
           ledger-alias* (normalize-alias ledger-alias)
           address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))

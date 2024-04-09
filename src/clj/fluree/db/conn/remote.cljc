@@ -39,7 +39,6 @@
                       (log/warn "-msg-out: " msg)
                       :TODO))
   (-nameservices [_] nameservices)
-  (-new-indexer [_ opts] (idx-default/create opts))
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 

@@ -70,10 +70,6 @@
   connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
-  (-new-indexer [_ opts]
-    (let [indexer-fn (:indexer ledger-defaults)]
-      (indexer-fn opts)))
-  ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection op: msg-in" {})))
   (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection op: msg-out" {})))
@@ -114,20 +110,8 @@
     s))
 
 (defn ledger-defaults
-  [{:keys [did indexer]}]
-  {:did     did
-   :indexer (cond
-              (fn? indexer)
-              indexer
-
-              (or (map? indexer) (nil? indexer))
-              (fn [opts]
-                (idx-default/create (merge indexer opts)))
-
-              :else
-              (throw (ex-info (str "Expected an indexer constructor fn or "
-                                   "default indexer options map. Provided: " indexer)
-                              {:status 400 :error :db/invalid-file-connection})))})
+  [{:keys [did]}]
+  {:did did})
 
 (defn default-file-nameservice
   "Returns file nameservice or will throw if storage-path generates an exception."

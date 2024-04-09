@@ -1,7 +1,7 @@
 (ns fluree.db.connection
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
-            [fluree.db.util.core :as util :refer [try* catch* get-first-value]]
+            [fluree.db.util.core :as util :refer [get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.json-ld :as json-ld]
@@ -12,7 +12,6 @@
 (defprotocol iConnection
   (-close [conn] "Closes all resources for this connection")
   (-closed? [conn] "Indicates if connection is open or closed")
-  (-new-indexer [conn opts] "Returns optional default new indexer object for a new ledger with optional opts.")
   (-did [conn] "Returns optional default did map if set at connection level")
   (-msg-in [conn msg] "Handler for incoming message from nameservices")
   (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")

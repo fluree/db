@@ -82,9 +82,6 @@
   connection/iConnection
   (-close [_] (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
-  (-new-indexer [_ opts]
-    (let [indexer-fn (:indexer ledger-defaults)]
-      (indexer-fn opts)))
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ _] (throw (ex-info "Unsupported S3Connection op: msg-in" {})))
   (-msg-out [_ _] (throw (ex-info "Unsupported S3Connection op: msg-out" {})))
@@ -111,20 +108,8 @@
     (pr (connection/printer-map conn))))
 
 (defn ledger-defaults
-  [{:keys [did indexer]}]
-  {:did     did
-   :indexer (cond
-              (fn? indexer)
-              indexer
-
-              (or (map? indexer) (nil? indexer))
-              (fn [opts]
-                (idx-default/create (merge indexer opts)))
-
-              :else
-              (throw (ex-info (str "Expected an indexer constructor fn or default indexer options map. Provided: "
-                                   indexer)
-                              {:status 400, :error :db/invalid-s3-connection})))})
+  [{:keys [did]}]
+  {:did did})
 
 (defn default-S3-nameservice
   "Returns S3 nameservice or will throw if storage-path generates an exception."
