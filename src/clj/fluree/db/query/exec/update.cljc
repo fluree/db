@@ -62,8 +62,9 @@
         (build-sid ns nme))))
 
 (defn build-flake
-  [db-vol t [s-mch p-mch o-mch]]
-  (let [m     (where/get-meta o-mch)
+  [db-vol t reasoned [s-mch p-mch o-mch]]
+  (let [m     (cond-> (where/get-meta o-mch)
+                      reasoned (assoc :reasoned reasoned))
         s-iri (where/get-iri s-mch)
         sid   (generate-sid! db-vol s-iri)
         p-iri (where/get-iri p-mch)
@@ -83,11 +84,11 @@
         (flake/create sid pid v* dt t true m)))))
 
 (defn insert
-  [db-vol txn {:keys [t]} solution-ch]
+  [db-vol txn {:keys [t reasoned]} solution-ch]
   (let [clause    (:insert txn)
         insert-xf (comp (mapcat (partial assign-clause clause))
                         (filter where/all-matched?)
-                        (map (partial build-flake db-vol t)))
+                        (map (partial build-flake db-vol t reasoned)))
         insert-ch (async/chan 2 insert-xf identity)]
     (async/pipe solution-ch insert-ch)))
 

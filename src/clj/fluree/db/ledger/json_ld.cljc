@@ -155,7 +155,7 @@
                     " however, latest-t is more current: " latest-t)
           false)))))
 
-(defrecord JsonLDLedger [id address alias did indexer state cache conn]
+(defrecord JsonLDLedger [id address alias did indexer state cache conn reasoner]
   ledger/iCommit
   (-commit! [ledger db] (commit! ledger db nil))
   (-commit! [ledger db opts] (commit! ledger db opts))
@@ -243,6 +243,7 @@
          :address address
          :cache   (atom {})
          :indexer indexer
+         :reasoner #{}
          :conn    conn}))))
 
 (defn initialize-db!

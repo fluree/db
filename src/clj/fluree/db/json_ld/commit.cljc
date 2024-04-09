@@ -18,6 +18,7 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.reasoner.core :as reasoner]
             [fluree.db.util.log :as log :include-macros true])
   (:refer-clojure :exclude [vswap!]))
 
@@ -218,12 +219,13 @@
 
 (defn commit-opts->data
   "Convert the novelty flakes into the json-ld shape."
-  [{:keys [ledger branch t] :as db} opts]
+  [{:keys [ledger branch t reasoner] :as db} opts]
   (go-try
     (let [committed-t (-> ledger
                           (ledger/-status branch)
                           branch/latest-commit-t)
-          new-flakes  (commit-flakes db)]
+          new-flakes  (cond-> (commit-flakes db)
+                              reasoner (reasoner/non-reasoned-flakes))]
       (when (not= t (inc committed-t))
         (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
                              " is no longer consistent with staged db 't' value of: " t ".")

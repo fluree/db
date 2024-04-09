@@ -80,18 +80,25 @@
       [(not-empty adds) (not-empty removes)])))
 
 (defn ->tx-state
-  [db txn-id author-did]
-  (let [{:keys [branch ledger policy], db-t :t} db
-        commit-t  (-> (ledger/-status ledger branch) branch/latest-commit-t)
-        t         (inc commit-t)
-        db-before (dbproto/-rootdb db)]
-    {:db-before     db-before
-     :txn-id                   txn-id
-     :author-did               author-did
-     :policy        policy
-     :stage-update? (= t db-t) ; if a previously staged db is getting updated
-                               ; again before committed
-     :t             t}))
+  "Generates a state map for transaction processing.
+  When optional reasoned-from-IRI is provided, will mark
+  any new flakes as reasoned from the provided value
+  in the flake's metadata (.-m) as :reasoned key."
+  ([db txn-id author-did] (->tx-state db txn-id author-did nil))
+  ([db txn-id author-did reasoned-from-IRI]
+   (let [{:keys [branch ledger policy], db-t :t} db
+         commit-t  (-> (ledger/-status ledger branch) branch/latest-commit-t)
+         t         (inc commit-t)
+         db-before (dbproto/-rootdb db)]
+     {:db-before     db-before
+      :txn-id        txn-id
+      :author-did    author-did
+      :policy        policy
+      :stage-update? (= t db-t) ; if a previously staged db is getting updated
+      ; again before committed
+      :t             t
+      :reasoner-max  10 ;; maximum number of reasoner iterations before exception
+      :reasoned      reasoned-from-IRI})))
 
 (defn into-flakeset
   [fuel-tracker error-ch flake-ch]
@@ -193,7 +200,7 @@
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
   along with performing any final validation and policy enforcement."
-  [tx-state [db flakes]]
+  [fuel-tracker tx-state [db flakes]]
   (go-try
     (let [subj-mods (<? (subject-mods flakes (:db-before tx-state)))
           ;; wrap it in an atom to reuse old validate-rules and policy/allowed? unchanged
@@ -223,4 +230,4 @@
 
            tx-state (->tx-state db* txn-id did)
            flakes   (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
-       (<? (flakes->final-db tx-state flakes))))))
+       (<? (flakes->final-db fuel-tracker tx-state flakes))))))
