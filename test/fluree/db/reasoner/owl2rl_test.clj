@@ -29,7 +29,12 @@
   (testing "owl equality semantics tests eq-sym and eq-trans"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+          db-base @(fluree/stage (fluree/db ledger)
+                                 {"@context" {"ex" "http://example.org/"}
+                                  "insert"   [{"@id"        "ex:carol"
+                                               "ex:zipCode" 60657}
+                                              {"@id"        "ex:carol-lynn"
+                                               "ex:zipCode" 12345}]})]
       (testing "Testing explicit owl:sameAs declaration"
         (let [db-same     @(fluree/stage db-base
                                          {"@context" {"ex"   "http://example.org/"
@@ -40,13 +45,14 @@
 
               db-reasoned @(fluree/reason db-same :owl2rl)]
 
-          (is (= ["ex:carol"]
-                 @(fluree/query db-reasoned
-                                {:context {"ex"  "http://example.org/"
-                                           "owl" "http://www.w3.org/2002/07/owl#"}
-                                 :select  "?same"
-                                 :where   {"@id"        "ex:carol-lynn"
-                                           "owl:sameAs" "?same"}}))
+          (is (= (list "ex:carol" "ex:carol-lynn")
+                 (sort
+                   @(fluree/query db-reasoned
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?same"
+                                   :where   {"@id"        "ex:carol-lynn"
+                                             "owl:sameAs" "?same"}})))
               "ex:carol-lynn should be deemed the same as ex:carol")))
 
       (testing "Testing owl:sameAs passed along as a reasoned rule"
@@ -56,24 +62,24 @@
                                            "@id"        "ex:carol"
                                            "owl:sameAs" {"@id" "ex:carol-lynn"}})]
 
-          (is (= ["ex:carol"]
-                 @(fluree/query db-reasoned
-                                {:context {"ex"  "http://example.org/"
-                                           "owl" "http://www.w3.org/2002/07/owl#"}
-                                 :select  "?same"
-                                 :where   {"@id"        "ex:carol-lynn"
-                                           "owl:sameAs" "?same"}}))
+          (is (= (list "ex:carol" "ex:carol-lynn")
+                 (sort
+                   @(fluree/query db-reasoned
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?same"
+                                   :where   {"@id"        "ex:carol-lynn"
+                                             "owl:sameAs" "?same"}})))
               "ex:carol-lynn should be deemed the same as ex:carol")))
 
 
       (testing "Testing owl:sameAs transitivity (eq-trans)"
-        (let [db-same     @(fluree/stage db-base
+        (let [ledger      @(fluree/create conn "reasoner/eq-trans" nil)
+              db-same     @(fluree/stage (fluree/db ledger)
                                          {"@context" {"ex"   "http://example.org/"
                                                       "owl"  "http://www.w3.org/2002/07/owl#"
                                                       "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                          "insert"   [{"@id"        "ex:carol"
-                                                       "owl:sameAs" {"@id" "ex:carol1"}}
-                                                      {"@id"        "ex:carol1"
+                                          "insert"   [{"@id"        "ex:carol1"
                                                        "owl:sameAs" {"@id" "ex:carol2"}}
                                                       {"@id"        "ex:carol2"
                                                        "owl:sameAs" {"@id" "ex:carol3"}}
@@ -87,19 +93,87 @@
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
-                                   :where   {"@id"        "ex:carol"
+                                   :where   {"@id"        "ex:carol1"
                                              "owl:sameAs" "?same"}})))
-              "ex:carol should be sameAs all other carols")
+              "ex:carol1 should be sameAs all other carols")
 
-          (is (= (list "ex:carol" "ex:carol1" "ex:carol2" "ex:carol3")
+          (is (= (list "ex:carol1" "ex:carol2" "ex:carol3" "ex:carol4")
                  (sort
                    @(fluree/query db-reasoned
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
-                                   :where   {"@id"        "ex:carol4"
+                                   :where   {"@id"        "ex:carol2"
                                              "owl:sameAs" "?same"}})))
-              "ex:carol4 should be sameAs all other carols"))))))
+              "ex:carol2 should be sameAs all other carols")))
+
+      ;; Most documentation recommends not using owl:sameAs for properties
+      ;; and for now eq-rep-p is not supported. It would act like owl:equivalentProperty
+      (testing "Testing owl:sameAs (eq-rep-s, eq-rep-o)"
+        (let [ledger        @(fluree/create conn "reasoner/eq-rep" nil)
+              db-same       @(fluree/stage (fluree/db ledger)
+                                           {"@context" {"ex"   "http://example.org/"
+                                                        "owl"  "http://www.w3.org/2002/07/owl#"
+                                                        "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                            "insert"   [{"@id"        "ex:carol1"
+                                                         "ex:name"    "Carol1"
+                                                         "ex:age"     72
+                                                         ;; make ex:carol1 sameAs ex:carol2, ex:carol2 sameAs ex:carol1
+                                                         "owl:sameAs" {"@id" "ex:carol2"}
+                                                         ;; note ex:friend is one of sameAs values, so will expand
+                                                         "ex:friend"  {"@id" "ex:carol3"}}
+                                                        {"@id"        "ex:carol2"
+                                                         "ex:name"    "Carol2"
+                                                         "ex:favFood" {"@id" "ex:pizza"}
+                                                         ;; make ex:carol2 sameAs ex:carol3, ex:carol3 sameAs ex:carol2
+                                                         "owl:sameAs" {"@id" "ex:carol3"}}
+                                                        {"@id"        "ex:carol3"
+                                                         "ex:name"    "Carol3"
+                                                         "ex:favFood" {"@id" "ex:pizza"}
+                                                         ;; make ex:carol3 sameAs ex:carol4, ex:carol4 sameAs ex:carol3
+                                                         "owl:sameAs" {"@id" "ex:carol4"}}
+                                                        {"@id"       "ex:carol4"
+                                                         "ex:name"   "Carol4"
+                                                         "ex:favNum" 42}]})
+              db-reasoned   @(fluree/reason db-same :owl2rl)
+              merged-result {"@id"        nil
+                             "ex:name"    ["Carol1" "Carol2" "Carol3" "Carol4"]
+                             "ex:age"     72
+                             "ex:favFood" {"@id" "ex:pizza"}
+                             "ex:friend"  [{"@id" "ex:carol1"}
+                                           {"@id" "ex:carol2"}
+                                           {"@id" "ex:carol3"}
+                                           {"@id" "ex:carol4"}]
+                             "ex:favNum"  42
+                             "owl:sameAs" [{"@id" "ex:carol1"} {"@id" "ex:carol2"} {"@id" "ex:carol3"} {"@id" "ex:carol4"}]}]
+
+          (is (= [(merge merged-result {"@id" "ex:carol1"})]
+                 @(fluree/query db-reasoned
+                                {:context {"ex"  "http://example.org/"
+                                           "owl" "http://www.w3.org/2002/07/owl#"}
+                                 :select  {"ex:carol1" ["*"]}}))
+              "ex:carol1 have all other carols' properties and values")
+
+          (is (= [(merge merged-result {"@id" "ex:carol2"})]
+                 @(fluree/query db-reasoned
+                                {:context {"ex"  "http://example.org/"
+                                           "owl" "http://www.w3.org/2002/07/owl#"}
+                                 :select  {"ex:carol2" ["*"]}}))
+              "ex:carol2 have all other carols' properties and values")
+
+          (is (= [(merge merged-result {"@id" "ex:carol3"})]
+                 @(fluree/query db-reasoned
+                                {:context {"ex"  "http://example.org/"
+                                           "owl" "http://www.w3.org/2002/07/owl#"}
+                                 :select  {"ex:carol3" ["*"]}}))
+              "ex:carol3 have all other carols' properties and values")
+
+          (is (= [(merge merged-result {"@id" "ex:carol4"})]
+                 @(fluree/query db-reasoned
+                                {:context {"ex"  "http://example.org/"
+                                           "owl" "http://www.w3.org/2002/07/owl#"}
+                                 :select  {"ex:carol4" ["*"]}}))
+              "ex:carol4 have all other carols' properties and values"))))))
 
 (deftest ^:integration domain-and-range
   (testing "rdfs:domain and rdfs:range tests"
@@ -215,40 +289,44 @@
                            "@id"      "ex:mother"
                            "@type"    ["owl:ObjectProperty" "owl:FunctionalProperty"]}])]
 
-      (is (= ["ex:carol2"]
-             @(fluree/query db-reasoned
-                            {:context {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                             :select  "?same"
-                             :where   {"@id"        "ex:carol"
-                                       "owl:sameAs" "?same"}}))
+      (is (= (list "ex:carol" "ex:carol2")
+             (sort
+               @(fluree/query db-reasoned
+                              {:context {"ex"  "http://example.org/"
+                                         "owl" "http://www.w3.org/2002/07/owl#"}
+                               :select  "?same"
+                               :where   {"@id"        "ex:carol"
+                                         "owl:sameAs" "?same"}})))
           "ex:carol should be deemed the same as ex:carol2")
 
-      (is (= ["ex:carol"]
-             @(fluree/query db-reasoned
-                            {:context {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                             :select  "?same"
-                             :where   {"@id"        "ex:carol2"
-                                       "owl:sameAs" "?same"}}))
+      (is (= (list "ex:carol" "ex:carol2")
+             (sort
+               @(fluree/query db-reasoned
+                              {:context {"ex"  "http://example.org/"
+                                         "owl" "http://www.w3.org/2002/07/owl#"}
+                               :select  "?same"
+                               :where   {"@id"        "ex:carol2"
+                                         "owl:sameAs" "?same"}})))
           "ex:carol2 should be deemed the same as ex:carol")
 
-      (is (= ["ex:anne2"]
-             @(fluree/query db-reasoned
-                            {:context {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                             :select  "?same"
-                             :where   {"@id"        "ex:anne"
-                                       "owl:sameAs" "?same"}}))
+      (is (= (list "ex:anne" "ex:anne2")
+             (sort
+               @(fluree/query db-reasoned
+                              {:context {"ex"  "http://example.org/"
+                                         "owl" "http://www.w3.org/2002/07/owl#"}
+                               :select  "?same"
+                               :where   {"@id"        "ex:anne"
+                                         "owl:sameAs" "?same"}})))
           "ex:anne2 should be deemed the same as ex:anne")
 
-      (is (= ["ex:anne"]
-             @(fluree/query db-reasoned
-                            {:context {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                             :select  "?same"
-                             :where   {"@id"        "ex:anne2"
-                                       "owl:sameAs" "?same"}}))
+      (is (= (list "ex:anne" "ex:anne2")
+             (sort
+               @(fluree/query db-reasoned
+                              {:context {"ex"  "http://example.org/"
+                                         "owl" "http://www.w3.org/2002/07/owl#"}
+                               :select  "?same"
+                               :where   {"@id"        "ex:anne2"
+                                         "owl:sameAs" "?same"}})))
           "ex:anne should be deemed the same as ex:anne2"))))
 
 (deftest ^:integration inverse-functional-properties
@@ -272,22 +350,24 @@
                            "@id"      "ex:email"
                            "@type"    ["owl:ObjectProperty" "owl:InverseFunctionalProperty"]}])]
 
-      (is (= ["ex:brian2"]
-             @(fluree/query db-reasoned
-                            {:context {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                             :select  "?same"
-                             :where   {"@id"        "ex:brian"
-                                       "owl:sameAs" "?same"}}))
+      (is (= (list "ex:brian" "ex:brian2")
+             (sort
+               @(fluree/query db-reasoned
+                              {:context {"ex"  "http://example.org/"
+                                         "owl" "http://www.w3.org/2002/07/owl#"}
+                               :select  "?same"
+                               :where   {"@id"        "ex:brian"
+                                         "owl:sameAs" "?same"}})))
           "ex:carol should be deemed the same as ex:carol2")
 
-      (is (= ["ex:ralph2"]
-             @(fluree/query db-reasoned
-                            {:context {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                             :select  "?same"
-                             :where   {"@id"        "ex:ralph"
-                                       "owl:sameAs" "?same"}}))
+      (is (= (list "ex:ralph" "ex:ralph2")
+             (sort
+               @(fluree/query db-reasoned
+                              {:context {"ex"  "http://example.org/"
+                                         "owl" "http://www.w3.org/2002/07/owl#"}
+                               :select  "?same"
+                               :where   {"@id"        "ex:ralph"
+                                         "owl:sameAs" "?same"}})))
           "ex:carol2 should be deemed the same as ex:carol"))))
 
 (deftest ^:integration symetric-properties
@@ -535,20 +615,22 @@
                                                                 {"@id" "ex:recipientId"}
                                                                 {"@id" "ex:ofOrgan"}]}]}])]
 
-      (is (= ["ex:brian2"]
-             @(fluree/query db-reasoned
-                            {:context {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                             :select  "?x"
-                             :where   {"@id"        "ex:brian"
-                                       "owl:sameAs" "?x"}}))
+      (is (= (list "ex:brian" "ex:brian2")
+             (sort
+               @(fluree/query db-reasoned
+                              {:context {"ex"  "http://example.org/"
+                                         "owl" "http://www.w3.org/2002/07/owl#"}
+                               :select  "?x"
+                               :where   {"@id"        "ex:brian"
+                                         "owl:sameAs" "?x"}})))
           "ex:brian should be the same as ex:brian2 because ex:hasWaitingListN is identical")
 
-      (is (= ["ex:t2"]
-             @(fluree/query db-reasoned
-                            {:context {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                             :select  "?x"
-                             :where   {"@id"        "ex:t1"
-                                       "owl:sameAs" "?x"}}))
+      (is (= (list "ex:t1" "ex:t2")
+             (sort
+               @(fluree/query db-reasoned
+                              {:context {"ex"  "http://example.org/"
+                                         "owl" "http://www.w3.org/2002/07/owl#"}
+                               :select  "?x"
+                               :where   {"@id"        "ex:t1"
+                                         "owl:sameAs" "?x"}})))
           "ex:t1 should be same as ex:t2 because ex:donorId, ex:recipientId, and ex:ofOrgan are identical"))))

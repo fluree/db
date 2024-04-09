@@ -685,20 +685,28 @@
 
 (def base-rules
   [
-   ;; eq-sym
-   [$owl-sameAs
-    {"where"  {"@id"       "?s"
-               $owl-sameAs "?ps"}
-     "insert" {"@id"       "?ps"
-               $owl-sameAs "?s"}}]
-   ;; eq-trans
-   [(str $owl-sameAs "(trans)")
+   ;; eq-sym, eq-trans, eq-rep-s covered by below rule
+   [(str $owl-sameAs "(eq)")
     {"where"  [{"@id"       "?s"
-                $owl-sameAs "?same"}
-               {"@id"       "?same"
-                $owl-sameAs "?same-same"}]
-     "insert" {"@id"       "?s"
-               $owl-sameAs "?same-same"}}]])
+                $owl-sameAs "?s'"}
+               {"@id" "?s"
+                "?p"  "?o"}
+               {"@id" "?s'"
+                "?p'" "?o'"}]
+     "insert" [{"@id" "?s'"
+                "?p"  "?o"}
+               {"@id"       "?s'"
+                $owl-sameAs {"@id" "?s"}}
+               {"@id" "?s"
+                "?p'" "?o'"}]}]
+   ;; eq-rep-o covered by below rule
+   [(str $owl-sameAs "(eq-rep-o)")
+    {"where"  [{"@id"       "?o"
+                $owl-sameAs "?o'"}
+               {"@id" "?s"
+                "?p"  "?o"}]
+     "insert" [{"@id" "?s"
+                "?p"  "?o'"}]}]])
 
 (defn statement->datalog
   [inserts owl-statement]
@@ -742,9 +750,7 @@
              (to-datalog ::prp-symp inserts owl-statement)
 
              (some #(= $owl-TransitiveProperty %) (:type owl-statement))
-             (to-datalog ::prp-trp inserts owl-statement)
-
-             )))
+             (to-datalog ::prp-trp inserts owl-statement))))
 
 (defn owl->datalog
   [inserts owl-graph]

@@ -305,7 +305,7 @@
                                                                  "owl:onProperty"     {"@id" "ex:mother"}
                                                                  "owl:maxCardinality" 1}]}])]
 
-          (is (= (list "ex:carol2" "ex:carol3")
+          (is (= (list "ex:carol" "ex:carol2" "ex:carol3")
                  (sort
                    @(fluree/query db-equiv
                                   {:context {"ex"  "http://example.org/"
@@ -315,7 +315,7 @@
                                              "owl:sameAs" "?same"}})))
               "ex:carol2 and ex:carol3 should be deemed the same as ex:carol")
 
-          (is (= (list "ex:carol" "ex:carol3")
+          (is (= (list "ex:carol" "ex:carol2" "ex:carol3")
                  (sort
                    @(fluree/query db-equiv
                                   {:context {"ex"  "http://example.org/"
@@ -325,7 +325,7 @@
                                              "owl:sameAs" "?same"}})))
               "ex:carol and ex:carol3 should be deemed the same as ex:carol2")
 
-          (is (= (list "ex:carol" "ex:carol2")
+          (is (= (list "ex:carol" "ex:carol2" "ex:carol3")
                  (sort
                    @(fluree/query db-equiv
                                   {:context {"ex"  "http://example.org/"
@@ -377,22 +377,24 @@
                                                                  "owl:onProperty"              {"@id" "ex:mother"}
                                                                  "owl:onClass"                 {"@id" "ex:Parent"}
                                                                  "owl:maxQualifiedCardinality" 1}]}])]
-          (is (= ["ex:carol2"]
-                 @(fluree/query db-equiv
-                                {:context {"ex"  "http://example.org/"
-                                           "owl" "http://www.w3.org/2002/07/owl#"}
-                                 :select  "?same"
-                                 :where   {"@id"        "ex:carol"
-                                           "owl:sameAs" "?same"}}))
+          (is (= (list "ex:carol" "ex:carol2")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?same"
+                                   :where   {"@id"        "ex:carol"
+                                             "owl:sameAs" "?same"}})))
               "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
 
-          (is (= ["ex:carol"]
-                 @(fluree/query db-equiv
-                                {:context {"ex"  "http://example.org/"
-                                           "owl" "http://www.w3.org/2002/07/owl#"}
-                                 :select  "?same"
-                                 :where   {"@id"        "ex:carol2"
-                                           "owl:sameAs" "?same"}}))
+          (is (= (list "ex:carol" "ex:carol2")
+                 (sort
+                   @(fluree/query db-equiv
+                                  {:context {"ex"  "http://example.org/"
+                                             "owl" "http://www.w3.org/2002/07/owl#"}
+                                   :select  "?same"
+                                   :where   {"@id"        "ex:carol2"
+                                             "owl:sameAs" "?same"}})))
               "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
 
           (is (= []
@@ -414,7 +416,7 @@
                                                                  "owl:onProperty"              {"@id" "ex:mother"}
                                                                  "owl:onClass"                 {"@id" "owl:Thing"}
                                                                  "owl:maxQualifiedCardinality" 1}]}])]
-          (is (= (list "ex:carol-not" "ex:carol2")
+          (is (= (list "ex:carol" "ex:carol-not" "ex:carol2")
                  (sort
                    @(fluree/query db-equiv
                                   {:context {"ex"  "http://example.org/"
@@ -424,7 +426,7 @@
                                              "owl:sameAs" "?same"}})))
               "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")
 
-          (is (= (list "ex:carol" "ex:carol-not")
+          (is (= (list "ex:carol" "ex:carol-not" "ex:carol2")
                  (sort
                    @(fluree/query db-equiv
                                   {:context {"ex"  "http://example.org/"
@@ -434,7 +436,7 @@
                                              "owl:sameAs" "?same"}})))
               "with owl:onClass=owl:Thing, class doesn't matter so all should be sameAs")
 
-          (is (= (list "ex:carol" "ex:carol2")
+          (is (= (list "ex:carol" "ex:carol-not" "ex:carol2")
                  (sort
                    @(fluree/query db-equiv
                                   {:context {"ex"  "http://example.org/"
