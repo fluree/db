@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async :refer [alts! go]]
             [clojure.string :as str]
             [fluree.db.flake :as flake]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [go-try <?]]
@@ -68,16 +69,12 @@
 (defn reasoner-stage
   [db fuel-tracker txn-id author-did rule-id full-rule]
   (go-try
-    (let [tx-state      (transact/->tx-state db txn-id author-did rule-id)
-          parsed-txn    (:rule-parsed full-rule)
-          _             (when-not (:where parsed-txn)
-                          (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
-                                          {:status 400 :error :db/invalid-transaction})))
-
-          flakes-ch     (transact/generate-flakes db fuel-tracker parsed-txn tx-state)
-          fuel-error-ch (:error-ch fuel-tracker)
-          chans         (remove nil? [fuel-error-ch flakes-ch])
-          [flakes] (alts! chans :priority true)]
+    (let [tx-state   (transact/->tx-state db txn-id author-did rule-id)
+          parsed-txn (:rule-parsed full-rule)
+          _          (when-not (:where parsed-txn)
+                       (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
+                                       {:status 400 :error :db/invalid-transaction})))
+          flakes     (async/<! (transact/generate-flakes db fuel-tracker parsed-txn tx-state))]
       (when (util/exception? flakes)
         (throw flakes))
       flakes)))
@@ -166,7 +163,7 @@
         (let [id   (:id rule)
               rule (util/get-first-value rule "http://flur.ee/ns/ledger#rule")]
           (if rule
-            (conj acc [(or id (str "_:" (rand-int 2147483647))) rule])
+            (conj acc [(or id (parse/new-blank-node-id)) rule])
             acc)))
       []
       expanded)))

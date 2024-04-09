@@ -31,7 +31,7 @@
 (def ^:const max-meta util/max-integer)
 
 
-(deftype Flake [s p o dt t op m _meta]
+(deftype Flake [s p o dt t op m -clj-meta]
   #?@(:clj  [clojure.lang.Seqable
              (seq [f] (list (.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)))
 
@@ -59,10 +59,10 @@
              (assoc [f k v] (assoc-flake f k v))
 
              clojure.lang.IMeta
-             (meta [_] _meta)
+             (meta [_] -clj-meta)
 
              clojure.lang.IObj
-             (withMeta [_ meta] (Flake. s p o dt t op m meta))
+             (withMeta [_ clj-meta] (Flake. s p o dt t op m clj-meta))
 
              Object
              (hashCode [f] (hash (seq f)))
@@ -116,10 +116,10 @@
              (-assoc [this k v] (assoc-flake this k v))
 
              IMeta
-             (-meta [this] _meta)
+             (-meta [this] -clj-meta)
 
              IWithMeta
-             (-with-meta [f meta] (Flake. (.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f) meta))
+             (-with-meta [f clj-meta] (Flake. (.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f) clj-meta))
 
              IPrintWithWriter
              (-pr-writer [^Flake f writer opts]

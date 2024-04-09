@@ -84,20 +84,21 @@
   When optional reasoned-from-IRI is provided, will mark
   any new flakes as reasoned from the provided value
   in the flake's metadata (.-m) as :reasoned key."
-  [db txn-id author-did reasoned-from-IRI]
-  (let [{:keys [branch ledger policy], db-t :t} db
-        commit-t  (-> (ledger/-status ledger branch) branch/latest-commit-t)
-        t         (inc commit-t)
-        db-before (dbproto/-rootdb db)]
-    {:db-before     db-before
-     :txn-id                   txn-id
-     :author-did               author-did
-     :policy        policy
-     :stage-update? (= t db-t) ; if a previously staged db is getting updated
-                               ; again before committed
-     :t             t
-     :reasoner-max  10 ;; maximum number of reasoner iterations before exception
-     :reasoned      reasoned-from-IRI}))
+  ([db txn-id author-did] (->tx-state db txn-id author-did nil))
+  ([db txn-id author-did reasoned-from-IRI]
+   (let [{:keys [branch ledger policy], db-t :t} db
+         commit-t  (-> (ledger/-status ledger branch) branch/latest-commit-t)
+         t         (inc commit-t)
+         db-before (dbproto/-rootdb db)]
+     {:db-before     db-before
+      :txn-id        txn-id
+      :author-did    author-did
+      :policy        policy
+      :stage-update? (= t db-t) ; if a previously staged db is getting updated
+      ; again before committed
+      :t             t
+      :reasoner-max  10 ;; maximum number of reasoner iterations before exception
+      :reasoned      reasoned-from-IRI})))
 
 (defn into-flakeset
   [fuel-tracker error-ch flake-ch]
@@ -227,6 +228,6 @@
            {txn-id :address}
            (<? (connection/-txn-write conn ledger raw-txn))
 
-           tx-state (->tx-state db* txn-id did nil)
+           tx-state (->tx-state db* txn-id did)
            flakes   (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
        (<? (flakes->final-db fuel-tracker tx-state flakes))))))
