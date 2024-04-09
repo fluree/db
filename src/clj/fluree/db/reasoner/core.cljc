@@ -1,6 +1,7 @@
 (ns fluree.db.reasoner.core
   (:require [clojure.core.async :as async :refer [alts! go]]
             [fluree.db.flake :as flake]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [go-try <?]]
@@ -122,7 +123,7 @@
         (let [id   (:id rule)
               rule (util/get-first-value rule "http://flur.ee/ns/ledger#rule")]
           (if rule
-            (conj acc [(or id (str "_:" (rand-int 2147483647))) rule])
+            (conj acc [(or id (parse/new-blank-node-id)) rule])
             acc)))
       []
       expanded)))
