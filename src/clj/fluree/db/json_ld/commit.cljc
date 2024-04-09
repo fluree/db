@@ -15,6 +15,7 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.reasoner.core :as reasoner]
             [fluree.db.util.log :as log :include-macros true])
   (:refer-clojure :exclude [vswap!]))
 
@@ -174,8 +175,9 @@
   :retract - retraction flakes
   :refs-ctx - context that must be included with final context, for refs (@id) values
   :flakes - all considered flakes, for any downstream processes that need it"
-  [db {:keys [compact-fn id-key type-key] :as _opts}]
-  (when-let [flakes  (commit-flakes db)]
+  [{:keys [reasoner] :as db} {:keys [compact-fn id-key type-key] :as _opts}]
+  (when-let [flakes (cond-> (commit-flakes db)
+                      reasoner (reasoner/non-reasoned-flakes))]
     (log/trace "generate-commit flakes:" flakes)
     (let [ctx (volatile! {})]
       (loop [[s-flakes & r] (partition-by flake/s flakes)

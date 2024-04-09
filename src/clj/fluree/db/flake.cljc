@@ -31,7 +31,7 @@
 (def ^:const max-meta util/max-integer)
 
 
-(deftype Flake [s p o dt t op m]
+(deftype Flake [s p o dt t op m -clj-meta]
   #?@(:clj  [clojure.lang.Seqable
              (seq [f] (list (.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)))
 
@@ -57,6 +57,12 @@
              (entryAt [f k] (some->> (get f k nil) (clojure.lang.MapEntry k)))
              (containsKey [_ k] (boolean (#{:s :p :o :dt :t :op :m} k)))
              (assoc [f k v] (assoc-flake f k v))
+
+             clojure.lang.IMeta
+             (meta [_] -clj-meta)
+
+             clojure.lang.IObj
+             (withMeta [_ clj-meta] (Flake. s p o dt t op m clj-meta))
 
              Object
              (hashCode [f] (hash (seq f)))
@@ -109,6 +115,12 @@
              IAssociative
              (-assoc [this k v] (assoc-flake this k v))
 
+             IMeta
+             (-meta [this] -clj-meta)
+
+             IWithMeta
+             (-with-meta [f clj-meta] (Flake. (.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f) clj-meta))
+
              IPrintWithWriter
              (-pr-writer [^Flake f writer opts]
                          (pr-sequential-writer writer pr-writer
@@ -123,6 +135,11 @@
 
 #?(:clj (defmethod pprint/simple-dispatch Flake [^Flake f]
           (pr f)))
+
+(defn create
+  "Creates a new flake from parts"
+  [s p o dt t op m]
+  (->Flake s p o dt t op m nil))
 
 (defn s
   [^Flake f]
@@ -167,17 +184,11 @@
   "Used primarily to generate flakes for comparator. If you wish to
   generate a flake for other purposes, be sure to supply all components."
   ([[s p o dt t op m]]
-   (->Flake s p o dt t op m))
+   (create s p o dt t op m))
   ([[s p o dt t op m] default-tx]
-   (->Flake s p o dt (or t default-tx) op m))
+   (create s p o dt (or t default-tx) op m))
   ([[s p o dt t op m] default-tx default-op]
-   (->Flake s p o dt (or t default-tx) (or op default-op) m)))
-
-(defn create
-  "Creates a new flake from parts"
-  [s p o dt t op m]
-  (->Flake s p o dt t op m))
-
+   (create s p o dt (or t default-tx) (or op default-op) m)))
 
 (defn Flake->parts
   [flake]
@@ -192,26 +203,33 @@
 (def m-pos 6)
 
 (def maximum
-  (->Flake max-s max-p max-s max-dt max-t max-op max-meta))
+  (create max-s max-p max-s max-dt max-t max-op max-meta))
 
 (def minimum
-  (->Flake min-s min-p min-s min-dt min-t min-op min-meta))
+  (create min-s min-p min-s min-dt min-t min-op min-meta))
 
 (defn- assoc-flake
   "Assoc for Flakes"
-  [flake k v]
-  (let [[s p o dt t op m] (Flake->parts flake)]
-    (case k
-      :s (->Flake v p o dt t op m)
-      :p (->Flake s v o dt t op m)
-      :o (->Flake s p v dt t op m)
-      :dt (->Flake s p o v t op m)
-      :t (->Flake s p o dt v op m)
-      :op (->Flake s p o dt t v m)
-      :m (->Flake s p o dt t op v)
-      #?(:clj  (throw (IllegalArgumentException. (str "Flake does not contain key: " k)))
-         :cljs (throw (js/Error. (str "Flake does not contain key: " k)))))))
-
+  ([flake k v]
+   (let [[s p o dt t op m] (Flake->parts flake)]
+     (case k
+       :s (create v p o dt t op m)
+       :p (create s v o dt t op m)
+       :o (create s p v dt t op m)
+       :dt (create s p o v t op m)
+       :t (create s p o dt v op m)
+       :op (create s p o dt t v m)
+       :m (create s p o dt t op v)
+       #?(:clj  (throw (IllegalArgumentException. (str "Flake does not contain key: " k)))
+          :cljs (throw (js/Error. (str "Flake does not contain key: " k)))))))
+  ([flake k v & kvs]
+   (let [ret (assoc-flake flake k v)]
+     (if kvs
+       (if (next kvs)
+         (recur ret (first kvs) (second kvs) (nnext kvs))
+         (throw (ex-info "assoc-flake expects even number of arguments after map/vector, found odd number"
+                         {:status 500 :error :db/system})))
+       ret))))
 
 (defn- get-flake-val
   [flake k not-found]
@@ -391,9 +409,9 @@
   Don't over-ride no-history, even if no-history for this predicate has changed. New inserts
   will have the no-history flag, but we need the old inserts to be properly retracted in the txlog."
   ([flake]
-   (->Flake (s flake) (p flake) (o flake) (dt flake) (t flake) (not (op flake)) (m flake)))
+   (assoc-flake flake :op (not (op flake))))
   ([flake t]
-   (->Flake (s flake) (p flake) (o flake) (dt flake) t (not (op flake)) (m flake))))
+   (assoc-flake flake :t t :op (not (op flake)))))
 
 (defn next-t
   [t]
@@ -420,8 +438,8 @@
   "Returns all matching flakes to a specific 't' value."
   [ss t]
   (avl/subrange ss
-                >= (->Flake min-s nil nil nil t nil nil)
-                <= (->Flake max-s nil nil nil t nil nil)))
+                >= (create min-s nil nil nil t nil nil)
+                <= (create max-s nil nil nil t nil nil)))
 
 (defn subrange
   ([ss test flake]

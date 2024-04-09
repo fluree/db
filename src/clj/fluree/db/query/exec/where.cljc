@@ -374,10 +374,10 @@
     (when (and (some? s*) (some? p*) (some? o*))
       [s* p* o*])))
 
-(defn get-equivalent-properties
+(defn get-child-properties
   [db prop]
   (-> db
-      (get-in [:schema :pred prop :equivalentProperty])
+      (get-in [:schema :pred prop :childProps])
       not-empty))
 
 (def nil-channel
@@ -393,7 +393,7 @@
         triple     (assign-matched-values tuple solution)]
     (if-let [[s p o] (compute-sids db triple)]
       (let [pid (get-sid p db-alias)]
-        (if-let [props (and pid (get-equivalent-properties db pid))]
+        (if-let [props (and pid (get-child-properties db pid))]
           (let [prop-ch (-> props (conj pid) async/to-chan!)]
             (async/pipeline-async 2
                                   matched-ch
