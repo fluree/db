@@ -21,7 +21,6 @@
 
 (defn validate
   [{:keys [db-after db-before mods context] :as staged-map}]
-  (def sm staged-map)
   (go-try
     (let [root-db (dbproto/-rootdb db-after)]
       (<? (shacl/validate! db-before root-db (vals mods) context))
