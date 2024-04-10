@@ -337,8 +337,7 @@
                       :path       [:ex/favNums],
                       :value      [11 17],
                       :expect     [11],
-                      :message
-                      "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11"}]}
+                      :message "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11"}]}
                    (ex-data db-not-equal2)))
             (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11."
                    (ex-message db-not-equal2))))
@@ -1190,12 +1189,12 @@ WORLD!",
                 :message (str "value "
                               (pr-str "HELLO
 WORLD!")
-                              " does not match pattern \"hello   (.*?)world\" with :sh/flags x, s")}]}
+                              " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x")}]}
              (ex-data db-wrong-case-greeting)))
       (is (= (str "Subject :ex/alice path [:ex/greeting] violates constraint :sh/pattern of shape _:fdb-2 - value "
                   (pr-str "HELLO
 WORLD!")
-                  " does not match pattern \"hello   (.*?)world\" with :sh/flags x, s.")
+                  " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x.")
              (ex-message db-wrong-case-greeting)))
 
       (is (= {:status 400,
@@ -1500,13 +1499,13 @@ WORLD!")
                 :report
                 [{:subject "ex:jd",
                   :constraint "sh:minCount",
-                  :shape "_:fdb-3",
+                  :shape "_:fdb-16",
                   :expect 1,
                   :path ["ex:pal" "ex:name"],
                   :value 0,
                   :message "count 0 is less than minimum count of 1"}]}
                (ex-data invalid-pal)))
-        (is (= "Subject ex:jd path [\"ex:pal\" \"ex:name\"] violates constraint sh:minCount of shape _:fdb-3 - count 0 is less than minimum count of 1."
+        (is (= "Subject ex:jd path [\"ex:pal\" \"ex:name\"] violates constraint sh:minCount of shape _:fdb-16 - count 0 is less than minimum count of 1."
                (ex-message invalid-pal)))))
 
     (testing "predicate-path"
@@ -1527,43 +1526,47 @@ WORLD!")
                 :report
                 [{:subject "ex:good-pal",
                   :constraint "sh:datatype",
-                  :shape "_:fdb-16",
+                  :shape "_:fdb-23",
                   :expect "xsd:string",
                   :path ["ex:name"],
                   :value ["xsd:integer"],
                   :message "the following values do not have expected datatype xsd:string: 123"}]}
                (ex-data valid-named)))))
     #_(testing "inverse sequence path"
-        (let [ ;; a valid Princess is anybody who is the child of someone's queen
-              db1              @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
-                                                   "insert"   {"@type"          "sh:NodeShape"
-                                                               "id"             "ex:PrincessShape"
-                                                               "sh:targetClass" {"@id" "ex:Princess"}
-                                                               "sh:property"    [{"sh:path"     {"@list" [{"sh:inversePath" {"id" "ex:child"}}
-                                                                                                          {"sh:inversePath" {"id" "ex:queen"}}]}
-                                                                                  "sh:minCount" 1}]}})
-              valid-princess   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                                   "insert"   {"id"          "ex:Pleb"
-                                                               "schema:name" "Pleb"
-                                                               "ex:queen"    {"id"          "ex:Buttercup"
-                                                                              "schema:name" "Buttercup"
-                                                                              "ex:child"    {"id"          "ex:Mork"
-                                                                                             "type"        "ex:Princess"
-                                                                                             "schema:name" "Mork"}}}})
-              invalid-princess @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                                   "insert"   {"id"          "ex:Pleb"
-                                                               "schema:name" "Pleb"
-                                                               "ex:child"    {"id"          "ex:Gerb"
-                                                                              "type"        "ex:Princess"
-                                                                              "schema:name" "Gerb"}}})]
-          (is (= [{"id" "ex:Mork", "type" "ex:Princess", "schema:name" "Mork"}]
-                 @(fluree/query valid-princess {"@context" context
-                                                "select"   {"ex:Mork" ["*"]}})))
+      (let [ ;; a valid Princess is anybody who is the child of someone's queen
+            db1              @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+                                                 "insert"   {"@type"          "sh:NodeShape"
+                                                             "id"             "ex:PrincessShape"
+                                                             "sh:targetClass" {"@id" "ex:Princess"}
+                                                             "sh:property"    [{"sh:path"
+                                                                                {"@list"
+                                                                                 [{"sh:inversePath"
+                                                                                   {"id" "ex:child"}}
+                                                                                  {"sh:inversePath"
+                                                                                   {"id" "ex:queen"}}]}
+                                                                                "sh:minCount" 1}]}})
+            valid-princess   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                                 "insert"   {"id"          "ex:Pleb"
+                                                             "schema:name" "Pleb"
+                                                             "ex:queen"    {"id"          "ex:Buttercup"
+                                                                            "schema:name" "Buttercup"
+                                                                            "ex:child"    {"id"          "ex:Mork"
+                                                                                           "type"        "ex:Princess"
+                                                                                           "schema:name" "Mork"}}}})
+            invalid-princess @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                                 "insert"   {"id"          "ex:Pleb"
+                                                             "schema:name" "Pleb"
+                                                             "ex:child"    {"id"          "ex:Gerb"
+                                                                            "type"        "ex:Princess"
+                                                                            "schema:name" "Gerb"}}})]
+        (is (= [{"id" "ex:Mork", "type" "ex:Princess", "schema:name" "Mork"}]
+               @(fluree/query valid-princess {"@context" context
+                                              "select"   {"ex:Mork" ["*"]}})))
 
-          (is (= {}
-                 (ex-data invalid-princess)))
-          (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
-                 (ex-message invalid-princess)))))))
+        (is (= {}
+               (ex-data invalid-princess)))
+        (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+               (ex-message invalid-princess)))))))
 
 (deftest ^:integration shacl-class-test
   (let [conn    @(fluree/connect {:method :memory})
@@ -1680,12 +1683,12 @@ WORLD!")
               [{:subject "ex:YellowPony",
                 :constraint "sh:in",
                 :shape "_:fdb-3",
+                :expect ["cyan" "magenta"],
                 :path ["ex:color"],
-                :expect ["magenta" "cyan"],
                 :value "yellow",
-                :message "value \"yellow\" is not in [\"magenta\" \"cyan\"]"}]}
+                :message "value \"yellow\" is not in [\"cyan\" \"magenta\"]"}]}
              (ex-data db2)))
-      (is (= "Subject ex:YellowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-3 - value \"yellow\" is not in [\"magenta\" \"cyan\"]."
+      (is (= "Subject ex:YellowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-3 - value \"yellow\" is not in [\"cyan\" \"magenta\"]."
              (ex-message db2)))))
   (testing "node refs"
     (let [conn    @(fluree/connect {:method :memory})
@@ -1720,12 +1723,12 @@ WORLD!")
               [{:subject "ex:RainbowPony",
                 :constraint "sh:in",
                 :shape "_:fdb-7",
+                :expect ["ex:Pink" "ex:Purple"],
                 :path ["ex:color"],
-                :expect ["ex:Purple" "ex:Pink"],
                 :value #fluree/SID [101 "Green"],
-                :message "value \"ex:Green\" is not in [\"ex:Purple\" \"ex:Pink\"]"}]}
+                :message "value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\"]"}]}
              (ex-data db2)))
-      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-7 - value \"ex:Green\" is not in [\"ex:Purple\" \"ex:Pink\"]."
+      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-7 - value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\"]."
             (ex-message db2)))
 
       (is (not (ex-data db3)))
@@ -1761,12 +1764,12 @@ WORLD!")
               [{:subject "ex:RainbowPony",
                 :constraint "sh:in",
                 :shape "_:fdb-12",
+                :expect ["ex:Pink" "ex:Purple" "green"],
                 :path ["ex:color"],
-                :expect ["green" "ex:Purple" "ex:Pink"],
                 :value #fluree/SID [101 "Green"],
-                :message "value \"ex:Green\" is not in [\"green\" \"ex:Purple\" \"ex:Pink\"]"}]}
+                :message "value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\" \"green\"]"}]}
              (ex-data db2)))
-      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-12 - value \"ex:Green\" is not in [\"green\" \"ex:Purple\" \"ex:Pink\"]."
+      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-12 - value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\" \"green\"]."
              (ex-message db2))))))
 
 (deftest ^:integration shacl-targetobjectsof-test
@@ -2216,23 +2219,21 @@ WORLD!")
               :report
               [{:subject "ex:InvalidHand",
                 :constraint "sh:qualifiedValueShape",
-                :shape "_:fdb-21",
-                :path ["ex:digit"],
-                :expect "ex:fingershape",
-                :value "ex:finger4andthumb",
-                :message
-                "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint"}
-               {:subject "ex:InvalidHand",
-                :constraint "sh:qualifiedValueShape",
                 :shape "_:fdb-20",
                 :path ["ex:digit"],
                 :expect "ex:thumbshape",
                 :value "ex:finger4andthumb",
-                :message
-                "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint"}]}
+                :message "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint"}
+               {:subject "ex:InvalidHand",
+                :constraint "sh:qualifiedValueShape",
+                :shape "_:fdb-21",
+                :path ["ex:digit"],
+                :expect "ex:fingershape",
+                :value "ex:finger4andthumb",
+                :message "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint"}]}
              (ex-data invalid-hand)))
-      (is (= "Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-21 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint.
-Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-20 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint."
+      (is (= "Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-20 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint.
+Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-21 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint."
              (ex-message invalid-hand))))))
 
 #_(deftest ^:integration post-processing-validation
