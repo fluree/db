@@ -2245,7 +2245,7 @@ WORLD!")
 Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-21 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint."
              (ex-message invalid-hand))))))
 
-#_(deftest ^:integration post-processing-validation
+(deftest ^:integration post-processing-validation
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "post-processing")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
@@ -2270,7 +2270,18 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                 {"id"        "ex:Alice"
                                                  "type"      "ex:User"
                                                  "ex:friend" {"@id" "ex:Bob"}}})]
-        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be http://www.w3.org/2001/XMLSchema#string."
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject "ex:Bob",
+                  :constraint "sh:datatype",
+                  :shape "_:fdb-2",
+                  :expect "xsd:string",
+                  :path ["ex:name"],
+                  :value ["xsd:integer"],
+                  :message "the following values do not have expected datatype xsd:string: 123"}]}
+               (ex-data db-forbidden-friend)))
+        (is (= "Subject ex:Bob path [\"ex:name\"] violates constraint sh:datatype of shape _:fdb-2 - the following values do not have expected datatype xsd:string: 123."
                (ex-message db-forbidden-friend)))))
     (testing "shape constraints"
       (let [db1            @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
@@ -2299,14 +2310,27 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                  "ex:cool" {"ex:isCool" true}}]
                @(fluree/query valid-person {"@context" context
                                             "select"   {"ex:Bob" ["*" {"ex:cool" ["ex:isCool"]}]}})))
-        (is (= "SHACL PropertyShape exception - sh:hasValue: at least one value must be true."
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject "ex:Reto",
+                  :constraint "sh:node",
+                  :shape "_:fdb-7",
+                  :expect ["ex:CoolShape"],
+                  :path ["ex:cool"],
+                  :value "_:fdb-11",
+                  :message "node _:fdb-11 does not conform to shapes [\"ex:CoolShape\"]"}]}
+               (ex-data invalid-person)))
+        (is (= "Subject ex:Reto path [\"ex:cool\"] violates constraint sh:node of shape _:fdb-7 - node _:fdb-11 does not conform to shapes [\"ex:CoolShape\"]."
                (ex-message invalid-person)))))
     (testing "extended path constraints"
       (let [db1            @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                                "insert"   {"id"             "ex:PersonShape"
                                                            "type"           "sh:NodeShape"
                                                            "sh:targetClass" {"id" "ex:Person"}
-                                                           "sh:property"    [{"sh:path"     {"@list" [{"id" "ex:cool"} {"id" "ex:dude"}]}
+                                                           "sh:property"    [{"sh:path"
+                                                                              {"@list" [{"id" "ex:cool"}
+                                                                                        {"id" "ex:dude"}]}
                                                                               "sh:nodeKind" {"id" "sh:BlankNode"}
                                                                               "sh:minCount" 1}]}})
             valid-person   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
@@ -2323,5 +2347,16 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                  "ex:cool" {"ex:dude" {"ex:isBlank" true}}}]
                @(fluree/query valid-person {"@context" context
                                             "select"   {"ex:Bob" ["*" {"ex:cool" [{"ex:dude" ["ex:isBlank"]}]}]}})))
-        (is (= "SHACL PropertyShape exception - sh:nodekind: every value must be a blank node identifier."
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject "ex:Reto",
+                  :constraint "sh:nodeKind",
+                  :shape "_:fdb-13",
+                  :expect "sh:BlankNode",
+                  :path ["ex:cool" "ex:dude"],
+                  :value "ex:Dude",
+                  :message "value ex:Dude is is not of kind sh:BlankNode"}]}
+               (ex-data invalid-person)))
+        (is (= "Subject ex:Reto path [\"ex:cool\" \"ex:dude\"] violates constraint sh:nodeKind of shape _:fdb-13 - value ex:Dude is is not of kind sh:BlankNode."
                (ex-message invalid-person)))))))
