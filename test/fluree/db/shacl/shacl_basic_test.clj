@@ -1220,9 +1220,9 @@ WORLD!")
                 :expect "(19|20)[0-9][0-9]",
                 :path [:ex/birthYear],
                 :value #fluree/SID [101 "ref"],
-                :message "value :ex/ref does not match pattern \"(19|20)[0-9][0-9]\""}]}
+                :message "value \":ex/ref\" does not match pattern \"(19|20)[0-9][0-9]\""}]}
              (ex-data db-ref-value)))
-      (is (= "Subject :ex/john path [:ex/birthYear] violates constraint :sh/pattern of shape _:fdb-3 - value :ex/ref does not match pattern \"(19|20)[0-9][0-9]\"."
+      (is (= "Subject :ex/john path [:ex/birthYear] violates constraint :sh/pattern of shape _:fdb-3 - value \":ex/ref\" does not match pattern \"(19|20)[0-9][0-9]\"."
              (ex-message db-ref-value)))
       (is (= [{:id          :ex/brian
                :type        :ex/User

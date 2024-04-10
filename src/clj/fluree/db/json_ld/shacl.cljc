@@ -1145,7 +1145,7 @@
          expect constraint} shape
 
         [single-expect :as pretty-expect]
-        (mapv #(if (iri/sid? %) (display %) %) expect)]
+        (mapv display expect)]
     (cond-> {:subject (display focus-node)
              :constraint (display constraint)
              :shape (display id)
@@ -1194,7 +1194,7 @@
            (assoc :value (mapv (comp display second) violations)
                   :message (str "the following values do not have expected datatype " (display datatype) ": "
                                 (->> violations
-                                     (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)))
+                                     (mapv (fn [[v _dt]] (display v)))
                                      (str/join ",")))))])))
 (defmethod validate-constraint const/sh_nodeKind [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
   (println "DEP validate-constraint " (pr-str constraint))
@@ -1214,7 +1214,7 @@
                        const/sh_IRIOrLiteral       (or iri? literal?)
                        const/sh_BlankNodeOrLiteral (or bnode? literal?)))))
          (mapv (fn [[v _dt]]
-                 (let [value (if (iri/sid? v) (display v) v)]
+                 (let [value (display v)]
                    (assoc result
                           :value value
                           :message (str "value " value " is is not of kind " (display nodekind)))))))))
@@ -1253,7 +1253,7 @@
                    (and (contains? numeric-types dt)
                         (> v min-ex))))
          (mapv (fn [[v dt]]
-                 (let [value (if (iri/sid? v) (display v) v)]
+                 (let [value (display v)]
                    (assoc result
                           :value value
                           :message (str "value " value " is less than exclusive minimum " min-ex))))))))
@@ -1268,7 +1268,7 @@
                    (and (contains? numeric-types dt)
                         (< v max-ex))))
          (mapv (fn [[v _dt]]
-                 (let [value (if (iri/sid? v) (display v) v)]
+                 (let [value (display v)]
                    (assoc result
                           :value value
                           :message (str "value " value " is greater than exclusive maximum " max-ex))))))))
@@ -1283,7 +1283,7 @@
                    (and (contains? numeric-types dt)
                         (>= v min-in))))
          (mapv (fn [[v _dt]]
-                 (let [value (if (iri/sid? v) (display v) v)]
+                 (let [value (display v)]
                    (assoc result
                           :value value
                           :message (str "value " value " is less than inclusive minimum " min-in))))))))
@@ -1298,7 +1298,7 @@
                    (and (contains? numeric-types dt)
                         (<= v max-in))))
          (mapv (fn [[v _dt]]
-                 (let [value (if (iri/sid? v) (display v) v)]
+                 (let [value (display v)]
                    (assoc result
                           :value value
                           :message (str "value " value " is greater than inclusive maximum " max-in))))))))
@@ -1314,10 +1314,10 @@
          (remove (fn [[v _dt]] (>= (count (str v)) min-length)))
          (mapv (fn [[v _dt]]
                  (if (iri/sid? v)
-                   (let [value (if (iri/sid? v) (display v) (pr-str v))]
+                   (let [value (display v)]
                      (assoc result
                             :value v
-                            :message (str "value " value " is not a literal value")))
+                            :message (str "value " (pr-str value) " is not a literal value")))
                    (let [value (pr-str (str v))]
                      (assoc result
                             :value v
@@ -1332,7 +1332,7 @@
          (remove (fn [[v _dt]] (<= (count (str v)) max-length)))
          (mapv (fn [[v _dt]]
                  (if (iri/sid? v)
-                   (let [value (if (iri/sid? v) (display v) (pr-str v))]
+                   (let [value (display v)]
                      (assoc result
                             :value v
                             :message (str "value " value " is not a literal value")))
@@ -1353,10 +1353,10 @@
     (->> value-nodes
          (remove (fn [[v dt]] (re-find pattern (str v))))
          (mapv (fn [[v _dt]]
-                 (let [value (if (iri/sid? v) (display v) (pr-str (str v)))]
+                 (let [value (display v)]
                    (assoc result
                           :value v
-                          :message (str "value " value " does not match pattern " (pr-str pattern-str)
+                          :message (str "value " (pr-str (str value)) " does not match pattern " (pr-str pattern-str)
                                         (when (seq valid-flags)
                                           (str " with " (display const/sh_flags) " " (str/join ", " flags)))))))))))
 #_(defmethod validate-constraint const/sh_languageIn [v-ctx constraint focus-flakes]) ; not supported
@@ -1374,8 +1374,8 @@
     (when (not= equals-objects focus-objects)
       (let [result (base-result v-ctx shape constraint focus-node)
             iri-path (:path result)
-            expect-vals  (sort (mapv (fn [v] (if (iri/sid? v) (display v) v)) equals-objects))
-            values   (sort (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)) value-nodes))]
+            expect-vals  (sort (mapv display equals-objects))
+            values   (sort (mapv (fn [[v _dt]] (display v)) value-nodes))]
         [(-> result
              (assoc :value values
                     :expect expect-vals
@@ -1392,8 +1392,8 @@
     (when (not-empty (set/intersection focus-objects disjoint-objects))
       (let [result      (base-result v-ctx shape constraint focus-node)
             iri-path    (:path result)
-            expect-vals (sort (mapv (fn [v] (if (iri/sid? v) (display v) v)) disjoint-objects))
-            values      (sort (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)) value-nodes))]
+            expect-vals (sort (mapv display disjoint-objects))
+            values      (sort (mapv (fn [[v _dt]] (display v)) value-nodes))]
         [(-> result
              (assoc :value values
                     :expect expect-vals
@@ -1410,8 +1410,8 @@
 
         result      (base-result v-ctx shape constraint focus-node)
         iri-path    (:path result)
-        expect-vals (sort (mapv (fn [v] (if (iri/sid? v) (display v) v)) less-than-objects))
-        values      (sort (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)) value-nodes))
+        expect-vals (sort (mapv display less-than-objects))
+        values      (sort (mapv (fn [[v _dt]] (display v)) value-nodes))
 
         result (assoc result :value values :expect expect-vals)]
     (if (or (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
@@ -1434,8 +1434,8 @@
 
         result      (base-result v-ctx shape constraint focus-node)
         iri-path    (:path result)
-        expect-vals (sort (mapv (fn [v] (if (iri/sid? v) (display v) v)) less-than-objects))
-        values      (sort (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)) value-nodes))
+        expect-vals (sort (mapv display less-than-objects))
+        values      (sort (mapv (fn [[v _dt]] (display v)) value-nodes))
         result      (assoc result :value values :expect expect-vals)]
     (if (or (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
                  (every? (fn [[_ dt]] (contains? numeric-types dt)) value-nodes))
@@ -1523,7 +1523,7 @@
 
         values (->> value-nodes
                     (mapv first)
-                    (mapv #(if (iri/sid? %) (display %) %)))
+                    (mapv display))
 
         result (-> (base-result v-ctx shape constraint focus-node)
                    (assoc :expect (display (get q-shape const/$id)))
@@ -1640,8 +1640,8 @@
 
         [term] expect]
     (when-not (some #(= term (first %)) value-nodes)
-      (let [value (mapv (fn [[v _dt]] (if (iri/sid? v) (display v) v)) value-nodes)
-            expect (if (iri/sid? term) (display term) term)]
+      (let [value (mapv (fn [[v _dt]] (display v)) value-nodes)
+            expect (display term)]
         [(-> (base-result v-ctx shape constraint focus-node)
              (assoc :value value
                     :message (str "at least one value of " value " must be " expect)))]))))
@@ -1654,10 +1654,10 @@
     (->> value-nodes
          (remove (fn [[v dt]] (contains? expected v)))
          (mapv (fn [[v dt]]
-                 (let [value (if (iri/sid? v) (display v) (pr-str (str v)))]
+                 (let [value (display v)]
                    (assoc result
                           :value v
-                          :message (str "value " value " is not in " (:expect result)))))))))
+                          :message (str "value " (pr-str value) " is not in " (:expect result)))))))))
 
 (defn explain-result
   [{:keys [subject constraint shape path message]}]
@@ -1686,6 +1686,13 @@
   (-> (iri/sid->iri sid ns-codes)
       (json-ld/compact context)))
 
+(defn make-display
+  [data-db context]
+  (fn [v]
+    (if (iri/sid? v)
+      (sid->compact-iri (:namespace-codes data-db) context v)
+      v)))
+
 (defn validate!
   "Will throw an exception if any of the modified subjects fails to conform to a shape that targets it.
 
@@ -1704,10 +1711,9 @@
       (doseq [shape-sid (<? (all-node-shape-ids shape-db))]
         (let [subject (-> s-flakes first flake/s)
               shape   (<? (build-shape shape-db shape-sid))
-              ;; TODO: add sid? check to display
-              v-ctx {:display (partial sid->compact-iri (:namespace-codes data-db) context)
-                     :shape-db shape-db
-                     :data-db data-db}]
+              v-ctx   {:display  (make-display data-db context)
+                       :shape-db shape-db
+                       :data-db  data-db}]
           (println "DEP shape" (pr-str shape-sid))
           ;; only enforce activated shapes
           (when (not (get shape const/sh_deactivated))
