@@ -1190,12 +1190,12 @@ WORLD!",
                 :message (str "value "
                               (pr-str "HELLO
 WORLD!")
-                              " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x")}]}
+                              " does not match pattern \"hello   (.*?)world\" with :sh/flags x, s")}]}
              (ex-data db-wrong-case-greeting)))
       (is (= (str "Subject :ex/alice path [:ex/greeting] violates constraint :sh/pattern of shape _:fdb-2 - value "
                   (pr-str "HELLO
 WORLD!")
-                  " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x.")
+                  " does not match pattern \"hello   (.*?)world\" with :sh/flags x, s.")
              (ex-message db-wrong-case-greeting)))
 
       (is (= {:status 400,
@@ -1681,11 +1681,11 @@ WORLD!")
                 :constraint "sh:in",
                 :shape "_:fdb-3",
                 :path ["ex:color"],
-                :expect ["cyan" "magenta"],
+                :expect ["magenta" "cyan"],
                 :value "yellow",
-                :message "value \"yellow\" is not in [\"cyan\" \"magenta\"]"}]}
+                :message "value \"yellow\" is not in [\"magenta\" \"cyan\"]"}]}
              (ex-data db2)))
-      (is (= "Subject ex:YellowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-3 - value \"yellow\" is not in [\"cyan\" \"magenta\"]."
+      (is (= "Subject ex:YellowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-3 - value \"yellow\" is not in [\"magenta\" \"cyan\"]."
              (ex-message db2)))))
   (testing "node refs"
     (let [conn    @(fluree/connect {:method :memory})
@@ -1721,11 +1721,11 @@ WORLD!")
                 :constraint "sh:in",
                 :shape "_:fdb-7",
                 :path ["ex:color"],
-                :expect ["ex:Pink" "ex:Purple"],
+                :expect ["ex:Purple" "ex:Pink"],
                 :value #fluree/SID [101 "Green"],
-                :message "value ex:Green is not in [\"ex:Pink\" \"ex:Purple\"]"}]}
+                :message "value \"ex:Green\" is not in [\"ex:Purple\" \"ex:Pink\"]"}]}
              (ex-data db2)))
-      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-7 - value ex:Green is not in [\"ex:Pink\" \"ex:Purple\"]."
+      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-7 - value \"ex:Green\" is not in [\"ex:Purple\" \"ex:Pink\"]."
             (ex-message db2)))
 
       (is (not (ex-data db3)))
@@ -1762,11 +1762,11 @@ WORLD!")
                 :constraint "sh:in",
                 :shape "_:fdb-12",
                 :path ["ex:color"],
-                :expect ["ex:Pink" "ex:Purple" "green"],
+                :expect ["green" "ex:Purple" "ex:Pink"],
                 :value #fluree/SID [101 "Green"],
-                :message "value ex:Green is not in [\"ex:Pink\" \"ex:Purple\" \"green\"]"}]}
+                :message "value \"ex:Green\" is not in [\"green\" \"ex:Purple\" \"ex:Pink\"]"}]}
              (ex-data db2)))
-      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-12 - value ex:Green is not in [\"ex:Pink\" \"ex:Purple\" \"green\"]."
+      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-12 - value \"ex:Green\" is not in [\"green\" \"ex:Purple\" \"ex:Pink\"]."
              (ex-message db2))))))
 
 (deftest ^:integration shacl-targetobjectsof-test
@@ -2216,23 +2216,23 @@ WORLD!")
               :report
               [{:subject "ex:InvalidHand",
                 :constraint "sh:qualifiedValueShape",
-                :shape "_:fdb-20",
-                :path ["ex:digit"],
-                :expect "ex:thumbshape",
-                :value "ex:finger4andthumb",
-                :message
-                "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint"}
-               {:subject "ex:InvalidHand",
-                :constraint "sh:qualifiedValueShape",
                 :shape "_:fdb-21",
                 :path ["ex:digit"],
                 :expect "ex:fingershape",
                 :value "ex:finger4andthumb",
                 :message
-                "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint"}]}
+                "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint"}
+               {:subject "ex:InvalidHand",
+                :constraint "sh:qualifiedValueShape",
+                :shape "_:fdb-20",
+                :path ["ex:digit"],
+                :expect "ex:thumbshape",
+                :value "ex:finger4andthumb",
+                :message
+                "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint"}]}
              (ex-data invalid-hand)))
-      (is (= "Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-20 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint.
-Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-21 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint."
+      (is (= "Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-21 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint.
+Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-20 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint."
              (ex-message invalid-hand))))))
 
 #_(deftest ^:integration post-processing-validation
