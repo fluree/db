@@ -1532,7 +1532,7 @@ WORLD!")
                   :value ["xsd:integer"],
                   :message "the following values do not have expected datatype xsd:string: 123"}]}
                (ex-data valid-named)))))
-    #_(testing "inverse sequence path"
+    (testing "inverse sequence path"
       (let [ ;; a valid Princess is anybody who is the child of someone's queen
             db1              @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                                  "insert"   {"@type"          "sh:NodeShape"
@@ -1563,9 +1563,18 @@ WORLD!")
                @(fluree/query valid-princess {"@context" context
                                               "select"   {"ex:Mork" ["*"]}})))
 
-        (is (= {}
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                [{:subject "ex:Gerb",
+                  :constraint "sh:minCount",
+                  :shape "_:fdb-26",
+                  :expect 1,
+                  :path [{"sh:inversePath" "ex:child"} {"sh:inversePath" "ex:queen"}],
+                  :value 0,
+                  :message "count 0 is less than minimum count of 1"}]}
                (ex-data invalid-princess)))
-        (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+        (is (= "Subject ex:Gerb path [{\"sh:inversePath\" \"ex:child\"} {\"sh:inversePath\" \"ex:queen\"}] violates constraint sh:minCount of shape _:fdb-26 - count 0 is less than minimum count of 1."
                (ex-message invalid-princess)))))))
 
 (deftest ^:integration shacl-class-test
