@@ -1,4 +1,4 @@
-(ns fluree.db.reasoner.core
+(ns fluree.db.reasoner
   (:require [clojure.core.async :as async :refer [alts! go]]
             [clojure.string :as str]
             [fluree.db.flake :as flake]
