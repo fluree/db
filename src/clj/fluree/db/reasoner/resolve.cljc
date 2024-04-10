@@ -47,7 +47,7 @@
   [patterns]
   (mapv
     (fn [[s p o]]
-      (flake/->Flake s p o nil nil nil nil))
+      (flake/create s p o nil nil nil nil))
     patterns))
 
 (defn rule-graph
@@ -90,4 +90,3 @@
              {:select ["?s" "?rule"]
               :where  {"@id"                           "?s",
                        "http://flur.ee/ns/ledger#rule" "?rule"}}))
-
