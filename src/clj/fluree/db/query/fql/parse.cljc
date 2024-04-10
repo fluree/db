@@ -189,12 +189,29 @@
                  (assoc expanded p* o)))
              {} m))
 
-(defn parse-value-attributes
-  [v attrs]
-  (if-let [lang (get attrs const/iri-language)]
-    (let [matcher (where/lang-matcher lang)]
-      (where/->val-filter v matcher))
+(defn get-expanded-datatype
+  [attrs context]
+  (some-> attrs
+          (get const/iri-type)
+          (json-ld/expand-iri context)))
+
+(defn parse-value-datatype
+  [v attrs context]
+  (if-let [dt-iri (get-expanded-datatype attrs context)]
+    (if (= const/iri-anyURI dt-iri)
+      (-> v
+          (json-ld/expand-iri context)
+          (where/anonymous-value dt-iri))
+      (where/anonymous-value v dt-iri))
     (where/anonymous-value v)))
+
+(defn parse-value-attributes
+  [v attrs context]
+  (let [mch (parse-value-datatype v attrs context)]
+    (if-let [lang (get attrs const/iri-language)]
+      (let [lang-matcher (where/lang-matcher lang)]
+        (where/with-filter mch lang-matcher))
+      mch)))
 
 (defn every-binary-pred
   [& fs]
@@ -273,7 +290,7 @@
       (let [attrs (dissoc o* const/iri-value)
             o-mch (if-let [var (parse-var-name v)]
                     (parse-variable-attributes var attrs vars)
-                    (parse-value-attributes v attrs))]
+                    (parse-value-attributes v attrs context))]
         [(flip-reverse-pattern [s-mch p-mch o-mch])])
       ;; ref
       (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
