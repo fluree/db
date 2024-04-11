@@ -2,8 +2,7 @@
   (:require [clojure.string :as str]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.log :as log]))
 
 ;; conversions of owl statements to datalog
 
@@ -79,9 +78,14 @@
 
 (defn blank-node?
   [node]
-  (-> node
-      get-id
-      blank-node-id?))
+  (try*
+    (some-> node
+            get-id
+            blank-node-id?)
+    (catch* e
+            (log/error (str "Unexpected error processing OWL node: " node
+                            " with error: " (ex-message e))
+                       false))))
 
 (defn get-value
   [val]
@@ -104,10 +108,18 @@
   "Returns all @id values from either an ordered list or a set of objects.
   Filters out any scalar (@value) values and blank nodes."
   [vals]
-  (->> (util/sequential vals)
-       unwrap-list
-       (map get-id)
-       (remove blank-node-id?)))
+  (try*
+    (->> (util/sequential vals)
+         unwrap-list
+         (into [] (comp
+                    (map get-id)
+                    (remove nil?)
+                    (remove blank-node-id?))))
+    (catch* e
+            (throw (ex-info (str "Unexpected error extracting all @id values from owl statement:" vals)
+                            {:status 500
+                             :error  :db/unexpected-error}
+                            e)))))
 
 (defn equiv-class-type
   [equiv-class-statement]
@@ -176,19 +188,25 @@
 
     all-rules))
 
+;; rdfs:domain
 (defmethod to-datalog ::prp-dom
   [_ _ owl-statement all-rules]
-  (let [domain   (-> owl-statement
+  (let [property (get-id owl-statement)
+        domain   (-> owl-statement
                      (get $rdfs-domain)
                      get-all-ids)
-        property (get-id owl-statement)
         rule     {"where"  {"@id"    "?s"
                             property nil}
                   "insert" {"@id"   "?s"
                             "@type" domain}}]
-    ;; rule-id *is* the property
-    (conj all-rules [(str property "(rdfs:domain)") rule])))
+    (if (and property (seq domain))
+      ;; rule-id *is* the property
+      (conj all-rules [(str property "(rdfs:domain)") rule])
+      (do (log/warn "Ignoring rdfs:domain rule " owl-statement
+                    " as property or domain definition not supported by owl2rl reasoning.")
+          all-rules))))
 
+;; rdfs:range
 (defmethod to-datalog ::prp-rng
   [_ _ owl-statement all-rules]
   (let [range    (-> owl-statement
@@ -200,8 +218,13 @@
                   "insert" {"@id"   "?ps"
                             "@type" range}}]
     ;; rule-id *is* the property
-    (conj all-rules [(str property "(rdfs:range)") rule])))
+    (if (and property (seq range))
+      (conj all-rules [(str property "(rdfs:range)") rule])
+      (do (log/warn "Ignoring rdfs:range rule " owl-statement
+                    " as property or range definition not supported by owl2rl reasoning rule.")
+          all-rules))))
 
+;; owl:FunctionalProperty
 (defmethod to-datalog ::prp-fp
   [_ _ owl-statement all-rules]
   (let [fp   (get-id owl-statement)
@@ -214,6 +237,7 @@
                         $owl-sameAs "?fp-vals2"}}]
     (conj all-rules [(str $owl-FunctionalProperty "(" fp ")") rule])))
 
+;; owl:InverseFunctionalProperty
 (defmethod to-datalog ::prp-ifp
   [_ _ owl-statement all-rules]
   (let [ifp  (get-id owl-statement)
@@ -226,6 +250,7 @@
                         $owl-sameAs "?x2"}}]
     (conj all-rules [(str $owl-InverseFunctionalProperty "(" ifp ")") rule])))
 
+;;owl:SymetricProperty
 (defmethod to-datalog ::prp-symp
   [_ _ owl-statement all-rules]
   (let [symp (get-id owl-statement)
@@ -235,6 +260,7 @@
                         symp  "?x"}}]
     (conj all-rules [(str symp "(owl:SymetricProperty)") rule])))
 
+;; owl:TransitiveProperty
 (defmethod to-datalog ::prp-trp
   [_ _ owl-statement all-rules]
   (let [trp  (get-id owl-statement)
@@ -469,11 +495,16 @@
             {:keys [classes union-of]} (group-by equiv-class-type (get some-values-statement $owl-someValuesFrom))]
         (cond
           classes
-          (-> acc
-              (conj {"@id"    binding-var
-                     property "?_some-val-rel"}) ;; choosing a binding var name unlikely to collide
-              (conj {"@id"   "?_some-val-rel"
-                     "@type" (-> classes first (get "@id"))}))
+          (let [target-type (-> classes first get-id)]
+            (if (and property target-type)
+              (-> acc
+                  (conj {"@id"    binding-var
+                         property "?_some-val-rel"}) ;; choosing a binding var name unlikely to collide
+                  (conj {"@id"   "?_some-val-rel"
+                         "@type" target-type}))
+              (do (log/warn (str "Ignoring owl:someValuesFrom rule: " some-values-statement
+                                 " as property or target @type not supported by owl2rl reasoning."))
+                  acc)))
 
           union-of
           (-> acc
@@ -581,7 +612,7 @@
             restrictions  (cond->> []
                                    has-value (into (has-value-condition "?y" has-value))
                                    some-values (into (some-values-condition "?y" some-values)))
-            class-list    (map get-id classes)
+            class-list    (get-all-ids classes)
             cls-int1      {"where"  (reduce
                                       (fn [acc c]
                                         (conj acc
@@ -591,10 +622,11 @@
                                       class-list)
                            "insert" {"@id"   "?y"
                                      "@type" rule-class}}
-            cls-int2      {"where"  {"@id"   "?y"
-                                     "@type" rule-class}
-                           "insert" {"@id"   "?y"
-                                     "@type" (into [] class-list)}}
+            cls-int2      (when (seq class-list)
+                            {"where"  {"@id"   "?y"
+                                       "@type" rule-class}
+                             "insert" {"@id"   "?y"
+                                       "@type" (into [] class-list)}})
 
             triples       (reduce
                             (fn [triples* c]
@@ -605,9 +637,8 @@
         ;; intersectionOf inserts subClassOf rules (scm-int)
         (swap! inserts assoc (str rule-class "(owl:intersectionOf-subclass)") triples)
 
-        (-> acc
-            (conj [(str rule-class "(owl:intersectionOf-1)#" (hash class-list)) cls-int1])
-            (conj [(str rule-class "(owl:intersectionOf-2)#" (hash class-list)) cls-int2]))))
+        (cond-> (conj acc [(str rule-class "(owl:intersectionOf-1)#" (hash class-list)) cls-int1])
+                cls-int2 (conj [(str rule-class "(owl:intersectionOf-2)#" (hash class-list)) cls-int2]))))
     []
     intersection-of-statements))
 
@@ -670,6 +701,7 @@
     ;; return empty rules, as the triples are inserted directly
     []))
 
+;; owl:equivalentClass
 (defmethod to-datalog ::cax-eqc
   [_ inserts owl-statement all-rules]
   (let [c1 (get-id owl-statement) ;; the class which is the subject
@@ -784,49 +816,53 @@
 
 (defn statement->datalog
   [inserts owl-statement]
-  (let [{:keys [functional-property? inverse-functional-property?
-                symetric-property? transitive-property?]} (property-types owl-statement)]
-    (cond
-      (contains? owl-statement $owl-sameAs) ;; TODO - can probably take this out of multi-fn
-      (to-datalog ::eq-sym inserts owl-statement [])
+  (try*
+    (let [{:keys [functional-property? inverse-functional-property?
+                  symetric-property? transitive-property?]} (property-types owl-statement)]
+      (cond
+        (contains? owl-statement $owl-sameAs) ;; TODO - can probably take this out of multi-fn
+        (to-datalog ::eq-sym inserts owl-statement [])
 
-      :else
-      (cond->> []
-               (contains? owl-statement $rdfs-domain)
-               (to-datalog ::prp-dom inserts owl-statement)
+        :else
+        (cond->> []
+                 (contains? owl-statement $rdfs-domain)
+                 (to-datalog ::prp-dom inserts owl-statement)
 
-               (contains? owl-statement $rdfs-range)
-               (to-datalog ::prp-rng inserts owl-statement)
+                 (contains? owl-statement $rdfs-range)
+                 (to-datalog ::prp-rng inserts owl-statement)
 
-               (contains? owl-statement $rdfs-subPropertyOf)
-               (to-datalog ::prp-spo1 inserts owl-statement)
+                 (contains? owl-statement $rdfs-subPropertyOf)
+                 (to-datalog ::prp-spo1 inserts owl-statement)
 
-               (contains? owl-statement $owl-propertyChainAxiom)
-               (to-datalog ::prp-spo2 inserts owl-statement)
+                 (contains? owl-statement $owl-propertyChainAxiom)
+                 (to-datalog ::prp-spo2 inserts owl-statement)
 
-               (contains? owl-statement $owl-inverseOf)
-               (to-datalog ::prp-inv inserts owl-statement)
+                 (contains? owl-statement $owl-inverseOf)
+                 (to-datalog ::prp-inv inserts owl-statement)
 
-               (contains? owl-statement $owl-hasKey)
-               (to-datalog ::prp-key inserts owl-statement)
+                 (contains? owl-statement $owl-hasKey)
+                 (to-datalog ::prp-key inserts owl-statement)
 
-               (contains? owl-statement $rdfs-subClassOf)
-               (to-datalog ::cax-sco inserts owl-statement)
+                 (contains? owl-statement $rdfs-subClassOf)
+                 (to-datalog ::cax-sco inserts owl-statement)
 
-               (contains? owl-statement $owl-equivalentClass)
-               (to-datalog ::cax-eqc inserts owl-statement)
+                 (contains? owl-statement $owl-equivalentClass)
+                 (to-datalog ::cax-eqc inserts owl-statement)
 
-               functional-property?
-               (to-datalog ::prp-fp inserts owl-statement)
+                 functional-property?
+                 (to-datalog ::prp-fp inserts owl-statement)
 
-               inverse-functional-property?
-               (to-datalog ::prp-ifp inserts owl-statement)
+                 inverse-functional-property?
+                 (to-datalog ::prp-ifp inserts owl-statement)
 
-               symetric-property?
-               (to-datalog ::prp-symp inserts owl-statement)
+                 symetric-property?
+                 (to-datalog ::prp-symp inserts owl-statement)
 
-               transitive-property?
-               (to-datalog ::prp-trp inserts owl-statement)))))
+                 transitive-property?
+                 (to-datalog ::prp-trp inserts owl-statement))))
+    (catch* e
+            (log/error e (str "Error processing OWL statement: " owl-statement " - skipping!"))
+            [])))
 
 (defn owl->datalog
   [inserts owl-graph]

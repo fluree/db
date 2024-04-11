@@ -3,7 +3,7 @@
             [clojure.string :as str]
             [fluree.db.flake :as flake]
             [fluree.db.query.fql.parse :as parse]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
@@ -155,19 +155,18 @@
 
 (defmethod rules-from-graph :datalog
   [_ _ graph]
-  (let []
-    (reduce
-      (fn [acc rule]
-        (if (map? rule)
-          (let [id   (:id rule)
-                rule (util/get-first-value rule "http://flur.ee/ns/ledger#rule")]
-            (if rule
-              (conj acc [(or id (parse/new-blank-node-id)) rule])
-              acc))
-          ;; else already in two-tuple form
-          (conj acc rule)))
-      []
-      graph)))
+  (reduce
+    (fn [acc rule]
+      (if (map? rule)
+        (let [id   (:id rule)
+              rule (util/get-first-value rule "http://flur.ee/ns/ledger#rule")]
+          (if rule
+            (conj acc [(or id (parse/new-blank-node-id)) rule])
+            acc))
+        ;; else already in two-tuple form
+        (conj acc rule)))
+    []
+    graph))
 
 (defmethod rules-from-graph :owl2rl
   [_ inserts graph]
@@ -185,9 +184,13 @@
   "Gets all relevant rules for the specified methods from the
   supplied rules graph or from the db if no graph is supplied."
   [methods db inserts supplied-rules]
-  (let [supplied-rules* (when supplied-rules
-                          (parse-rules-graph supplied-rules))]
-    (go-try
+  (go-try
+    (let [supplied-rules* (when supplied-rules
+                            (try*
+                              (parse-rules-graph supplied-rules)
+                              (catch* e
+                                      (log/error "Error parsing supplied rules graph:" e)
+                                      (throw e))))]
       (loop [[method & r] methods
              rules []]
         (if method
