@@ -20,7 +20,7 @@
   (and (or (string? x) (symbol? x) (keyword? x))
        (-> x name first (= \?))))
 
-(def value? (complement coll?))
+(def value? (complement sequential?))
 
 (defn iri-key?
   [x]
