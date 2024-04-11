@@ -114,7 +114,7 @@
                              "updated by another user or process.")
                         {:status 400 :error :db/invalid-commit})))
       (throw (ex-info (str "Unexpected Error updating commit database. "
-                           "New database has an inconsistent t from it's commit:"
+                           "New database has an inconsistent t from its commit:"
                            db-t " and " new-t " respectively.")
                       {:status 500 :error :db/invalid-db})))))
 
