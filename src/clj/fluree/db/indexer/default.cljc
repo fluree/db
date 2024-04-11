@@ -509,8 +509,8 @@
       (go
         (try*
           (push-index-event indexer :index-start index-state)
-          (let [indexed-db                      (<? (refresh indexer db opts))
-                index-state*                    (unlock-indexer (:state-atom indexer) branch tempid indexed-db)
+          (let [indexed-db   (<? (refresh indexer db opts))
+                index-state* (unlock-indexer (:state-atom indexer) branch tempid indexed-db)
                 {:keys [update-commit-fn port]} index-state*]
             ;; in case event listener wanted final indexed db, put on established port
             (when (fn? update-commit-fn)

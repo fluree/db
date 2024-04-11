@@ -28,9 +28,9 @@
 
 (defn- subject-block-pred
   [db compact-fn list? p-flakes]
-  (loop [[p-flake & r'] p-flakes
+  (loop [[p-flake & r] p-flakes
          all-refs? nil
-         acc'      nil]
+         acc      nil]
     (let [pdt       (flake/dt p-flake)
           ref?      (= const/$xsd:anyURI pdt)
           [obj all-refs?] (if ref?
@@ -43,15 +43,15 @@
                              false])
           obj*      (cond-> obj
                       list? (assoc :i (-> p-flake flake/m :i))
+
+                      ;; need to retain the `@type` for times so they will be
+                      ;; coerced correctly when loading
                       (datatype/time-type? pdt)
-                      ;;need to retain the `@type` for times
-                      ;;so they will be coerced correctly when loading
-                      (assoc "@type"
-                             (get-s-iri pdt db compact-fn)))
-          next-acc' (conj acc' obj*)]
-      (if (seq r')
-        (recur r' all-refs? next-acc')
-        [next-acc' all-refs?]))))
+                      (assoc "@type" (get-s-iri pdt db compact-fn)))
+          acc' (conj acc obj*)]
+      (if (seq r)
+        (recur r all-refs? acc')
+        [acc' all-refs?]))))
 
 (defn- set-refs-type-in-ctx
   [^clojure.lang.Volatile ctx p-iri refs]
@@ -77,10 +77,10 @@
                              (and all-refs? (not list?)) handle-all-refs
                              list?                       handle-list-values
                              (= 1 (count objs))          first)
-          next-acc         (assoc acc p-iri objs*)]
+          acc'         (assoc acc p-iri objs*)]
       (if (seq r)
-        (recur r next-acc)
-        next-acc))))
+        (recur r acc')
+        acc'))))
 
 (defn- did-from-private
   [private-key]
@@ -193,7 +193,7 @@
                   ;; we don't output auto-generated rdfs:Class definitions for classes
                   ;; (they are implied when used in rdf:type statements)
                   [assert retract]
-                  (let [{assert-flakes  true,
+                  (let [{assert-flakes  true
                          retract-flakes false}
                         (group-by flake/op s-flakes)
 
