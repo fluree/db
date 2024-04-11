@@ -1,16 +1,11 @@
 (ns fluree.db.validation
   (:require [fluree.db.constants :as const]
-            [fluree.db.util.core :refer [pred-ident?]]
             [fluree.db.util.docs :as docs]
             [malli.core :as m]
             [malli.error :as me]
             [malli.util :as mu]
             [clojure.string :as str]
             [clojure.walk :as walk]))
-
-(defn iri?
-  [v]
-  (or (keyword? v) (string? v)))
 
 (defn decode-json-ld-keyword
   [v]
@@ -27,33 +22,15 @@
 
 (def value? (complement coll?))
 
-(defn sid?
-  [x]
-  (int? x))
-
 (defn iri-key?
   [x]
   (= const/iri-id x))
-
-(defn where-op [x]
-  (when (sequential? x)
-    (first x)))
 
 (defn where-pattern-type
   [pattern]
   (if (sequential? pattern)
     (-> pattern first keyword)
     :node))
-
-(defn string->keyword
-  [x]
-  (if (string? x)
-    (keyword x)
-    x))
-
-(defn humanize-error
-  [error]
-  (-> error ex-data :data :explain me/humanize))
 
 (defn explain-error
   [error]
@@ -66,19 +43,18 @@
   (let [{:keys [path in]} error]
     (loop [i (dec (count path))]
       (when-not (= 0 i)
-        (let [subpath (subvec path 0 i)
+        (let [subpath         (subvec path 0 i)
               schema-fragment (mu/get-in schema subpath)
-              type (some-> schema-fragment
-                           m/type)]
+              type            (some-> schema-fragment
+                                      m/type)]
           (if (#{:or :orn} type)
-            (let [props (m/properties schema-fragment)
-                  in-length (count (mu/path->in schema subpath))
-                  in' (subvec in 0 in-length)]
+            (let [in-length (count (mu/path->in schema subpath))
+                  in'       (subvec in 0 in-length)]
               {:schema schema-fragment
-               :path subpath
-               :type type
-               :in in'
-               :value (get-in (walk/keywordize-keys value) in')})
+               :path   subpath
+               :type   type
+               :in     in'
+               :value  (get-in (walk/keywordize-keys value) in')})
             (recur (dec i))))))))
 
 (defn error-specificity-score
@@ -91,7 +67,7 @@
    When used in sorting, will push those errors
    toward the start of the list. "
   [error]
-  (let [{:keys [schema value in path type]} error
+  (let [{:keys [schema in type]} error
         properties (m/properties schema)]
     ;;When inline limit constraints, eg
     ;;`[:map {:max 1} ...]` are used, then both type and limit
@@ -251,7 +227,7 @@
   chooses an error based on heuristics."
   [explained-error opts]
   (let [error-opts (or opts default-error-overrides)
-        {:keys [errors schema value]} explained-error
+        {:keys [errors]} explained-error
         e          (or (top-level-fn-error errors)
                        (choose-relevant-error explained-error))]
     (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts))))))
