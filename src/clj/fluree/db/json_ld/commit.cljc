@@ -193,7 +193,7 @@
                   ;; we don't output auto-generated rdfs:Class definitions for classes
                   ;; (they are implied when used in rdf:type statements)
                   [assert retract]
-                  (let [{assert-flakes  true,
+                  (let [{assert-flakes  true
                          retract-flakes false}
                         (group-by flake/op s-flakes)
 
