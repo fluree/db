@@ -43,11 +43,11 @@
                              false])
           obj*      (cond-> obj
                       list? (assoc :i (-> p-flake flake/m :i))
+
+                      ;; need to retain the `@type` for times so they will be
+                      ;; coerced correctly when loading
                       (datatype/time-type? pdt)
-                      ;;need to retain the `@type` for times
-                      ;;so they will be coerced correctly when loading
-                      (assoc "@type"
-                             (get-s-iri pdt db compact-fn)))
+                      (assoc "@type" (get-s-iri pdt db compact-fn)))
           next-acc (conj acc obj*)]
       (if (seq r)
         (recur r all-refs? next-acc)
