@@ -1,10 +1,12 @@
 (ns fluree.db.reasoner.resolve
   (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.exec.where :as exec-where]
+            [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql :as fql]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
@@ -93,13 +95,34 @@
     {}
     rules))
 
-(defn find-rules
+(defn extract-owl2rl-from-db
+  [db]
+  (async/go
+    (let [all-rules (async/<! (fql/query db nil
+                                         {:select {"?s" ["*"]}
+                                          :where  [["union"
+                                                    {"@id"   "?s",
+                                                     "@type" owl-datalog/$owl-Class}
+                                                    {"@id"   "?s",
+                                                     "@type" owl-datalog/$owl-ObjectProperty}
+                                                    {"@id"   "?s",
+                                                     owl-datalog/$owl-sameAs nil}]]
+                                          :depth  6}))]
+      (if (util/exception? all-rules)
+        (do
+          (log/error "Error extracting owl2rl from db:" (ex-message all-rules))
+          all-rules)
+        ;; blank nodes can be part of OWL logic (nested), but we won't assign class or
+        ;; property names to blank nodes
+        (remove owl-datalog/blank-node? all-rules)))))
+
+(defn rules-from-db
   "Returns core async channel with rules query result"
-  [db regime]
-  (case regime
+  [db method]
+  (case method
     :datalog (fql/query db nil
                         {:select ["?s" "?rule"]
                          :where  {"@id"                           "?s",
                                   "http://flur.ee/ns/ledger#rule" "?rule"}})
-    :owl2rl (async/go owl-datalog/base-rules)))
+    :owl2rl  (extract-owl2rl-from-db db)))
 

@@ -356,18 +356,20 @@
 ;; reasoning APIs
 
 (defn reason
-  "Sets the reasoner type(s) to perform on a db.
+  "Sets the reasoner methods(s) to perform on a db.
+  Supported methods are :datalog and :owl2rl.
+  One or more methods can be supplied as a sequential list/vector.
+
   Reasoning is done in-memory at the db-level and is not persisted.
 
-  Reasoning types currently supported are :datalog and :owl2rl.
-
-  You can give a single reasoning type as an argument, or multiple
-  as a sequential list/vector."
-  ([db regimes] (reason db regimes nil nil))
-  ([db regimes graph] (reason db regimes graph nil))
-  ([db regimes graph opts]
+  A rules graph containing rules in JSON-LD format can be supplied,
+  or if no rules graph is supplied, the rules will be looked for within
+  the db itself."
+  ([db methods] (reason db methods nil nil))
+  ([db methods rules-graph] (reason db methods rules-graph nil))
+  ([db methods rules-graph opts]
    (promise-wrap
-     (reasoner/reason db regimes graph opts))))
+     (reasoner/reason db methods rules-graph opts))))
 
 (defn reasoned-count
   "Returns a count of reasoned facts in the provided db."

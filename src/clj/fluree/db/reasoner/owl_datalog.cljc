@@ -1,21 +1,27 @@
 (ns fluree.db.reasoner.owl-datalog
   (:require [clojure.string :as str]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.util.json :as json]))
 
 ;; conversions of owl statements to datalog
 
+(def ^:const $owl-Thing "http://www.w3.org/2002/07/owl#Thing")
+(def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
+(def ^:const $owl-ObjectProperty "http://www.w3.org/2002/07/owl#ObjectProperty")
+(def ^:const $owl-FunctionalProperty "http://www.w3.org/2002/07/owl#FunctionalProperty")
+(def ^:const $owl-InverseFunctionalProperty "http://www.w3.org/2002/07/owl#InverseFunctionalProperty")
+(def ^:const $owl-SymetricProperty "http://www.w3.org/2002/07/owl#SymetricProperty")
+(def ^:const $owl-TransitiveProperty "http://www.w3.org/2002/07/owl#TransitiveProperty")
+
+(def ^:const $owl-sameAs "http://www.w3.org/2002/07/owl#sameAs")
+
 ;; property expressions
 (def ^:const $rdfs-domain "http://www.w3.org/2000/01/rdf-schema#domain")
 (def ^:const $rdfs-range "http://www.w3.org/2000/01/rdf-schema#range")
 (def ^:const $rdfs-subClassOf "http://www.w3.org/2000/01/rdf-schema#subClassOf")
 (def ^:const $rdfs-subPropertyOf "http://www.w3.org/2000/01/rdf-schema#subPropertyOf")
-(def ^:const $owl-sameAs "http://www.w3.org/2002/07/owl#sameAs")
-(def ^:const $owl-FunctionalProperty "http://www.w3.org/2002/07/owl#FunctionalProperty")
-(def ^:const $owl-InverseFunctionalProperty "http://www.w3.org/2002/07/owl#InverseFunctionalProperty")
-(def ^:const $owl-SymetricProperty "http://www.w3.org/2002/07/owl#SymetricProperty")
-(def ^:const $owl-TransitiveProperty "http://www.w3.org/2002/07/owl#TransitiveProperty")
 (def ^:const $owl-propertyChainAxiom "http://www.w3.org/2002/07/owl#propertyChainAxiom")
 (def ^:const $owl-inverseOf "http://www.w3.org/2002/07/owl#inverseOf")
 (def ^:const $owl-hasKey "http://www.w3.org/2002/07/owl#hasKey")
@@ -34,70 +40,115 @@
 (def ^:const $owl-maxCardinality "http://www.w3.org/2002/07/owl#maxCardinality")
 (def ^:const $owl-maxQualifiedCardinality "http://www.w3.org/2002/07/owl#maxQualifiedCardinality")
 
-(def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
-(def ^:const $owl-Thing "http://www.w3.org/2002/07/owl#Thing")
-
-
 (defn unwrap-list
-  "If values are contained in an @list, unwraps them"
+  "If values are contained in a @list, unwraps them.
+  @list can look like:
+  {ex:someProperty [{@list [ex:val1 ex:val2]}]}
+  or in single-cardinality form:
+  {ex:someProperty {@list [ex:val1 ex:val2]}}"
   [vals]
-  (if-let [list-vals (:list (first vals))]
-    list-vals
-    vals))
+  (let [first-val (if (sequential? vals)
+                    (first vals)
+                    vals)
+        list-vals (when (map? first-val)
+                    (or (:list first-val)
+                        (get first-val "@list")))]
+    (or list-vals
+        vals)))
+
+(defn blank-node-id?
+  [s]
+  (str/starts-with? s parse/blank-node-prefix))
+
+(defn get-first
+  [node key]
+  (let [v (get node key)]
+    (if (sequential? v)
+      (-> v first)
+      v)))
+
+(defn get-id
+  [node]
+  (or (:id node)
+      (get node "@id")))
+
+(defn get-first-id
+  [node key]
+  (let [node' (get-first node key)]
+    (get-id node')))
 
 (defn blank-node?
-  [statement]
-  (when-let [id (:id statement)]
-    (str/starts-with? id "_:")))
+  [node]
+  (-> node
+      get-id
+      blank-node-id?))
+
+(defn get-value
+  [val]
+  (if (map? val)
+    (or (:value val)
+        (get val "@value"))
+    val))
+
+(defn get-first-value
+  [node key]
+  (let [v (get-first node key)]
+    (get-value v)))
+
+(defn get-types
+  [node]
+  (or (:type node)
+      (get node "@type")))
 
 (defn get-all-ids
   "Returns all @id values from either an ordered list or a set of objects.
   Filters out any scalar (@value) values and blank nodes."
   [vals]
-  (->> vals
+  (->> (util/sequential vals)
        unwrap-list
-       (remove blank-node?)
-       (map :id)))
+       (map get-id)
+       (remove blank-node-id?)))
 
 (defn equiv-class-type
   [equiv-class-statement]
-  (cond (some #(= % $owl-Restriction) (:type equiv-class-statement))
-        (cond
-          (contains? equiv-class-statement $owl-hasValue)
-          :has-value
+  (let [statement-id (get-id equiv-class-statement)]
+    (cond (some #(= % $owl-Restriction) (get-types equiv-class-statement))
+          (cond
+            (contains? equiv-class-statement $owl-hasValue)
+            :has-value
 
-          (contains? equiv-class-statement $owl-someValuesFrom)
-          :some-values
+            (contains? equiv-class-statement $owl-someValuesFrom)
+            :some-values
 
-          (contains? equiv-class-statement $owl-allValuesFrom)
-          :all-values
+            (contains? equiv-class-statement $owl-allValuesFrom)
+            :all-values
 
-          (contains? equiv-class-statement $owl-maxCardinality)
-          :max-cardinality
+            (contains? equiv-class-statement $owl-maxCardinality)
+            :max-cardinality
 
-          (contains? equiv-class-statement $owl-maxQualifiedCardinality)
-          :max-qual-cardinality
+            (contains? equiv-class-statement $owl-maxQualifiedCardinality)
+            :max-qual-cardinality
 
-          :else
-          (do
-            (log/warn "Unsupported owl:Restriction" equiv-class-statement)
-            nil))
+            :else
+            (do
+              (log/warn "Unsupported owl:Restriction" equiv-class-statement)
+              nil))
 
-        (contains? equiv-class-statement $owl-oneOf)
-        :one-of
+          (contains? equiv-class-statement $owl-oneOf)
+          :one-of
 
-        (contains? equiv-class-statement $owl-intersectionOf)
-        :intersection-of
+          (contains? equiv-class-statement $owl-intersectionOf)
+          :intersection-of
 
-        (contains? equiv-class-statement $owl-unionOf)
-        :union-of
+          (contains? equiv-class-statement $owl-unionOf)
+          :union-of
 
-        (contains? equiv-class-statement :id)
-        (if (blank-node? equiv-class-statement)
-          :blank-nodes
-          :classes)
+          statement-id
+          (if (blank-node-id? statement-id)
+            :blank-nodes
+            :classes)
 
-        :else nil))
+          :else nil)))
 
 (defmulti to-datalog (fn [rule-type inserts owl-statement all-rules]
                        rule-type))
@@ -107,7 +158,7 @@
   ;; note any owl:sameAs are just inserts into the current db
   ;; the owl:sameAs rule is a base rule for any existing owl:sameAs
   ;; that might already exist in the current db
-  (let [id      (:id owl-statement)
+  (let [id      (get-id owl-statement)
         sa-ids  (-> owl-statement
                     (get $owl-sameAs)
                     get-all-ids)
@@ -130,7 +181,7 @@
   (let [domain   (-> owl-statement
                      (get $rdfs-domain)
                      get-all-ids)
-        property (:id owl-statement)
+        property (get-id owl-statement)
         rule     {"where"  {"@id"    "?s"
                             property nil}
                   "insert" {"@id"   "?s"
@@ -143,7 +194,7 @@
   (let [range    (-> owl-statement
                      (get $rdfs-range)
                      get-all-ids)
-        property (:id owl-statement)
+        property (get-id owl-statement)
         rule     {"where"  {"@id"    nil,
                             property "?ps"}
                   "insert" {"@id"   "?ps"
@@ -153,7 +204,7 @@
 
 (defmethod to-datalog ::prp-fp
   [_ _ owl-statement all-rules]
-  (let [fp   (:id owl-statement)
+  (let [fp   (get-id owl-statement)
         rule {"where"  [{"@id" "?s"
                          fp    "?fp-vals"}
                         {"@id" "?s"
@@ -165,7 +216,7 @@
 
 (defmethod to-datalog ::prp-ifp
   [_ _ owl-statement all-rules]
-  (let [ifp  (:id owl-statement)
+  (let [ifp  (get-id owl-statement)
         rule {"where"  [{"@id" "?x1"
                          ifp   "?y"}
                         {"@id" "?x2"
@@ -177,7 +228,7 @@
 
 (defmethod to-datalog ::prp-symp
   [_ _ owl-statement all-rules]
-  (let [symp (:id owl-statement)
+  (let [symp (get-id owl-statement)
         rule {"where"  [{"@id" "?x"
                          symp  "?y"}]
               "insert" {"@id" "?y"
@@ -186,7 +237,7 @@
 
 (defmethod to-datalog ::prp-trp
   [_ _ owl-statement all-rules]
-  (let [trp  (:id owl-statement)
+  (let [trp  (get-id owl-statement)
         rule {"where"  [{"@id" "?x"
                          trp   "?y"}
                         {"@id" "?y"
@@ -198,7 +249,7 @@
 ;; rdfs:subPropertyOf
 (defmethod to-datalog ::prp-spo1
   [_ inserts owl-statement all-rules]
-  (let [child-prop   (:id owl-statement)
+  (let [child-prop   (get-id owl-statement)
         parent-props (-> owl-statement
                          (get $rdfs-subPropertyOf)
                          get-all-ids)
@@ -221,7 +272,7 @@
 (defmethod to-datalog ::prp-spo2
   [_ _ owl-statement all-rules]
   (try*
-    (let [prop    (:id owl-statement)
+    (let [prop    (get-id owl-statement)
           p-chain (-> owl-statement
                       (get $owl-propertyChainAxiom)
                       get-all-ids)
@@ -252,8 +303,8 @@
 
 (defmethod to-datalog ::prp-inv
   [_ _ owl-statement all-rules]
-  (let [prop     (util/get-first-id owl-statement $owl-inverseOf)
-        inv-prop (:id owl-statement)
+  (let [prop     (get-first-id owl-statement $owl-inverseOf)
+        inv-prop (get-id owl-statement)
         rule1    {"where"  [{"@id" "?x"
                              prop  "?y"}]
                   "insert" {"@id"    "?y"
@@ -287,9 +338,9 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property  (util/get-first-id restriction $owl-onProperty)
-            max-q-val (util/get-first-value restriction $owl-maxQualifiedCardinality)
-            on-class  (util/get-first-id restriction $owl-onClass)
+      (let [property  (get-first-id restriction $owl-onProperty)
+            max-q-val (get-first-value restriction $owl-maxQualifiedCardinality)
+            on-class  (get-first-id restriction $owl-onClass)
             rule      (if (= $owl-Thing on-class)
                         ;; special case for rule cls-maxqc4 where onClass
                         ;; is owl:Thing, means every object of property is sameAs
@@ -330,8 +381,8 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (util/get-first-id restriction $owl-onProperty)
-            max-val  (util/get-first-value restriction $owl-maxCardinality)
+      (let [property (get-first-id restriction $owl-onProperty)
+            max-val  (get-first-value restriction $owl-maxCardinality)
             rule     {"where"  [{"@id"    "?x"
                                  "@type"  rule-class
                                  property "?y1"}
@@ -356,11 +407,11 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (util/get-first-id restriction $owl-onProperty)
-            one-val  (if-let [one-val (util/get-first restriction $owl-hasValue)]
-                       (if-let [one-val-id (:id one-val)]
+      (let [property (get-first-id restriction $owl-onProperty)
+            one-val  (if-let [one-val (get-first restriction $owl-hasValue)]
+                       (if-let [one-val-id (get-id one-val)]
                          {"@id" one-val-id}
-                         (:value one-val)))
+                         (get-value one-val)))
             rule1    {"where"  {"@id"    "?x"
                                 property one-val}
                       "insert" {"@id"   "?x"
@@ -375,7 +426,7 @@
               (conj [(str rule-class "(owl:Restriction-" property "-2)") rule2]))
           (do (log/warn "owl:Restriction for class" rule-class
                         "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
-                        "and owl:hasValue is:" (util/get-first restriction $owl-hasValue)
+                        "and owl:hasValue is:" (get-first restriction $owl-hasValue)
                         ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
                         "hasValue must exist, but can be an IRI or literal value.")
               acc))))
@@ -387,8 +438,8 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (util/get-first-id restriction $owl-onProperty)
-            all-val  (util/get-first-id restriction $owl-allValuesFrom)
+      (let [property (get-first-id restriction $owl-onProperty)
+            all-val  (get-first-id restriction $owl-allValuesFrom)
             rule     {"where"  {"@id"    "?x"
                                 property "?y"}
                       "insert" {"@id"   "?y"
@@ -397,7 +448,7 @@
           (conj acc [(str rule-class "(owl:allValuesFrom-" property ")") rule])
           (do (log/warn "owl:Restriction for class" rule-class
                         "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
-                        "and owl:allValuesFrom is:" (util/get-first restriction $owl-allValuesFrom)
+                        "and owl:allValuesFrom is:" (get-first restriction $owl-allValuesFrom)
                         ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
                         "allValuesFrom must exist and must be an IRI.")
               acc))))
@@ -414,7 +465,7 @@
   [binding-var some-values-statements]
   (reduce
     (fn [acc some-values-statement]
-      (let [property (util/get-first-id some-values-statement $owl-onProperty)
+      (let [property (get-first-id some-values-statement $owl-onProperty)
             {:keys [classes union-of]} (group-by equiv-class-type (get some-values-statement $owl-someValuesFrom))]
         (cond
           classes
@@ -422,7 +473,7 @@
               (conj {"@id"    binding-var
                      property "?_some-val-rel"}) ;; choosing a binding var name unlikely to collide
               (conj {"@id"   "?_some-val-rel"
-                     "@type" (-> classes first :id)}))
+                     "@type" (-> classes first (get "@id"))}))
 
           union-of
           (-> acc
@@ -452,11 +503,11 @@
   [binding-var has-value-statements]
   (reduce
     (fn [acc has-value-statement]
-      (let [property (util/get-first-id has-value-statement $owl-onProperty)
-            one-val  (if-let [one-val (util/get-first has-value-statement $owl-hasValue)]
-                       (if-let [one-val-id (:id one-val)]
+      (let [property (get-first-id has-value-statement $owl-onProperty)
+            one-val  (if-let [one-val (get-first has-value-statement $owl-hasValue)]
+                       (if-let [one-val-id (get-id one-val)]
                          {"@id" one-val-id}
-                         (:value one-val)))]
+                         (get-value one-val)))]
         (conj acc {"@id"    binding-var
                    property one-val})))
     []
@@ -484,12 +535,12 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (util/get-first-id restriction $owl-onProperty)
+      (let [property (get-first-id restriction $owl-onProperty)
             {:keys [classes one-of]} (group-by equiv-class-type (get restriction $owl-someValuesFrom))
             rule     (cond
                        ;; special case where someValuesFrom is owl:Thing, means
                        ;; everything with property should be in the class (cls-svf2)
-                       (and classes (= $owl-Thing (-> classes first :id)))
+                       (and classes (= $owl-Thing (-> classes first get-id)))
                        {"where"  {"@id"    "?x"
                                   property nil}
                         "insert" {"@id"   "?x"
@@ -500,7 +551,7 @@
                        {"where"  [{"@id"    "?x"
                                    property "?y"}
                                   {"@id"   "?y"
-                                   "@type" (-> classes first :id)}]
+                                   "@type" (-> classes first get-id)}]
                         "insert" {"@id"   "?x"
                                   "@type" rule-class}}
 
@@ -513,7 +564,7 @@
           (conj acc [(str rule-class "(owl:someValuesFrom-" property ")") rule])
           (do (log/warn "owl:Restriction for class" rule-class
                         "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
-                        "and owl:someValuesFrom is:" (util/get-first restriction $owl-someValuesFrom)
+                        "and owl:someValuesFrom is:" (get-first restriction $owl-someValuesFrom)
                         ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
                         "someValuesFrom must exist and must be a Class.")
               acc))))
@@ -530,7 +581,7 @@
             restrictions  (cond->> []
                                    has-value (into (has-value-condition "?y" has-value))
                                    some-values (into (some-values-condition "?y" some-values)))
-            class-list    (map :id classes)
+            class-list    (map get-id classes)
             cls-int1      {"where"  (reduce
                                       (fn [acc c]
                                         (conj acc
@@ -575,7 +626,7 @@
                                        "insert" {"@id"   "?y"
                                                  "@type" rule-class}}])
                                    restrictions)
-            class-list        (map :id classes)
+            class-list        (map get-id classes)
             ;; could do optional clauses instead of separate
             ;; opted for separate for now to keep it simple
             ;; and allow for possibly fewer rule triggers with
@@ -621,7 +672,7 @@
 
 (defmethod to-datalog ::cax-eqc
   [_ inserts owl-statement all-rules]
-  (let [c1 (:id owl-statement) ;; the class which is the subject
+  (let [c1 (get-id owl-statement) ;; the class which is the subject
         ;; combine with all other equivalent classes for a set of 2+ total classes
         {:keys [classes intersection-of union-of one-of
                 has-value some-values all-values
@@ -643,7 +694,7 @@
 ;; rdfs:subClassOf
 (defmethod to-datalog ::cax-sco
   [_ inserts owl-statement all-rules]
-  (let [c1         (:id owl-statement) ;; the class which is the subject
+  (let [c1         (get-id owl-statement) ;; the class which is the subject
         class-list (-> owl-statement
                        (get $rdfs-subClassOf)
                        get-all-ids)
@@ -661,7 +712,7 @@
 
 (defmethod to-datalog ::prp-key
   [_ _ owl-statement all-rules]
-  (let [class     (:id owl-statement)
+  (let [class     (get-id owl-statement)
         ;; support props in either @list form, or just as a set of values
         prop-list (-> owl-statement
                       (get $owl-hasKey)
@@ -708,49 +759,74 @@
      "insert" [{"@id" "?s"
                 "?p"  "?o'"}]}]])
 
+(defn property-types
+  [owl-statement]
+  (let [types (get-types owl-statement)]
+    (reduce (fn [acc type]
+              (condp = type
+
+                $owl-FunctionalProperty
+                (assoc acc :functional-property? true)
+
+                $owl-InverseFunctionalProperty
+                (assoc acc :inverse-functional-property? true)
+
+                $owl-SymetricProperty
+                (assoc acc :symetric-property? true)
+
+                $owl-TransitiveProperty
+                (assoc acc :transitive-property? true)
+
+                acc))
+            {}
+            types)))
+
+
 (defn statement->datalog
   [inserts owl-statement]
-  (cond
-    (contains? owl-statement $owl-sameAs) ;; TODO - can probably take this out of multi-fn
-    (to-datalog ::eq-sym inserts owl-statement [])
+  (let [{:keys [functional-property? inverse-functional-property?
+                symetric-property? transitive-property?]} (property-types owl-statement)]
+    (cond
+      (contains? owl-statement $owl-sameAs) ;; TODO - can probably take this out of multi-fn
+      (to-datalog ::eq-sym inserts owl-statement [])
 
-    :else
-    (cond->> []
-             (contains? owl-statement $rdfs-domain)
-             (to-datalog ::prp-dom inserts owl-statement)
+      :else
+      (cond->> []
+               (contains? owl-statement $rdfs-domain)
+               (to-datalog ::prp-dom inserts owl-statement)
 
-             (contains? owl-statement $rdfs-range)
-             (to-datalog ::prp-rng inserts owl-statement)
+               (contains? owl-statement $rdfs-range)
+               (to-datalog ::prp-rng inserts owl-statement)
 
-             (contains? owl-statement $rdfs-subPropertyOf)
-             (to-datalog ::prp-spo1 inserts owl-statement)
+               (contains? owl-statement $rdfs-subPropertyOf)
+               (to-datalog ::prp-spo1 inserts owl-statement)
 
-             (contains? owl-statement $owl-propertyChainAxiom)
-             (to-datalog ::prp-spo2 inserts owl-statement)
+               (contains? owl-statement $owl-propertyChainAxiom)
+               (to-datalog ::prp-spo2 inserts owl-statement)
 
-             (contains? owl-statement $owl-inverseOf)
-             (to-datalog ::prp-inv inserts owl-statement)
+               (contains? owl-statement $owl-inverseOf)
+               (to-datalog ::prp-inv inserts owl-statement)
 
-             (contains? owl-statement $owl-hasKey)
-             (to-datalog ::prp-key inserts owl-statement)
+               (contains? owl-statement $owl-hasKey)
+               (to-datalog ::prp-key inserts owl-statement)
 
-             (contains? owl-statement $rdfs-subClassOf)
-             (to-datalog ::cax-sco inserts owl-statement)
+               (contains? owl-statement $rdfs-subClassOf)
+               (to-datalog ::cax-sco inserts owl-statement)
 
-             (contains? owl-statement $owl-equivalentClass)
-             (to-datalog ::cax-eqc inserts owl-statement)
+               (contains? owl-statement $owl-equivalentClass)
+               (to-datalog ::cax-eqc inserts owl-statement)
 
-             (some #(= $owl-FunctionalProperty %) (:type owl-statement))
-             (to-datalog ::prp-fp inserts owl-statement)
+               functional-property?
+               (to-datalog ::prp-fp inserts owl-statement)
 
-             (some #(= $owl-InverseFunctionalProperty %) (:type owl-statement))
-             (to-datalog ::prp-ifp inserts owl-statement)
+               inverse-functional-property?
+               (to-datalog ::prp-ifp inserts owl-statement)
 
-             (some #(= $owl-SymetricProperty %) (:type owl-statement))
-             (to-datalog ::prp-symp inserts owl-statement)
+               symetric-property?
+               (to-datalog ::prp-symp inserts owl-statement)
 
-             (some #(= $owl-TransitiveProperty %) (:type owl-statement))
-             (to-datalog ::prp-trp inserts owl-statement))))
+               transitive-property?
+               (to-datalog ::prp-trp inserts owl-statement)))))
 
 (defn owl->datalog
   [inserts owl-graph]

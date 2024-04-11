@@ -150,45 +150,52 @@
                   reasoned-db)))))
         db))))
 
-(defmulti rules-from-graph (fn [regime-type inserts graph]
-                             regime-type))
+(defmulti rules-from-graph (fn [method inserts graph]
+                             method))
 
 (defmethod rules-from-graph :datalog
   [_ _ graph]
-  (let [expanded (-> graph
-                     json-ld/expand
-                     util/sequential)]
+  (let []
     (reduce
       (fn [acc rule]
-        (let [id   (:id rule)
-              rule (util/get-first-value rule "http://flur.ee/ns/ledger#rule")]
-          (if rule
-            (conj acc [(or id (parse/new-blank-node-id)) rule])
-            acc)))
+        (if (map? rule)
+          (let [id   (:id rule)
+                rule (util/get-first-value rule "http://flur.ee/ns/ledger#rule")]
+            (if rule
+              (conj acc [(or id (parse/new-blank-node-id)) rule])
+              acc))
+          ;; else already in two-tuple form
+          (conj acc rule)))
       []
-      expanded)))
+      graph)))
 
 (defmethod rules-from-graph :owl2rl
   [_ inserts graph]
-  (let [expanded (-> graph
-                     json-ld/expand
-                     util/sequential)]
-    (log/debug "OWL expanded rules: " expanded)
-    (owl-datalog/owl->datalog inserts expanded)))
+  (let []
+    (log/debug "Reasoner - source OWL rules: " graph)
+    (owl-datalog/owl->datalog inserts graph)))
 
+(defn parse-rules-graph
+  [rules-graph]
+  (-> rules-graph
+      json-ld/expand
+      util/sequential))
 
 (defn all-rules
-  [regimes db inserts graph]
-  (go-try
-    (loop [[regime & r] regimes
-           rules []]
-      (if regime
-        (let [rules* (if graph
-                       (rules-from-graph regime inserts graph)
-                       (<? (resolve/find-rules db regime)))] ;; TODO - need to make regime-specific
-
-          (recur r (into rules rules*)))
-        rules))))
+  "Gets all relevant rules for the specified methods from the
+  supplied rules graph or from the db if no graph is supplied."
+  [methods db inserts supplied-rules]
+  (let [supplied-rules* (when supplied-rules
+                          (parse-rules-graph supplied-rules))]
+    (go-try
+      (loop [[method & r] methods
+             rules []]
+        (if method
+          (let [rules-graph* (or supplied-rules*
+                                 (<? (resolve/rules-from-db db method)))
+                rules*       (rules-from-graph method inserts rules-graph*)]
+            (recur r (into rules rules*)))
+          rules)))))
 
 (defn triples->map
   "Turns triples from same subject (@id) originating from
@@ -239,23 +246,23 @@
           db*)))))
 
 (defn reason
-  [db regimes graph {:keys [max-fuel reasoner-max]
-                     :or   {reasoner-max 10} :as opts}]
+  [db methods rules-graph {:keys [max-fuel reasoner-max]
+                           :or   {reasoner-max 10} :as opts}]
   (go-try
-    (let [regimes         (set (util/sequential regimes))
+    (let [methods*        (set (util/sequential methods))
           fuel-tracker    (fuel/tracker max-fuel)
-          db*             (update db :reasoner #(into regimes %))
+          db*             (update db :reasoner #(into methods* %))
           tx-state        (transact/->tx-state db* nil nil nil)
           inserts         (atom nil)
-          raw-rules       (<? (all-rules regimes db* inserts graph))
-          _               (log/debug "All parsed rules: " raw-rules)
+          raw-rules       (<? (all-rules methods* db* inserts rules-graph))
+          _               (log/debug "Reasoner - extracted rules: " raw-rules)
           reasoning-rules (->> raw-rules
                                (resolve/rules->graph db*)
                                add-rule-dependencies)
           db**            (if-let [inserts* @inserts]
                             (<? (process-inserts db* fuel-tracker inserts*))
                             db*)]
-      (log/trace "Final parsed reasoning rules: " reasoning-rules)
+      (log/trace "Reasoner - parsed rules: " reasoning-rules)
       (if (empty? reasoning-rules)
         db**
         (<? (execute-reasoner db** reasoning-rules fuel-tracker reasoner-max tx-state))))))
