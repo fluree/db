@@ -162,12 +162,12 @@
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
   [t flake]
-  (< t (flake/t flake)))
+  (flake/t-after? (flake/t flake) t))
 
 (defn before-t?
   "Returns `true` if `flake` has a transaction value before the provided `t`"
   [t flake]
-  (> t (flake/t flake)))
+  (flake/t-before? (flake/t flake) t))
 
 (defn filter-after
   "Returns a sequence containing only flakes from the flake set `flakes` with
@@ -175,12 +175,22 @@
   [t flakes]
   (filter (partial after-t? t) flakes))
 
+(defn filter-before
+  [t flakes]
+  (filter (partial before-t? t) flakes))
+
 (defn flakes-through
   "Returns an avl-subset of the avl-set `flakes` with transaction values on or
   before the provided `t`."
   [t flakes]
   (->> flakes
        (filter-after t)
+       (flake/disj-all flakes)))
+
+(defn flakes-after
+  [t flakes]
+  (->> flakes
+       (filter-before (flake/next-t t))
        (flake/disj-all flakes)))
 
 (defn novelty-subrange

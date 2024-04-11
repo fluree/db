@@ -10,5 +10,4 @@
   (-push-event [indexer event-data] "Pushes an index event (map) to all watchers")
   (-close [indexer]  "Shuts down indexer, removes all watches after notification.")
   (-status [indexer]  "Returns current status of reindexing.")
-  (-empty-novelty [indexer db] [indexer db t]"Returns db with emptied novelty, when 't' provided only empties novelty at or before 't'")
   (-reindex [indexer db]  "Executes a full reindex on db."))

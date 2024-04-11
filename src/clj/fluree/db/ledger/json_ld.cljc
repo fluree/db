@@ -15,7 +15,8 @@
             [fluree.db.connection :as connection :refer [register-ledger release-ledger]]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [fluree.db.flake :as flake])
   (:refer-clojure :exclude [load]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -37,15 +38,16 @@
     (when-not branch-meta
       (throw (ex-info (str "Invalid branch: " branch ".")
                       {:status 400 :error :db/invalid-branch})))
-    (branch/latest-db branch-meta)))
+    (branch/current-db branch-meta)))
 
 (defn db-update
   "Updates db, will throw if not next 't' from current db.
   Returns original db, or if index has since been updated then
   updated db with new index point."
   [{:keys [state] :as _ledger} {:keys [branch] :as db}]
-  (-> (swap! state update-in [:branches branch] branch/update-db db)
-      (get-in [:branches branch :latest-db])))
+  (-> state
+      (swap! update-in [:branches branch] branch/update-db db)
+      (get-in [:branches branch :current-db])))
 
 (defn commit-update
   "Updates both latest db and commit db. If latest registered index is
@@ -53,14 +55,15 @@
 
   If index in provided db is newer, updates latest index held in ledger state."
   [{:keys [state] :as ledger} branch-name db]
-  (log/debug "Attempting to update ledger's db with new commit:"
-             (:alias ledger) "branch:" branch-name)
+  (log/debug "Attempting to update ledger:" (:alias ledger)
+             "and branch:" branch-name "with new commit to t" (:t db))
   (when-not (get-in @state [:branches branch-name])
     (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                          "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
                     {:status 400 :error :db/invalid-branch})))
-  (-> (swap! state update-in [:branches branch-name] branch/update-commit db)
-      (get-in [:branches branch-name :commit-db])))
+  (-> state
+      (swap! update-in [:branches branch-name] branch/update-commit db)
+      (get-in [:branches branch-name :current-db])))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
@@ -69,13 +72,13 @@
         branch-data (if requested-branch
                       (get branches requested-branch)
                       (get branches branch))
-        {:keys [latest-db commit]} branch-data
-        {:keys [stats t]} latest-db
+        {:keys [current-db]} branch-data
+        {:keys [commit stats t]} current-db
         {:keys [size flakes]} stats]
     {:address address
      :alias   alias
      :branch  branch
-     :t       (when t (- t))
+     :t       t
      :size    size
      :flakes  flakes
      :commit  commit}))
@@ -89,10 +92,15 @@
 
 (defn commit!
   [ledger db opts]
-  (let [opts* (normalize-opts opts)
-        db*   (or db (ledger/-db ledger (:branch opts*)))]
-    (jld-commit/commit ledger db* opts*)))
-
+  (let [{:keys [branch] :as opts*}
+        (normalize-opts opts)
+        {:keys [t] :as db*} (or db (ledger/-db ledger (:branch opts*)))
+        committed-t                (ledger/latest-commit-t ledger branch)]
+    (if (= t (flake/next-t committed-t))
+      (jld-commit/commit ledger db* opts*)
+      (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
+                           " is no longer consistent with staged db 't' value of: " t ".")
+                      {:status 400 :error :db/invalid-commit})))))
 
 (defn close-ledger
   "Shuts down ledger and resources."
@@ -101,14 +109,6 @@
   (reset! state {:closed? true})
   (reset! cache {})
   (release-ledger conn alias)) ;; remove ledger from conn cache
-
-;; TODO - finalize in-memory db update along with logic to ensure consistent state
-(defn update-local-db
-  "Returns true if update was successful, else false or exception
-  if unexpected exception occurs."
-  [ledger updated-db]
-
-  true)
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because
@@ -122,37 +122,37 @@
           commit-t  (-> expanded-commit
                         (get-first const/iri-data)
                         (get-first-value const/iri-t))
-          latest-db (ledger/-db ledger {:branch branch})
-          latest-t  (- (:t latest-db))]
+          current-db (ledger/-db ledger {:branch branch})
+          current-t  (:t current-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
-                 "where current cached db t value is:" latest-t)
-      ;; note, index updates will have same t value as current one, so still need to check if t = latest-t
+                 "where current cached db t value is:" current-t)
+      ;; note, index updates will have same t value as current one, so still need to check if t = current-t
       (cond
 
-        (= commit-t (inc latest-t))
-        (let [updated-db  (<? (jld-reify/merge-commit conn latest-db false [commit proof]))
+        (= commit-t (flake/next-t current-t))
+        (let [updated-db  (<? (jld-reify/merge-commit conn current-db false [commit proof]))
               commit-map  (commit-data/json-ld->map commit (select-keys updated-db index/types))
               updated-db* (assoc updated-db :commit commit-map)]
           (commit-update ledger branch updated-db*))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
-        (> commit-t (inc latest-t))
+        (flake/t-after? commit-t (flake/next-t current-t))
         (do
           (log/debug "Received commit update that is more than 1 ahead of current ledger state. "
                      "Will dump in-memory ledger and force a reload: " (:alias ledger))
           (close-ledger ledger)
           false)
 
-        (= commit-t latest-t)
+        (= commit-t current-t)
         (do
           (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
-                    " however we already have this commit so not applying: " latest-t)
+                    " however we already have this commit so not applying: " current-t)
           false)
 
-        (< commit-t latest-t)
+        (flake/t-before? commit-t current-t)
         (do
           (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
-                    " however, latest-t is more current: " latest-t)
+                    " however, latest t is more current: " current-t)
           false)))))
 
 (defrecord JsonLDLedger [id address alias did indexer state cache conn reasoner]
@@ -164,10 +164,9 @@
   ledger/iLedger
   (-db [ledger] (db ledger nil))
   (-db [ledger opts] (db ledger opts))
-  (-db-update [ledger db] (db-update ledger db))
   (-branch [ledger] (branch-meta ledger nil))
   (-branch [ledger branch] (branch-meta ledger branch))
-  (-commit-update [ledger branch db] (commit-update ledger branch db))
+  (-commit-update! [ledger branch db] (commit-update ledger branch db))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))
   (-did [_] did)
@@ -183,17 +182,6 @@
           (str/starts-with? ledger-alias "#"))
     (subs ledger-alias 1)
     ledger-alias))
-
-(defn include-dbs
-  [conn db include]
-  (go-try
-    (loop [[commit-address & r] include
-           db* db]
-      (if commit-address
-        (let [commit-tuple (jld-reify/read-commit conn commit-address)
-              db**         (<? (jld-reify/load-db db* commit-tuple true))]
-          (recur r db**))
-        db*))))
 
 
 (defn ->ledger
@@ -227,7 +215,7 @@
           address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
           ;; map of all branches and where they are branched from
-          branches      {branch (branch/new-branch-map nil ledger-alias* branch ns-addresses)}]
+          branches      {branch (branch/new-branch-map ledger-alias* branch ns-addresses)}]
       (map->JsonLDLedger
         {:id      (random-uuid)
          :did     did*
@@ -247,22 +235,15 @@
          :conn    conn}))))
 
 (defn initialize-db!
-  ([ledger]
-   (initialize-db! ledger nil))
-  ([{:keys [conn] :as ledger} include]
-   (go-try
-     (let [db (jld-db/create ledger)]
-       (if (seq include)
-         ;; includes other ledgers - experimental
-         (let [db* (<? (include-dbs conn db include))]
-           (ledger/-db-update ledger db*))
-         (ledger/-db-update ledger db))))))
+  [ledger]
+  (let [db (jld-db/create ledger)]
+    (db-update ledger db)))
 
 (defn create*
-  [conn ledger-alias {:keys [include] :as opts}]
+  [conn ledger-alias opts]
   (go-try
     (let [ledger (<? (->ledger conn ledger-alias opts))]
-      (<? (initialize-db! ledger include))
+      (initialize-db! ledger)
       ledger)))
 
 (defn create
@@ -313,8 +294,8 @@
           branch       (keyword (get-first-value commit const/iri-branch))
           ledger       (<? (create* conn ledger-alias {:branch branch}))
           db           (ledger/-db ledger)
-          db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
-      (ledger/-commit-update ledger branch db*)
+          db*          (<? (jld-reify/load-db-idx ledger db commit commit-addr false))]
+      (ledger/-commit-update! ledger branch db*)
       (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
       (async/put! ledger-chan ledger) ; note, ledger can be an exception!
       ledger)))
