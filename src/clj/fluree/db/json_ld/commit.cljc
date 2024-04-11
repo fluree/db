@@ -48,10 +48,10 @@
                       ;; coerced correctly when loading
                       (datatype/time-type? pdt)
                       (assoc "@type" (get-s-iri pdt db compact-fn)))
-          next-acc (conj acc obj*)]
+          acc' (conj acc obj*)]
       (if (seq r)
-        (recur r all-refs? next-acc)
-        [next-acc all-refs?]))))
+        (recur r all-refs? acc')
+        [acc' all-refs?]))))
 
 (defn- set-refs-type-in-ctx
   [^clojure.lang.Volatile ctx p-iri refs]
@@ -77,10 +77,10 @@
                              (and all-refs? (not list?)) handle-all-refs
                              list?                       handle-list-values
                              (= 1 (count objs))          first)
-          next-acc         (assoc acc p-iri objs*)]
+          acc'         (assoc acc p-iri objs*)]
       (if (seq r)
-        (recur r next-acc)
-        next-acc))))
+        (recur r acc')
+        acc'))))
 
 (defn- did-from-private
   [private-key]
