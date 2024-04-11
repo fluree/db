@@ -1,7 +1,6 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.util.log :as log]
-            [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.policy :as perm]
@@ -84,7 +83,7 @@
   ([db txn author-did]
    (->tx-state db txn author-did nil))
 
-  ([db txn author-did reasoned-from-IRI]
+  ([db txn author-did reasoned-from-iri]
   (let [{:keys [policy], db-t :t} db
 
         commit-t  (-> db :commit commit-data/t)
@@ -98,7 +97,7 @@
                                ; again before committed
      :t             t
      :reasoner-max  10 ; maximum number of reasoner iterations before exception
-     :reasoned      reasoned-from-IRI})))
+     :reasoned      reasoned-from-iri})))
 
 (defn into-flakeset
   [fuel-tracker error-ch flake-ch]
