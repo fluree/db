@@ -31,8 +31,8 @@
 
 ;; TODO - if you branch from an uncommitted branch, and then commit, commit the current-branch too
 (defn new-branch-map
-  "Returns a new branch name for specified branch name off of
-  supplied current-branch."
+  "Returns a new branch map for specified branch name off of supplied
+  current-branch."
   ([ledger-alias branch-name ns-addresses]
    (new-branch-map nil ledger-alias branch-name ns-addresses))
   ([current-branch-map ledger-alias branch-name ns-addresses]
