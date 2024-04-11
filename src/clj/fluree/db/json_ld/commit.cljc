@@ -28,9 +28,9 @@
 
 (defn- subject-block-pred
   [db compact-fn list? p-flakes]
-  (loop [[p-flake & r'] p-flakes
+  (loop [[p-flake & r] p-flakes
          all-refs? nil
-         acc'      nil]
+         acc      nil]
     (let [pdt       (flake/dt p-flake)
           ref?      (= const/$xsd:anyURI pdt)
           [obj all-refs?] (if ref?
@@ -48,10 +48,10 @@
                       ;;so they will be coerced correctly when loading
                       (assoc "@type"
                              (get-s-iri pdt db compact-fn)))
-          next-acc' (conj acc' obj*)]
-      (if (seq r')
-        (recur r' all-refs? next-acc')
-        [next-acc' all-refs?]))))
+          next-acc (conj acc obj*)]
+      (if (seq r)
+        (recur r all-refs? next-acc)
+        [next-acc all-refs?]))))
 
 (defn- set-refs-type-in-ctx
   [^clojure.lang.Volatile ctx p-iri refs]
