@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.api-test
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require #?(:clj  [clojure.test :refer [deftest is testing use-fixtures]]
+               :cljs [cljs.test :refer-macros [deftest is testing async]])
             #?@(:cljs [[clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]])
             [fluree.db.did :as did]
@@ -14,7 +15,7 @@
                       :as twf]
                :cljs [test-with-files.tools :as-alias twf])))
 
-(use-fixtures :each test-utils/deterministic-blank-node-fixture)
+#?(:clj (use-fixtures :each test-utils/deterministic-blank-node-fixture))
 
 (deftest exists?-test
   (testing "returns false before committing data to a ledger"
