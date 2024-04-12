@@ -31,6 +31,14 @@
               db-reason   @(fluree/reason db+ontology :owl2rl)]
 
           (is (not (util/exception? db-reason))
+              "No exceptions should be thrown when reasoning with the entire ontology")))
+
+      (testing "Transact ontology into a different db, then reason"
+        (let [ontology-ledger @(fluree/create conn "reasoner/owl-gist-ontology" nil)
+              ontology-db     @(fluree/stage (fluree/db ontology-ledger) {"insert" gist-ontology})
+              db-reason       @(fluree/reason db-base :owl2rl ontology-db)]
+
+          (is (not (util/exception? db-reason))
               "No exceptions should be thrown when reasoning with the entire ontology"))))))
 
 #_(deftest ^:integration owl-gist-account
