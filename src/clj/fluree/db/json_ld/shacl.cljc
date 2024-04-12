@@ -173,22 +173,23 @@
         (not-empty results)))))
 
 (defn sid-node
+  "Create a value node with the given sid."
   [sid]
   [sid const/$xsd:anyURI])
 
 (defn subject-node
+  "Create a value node out of the subject of a flake."
   [flake]
   (sid-node (flake/s flake)))
 
-;; TODO: rename to object-node
-(defn value-node
-  "Take a flake and create a value node suitable for validation. A value node is a tuple of [value dt]."
+(defn object-node
+  "Take a flake and create a value node out of the object. A value node is a tuple of [value dt]."
   [flake]
   [(flake/o flake) (flake/dt flake)])
 
 (defn resolve-predicate-path
   [data-db focus-node pred-path]
-  (query-range/index-range data-db :spot = [focus-node pred-path] {:flake-xf (map value-node)}))
+  (query-range/index-range data-db :spot = [focus-node pred-path] {:flake-xf (map object-node)}))
 
 (defn resolve-inverse-path
   [data-db focus-node inverse-path]
@@ -275,7 +276,7 @@
             referring-pids  (not-empty (<? (query-range/index-range db :opst = [[sid const/$xsd:anyURI]]
                                                                     {:flake-xf (map flake/p)})))
             p-flakes        (filterv (fn [f] (= (flake/p f) target-pid)) s-flakes)
-            focus-nodes     (mapv value-node p-flakes)]
+            focus-nodes     (mapv object-node p-flakes)]
         ;; TODO: we don't know that these are sids, so we need to use a node layout for focus nodes
         (cond-> (mapv flake/o p-flakes)
           referring-pids (conj sid))))))
@@ -304,9 +305,9 @@
             results          []]
        (if focus-node
          (let [value-nodes (if (= (some-> s-flakes first flake/s) focus-node)
-                             (mapv value-node s-flakes)
+                             (mapv object-node s-flakes)
                              (<? (query-range/index-range data-db :spot = [focus-node]
-                                                          {:flake-xf (map value-node)})))]
+                                                          {:flake-xf (map object-node)})))]
            (if-let [results* (<? (validate-node-shape v-ctx shape focus-node value-nodes))]
              (recur r (into results results*))
              (recur r results)))
@@ -696,7 +697,7 @@
                                   results []]
                              (if node-shape
                                (let [value-nodes (<? (query-range/index-range data-db :spot = [v]
-                                                                              {:flake-xf (map value-node)}))]
+                                                                              {:flake-xf (map object-node)}))]
                                  (if-let [results* (<? (validate-node-shape v-ctx node-shape v value-nodes))]
                                    (recur r (conj results (assoc result
                                                                  :value (display v)
@@ -745,7 +746,7 @@
           ;; build up conforming sids
           (let [focus-node* (if (iri/sid? v) v focus-node)
                 value-nodes* (if (iri/sid? v)
-                               (<? (query-range/index-range data-db :spot = [v] {:flake-xf (map value-node)}))
+                               (<? (query-range/index-range data-db :spot = [v] {:flake-xf (map object-node)}))
                                value-nodes)
                 result (if (property-shape? q-shape)
                          (<? (validate-property-shape v-ctx q-shape focus-node*))
@@ -765,7 +766,7 @@
                                 non-disjoint-conformers* []]
                            (if sib-q-shape
                              (let [value-nodes (<? (query-range/index-range data-db :spot = [conforming-sid]
-                                                                            {:flake-xf (map value-node)}))
+                                                                            {:flake-xf (map object-node)}))
                                    q-result (if (property-shape? sib-q-shape)
                                               (<? (validate-property-shape v-ctx sib-q-shape conforming-sid))
                                               (<? (validate-node-shape v-ctx sib-q-shape conforming-sid value-nodes)))]
