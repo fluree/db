@@ -102,11 +102,11 @@
                                          {:select {"?s" ["*"]}
                                           :where  [["union"
                                                     {"@id"   "?s",
-                                                     "@type" owl-datalog/$owl-Class}
+                                                     "@type" const/iri-owl:Class}
                                                     {"@id"   "?s",
-                                                     "@type" owl-datalog/$owl-ObjectProperty}
+                                                     "@type" const/iri-owl:ObjectProperty}
                                                     {"@id"   "?s",
-                                                     owl-datalog/$owl-sameAs nil}]]
+                                                     const/iri-owl:sameAs nil}]]
                                           :depth  6}))]
       (if (util/exception? all-rules)
         (do

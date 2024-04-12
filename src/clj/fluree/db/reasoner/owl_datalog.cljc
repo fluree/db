@@ -1,43 +1,11 @@
 (ns fluree.db.reasoner.owl-datalog
   (:require [clojure.string :as str]
             [fluree.db.query.fql.parse :as parse]
+            [fluree.db.constants :as const]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
 ;; conversions of owl statements to datalog
-
-(def ^:const $owl-Thing "http://www.w3.org/2002/07/owl#Thing")
-(def ^:const $owl-Class "http://www.w3.org/2002/07/owl#Class")
-(def ^:const $owl-ObjectProperty "http://www.w3.org/2002/07/owl#ObjectProperty")
-(def ^:const $owl-FunctionalProperty "http://www.w3.org/2002/07/owl#FunctionalProperty")
-(def ^:const $owl-InverseFunctionalProperty "http://www.w3.org/2002/07/owl#InverseFunctionalProperty")
-(def ^:const $owl-SymetricProperty "http://www.w3.org/2002/07/owl#SymetricProperty")
-(def ^:const $owl-TransitiveProperty "http://www.w3.org/2002/07/owl#TransitiveProperty")
-
-(def ^:const $owl-sameAs "http://www.w3.org/2002/07/owl#sameAs")
-
-;; property expressions
-(def ^:const $rdfs-domain "http://www.w3.org/2000/01/rdf-schema#domain")
-(def ^:const $rdfs-range "http://www.w3.org/2000/01/rdf-schema#range")
-(def ^:const $rdfs-subClassOf "http://www.w3.org/2000/01/rdf-schema#subClassOf")
-(def ^:const $rdfs-subPropertyOf "http://www.w3.org/2000/01/rdf-schema#subPropertyOf")
-(def ^:const $owl-propertyChainAxiom "http://www.w3.org/2002/07/owl#propertyChainAxiom")
-(def ^:const $owl-inverseOf "http://www.w3.org/2002/07/owl#inverseOf")
-(def ^:const $owl-hasKey "http://www.w3.org/2002/07/owl#hasKey")
-
-;; class expressions
-(def ^:const $owl-equivalentClass "http://www.w3.org/2002/07/owl#equivalentClass")
-(def ^:const $owl-intersectionOf "http://www.w3.org/2002/07/owl#intersectionOf")
-(def ^:const $owl-unionOf "http://www.w3.org/2002/07/owl#unionOf")
-(def ^:const $owl-Restriction "http://www.w3.org/2002/07/owl#Restriction")
-(def ^:const $owl-onProperty "http://www.w3.org/2002/07/owl#onProperty")
-(def ^:const $owl-onClass "http://www.w3.org/2002/07/owl#onClass")
-(def ^:const $owl-oneOf "http://www.w3.org/2002/07/owl#oneOf")
-(def ^:const $owl-hasValue "http://www.w3.org/2002/07/owl#hasValue")
-(def ^:const $owl-someValuesFrom "http://www.w3.org/2002/07/owl#someValuesFrom")
-(def ^:const $owl-allValuesFrom "http://www.w3.org/2002/07/owl#allValuesFrom")
-(def ^:const $owl-maxCardinality "http://www.w3.org/2002/07/owl#maxCardinality")
-(def ^:const $owl-maxQualifiedCardinality "http://www.w3.org/2002/07/owl#maxQualifiedCardinality")
 
 (defn unwrap-list
   "If values are contained in a @list, unwraps them.
@@ -124,21 +92,21 @@
 (defn equiv-class-type
   [equiv-class-statement]
   (let [statement-id (get-id equiv-class-statement)]
-    (cond (some #(= % $owl-Restriction) (get-types equiv-class-statement))
+    (cond (some #(= % const/iri-owl:Restriction) (get-types equiv-class-statement))
           (cond
-            (contains? equiv-class-statement $owl-hasValue)
+            (contains? equiv-class-statement const/iri-owl:hasValue)
             :has-value
 
-            (contains? equiv-class-statement $owl-someValuesFrom)
+            (contains? equiv-class-statement const/iri-owl:someValuesFrom)
             :some-values
 
-            (contains? equiv-class-statement $owl-allValuesFrom)
+            (contains? equiv-class-statement const/iri-owl:allValuesFrom)
             :all-values
 
-            (contains? equiv-class-statement $owl-maxCardinality)
+            (contains? equiv-class-statement const/iri-owl:maxCardinality)
             :max-cardinality
 
-            (contains? equiv-class-statement $owl-maxQualifiedCardinality)
+            (contains? equiv-class-statement const/iri-owl:maxQualifiedCardinality)
             :max-qual-cardinality
 
             :else
@@ -146,13 +114,13 @@
               (log/warn "Unsupported owl:Restriction" equiv-class-statement)
               nil))
 
-          (contains? equiv-class-statement $owl-oneOf)
+          (contains? equiv-class-statement const/iri-owl:oneOf)
           :one-of
 
-          (contains? equiv-class-statement $owl-intersectionOf)
+          (contains? equiv-class-statement const/iri-owl:intersectionOf)
           :intersection-of
 
-          (contains? equiv-class-statement $owl-unionOf)
+          (contains? equiv-class-statement const/iri-owl:unionOf)
           :union-of
 
           statement-id
@@ -172,14 +140,14 @@
   ;; that might already exist in the current db
   (let [id      (get-id owl-statement)
         sa-ids  (-> owl-statement
-                    (get $owl-sameAs)
+                    (get const/iri-owl:sameAs)
                     get-all-ids)
-        rule-id (str $owl-sameAs "(" id ")")
+        rule-id (str const/iri-owl:sameAs "(" id ")")
         triples (->> sa-ids
                      (mapcat (fn [sa-id]
                                ;; insert triples both ways
-                               [[id $owl-sameAs {"@id" sa-id}]
-                                [sa-id $owl-sameAs {"@id" id}]]))
+                               [[id const/iri-owl:sameAs {"@id" sa-id}]
+                                [sa-id const/iri-owl:sameAs {"@id" id}]]))
                      set)]
 
     ;; insert sameAs triples into inserts atom
@@ -193,7 +161,7 @@
   [_ _ owl-statement all-rules]
   (let [property (get-id owl-statement)
         domain   (-> owl-statement
-                     (get $rdfs-domain)
+                     (get const/iri-rdfs:domain)
                      get-all-ids)
         rule     {"where"  {"@id"    "?s"
                             property nil}
@@ -210,7 +178,7 @@
 (defmethod to-datalog ::prp-rng
   [_ _ owl-statement all-rules]
   (let [range    (-> owl-statement
-                     (get $rdfs-range)
+                     (get const/iri-rdfs:range)
                      get-all-ids)
         property (get-id owl-statement)
         rule     {"where"  {"@id"    nil,
@@ -233,9 +201,9 @@
                         {"@id" "?s"
                          fp    "?fp-vals2"}
                         ["filter" "(not= ?fp-vals ?fp-vals2)"]]
-              "insert" {"@id"       "?fp-vals"
-                        $owl-sameAs "?fp-vals2"}}]
-    (conj all-rules [(str $owl-FunctionalProperty "(" fp ")") rule])))
+              "insert" {"@id"                "?fp-vals"
+                        const/iri-owl:sameAs "?fp-vals2"}}]
+    (conj all-rules [(str const/iri-owl:FunctionalProperty "(" fp ")") rule])))
 
 ;; owl:InverseFunctionalProperty
 (defmethod to-datalog ::prp-ifp
@@ -246,9 +214,9 @@
                         {"@id" "?x2"
                          ifp   "?y"}
                         ["filter" "(not= ?x1 ?x2)"]]
-              "insert" {"@id"       "?x1"
-                        $owl-sameAs "?x2"}}]
-    (conj all-rules [(str $owl-InverseFunctionalProperty "(" ifp ")") rule])))
+              "insert" {"@id"                "?x1"
+                        const/iri-owl:sameAs "?x2"}}]
+    (conj all-rules [(str const/iri-owl:InverseFunctionalProperty "(" ifp ")") rule])))
 
 ;;owl:SymetricProperty
 (defmethod to-datalog ::prp-symp
@@ -277,10 +245,10 @@
   [_ inserts owl-statement all-rules]
   (let [child-prop   (get-id owl-statement)
         parent-props (-> owl-statement
-                         (get $rdfs-subPropertyOf)
+                         (get const/iri-rdfs:subPropertyOf)
                          get-all-ids)
         triples      (mapv (fn [parent-prop]
-                             [child-prop $rdfs-subPropertyOf {"@id" parent-prop}])
+                             [child-prop const/iri-rdfs:subPropertyOf {"@id" parent-prop}])
                            parent-props)
         rule-id      (str child-prop "(rdfs:subPropertyOf)")]
 
@@ -300,7 +268,7 @@
   (try*
     (let [prop    (get-id owl-statement)
           p-chain (-> owl-statement
-                      (get $owl-propertyChainAxiom)
+                      (get const/iri-owl:propertyChainAxiom)
                       get-all-ids)
           where   (->> p-chain
                        (map-indexed (fn [idx p-n]
@@ -329,7 +297,7 @@
 
 (defmethod to-datalog ::prp-inv
   [_ _ owl-statement all-rules]
-  (let [prop     (get-first-id owl-statement $owl-inverseOf)
+  (let [prop     (get-first-id owl-statement const/iri-owl:inverseOf)
         inv-prop (get-id owl-statement)
         rule1    {"where"  [{"@id" "?x"
                              prop  "?y"}]
@@ -364,10 +332,10 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property  (get-first-id restriction $owl-onProperty)
-            max-q-val (get-first-value restriction $owl-maxQualifiedCardinality)
-            on-class  (get-first-id restriction $owl-onClass)
-            rule      (if (= $owl-Thing on-class)
+      (let [property  (get-first-id restriction const/iri-owl:onProperty)
+            max-q-val (get-first-value restriction const/iri-owl:maxQualifiedCardinality)
+            on-class  (get-first-id restriction const/iri-owl:onClass)
+            rule      (if (= const/iri-owl:Thing on-class)
                         ;; special case for rule cls-maxqc4 where onClass
                         ;; is owl:Thing, means every object of property is sameAs
                         {"where"  [{"@id"    "?u"
@@ -376,8 +344,8 @@
                                    {"@id"    "?u"
                                     property "?y2"}
                                    ["filter" "(not= ?y1 ?y2)"]]
-                         "insert" {"@id"       "?y1"
-                                   $owl-sameAs "?y2"}}
+                         "insert" {"@id"                "?y1"
+                                   const/iri-owl:sameAs "?y2"}}
                         ;; standard case for rule cls-maxqc3
                         {"where"  [{"@id"    "?u"
                                     "@type"  rule-class
@@ -389,8 +357,8 @@
                                    {"@id"   "?y2"
                                     "@type" on-class}
                                    ["filter" "(not= ?y1 ?y2)"]]
-                         "insert" {"@id"       "?y1"
-                                   $owl-sameAs "?y2"}})]
+                         "insert" {"@id"                "?y1"
+                                   const/iri-owl:sameAs "?y2"}})]
         (if (and property on-class (= 1 max-q-val))
           (conj acc [(str rule-class "(owl:maxQualifiedCardinality-" property ")") rule])
           (do (log/info "owl:Restriction for class" rule-class
@@ -407,8 +375,8 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (get-first-id restriction $owl-onProperty)
-            max-val  (get-first-value restriction $owl-maxCardinality)
+      (let [property (get-first-id restriction const/iri-owl:onProperty)
+            max-val  (get-first-value restriction const/iri-owl:maxCardinality)
             rule     {"where"  [{"@id"    "?x"
                                  "@type"  rule-class
                                  property "?y1"}
@@ -416,8 +384,8 @@
                                  "@type"  rule-class
                                  property "?y2"}
                                 ["filter" "(not= ?y1 ?y2)"]]
-                      "insert" {"@id"       "?y1"
-                                $owl-sameAs "?y2"}}]
+                      "insert" {"@id"                "?y1"
+                                const/iri-owl:sameAs "?y2"}}]
         (if (and property (= 1 max-val))
           (conj acc [(str rule-class "(owl:maxCardinality-" property ")") rule])
           (do (log/info "owl:Restriction for class" rule-class
@@ -433,8 +401,8 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (get-first-id restriction $owl-onProperty)
-            one-val  (if-let [one-val (get-first restriction $owl-hasValue)]
+      (let [property (get-first-id restriction const/iri-owl:onProperty)
+            one-val  (if-let [one-val (get-first restriction const/iri-owl:hasValue)]
                        (if-let [one-val-id (get-id one-val)]
                          {"@id" one-val-id}
                          (get-value one-val)))
@@ -451,8 +419,8 @@
               (conj [(str rule-class "(owl:Restriction-" property "-1)") rule1])
               (conj [(str rule-class "(owl:Restriction-" property "-2)") rule2]))
           (do (log/warn "owl:Restriction for class" rule-class
-                        "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
-                        "and owl:hasValue is:" (get-first restriction $owl-hasValue)
+                        "is not properly defined. owl:onProperty is:" (get restriction const/iri-owl:onProperty)
+                        "and owl:hasValue is:" (get-first restriction const/iri-owl:hasValue)
                         ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
                         "hasValue must exist, but can be an IRI or literal value.")
               acc))))
@@ -464,8 +432,8 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (get-first-id restriction $owl-onProperty)
-            all-val  (get-first-id restriction $owl-allValuesFrom)
+      (let [property (get-first-id restriction const/iri-owl:onProperty)
+            all-val  (get-first-id restriction const/iri-owl:allValuesFrom)
             rule     {"where"  {"@id"    "?x"
                                 property "?y"}
                       "insert" {"@id"   "?y"
@@ -473,8 +441,8 @@
         (if (and property all-val)
           (conj acc [(str rule-class "(owl:allValuesFrom-" property ")") rule])
           (do (log/warn "owl:Restriction for class" rule-class
-                        "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
-                        "and owl:allValuesFrom is:" (get-first restriction $owl-allValuesFrom)
+                        "is not properly defined. owl:onProperty is:" (get restriction const/iri-owl:onProperty)
+                        "and owl:allValuesFrom is:" (get-first restriction const/iri-owl:allValuesFrom)
                         ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
                         "allValuesFrom must exist and must be an IRI.")
               acc))))
@@ -491,8 +459,8 @@
   [binding-var some-values-statements]
   (reduce
     (fn [acc some-values-statement]
-      (let [property (get-first-id some-values-statement $owl-onProperty)
-            {:keys [classes union-of]} (group-by equiv-class-type (get some-values-statement $owl-someValuesFrom))]
+      (let [property (get-first-id some-values-statement const/iri-owl:onProperty)
+            {:keys [classes union-of]} (group-by equiv-class-type (get some-values-statement const/iri-owl:someValuesFrom))]
         (cond
           classes
           (let [target-type (-> classes first get-id)]
@@ -514,7 +482,7 @@
                               (conj acc {"@id"   "?_some-val-rel"
                                          "@type" {"@id" i}}))
                             ["union"]
-                            (-> union-of first (get $owl-unionOf) get-all-ids))))
+                            (-> union-of first (get const/iri-owl:unionOf) get-all-ids))))
 
           :else
           (do (log/warn "Ignoring some rules from nested owl:someValuesFrom values."
@@ -534,8 +502,8 @@
   [binding-var has-value-statements]
   (reduce
     (fn [acc has-value-statement]
-      (let [property (get-first-id has-value-statement $owl-onProperty)
-            one-val  (if-let [one-val (get-first has-value-statement $owl-hasValue)]
+      (let [property (get-first-id has-value-statement const/iri-owl:onProperty)
+            one-val  (if-let [one-val (get-first has-value-statement const/iri-owl:hasValue)]
                        (if-let [one-val-id (get-id one-val)]
                          {"@id" one-val-id}
                          (get-value one-val)))]
@@ -550,7 +518,7 @@
   Assume just a single one-of-statement is passed in, not a list."
   [binding-var property one-of-statement]
   (let [individuals (-> one-of-statement
-                        (get $owl-oneOf)
+                        (get const/iri-owl:oneOf)
                         get-all-ids)]
     (reduce (fn [acc i]
               (conj acc {"@id"    binding-var
@@ -566,12 +534,12 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (get-first-id restriction $owl-onProperty)
-            {:keys [classes one-of]} (group-by equiv-class-type (get restriction $owl-someValuesFrom))
+      (let [property (get-first-id restriction const/iri-owl:onProperty)
+            {:keys [classes one-of]} (group-by equiv-class-type (get restriction const/iri-owl:someValuesFrom))
             rule     (cond
                        ;; special case where someValuesFrom is owl:Thing, means
                        ;; everything with property should be in the class (cls-svf2)
-                       (and classes (= $owl-Thing (-> classes first get-id)))
+                       (and classes (= const/iri-owl:Thing (-> classes first get-id)))
                        {"where"  {"@id"    "?x"
                                   property nil}
                         "insert" {"@id"   "?x"
@@ -594,8 +562,8 @@
         (if rule
           (conj acc [(str rule-class "(owl:someValuesFrom-" property ")") rule])
           (do (log/warn "owl:Restriction for class" rule-class
-                        "is not properly defined. owl:onProperty is:" (get restriction $owl-onProperty)
-                        "and owl:someValuesFrom is:" (get-first restriction $owl-someValuesFrom)
+                        "is not properly defined. owl:onProperty is:" (get restriction const/iri-owl:onProperty)
+                        "and owl:someValuesFrom is:" (get-first restriction const/iri-owl:someValuesFrom)
                         ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
                         "someValuesFrom must exist and must be a Class.")
               acc))))
@@ -607,7 +575,7 @@
   [rule-class intersection-of-statements inserts]
   (reduce
     (fn [acc intersection-of-statement]
-      (let [intersections (unwrap-list (get intersection-of-statement $owl-intersectionOf))
+      (let [intersections (unwrap-list (get intersection-of-statement const/iri-owl:intersectionOf))
             {:keys [classes has-value some-values]} (group-by equiv-class-type intersections)
             restrictions  (cond->> []
                                    has-value (into (has-value-condition "?y" has-value))
@@ -630,7 +598,7 @@
 
             triples       (reduce
                             (fn [triples* c]
-                              (conj triples* [rule-class $rdfs-subClassOf {"@id" c}]))
+                              (conj triples* [rule-class const/iri-rdfs:subClassOf {"@id" c}]))
                             []
                             class-list)]
 
@@ -647,7 +615,7 @@
   [rule-class union-of-statements inserts]
   (reduce
     (fn [acc union-of-statement]
-      (let [unions            (unwrap-list (get union-of-statement $owl-unionOf))
+      (let [unions            (unwrap-list (get union-of-statement const/iri-owl:unionOf))
             {:keys [classes has-value]} (group-by equiv-class-type unions)
             restrictions      (cond->> []
                                        has-value (into (has-value-condition "?y" has-value)))
@@ -673,7 +641,7 @@
 
             triples           (reduce
                                 (fn [triples* c]
-                                  (conj triples* [c $rdfs-subClassOf {"@id" rule-class}]))
+                                  (conj triples* [c const/iri-rdfs:subClassOf {"@id" rule-class}]))
                                 []
                                 class-list)]
 
@@ -689,7 +657,7 @@
   [rule-class one-of-statements inserts]
   (let [triples (reduce (fn [acc one-of-statement]
                           (let [individuals (-> one-of-statement
-                                                (get $owl-oneOf)
+                                                (get const/iri-owl:oneOf)
                                                 get-all-ids)
                                 triples     (map (fn [i]
                                                    [i "@type" rule-class])
@@ -708,7 +676,7 @@
         ;; combine with all other equivalent classes for a set of 2+ total classes
         {:keys [classes intersection-of union-of one-of
                 has-value some-values all-values
-                max-cardinality max-qual-cardinality]} (->> (get owl-statement $owl-equivalentClass)
+                max-cardinality max-qual-cardinality]} (->> (get owl-statement const/iri-owl:equivalentClass)
                                                             unwrap-list
                                                             (group-by equiv-class-type))]
     (cond-> all-rules
@@ -728,11 +696,11 @@
   [_ inserts owl-statement all-rules]
   (let [c1         (get-id owl-statement) ;; the class which is the subject
         class-list (-> owl-statement
-                       (get $rdfs-subClassOf)
+                       (get const/iri-rdfs:subClassOf)
                        get-all-ids)
         triples    (reduce
                      (fn [triples* c]
-                       (conj triples* [c1 $rdfs-subClassOf {"@id" c}]))
+                       (conj triples* [c1 const/iri-rdfs:subClassOf {"@id" c}]))
                      []
                      class-list)]
 
@@ -747,7 +715,7 @@
   (let [class     (get-id owl-statement)
         ;; support props in either @list form, or just as a set of values
         prop-list (-> owl-statement
-                      (get $owl-hasKey)
+                      (get const/iri-owl:hasKey)
                       get-all-ids)
         where     (->> prop-list
                        (map-indexed (fn [idx prop]
@@ -756,10 +724,10 @@
         rule      {"where"  [(assoc where "@id" "?x")
                              (assoc where "@id" "?y")
                              ["filter" "(not= ?x ?y)"]]
-                   "insert" [{"@id"       "?x"
-                              $owl-sameAs "?y"}
-                             {"@id"       "?y"
-                              $owl-sameAs "?x"}]}]
+                   "insert" [{"@id"                "?x"
+                              const/iri-owl:sameAs "?y"}
+                             {"@id"                "?y"
+                              const/iri-owl:sameAs "?x"}]}]
     (conj all-rules [(str class "(owl:hasKey)#" (hash prop-list)) rule])))
 
 (defmethod to-datalog :default
@@ -769,23 +737,23 @@
 (def base-rules
   [
    ;; eq-sym, eq-trans, eq-rep-s covered by below rule
-   [(str $owl-sameAs "(eq)")
-    {"where"  [{"@id"       "?s"
-                $owl-sameAs "?s'"}
+   [(str const/iri-owl:sameAs "(eq)")
+    {"where"  [{"@id"                "?s"
+                const/iri-owl:sameAs "?s'"}
                {"@id" "?s"
                 "?p"  "?o"}
                {"@id" "?s'"
                 "?p'" "?o'"}]
      "insert" [{"@id" "?s'"
                 "?p"  "?o"}
-               {"@id"       "?s'"
-                $owl-sameAs {"@id" "?s"}}
+               {"@id"                "?s'"
+                const/iri-owl:sameAs {"@id" "?s"}}
                {"@id" "?s"
                 "?p'" "?o'"}]}]
    ;; eq-rep-o covered by below rule
-   [(str $owl-sameAs "(eq-rep-o)")
-    {"where"  [{"@id"       "?o"
-                $owl-sameAs "?o'"}
+   [(str const/iri-owl:sameAs "(eq-rep-o)")
+    {"where"  [{"@id"                "?o"
+                const/iri-owl:sameAs "?o'"}
                {"@id" "?s"
                 "?p"  "?o"}]
      "insert" [{"@id" "?s"
@@ -797,16 +765,16 @@
     (reduce (fn [acc type]
               (condp = type
 
-                $owl-FunctionalProperty
+                const/iri-owl:FunctionalProperty
                 (assoc acc :functional-property? true)
 
-                $owl-InverseFunctionalProperty
+                const/iri-owl:InverseFunctionalProperty
                 (assoc acc :inverse-functional-property? true)
 
-                $owl-SymetricProperty
+                const/iri-owl:SymetricProperty
                 (assoc acc :symetric-property? true)
 
-                $owl-TransitiveProperty
+                const/iri-owl:TransitiveProperty
                 (assoc acc :transitive-property? true)
 
                 acc))
@@ -820,33 +788,33 @@
     (let [{:keys [functional-property? inverse-functional-property?
                   symetric-property? transitive-property?]} (property-types owl-statement)]
       (cond
-        (contains? owl-statement $owl-sameAs) ;; TODO - can probably take this out of multi-fn
+        (contains? owl-statement const/iri-owl:sameAs) ;; TODO - can probably take this out of multi-fn
         (to-datalog ::eq-sym inserts owl-statement [])
 
         :else
         (cond->> []
-                 (contains? owl-statement $rdfs-domain)
+                 (contains? owl-statement const/iri-rdfs:domain)
                  (to-datalog ::prp-dom inserts owl-statement)
 
-                 (contains? owl-statement $rdfs-range)
+                 (contains? owl-statement const/iri-rdfs:range)
                  (to-datalog ::prp-rng inserts owl-statement)
 
-                 (contains? owl-statement $rdfs-subPropertyOf)
+                 (contains? owl-statement const/iri-rdfs:subPropertyOf)
                  (to-datalog ::prp-spo1 inserts owl-statement)
 
-                 (contains? owl-statement $owl-propertyChainAxiom)
+                 (contains? owl-statement const/iri-owl:propertyChainAxiom)
                  (to-datalog ::prp-spo2 inserts owl-statement)
 
-                 (contains? owl-statement $owl-inverseOf)
+                 (contains? owl-statement const/iri-owl:inverseOf)
                  (to-datalog ::prp-inv inserts owl-statement)
 
-                 (contains? owl-statement $owl-hasKey)
+                 (contains? owl-statement const/iri-owl:hasKey)
                  (to-datalog ::prp-key inserts owl-statement)
 
-                 (contains? owl-statement $rdfs-subClassOf)
+                 (contains? owl-statement const/iri-rdfs:subClassOf)
                  (to-datalog ::cax-sco inserts owl-statement)
 
-                 (contains? owl-statement $owl-equivalentClass)
+                 (contains? owl-statement const/iri-owl:equivalentClass)
                  (to-datalog ::cax-eqc inserts owl-statement)
 
                  functional-property?

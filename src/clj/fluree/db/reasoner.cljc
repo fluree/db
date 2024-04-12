@@ -9,6 +9,7 @@
             [fluree.db.reasoner.resolve :as resolve]
             [fluree.db.json-ld.transact :as transact]
             [fluree.db.fuel :as fuel]
+            [fluree.db.constants :as const]
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
@@ -86,7 +87,7 @@
   allowed you to filter 'o' values that are equal to 's' values
   but until that works. this addresses the issue."
   [rule-id new-flakes]
-  (if (str/starts-with? rule-id (str owl-datalog/$owl-sameAs "(trans)"))
+  (if (str/starts-with? rule-id (str const/iri-owl:sameAs "(trans)"))
     (reduce
       (fn [acc new-flake]
         (if (= (flake/s new-flake) (flake/o new-flake))
