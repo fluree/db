@@ -11,7 +11,6 @@
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log :include-macros true]
             [clojure.core.async :as async]))
 
@@ -100,7 +99,7 @@
            db                      (db/create ledger)]
       (if commit-tuple
         (let [merged-db     (<? (merge-commit conn db commit-tuple))
-              update-commit (commit/update-commit-fn merged-db commit-opts)
+              update-commit (commit/update-commit-fn ledger merged-db commit-opts)
               indexed-db    (<? (indexer/do-index indexer merged-db
                                                   {:changes-ch    ch
                                                    :update-commit update-commit}))]
@@ -127,5 +126,5 @@
                                 async/merge
                                 (async/pipe changes-ch))
           db                (<? (merge-commits ledger commit-opts* tuples-chans))]
-      (ledger/-db-update ledger db)
+      (jld-ledger/db-update ledger db)
       ledger)))

@@ -38,17 +38,68 @@
      (ex-info (str "variable " x " is not bound in where nor values clause")
               {:status 400, :error :db/invalid-transaction}))))
 
+(defn expand-keys
+  [m context]
+  (reduce-kv (fn [expanded p o]
+               (let [p* (if (v/variable? p)
+                          p
+                          (json-ld/expand-iri p context))]
+                 (assoc expanded p* o)))
+             {} m))
+
+(defn get-expanded-datatype
+  [attrs context]
+  (some-> attrs
+          (get const/iri-type)
+          (json-ld/expand-iri context)))
+
+(defn parse-value-datatype
+  [v attrs context]
+  (if-let [dt-iri (get-expanded-datatype attrs context)]
+    (if (= const/iri-anyURI dt-iri)
+      (-> v
+          (json-ld/expand-iri context)
+          (where/anonymous-value dt-iri))
+      (where/anonymous-value v dt-iri))
+    (where/anonymous-value v)))
+
+(defn parse-value-attributes
+  [v attrs context]
+  (let [mch (parse-value-datatype v attrs context)]
+    (if-let [lang (get attrs const/iri-language)]
+      (let [lang-matcher (where/lang-matcher lang)]
+        (where/with-filter mch lang-matcher))
+      mch)))
+
+(defn match-value-binding-map
+  [var-match binding-map context]
+  (let [attrs (expand-keys binding-map context)
+        val   (get attrs const/iri-value)]
+    (if-let [dt-iri (get-expanded-datatype attrs context)]
+      (if (= const/iri-anyURI dt-iri)
+        (let [expanded (json-ld/expand-iri val context)]
+          (where/match-iri var-match expanded))
+        (where/match-value var-match val dt-iri))
+      (let [dt (datatype/infer-iri val)]
+        (where/match-value var-match val dt)))))
+
+(defn match-value-binding
+  [var-match value context]
+  (if (map? value)
+    (match-value-binding-map var-match value context)
+    (let [dt (datatype/infer-iri value)]
+      (where/match-value var-match value dt))))
+
 (defn parse-value-binding
-  [vars vals]
-  (let [var-matches (mapv parse-variable vars)
-        binding     (mapv (fn [var-match value]
-                            (let [dt (datatype/infer-iri value)]
-                              (where/match-value var-match value dt)))
-                          var-matches vals)]
+  [vars vals context]
+  (let [var-matches (map parse-variable vars)
+        binding     (map (fn [var-match val]
+                           (match-value-binding var-match val context))
+                         var-matches vals)]
     (zipmap vars binding)))
 
 (defn parse-values
-  [q]
+  [q context]
   (when-let [values (:values q)]
     (let [[vars vals] values
           vars*     (keep parse-var-name (util/sequential vars))
@@ -57,7 +108,8 @@
       (if (every? (fn [binding]
                     (= (count binding) var-count))
                   vals*)
-        [vars* (mapv (partial parse-value-binding vars*)
+        [vars* (mapv (fn [vals**]
+                       (parse-value-binding vars* vals** context))
                      vals*)]
         (throw (ex-info (str "Invalid value binding: "
                              "number of variables and values don't match: "
@@ -180,22 +232,6 @@
                  (parse-pattern pattern vars context)))
        where/->where-clause))
 
-(defn expand-keys
-  [m context]
-  (reduce-kv (fn [expanded p o]
-               (let [p* (if (v/variable? p)
-                          p
-                          (json-ld/expand-iri p context))]
-                 (assoc expanded p* o)))
-             {} m))
-
-(defn parse-value-attributes
-  [v attrs]
-  (if-let [lang (get attrs const/iri-language)]
-    (let [matcher (where/lang-matcher lang)]
-      (where/->val-filter v matcher))
-    (where/anonymous-value v)))
-
 (defn every-binary-pred
   [& fs]
   (fn [x y]
@@ -273,7 +309,7 @@
       (let [attrs (dissoc o* const/iri-value)
             o-mch (if-let [var (parse-var-name v)]
                     (parse-variable-attributes var attrs vars)
-                    (parse-value-attributes v attrs))]
+                    (parse-value-attributes v attrs context))]
         [(flip-reverse-pattern [s-mch p-mch o-mch])])
       ;; ref
       (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
@@ -535,7 +571,7 @@
 (defn parse-analytical-query
   [q]
   (let [context       (context/extract q)
-        [vars values] (parse-values q)
+        [vars values] (parse-values q context)
         where         (parse-where q vars context)
         grouping      (parse-grouping q)
         ordering      (parse-ordering q)]
@@ -661,7 +697,7 @@
 (defn parse-txn
   [txn context]
   (let [vals-map      {:values (util/get-first-value txn const/iri-values)}
-        [vars values] (parse-values vals-map)
+        [vars values] (parse-values vals-map context)
         where-map     {:where (util/get-first-value txn const/iri-where)}
         where         (parse-where where-map vars context)
         bound-vars    (-> where where/bound-variables (into vars))

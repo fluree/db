@@ -31,7 +31,7 @@
       (log/debug "datetime->t index-range:" (pr-str flakes))
       (if (empty? flakes)
         (:t db)
-        (let [t (-> flakes first flake/t dec)]
+        (let [t (-> flakes first flake/t flake/prev-t)]
           (if (zero? t)
             (throw (ex-info (str "There is no data as of " datetime)
                             {:status 400, :error :db/invalid-query}))

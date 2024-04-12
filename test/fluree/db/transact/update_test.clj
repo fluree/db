@@ -594,3 +594,75 @@
                "schema:description" "We ❤️ All Blood"}]
              @(fluree/query db2 {"@context" test-utils/default-str-context
                                  :select    {"ex:mosquitos" ["*"]}}))))))
+
+
+(deftest ^:integration updates-only-on-existence
+  (testing "Updating data with iri values bindings"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "update-without-insert")
+          db0    (fluree/db ledger)
+          db1    @(fluree/stage db0
+                                {"@context" ["https://ns.flur.ee"
+                                             test-utils/default-context
+                                             {:ex "http://example.org/ns/"}]
+                                 "insert"
+                                 {:graph [{:id           :ex/rutherford
+                                           :type         :ex/User
+                                           :schema/name  "Rutherford"
+                                           :schema/email "rbhayes@usa.gov"
+                                           :schema/age   55}
+                                          {:id          :ex/millard
+                                           :type        :ex/User
+                                           :schema/name "Millard Fillmore"
+                                           :schema/age  62}]}})]
+      (testing "on existing subjects"
+        (let [db2 @(fluree/stage
+                     db1
+                     {"@context" ["https://ns.flur.ee"
+                                  {:ex "http://example.org/ns/", :value "@value"}
+                                  test-utils/default-context]
+                      "where"    {:id "?s", :schema/name "?o"}
+                      "delete"   {:id "?s", :schema/name "?o"}
+                      "insert"   {:id "?s", :schema/name "Rutherford B. Hayes"}
+                      "values"   ["?s" [{:value :ex/rutherford, :type :xsd/anyURI}]]})]
+          (is (= [{:type :ex/User,
+                   :schema/age 55,
+                   :schema/email "rbhayes@usa.gov",
+                   :schema/name "Rutherford B. Hayes",
+                   :id :ex/rutherford}]
+                 @(fluree/query db2 {"@context" [test-utils/default-context
+                                                 {:ex "http://example.org/ns/"}]
+                                     :select    {:ex/rutherford [:*]}}))
+              "updates the specified properties on the specified subjects")
+          (is (= [{:id          :ex/millard
+                   :type        :ex/User
+                   :schema/name "Millard Fillmore"
+                   :schema/age  62}]
+                 @(fluree/query db2 {"@context" [test-utils/default-context
+                                                 {:ex "http://example.org/ns/"}]
+                                     :select    {:ex/millard [:*]}}))
+              "does not update different subjects")))
+      (testing "on nonexistent subjects"
+        (let [db2 @(fluree/stage
+                     db1
+                     {"@context" ["https://ns.flur.ee"
+                                  {:ex "http://example.org/ns/", :value "@value"}
+                                  test-utils/default-context]
+                      "where"    {:id "?s", :schema/name "?o"}
+                      "delete"   {:id "?s", :schema/name "?o"}
+                      "insert"   {:id "?s", :schema/name "Chester A. Arthur"}
+                      "values"   ["?s" [{:value :ex/chester, :type :xsd/anyURI}]]})]
+          (is (= [{:type :ex/User,
+                   :schema/age 55,
+                   :schema/email "rbhayes@usa.gov",
+                   :schema/name "Rutherford",
+                   :id :ex/rutherford}]
+                 @(fluree/query db2 {"@context" [test-utils/default-context
+                                                 {:ex "http://example.org/ns/"}]
+                                     :select    {:ex/rutherford [:*]}}))
+              "does not update existing subjects")
+          (is (= [{:id :ex/chester}]
+                 @(fluree/query db2 {"@context" [test-utils/default-context
+                                                 {:ex "http://example.org/ns/"}]
+                                     :select    {:ex/chester [:*]}}))
+              "does not add any facts for non-existing subjects"))))))

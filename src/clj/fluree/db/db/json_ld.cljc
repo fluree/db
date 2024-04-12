@@ -10,7 +10,6 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.transact :as jld-transact]
-            [fluree.db.indexer :as indexer]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.commit-data :as commit-data])
   #?(:clj (:import (java.io Writer))))
@@ -44,36 +43,70 @@
           (str "Invalid predicate property: " (pr-str property)))
   (get-in schema [:pred predicate property]))
 
+(defn empty-all-novelty
+  [db]
+  (let [cleared (reduce (fn [db* idx]
+                          (update-in db* [:novelty idx] empty))
+                        db index/types)]
+    (assoc-in cleared [:novelty :size] 0)))
+
+(defn empty-novelty
+  "Empties novelty @ t value and earlier. If t is null, empties all novelty."
+  [db t]
+  (cond
+    (or (nil? t)
+        (= t (:t db)))
+    (empty-all-novelty db)
+
+    (flake/t-before? t (:t db))
+    (let [cleared (reduce (fn [db* idx]
+                            (update-in db* [:novelty idx]
+                                       (fn [flakes]
+                                         (index/flakes-after t flakes))))
+                          db index/types)
+          size    (flake/size-bytes (get-in cleared [:novelty :spot]))]
+      (assoc-in cleared [:novelty :size] size))
+
+    :else
+    (throw (ex-info (str "Request to empty novelty at t value: " t
+                         ", however provided db is only at t value: " (:t db))
+                    {:status 500 :error :db/indexing}))))
+
 (defn force-index-update
-  [{:keys [ledger commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
+  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
   (let [index-t (:t data-map)
         commit* (assoc commit :index commit-index)]
     (-> db
+        (empty-novelty index-t)
         (assoc :commit commit*
-               :novelty* (indexer/-empty-novelty (:indexer ledger) db index-t)
+               :novelty* (empty-novelty db index-t)
                :spot spot
                :post post
                :opst opst
                :tspo tspo)
         (assoc-in [:stats :indexed] index-t))))
 
+(defn newer-index?
+  [commit {data-map :data, :as _commit-index}]
+  (if data-map
+    (let [commit-index-t (commit-data/index-t commit)
+          index-t        (:t data-map)]
+      (or (nil? commit-index-t)
+          (flake/t-after? index-t commit-index-t)))
+    false))
+
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [commit] :as db} {data-map :data, :as commit-index}]
-  (let [index-t        (:t data-map)
-        commit-index-t (commit-data/index-t commit)
-        newer-index?   (and data-map
-                            (or (nil? commit-index-t)
-                                (> index-t commit-index-t)))]
-    (if newer-index?
-      (force-index-update db commit-index)
-      db)))
+  [{:keys [commit] :as db} commit-index]
+  (if (newer-index? commit commit-index)
+    (force-index-update db commit-index)
+    db))
 
 ;; ================ end Jsonld record support fns ============================
 
 (defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot post opst
-                     tspo schema comparators novelty policy namespaces
+                     tspo schema comparators staged novelty policy namespaces
                      namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
@@ -150,6 +183,7 @@
                     :tspo            tspo
                     :schema          schema
                     :comparators     index/default-comparators
+                    :staged          []
                     :novelty         novelty
                     :policy          root-policy-map
                     :namespaces      iri/default-namespaces
