@@ -13,6 +13,7 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
+            [fluree.db.dbproto :refer [db?]]
             [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -184,11 +185,14 @@
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
   supplied rules graph or from the db if no graph is supplied."
-  [methods db inserts supplied-rules]
+  [methods db inserts graph-or-db]
   (go-try
-    (let [supplied-rules* (when supplied-rules
+    (let [rules-db        (cond
+                            (nil? graph-or-db) db
+                            (db? graph-or-db) graph-or-db)
+          supplied-rules* (when-not rules-db
                             (try*
-                              (parse-rules-graph supplied-rules)
+                              (parse-rules-graph graph-or-db)
                               (catch* e
                                       (log/error "Error parsing supplied rules graph:" e)
                                       (throw e))))]
@@ -196,7 +200,7 @@
              rules []]
         (if method
           (let [rules-graph* (or supplied-rules*
-                                 (<? (resolve/rules-from-db db method)))
+                                 (<? (resolve/rules-from-db rules-db method)))
                 rules*       (rules-from-graph method inserts rules-graph*)]
             (recur r (into rules rules*)))
           rules)))))
@@ -250,7 +254,7 @@
           db*)))))
 
 (defn reason
-  [db methods rules-graph {:keys [max-fuel reasoner-max]
+  [db methods graph-or-db {:keys [max-fuel reasoner-max]
                            :or   {reasoner-max 10} :as opts}]
   (go-try
     (let [methods*        (set (util/sequential methods))
@@ -258,7 +262,7 @@
           db*             (update db :reasoner #(into methods* %))
           tx-state        (transact/->tx-state db* nil nil nil)
           inserts         (atom nil)
-          raw-rules       (<? (all-rules methods* db* inserts rules-graph))
+          raw-rules       (<? (all-rules methods* db* inserts graph-or-db))
           _               (log/debug "Reasoner - extracted rules: " raw-rules)
           reasoning-rules (->> raw-rules
                                (resolve/rules->graph db*)

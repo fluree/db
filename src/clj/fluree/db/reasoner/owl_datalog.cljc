@@ -699,8 +699,7 @@
             some-values (into (equiv-some-values c1 some-values)) ;; cls-svf1, cls-svf2
             all-values (into (equiv-all-values c1 all-values)) ;; cls-svf1, cls-svf2
             max-cardinality (into (equiv-max-cardinality c1 max-cardinality)) ;; cls-maxc2
-            max-qual-cardinality (into (equiv-max-qual-cardinality c1 max-qual-cardinality)) ;; cls-maxqc3, cls-maxqc4
-            )))
+            max-qual-cardinality (into (equiv-max-qual-cardinality c1 max-qual-cardinality))))) ;; cls-maxqc3, cls-maxqc4
 
 ;; rdfs:subClassOf
 (defmethod to-datalog ::cax-sco
