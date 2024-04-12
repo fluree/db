@@ -648,9 +648,15 @@
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
   [allowed-vars expanded]
-  (reduce (partial parse-subj-cmp allowed-vars)
-          []
-          expanded))
+  (try*
+    (reduce (partial parse-subj-cmp allowed-vars)
+            []
+            expanded)
+    (catch* e
+            (throw (ex-info (str "Parsing failure due to: " (ex-message e)
+                                 ". Query: " expanded)
+                            (ex-data e)
+                            e)))))
 
 (defn parse-txn
   [txn context]
