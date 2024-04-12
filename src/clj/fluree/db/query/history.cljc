@@ -312,10 +312,7 @@
                                     (t-flakes->json-ld db context compact cache error-ch)
                                     (async/into [])
                                     <!)
-           [annotation]        (->> annotation-flakes
-                                    (t-flakes->json-ld db context compact cache error-ch)
-                                    (async/into [])
-                                    <!)
+           annotation          (<? (t-flakes->json-ld db context compact cache error-ch annotation-flakes))
 
            assert-key          (json-ld/compact const/iri-assert compact)
            retract-key         (json-ld/compact const/iri-retract compact)
