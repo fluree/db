@@ -97,6 +97,9 @@
            (first (get shape const/sh_qualifiedMaxCount)))))
 
 (defn build-shape-node
+  "Recursively build a shape by traversing the ref flakes and constructing nodes out of
+  them. This function will halt but not error if a cycle is detected. It is also not
+  stack safe."
   ([db shape-sid]
    (build-shape-node db shape-sid #{shape-sid}))
   ([db shape-sid built-nodes]
@@ -117,6 +120,8 @@
          shape-sid)))))
 
 (defn build-shape
+  "Build the shape of the given sid. Use a cached value if it exists. The cache is reset
+  in `vocab/hydrate-schema` if any shapes are modified."
   [db shape-sid]
   (go-try
     (let [shapes-cache (-> db :schema :shapes)]
@@ -196,6 +201,7 @@
   (query-range/index-range data-db :opst = [focus-node inverse-path] {:flake-xf (map subject-node)}))
 
 (defn resolve-segment
+  "Return the value nodes corresponding to the path segment from the focus-node."
   [data-db focus-node segment]
   (go-try
     (if (iri/sid? segment)
@@ -236,12 +242,14 @@
           (not-empty results))))))
 
 (defn target-node-target?
+  "If a subject is the same as the targetNode target, it is targeted."
   [shape s-flakes]
   (let [sid        (some-> s-flakes first flake/s)
         target-sids (->> (get shape const/sh_targetNode) (into #{}))]
     (contains? target-sids sid)))
 
 (defn target-class-target?
+  "If a subject has the targeted @type, then it is a targetClass target."
   [shape s-flakes]
   (let [target-class (first (get shape const/sh_targetClass))]
     (some (fn [f]
@@ -250,6 +258,7 @@
           s-flakes)))
 
 (defn target-subjects-of-target?
+  "If a subject has the targeted predicate, then it is a targetSubjectsOf target."
   [shape s-flakes]
   (let [target-pid (first (get shape const/sh_targetSubjectsOf))]
     (some (fn [f] (= (flake/p f) target-pid))
@@ -269,6 +278,8 @@
   (first (get shape const/sh_targetObjectsOf)))
 
 (defn target-objects-of-focus-nodes
+  "Returns the objects of any targeted predicate, plus the subject if it is referred to by
+  the targeted predicate."
   [db shape s-flakes]
   (go-try
     (let [target-pid (first (get shape const/sh_targetObjectsOf))]
@@ -277,7 +288,7 @@
                                                                     {:flake-xf (map flake/p)})))
             p-flakes        (filterv (fn [f] (= (flake/p f) target-pid)) s-flakes)
             focus-nodes     (mapv object-node p-flakes)]
-        ;; TODO: we don't know that these are sids, so we need to use a node layout for focus nodes
+        ;; TODO: we assume that these objects are sids, but that assumption may not hold
         (cond-> (mapv flake/o p-flakes)
           referring-pids (conj sid))))))
 
@@ -865,6 +876,7 @@
                             :message (str "value " (pr-str value) " is not in " (:expect result))))))))))
 
 (defn explain-result
+  "Format a validation result into a readable error message."
   [{:keys [subject constraint shape path message]}]
   (str "Subject " subject (when path (str " path " path))
        " violates constraint " constraint " of shape " shape " - " message "."))
@@ -879,20 +891,19 @@
                      :report results}))))
 
 (defn all-node-shape-ids
+  "Returns the sids of all subjects with an @type of sh:NodeShape."
   [db]
   (query-range/index-range db :post = [const/$rdf:type [const/sh_NodeShape const/$xsd:anyURI]]
                            {:flake-xf (map flake/s)}))
 
-(defn sid->compact-iri
-  [ns-codes context sid]
-  (-> (iri/sid->iri sid ns-codes)
-      (json-ld/compact context)))
-
 (defn make-display
+  "Creates a function used to format values for human consumption. Translates SIDs into
+  IRIs, then compacts them with the transaction context."
   [data-db context]
   (fn [v]
     (if (iri/sid? v)
-      (sid->compact-iri (:namespace-codes data-db) context v)
+      (-> (iri/sid->iri v (:namespace-codes data-db))
+          (json-ld/compact context))
       v)))
 
 (defn validate!
