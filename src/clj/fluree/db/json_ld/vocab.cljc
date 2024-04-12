@@ -231,12 +231,6 @@
                         :pred  {}})
      :subclasses (delay {})}))
 
-(defn reset-shapes
-  "Resets the shapes cache - called when new shapes added to db"
-  [{:keys [shapes] :as _schema}]
-  (reset! shapes {:class {}
-                  :pred  {}}))
-
 (defn modified-shape?
   [s-flakes]
   (some (fn [[_ p o :as _f]]
