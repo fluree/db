@@ -27,23 +27,28 @@
       (<? (shacl/validate! db-before root-db (vals mods) context))
       staged-map)))
 
+(defn nested-nodes?
+  "Returns truthy if the provided node has any nested nodes."
+  [node]
+  (->> node
+       (into []
+             (comp (remove (fn [[k v]] (keyword? k))) ; remove :id :idx :type
+                   (mapcat rest)                      ; discard keys
+                   (mapcat (partial remove :value)))) ; remove value objects
+       not-empty))
+
 (defn validate-annotation
   "Validate that the commit annotation is just a single json-ld node."
   [[annotation :as expanded]]
-  (let [multiple-nodes? (> (count expanded) 1)
-        specified-id    (:id annotation)
-        nested-nodes    (into []
-                              (comp (remove (fn [[k v]] (keyword? k))) ; remove :id :idx :type
-                                    (mapcat rest)                      ; discard keys
-                                    (mapcat (partial remove :value))) ; remove value objects
-                              annotation)]
-    (when specified-id
-      (throw (ex-info "Commit annotation cannot specify a subject identifier."
-                      {:status 400, :error :db/invalid-annotation :id specified-id})))
-    (when (or multiple-nodes? (not-empty nested-nodes))
+  (when-let [specified-id (:id annotation)]
+    (throw (ex-info "Commit annotation cannot specify a subject identifier."
+                    {:status 400, :error :db/invalid-annotation :id specified-id})))
+  (when (or (> (count expanded) 1)
+            (nested-nodes? annotation))
       (throw (ex-info "Commit annotation must only have a single subject."
                       {:status 400, :error :db/invalid-annotation})))
-    expanded))
+  ;; everything is good
+  expanded)
 
 ;; TODO - can use transient! below
 (defn stage-update-novelty
