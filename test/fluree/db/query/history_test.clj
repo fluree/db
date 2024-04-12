@@ -1002,26 +1002,9 @@
                      (fluree/commit! ledger)
                      (deref))
 
-            invalid1 @(fluree/stage db0 {"@context" context
-                                         "insert" [{"@id" "ex:betty"
-                                                    "@type" "ex:Yeti"
-                                                    "schema:name" "Betty"
-                                                    "schema:age" 55}]}
-                                    {:annotation {"ex:originator" "opts" "ex:nested" {"invalid" "true"}}})
-            invalid2 @(fluree/stage db0 {"@context" context
-                                         "insert" [{"@id" "ex:betty"
-                                                    "@type" "ex:Yeti"
-                                                    "schema:name" "Betty"
-                                                    "schema:age" 55}]}
-                                    {:annotation [{"ex:originator" "opts" "ex:multiple" true}
-                                                  {"ex:originator" "opts" "ex:invalid" true}]})
 
-            invalid3 @(fluree/stage db0 {"@context" context
-                                         "insert" [{"@id" "ex:betty"
-                                                    "@type" "ex:Yeti"
-                                                    "schema:name" "Betty"
-                                                    "schema:age" 55}]}
-                                    {:annotation [{"ex:originator" "opts" "@id" "invalid:subj"}]})
+
+
 
             db2 (->> @(fluree/stage db1 {"@context" context
                                          "insert" [{"@id" "ex:freddy"
@@ -1040,17 +1023,40 @@
                                          "opts" {"annotation" {"ex:originator" "txn" "ex:data" "ok"}}})
                      (fluree/commit! ledger)
                      (deref))]
-        (is (= "Commit annotation must only have a single subject." (ex-message invalid1)))
-        (is (= "Commit annotation must only have a single subject." (ex-message invalid2)))
-        (is (= "Commit annotation cannot specify a subject identifier." (ex-message invalid3)))
+        (testing "annotations in commit-details"
+          (is (= [{"f:txn" "fluree:memory://5c54eee1fd6be197402fcd76b035cd6f42b55723f35c294992d76e6eea2cf874"}
+                  {"f:txn" "fluree:memory://6ab2e58c44af9db30feb461c212b3b566a35fdfe92d53b61018eab425ca0c342"
+                   "f:annotation" {"id" "_:fdb-3" "ex:data" "ok" "ex:originator" "opts"}}
 
-        (is (= [{"f:txn" "fluree:memory://5c54eee1fd6be197402fcd76b035cd6f42b55723f35c294992d76e6eea2cf874"}
-                {"f:txn" "fluree:memory://6ab2e58c44af9db30feb461c212b3b566a35fdfe92d53b61018eab425ca0c342"
-                 "f:annotation" {"id" "_:fdb-6" "ex:data" "ok" "ex:originator" "opts"}}
+                  {"f:txn" "fluree:memory://22738244510e8c756cbc14eedc3d223e4b66024ffbc3debb856c7d7b063798df"
+                   "f:annotation" {"id" "_:fdb-5" "ex:data" "ok" "ex:originator" "txn"}}]
+                 (->> @(fluree/history ledger {:context        context
+                                               :commit-details true
+                                               :t              {:from 1 :to :latest}})
+                      (mapv (fn [c] (-> c (get "f:commit") (select-keys ["f:txn" "f:annotation"]))))))))
 
-                {"f:txn" "fluree:memory://22738244510e8c756cbc14eedc3d223e4b66024ffbc3debb856c7d7b063798df"
-                 "f:annotation" {"id" "_:fdb-8" "ex:data" "ok" "ex:originator" "txn"}}]
-               (->> @(fluree/history ledger {:context        context
-                                             :commit-details true
-                                             :t              {:from 1 :to :latest}})
-                    (mapv (fn [c] (-> c (get "f:commit") (select-keys ["f:txn" "f:annotation"])))))))))))
+        (testing "only single annotation subject permitted"
+          (let [invalid1 @(fluree/stage db0 {"@context" context
+                                             "insert" [{"@id" "ex:betty"
+                                                        "@type" "ex:Yeti"
+                                                        "schema:name" "Betty"
+                                                        "schema:age" 55}]}
+                                        {:annotation {"ex:originator" "opts" "ex:nested" {"invalid" "true"}}})
+                invalid2 @(fluree/stage db0 {"@context" context
+                                             "insert" [{"@id" "ex:betty"
+                                                        "@type" "ex:Yeti"
+                                                        "schema:name" "Betty"
+                                                        "schema:age" 55}]}
+                                        {:annotation [{"ex:originator" "opts" "ex:multiple" true}
+                                                      {"ex:originator" "opts" "ex:invalid" true}]})]
+            (is (= "Commit annotation must only have a single subject." (ex-message invalid1)))
+            (is (= "Commit annotation must only have a single subject." (ex-message invalid2)))))
+
+        (testing "annotation has no references"
+          (let [invalid3 @(fluree/stage db0 {"@context" context
+                                             "insert" [{"@id" "ex:betty"
+                                                        "@type" "ex:Yeti"
+                                                        "schema:name" "Betty"
+                                                        "schema:age" 55}]}
+                                        {:annotation [{"ex:originator" "opts" "@id" "invalid:subj"}]})]
+            (is (= "Commit annotation cannot specify a subject identifier." (ex-message invalid3)))))))))
