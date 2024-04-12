@@ -104,7 +104,7 @@
 (def ^:const iri-owl:allValuesFrom "http://www.w3.org/2002/07/owl#allValuesFrom")
 (def ^:const iri-owl:maxCardinality "http://www.w3.org/2002/07/owl#maxCardinality")
 (def ^:const iri-owl:maxQualifiedCardinality "http://www.w3.org/2002/07/owl#maxQualifiedCardinality")
-
+(def ^:const iri-owl:qualifiedCardinality "http://www.w3.org/2002/07/owl#qualifiedCardinality")
 
 ;; predicate id constants
 

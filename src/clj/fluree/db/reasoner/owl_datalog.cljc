@@ -109,6 +109,9 @@
             (contains? equiv-class-statement const/iri-owl:maxQualifiedCardinality)
             :max-qual-cardinality
 
+            (contains? equiv-class-statement const/iri-owl:qualifiedCardinality)
+            :qual-cardinality
+
             :else
             (do
               (log/warn "Unsupported owl:Restriction" equiv-class-statement)
@@ -576,20 +579,22 @@
   (reduce
     (fn [acc intersection-of-statement]
       (let [intersections (unwrap-list (get intersection-of-statement const/iri-owl:intersectionOf))
-            {:keys [classes has-value some-values]} (group-by equiv-class-type intersections)
+            {:keys [classes has-value some-values qual-cardinality]} (group-by equiv-class-type intersections)
             restrictions  (cond->> []
                                    has-value (into (has-value-condition "?y" has-value))
                                    some-values (into (some-values-condition "?y" some-values)))
             class-list    (get-all-ids classes)
-            cls-int1      {"where"  (reduce
-                                      (fn [acc c]
-                                        (conj acc
-                                              {"@id"   "?y"
-                                               "@type" c}))
-                                      restrictions
-                                      class-list)
-                           "insert" {"@id"   "?y"
-                                     "@type" rule-class}}
+            cls-int1      (when (or (seq class-list)
+                                    (seq restrictions))
+                            {"where"  (reduce
+                                        (fn [acc c]
+                                          (conj acc
+                                                {"@id"   "?y"
+                                                 "@type" c}))
+                                        restrictions
+                                        class-list)
+                             "insert" {"@id"   "?y"
+                                       "@type" rule-class}})
             cls-int2      (when (seq class-list)
                             {"where"  {"@id"   "?y"
                                        "@type" rule-class}
@@ -602,10 +607,16 @@
                             []
                             class-list)]
 
-        ;; intersectionOf inserts subClassOf rules (scm-int)
-        (swap! inserts assoc (str rule-class "(owl:intersectionOf-subclass)") triples)
+        (when qual-cardinality
+          (log/warn (str "Ignoring owl:qualifiedCardinality rule(s), "
+                         " not supported by owl2rl profile: " qual-cardinality)))
 
-        (cond-> (conj acc [(str rule-class "(owl:intersectionOf-1)#" (hash class-list)) cls-int1])
+        ;; intersectionOf inserts subClassOf rules (scm-int)
+        (when (seq triples)
+          (swap! inserts assoc (str rule-class "(owl:intersectionOf-subclass)") triples))
+
+        (cond-> acc
+                cls-int1 (conj [(str rule-class "(owl:intersectionOf-1)#" (hash class-list)) cls-int1])
                 cls-int2 (conj [(str rule-class "(owl:intersectionOf-2)#" (hash class-list)) cls-int2]))))
     []
     intersection-of-statements))
