@@ -227,27 +227,27 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                                  :select  {'?s [:*]}
                                  :where   {:id '?s, :type :ex/User}}
           db                    @(fluree/stage
-                        (fluree/db ledger)
-                        {"@context" ["https://ns.flur.ee" context]
-                         "insert"
-                         {:id             :ex/UserShape
-                          :type           [:sh/NodeShape]
-                          :sh/targetClass :ex/User
-                          :sh/not         [{:sh/path      :ex/tag
-                                            :sh/minLength 4}
-                                           {:sh/path      :schema/name
-                                            :sh/maxLength 10}
-                                           {:sh/path    :ex/greeting
-                                            :sh/pattern "hello.*"}]}})
+                                   (fluree/db ledger)
+                                   {"@context" ["https://ns.flur.ee" context]
+                                    "insert"
+                                    {:id             :ex/UserShape
+                                     :type           [:sh/NodeShape]
+                                     :sh/targetClass :ex/User
+                                     :sh/not         [{:sh/path      :ex/tag
+                                                       :sh/minLength 4}
+                                                      {:sh/path      :schema/name
+                                                       :sh/maxLength 10}
+                                                      {:sh/path    :ex/greeting
+                                                       :sh/pattern "hello.*"}]}})
           db-ok                 @(fluree/stage
-                   db
-                   {"@context" ["https://ns.flur.ee" context]
-                    "insert"
-                    {:id          :ex/jean-claude
-                     :type        :ex/User,
-                     :schema/name "Jean-Claude"
-                     :ex/tag      1
-                     :ex/greeting "HOWDY"}})
+                                   db
+                                   {"@context" ["https://ns.flur.ee" context]
+                                    "insert"
+                                    {:id          :ex/jean-claude
+                                     :type        :ex/User,
+                                     :schema/name "Jean-Claude"
+                                     :ex/tag      1
+                                     :ex/greeting "HOWDY"}})
           db-name-too-short     @(fluree/stage
                                    db
                                    {"@context" ["https://ns.flur.ee" context]
