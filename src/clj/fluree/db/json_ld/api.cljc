@@ -284,12 +284,37 @@
            policy-id  (perm/parse-policy-identity identity-map parsed-ctx)]
        (perm/wrap-policy db policy-id)))))
 
+(defn dataset
+  "Creates a composed dataset from multiple resolved graph databases.
+
+  The databases to be composed are supplied as a map with a string alias
+  as they key, and the resolved graph db as the value.
+
+  By default, every resolved graph db will be composed together as a new
+  default graph which will be used for all where clauses in queries that
+  do *not* specify a specific graph to target, which is done using the
+  special `graph` syntax in the where clause.
+
+  If just one or more of the supplied graph dbs should instead be used as
+  the default graph (instead of all of them), supply the second argument
+  as a list of the db aliases in the db-map that should be used as the
+  default.
+
+  Targeting a single named graph in a query (as opposed to the default graph)
+  is done by using the `graph` syntax within the 'where' clause, for example:
+  {...
+   'where': [...
+             ['graph' <graph-alias> <query-pattern>]]
+   ...}"
+  ([named-graphs] (dataset named-graphs (keys named-graphs)))
+  ([named-graphs default-graphs]
+   (query-api/dataset named-graphs default-graphs)))
 
 (defn query
-  "Queries a db value and returns a promise with the results."
-  ([db q] (query db q {}))
-  ([db q opts]
-   (promise-wrap (query-api/query db q opts))))
+  "Queries a dataset or single db and returns a promise with the results."
+  ([ds q] (query ds q {}))
+  ([ds q opts]
+   (promise-wrap (query-api/query ds q opts))))
 
 (defn query-connection
   "Queries the latest db in the ledger specified by the 'from' parameter in the

@@ -38,17 +38,17 @@
 
 (defn query
   "Returns core async channel with results or exception"
-  ([db query-map]
-   (query db nil query-map))
-  ([db fuel-tracker query-map]
+  ([ds query-map]
+   (query ds nil query-map))
+  ([ds fuel-tracker query-map]
    (if (cache? query-map)
-     (cache-query db query-map)
+     (cache-query ds query-map)
      (let [q   (try*
                  (let [parsed (parse/parse-query query-map)]
-                   (or (re-parse-as-simple-subj-crawl parsed db)
+                   (or (re-parse-as-simple-subj-crawl parsed ds)
                        parsed))
                  (catch* e e))
-           db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
+           db* (assoc ds :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
        (if (util/exception? q)
          (async/to-chan! [q])
          (if (= :simple-subject-crawl (:strategy q))
