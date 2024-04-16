@@ -61,14 +61,14 @@
                   (ensure-namespace db ns)))
         (build-sid ns nme))))
 
-(defn create-flake-iri-object
+(defn create-iri-reference-flake
   [db-vol sid pid o-mch t m]
   (let [o-iri (where/get-iri o-mch)
         oid   (generate-sid! db-vol o-iri)
         dt    const/$xsd:anyURI]
     (flake/create sid pid oid dt t true m)))
 
-(defn create-flake-scalar-object
+(defn create-scalar-flake
   [db-vol p-iri sid pid o-mch t m]
   (let [v  (where/get-value o-mch)
         dt (or (some-> o-mch
@@ -87,8 +87,8 @@
         p-iri (where/get-iri p-mch)
         pid   (generate-sid! db-vol p-iri)]
     (cond-> (if (where/matched-iri? o-mch)
-              (create-flake-iri-object db-vol sid pid o-mch t m)
-              (create-flake-scalar-object db-vol p-iri sid pid o-mch t m))
+              (create-iri-reference-flake db-vol sid pid o-mch t m)
+              (create-scalar-flake db-vol p-iri sid pid o-mch t m))
             reasoned (with-meta {:reasoned reasoned}))))
 
 (defn insert

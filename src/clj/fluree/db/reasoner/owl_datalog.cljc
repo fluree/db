@@ -133,7 +133,7 @@
 
           :else nil)))
 
-(defmulti to-datalog (fn [rule-type inserts owl-statement all-rules]
+(defmulti to-datalog (fn [rule-type _inserts _owl-statement _all-rules]
                        rule-type))
 
 (defmethod to-datalog ::eq-sym
