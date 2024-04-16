@@ -1,6 +1,6 @@
 (ns fluree.db.reasoner.owl-datalog
   (:require [clojure.string :as str]
-            [fluree.db.query.fql.parse :as parse]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
@@ -23,50 +23,6 @@
     (or list-vals
         vals)))
 
-(defn blank-node-id?
-  [s]
-  (str/starts-with? s parse/blank-node-prefix))
-
-(defn get-first
-  [node key]
-  (let [v (get node key)]
-    (if (sequential? v)
-      (-> v first)
-      v)))
-
-(defn get-id
-  [node]
-  (or (:id node)
-      (get node "@id")))
-
-(defn get-first-id
-  [node key]
-  (let [node' (get-first node key)]
-    (get-id node')))
-
-(defn blank-node?
-  [node]
-  (try*
-    (some-> node
-            get-id
-            blank-node-id?)
-    (catch* e
-            (log/error (str "Unexpected error processing OWL node: " node
-                            " with error: " (ex-message e))
-                       false))))
-
-(defn get-value
-  [val]
-  (if (map? val)
-    (or (:value val)
-        (get val "@value"))
-    val))
-
-(defn get-first-value
-  [node key]
-  (let [v (get-first node key)]
-    (get-value v)))
-
 (defn get-types
   [node]
   (or (:type node)
@@ -80,9 +36,9 @@
     (->> (util/sequential vals)
          unwrap-list
          (into [] (comp
-                    (map get-id)
+                    (map util/get-id)
                     (remove nil?)
-                    (remove blank-node-id?))))
+                    (remove iri/blank-node-id?))))
     (catch* e
             (throw (ex-info (str "Unexpected error extracting all @id values from owl statement:" vals)
                             {:status 500
@@ -91,7 +47,7 @@
 
 (defn equiv-class-type
   [equiv-class-statement]
-  (let [statement-id (get-id equiv-class-statement)]
+  (let [statement-id (util/get-id equiv-class-statement)]
     (cond (some #(= % const/iri-owl:Restriction) (get-types equiv-class-statement))
           (cond
             (contains? equiv-class-statement const/iri-owl:hasValue)
@@ -127,7 +83,7 @@
           :union-of
 
           statement-id
-          (if (blank-node-id? statement-id)
+          (if (iri/blank-node-id? statement-id)
             :blank-nodes
             :classes)
 
@@ -141,7 +97,7 @@
   ;; note any owl:sameAs are just inserts into the current db
   ;; the owl:sameAs rule is a base rule for any existing owl:sameAs
   ;; that might already exist in the current db
-  (let [id      (get-id owl-statement)
+  (let [id      (util/get-id owl-statement)
         sa-ids  (-> owl-statement
                     (get const/iri-owl:sameAs)
                     get-all-ids)
@@ -162,7 +118,7 @@
 ;; rdfs:domain
 (defmethod to-datalog ::prp-dom
   [_ _ owl-statement all-rules]
-  (let [property (get-id owl-statement)
+  (let [property (util/get-id owl-statement)
         domain   (-> owl-statement
                      (get const/iri-rdfs:domain)
                      get-all-ids)
@@ -183,7 +139,7 @@
   (let [range    (-> owl-statement
                      (get const/iri-rdfs:range)
                      get-all-ids)
-        property (get-id owl-statement)
+        property (util/get-id owl-statement)
         rule     {"where"  {"@id"    nil,
                             property "?ps"}
                   "insert" {"@id"   "?ps"
@@ -198,7 +154,7 @@
 ;; owl:FunctionalProperty
 (defmethod to-datalog ::prp-fp
   [_ _ owl-statement all-rules]
-  (let [fp   (get-id owl-statement)
+  (let [fp   (util/get-id owl-statement)
         rule {"where"  [{"@id" "?s"
                          fp    "?fp-vals"}
                         {"@id" "?s"
@@ -211,7 +167,7 @@
 ;; owl:InverseFunctionalProperty
 (defmethod to-datalog ::prp-ifp
   [_ _ owl-statement all-rules]
-  (let [ifp  (get-id owl-statement)
+  (let [ifp  (util/get-id owl-statement)
         rule {"where"  [{"@id" "?x1"
                          ifp   "?y"}
                         {"@id" "?x2"
@@ -224,7 +180,7 @@
 ;;owl:SymetricProperty
 (defmethod to-datalog ::prp-symp
   [_ _ owl-statement all-rules]
-  (let [symp (get-id owl-statement)
+  (let [symp (util/get-id owl-statement)
         rule {"where"  [{"@id" "?x"
                          symp  "?y"}]
               "insert" {"@id" "?y"
@@ -234,7 +190,7 @@
 ;; owl:TransitiveProperty
 (defmethod to-datalog ::prp-trp
   [_ _ owl-statement all-rules]
-  (let [trp  (get-id owl-statement)
+  (let [trp  (util/get-id owl-statement)
         rule {"where"  [{"@id" "?x"
                          trp   "?y"}
                         {"@id" "?y"
@@ -246,7 +202,7 @@
 ;; rdfs:subPropertyOf
 (defmethod to-datalog ::prp-spo1
   [_ inserts owl-statement all-rules]
-  (let [child-prop   (get-id owl-statement)
+  (let [child-prop   (util/get-id owl-statement)
         parent-props (-> owl-statement
                          (get const/iri-rdfs:subPropertyOf)
                          get-all-ids)
@@ -269,7 +225,7 @@
 (defmethod to-datalog ::prp-spo2
   [_ _ owl-statement all-rules]
   (try*
-    (let [prop    (get-id owl-statement)
+    (let [prop    (util/get-id owl-statement)
           p-chain (-> owl-statement
                       (get const/iri-owl:propertyChainAxiom)
                       get-all-ids)
@@ -300,8 +256,8 @@
 
 (defmethod to-datalog ::prp-inv
   [_ _ owl-statement all-rules]
-  (let [prop     (get-first-id owl-statement const/iri-owl:inverseOf)
-        inv-prop (get-id owl-statement)
+  (let [prop     (util/get-first-id owl-statement const/iri-owl:inverseOf)
+        inv-prop (util/get-id owl-statement)
         rule1    {"where"  [{"@id" "?x"
                              prop  "?y"}]
                   "insert" {"@id"    "?y"
@@ -335,9 +291,9 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property  (get-first-id restriction const/iri-owl:onProperty)
-            max-q-val (get-first-value restriction const/iri-owl:maxQualifiedCardinality)
-            on-class  (get-first-id restriction const/iri-owl:onClass)
+      (let [property  (util/get-first-id restriction const/iri-owl:onProperty)
+            max-q-val (util/get-first-value restriction const/iri-owl:maxQualifiedCardinality)
+            on-class  (util/get-first-id restriction const/iri-owl:onClass)
             rule      (if (= const/iri-owl:Thing on-class)
                         ;; special case for rule cls-maxqc4 where onClass
                         ;; is owl:Thing, means every object of property is sameAs
@@ -378,8 +334,8 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (get-first-id restriction const/iri-owl:onProperty)
-            max-val  (get-first-value restriction const/iri-owl:maxCardinality)
+      (let [property (util/get-first-id restriction const/iri-owl:onProperty)
+            max-val  (util/get-first-value restriction const/iri-owl:maxCardinality)
             rule     {"where"  [{"@id"    "?x"
                                  "@type"  rule-class
                                  property "?y1"}
@@ -404,26 +360,26 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (get-first-id restriction const/iri-owl:onProperty)
-            one-val  (if-let [one-val (get-first restriction const/iri-owl:hasValue)]
-                       (if-let [one-val-id (get-id one-val)]
-                         {"@id" one-val-id}
-                         (get-value one-val)))
+      (let [property (util/get-first-id restriction const/iri-owl:onProperty)
+            has-val  (util/get-first restriction const/iri-owl:hasValue)
+            has-val* (if (util/get-id has-val)
+                       {"@id" has-val}
+                       (util/get-value has-val))
             rule1    {"where"  {"@id"    "?x"
-                                property one-val}
+                                property has-val*}
                       "insert" {"@id"   "?x"
                                 "@type" rule-class}}
             rule2    {"where"  {"@id"   "?x"
                                 "@type" rule-class}
                       "insert" {"@id"    "?x"
-                                property one-val}}]
-        (if (and property one-val)
+                                property has-val*}}]
+        (if (and property has-val*)
           (-> acc
               (conj [(str rule-class "(owl:Restriction-" property "-1)") rule1])
               (conj [(str rule-class "(owl:Restriction-" property "-2)") rule2]))
           (do (log/warn "owl:Restriction for class" rule-class
-                        "is not properly defined. owl:onProperty is:" (get restriction const/iri-owl:onProperty)
-                        "and owl:hasValue is:" (get-first restriction const/iri-owl:hasValue)
+                        "is not properly defined. owl:onProperty is:" property
+                        "and owl:hasValue is:" has-val
                         ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
                         "hasValue must exist, but can be an IRI or literal value.")
               acc))))
@@ -435,8 +391,8 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (get-first-id restriction const/iri-owl:onProperty)
-            all-val  (get-first-id restriction const/iri-owl:allValuesFrom)
+      (let [property (util/get-first-id restriction const/iri-owl:onProperty)
+            all-val  (util/get-first-id restriction const/iri-owl:allValuesFrom)
             rule     {"where"  {"@id"    "?x"
                                 property "?y"}
                       "insert" {"@id"   "?y"
@@ -445,7 +401,7 @@
           (conj acc [(str rule-class "(owl:allValuesFrom-" property ")") rule])
           (do (log/warn "owl:Restriction for class" rule-class
                         "is not properly defined. owl:onProperty is:" (get restriction const/iri-owl:onProperty)
-                        "and owl:allValuesFrom is:" (get-first restriction const/iri-owl:allValuesFrom)
+                        "and owl:allValuesFrom is:" (util/get-first restriction const/iri-owl:allValuesFrom)
                         ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
                         "allValuesFrom must exist and must be an IRI.")
               acc))))
@@ -462,11 +418,11 @@
   [binding-var some-values-statements]
   (reduce
     (fn [acc some-values-statement]
-      (let [property (get-first-id some-values-statement const/iri-owl:onProperty)
+      (let [property (util/get-first-id some-values-statement const/iri-owl:onProperty)
             {:keys [classes union-of]} (group-by equiv-class-type (get some-values-statement const/iri-owl:someValuesFrom))]
         (cond
           classes
-          (let [target-type (-> classes first get-id)]
+          (let [target-type (-> classes first util/get-id)]
             (if (and property target-type)
               (-> acc
                   (conj {"@id"    binding-var
@@ -505,13 +461,13 @@
   [binding-var has-value-statements]
   (reduce
     (fn [acc has-value-statement]
-      (let [property (get-first-id has-value-statement const/iri-owl:onProperty)
-            one-val  (if-let [one-val (get-first has-value-statement const/iri-owl:hasValue)]
-                       (if-let [one-val-id (get-id one-val)]
-                         {"@id" one-val-id}
-                         (get-value one-val)))]
+      (let [property   (util/get-first-id has-value-statement const/iri-owl:onProperty)
+            has-value  (util/get-first has-value-statement const/iri-owl:hasValue)
+            has-value* (if-let [has-val-id (util/get-id has-value)]
+                         {"@id" has-val-id}
+                         (util/get-value has-value))]
         (conj acc {"@id"    binding-var
-                   property one-val})))
+                   property has-value*})))
     []
     has-value-statements))
 
@@ -537,12 +493,12 @@
   [rule-class restrictions]
   (reduce
     (fn [acc restriction]
-      (let [property (get-first-id restriction const/iri-owl:onProperty)
+      (let [property (util/get-first-id restriction const/iri-owl:onProperty)
             {:keys [classes one-of]} (group-by equiv-class-type (get restriction const/iri-owl:someValuesFrom))
             rule     (cond
                        ;; special case where someValuesFrom is owl:Thing, means
                        ;; everything with property should be in the class (cls-svf2)
-                       (and classes (= const/iri-owl:Thing (-> classes first get-id)))
+                       (and classes (= const/iri-owl:Thing (-> classes first util/get-id)))
                        {"where"  {"@id"    "?x"
                                   property nil}
                         "insert" {"@id"   "?x"
@@ -553,7 +509,7 @@
                        {"where"  [{"@id"    "?x"
                                    property "?y"}
                                   {"@id"   "?y"
-                                   "@type" (-> classes first get-id)}]
+                                   "@type" (-> classes first util/get-id)}]
                         "insert" {"@id"   "?x"
                                   "@type" rule-class}}
 
@@ -566,7 +522,7 @@
           (conj acc [(str rule-class "(owl:someValuesFrom-" property ")") rule])
           (do (log/warn "owl:Restriction for class" rule-class
                         "is not properly defined. owl:onProperty is:" (get restriction const/iri-owl:onProperty)
-                        "and owl:someValuesFrom is:" (get-first restriction const/iri-owl:someValuesFrom)
+                        "and owl:someValuesFrom is:" (util/get-first restriction const/iri-owl:someValuesFrom)
                         ". onProperty must exist and be an IRI (wrapped in {@id: ...})."
                         "someValuesFrom must exist and must be a Class.")
               acc))))
@@ -636,7 +592,7 @@
                                        "insert" {"@id"   "?y"
                                                  "@type" rule-class}}])
                                    restrictions)
-            class-list        (map get-id classes)
+            class-list        (map util/get-id classes)
             ;; could do optional clauses instead of separate
             ;; opted for separate for now to keep it simple
             ;; and allow for possibly fewer rule triggers with
@@ -683,7 +639,7 @@
 ;; owl:equivalentClass
 (defmethod to-datalog ::cax-eqc
   [_ inserts owl-statement all-rules]
-  (let [c1 (get-id owl-statement) ;; the class which is the subject
+  (let [c1 (util/get-id owl-statement) ;; the class which is the subject
         ;; combine with all other equivalent classes for a set of 2+ total classes
         {:keys [classes intersection-of union-of one-of
                 has-value some-values all-values
@@ -704,7 +660,7 @@
 ;; rdfs:subClassOf
 (defmethod to-datalog ::cax-sco
   [_ inserts owl-statement all-rules]
-  (let [c1         (get-id owl-statement) ;; the class which is the subject
+  (let [c1         (util/get-id owl-statement) ;; the class which is the subject
         class-list (-> owl-statement
                        (get const/iri-rdfs:subClassOf)
                        get-all-ids)
@@ -722,7 +678,7 @@
 
 (defmethod to-datalog ::prp-key
   [_ _ owl-statement all-rules]
-  (let [class     (get-id owl-statement)
+  (let [class     (util/get-id owl-statement)
         ;; support props in either @list form, or just as a set of values
         prop-list (-> owl-statement
                       (get const/iri-owl:hasKey)

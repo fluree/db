@@ -2,7 +2,7 @@
   (:require [clojure.core.async :as async :refer [alts! go]]
             [clojure.string :as str]
             [fluree.db.flake :as flake]
-            [fluree.db.query.fql.parse :as parse]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [go-try <?]]
@@ -154,7 +154,7 @@
         (let [id   (:id rule)
               rule (util/get-first-value rule const/iri-rule)]
           (if rule
-            (conj acc [(or id (parse/new-blank-node-id)) rule])
+            (conj acc [(or id (iri/new-blank-node-id)) rule])
             acc))
         ;; else already in two-tuple form
         (conj acc rule)))

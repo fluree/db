@@ -4,12 +4,11 @@
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.query.fql.parse :as parse]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as exec-where]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql :as fql]
-            [fluree.db.reasoner.owl-datalog :as owl-datalog]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -114,7 +113,7 @@
           all-rules)
         ;; blank nodes can be part of OWL logic (nested), but we won't assign class or
         ;; property names to blank nodes
-        (remove owl-datalog/blank-node? all-rules)))))
+        (remove iri/blank-node? all-rules)))))
 
 (defn rules-from-db
   "Returns core async channel with rules query result"
