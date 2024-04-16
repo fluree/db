@@ -9,6 +9,7 @@
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.json-ld :as json-ld]
+            [clojure.core.async :as async]
             [clojure.string :as str]
             [clojure.set :as set])
   #?(:clj (:import (java.util.regex Pattern))))
@@ -92,9 +93,9 @@
   "A qualified value shape has one value for sh:qualifiedValueShape and either a
   sh:qualifiedMinCount or a sh:qualifiedMaxCount."
   [shape]
-  (and (first (get shape const/sh_qualifiedValueShape))
-       (or (first (get shape const/sh_qualifiedMinCount))
-           (first (get shape const/sh_qualifiedMaxCount)))))
+  (and (util/get-first shape const/sh_qualifiedValueShape)
+       (or (util/get-first shape const/sh_qualifiedMinCount)
+           (util/get-first shape const/sh_qualifiedMaxCount))))
 
 (defn build-shape-node
   "Recursively build a shape by traversing the ref flakes and constructing nodes out of
@@ -164,7 +165,8 @@
   (fn [v-ctx shape constraint focus-node value-nodes]
     constraint))
 
-(defmethod validate-constraint :default [_ _ _ _ _] (go-try nil))
+(def empty-channel (doto (async/chan) async/close!))
+(defmethod validate-constraint :default [_ _ _ _ _] empty-channel)
 
 (defn validate-constraints
   [v-ctx shape focus-node value-nodes]
@@ -298,15 +300,17 @@
   [data-db shape s-flakes]
   (go-try
     (let [sid (some-> s-flakes first flake/s)]
-      (cond (target-node-target? shape s-flakes)        [sid]
-            (target-class-target? shape s-flakes)       [sid]
-            (target-subjects-of-target? shape s-flakes) [sid]
-            (implicit-target? shape s-flakes)           [sid]
-            (target-objects-of-target? shape)
-            (<? (target-objects-of-focus-nodes data-db shape s-flakes))
-            :else
-            ;; no target declaration, no focus nodes
-            []))))
+      (cond (or (target-node-target? shape s-flakes)
+                (target-class-target? shape s-flakes)
+                (target-subjects-of-target? shape s-flakes)
+                (implicit-target? shape s-flakes))
+            [sid]
+
+             (target-objects-of-target? shape)
+             (<? (target-objects-of-focus-nodes data-db shape s-flakes))
+
+             :else ;; no target declaration, no focus nodes
+             []))))
 
 (defn validate-node-shape
   "Validate the focus nodes that are targeted by the target declaration, or the provided nodes."
@@ -398,8 +402,8 @@
           result     (base-result v-ctx shape constraint focus-node)]
       (->> value-nodes
            (remove (fn [[v _dt]]
-                     (let [iri?     (and (iri/sid? v) (not (iri/bnode? v)))
-                           bnode?   (iri/bnode? v)
+                     (let [iri?     (and (iri/sid? v) (not (iri/blank-node-sid? v)))
+                           bnode?   (iri/blank-node-sid? v)
                            literal? (not (iri/sid? v))]
                        (condp = nodekind
                          const/sh_BlankNode          bnode?

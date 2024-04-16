@@ -50,14 +50,14 @@
         db-after
         (loop [[s-flakes & r] (partition-by flake/s add)]
           (if s-flakes
-            (let [fflake         (first s-flakes)
-                  sid            (flake/s fflake)
-                  classes        (->> (get mods sid)
-                                      (into #{} (comp (filter flake/class-flake?)
-                                                       (map flake/o))))
+            (let [fflake  (first s-flakes)
+                  sid     (flake/s fflake)
+                  classes (->> (get mods sid)
+                               (into #{} (comp (filter flake/class-flake?)
+                                               (map flake/o))))
 
-                  class-iris (map (partial iri/decode-sid db-after)
-                                  classes)
+                  class-iris     (map (partial iri/decode-sid db-after)
+                                      classes)
                   {defaults :default props :property}
                   (validate/group-policies-by-default policy const/iri-modify
                                                       class-iris)

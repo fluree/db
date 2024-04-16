@@ -165,7 +165,7 @@
   [x]
   (instance? SID x))
 
-(defn bnode?
+(defn blank-node-sid?
   [x]
   (and (sid? x)
        (= (get-namespace x) "_:")))
