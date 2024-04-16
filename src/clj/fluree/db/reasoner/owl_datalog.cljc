@@ -6,38 +6,21 @@
 
 ;; conversions of owl statements to datalog
 
-(defn unwrap-list
-  "If values are contained in a @list, unwraps them.
-  @list can look like:
-  {ex:someProperty [{@list [ex:val1 ex:val2]}]}
-  or in single-cardinality form:
-  {ex:someProperty {@list [ex:val1 ex:val2]}}"
+(defn only-named-ids
+  "Returns all @id values that are not blank nodes
+  from either an ordered list or a set of objects."
   [vals]
-  (let [first-val (if (sequential? vals)
-                    (first vals)
-                    vals)
-        list-vals (when (map? first-val)
-                    (or (:list first-val)
-                        (get first-val "@list")))]
-    (or list-vals
-        vals)))
+  (->> (util/unwrap-list vals)
+       (into [] (comp
+                  (keep util/get-id)
+                  (remove iri/blank-node-id?)))))
 
-(defn get-all-ids
-  "Returns all @id values from either an ordered list or a set of objects.
-  Filters out any scalar (@value) values and blank nodes."
-  [vals]
-  (try*
-    (->> (util/sequential vals)
-         unwrap-list
-         (into [] (comp
-                    (map util/get-id)
-                    (remove nil?)
-                    (remove iri/blank-node-id?))))
-    (catch* e
-            (throw (ex-info (str "Unexpected error extracting all @id values from owl statement:" vals)
-                            {:status 500
-                             :error  :db/unexpected-error}
-                            e)))))
+(defn get-named-ids
+  "Gets all @id values from property 'k' in json-ld node.
+  Filters all scalar values and blank nodes."
+  [json-ld k]
+  (->> (util/get-all-ids json-ld k)
+       (remove iri/blank-node-id?)))
 
 (defn equiv-class-type
   [equiv-class-statement]
@@ -92,9 +75,7 @@
   ;; the owl:sameAs rule is a base rule for any existing owl:sameAs
   ;; that might already exist in the current db
   (let [id      (util/get-id owl-statement)
-        sa-ids  (-> owl-statement
-                    (get const/iri-owl:sameAs)
-                    get-all-ids)
+        sa-ids  (get-named-ids owl-statement const/iri-owl:sameAs)
         rule-id (str const/iri-owl:sameAs "(" id ")")
         triples (->> sa-ids
                      (mapcat (fn [sa-id]
@@ -113,9 +94,7 @@
 (defmethod to-datalog ::prp-dom
   [_ _ owl-statement all-rules]
   (let [property (util/get-id owl-statement)
-        domain   (-> owl-statement
-                     (get const/iri-rdfs:domain)
-                     get-all-ids)
+        domain   (get-named-ids owl-statement const/iri-rdfs:domain)
         rule     {"where"  {"@id"    "?s"
                             property nil}
                   "insert" {"@id"   "?s"
@@ -130,9 +109,7 @@
 ;; rdfs:range
 (defmethod to-datalog ::prp-rng
   [_ _ owl-statement all-rules]
-  (let [range    (-> owl-statement
-                     (get const/iri-rdfs:range)
-                     get-all-ids)
+  (let [range    (get-named-ids owl-statement const/iri-rdfs:range)
         property (util/get-id owl-statement)
         rule     {"where"  {"@id"    nil,
                             property "?ps"}
@@ -197,9 +174,7 @@
 (defmethod to-datalog ::prp-spo1
   [_ inserts owl-statement all-rules]
   (let [child-prop   (util/get-id owl-statement)
-        parent-props (-> owl-statement
-                         (get const/iri-rdfs:subPropertyOf)
-                         get-all-ids)
+        parent-props (get-named-ids owl-statement const/iri-rdfs:subPropertyOf)
         triples      (mapv (fn [parent-prop]
                              [child-prop const/iri-rdfs:subPropertyOf {"@id" parent-prop}])
                            parent-props)
@@ -220,9 +195,7 @@
   [_ _ owl-statement all-rules]
   (try*
     (let [prop    (util/get-id owl-statement)
-          p-chain (-> owl-statement
-                      (get const/iri-owl:propertyChainAxiom)
-                      get-all-ids)
+          p-chain (get-named-ids owl-statement const/iri-owl:propertyChainAxiom)
           where   (->> p-chain
                        (map-indexed (fn [idx p-n]
                                       (if p-n
@@ -269,7 +242,7 @@
   "Maps every class equivalence to every other class in the set"
   [rule-class class-statements]
   (let [c-set (->> class-statements
-                   get-all-ids
+                   only-named-ids
                    (into #{rule-class}))]
     (map-indexed (fn [idx cn]
                    (let [rule-id (str rule-class "(owl:equivalentClass-" idx ")")
@@ -428,9 +401,9 @@
                   acc)))
 
           union-of
-          (let [union-classes   (-> (first union-of) ;; always sequential, but only can be one value so take first
-                                    (get const/iri-owl:unionOf)
-                                    get-all-ids)
+          (let [union-classes   (-> union-of
+                                    first ;; always sequential, but only can be one value so take first
+                                    (get-named-ids const/iri-owl:unionOf))
                 with-property-q {"@id"    binding-var
                                  property "?_some-val-rel"}
                 of-classes-q    (reduce (fn [acc class]
@@ -475,9 +448,7 @@
 
   Assume just a single one-of-statement is passed in, not a list."
   [binding-var property one-of-statement]
-  (let [individuals (-> one-of-statement
-                        (get const/iri-owl:oneOf)
-                        get-all-ids)]
+  (let [individuals (get-named-ids one-of-statement const/iri-owl:oneOf)]
     (reduce (fn [acc i]
               (conj acc {"@id"    binding-var
                          property {"@id" i}}))
@@ -533,12 +504,12 @@
   [rule-class intersection-of-statements inserts]
   (reduce
     (fn [acc intersection-of-statement]
-      (let [intersections (unwrap-list (get intersection-of-statement const/iri-owl:intersectionOf))
+      (let [intersections (util/unwrap-list (get intersection-of-statement const/iri-owl:intersectionOf))
             {:keys [classes has-value some-values qual-cardinality]} (group-by equiv-class-type intersections)
             restrictions  (cond->> []
                                    has-value (into (has-value-condition "?y" has-value))
                                    some-values (into (some-values-condition "?y" some-values)))
-            class-list    (get-all-ids classes)
+            class-list    (only-named-ids classes)
             cls-int1      (when (or (seq class-list)
                                     (seq restrictions))
                             {"where"  (reduce
@@ -581,7 +552,7 @@
   [rule-class union-of-statements inserts]
   (reduce
     (fn [acc union-of-statement]
-      (let [unions            (unwrap-list (get union-of-statement const/iri-owl:unionOf))
+      (let [unions            (util/unwrap-list (get union-of-statement const/iri-owl:unionOf))
             {:keys [classes has-value]} (group-by equiv-class-type unions)
             restrictions      (cond->> []
                                        has-value (into (has-value-condition "?y" has-value)))
@@ -622,9 +593,7 @@
   "Handles rule cls-oo"
   [rule-class one-of-statements inserts]
   (let [triples (reduce (fn [acc one-of-statement]
-                          (let [individuals (-> one-of-statement
-                                                (get const/iri-owl:oneOf)
-                                                get-all-ids)
+                          (let [individuals (get-named-ids one-of-statement const/iri-owl:oneOf)
                                 triples     (map (fn [i]
                                                    [i "@type" rule-class])
                                                  individuals)]
@@ -643,7 +612,7 @@
         {:keys [classes intersection-of union-of one-of
                 has-value some-values all-values
                 max-cardinality max-qual-cardinality]} (->> (get owl-statement const/iri-owl:equivalentClass)
-                                                            unwrap-list
+                                                            util/unwrap-list
                                                             (group-by equiv-class-type))]
     (cond-> all-rules
             classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
@@ -660,9 +629,7 @@
 (defmethod to-datalog ::cax-sco
   [_ inserts owl-statement all-rules]
   (let [c1         (util/get-id owl-statement) ;; the class which is the subject
-        class-list (-> owl-statement
-                       (get const/iri-rdfs:subClassOf)
-                       get-all-ids)
+        class-list (get-named-ids owl-statement const/iri-rdfs:subClassOf)
         triples    (reduce
                      (fn [triples* c]
                        (conj triples* [c1 const/iri-rdfs:subClassOf {"@id" c}]))
@@ -679,9 +646,7 @@
   [_ _ owl-statement all-rules]
   (let [class     (util/get-id owl-statement)
         ;; support props in either @list form, or just as a set of values
-        prop-list (-> owl-statement
-                      (get const/iri-owl:hasKey)
-                      get-all-ids)
+        prop-list (get-named-ids owl-statement const/iri-owl:hasKey)
         where     (->> prop-list
                        (map-indexed (fn [idx prop]
                                       [prop (str "?z" idx)]))
