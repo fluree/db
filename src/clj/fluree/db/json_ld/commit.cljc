@@ -15,7 +15,7 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.reasoner.core :as reasoner]
+            [fluree.db.reasoner :as reasoner]
             [fluree.db.util.log :as log :include-macros true])
   (:refer-clojure :exclude [vswap!]))
 

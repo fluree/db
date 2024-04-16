@@ -55,6 +55,7 @@
 (def ^:const iri-values (fluree-iri "values"))
 (def ^:const iri-insert (fluree-iri "insert"))
 (def ^:const iri-delete (fluree-iri "delete"))
+(def ^:const iri-rule (fluree-iri "rule"))
 
 (def ^:const iri-context "@context")
 (def ^:const iri-id "@id")
@@ -67,6 +68,44 @@
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
 (def ^:const iri-lang-string "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
+
+;; rdfs
+(def ^:const iri-rdfs:Class "http://www.w3.org/2000/01/rdf-schema#Class")
+(def ^:const iri-rdfs:subClassOf "http://www.w3.org/2000/01/rdf-schema#subClassOf")
+(def ^:const iri-rdfs:subPropertyOf "http://www.w3.org/2000/01/rdf-schema#subPropertyOf")
+(def ^:const iri-rdfs:domain "http://www.w3.org/2000/01/rdf-schema#domain")
+(def ^:const iri-rdfs:range "http://www.w3.org/2000/01/rdf-schema#range")
+
+;; OWL
+(def ^:const iri-owl:Thing "http://www.w3.org/2002/07/owl#Thing")
+(def ^:const iri-owl:Class "http://www.w3.org/2002/07/owl#Class")
+(def ^:const iri-owl:ObjectProperty "http://www.w3.org/2002/07/owl#ObjectProperty")
+(def ^:const iri-owl:FunctionalProperty "http://www.w3.org/2002/07/owl#FunctionalProperty")
+(def ^:const iri-owl:InverseFunctionalProperty "http://www.w3.org/2002/07/owl#InverseFunctionalProperty")
+(def ^:const iri-owl:SymetricProperty "http://www.w3.org/2002/07/owl#SymetricProperty")
+(def ^:const iri-owl:TransitiveProperty "http://www.w3.org/2002/07/owl#TransitiveProperty")
+
+(def ^:const iri-owl:sameAs "http://www.w3.org/2002/07/owl#sameAs")
+
+;; property expressions
+(def ^:const iri-owl:propertyChainAxiom "http://www.w3.org/2002/07/owl#propertyChainAxiom")
+(def ^:const iri-owl:inverseOf "http://www.w3.org/2002/07/owl#inverseOf")
+(def ^:const iri-owl:hasKey "http://www.w3.org/2002/07/owl#hasKey")
+
+;; class expressions
+(def ^:const iri-owl:equivalentClass "http://www.w3.org/2002/07/owl#equivalentClass")
+(def ^:const iri-owl:intersectionOf "http://www.w3.org/2002/07/owl#intersectionOf")
+(def ^:const iri-owl:unionOf "http://www.w3.org/2002/07/owl#unionOf")
+(def ^:const iri-owl:Restriction "http://www.w3.org/2002/07/owl#Restriction")
+(def ^:const iri-owl:onProperty "http://www.w3.org/2002/07/owl#onProperty")
+(def ^:const iri-owl:onClass "http://www.w3.org/2002/07/owl#onClass")
+(def ^:const iri-owl:oneOf "http://www.w3.org/2002/07/owl#oneOf")
+(def ^:const iri-owl:hasValue "http://www.w3.org/2002/07/owl#hasValue")
+(def ^:const iri-owl:someValuesFrom "http://www.w3.org/2002/07/owl#someValuesFrom")
+(def ^:const iri-owl:allValuesFrom "http://www.w3.org/2002/07/owl#allValuesFrom")
+(def ^:const iri-owl:maxCardinality "http://www.w3.org/2002/07/owl#maxCardinality")
+(def ^:const iri-owl:maxQualifiedCardinality "http://www.w3.org/2002/07/owl#maxQualifiedCardinality")
+(def ^:const iri-owl:qualifiedCardinality "http://www.w3.org/2002/07/owl#qualifiedCardinality")
 
 ;; predicate id constants
 
@@ -92,9 +131,9 @@
 (def ^:const $rdf:Property (iri/iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"))
 (def ^:const $rdf:langString (iri/iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"))
 
-(def ^:const $rdfs:subClassOf (iri/iri->sid "http://www.w3.org/2000/01/rdf-schema#subClassOf"))
-(def ^:const $rdfs:subPropertyOf (iri/iri->sid "http://www.w3.org/2000/01/rdf-schema#subPropertyOf"))
-(def ^:const $rdfs:Class (iri/iri->sid "http://www.w3.org/2000/01/rdf-schema#Class"))
+(def ^:const $rdfs:subClassOf (iri/iri->sid iri-rdfs:subClassOf))
+(def ^:const $rdfs:subPropertyOf (iri/iri->sid iri-rdfs:subPropertyOf))
+(def ^:const $rdfs:Class (iri/iri->sid iri-rdfs:Class))
 
 ;; shacl
 (def ^:const $sh:NodeShape (iri/iri->sid "http://www.w3.org/ns/shacl#NodeShape"))

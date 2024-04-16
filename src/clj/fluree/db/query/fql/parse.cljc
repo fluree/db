@@ -14,8 +14,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.validation :as v]
-            [fluree.json-ld :as json-ld]
-            [nano-id.core :refer [nano-id]]))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -590,17 +589,6 @@
   (log/trace "parse-query" q)
   (-> q syntax/coerce-query parse-analytical-query))
 
-(def blank-node-prefix
-  "_:fdb")
-
-(defn new-blank-node-id
-  "Generate a temporary blank-node id. This will get replaced during flake creation
-  when a sid is generated."
-  []
-  (let [now (util/current-time-millis)
-        suf (nano-id 8)]
-    (str/join "-" [blank-node-prefix now suf] )))
-
 (declare parse-subj-cmp)
 
 (defn parse-object-value
@@ -632,7 +620,7 @@
                     (parse-variable-if-allowed allowed-vars id)
                     (where/match-iri
                      (if (nil? id)
-                       (new-blank-node-id)
+                       (iri/new-blank-node-id)
                        id)))
           ref-cmp (if m
                     (assoc ref-obj ::where/meta m)
@@ -675,7 +663,7 @@
 (defn parse-subj-cmp
   [allowed-vars triples {:keys [id] :as node}]
   (let [subj-cmp (cond (v/variable? id) (parse-variable-if-allowed allowed-vars id)
-                       (nil? id)        (where/match-iri (new-blank-node-id))
+                       (nil? id)        (where/match-iri (iri/new-blank-node-id))
                        :else            (where/match-iri id))]
     (reduce (partial parse-pred-cmp allowed-vars subj-cmp)
             triples
@@ -684,9 +672,15 @@
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
   [allowed-vars expanded]
-  (reduce (partial parse-subj-cmp allowed-vars)
-          []
-          expanded))
+  (try*
+    (reduce (partial parse-subj-cmp allowed-vars)
+            []
+            expanded)
+    (catch* e
+            (throw (ex-info (str "Parsing failure due to: " (ex-message e)
+                                 ". Query: " expanded)
+                            (ex-data e)
+                            e)))))
 
 (defn parse-txn
   [txn context]

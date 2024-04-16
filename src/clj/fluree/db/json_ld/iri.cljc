@@ -4,6 +4,7 @@
             [fluree.db.util.bytes :as bytes]
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]
+            [nano-id.core :refer [nano-id]]
             #?(:cljs [fluree.db.sid :refer [SID]]))
   #?(:clj (:import (fluree.db SID))))
 
@@ -208,3 +209,28 @@
 (defn fluree-iri
   [nme]
   (str f-ns nme))
+
+(def blank-node-prefix
+  "_:fdb")
+
+(defn blank-node-id?
+  [s]
+  (str/starts-with? s blank-node-prefix))
+
+(defn blank-node?
+  [node]
+  (when-let [id (util/get-id node)]
+    (if (string? id)
+      (blank-node-id? id)
+      (throw (ex-info (str "JSON-LD node improperly formed, @id values must be strings, but found: " id
+                           " in node: " node ".")
+                      {:status 500
+                       :error  :db/unexpected-error})))))
+
+(defn new-blank-node-id
+  "Generate a temporary blank-node id. This will get replaced during flake creation
+  when a sid is generated."
+  []
+  (let [now (util/current-time-millis)
+        suf (nano-id 8)]
+    (str/join "-" [blank-node-prefix now suf] )))
