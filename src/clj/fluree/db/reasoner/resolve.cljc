@@ -105,7 +105,7 @@
                                                      "@type" const/iri-owl:Class}
                                                     {"@id"   "?s",
                                                      "@type" const/iri-owl:ObjectProperty}
-                                                    {"@id"   "?s",
+                                                    {"@id"                "?s",
                                                      const/iri-owl:sameAs nil}]]
                                           :depth  6}))]
       (if (util/exception? all-rules)
@@ -122,7 +122,7 @@
   (case method
     :datalog (fql/query db nil
                         {:select ["?s" "?rule"]
-                         :where  {"@id"                           "?s",
-                                  "http://flur.ee/ns/ledger#rule" "?rule"}})
-    :owl2rl  (extract-owl2rl-from-db db)))
+                         :where  {"@id"          "?s",
+                                  const/iri-rule "?rule"}})
+    :owl2rl (extract-owl2rl-from-db db)))
 

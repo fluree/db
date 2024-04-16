@@ -152,7 +152,7 @@
     (fn [acc rule]
       (if (map? rule)
         (let [id   (:id rule)
-              rule (util/get-first-value rule "http://flur.ee/ns/ledger#rule")]
+              rule (util/get-first-value rule const/iri-rule)]
           (if rule
             (conj acc [(or id (parse/new-blank-node-id)) rule])
             acc))

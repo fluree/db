@@ -55,6 +55,7 @@
 (def ^:const iri-values (fluree-iri "values"))
 (def ^:const iri-insert (fluree-iri "insert"))
 (def ^:const iri-delete (fluree-iri "delete"))
+(def ^:const iri-rule (fluree-iri "rule"))
 
 (def ^:const iri-context "@context")
 (def ^:const iri-id "@id")
