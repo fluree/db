@@ -1,6 +1,5 @@
 (ns fluree.db.reasoner.owl-datalog
-  (:require [clojure.string :as str]
-            [fluree.db.json-ld.iri :as iri]
+  (:require [fluree.db.json-ld.iri :as iri]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
@@ -23,11 +22,6 @@
     (or list-vals
         vals)))
 
-(defn get-types
-  [node]
-  (or (:type node)
-      (get node "@type")))
-
 (defn get-all-ids
   "Returns all @id values from either an ordered list or a set of objects.
   Filters out any scalar (@value) values and blank nodes."
@@ -48,7 +42,7 @@
 (defn equiv-class-type
   [equiv-class-statement]
   (let [statement-id (util/get-id equiv-class-statement)]
-    (cond (some #(= % const/iri-owl:Restriction) (get-types equiv-class-statement))
+    (cond (util/of-type? equiv-class-statement const/iri-owl:Restriction)
           (cond
             (contains? equiv-class-statement const/iri-owl:hasValue)
             :has-value
@@ -434,14 +428,19 @@
                   acc)))
 
           union-of
-          (-> acc
-              (conj {"@id"    binding-var
-                     property "?_some-val-rel"})
-              (conj (reduce (fn [acc i]
-                              (conj acc {"@id"   "?_some-val-rel"
-                                         "@type" {"@id" i}}))
-                            ["union"]
-                            (-> union-of first (get const/iri-owl:unionOf) get-all-ids))))
+          (let [union-classes   (-> (first union-of) ;; always sequential, but only can be one value so take first
+                                    (get const/iri-owl:unionOf)
+                                    get-all-ids)
+                with-property-q {"@id"    binding-var
+                                 property "?_some-val-rel"}
+                of-classes-q    (reduce (fn [acc class]
+                                          (conj acc {"@id"   "?_some-val-rel"
+                                                     "@type" {"@id" class}}))
+                                        ["union"]
+                                        union-classes)]
+            (-> acc
+                (conj with-property-q)
+                (conj of-classes-q)))
 
           :else
           (do (log/warn "Ignoring some rules from nested owl:someValuesFrom values."
@@ -727,7 +726,7 @@
 
 (defn property-types
   [owl-statement]
-  (let [types (get-types owl-statement)]
+  (let [types (util/get-types owl-statement)]
     (reduce (fn [acc type]
               (condp = type
 

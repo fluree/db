@@ -419,6 +419,18 @@
       (first v)
       v)))
 
+(defn get-types
+  [json-ld]
+  (or (:type json-ld)
+      (get json-ld "@type")))
+
+(defn of-type?
+  "Returns true if the provided json-ld node is of the provided type."
+  [json-ld rdf-type]
+  (->> json-ld
+       get-types
+       (some #(= % rdf-type))))
+
 (defn get-value
   [val]
   (if (map? val)
