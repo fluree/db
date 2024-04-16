@@ -22,23 +22,6 @@
   (->> (util/get-all-ids json-ld k)
        (remove iri/blank-node-id?)))
 
-(defn get-all-ids
-  "Returns all @id values from either an ordered list or a set of objects.
-  Filters out any scalar (@value) values and blank nodes."
-  [vals]
-  (try*
-    (->> (util/sequential vals)
-         util/unwrap-list
-         (into [] (comp
-                    (map util/get-id)
-                    (remove nil?)
-                    (remove iri/blank-node-id?))))
-    (catch* e
-            (throw (ex-info (str "Unexpected error extracting all @id values from owl statement:" vals)
-                            {:status 500
-                             :error  :db/unexpected-error}
-                            e)))))
-
 (defn equiv-class-type
   [equiv-class-statement]
   (let [statement-id (util/get-id equiv-class-statement)]
