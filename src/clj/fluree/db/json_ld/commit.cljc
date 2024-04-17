@@ -308,11 +308,11 @@
 (defn write-transactions!
   [conn ledger staged]
   (go-try
-    (loop [[[txn author-did] & r] staged
+    (loop [[[txn author-did annotation] & r] staged
            results                []]
       (if txn
         (let [{txn-id :address} (<? (connection/-txn-write conn ledger txn))]
-          (recur r (conj results [txn-id author-did])))
+          (recur r (conj results [txn-id author-did annotation])))
         results))))
 
 (defn commit
@@ -324,8 +324,10 @@
     (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
           (enrich-commit-opts ledger db opts)
 
-          txns              (<? (write-transactions! conn ledger staged))
-          [[txn-id author]] txns
+          txns (<? (write-transactions! conn ledger staged))
+
+          [[txn-id author annotation]] txns
+
           [dbid db-jsonld]  (db->jsonld db opts*)
           ledger-update-res (<? (connection/-c-write conn ledger db-jsonld)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
@@ -337,6 +339,7 @@
                              :t          t
                              :db-address db-address
                              :author     (or author "")
+                             :annotation annotation
                              :txn-id     (if (= 1 (count txns)) txn-id "")
                              :flakes     (:flakes stats)
                              :size       (:size stats)}

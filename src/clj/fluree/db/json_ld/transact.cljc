@@ -15,7 +15,8 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -25,6 +26,29 @@
     (let [root-db (dbproto/-rootdb db-after)]
       (<? (shacl/validate! db-before root-db (vals mods) context))
       staged-map)))
+
+(defn nested-nodes?
+  "Returns truthy if the provided node has any nested nodes."
+  [node]
+  (->> node
+       (into []
+             (comp (remove (fn [[k v]] (keyword? k))) ; remove :id :idx :type
+                   (mapcat rest)                      ; discard keys
+                   (mapcat (partial remove :value)))) ; remove value objects
+       not-empty))
+
+(defn validate-annotation
+  "Validate that the commit annotation is just a single json-ld node."
+  [[annotation :as expanded]]
+  (when-let [specified-id (:id annotation)]
+    (throw (ex-info "Commit annotation cannot specify a subject identifier."
+                    {:status 400, :error :db/invalid-annotation :id specified-id})))
+  (when (or (> (count expanded) 1)
+            (nested-nodes? annotation))
+      (throw (ex-info "Commit annotation must only have a single subject."
+                      {:status 400, :error :db/invalid-annotation})))
+  ;; everything is good
+  expanded)
 
 ;; TODO - can use transient! below
 (defn stage-update-novelty
@@ -48,10 +72,7 @@
   "Generates a state map for transaction processing. When optional
   reasoned-from-IRI is provided, will mark any new flakes as reasoned from the
   provided value in the flake's metadata (.-m) as :reasoned key."
-  ([db context txn author-did]
-   (->tx-state db context txn author-did nil))
-
-  ([db context txn author-did reasoned-from-iri]
+  [& {:keys [db context txn author-did annotation reasoned-from-iri]}]
   (let [{:keys [policy], db-t :t} db
 
         commit-t  (-> db :commit commit-data/t)
@@ -60,13 +81,13 @@
     {:db-before     db-before
      :context       context
      :txn           txn
+     :annotation    annotation
      :author-did    author-did
      :policy        policy
-     :stage-update? (= t db-t)          ; if a previously staged db is getting updated
-                                        ; again before committed
+     :stage-update? (= t db-t) ; if a previously staged db is getting updated again before committed
      :t             t
-     :reasoner-max  10          ; maximum number of reasoner iterations before exception
-     :reasoned      reasoned-from-iri})))
+     :reasoner-max  10         ; maximum number of reasoner iterations before exception
+     :reasoned      reasoned-from-iri}))
 
 (defn into-flakeset
   [fuel-tracker error-ch flake-ch]
@@ -108,7 +129,7 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [db new-flakes {:keys [stage-update? policy t txn author-did db-before context] :as _tx-state}]
+  [db new-flakes {:keys [stage-update? policy t txn author-did annotation db-before context] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
@@ -117,7 +138,7 @@
           mods (<? (modified-subjects db add))
 
           db-after  (-> db
-                        (update :staged conj [txn author-did])
+                        (update :staged conj [txn author-did annotation])
                         (assoc :policy policy) ;; re-apply policy to db-after
                         (assoc :t t)
                         (commit-data/update-novelty add remove)
@@ -146,9 +167,15 @@
      (let [{:keys [context raw-txn did]} parsed-opts
 
            parsed-txn (q-parse/parse-txn txn context)
+           annotation (some-> (or (:annotation parsed-txn) (:annotation parsed-opts))
+                              (json-ld/expand context)
+                              (util/sequential)
+                              (validate-annotation))
            db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                         (<? (perm/wrap-policy db policy-identity))
                         db)
-           tx-state   (->tx-state db* context raw-txn did)
+
+           tx-state   (->tx-state :db db*, :context context, :txn raw-txn, :author-did did
+                                  :annotation annotation)
            flakes     (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
        (<? (flakes->final-db fuel-tracker tx-state flakes))))))

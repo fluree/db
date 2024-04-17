@@ -31,6 +31,7 @@
 (def ^:const iri-time (fluree-iri "time"))
 (def ^:const iri-author (fluree-iri "author"))
 (def ^:const iri-txn (fluree-iri "txn"))
+(def ^:const iri-annotation (fluree-iri "annotation"))
 (def ^:const iri-message (fluree-iri "message"))
 (def ^:const iri-tag (fluree-iri "tag"))
 (def ^:const iri-updates (fluree-iri "updates"))
@@ -117,6 +118,7 @@
 (def ^:const $_commit:signer (iri/iri->sid iri-issuer))
 (def ^:const $_commit:author (iri/iri->sid iri-author))
 (def ^:const $_commit:txn (iri/iri->sid iri-txn))
+(def ^:const $_commit:annotation (iri/iri->sid iri-annotation))
 (def ^:const $_ledger:alias (iri/iri->sid iri-alias))
 (def ^:const $_ledger:branch (iri/iri->sid iri-branch))
 

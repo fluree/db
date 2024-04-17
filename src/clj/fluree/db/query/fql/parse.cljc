@@ -696,13 +696,15 @@
         insert-clause (-> txn
                           (util/get-first-value const/iri-insert)
                           (json-ld/expand context))
-        insert        (->> insert-clause util/sequential (parse-triples bound-vars))]
+        insert        (->> insert-clause util/sequential (parse-triples bound-vars))
+        annotation    (util/get-first-value txn const/iri-annotation)]
     (when (and (empty? insert) (empty? delete))
       (throw (ex-info (str "Invalid transaction, insert or delete clause must contain nodes with objects.")
                       {:status 400 :error :db/invalid-transaction})))
     (cond-> {}
       context      (assoc :context context)
       where        (assoc :where where)
+      annotation   (assoc :annotation annotation)
       (seq values) (assoc :values values)
       (seq delete) (assoc :delete delete)
       (seq insert) (assoc :insert insert))))

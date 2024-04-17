@@ -80,16 +80,18 @@
     (flake/create sid pid v* dt t true m)))
 
 (defn build-flake
-  [db-vol t reasoned [s-mch p-mch o-mch]]
-  (let [m     (where/get-meta o-mch)
-        s-iri (where/get-iri s-mch)
-        sid   (generate-sid! db-vol s-iri)
-        p-iri (where/get-iri p-mch)
-        pid   (generate-sid! db-vol p-iri)]
-    (cond-> (if (where/matched-iri? o-mch)
-              (create-iri-reference-flake db-vol sid pid o-mch t m)
-              (create-scalar-flake db-vol p-iri sid pid o-mch t m))
-            reasoned (with-meta {:reasoned reasoned}))))
+  ([db-vol t matched-triple]
+   (build-flake db-vol t nil matched-triple))
+  ([db-vol t reasoned [s-mch p-mch o-mch]]
+   (let [m     (where/get-meta o-mch)
+         s-iri (where/get-iri s-mch)
+         sid   (generate-sid! db-vol s-iri)
+         p-iri (where/get-iri p-mch)
+         pid   (generate-sid! db-vol p-iri)]
+     (cond-> (if (where/matched-iri? o-mch)
+               (create-iri-reference-flake db-vol sid pid o-mch t m)
+               (create-scalar-flake db-vol p-iri sid pid o-mch t m))
+       reasoned (with-meta {:reasoned reasoned})))))
 
 (defn insert
   [db-vol txn {:keys [t reasoned]} solution-ch]
