@@ -84,8 +84,7 @@
      :annotation    annotation
      :author-did    author-did
      :policy        policy
-     :stage-update? (= t db-t)         ; if a previously staged db is getting updated
-                                        ; again before committed
+     :stage-update? (= t db-t) ; if a previously staged db is getting updated again before committed
      :t             t
      :reasoner-max  10         ; maximum number of reasoner iterations before exception
      :reasoned      reasoned-from-iri}))
@@ -176,7 +175,7 @@
                         (<? (perm/wrap-policy db policy-identity))
                         db)
 
-           tx-state   (->tx-state :db db* :context context :txn raw-txn :author-did did
+           tx-state   (->tx-state :db db*, :context context, :txn raw-txn, :author-did did
                                   :annotation annotation)
            flakes     (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
        (<? (flakes->final-db fuel-tracker tx-state flakes))))))

@@ -55,7 +55,7 @@
   "When triples from rules require explicit inserts, returns flakes."
   [db fuel-tracker rule-id insert-smt]
   (go-try
-    (let [tx-state (-> (transact/->tx-state :db db :reasoned-from-iri rule-id)
+    (let [tx-state (-> (transact/->tx-state :db db, :reasoned-from-iri rule-id)
                        (assoc :stage-update? true))
           [db* new-flakes] (<? (transact/generate-flakes db fuel-tracker insert-smt tx-state))]
       (<? (transact/final-db db* new-flakes tx-state)))))
@@ -63,7 +63,7 @@
 (defn reasoner-stage
   [db fuel-tracker rule-id full-rule]
   (go-try
-    (let [tx-state   (transact/->tx-state :db db :reasoned-from-iri rule-id)
+    (let [tx-state   (transact/->tx-state :db db, :reasoned-from-iri rule-id)
           parsed-txn (:rule-parsed full-rule)
           _          (when-not (:where parsed-txn)
                        (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))

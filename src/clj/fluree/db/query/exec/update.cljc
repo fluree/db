@@ -80,8 +80,8 @@
     (flake/create sid pid v* dt t true m)))
 
 (defn build-flake
-  ([db-vol t [s-mch p-mch o-mch :as matches]]
-   (build-flake db-vol t nil matches))
+  ([db-vol t matched-triple]
+   (build-flake db-vol t nil matched-triple))
   ([db-vol t reasoned [s-mch p-mch o-mch]]
    (let [m     (where/get-meta o-mch)
          s-iri (where/get-iri s-mch)
