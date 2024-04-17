@@ -55,15 +55,15 @@
   "When triples from rules require explicit inserts, returns flakes."
   [db fuel-tracker txn-id author-did rule-id insert-smt]
   (go-try
-    (let [tx-state (-> (transact/->tx-state db txn-id author-did rule-id)
+    (let [tx-state (-> (transact/->tx-state db {} txn-id author-did rule-id)
                        (assoc :stage-update? true))
           [db* new-flakes] (<? (transact/generate-flakes db fuel-tracker insert-smt tx-state))]
-      (transact/final-db db* new-flakes tx-state))))
+      (<? (transact/final-db db* new-flakes tx-state)))))
 
 (defn reasoner-stage
   [db fuel-tracker txn-id author-did rule-id full-rule]
   (go-try
-    (let [tx-state   (transact/->tx-state db txn-id author-did rule-id)
+    (let [tx-state   (transact/->tx-state db {} txn-id author-did rule-id)
           parsed-txn (:rule-parsed full-rule)
           _          (when-not (:where parsed-txn)
                        (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
@@ -97,7 +97,7 @@
           reasoner-flakes* (filter-same-as-trans rule-id reasoner-flakes)]
       (log/debug "reasoner flakes: " rule-id reasoner-flakes*)
       ;; returns map of :db-after, :add, :remove - but for reasoning we only support adds, so remove should be empty
-      (transact/final-db db reasoner-flakes* tx-state*))))
+      (<? (transact/final-db db reasoner-flakes* tx-state*)))))
 
 (defn execute-reasoner
   "Executes the reasoner on the staged db-after and returns the updated db-after."
@@ -252,7 +252,7 @@
     (let [methods*        (set (util/sequential methods))
           fuel-tracker    (fuel/tracker max-fuel)
           db*             (update db :reasoner #(into methods* %))
-          tx-state        (transact/->tx-state db* nil nil nil)
+          tx-state        (transact/->tx-state db* {} nil nil)
           inserts         (atom nil)
           ;; TODO - rules can be processed in parallel
           raw-rules       (<? (all-rules methods* db* inserts graph-or-db))

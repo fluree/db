@@ -165,6 +165,11 @@
   [x]
   (instance? SID x))
 
+(defn blank-node-sid?
+  [x]
+  (and (sid? x)
+       (= (get-namespace x) "_:")))
+
 (def min-sid
   (->sid 0 ""))
 

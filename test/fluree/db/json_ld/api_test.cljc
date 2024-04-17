@@ -1,5 +1,5 @@
 (ns fluree.db.json-ld.api-test
-  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [clojure.test :refer [deftest is testing use-fixtures]]
                :cljs [cljs.test :refer-macros [deftest is testing async]])
             #?@(:cljs [[clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]])
@@ -14,6 +14,8 @@
             #?(:clj  [test-with-files.tools :refer [with-tmp-dir]
                       :as twf]
                :cljs [test-with-files.tools :as-alias twf])))
+
+#?(:clj (use-fixtures :each test-utils/deterministic-blank-node-fixture))
 
 (deftest exists?-test
   (testing "returns false before committing data to a ledger"
@@ -976,7 +978,7 @@
                                   "where"    {"id" "?s", "ex:name" "Murray"}
                                   "select"   {"?s" ["*" {"ex:address" ["ex:street" "ex:city" "ex:state" "ex:zip"]}]}})))
 
-       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+       (is (= "Subject ex:mp path [\"ex:nickname\"] violates constraint sh:maxCount of shape _:fdb-5 - count 2 is greater than maximum count of 1."
               (ex-message db4)))
 
        (is (= [{"id"               "ex:alice"
