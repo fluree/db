@@ -108,6 +108,23 @@
 (def ^:const iri-owl:maxQualifiedCardinality "http://www.w3.org/2002/07/owl#maxQualifiedCardinality")
 (def ^:const iri-owl:qualifiedCardinality "http://www.w3.org/2002/07/owl#qualifiedCardinality")
 
+;; SHACL validation report iris
+(def ^:const iri_ValidationReport "http://www.w3.org/ns/shacl#ValidationReport")
+(def ^:const iri_conforms "http://www.w3.org/ns/shacl#conforms")
+(def ^:const iri_shapesGraphWellFormed "http://www.w3.org/ns/shacl#shapesGraphWellFormed")
+(def ^:const iri_result "http://www.w3.org/ns/shacl#result")
+(def ^:const iri_ValidationResult "http://www.w3.org/ns/shacl#ValidationResult")
+(def ^:const iri_focusNode "http://www.w3.org/ns/shacl#focusNode")
+(def ^:const iri_resultPath "http://www.w3.org/ns/shacl#resultPath")
+(def ^:const iri_value "http://www.w3.org/ns/shacl#value")
+(def ^:const iri_sourceShape "http://www.w3.org/ns/shacl#sourceShape")
+(def ^:const iri_constraintComponent "http://www.w3.org/ns/shacl#constraintComponent")
+(def ^:const iri_details "http://www.w3.org/ns/shacl#details")
+(def ^:const iri_resultMessage "http://www.w3.org/ns/shacl#resultMessage")
+(def ^:const iri_resultSeverity "http://www.w3.org/ns/shacl#resultSeverity")
+(def ^:const iri_Violation "http://www.w3.org/ns/shacl#Violation")
+(def ^:const iri_expectation (fluree-iri "expectation"))
+
 ;; predicate id constants
 
 (def ^:const $_previous (iri/iri->sid iri-previous))
