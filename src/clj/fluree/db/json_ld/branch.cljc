@@ -31,8 +31,8 @@
 
 ;; TODO - if you branch from an uncommitted branch, and then commit, commit the current-branch too
 (defn new-branch-map
-  "Returns a new branch name for specified branch name off of
-  supplied current-branch."
+  "Returns a new branch map for specified branch name off of supplied
+  current-branch."
   ([ledger-alias branch-name ns-addresses]
    (new-branch-map nil ledger-alias branch-name ns-addresses))
   ([current-branch-map ledger-alias branch-name ns-addresses]
@@ -114,7 +114,7 @@
                              "updated by another user or process.")
                         {:status 400 :error :db/invalid-commit})))
       (throw (ex-info (str "Unexpected Error updating commit database. "
-                           "New database has an inconsistent t from it's commit:"
+                           "New database has an inconsistent t from its commit:"
                            db-t " and " new-t " respectively.")
                       {:status 500 :error :db/invalid-db})))))
 

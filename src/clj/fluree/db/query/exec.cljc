@@ -46,14 +46,14 @@
   "Execute the parsed query `q` against the database value `db`. Returns an async
   channel which will eventually contain a single vector of results, or an
   exception if there was an error."
-  [db fuel-tracker q]
+  [ds fuel-tracker q]
   (go
     (let [error-ch  (async/chan)
-          result-ch (->> (where/search db q fuel-tracker error-ch)
+          result-ch (->> (where/search ds q fuel-tracker error-ch)
                          (group/combine q)
                          (having/filter q error-ch)
                          (order/arrange q)
-                         (select/format db q fuel-tracker error-ch)
+                         (select/format ds q fuel-tracker error-ch)
                          (drop-offset q)
                          (take-limit q)
                          (collect-results q))]

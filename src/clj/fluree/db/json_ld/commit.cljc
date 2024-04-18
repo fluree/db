@@ -15,6 +15,7 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.reasoner :as reasoner]
             [fluree.db.util.log :as log :include-macros true])
   (:refer-clojure :exclude [vswap!]))
 
@@ -27,9 +28,9 @@
 
 (defn- subject-block-pred
   [db compact-fn list? p-flakes]
-  (loop [[p-flake & r'] p-flakes
+  (loop [[p-flake & r] p-flakes
          all-refs? nil
-         acc'      nil]
+         acc      nil]
     (let [pdt       (flake/dt p-flake)
           ref?      (= const/$xsd:anyURI pdt)
           [obj all-refs?] (if ref?
@@ -42,15 +43,15 @@
                              false])
           obj*      (cond-> obj
                       list? (assoc :i (-> p-flake flake/m :i))
+
+                      ;; need to retain the `@type` for times so they will be
+                      ;; coerced correctly when loading
                       (datatype/time-type? pdt)
-                      ;;need to retain the `@type` for times
-                      ;;so they will be coerced correctly when loading
-                      (assoc "@type"
-                             (get-s-iri pdt db compact-fn)))
-          next-acc' (conj acc' obj*)]
-      (if (seq r')
-        (recur r' all-refs? next-acc')
-        [next-acc' all-refs?]))))
+                      (assoc "@type" (get-s-iri pdt db compact-fn)))
+          acc' (conj acc obj*)]
+      (if (seq r)
+        (recur r all-refs? acc')
+        [acc' all-refs?]))))
 
 (defn- set-refs-type-in-ctx
   [^clojure.lang.Volatile ctx p-iri refs]
@@ -76,10 +77,10 @@
                              (and all-refs? (not list?)) handle-all-refs
                              list?                       handle-list-values
                              (= 1 (count objs))          first)
-          next-acc         (assoc acc p-iri objs*)]
+          acc'         (assoc acc p-iri objs*)]
       (if (seq r)
-        (recur r next-acc)
-        next-acc))))
+        (recur r acc')
+        acc'))))
 
 (defn- did-from-private
   [private-key]
@@ -174,8 +175,9 @@
   :retract - retraction flakes
   :refs-ctx - context that must be included with final context, for refs (@id) values
   :flakes - all considered flakes, for any downstream processes that need it"
-  [db {:keys [compact-fn id-key type-key] :as _opts}]
-  (when-let [flakes  (commit-flakes db)]
+  [{:keys [reasoner] :as db} {:keys [compact-fn id-key type-key] :as _opts}]
+  (when-let [flakes (cond-> (commit-flakes db)
+                      reasoner (reasoner/non-reasoned-flakes))]
     (log/trace "generate-commit flakes:" flakes)
     (let [ctx (volatile! {})]
       (loop [[s-flakes & r] (partition-by flake/s flakes)
@@ -191,7 +193,7 @@
                   ;; we don't output auto-generated rdfs:Class definitions for classes
                   ;; (they are implied when used in rdf:type statements)
                   [assert retract]
-                  (let [{assert-flakes  true,
+                  (let [{assert-flakes  true
                          retract-flakes false}
                         (group-by flake/op s-flakes)
 
@@ -306,11 +308,11 @@
 (defn write-transactions!
   [conn ledger staged]
   (go-try
-    (loop [[[txn author-did] & r] staged
+    (loop [[[txn author-did annotation] & r] staged
            results                []]
       (if txn
         (let [{txn-id :address} (<? (connection/-txn-write conn ledger txn))]
-          (recur r (conj results [txn-id author-did])))
+          (recur r (conj results [txn-id author-did annotation])))
         results))))
 
 (defn commit
@@ -322,8 +324,10 @@
     (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
           (enrich-commit-opts ledger db opts)
 
-          txns              (<? (write-transactions! conn ledger staged))
-          [[txn-id author]] txns
+          txns (<? (write-transactions! conn ledger staged))
+
+          [[txn-id author annotation]] txns
+
           [dbid db-jsonld]  (db->jsonld db opts*)
           ledger-update-res (<? (connection/-c-write conn ledger db-jsonld)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
@@ -335,6 +339,7 @@
                              :t          t
                              :db-address db-address
                              :author     (or author "")
+                             :annotation annotation
                              :txn-id     (if (= 1 (count txns)) txn-id "")
                              :flakes     (:flakes stats)
                              :size       (:size stats)}

@@ -18,6 +18,7 @@
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.query.dataset :refer [dataset?]]
             [fluree.db.validation :as v]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -118,12 +119,12 @@
       (assoc-in db** [:policy :cache] (atom {})))))
 
 (defn track-query
-  [db max-fuel query]
+  [ds max-fuel query]
   (go-try
-    (let [start        #?(:clj  (System/nanoTime)
-                          :cljs (util/current-time-millis))
-          fuel-tracker (fuel/tracker max-fuel)]
-      (try* (let [result (<? (fql/query db fuel-tracker query))]
+    (let [start #?(:clj (System/nanoTime)
+                   :cljs (util/current-time-millis))
+          fuel-tracker  (fuel/tracker max-fuel)]
+      (try* (let [result (<? (fql/query ds fuel-tracker query))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start)
@@ -138,22 +139,24 @@
 (defn query-fql
   "Execute a query against a database source. Returns core async channel
   containing result or exception."
-  [db query]
+  [ds query]
   (go-try
-    (let [{query :subject, did :did}  (or (<? (cred/verify query))
-                                          {:subject query})
+    (let [{query :subject, did :did} (or (<? (cred/verify query))
+                                         {:subject query})
           {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
 
           ;; TODO: extracting query context here for policy only to do it later
           ;; while parsing the query. We need to consolidate both policy and
           ;; query parsing while cleaning up the query api call stack.
           q-ctx    (ctx-util/extract query*)
-          db*      (<? (restrict-db db t q-ctx opts))
-          query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
+          ds*      (if (dataset? ds)
+                     ds
+                     (<? (restrict-db ds t q-ctx opts)))
+          query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
           max-fuel (:max-fuel opts)]
       (if (::util/track-fuel? opts)
-        (<? (track-query db* max-fuel query**))
-        (<? (fql/query db* query**))))))
+        (<? (track-query ds* max-fuel query**))
+        (<? (fql/query ds* query**))))))
 
 (defn query-sparql
   [db query]
@@ -213,6 +216,14 @@
          (recur r db-map*))
        db-map))))
 
+(defn dataset
+  [named-graphs default-aliases]
+  (let [default-coll (some->> default-aliases
+                              util/sequential
+                              (select-keys named-graphs)
+                              vals)]
+    (dataset/combine named-graphs default-coll)))
+
 (defn load-dataset
   [conn defaults named global-t context opts]
   (go-try
@@ -224,13 +235,9 @@
                                                             ; the data set
                                                             ; consists of one
                                                             ; ledger
-      (let [all-aliases  (->> defaults (concat named) distinct)
-            db-map       (<? (load-aliases conn all-aliases global-t context opts))
-            default-coll (-> db-map
-                             (select-keys defaults)
-                             vals)
-            named-map    (select-keys db-map named)]
-        (dataset/combine named-map default-coll)))))
+      (let [all-aliases (->> defaults (concat named) distinct)
+            db-map      (<? (load-aliases conn all-aliases global-t context opts))]
+        (dataset db-map defaults)))))
 
 (defn query-connection-fql
   [conn query]

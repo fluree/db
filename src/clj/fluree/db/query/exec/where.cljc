@@ -136,14 +136,6 @@
            first
            (= \?))))
 
-(defn ->var-filter
-  "Build a query function specification for the variable `var` out of the
-  parsed function `f`."
-  [var f]
-  (-> var
-      unmatched-var
-      (assoc ::fn f)))
-
 (defn lang-matcher
   "Return a function that returns true if the language metadata of a matched
   pattern equals the supplied language code `lang`."
@@ -154,13 +146,29 @@
                   lang)]
       (-> mch ::meta :lang (= lang*)))))
 
+(defn with-filter
+  [mch f]
+  (assoc mch ::fn f))
+
+(defn ->var-filter
+  "Build a query function specification for the variable `var` out of the
+  parsed function `f`."
+  [var f]
+  (-> var
+      unmatched-var
+      (with-filter f)))
+
 (defn ->val-filter
   "Build a query function specification for the explicit value `val` out of the
   boolean function `f`. `f` should accept a single flake where-match map."
-  [val f]
-  (-> val
-      anonymous-value
-      (assoc ::fn f)))
+  ([val f]
+   (-> val
+       anonymous-value
+       (with-filter f)))
+  ([val dt-iri f]
+   (-> val
+       (anonymous-value dt-iri)
+       (with-filter f))))
 
 (defn ->predicate
   "Build a pattern that already matches the explicit predicate value `value`."
@@ -374,10 +382,10 @@
     (when (and (some? s*) (some? p*) (some? o*))
       [s* p* o*])))
 
-(defn get-equivalent-properties
+(defn get-child-properties
   [db prop]
   (-> db
-      (get-in [:schema :pred prop :equivalentProperty])
+      (get-in [:schema :pred prop :childProps])
       not-empty))
 
 (def nil-channel
@@ -393,7 +401,7 @@
         triple     (assign-matched-values tuple solution)]
     (if-let [[s p o] (compute-sids db triple)]
       (let [pid (get-sid p db-alias)]
-        (if-let [props (and pid (get-equivalent-properties db pid))]
+        (if-let [props (and pid (get-child-properties db pid))]
           (let [prop-ch (-> props (conj pid) async/to-chan!)]
             (async/pipeline-async 2
                                   matched-ch

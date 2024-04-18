@@ -17,6 +17,8 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.connection :refer [notify-ledger]]
+            [fluree.db.reasoner :as reasoner]
+            [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy :as perm])
   (:refer-clojure :exclude [merge load range exists?]))
 
@@ -282,12 +284,37 @@
            policy-id  (perm/parse-policy-identity identity-map parsed-ctx)]
        (perm/wrap-policy db policy-id)))))
 
+(defn dataset
+  "Creates a composed dataset from multiple resolved graph databases.
+
+  The databases to be composed are supplied as a map with a string alias
+  as they key, and the resolved graph db as the value.
+
+  By default, every resolved graph db will be composed together as a new
+  default graph which will be used for all where clauses in queries that
+  do *not* specify a specific graph to target, which is done using the
+  special `graph` syntax in the where clause.
+
+  If just one or more of the supplied graph dbs should instead be used as
+  the default graph (instead of all of them), supply the second argument
+  as a list of the db aliases in the db-map that should be used as the
+  default.
+
+  Targeting a single named graph in a query (as opposed to the default graph)
+  is done by using the `graph` syntax within the 'where' clause, for example:
+  {...
+   'where': [...
+             ['graph' <graph-alias> <query-pattern>]]
+   ...}"
+  ([named-graphs] (dataset named-graphs (keys named-graphs)))
+  ([named-graphs default-graphs]
+   (query-api/dataset named-graphs default-graphs)))
 
 (defn query
-  "Queries a db value and returns a promise with the results."
-  ([db q] (query db q {}))
-  ([db q opts]
-   (promise-wrap (query-api/query db q opts))))
+  "Queries a dataset or single db and returns a promise with the results."
+  ([ds q] (query ds q {}))
+  ([ds q opts]
+   (promise-wrap (query-api/query ds q opts))))
 
 (defn query-connection
   "Queries the latest db in the ledger specified by the 'from' parameter in the
@@ -328,9 +355,90 @@
    (json-ld/expand-iri compact-iri
                        (json-ld/parse-context context))))
 
-(defn internal-id
-  "Returns the internal Fluree integer id for a given IRI.
+(defn encode-iri
+  "Returns the internal Fluree IRI identifier (a compact form).
   This can be used for doing range scans, slices and for other
   more advanced needs."
   [db iri]
   (iri/encode-iri db iri))
+
+(defn internal-id
+  "Deprecated, use encode-iri instead."
+  {:deprecated true}
+  [db iri]
+  (do
+    (println "WARNING: (internal-id db iri) is deprecated, use (encode-iri db iri).")
+    (encode-iri db iri)))
+
+(defn decode-iri
+  "Opposite of encode-iri. When doing more advanced features
+  like direct range-scans of indexes, IRIs are returned in their
+  internal compact format. This allows the IRI to be returned
+  as a full string IRI."
+  [db iri]
+  (iri/decode-sid db iri))
+
+;; reasoning APIs
+
+(defn reason
+  "Sets the reasoner methods(s) to perform on a db.
+  Supported methods are :datalog and :owl2rl.
+  One or more methods can be supplied as a sequential list/vector.
+
+  Reasoning is done in-memory at the db-level and is not persisted.
+
+  A rules graph containing rules in JSON-LD format can be supplied,
+  or if no rules graph is supplied, the rules will be looked for within
+  the db itself."
+  ([db methods] (reason db methods nil nil))
+  ([db methods rules-graph] (reason db methods rules-graph nil))
+  ([db methods rules-graph opts]
+   (promise-wrap
+     (reasoner/reason db methods rules-graph opts))))
+
+(defn reasoned-count
+  "Returns a count of reasoned facts in the provided db."
+  [db]
+  (let [spot (-> db :novelty :spot)]
+    (reduce (fn [n flake]
+              (if (reasoner/reasoned-rule? flake)
+                (inc n)
+                n))
+            0 spot)))
+
+(defn reasoned-facts
+  "Returns all reasoned facts in the provided db as  4-tuples of:
+  [subject property object rule-iri]
+  where the rule-iri is the @id of the rule that generated the fact
+
+  Returns 4-tuples of  where
+  the rule-iri is the @id of the rule that generated the fact.
+
+  NOTE: Currently returns internal fluree ids for subject, property and object.
+  This will be changed to return IRIs in a future release.
+
+  Optional opts map specified grouping, or no grouping (default):
+  {:group-by :rule} - group by rule IRI
+  {:group-by :subject} - group by the reasoned triples' subject
+  {:group-by ::property} - group by the reasoned triples' property IRI"
+  ([db] (reasoned-facts db nil))
+  ([db opts]
+   (let [group-fn (case (:group-by opts)
+                    nil nil
+                    :subject (fn [p] (nth p 0))
+                    :property (fn [p] (nth p 1))
+                    :rule (fn [p] (nth p 3)))
+         triples+ (juxt #(decode-iri db (flake/s %))
+                        #(decode-iri db (flake/p %))
+                        #(as-> (flake/o %) o
+                               (if (iri/sid? o)
+                                 (decode-iri db o)
+                                 o))
+                        #(reasoner/reasoned-rule? %))
+         result   (->> db :novelty :spot
+                       reasoner/reasoned-flakes
+                       (mapv triples+))]
+     (if group-fn
+       (group-by group-fn result)
+       result))))
+
