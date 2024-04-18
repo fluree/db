@@ -108,10 +108,10 @@
     (if (= db-t new-t)
       (if (updatable-commit? current-commit new-commit)
         (update-db branch-map db)
-        (throw (ex-info (str "Commit failed, latest committed db is " current-t
-                             " and you are trying to commit at db at t value of: "
-                             new-t ". These should be one apart. Likely db was "
-                             "updated by another user or process.")
+        (throw (ex-info (str "Commit failed. current-t:" current-t
+                             " new-t:" new-t
+                             " current-index: " (commit-data/index-t current-commit)
+                             " new-index: " (commit-data/index-t new-commit))
                         {:status 400 :error :db/invalid-commit})))
       (throw (ex-info (str "Unexpected Error updating commit database. "
                            "New database has an inconsistent t from its commit:"
