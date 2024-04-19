@@ -114,12 +114,6 @@
    ["address" :address]
    ["data" :data]])
 
-(def json-ld-default-ctx-template
-  "Note, key-val pairs are in vector form to preserve ordering of final commit map"
-  [["id" :id]
-   ["type" ["Context"]]
-   ["address" :address]])
-
 (defn merge-template
   "Merges provided map with template and places any
   values in map with respective template value. If value
