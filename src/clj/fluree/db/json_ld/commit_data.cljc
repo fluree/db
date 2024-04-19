@@ -249,6 +249,9 @@
    :branch (if branch
              (util/keyword->str branch)
              "main")
+   :data   {:t 0
+            :flakes 0
+            :size 0}
    :ns     (mapv #(if (map? %)
                     %
                     {:id %})
