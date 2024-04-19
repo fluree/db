@@ -337,17 +337,13 @@
          path       const/sh_path
          [severity] const/sh_severity
          [message]  const/sh_message
-         expect     constraint} shape
-
-        [single-expect :as pretty-expect]
-        (mapv display expect)]
+         expect     constraint}
+        shape]
     (cond-> {:subject (display focus-node)
              :constraint (display constraint)
              :severity (or (display severity) (json-ld/compact const/iri_Violation context))
              :shape (display id)}
-      expect (assoc :expect (if (> (count expect) 1)
-                              pretty-expect
-                              single-expect))
+      expect  (assoc :expect (util/unwrap-singleton (mapv display expect)))
       message (assoc :message message)
       path    (assoc :path (mapv (fn [segment]
                                    (if (iri/sid? segment)

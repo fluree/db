@@ -443,6 +443,17 @@
       (get-first k)
       get-id))
 
+(defn unwrap-singleton
+  ([coll]
+   (if (= 1 (count coll))
+     (first coll)
+     coll))
+
+  ([iri context coll]
+   (if (#{:list :set} (-> context (get iri) :container))
+     coll
+     (unwrap-singleton coll))))
+
 (defn parse-opts
   [opts]
   (let [other-keys    (->> opts keys (remove #{:max-fuel :maxFuel}))
