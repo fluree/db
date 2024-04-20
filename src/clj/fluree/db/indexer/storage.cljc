@@ -5,7 +5,8 @@
             [clojure.set :refer [map-invert]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.index :as index]
-            [clojure.core.async :refer [go <!] :as async]
+            [fluree.db.json-ld.iri :as iri]
+            [clojure.core.async :refer [go] :as async]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
@@ -72,10 +73,11 @@
   [{:keys [schema]}]
   (->> (:pred schema)
        (reduce (fn [root [k {:keys [datatype]}]]
-                 (if (number? k)
-                   (if datatype
-                     (conj root [k datatype])
-                     (conj root [k]))
+                 (if (iri/sid? k)
+                   (let [sid (iri/serialize-sid k)]
+                     (if datatype
+                       (conj root [sid (iri/serialize-sid datatype)])
+                       (conj root [sid])))
                    root))
                [])))
 
@@ -138,17 +140,23 @@
   (let [{:keys [t stats preds namespace-codes]}
         root-data
         namespaces (map-invert namespace-codes)
-        db*        (assoc blank-db
-                          :t  t
-                          :preds preds
+        db         (assoc blank-db
+                          :t t
                           :namespaces namespaces
                           :namespace-codes namespace-codes
-                          :stats (assoc stats :indexed t))]
-    (reduce
-      (fn [db idx]
-        (let [idx-root (reify-index-root conn db idx (get root-data idx))]
-          (assoc db idx idx-root)))
-      db* index/types)))
+                          :stats (assoc stats :indexed t))
+        indexed-db (reduce
+                     (fn [db* idx]
+                       (let [idx-root (reify-index-root conn db* idx (get root-data idx))]
+                         (assoc db* idx idx-root)))
+                     db index/types)
+        preds*     (mapv (fn [p]
+                           (if (iri/serialized-sid? p)
+                             (iri/deserialize-sid p)
+                             (mapv iri/deserialize-sid p)))
+                         preds)
+        schema     (<? (vocab/load-schema indexed-db preds*))]
+    (assoc indexed-db :schema schema)))
 
 
 (defn read-garbage
@@ -182,10 +190,7 @@
                               idx-address ".")
                          {:status 400
                           :error  :db/unavailable}))
-         (let [db     (reify-db-root conn blank-db db-root)
-               schema (<? (vocab/load-schema db))
-               db*    (assoc db :schema schema)]
-           db*))))))
+         (reify-db-root conn blank-db db-root))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]
