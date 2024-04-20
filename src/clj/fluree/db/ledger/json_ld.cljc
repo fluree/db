@@ -131,7 +131,7 @@
       (cond
 
         (= commit-t (flake/next-t current-t))
-        (let [updated-db  (<? (jld-reify/merge-commit conn current-db false [commit proof]))
+        (let [updated-db  (<? (jld-reify/merge-commit conn current-db [commit proof]))
               commit-map  (commit-data/json-ld->map commit (select-keys updated-db index/types))
               updated-db* (assoc updated-db :commit commit-map)]
           (commit-update ledger branch updated-db*))
@@ -295,7 +295,7 @@
           branch       (keyword (get-first-value commit const/iri-branch))
           ledger       (<? (create* conn ledger-alias {:branch branch}))
           db           (ledger/-db ledger)
-          db*          (<? (jld-reify/load-db-idx ledger db commit commit-addr false))]
+          db*          (<? (jld-reify/load-db-idx ledger db commit commit-addr))]
       (ledger/-commit-update! ledger branch db*)
       (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
       (async/put! ledger-chan ledger) ; note, ledger can be an exception!

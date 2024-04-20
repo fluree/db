@@ -286,17 +286,13 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates
   respective indexes and returns updated db"
-  [conn {:keys [alias t] :as db} merged-db? [commit _proof]]
+  [conn {:keys [alias] :as db} [commit _proof]]
   (go-try
     (let [db-address       (-> commit
                                (get-first const/iri-data)
                                (get-first-value const/iri-address))
           db-data          (<? (read-db conn db-address))
           t-new            (db-t db-data)
-          _                (when (and (not= t-new (inc t))
-                                      (not merged-db?)) ;; when including multiple dbs, t values will get reused.
-                             (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
-                                             {:status 500 :error :db/invalid-commit})))
           assert           (db-assert db-data)
           asserted-flakes  (assert-flakes db t-new assert)
           retract          (db-retract db-data)
@@ -381,22 +377,8 @@
           (let [commit-tuple (<? (read-commit conn prev-commit-addr))]
             (recur commit-tuple commit-t commit-tuples*)))))))
 
-
-(defn load-db
-  [{:keys [ledger] :as db} latest-commit-tuple merged-db?]
-  (go-try
-    (let [{:keys [conn]} ledger
-          commit-tuples (<? (trace-commits conn latest-commit-tuple 1))]
-      (loop [[commit-tuple & r] commit-tuples
-             db* db]
-        (if commit-tuple
-          (let [new-db (<? (merge-commit conn db* merged-db? commit-tuple))]
-            (recur r new-db))
-          db*)))))
-
-
 (defn load-db-idx
-  [ledger db latest-commit commit-address merged-db?]
+  [ledger db latest-commit commit-address]
   (go-try
     (let [{:keys [conn]} ledger
           idx-meta   (get-first latest-commit const/iri-index) ; get persistent
@@ -421,6 +403,6 @@
                                                                                 1)))
                db* db-base*]
           (if commit-tuple
-            (let [new-db (<? (merge-commit conn db* merged-db? commit-tuple))]
+            (let [new-db (<? (merge-commit conn db* commit-tuple))]
               (recur r new-db))
             db*))))))
