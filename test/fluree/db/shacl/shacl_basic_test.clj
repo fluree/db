@@ -2880,3 +2880,43 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                      (get "sh:result")
                      (get 0)
                      (get "sh:resultMessage")))))))))
+
+(deftest target-subjects-of
+  (let [conn    @(fluree/connect {:method :memory})
+        ledger  @(fluree/create conn "validation-report")
+        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.com/ns/"}]
+        db0     (fluree/db ledger)
+
+        db1 @(fluree/stage db0 {"@context" context
+                                "insert"
+                                {"type"                "sh:NodeShape"
+                                 "sh:targetSubjectsOf" {"@id" "ex:myProperty"}
+                                 "sh:property"         [{"sh:path"     {"@id" "ex:myProperty"}
+                                                         "sh:maxCount" 1}]}})]
+    (testing "valid target"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert" {"id" "ex:valid"
+                                              "ex:myProperty" "A"}})]
+        (is (nil? (ex-data db2)))))
+    (testing "invalid target"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert" {"id" "ex:invalid"
+                                              "ex:myProperty" ["A" "B"]}})]
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                {"type" "sh:ValidationReport",
+                 "sh:conforms" false,
+                 "sh:result"
+                 [{"sh:constraintComponent" "sh:maxCount",
+                   "sh:focusNode" "ex:invalid",
+                   "sh:resultSeverity" "sh:Violation",
+                   "sh:value" 2,
+                   "sh:resultPath" ["ex:myProperty"],
+                   "type" "sh:ValidationResult",
+                   "sh:resultMessage" "count 2 is greater than maximum count of 1",
+                   "sh:sourceShape" "_:fdb-3",
+                   "f:expectation" 1}]}}
+               (ex-data db2)))
+        (is (= "Subject ex:invalid path [\"ex:myProperty\"] violates constraint sh:maxCount of shape _:fdb-3 - count 2 is greater than maximum count of 1."
+               (ex-message db2)))))))
