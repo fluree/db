@@ -421,3 +421,160 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-19.
 Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-20."
                  (ex-message db-greeting-incorrect))))))))
+
+(deftest ^:integration shacl-and-tests
+  (let [conn    @(fluree/connect {:method :memory})
+        ledger  @(fluree/create conn "shacl-and")
+        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        db0     (fluree/db ledger)
+        db1     @(fluree/stage db0 {"@context" context
+                                    "insert"
+                                    {"@id" "ex:andShape"
+                                     "@type" "sh:NodeShape"
+                                     "sh:targetNode" {"@id" "ex:a"}
+                                     "sh:and" [{"sh:path" {"@id" "ex:width"}
+                                                "sh:minCount" 1}
+                                               {"sh:path" {"@id" "ex:width"}
+                                                "sh:datatype" {"@id" "xsd:integer"}}
+                                               {"sh:path" {"@id" "ex:height"}
+                                                "sh:minCount" 1}
+                                               {"sh:path" {"@id" "ex:height"}
+                                                "sh:datatype" {"@id" "xsd:integer"}}]}})]
+    (testing "conforms to all shapes"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert" {"@id" "ex:a" "ex:height" 3 "ex:width" 4}})]
+        (is (nil? (ex-data db2)))))
+
+    (testing "conforms to only two shapes"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert" {"@id" "ex:a" "ex:height" 3}})]
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                {"type" "sh:ValidationReport",
+                 "sh:conforms" false,
+                 "sh:result"
+                 [{"type" "sh:ValidationResult",
+                   "sh:resultSeverity" "sh:Violation",
+                   "sh:focusNode" "ex:a",
+                   "sh:constraintComponent" "sh:and",
+                   "sh:sourceShape" "ex:andShape",
+                   "sh:value" "ex:a",
+                   "sh:resultMessage"
+                   "ex:a failed to conform to all sh:and shapes: [\"_:fdb-2\" \"_:fdb-3\" \"_:fdb-4\" \"_:fdb-5\"]"}]}}
+               (ex-data db2)))
+        (is (= "Subject ex:a violates constraint sh:and of shape ex:andShape - ex:a failed to conform to all sh:and shapes: [\"_:fdb-2\" \"_:fdb-3\" \"_:fdb-4\" \"_:fdb-5\"]."
+               (ex-message db2)))))))
+
+(deftest ^:integration shacl-or-tests
+  (let [conn    @(fluree/connect {:method :memory})
+        ledger  @(fluree/create conn "shacl-or")
+        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        db0     (fluree/db ledger)
+        db1     @(fluree/stage db0 {"@context" context
+                                    "insert"
+                                    {"@id" "ex:orShape"
+                                     "@type" "sh:NodeShape"
+                                     "sh:targetClass" {"@id" "ex:Dimensional"}
+                                     "sh:or" [{"sh:path" {"@id" "ex:height"}
+                                               "sh:minCount" 1
+                                               "sh:datatype" {"@id" "xsd:integer"}}
+                                              {"sh:path" {"@id" "ex:width"}
+                                               "sh:minCount" 1
+                                               "sh:datatype" {"@id" "xsd:integer"}}
+                                              {"sh:path" {"@id" "ex:depth"}
+                                               "sh:minCount" 1
+                                               "sh:datatype" {"@id" "xsd:integer"}}]}})]
+    (testing "conforms to one shape"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert" {"@type" "ex:Dimensional" "ex:height" 8}})]
+        (is (nil? (ex-data db2)))))
+
+    (testing "conforms to no shapes"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert" {"@type" "ex:Dimensional" "ex:bigness" "yup it's big"}})]
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                {"type" "sh:ValidationReport",
+                 "sh:conforms" false,
+                 "sh:result"
+                 [{"type" "sh:ValidationResult",
+                   "sh:resultSeverity" "sh:Violation",
+                   "sh:focusNode" "_:fdb-8",
+                   "sh:constraintComponent" "sh:or",
+                   "sh:sourceShape" "ex:orShape",
+                   "sh:value" "_:fdb-8",
+                   "sh:resultMessage" "_:fdb-8 failed to conform to any of the following shapes: [\"_:fdb-2\" \"_:fdb-3\" \"_:fdb-4\"]"}]}}
+               (ex-data db2)))
+        (is (= "Subject _:fdb-8 violates constraint sh:or of shape ex:orShape - _:fdb-8 failed to conform to any of the following shapes: [\"_:fdb-2\" \"_:fdb-3\" \"_:fdb-4\"]."
+               (ex-message db2)))))))
+
+(deftest ^:integration shacl-xone-tests
+  (let [conn    @(fluree/connect {:method :memory})
+        ledger  @(fluree/create conn "shacl-or")
+        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        db0     (fluree/db ledger)
+        db1     @(fluree/stage db0 {"@context" context
+                                    "insert"
+                                    {"@id"           "ex:orShape"
+                                     "@type"         "sh:NodeShape"
+                                     "sh:targetNode" {"@id" "ex:Named"}
+                                     "sh:xone"       [{"@id" "ex:one-part"
+                                                       "sh:property"
+                                                       {"sh:path"     {"@id" "ex:fullName"}
+                                                        "sh:minCount" 1}}
+                                                      {"@id" "ex:two-parts"
+                                                       "sh:property"
+                                                       [{"sh:path"     {"@id" "ex:firstName"}
+                                                         "sh:minCount" 1}
+                                                        {"sh:path"     {"@id" "ex:lastName"}
+                                                         "sh:minCount" 1}]}]}})]
+    (testing "conforms to one shape"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert"   {"@id"         "ex:Named"
+                                                "ex:fullName" "George Washington"}})]
+        (is (nil? (ex-data db2)))))
+
+    (testing "conforms to no shapes"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert"   {"@id" "ex:Named" "ex:nickname" "Father G"}})]
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                {"type" "sh:ValidationReport",
+                 "sh:conforms" false,
+                 "sh:result"
+                 [{"type" "sh:ValidationResult",
+                   "sh:resultSeverity" "sh:Violation",
+                   "sh:focusNode" "ex:Named",
+                   "sh:constraintComponent" "sh:xone",
+                   "sh:sourceShape" "ex:orShape",
+                   "sh:value" ["Father G"],
+                   "sh:resultMessage" "values conformed to 0 of the following sh:xone shapes: [\"ex:one-part\" \"ex:two-parts\"]; must only conform to one"}]}}
+               (ex-data db2)))
+        (is (= "Subject ex:Named violates constraint sh:xone of shape ex:orShape - values conformed to 0 of the following sh:xone shapes: [\"ex:one-part\" \"ex:two-parts\"]; must only conform to one."
+               (ex-message db2)))))
+
+    (testing "conforms to more than one shapes"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert"   {"@id"          "ex:Named"
+                                                "ex:fullName"  "George Washington"
+                                                "ex:firstName" "George"
+                                                "ex:lastName"  "Washington"}})]
+        (is (= {:status 400,
+                :error :shacl/violation,
+                :report
+                {"type" "sh:ValidationReport",
+                 "sh:conforms" false,
+                 "sh:result"
+                 [{"type" "sh:ValidationResult",
+                   "sh:resultSeverity" "sh:Violation",
+                   "sh:focusNode" "ex:Named",
+                   "sh:constraintComponent" "sh:xone",
+                   "sh:sourceShape" "ex:orShape",
+                   "sh:value" ["Washington" "George Washington" "George"],
+                   "sh:resultMessage" "values conformed to 2 of the following sh:xone shapes: [\"ex:one-part\" \"ex:two-parts\"]; must only conform to one"}]}}
+               (ex-data db2)))
+        (is (= "Subject ex:Named violates constraint sh:xone of shape ex:orShape - values conformed to 2 of the following sh:xone shapes: [\"ex:one-part\" \"ex:two-parts\"]; must only conform to one."
+               (ex-message db2)))))))
