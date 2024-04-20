@@ -202,15 +202,33 @@
   [data-db focus-node inverse-path]
   (query-range/index-range data-db :opst = [focus-node inverse-path] {:flake-xf (map subject-node)}))
 
+(defn resolve-alternative-path
+  [data-db focus-node alternative-path]
+  (go-try
+    (loop [[pid & r] alternative-path
+           value-nodes    []]
+      (if pid
+        (let [value-nodes* (<? (query-range/index-range data-db :spot = [focus-node pid]
+                                                        {:flake-xf (map object-node)}))]
+          (println "DEP alt" (pr-str focus-node) (pr-str pid) (pr-str value-nodes*))
+          (recur r (into value-nodes value-nodes*)))
+        value-nodes))))
+
 (defn resolve-segment
   "Return the value nodes corresponding to the path segment from the focus-node."
   [data-db focus-node segment]
   (go-try
     (if (iri/sid? segment)
       (<? (resolve-predicate-path data-db focus-node segment))
-      (let [{[inverse-path] const/sh_inversePath} segment]
-        (cond inverse-path (<? (resolve-inverse-path data-db focus-node inverse-path))
-              :else (throw (ex-info "Unsupported property path segment." {:segment segment})))))))
+      (let [{[inverse-path]   const/sh_inversePath
+             alternative-path const/sh_alternativePath
+             [zero-or-one]    const/sh_zeroOrOnePath
+             [zero-or-more]   const/sh_zeroOrMorePath
+             [one-or-more]    const/sh_oneOrMorePath}
+            segment]
+        (cond inverse-path     (<? (resolve-inverse-path data-db focus-node inverse-path))
+              alternative-path (<? (resolve-alternative-path data-db focus-node alternative-path))
+              :else            (throw (ex-info "Unsupported property path segment." {:segment segment})))))))
 
 (defn resolve-value-nodes
   "Return the value nodes resolved via the path from the focus node."
