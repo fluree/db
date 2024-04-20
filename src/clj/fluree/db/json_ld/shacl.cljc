@@ -192,7 +192,7 @@
 (defn object-node
   "Take a flake and create a value node out of the object. A value node is a tuple of [value dt]."
   [flake]
-  [(flake/o flake) (flake/dt flake)])
+  [(flake/o flake) (flake/dt flake) (:lang (flake/m flake))])
 
 (defn resolve-predicate-path
   [data-db focus-node pred-path]
@@ -585,8 +585,47 @@
                                          (str "value " (pr-str (str value)) " does not match pattern " (pr-str pattern-str)
                                               (when (seq valid-flags)
                                                 (str " with " (display const/sh_flags) " " (str/join ", " flags)))))))))))))
-#_(defmethod validate-constraint const/sh_languageIn [v-ctx constraint focus-flakes]) ; not supported
-#_(defmethod validate-constraint const/sh_uniqueLang [v-ctx constraint focus-flakes]) ; not supported
+
+(defmethod validate-constraint const/sh_languageIn
+  [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (go-try
+    (let [{expect constraint} shape
+
+          langs  (into #{} expect)
+          result (base-result v-ctx shape constraint focus-node)]
+      (->> value-nodes
+           (remove (fn [[_v _dt lang]] (contains? langs lang)))
+           (mapv (fn [[v _dt lang]]
+                   (let [value (display v)]
+                     (assoc result
+                            :value v
+                            :message (or (:message result)
+                                         (str "value " (pr-str (str value))
+                                              " does not have language tag in "
+                                              (pr-str expect)))))))))))
+
+(defmethod validate-constraint const/sh_uniqueLang
+  [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (go-try
+    (let [{[unique?] constraint} shape
+
+          result (base-result v-ctx shape constraint focus-node)]
+      (when unique?
+        (when-let [violations (->> value-nodes
+                                   (group-by (fn [[_v _dt lang]] lang))
+                                   (reduce-kv (fn [violations lang lang-nodes]
+                                                (if (> (count lang-nodes) 1)
+                                                  (assoc violations lang lang-nodes)
+                                                  violations))
+                                              {})
+                                   (not-empty))]
+          (let [values  (->> (apply concat (vals violations))
+                             (mapv first)
+                             (mapv display))]
+            [(assoc result
+                    :value false
+                    :message (or (:message result)
+                                 (str "values " values " do not have unique language tags")))]))))))
 
 ;; property pair constraints
 (defmethod validate-constraint const/sh_equals
