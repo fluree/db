@@ -239,7 +239,7 @@
     [leaf]))
 
 (defn update-leaf
-  [leaf idx t novelty remove-preds]
+  [leaf t novelty remove-preds]
   (let [new-flakes (index/novelty-subrange leaf t novelty)
         to-remove  (filter-predicates remove-preds (:flakes leaf) new-flakes)]
     (if (or (seq new-flakes) (seq to-remove))
@@ -262,7 +262,7 @@
   *overflow-bytes*, and rebalancing the branches so that none have more children
   than *overflow-children*. Maintains a 'lifo' stack to preserve the depth-first
   order of the transformed stream."
-  [idx t novelty remove-preds]
+  [t novelty remove-preds]
   (fn [xf]
     (let [stack (volatile! [])]
       (fn
@@ -279,7 +279,7 @@
         ;;   3. Iterate each resulting node with the nested transformer.
         ([result node]
          (if (index/leaf? node)
-           (let [leaves (update-leaf node idx t novelty remove-preds)]
+           (let [leaves (update-leaf node t novelty remove-preds)]
              (vswap! stack into leaves)
              result)
 
@@ -405,7 +405,7 @@
 (defn refresh-index
   [{:keys [conn] :as db} changes-ch error-ch {::keys [idx t novelty remove-preds root]}]
   (let [refresh-xf (comp (map preserve-id)
-                         (integrate-novelty idx t novelty remove-preds))
+                         (integrate-novelty t novelty remove-preds))
         novel?     (fn [node]
                      (or (seq remove-preds)
                          (seq (index/novelty-subrange node t novelty))))]
