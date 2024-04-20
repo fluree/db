@@ -1425,6 +1425,90 @@ WORLD!")
           (is (= "Subject :ex/john path [:ex/birthYear] violates constraint :sh/pattern of shape _:fdb-3 - value \":ex/ref\" does not match pattern \"(19|20)[0-9][0-9]\"."
                  (ex-message db-ref-value))))))))
 
+(deftest language-constraints
+  (let [conn    @(fluree/connect {:method :memory})
+        ledger  @(fluree/create conn "validation-report")
+        context ["https://ns.flur.ee" test-utils/default-str-context
+                 {"ex" "http://example.com/ns/"}]
+        db0     (fluree/db ledger)]
+    (testing "language-in"
+      (let [db1 @(fluree/stage db0 {"@context" context
+                                    "insert"
+                                    {"@id"           "ex:langShape"
+                                     "type"          "sh:NodeShape"
+                                     "sh:targetNode" {"@id" "ex:a"}
+                                     "sh:property"   [{"sh:path"       {"@id" "ex:label"}
+                                                       "sh:languageIn" ["en" "fr"]}]}})]
+        (testing "language conforms"
+          (let [db2 @(fluree/stage db1 {"@context" context
+                                        "insert"
+                                        {"@id"      "ex:a"
+                                         "ex:label" {"@value" "foo" "@language" "en"}}})]
+            (is (nil? (ex-data db2)))))
+        (testing "language not allowed"
+          (let [db2 @(fluree/stage db1 {"@context" context
+                                        "insert"
+                                        {"@id"      "ex:a"
+                                         "ex:label" {"@value" "foo" "@language" "cz"}}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    {"type"        "sh:ValidationReport",
+                     "sh:conforms" false,
+                     "sh:result"
+                     [{"sh:constraintComponent" "sh:languageIn",
+                       "sh:focusNode"           "ex:a",
+                       "sh:resultSeverity"      "sh:Violation",
+                       "sh:value"               "foo",
+                       "sh:resultPath"          ["ex:label"],
+                       "type"                   "sh:ValidationResult",
+                       "sh:resultMessage"
+                       "value \"foo\" does not have language tag in [\"en\" \"fr\"]",
+                       "sh:sourceShape"         "_:fdb-2",
+                       "f:expectation"          ["en" "fr"]}]}}
+                   (ex-data db2)))
+            (is (= "Subject ex:a path [\"ex:label\"] violates constraint sh:languageIn of shape _:fdb-2 - value \"foo\" does not have language tag in [\"en\" \"fr\"]."
+                   (ex-message db2)))))))
+    (testing "unique-lang"
+      (let [db1 @(fluree/stage db0 {"@context" context
+                                    "insert"
+                                    {"@id"           "ex:langShape"
+                                     "type"          "sh:NodeShape"
+                                     "sh:targetNode" {"@id" "ex:a"}
+                                     "sh:property"   [{"sh:path"       {"@id" "ex:label"}
+                                                       "sh:uniqueLang" true}]}})]
+        (testing "all langs unique"
+          (let [db2 @(fluree/stage db1 {"@context" context
+                                        "insert"
+                                        {"@id"      "ex:a"
+                                         "ex:label" [{"@value" "foo" "@language" "en"}
+                                                     {"@value" "feuou" "@language" "fr"}]}})]
+            (is (nil? (ex-data db2)))))
+        (testing "langs repeated"
+          (let [db2 @(fluree/stage db1 {"@context" context
+                                        "insert"
+                                        {"@id"      "ex:a"
+                                         "ex:label" [{"@value" "foo" "@language" "en"}
+                                                     {"@value" "bar" "@language" "en"}]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    {"type"        "sh:ValidationReport",
+                     "sh:conforms" false,
+                     "sh:result"
+                     [{"sh:constraintComponent" "sh:uniqueLang",
+                       "sh:focusNode"           "ex:a",
+                       "sh:resultSeverity"      "sh:Violation",
+                       "sh:value"               false,
+                       "sh:resultPath"          ["ex:label"],
+                       "type"                   "sh:ValidationResult",
+                       "sh:resultMessage"       "values [\"bar\" \"foo\"] do not have unique language tags",
+                       "sh:sourceShape"         "_:fdb-6",
+                       "f:expectation"          true}]}}
+                   (ex-data db2)))
+            (is (= "Subject ex:a path [\"ex:label\"] violates constraint sh:uniqueLang of shape _:fdb-6 - values [\"bar\" \"foo\"] do not have unique language tags."
+                   (ex-message db2)))))))))
+
 (deftest ^:integration shacl-multiple-properties-test
   (testing "multiple properties works"
     (let [conn       (test-utils/create-conn)
