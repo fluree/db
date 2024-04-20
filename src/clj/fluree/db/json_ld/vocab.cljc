@@ -357,7 +357,7 @@
      (assoc db :schema schema))))
 
 (defn load-schema
-  [{:keys [preds t] :as db}]
+  [{:keys [preds] :as db}]
   (go-try
     (loop [[[pred-sid] & r] preds
            vocab-flakes (flake/sorted-set-by flake/cmp-flakes-spot)]
