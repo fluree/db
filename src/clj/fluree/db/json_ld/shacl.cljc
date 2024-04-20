@@ -750,9 +750,80 @@
                                                            (display (get not-shape const/$id))))))))))
         (not-empty results)))))
 
-#_(defmethod validate-constraint const/sh_and [v-ctx constraint focus-flakes]) ; not supported
-#_(defmethod validate-constraint const/sh_or [v-ctx constraint focus-flakes])  ; not supported
-#_(defmethod validate-constraint const/sh_xone [v-ctx constraint focus-flakes]) ; not supported
+(defmethod validate-constraint const/sh_and
+  [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (go-try
+    (let [and-shapes (get shape const/sh_and)]
+      (loop [[and-shape & r] and-shapes
+             nonconforming?  false]
+        (if and-shape
+          (if-let [results* (if (property-shape? and-shape)
+                              (<? (validate-property-shape v-ctx and-shape focus-node))
+                              (<? (validate-node-shape v-ctx and-shape focus-node value-nodes)))]
+            ;; short-circuit if there's a validation result
+            (recur nil true)
+            (recur r nonconforming?))
+          (when nonconforming?
+            (let [result (base-result v-ctx shape constraint focus-node)]
+              [(-> result
+                   (dissoc :expect)
+                   (assoc :value (display focus-node)
+                          :message (or (:message result)
+                                       (str (display focus-node) " failed to conform to all " (display const/sh_and)
+                                            " shapes: " (mapv (comp display #(get % const/$id)) and-shapes)))))])))))))
+
+(defmethod validate-constraint const/sh_or
+  [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (go-try
+    (let [or-shapes (get shape const/sh_or)]
+      (loop [[or-shape & r]  or-shapes
+             none-conformed? true]
+        (if or-shape
+          (let [results (if (property-shape? or-shape)
+                          (<? (validate-property-shape v-ctx or-shape focus-node))
+                          (<? (validate-node-shape v-ctx or-shape focus-node value-nodes)))]
+
+            (println "DEP or results" (pr-str results))
+            (if results
+              (recur r none-conformed?)
+              ;; short-circuit if there's a single conforming shape
+              (recur nil false)))
+
+          (when none-conformed?
+            (let [result (base-result v-ctx shape constraint focus-node)]
+              [(-> result
+                   (dissoc :expect)
+                   (assoc :value (display focus-node)
+                          :message (or (:message result)
+                                       (str (display focus-node) " failed to conform to any of the following shapes: "
+                                            (mapv (comp display #(get % const/$id)) or-shapes)))))])))))))
+
+(defmethod validate-constraint const/sh_xone
+  [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (go-try
+    (let [xone-shapes (get shape const/sh_xone)
+
+          result (base-result v-ctx shape constraint focus-node)]
+      (loop [[xone-shape & r] xone-shapes
+             conforms         []]
+        (if xone-shape
+          (let [results (if (property-shape? xone-shape)
+                          (<? (validate-property-shape v-ctx xone-shape focus-node))
+                          (<? (validate-node-shape v-ctx xone-shape focus-node value-nodes)))]
+            (if results
+              (recur r conforms)
+              (recur r (conj conforms (get xone-shape const/$id)))))
+
+          (when (not= 1 (count conforms))
+            (let [values (mapv (comp display first) value-nodes)]
+              [(-> result
+                   (dissoc :expect)
+                   (assoc :value values
+                          :message (or (:message result)
+                                       (str "values conformed to "
+                                            (count conforms) " of the following " (display const/sh_xone) " shapes: "
+                                            (mapv (comp display #(get % const/$id)) xone-shapes)
+                                            "; must only conform to one"))))])))))))
 
 ;; shape-based constraints
 (defmethod validate-constraint const/sh_node
