@@ -409,6 +409,7 @@
                            bnode?   (iri/blank-node-sid? v)
                            literal? (not (iri/sid? v))]
                        (condp = nodekind
+                         const/sh_Literal            literal?
                          const/sh_BlankNode          bnode?
                          const/sh_IRI                iri?
                          const/sh_BlankNodeOrIRI     (or iri? bnode?)
