@@ -9,28 +9,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-;; branch operations on json-ld ledger
-
-(defn current-branch
-  "Returns current branch name."
-  [ledger]
-  (-> ledger
-      :state
-      deref
-      :branch))
-
-(defn branch-meta
-  "Returns branch map data for current branch, or specified branch"
-  ([ledger]
-   (branch-meta ledger (current-branch ledger)))
-  ([ledger branch]
-   (-> ledger
-       :state
-       deref
-       :branches
-       (get branch))))
-
-;; TODO - if you branch from an uncommitted branch, and then commit, commit the current-branch too
 (defn new-branch-map
   "Returns a new branch map for specified branch name off of supplied
   current-branch."
