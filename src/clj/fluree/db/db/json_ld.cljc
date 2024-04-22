@@ -105,8 +105,8 @@
 
 ;; ================ end Jsonld record support fns ============================
 
-(defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot post opst
-                     tspo schema comparators staged novelty policy namespaces
+(defrecord JsonLdDb [alias branch commit t tt-id stats spot post opst tspo
+                     schema comparators staged novelty policy namespaces
                      namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
@@ -169,8 +169,7 @@
         stats         {:flakes 0, :size 0, :indexed 0}
         schema        (vocab/base-schema)
         branch        (branch/branch-meta ledger)]
-    (map->JsonLdDb {:ledger          ledger
-                    :conn            conn
+    (map->JsonLdDb {:conn            conn
                     :alias           alias
                     :branch          (:name branch)
                     :commit          (:commit branch)
