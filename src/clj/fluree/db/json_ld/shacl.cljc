@@ -210,7 +210,6 @@
       (if pid
         (let [value-nodes* (<? (query-range/index-range data-db :spot = [focus-node pid]
                                                         {:flake-xf (map object-node)}))]
-          (println "DEP alt" (pr-str focus-node) (pr-str pid) (pr-str value-nodes*))
           (recur r (into value-nodes value-nodes*)))
         value-nodes))))
 
@@ -802,7 +801,6 @@
                           (<? (validate-property-shape v-ctx or-shape focus-node))
                           (<? (validate-node-shape v-ctx or-shape focus-node value-nodes)))]
 
-            (println "DEP or results" (pr-str results))
             (if results
               (recur r none-conformed?)
               ;; short-circuit if there's a single conforming shape
