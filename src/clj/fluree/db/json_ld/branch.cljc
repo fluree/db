@@ -12,18 +12,11 @@
 (defn new-branch-map
   "Returns a new branch map for specified branch name off of supplied
   current-branch."
-  ([conn ledger-alias branch-name ns-addresses]
-   (new-branch-map conn nil ledger-alias branch-name ns-addresses))
-  ([conn current-branch-map ledger-alias branch-name ns-addresses]
-   (let [{:keys [current-db]} current-branch-map]
-     (let [initial-commit (commit-data/blank-commit ledger-alias branch-name ns-addresses)
-           initial-db     (or current-db
-                              (jld-db/create conn ledger-alias branch-name initial-commit))]
-       (cond-> {:name      branch-name
-                :commit    initial-commit
-                :current-db initial-db}
-         (not-empty current-branch-map)
-         (assoc :from (select-keys current-branch-map [:name :commit])))))))
+  [conn ledger-alias branch-name ns-addresses]
+  (let [initial-commit (commit-data/blank-commit ledger-alias branch-name ns-addresses)
+        initial-db     (jld-db/create conn ledger-alias branch-name initial-commit)]
+    {:name       branch-name
+     :current-db initial-db}))
 
 (defn skipped-t?
   [new-t current-t]
@@ -77,15 +70,20 @@
              (not (flake/t-after? new-t current-t))) ; index update may come after multiple commits
         (= new-t (inc current-t)))))
 
+(defn current-db
+  "Returns current db from branch data"
+  [branch-map]
+  (:current-db branch-map))
+
 (defn update-commit
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
   [branch-map {new-commit :commit, db-t :t, :as db}]
-  (let [{current-commit :commit} branch-map
-        current-t                (commit-data/t current-commit)
-        new-t                    (commit-data/t new-commit)]
+  (let [current-commit (-> branch-map current-db :commit)
+        current-t      (commit-data/t current-commit)
+        new-t          (commit-data/t new-commit)]
     (if (= db-t new-t)
       (if (updatable-commit? current-commit new-commit)
         (update-db branch-map db)
@@ -98,8 +96,3 @@
                            "New database has an inconsistent t from its commit:"
                            db-t " and " new-t " respectively.")
                       {:status 500 :error :db/invalid-db})))))
-
-(defn current-db
-  "Returns latest db from branch data"
-  [branch-map]
-  (:current-db branch-map))
