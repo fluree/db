@@ -165,53 +165,65 @@
    :flakes  (get-first-value data const/iri-flakes)
    :size    (get-first-value data const/iri-size)})
 
+(defn jsonld->clj
+  [jsonld]
+  (let [id      (:id jsonld)
+        v       (get-first-value jsonld const/iri-v)
+        alias   (get-first-value jsonld const/iri-alias)
+        branch  (get-first-value jsonld const/iri-branch)
+        address (-> jsonld
+                    (get-first-value const/iri-address)
+                    not-empty)
+
+        time        (get-first-value jsonld const/iri-time)
+        message     (get-first-value jsonld const/iri-message)
+        tags        (get-first jsonld const/iri-tag)
+        issuer      (get-first jsonld const/iri-issuer)
+        prev-commit (get-first jsonld const/iri-previous)
+        data        (get-first jsonld const/iri-data)
+        ns          (get-first jsonld const/iri-ns)
+        index       (get-first jsonld const/iri-index)]
+
+    (cond-> {:id             id
+             :v              v
+             :alias          alias
+             :branch         branch
+             :time           time
+             :message        message
+             :tag            (mapv :value tags)
+             :previous       {:id      (:id prev-commit)
+                              :address (get-first-value prev-commit const/iri-address)}
+             :data           (parse-db-data data)}
+      address (assoc :address address)
+      ns      (assoc :ns (->> ns
+                              util/sequential
+                              (mapv (fn [namespace]
+                                      (select-keys namespace [:id])))))
+      index   (assoc :index {:id      (:id index)
+                             :address (get-first-value index const/iri-address)
+                             :data    (parse-db-data (get-first index const/iri-data))})
+      issuer  (assoc :issuer (select-keys issuer [:id])))))
+
+(defn update-index-roots
+  [commit-map {:keys [spot post opst tspo]}]
+  (if (contains? commit-map :index)
+    (update commit-map :index assoc :spot spot, :post post, :opst opst, :tspo tspo)
+    commit-map))
+
 (defn json-ld->map
-  "Turns json-ld commit meta into the clojure map structure."
   ([commit-jsonld index-roots]
    (json-ld->map commit-jsonld nil index-roots))
-  ([commit-jsonld commit-address {:keys [spot post opst tspo]}]
-   (let [id      (:id commit-jsonld)
-         address (-> commit-jsonld
-                     (get-first-value const/iri-address)
-                     not-empty
-                     (or commit-address)) ; address, if using something like
-                                        ; IPFS, is empty string
-         v       (get-first-value commit-jsonld const/iri-v)
-         alias   (get-first-value commit-jsonld const/iri-alias)
-         branch  (get-first-value commit-jsonld const/iri-branch)
 
-         time        (get-first-value commit-jsonld const/iri-time)
-         message     (get-first-value commit-jsonld const/iri-message)
-         tags        (get-first commit-jsonld const/iri-tag)
-         issuer      (get-first commit-jsonld const/iri-issuer)
-         prev-commit (get-first commit-jsonld const/iri-previous)
-         data        (get-first commit-jsonld const/iri-data)
-         ns          (get-first commit-jsonld const/iri-ns)
+  ([commit-jsonld fallback-address index-roots]
+   (let [commit-map (jsonld->clj commit-jsonld)]
+     (cond-> commit-map
+       (and (some? fallback-address)
+            (not (contains? commit-map :address)))
+       (assoc :address fallback-address) ; address, if using something like
+                                         ; IPFS, is empty string
 
-         index (get-first commit-jsonld const/iri-index)]
-     (cond-> {:id             id
-              :address        address
-              :v              v
-              :alias          alias
-              :branch         branch
-              :time           time
-              :message        message
-              :tag            (mapv :value tags)
-              :previous       {:id      (:id prev-commit)
-                               :address (get-first-value prev-commit const/iri-address)}
-              :data           (parse-db-data data)}
-       ns     (assoc :ns (->> ns
-                              util/sequential
-                              (mapv (fn [namespace] {:id (:id namespace)}))))
-       index  (assoc :index {:id      (:id index)
-                             :address (get-first-value index const/iri-address)
-                             :data    (parse-db-data (get-first index const/iri-data))
-                             :spot    spot
-                             :post    post
-                             :opst    opst
-                             :tspo    tspo})
-       issuer (assoc :issuer {:id (:id issuer)})))))
-
+       true
+       (update-index-roots index-roots)))))
 
 (defn update-commit-id
   "Once a commit id is known (by hashing json-ld version of commit), update
