@@ -299,7 +299,7 @@
           retracted-flakes (retract-flakes db t-new retract)
 
           {:keys [previous issuer message] :as commit-metadata}
-          (commit-data/json-ld->map commit db)
+          (commit-data/json-ld->map commit (select-keys db index/types))
 
           commit-id          (:id commit-metadata)
           commit-sid         (iri/encode-iri db commit-id)
@@ -389,8 +389,8 @@
                        (<? (storage/reify-db conn db idx-address))
                        db)
           commit-map (commit-data/json-ld->map latest-commit
-                                               (-> (select-keys db-base index/types)
-                                                   (assoc :commit-address commit-address)))
+                                               commit-address
+                                               (select-keys db-base index/types))
           _          (log/debug "load-db-idx commit-map:" commit-map)
           db-base*   (assoc db-base :commit commit-map)
           index-t    (commit-data/index-t commit-map)
