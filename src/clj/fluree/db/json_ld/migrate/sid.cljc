@@ -6,6 +6,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.ledger.json-ld :as jld-ledger]
+            [fluree.db.index :as index]
             [fluree.db.indexer.default :as indexer]
             [fluree.db.db.json-ld :as db]
             [fluree.db.nameservice.core :as nameservice]
@@ -53,7 +54,7 @@
           db*              (set-namespaces db ns-mapping)
 
           {:keys [previous issuer message] :as commit-metadata}
-          (commit-data/json-ld->map commit db*)
+          (commit-data/json-ld->map commit (select-keys db* index/types))
 
           commit-id          (:id commit-metadata)
           commit-sid         (iri/encode-iri db* commit-id)
