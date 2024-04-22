@@ -97,7 +97,7 @@
   [{:keys [conn indexer] :as ledger} commit-opts tuples-chans]
   (go-try
     (loop [[[commit-tuple ch] & r] tuples-chans
-           db                      (db/create ledger)]
+           db                      (jld-ledger/db ledger nil)]
       (if commit-tuple
         (let [merged-db     (<? (merge-commit conn db commit-tuple))
               update-commit (commit/update-commit-fn ledger merged-db commit-opts)
@@ -117,7 +117,7 @@
           ledger-alias      (jld-ledger/commit->ledger-alias conn address first-commit)
           branch            (or (keyword (get-first-value first-commit const/iri-branch))
                                 :main)
-          ledger            (<? (jld-ledger/->ledger conn ledger-alias {:branch branch}))
+          ledger            (<? (jld-ledger/create* conn ledger-alias {:branch branch}))
           commit-opts*      (assoc commit-opts :branch branch)
           tuples-chans      (map (fn [commit-tuple]
                                    [commit-tuple (async/chan)])

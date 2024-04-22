@@ -119,10 +119,13 @@
   [{:keys [conn] :as ledger} expanded-commit]
   (go-try
     (let [[commit proof] (jld-reify/verify-commit expanded-commit)
-          branch    (keyword (get-first-value expanded-commit const/iri-branch))
-          commit-t  (-> expanded-commit
-                        (get-first const/iri-data)
-                        (get-first-value const/iri-t))
+
+          branch     (-> expanded-commit
+                         (get-first-value const/iri-branch)
+                         keyword)
+          commit-t   (-> expanded-commit
+                         (get-first const/iri-data)
+                         (get-first-value const/iri-t))
           current-db (ledger/-db ledger {:branch branch})
           current-t  (:t current-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
@@ -185,7 +188,7 @@
     ledger-alias))
 
 
-(defn ->ledger
+(defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
@@ -216,7 +219,7 @@
           address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
           ;; map of all branches and where they are branched from
-          branches      {branch (branch/new-branch-map ledger-alias* branch ns-addresses)}]
+          branches      {branch (branch/new-branch-map conn ledger-alias* branch ns-addresses)}]
       (map->JsonLDLedger
         {:id      (random-uuid)
          :did     did*
@@ -234,18 +237,6 @@
          :indexer indexer
          :reasoner #{}
          :conn    conn}))))
-
-(defn initialize-db!
-  [ledger]
-  (let [db (jld-db/create ledger)]
-    (db-update ledger db)))
-
-(defn create*
-  [conn ledger-alias opts]
-  (go-try
-    (let [ledger (<? (->ledger conn ledger-alias opts))]
-      (initialize-db! ledger)
-      ledger)))
 
 (defn create
   [conn ledger-alias opts]

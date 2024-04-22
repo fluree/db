@@ -2,6 +2,7 @@
   (:require [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.flake :as flake]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.log :as log :include-macros true])
 
   (:refer-clojure :exclude [name]))
@@ -33,14 +34,16 @@
 (defn new-branch-map
   "Returns a new branch map for specified branch name off of supplied
   current-branch."
-  ([ledger-alias branch-name ns-addresses]
-   (new-branch-map nil ledger-alias branch-name ns-addresses))
-  ([current-branch-map ledger-alias branch-name ns-addresses]
+  ([conn ledger-alias branch-name ns-addresses]
+   (new-branch-map conn nil ledger-alias branch-name ns-addresses))
+  ([conn current-branch-map ledger-alias branch-name ns-addresses]
    (let [{:keys [current-db]} current-branch-map]
-     (let [initial-commit (commit-data/blank-commit ledger-alias branch-name ns-addresses)]
+     (let [initial-commit (commit-data/blank-commit ledger-alias branch-name ns-addresses)
+           initial-db     (or current-db
+                              (jld-db/create conn ledger-alias branch-name initial-commit))]
        (cond-> {:name      branch-name
                 :commit    initial-commit
-                :current-db current-db}
+                :current-db initial-db}
          (not-empty current-branch-map)
          (assoc :from (select-keys current-branch-map [:name :commit])))))))
 

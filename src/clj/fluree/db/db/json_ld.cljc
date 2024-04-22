@@ -8,7 +8,6 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.commit-data :as commit-data])
@@ -155,24 +154,23 @@
     {:size 0} index/types))
 
 (defn create
-  [{:keys [alias conn] :as ledger}]
+  [conn ledger-alias branch commit]
   (let [novelty (new-novelty-map index/default-comparators)
         {spot-cmp :spot
          post-cmp :post
          opst-cmp :opst
          tspo-cmp :tspo} index/default-comparators
 
-        spot          (index/empty-branch alias spot-cmp)
-        post          (index/empty-branch alias post-cmp)
-        opst          (index/empty-branch alias opst-cmp)
-        tspo          (index/empty-branch alias tspo-cmp)
+        spot          (index/empty-branch ledger-alias spot-cmp)
+        post          (index/empty-branch ledger-alias post-cmp)
+        opst          (index/empty-branch ledger-alias opst-cmp)
+        tspo          (index/empty-branch ledger-alias tspo-cmp)
         stats         {:flakes 0, :size 0, :indexed 0}
-        schema        (vocab/base-schema)
-        branch        (branch/branch-meta ledger)]
+        schema        (vocab/base-schema)]
     (map->JsonLdDb {:conn            conn
-                    :alias           alias
-                    :branch          (:name branch)
-                    :commit          (:commit branch)
+                    :alias           ledger-alias
+                    :branch          branch
+                    :commit          commit
                     :t               0
                     :tt-id           nil
                     :stats           stats
