@@ -117,7 +117,7 @@
   If commit successful, returns successfully updated db."
   [{:keys [conn] :as ledger} expanded-commit]
   (go-try
-    (let [[commit proof] (jld-reify/parse-commit expanded-commit)
+    (let [[commit proof] (jld-reify/verify-commit expanded-commit)
           branch    (keyword (get-first-value expanded-commit const/iri-branch))
           commit-t  (-> expanded-commit
                         (get-first const/iri-data)

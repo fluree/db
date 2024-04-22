@@ -241,7 +241,7 @@
     commit-retract))
 
 ;; TODO - validate commit signatures
-(defn validate-commit
+(defn validate-commit-proof
   "Run proof validation, if exists.
   Return actual commit data. In the case of a VerifiableCredential this is
   the `credentialSubject`."
@@ -249,18 +249,18 @@
   ;; TODO - returning true for now
   true)
 
-(defn parse-commit
+(defn has-proof?
+  [commit-data]
+  (contains? commit-data const/iri-cred-subj))
+
+(defn verify-commit
   "Given a full commit json, returns two-tuple of [commit-data commit-proof]"
   [commit-data]
-  (let [has-proof? (contains? commit-data const/iri-cred-subj)
-        commit     (if has-proof?
-                     (get-first commit-data const/iri-cred-subj)
-                     commit-data)]
-    (if has-proof?
-      (do
-        (validate-commit commit-data)
-        [commit commit-data])
-      [commit nil])))
+  (if (has-proof? commit-data)
+    (let [credential-subject (get-first commit-data const/iri-cred-subj)]
+      (validate-commit-proof commit-data)
+      [credential-subject commit-data])
+    [commit-data nil]))
 
 (defn read-commit
   [conn commit-address]
@@ -274,7 +274,7 @@
         (-> commit-data
             (assoc-in addr-key-path commit-address)
             json-ld/expand
-            parse-commit)))))
+            verify-commit)))))
 
 (defn read-db
   [conn db-address]
