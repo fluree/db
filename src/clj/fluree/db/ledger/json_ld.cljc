@@ -3,7 +3,6 @@
             [fluree.db.ledger :as ledger]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.branch :as branch]
-            [fluree.db.db.json-ld :as jld-db]
             [fluree.db.json-ld.commit :as jld-commit]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
@@ -219,7 +218,7 @@
           address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
           ;; map of all branches and where they are branched from
-          branches      {branch (branch/new-branch-map conn ledger-alias* branch ns-addresses)}]
+          branches      {branch (<? (branch/new-branch-map conn ledger-alias* branch ns-addresses))}]
       (map->JsonLDLedger
         {:id      (random-uuid)
          :did     did*

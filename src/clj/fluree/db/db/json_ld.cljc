@@ -1,4 +1,5 @@
 (ns fluree.db.db.json-ld
+  (:refer-clojure :exclude [load])
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql :as fql]
@@ -153,35 +154,36 @@
                        flake/sorted-set-by)))
     {:size 0} index/types))
 
-(defn create
+(defn load
   [conn ledger-alias branch commit]
-  (let [novelty (new-novelty-map index/default-comparators)
-        {spot-cmp :spot
-         post-cmp :post
-         opst-cmp :opst
-         tspo-cmp :tspo} index/default-comparators
+  (go-try
+    (let [{spot-cmp :spot
+           post-cmp :post
+           opst-cmp :opst
+           tspo-cmp :tspo} index/default-comparators
 
-        spot          (index/empty-branch ledger-alias spot-cmp)
-        post          (index/empty-branch ledger-alias post-cmp)
-        opst          (index/empty-branch ledger-alias opst-cmp)
-        tspo          (index/empty-branch ledger-alias tspo-cmp)
-        stats         {:flakes 0, :size 0, :indexed 0}
-        schema        (vocab/base-schema)]
-    (map->JsonLdDb {:conn            conn
-                    :alias           ledger-alias
-                    :branch          branch
-                    :commit          commit
-                    :t               0
-                    :tt-id           nil
-                    :stats           stats
-                    :spot            spot
-                    :post            post
-                    :opst            opst
-                    :tspo            tspo
-                    :schema          schema
-                    :comparators     index/default-comparators
-                    :staged          []
-                    :novelty         novelty
-                    :policy          root-policy-map
-                    :namespaces      iri/default-namespaces
-                    :namespace-codes iri/default-namespace-codes})))
+          spot    (index/empty-branch ledger-alias spot-cmp)
+          post    (index/empty-branch ledger-alias post-cmp)
+          opst    (index/empty-branch ledger-alias opst-cmp)
+          tspo    (index/empty-branch ledger-alias tspo-cmp)
+          stats   {:flakes 0, :size 0, :indexed 0}
+          novelty (new-novelty-map index/default-comparators)
+          schema  (vocab/base-schema)]
+      (map->JsonLdDb {:conn            conn
+                      :alias           ledger-alias
+                      :branch          branch
+                      :commit          commit
+                      :t               0
+                      :tt-id           nil
+                      :stats           stats
+                      :spot            spot
+                      :post            post
+                      :opst            opst
+                      :tspo            tspo
+                      :schema          schema
+                      :comparators     index/default-comparators
+                      :staged          []
+                      :novelty         novelty
+                      :policy          root-policy-map
+                      :namespaces      iri/default-namespaces
+                      :namespace-codes iri/default-namespace-codes}))))

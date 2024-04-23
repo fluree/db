@@ -8,7 +8,6 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.index :as index]
             [fluree.db.indexer.default :as indexer]
-            [fluree.db.db.json-ld :as db]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
