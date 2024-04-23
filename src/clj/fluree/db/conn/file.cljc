@@ -10,7 +10,6 @@
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.indexer.storage :as index-storage]
-            [fluree.db.indexer.default :as idx-default]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]

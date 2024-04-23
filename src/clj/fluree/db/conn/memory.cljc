@@ -8,7 +8,6 @@
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]
             [fluree.db.storage :as storage]
