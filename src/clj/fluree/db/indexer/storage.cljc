@@ -36,16 +36,16 @@
 
 (defn write-leaf
   "Serializes and writes the index leaf node `leaf` to storage."
-  [{:keys [conn ledger] :as _db} idx-type leaf]
+  [{:keys [alias conn] :as _db} idx-type leaf]
   (let [ser (serdeproto/-serialize-leaf (serde conn) leaf)]
-    (connection/-index-file-write conn ledger idx-type ser)))
+    (connection/-index-file-write conn alias idx-type ser)))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key.
   Returns two-tuple of response output and raw bytes written."
-  [{:keys [conn ledger] :as _db} idx-type data]
+  [{:keys [alias conn] :as _db} idx-type data]
   (let [ser (serdeproto/-serialize-branch (serde conn) data)]
-    (connection/-index-file-write conn ledger idx-type ser)))
+    (connection/-index-file-write conn alias idx-type ser)))
 
 (defn write-branch
   "Writes the child attributes index branch node `branch` to storage."
@@ -59,17 +59,17 @@
 (defn write-garbage
   "Writes garbage record out for latest index."
   [db garbage]
-  (let [{:keys [conn ledger ledger-alias t]} db
+  (let [{:keys [alias conn t]} db
 
-        data {:ledger-alias ledger-alias
+        data {:ledger-alias alias
               :t            t
               :garbage      garbage}
         ser  (serdeproto/-serialize-garbage (serde conn) data)]
-    (connection/-index-file-write conn ledger :garbage ser)))
+    (connection/-index-file-write conn alias :garbage ser)))
 
 (defn write-db-root
   [db]
-  (let [{:keys [conn ledger commit t stats spot psot post opst tspo
+  (let [{:keys [alias conn commit t stats spot psot post opst tspo
                 schema namespace-codes]}
         db
 
@@ -88,7 +88,7 @@
                       :prevIndex       (or (:indexed stats) 0)
                       :namespace-codes namespace-codes}
         ser          (serdeproto/-serialize-db-root (serde conn) data)]
-    (connection/-index-file-write conn ledger :root ser)))
+    (connection/-index-file-write conn alias :root ser)))
 
 
 (defn read-branch

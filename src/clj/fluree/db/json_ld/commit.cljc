@@ -250,7 +250,7 @@
 
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
-  [ledger {:keys [commit] :as db} {:keys [branch did private] :as _opts}]
+  [{:keys [alias] :as ledger} {:keys [commit] :as db} {:keys [branch did private] :as _opts}]
   (go-try
     (let [{:keys [conn state]} ledger
           ledger-commit (:commit (ledger/-status ledger branch))
@@ -260,7 +260,7 @@
           signed-commit (if did
                           (<? (cred/generate jld-commit private (:id did)))
                           jld-commit)
-          commit-res    (<? (connection/-c-write conn ledger signed-commit)) ;; write commit credential
+          commit-res    (<? (connection/-c-write conn alias signed-commit)) ; write commit credential
           new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
           db*           (assoc db :commit new-commit**)
           db**          (if (new-t? ledger-commit commit)
@@ -307,12 +307,12 @@
                                  :changes-ch    changes-ch}))))
 
 (defn write-transactions!
-  [conn ledger staged]
+  [conn {:keys [alias] :as _ledger} staged]
   (go-try
     (loop [[[txn author-did annotation] & r] staged
            results                []]
       (if txn
-        (let [{txn-id :address} (<? (connection/-txn-write conn ledger txn))]
+        (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
           (recur r (conj results [txn-id author-did annotation])))
         results))))
 
@@ -320,7 +320,7 @@
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [conn] :as ledger} {:keys [t stats commit staged] :as db} opts]
+  [{:keys [alias conn] :as ledger} {:keys [t stats commit staged] :as db} opts]
   (go-try
     (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
           (enrich-commit-opts ledger db opts)
@@ -330,8 +330,8 @@
           [[txn-id author annotation]] txns
 
           [dbid db-jsonld]  (db->jsonld db opts*)
-          ledger-update-res (<? (connection/-c-write conn ledger db-jsonld)) ;; write commit data
-          db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
+          ledger-update-res (<? (connection/-c-write conn alias db-jsonld)) ; write commit data
+          db-address        (:address ledger-update-res) ; may not have address (e.g. IPFS) until after writing file
           base-commit-map   {:old-commit commit
                              :issuer     did
                              :message    message

@@ -15,7 +15,6 @@
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
-            [fluree.db.ledger :as ledger]
             [fluree.db.storage :as storage]
             [fluree.db.storage.file :as file-storage])
   #?(:clj (:import (java.io Writer))))
@@ -23,17 +22,16 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn- write-data
-  [{:keys [store] :as _conn} ledger data-type data]
+  [{:keys [store] :as _conn} ledger-alias data-type data]
   (go-try
-    (let [alias    (ledger/-alias ledger)
-          json     (if (string? data)
+    (let [json     (if (string? data)
                      data
                      (json-ld/normalize-data data))
           bytes    (bytes/string->UTF8 json)
           type-dir (name data-type)
           hash     (crypto/sha2-256 bytes :hex)
           filename (str hash ".json")
-          path     (str/join "/" [alias type-dir filename])
+          path     (str/join "/" [ledger-alias type-dir filename])
 
           {:keys [hash address]} (<? (storage/write store path bytes))]
       {:name    path
@@ -56,12 +54,16 @@
                            nameservices serializer msg-out-ch lru-cache-atom]
 
   connection/iStorage
-  (-c-read [conn commit-key] (read-data conn commit-key false))
-  (-c-write [conn ledger commit-data] (write-data conn ledger :commit commit-data))
-  (-txn-read [conn txn-key] (read-data conn txn-key false))
-  (-txn-write [conn ledger txn-data] (write-data conn ledger :txn txn-data))
-  (-index-file-write [conn ledger index-type index-data]
-    (write-data conn ledger (str "index/" (name index-type)) index-data))
+  (-c-read [conn commit-key]
+    (read-data conn commit-key false))
+  (-c-write [conn ledger-alias commit-data]
+    (write-data conn ledger-alias :commit commit-data))
+  (-txn-read [conn txn-key]
+    (read-data conn txn-key false))
+  (-txn-write [conn ledger-alias txn-data]
+    (write-data conn ledger-alias :txn txn-data))
+  (-index-file-write [conn ledger-alias index-type index-data]
+    (write-data conn ledger-alias (str "index/" (name index-type)) index-data))
   (-index-file-read [conn index-address] (read-data conn index-address true))
 
   connection/iConnection
