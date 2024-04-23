@@ -1,5 +1,6 @@
 (ns fluree.db.conn.s3
   (:require [cognitect.aws.client.api :as aws]
+            [clojure.string :as str]
             [fluree.db.nameservice.s3 :as ns-s3]
             [clojure.core.async :as async :refer [go]]
             [fluree.crypto :as crypto]
@@ -24,17 +25,14 @@
   [{:keys [store] :as _conn} ledger data-type data]
   (go-try
     (let [alias    (ledger/-alias ledger)
-          branch   (-> ledger ledger/-branch :name name)
           json     (if (string? data)
                      data
                      (json-ld/normalize-data data))
           bytes    (.getBytes ^String json)
-          hash     (crypto/sha2-256 bytes :hex)
           type-dir (name data-type)
-          path     (str alias
-                        (when branch (str "/" branch))
-                        (str "/" type-dir "/")
-                        hash ".json")
+          hash     (crypto/sha2-256 bytes :hex)
+          filename (str hash ".json")
+          path     (str/join "/" [alias type-dir filename])
           result   (<? (storage/write store path bytes))]
       {:name    path
        :hash    hash

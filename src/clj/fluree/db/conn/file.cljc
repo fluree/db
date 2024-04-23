@@ -25,17 +25,14 @@
   [{:keys [store] :as _conn} ledger data-type data]
   (go-try
     (let [alias    (ledger/-alias ledger)
-          branch   (name (:name (ledger/-branch ledger)))
           json     (if (string? data)
                      data
                      (json-ld/normalize-data data))
           bytes    (bytes/string->UTF8 json)
-          hash     (crypto/sha2-256 bytes :hex)
           type-dir (name data-type)
-          path     (str alias
-                        (when branch (str "/" branch))
-                        (str "/" type-dir "/")
-                        hash ".json")
+          hash     (crypto/sha2-256 bytes :hex)
+          filename (str hash ".json")
+          path     (str/join "/" [alias type-dir filename])
 
           {:keys [hash address]} (<? (storage/write store path bytes))]
       {:name    path
