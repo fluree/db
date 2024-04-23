@@ -8,7 +8,6 @@
             [fluree.db.connection :as connection]
             [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
-            [fluree.db.ledger :as ledger]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.util.async :refer [<? go-try]]
@@ -23,17 +22,16 @@
 (set! *warn-on-reflection* true)
 
 (defn write-data
-  [{:keys [store] :as _conn} ledger data-type data]
+  [{:keys [store] :as _conn} ledger-alias data-type data]
   (go-try
-    (let [alias    (ledger/-alias ledger)
-          json     (if (string? data)
+    (let [json     (if (string? data)
                      data
                      (json-ld/normalize-data data))
           bytes    (.getBytes ^String json)
           type-dir (name data-type)
           hash     (crypto/sha2-256 bytes :hex)
           filename (str hash ".json")
-          path     (str/join "/" [alias type-dir filename])
+          path     (str/join "/" [ledger-alias type-dir filename])
           result   (<? (storage/write store path bytes))]
       {:name    path
        :hash    hash
@@ -48,12 +46,12 @@
       (json/parse commit-data false))))
 
 (defn write-commit
-  [conn ledger commit-data]
-  (write-data conn ledger :commit commit-data))
+  [conn ledger-alias commit-data]
+  (write-data conn ledger-alias :commit commit-data))
 
 (defn write-index
-  [conn ledger index-type index-data]
-  (write-data conn ledger (str "index/" (name index-type)) index-data))
+  [conn ledger-alias index-type index-data]
+  (write-data conn ledger-alias (str "index/" (name index-type)) index-data))
 
 (defn read-index
   [{:keys [store] :as _conn} index-address]
@@ -61,19 +59,20 @@
     (let [index-data (<? (storage/read store index-address))]
       (json/parse index-data true))))
 
-
 (defrecord S3Connection [id state ledger-defaults parallelism lru-cache-atom nameservices store]
   connection/iStorage
-  (-c-read [conn commit-key] (read-commit conn commit-key))
-  (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
+  (-c-read [conn commit-key]
+    (read-commit conn commit-key))
+  (-c-write [conn ledger-alias commit-data]
+    (write-commit conn ledger-alias commit-data))
   (-txn-read [_ txn-key]
     (go-try
       (let [txn-data (<? (storage/read store txn-key))]
         (json/parse txn-data false))))
-  (-txn-write [conn ledger txn-data]
-    (write-data conn ledger :txn txn-data))
-  (-index-file-write [conn ledger index-type index-data]
-    (write-index conn ledger index-type index-data))
+  (-txn-write [conn ledger-alias txn-data]
+    (write-data conn ledger-alias :txn txn-data))
+  (-index-file-write [conn ledger-alias index-type index-data]
+    (write-index conn ledger-alias index-type index-data))
   (-index-file-read [conn index-address]
     (read-index conn index-address))
 
