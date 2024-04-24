@@ -137,26 +137,27 @@
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
   [conn blank-db root-data]
-  (let [{:keys [t stats preds namespace-codes]}
-        root-data
-        namespaces (map-invert namespace-codes)
-        db         (assoc blank-db
-                          :t t
-                          :namespaces namespaces
-                          :namespace-codes namespace-codes
-                          :stats (assoc stats :indexed t))
-        indexed-db (reduce
-                     (fn [db* idx]
-                       (let [idx-root (reify-index-root conn db* idx (get root-data idx))]
-                         (assoc db* idx idx-root)))
-                     db index/types)
-        preds*     (mapv (fn [p]
-                           (if (iri/serialized-sid? p)
-                             (iri/deserialize-sid p)
-                             (mapv iri/deserialize-sid p)))
-                         preds)
-        schema     (<? (vocab/load-schema indexed-db preds*))]
-    (assoc indexed-db :schema schema)))
+  (go-try
+    (let [{:keys [t stats preds namespace-codes]}
+          root-data
+          namespaces (map-invert namespace-codes)
+          db         (assoc blank-db
+                            :t t
+                            :namespaces namespaces
+                            :namespace-codes namespace-codes
+                            :stats (assoc stats :indexed t))
+          indexed-db (reduce
+                       (fn [db* idx]
+                         (let [idx-root (reify-index-root conn db* idx (get root-data idx))]
+                           (assoc db* idx idx-root)))
+                       db index/types)
+          preds*     (mapv (fn [p]
+                             (if (iri/serialized-sid? p)
+                               (iri/deserialize-sid p)
+                               (mapv iri/deserialize-sid p)))
+                           preds)
+          schema     (<? (vocab/load-schema indexed-db preds*))]
+      (assoc indexed-db :schema schema))))
 
 
 (defn read-garbage
@@ -190,7 +191,7 @@
                               idx-address ".")
                          {:status 400
                           :error  :db/unavailable}))
-         (reify-db-root conn blank-db db-root))))))
+         (<? (reify-db-root conn blank-db db-root)))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]
