@@ -320,15 +320,14 @@
 
 (defn add-pid
   [db preds pid]
-  (let [{:keys [iri] :as p-map} (initial-property-map db pid)]
-    (assoc preds pid p-map, iri p-map)))
+  (if (contains? preds pid)
+    preds
+    (let [{:keys [iri] :as p-map} (initial-property-map db pid)]
+      (assoc preds pid p-map, iri p-map))))
 
 (defn add-predicates
   [db pred-map pids]
-  (reduce (fn [preds pid]
-            (if (contains? preds pid)
-              preds
-              (add-pid db preds pid)))
+  (reduce (partial add-pid db)
           pred-map pids))
 
 (defn build-schema
@@ -369,13 +368,18 @@
           (:pred schema)))
 
 (defn load-schema
-  [db preds]
+  [{:keys [t] :as db} preds]
   (go-try
-    (loop [[[pred-sid] & r] preds
-           vocab-flakes (flake/sorted-set-by flake/cmp-flakes-spot)]
-      (if pred-sid
-        (let [pred-flakes (<? (query-range/index-range db :spot = [pred-sid]))]
-          (recur r (into vocab-flakes pred-flakes)))
-        (-> (build-schema db preds vocab-flakes)
-            ;; only use predicates that have a dt
+    (loop [[[pid] & r]  preds
+           vocab-flakes (flake/sorted-set-by flake/cmp-flakes-spot)
+           pred-map     (-> db :schema :pred)]
+      (if pid
+        (let [pred-flakes   (<? (query-range/index-range db :spot = [pid]))
+              vocab-flakes* (into vocab-flakes pred-flakes)
+              pred-map*     (add-pid db pred-map pid)]
+          (recur r vocab-flakes* pred-map*))
+        (-> db
+            :schema
+            (assoc :pred pred-map)
+            (update-with db t vocab-flakes)
             (add-pred-datatypes (filterv #(> (count %) 1) preds)))))))
