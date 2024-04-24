@@ -67,28 +67,14 @@
         ser  (serdeproto/-serialize-garbage (serde conn) data)]
     (connection/-index-file-write conn alias :garbage ser)))
 
-(defn extract-schema-root
-  "Transform the schema cache for serialization by turning every predicate into a
-  tuple of [pid datatype]."
-  [{:keys [schema]}]
-  (->> (:pred schema)
-       (reduce (fn [root [k {:keys [datatype]}]]
-                 (if (iri/sid? k)
-                   (let [sid (iri/serialize-sid k)]
-                     (if datatype
-                       (conj root [sid (iri/serialize-sid datatype)])
-                       (conj root [sid])))
-                   root))
-               [])))
-
 (defn write-db-root
   [db]
-  (let [{:keys [alias conn commit t stats spot psot post opst tspo
+  (let [{:keys [alias conn commit schema t stats spot psot post opst tspo
                 namespace-codes]}
         db
 
         ledger-alias (:id commit)
-        preds        (extract-schema-root db)
+        preds        (vocab/serialize-schema-predicates schema)
         data         {:ledger-alias    ledger-alias
                       :t               t
                       :preds           preds
@@ -126,12 +112,12 @@
                                 {:status 500
                                  :error  :db/unexpected-error})))]
     (cond-> index-data
-            (:rhs index-data) (update :rhs flake/parts->Flake)
-            (:first index-data) (update :first flake/parts->Flake)
-            true (assoc :comparator cmp
-                        :ledger-alias ledger-alias
-                        :t t
-                        :leftmost? true))))
+      (:rhs index-data)   (update :rhs flake/parts->Flake)
+      (:first index-data) (update :first flake/parts->Flake)
+      true                (assoc :comparator cmp
+                                 :ledger-alias ledger-alias
+                                 :t t
+                                 :leftmost? true))))
 
 
 (defn reify-db-root
