@@ -160,9 +160,12 @@
   "Returns all data for a db index root of a given t."
   ([conn idx-address]
    (go-try
-     (let [data (<? (connection/-index-file-read conn idx-address))]
-       (when data
-         (serdeproto/-deserialize-db-root (serde conn) data))))))
+     (if-let [data (<? (connection/-index-file-read conn idx-address))]
+       (serdeproto/-deserialize-db-root (serde conn) data)
+       (throw (ex-info (str "Could not load index point at address: "
+                            idx-address ".")
+                       {:status 400
+                        :error  :db/unavailable}))))))
 
 
 (defn reify-db
@@ -171,13 +174,7 @@
   ([conn blank-db idx-address]
    (go-try
      (let [db-root (<? (read-db-root conn idx-address))]
-       (if-not db-root
-         (throw (ex-info (str "Database " (:address blank-db)
-                              " could not be loaded at index point: "
-                              idx-address ".")
-                         {:status 400
-                          :error  :db/unavailable}))
-         (<? (reify-db-root conn blank-db db-root)))))))
+       (<? (reify-db-root conn blank-db db-root))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]
