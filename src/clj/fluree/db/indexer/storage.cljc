@@ -84,7 +84,6 @@
                :opst            (child-data opst)
                :tspo            (child-data tspo)
                :timestamp       (util/current-time-millis)
-               :prevIndex       (or (:indexed stats) 0)
                :namespace-codes namespace-codes}
         ser   (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn alias :root ser)))
@@ -110,13 +109,11 @@
                                      (pr-str index))
                                 {:status 500
                                  :error  :db/unexpected-error})))]
-    (cond-> index-data
-      (:rhs index-data)   (update :rhs flake/parts->Flake)
-      (:first index-data) (update :first flake/parts->Flake)
-      true                (assoc :comparator cmp
-                                 :ledger-alias ledger-alias
-                                 :t t
-                                 :leftmost? true))))
+    (assoc index-data
+           :comparator cmp
+           :ledger-alias ledger-alias
+           :t t
+           :leftmost? true)))
 
 
 (defn reify-db-root
