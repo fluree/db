@@ -11,7 +11,9 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.util.log :as log]
-            [fluree.db.json-ld.commit-data :as commit-data])
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [clojure.set :refer [map-invert]]
+            [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -129,24 +131,29 @@
   (decode-sid [_ sid]
     (iri/sid->iri sid namespace-codes)))
 
+(def label "#fluree/JsonLdDb ")
+
+(defn display
+  [db]
+  (select-keys db [:alias :t :stats :policy]))
+
 #?(:cljs
    (extend-type JsonLdDb
      IPrintWithWriter
      (-pr-writer [db w _opts]
-       (-write w "#FlureeJsonLdDb ")
-       (-write w (pr {:alias  (:alias db)
-                      :t      (:t db)
-                      :stats  (:stats db)
-                      :policy (:policy db)})))))
+       (-write w label)
+       (-write w (-> db display pr)))))
 
 #?(:clj
    (defmethod print-method JsonLdDb [^JsonLdDb db, ^Writer w]
-     (.write w (str "#FlureeJsonLdDb "))
+     (.write w label)
      (binding [*out* w]
-       (pr {:alias  (:alias db)
-            :t      (:t db)
-            :stats  (:stats db)
-            :policy (:policy db)}))))
+       (-> db display pr))))
+
+(defmethod pprint/simple-dispatch JsonLdDb
+  [db]
+  (print label)
+  (-> db display pprint))
 
 (defn new-novelty-map
   [comparators]
