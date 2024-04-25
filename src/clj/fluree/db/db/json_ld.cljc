@@ -134,16 +134,19 @@
      IPrintWithWriter
      (-pr-writer [db w _opts]
        (-write w "#FlureeJsonLdDb ")
-       (-write w (pr {:method      (:method db) :alias (:alias db)
-                      :t           (:t db) :stats (:stats db)
-                      :policy      (:policy db)})))))
+       (-write w (pr {:alias  (:alias db)
+                      :t      (:t db)
+                      :stats  (:stats db)
+                      :policy (:policy db)})))))
 
 #?(:clj
    (defmethod print-method JsonLdDb [^JsonLdDb db, ^Writer w]
      (.write w (str "#FlureeJsonLdDb "))
      (binding [*out* w]
-       (pr {:method (:method db) :alias (:alias db)
-            :t      (:t db) :stats (:stats db) :policy (:policy db)}))))
+       (pr {:alias  (:alias db)
+            :t      (:t db)
+            :stats  (:stats db)
+            :policy (:policy db)}))))
 
 (defn new-novelty-map
   [comparators]
