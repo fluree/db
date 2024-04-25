@@ -69,25 +69,24 @@
 
 (defn write-db-root
   [db]
-  (let [{:keys [alias conn commit schema t stats spot psot post opst tspo
+  (let [{:keys [alias conn schema t stats spot psot post opst tspo
                 namespace-codes]}
         db
 
-        ledger-alias (:id commit)
-        preds        (vocab/serialize-schema-predicates schema)
-        data         {:ledger-alias    ledger-alias
-                      :t               t
-                      :preds           preds
-                      :stats           (select-keys stats [:flakes :size])
-                      :spot            (child-data spot)
-                      :psot            (child-data psot)
-                      :post            (child-data post)
-                      :opst            (child-data opst)
-                      :tspo            (child-data tspo)
-                      :timestamp       (util/current-time-millis)
-                      :prevIndex       (or (:indexed stats) 0)
-                      :namespace-codes namespace-codes}
-        ser          (serdeproto/-serialize-db-root (serde conn) data)]
+        preds (vocab/serialize-schema-predicates schema)
+        data  {:ledger-alias    alias
+               :t               t
+               :preds           preds
+               :stats           (select-keys stats [:flakes :size])
+               :spot            (child-data spot)
+               :psot            (child-data psot)
+               :post            (child-data post)
+               :opst            (child-data opst)
+               :tspo            (child-data tspo)
+               :timestamp       (util/current-time-millis)
+               :prevIndex       (or (:indexed stats) 0)
+               :namespace-codes namespace-codes}
+        ser   (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn alias :root ser)))
 
 
