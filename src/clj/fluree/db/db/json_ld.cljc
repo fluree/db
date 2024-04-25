@@ -154,36 +154,32 @@
                        flake/sorted-set-by)))
     {:size 0} index/types))
 
+(defn genesis-root-map
+  [ledger-alias]
+  (let [{spot-cmp :spot, post-cmp :post, opst-cmp :opst, tspo-cmp :tspo}
+        index/default-comparators]
+    {:t               0
+     :spot            (index/empty-branch ledger-alias spot-cmp)
+     :post            (index/empty-branch ledger-alias post-cmp)
+     :opst            (index/empty-branch ledger-alias opst-cmp)
+     :tspo            (index/empty-branch ledger-alias tspo-cmp)
+     :novelty         (new-novelty-map index/default-comparators)
+     :schema          (vocab/base-schema)
+     :stats           {:flakes 0, :size 0, :indexed 0}
+     :namespaces      iri/default-namespaces
+     :namespace-codes iri/default-namespace-codes}))
+
 (defn load
   [conn ledger-alias branch commit]
   (go-try
-    (let [{spot-cmp :spot
-           post-cmp :post
-           opst-cmp :opst
-           tspo-cmp :tspo} index/default-comparators
-
-          spot    (index/empty-branch ledger-alias spot-cmp)
-          post    (index/empty-branch ledger-alias post-cmp)
-          opst    (index/empty-branch ledger-alias opst-cmp)
-          tspo    (index/empty-branch ledger-alias tspo-cmp)
-          stats   {:flakes 0, :size 0, :indexed 0}
-          novelty (new-novelty-map index/default-comparators)
-          schema  (vocab/base-schema)]
-      (map->JsonLdDb {:conn            conn
-                      :alias           ledger-alias
-                      :branch          branch
-                      :commit          commit
-                      :t               0
-                      :tt-id           nil
-                      :stats           stats
-                      :spot            spot
-                      :post            post
-                      :opst            opst
-                      :tspo            tspo
-                      :schema          schema
-                      :comparators     index/default-comparators
-                      :staged          []
-                      :novelty         novelty
-                      :policy          root-policy-map
-                      :namespaces      iri/default-namespaces
-                      :namespace-codes iri/default-namespace-codes}))))
+    (let [root-map (genesis-root-map ledger-alias)]
+      (-> root-map
+          (assoc :conn conn
+                 :alias ledger-alias
+                 :branch branch
+                 :commit commit
+                 :tt-id nil
+                 :comparators index/default-comparators
+                 :staged []
+                 :policy root-policy-map)
+          map->JsonLdDb))))
