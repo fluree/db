@@ -250,9 +250,7 @@
                        :error  :db/unexpected-error})))))
 
 (defn new-blank-node-id
-  "Generate a temporary blank-node id. This will get replaced during flake creation
-  when a sid is generated."
   []
   (let [now (util/current-time-millis)
         suf (nano-id 8)]
-    (str/join "-" [blank-node-prefix now suf] )))
+    (str/join "-" [blank-node-prefix now suf])))
