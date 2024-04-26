@@ -131,7 +131,7 @@
   (decode-sid [_ sid]
     (iri/sid->iri sid namespace-codes)))
 
-(def label "#fluree/JsonLdDb ")
+(def ^String label "#fluree/JsonLdDb ")
 
 (defn display
   [db]
