@@ -156,6 +156,14 @@
   #?(:clj  (Integer/parseInt s)
      :cljs (js/parseInt s)))
 
+(defn str->long
+  "Converts string to long integer. Assumes you've already verified the string is
+  parsable to a long.
+
+  Note JS only has precision to 2^53-1, so this will not work for larger numbers."
+  [s]
+  #?(:clj  (Long/parseLong s)
+     :cljs (js/parseInt s)))
 
 (defn keyword->str
   "Converts a keyword to string. Can safely be called on a
