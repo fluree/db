@@ -102,43 +102,49 @@
       (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
-  "Turns each index root node into an unresolved node."
-  [{:keys [ledger-alias comparators t]} index index-data]
-  (let [cmp (or (get comparators index)
-                (throw (ex-info (str "Internal error reifying db index root: "
-                                     (pr-str index))
-                                {:status 500
-                                 :error  :db/unexpected-error})))]
-    (assoc index-data
-           :comparator cmp
-           :ledger-alias ledger-alias
-           :t t
-           :leftmost? true)))
+  [index-data ledger-alias comparator t]
+  (assoc index-data
+         :ledger-alias ledger-alias
+         :t t
+         :comparator comparator))
 
+(defn reify-index-roots
+  [{:keys [t ledger-alias] :as root-data}]
+  (reduce (fn [root idx]
+            (let [comparator (get index/comparators idx)]
+              (update root idx reify-index-root ledger-alias comparator t)))
+          root-data index/types))
+
+(defn deserialize-preds
+  [preds]
+  (mapv (fn [p]
+          (if (iri/serialized-sid? p)
+            (iri/deserialize-sid p)
+            (mapv iri/deserialize-sid p)))
+        preds))
+
+(defn reify-namespaces
+  [root-map]
+  (let [namespaces (-> root-map :namespace-codes map-invert)]
+    (assoc root-map :namespaces namespaces)))
 
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
   [blank-db root-data]
   (go-try
-    (let [{:keys [t stats preds namespace-codes]}
+    (let [{:keys [t stats preds namespaces namespace-codes]}
           root-data
-          namespaces (map-invert namespace-codes)
           db         (assoc blank-db
                             :t t
+                            :stats stats
                             :namespaces namespaces
-                            :namespace-codes namespace-codes
-                            :stats (assoc stats :indexed t))
+                            :namespace-codes namespace-codes)
           indexed-db (reduce
                        (fn [db* idx]
-                         (let [idx-root (reify-index-root db* idx (get root-data idx))]
+                         (let [idx-root (get root-data idx)]
                            (assoc db* idx idx-root)))
                        db index/types)
-          preds*     (mapv (fn [p]
-                             (if (iri/serialized-sid? p)
-                               (iri/deserialize-sid p)
-                               (mapv iri/deserialize-sid p)))
-                           preds)
-          schema     (<? (vocab/load-schema indexed-db preds*))]
+          schema     (<? (vocab/load-schema indexed-db preds))]
       (assoc indexed-db :schema schema))))
 
 
@@ -157,7 +163,13 @@
   ([conn idx-address]
    (go-try
      (if-let [data (<? (connection/-index-file-read conn idx-address))]
-       (serdeproto/-deserialize-db-root (serde conn) data)
+       (let [{:keys [t] :as root-data}
+             (serdeproto/-deserialize-db-root (serde conn) data)]
+         (-> root-data
+             reify-index-roots
+             reify-namespaces
+             (update :stats assoc :indexed t)
+             (update :preds deserialize-preds)))
        (throw (ex-info (str "Could not load index point at address: "
                             idx-address ".")
                        {:status 400
