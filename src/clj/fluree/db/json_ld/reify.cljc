@@ -298,14 +298,14 @@
           retract          (db-retract db-data)
           retracted-flakes (retract-flakes db t-new retract)
 
-          {:keys [previous issuer message] :as commit-metadata}
+          {:keys [previous issuer message] :as commit-map}
           (commit-data/json-ld->map commit (select-keys db index/types))
 
-          commit-id          (:id commit-metadata)
+          commit-id          (:id commit-map)
           commit-sid         (iri/encode-iri db commit-id)
           [prev-commit _]    (some->> previous :address (read-commit conn) <?)
           db-sid             (iri/encode-iri db alias)
-          metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
+          metadata-flakes    (commit-data/commit-metadata-flakes commit-map
                                                                  t-new commit-sid db-sid)
           previous-id        (when prev-commit (:id prev-commit))
           prev-commit-flakes (when previous-id
@@ -332,8 +332,10 @@
                                      message-flakes (into message-flakes)))]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
-                      commit-metadata))
-      (merge-flakes db t-new all-flakes))))
+                      commit-map))
+      (-> db
+          (merge-flakes t-new all-flakes)
+          (assoc :commit commit-map)))))
 
 
 (defn trace-commits

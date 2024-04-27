@@ -133,10 +133,8 @@
       (cond
 
         (= commit-t (flake/next-t current-t))
-        (let [updated-db  (<? (jld-reify/merge-commit conn current-db [commit proof]))
-              commit-map  (commit-data/json-ld->map commit (select-keys updated-db index/types))
-              updated-db* (assoc updated-db :commit commit-map)]
-          (commit-update ledger branch updated-db*))
+        (let [updated-db  (<? (jld-reify/merge-commit conn current-db [commit proof]))]
+          (commit-update ledger branch updated-db))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
         (flake/t-after? commit-t (flake/next-t current-t))
