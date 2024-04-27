@@ -104,7 +104,7 @@
 
 (defn reify-index-root
   "Turns each index root node into an unresolved node."
-  [_conn {:keys [ledger-alias comparators t]} index index-data]
+  [{:keys [ledger-alias comparators t]} index index-data]
   (let [cmp (or (get comparators index)
                 (throw (ex-info (str "Internal error reifying db index root: "
                                      (pr-str index))
@@ -121,7 +121,7 @@
 
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
-  [conn blank-db root-data]
+  [blank-db root-data]
   (go-try
     (let [{:keys [t stats preds namespace-codes]}
           root-data
@@ -133,7 +133,7 @@
                             :stats (assoc stats :indexed t))
           indexed-db (reduce
                        (fn [db* idx]
-                         (let [idx-root (reify-index-root conn db* idx (get root-data idx))]
+                         (let [idx-root (reify-index-root db* idx (get root-data idx))]
                            (assoc db* idx idx-root)))
                        db index/types)
           preds*     (mapv (fn [p]
@@ -176,7 +176,7 @@
                               idx-address ".")
                          {:status 400
                           :error  :db/unavailable}))
-         (<? (reify-db-root conn blank-db db-root)))))))
+         (<? (reify-db-root blank-db db-root)))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]
