@@ -167,13 +167,13 @@
 (defn genesis-root-map
   [ledger-alias]
   (let [{spot-cmp :spot, post-cmp :post, opst-cmp :opst, tspo-cmp :tspo}
-        index/default-comparators]
+        index/comparators]
     {:t               0
      :spot            (index/empty-branch ledger-alias spot-cmp)
      :post            (index/empty-branch ledger-alias post-cmp)
      :opst            (index/empty-branch ledger-alias opst-cmp)
      :tspo            (index/empty-branch ledger-alias tspo-cmp)
-     :novelty         (new-novelty-map index/default-comparators)
+     :novelty         (new-novelty-map index/comparators)
      :schema          (vocab/base-schema)
      :stats           {:flakes 0, :size 0, :indexed 0}
      :namespaces      iri/default-namespaces
@@ -189,7 +189,7 @@
                  :branch branch
                  :commit commit
                  :tt-id nil
-                 :comparators index/default-comparators
+                 :comparators index/comparators
                  :staged []
                  :policy root-policy-map)
           map->JsonLdDb))))

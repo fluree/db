@@ -9,7 +9,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.cache :as conn-cache]))
 
-(def default-comparators
+(def comparators
   "Map of default index comparators for the five index types"
   {:spot flake/cmp-flakes-spot
    :post flake/cmp-flakes-post
@@ -19,7 +19,7 @@
 (def types
   "The four possible index orderings based on the subject, predicate, object,
   and transaction flake attributes"
-  (-> default-comparators keys set))
+  (-> comparators keys set))
 
 (defn reference?
   [dt]
