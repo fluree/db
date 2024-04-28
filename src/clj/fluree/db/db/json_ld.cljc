@@ -4,6 +4,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql :as fql]
             [fluree.db.index :as index]
+            [fluree.db.indexer.storage :as index-storage]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -173,23 +174,26 @@
      :post            (index/empty-branch ledger-alias post-cmp)
      :opst            (index/empty-branch ledger-alias opst-cmp)
      :tspo            (index/empty-branch ledger-alias tspo-cmp)
-     :novelty         (new-novelty-map index/comparators)
-     :schema          (vocab/base-schema)
      :stats           {:flakes 0, :size 0, :indexed 0}
      :namespaces      iri/default-namespaces
-     :namespace-codes iri/default-namespace-codes}))
+     :namespace-codes iri/default-namespace-codes
+     :novelty         (new-novelty-map index/comparators)
+     :schema          (vocab/base-schema)}))
 
 (defn load
   [conn ledger-alias branch commit]
   (go-try
-    (let [root-map (genesis-root-map ledger-alias)]
-      (-> root-map
-          (assoc :conn conn
-                 :alias ledger-alias
-                 :branch branch
-                 :commit commit
-                 :tt-id nil
-                 :comparators index/comparators
-                 :staged []
-                 :policy root-policy-map)
-          map->JsonLdDb))))
+    (let [root-map   (if-let [{:keys [address]} (:index commit)]
+                       (<? (index-storage/read-db-root conn address))
+                       (genesis-root-map ledger-alias))
+          indexed-db (-> root-map
+                         (assoc :conn conn
+                                :alias ledger-alias
+                                :branch branch
+                                :commit commit
+                                :tt-id nil
+                                :comparators index/comparators
+                                :staged []
+                                :policy root-policy-map)
+                         map->JsonLdDb)]
+      indexed-db)))
