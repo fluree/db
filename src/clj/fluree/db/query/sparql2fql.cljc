@@ -41,7 +41,7 @@
   "BNF -- IRIREF"
   [base-decl]
   (log/trace "handle-base-decl:" base-decl)
-  (let [iriref (-> base-decl second second handle-iri-ref)]
+  (let [iriref (-> base-decl first second handle-iri-ref)]
     {"@base" iriref, "@vocab" iriref}))
 
 (defn handle-prefixed-name
