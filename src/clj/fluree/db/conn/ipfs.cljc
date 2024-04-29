@@ -153,8 +153,7 @@
                              :base-address "fluree:file://"
                              :sync?        true}}}]
   (go-try
-    (let [ipfs-endpoint   (-> (or server "http://127.0.0.1:5001/")
-                              validate-http-url)
+    (let [ipfs-endpoint   (validate-http-url server)
           ledger-defaults (ledger-defaults defaults)
           memory          (or memory 1000000) ; default 1MB memory
           conn-id         (str (random-uuid))
