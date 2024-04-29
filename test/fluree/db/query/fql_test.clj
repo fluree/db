@@ -1,6 +1,6 @@
 (ns fluree.db.query.fql-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
+            [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration grouping-test
@@ -229,6 +229,34 @@
                                                        :schema/isBasedOn {:id :wiki/Q3107329}}})]
         (is (= [["The Hitchhiker's Guide to the Galaxy"]]
                test-subject))))))
+
+(deftest ^:integration id-test
+  (let [conn   (test-utils/create-conn)
+        movies (test-utils/load-movies conn)
+        db     (fluree/db movies)]
+    (testing "searching for bare id maps"
+      (let [test-subject @(fluree/query db {:context test-utils/default-context
+                                            :select  '[?id]
+                                            :where   '{:id ?id}})]
+        (is (pred-match? [[test-utils/db-id?]
+                          [test-utils/db-id?]
+                          [test-utils/db-id?]
+                          [test-utils/db-id?]
+                          [test-utils/commit-id?]
+                          [test-utils/commit-id?]
+                          [test-utils/commit-id?]
+                          [test-utils/commit-id?]
+                          [:wiki/Q109331]
+                          [:wiki/Q173540]
+                          [:wiki/Q230552]
+                          [:wiki/Q2870]
+                          [:wiki/Q2875]
+                          [:wiki/Q3107329]
+                          [:wiki/Q42]
+                          [:wiki/Q836821]
+                          [:wiki/Q91540]]
+                         test-subject)
+            "returns all the subject ids in the ledger")))))
 
 (deftest language-test
   (testing "Querying ledgers loaded with language-tagged strings"
