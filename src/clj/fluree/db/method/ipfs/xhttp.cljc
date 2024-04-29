@@ -2,6 +2,7 @@
   (:require [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.xhttp :as xhttp]
             [fluree.db.util.core :as util]
+            [clojure.core.async :as async]
             [fluree.db.util.log :as log :include-macros true])
   (:refer-clojure :exclude [cat]))
 
@@ -61,11 +62,29 @@
 
 (defn cat
   "Retrieves JSON object from IPFS, returns core async channel with
-  parsed JSON without keywordizing keys."
+  parsed JSON. If keywordize-keys? is truthy, will keywordize JSON
+  retrieved.
+
+  Returns ex-info exception if failure in either retrieving or parsing."
   [ipfs-endpoint block-id keywordize-keys?]
-  (log/debug "Retrieving json from IPFS cid:" block-id)
-  (let [url (str ipfs-endpoint "api/v0/cat?arg=" block-id)]
-    (xhttp/post-json url nil {:keywordize-keys keywordize-keys?})))
+  (log/debug "Retrieving json from IPFS - cid:" block-id)
+  (go-try
+    (let [url (str ipfs-endpoint "api/v0/cat?arg=" block-id)
+          res (async/<! (xhttp/post-json url nil {:keywordize-keys keywordize-keys?}))]
+      (if (util/exception? res)
+        (case (:error (ex-data res))
+          :db/invalid-json
+          (ex-info (str "IPFS file read (cat) JSON parsing exception for CID " block-id)
+                   {:status 400 :error :db/invalid-json} res)
+
+          :xhttp/exception
+          (ex-info (str "IPFS file read (cat) failed - file unavailable: " (ex-message res))
+                   {:status 400 :error :db/file-unavailable} res)
+
+          ;; else
+          (ex-info (str "IPFS file read (cat) failed with unexpected exception: " (ex-message res))
+                   {:status 500 :error :db/ipfs-failure} res))
+        res))))
 
 
 (defn publish
@@ -90,46 +109,3 @@
           {:keys [Path] :as res} (<? (xhttp/post-json endpoint nil {:request-timeout 200000}))]
       (log/debug "IPNS name resolve complete with response: " res)
       Path)))
-
-
-(comment
-  (def ipfs-endpoint "http://127.0.0.1:5001/")
-  (require '[clojure.core.async :as async])
-
-  (async/<!! (name-resolve ipfs-endpoint "k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2"))
-
-  (async/go
-    (let [resp (async/<! (ls ipfs-endpoint "/ipfs/QmQPeNsJPyVWPFDVHb77w8G42Fvo15z4bG2X8D2GhfbSXc/"))]
-      (println resp)))
-
-  (async/go
-    (println (async/<! (cat ipfs-endpoint (str "/ipfs/QmQPeNsJPyVWPFDVHb77w8G42Fvo15z4bG2X8D2GhfbSXc/"
-                                               "readme")))))
-
-  (async/go
-    (println (async/<! (add ipfs-endpoint "Twas brillig"))))
-
-
-  (async/go
-    (println (async/<! (publish ipfs-endpoint "Twas brillig"))))
-
-
-  (clojure.core.async/<!!
-    (cat "http://127.0.0.1:5001/" "/ipfs/QmXh2W5GPnocpiyFYtQKu4cPLDSwdDELYRTyZkhMSKx7vj"))
-
-  (clojure.core.async/<!!
-    (publish "http://127.0.0.1:5001/" "/ipfs/QmPTXAvmWrmcbqAPxY82N6nRcLUyEWP51UZVtq15CDMVYs" "Fluree1"))
-
-  (clojure.core.async/<!!
-    (xhttp/post-json "http://127.0.0.1:5001/api/v0/cat?arg=/ipns/k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2" nil {:keywordize-keys false}))
-
-  (clojure.core.async/<!!
-    (xhttp/post-json "http://127.0.0.1:5001/api/v0/ls?arg=k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2" nil nil))
-
-
-  (clojure.core.async/<!!
-    (ls "http://127.0.0.1:5001/" "/ipns/k51qzi5uqu5dllaos3uy3sx0o8gw221tyaiu2qwmgdzy5lofij0us0h4ai41az"))
-
-  (clojure.core.async/<!!
-    (add "http://127.0.0.1:5001/" {:hi "there" :im "blahhere"})))
-
