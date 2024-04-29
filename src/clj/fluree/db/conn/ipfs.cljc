@@ -18,6 +18,8 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(def default-ipfs-server "http://127.0.0.1:5001/")
+
 (defn close
   [id state]
   (log/info "Closing IPFS Connection" id)
@@ -144,7 +146,7 @@
            nameservices
            ;; if not providing preconfigured 'nameservices', ipns + file nameservices used
            ipns-nameservice file-nameservice]
-    :or   {server           "http://127.0.0.1:5001/"
+    :or   {server           default-ipfs-server
            serializer       (json-serde)
            ipns-nameservice {:profile "self"
                              :server  nil ;; :server will default to 'server' param
