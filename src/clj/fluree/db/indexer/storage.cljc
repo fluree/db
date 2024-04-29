@@ -5,7 +5,8 @@
             [clojure.set :refer [map-invert]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.index :as index]
-            [clojure.core.async :refer [go <!] :as async]
+            [fluree.db.json-ld.iri :as iri]
+            [clojure.core.async :refer [go] :as async]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
@@ -66,27 +67,14 @@
         ser  (serdeproto/-serialize-garbage (serde conn) data)]
     (connection/-index-file-write conn ledger :garbage ser)))
 
-(defn extract-schema-root
-  "Transform the schema cache for serialization by turning every predicate into a
-  tuple of [pid datatype]."
-  [{:keys [schema]}]
-  (->> (:pred schema)
-       (reduce (fn [root [k {:keys [datatype]}]]
-                 (if (number? k)
-                   (if datatype
-                     (conj root [k datatype])
-                     (conj root [k]))
-                   root))
-               [])))
-
 (defn write-db-root
   [db]
   (let [{:keys [conn ledger commit t stats spot psot post opst tspo
-                namespace-codes]}
+                schema namespace-codes]}
         db
 
         ledger-alias (:id commit)
-        preds        (extract-schema-root db)
+        preds        (vocab/serialize-schema-predicates schema)
         data         {:ledger-alias    ledger-alias
                       :t               t
                       :preds           preds
@@ -124,31 +112,38 @@
                                 {:status 500
                                  :error  :db/unexpected-error})))]
     (cond-> index-data
-            (:rhs index-data) (update :rhs flake/parts->Flake)
-            (:first index-data) (update :first flake/parts->Flake)
-            true (assoc :comparator cmp
-                        :ledger-alias ledger-alias
-                        :t t
-                        :leftmost? true))))
+      (:rhs index-data)   (update :rhs flake/parts->Flake)
+      (:first index-data) (update :first flake/parts->Flake)
+      true                (assoc :comparator cmp
+                                 :ledger-alias ledger-alias
+                                 :t t
+                                 :leftmost? true))))
 
 
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
   [conn blank-db root-data]
-  (let [{:keys [t stats preds namespace-codes]}
-        root-data
-        namespaces (map-invert namespace-codes)
-        db*        (assoc blank-db
-                          :t  t
-                          :preds preds
-                          :namespaces namespaces
-                          :namespace-codes namespace-codes
-                          :stats (assoc stats :indexed t))]
-    (reduce
-      (fn [db idx]
-        (let [idx-root (reify-index-root conn db idx (get root-data idx))]
-          (assoc db idx idx-root)))
-      db* index/types)))
+  (go-try
+    (let [{:keys [t stats preds namespace-codes]}
+          root-data
+          namespaces (map-invert namespace-codes)
+          db         (assoc blank-db
+                            :t t
+                            :namespaces namespaces
+                            :namespace-codes namespace-codes
+                            :stats (assoc stats :indexed t))
+          indexed-db (reduce
+                       (fn [db* idx]
+                         (let [idx-root (reify-index-root conn db* idx (get root-data idx))]
+                           (assoc db* idx idx-root)))
+                       db index/types)
+          preds*     (mapv (fn [p]
+                             (if (iri/serialized-sid? p)
+                               (iri/deserialize-sid p)
+                               (mapv iri/deserialize-sid p)))
+                           preds)
+          schema     (<? (vocab/load-schema indexed-db preds*))]
+      (assoc indexed-db :schema schema))))
 
 
 (defn read-garbage
@@ -182,10 +177,7 @@
                               idx-address ".")
                          {:status 400
                           :error  :db/unavailable}))
-         (let [db     (reify-db-root conn blank-db db-root)
-               schema (<? (vocab/load-schema db))
-               db*    (assoc db :schema schema)]
-           db*))))))
+         (<? (reify-db-root conn blank-db db-root)))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]
