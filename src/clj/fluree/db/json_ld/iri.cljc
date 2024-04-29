@@ -150,6 +150,13 @@
 (def serialize-sid
   (juxt get-ns-code get-name))
 
+(defn serialized-sid?
+  [x]
+  (and (vector? x)
+       (= (count x) 2)
+       (number? (nth x 0))
+       (string? (nth x 1))))
+
 #?(:clj (defmethod print-method SID [^SID sid ^java.io.Writer w]
           (doto w
             (.write "#fluree/SID ")
