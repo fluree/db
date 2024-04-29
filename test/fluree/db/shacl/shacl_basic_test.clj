@@ -1425,6 +1425,90 @@ WORLD!")
           (is (= "Subject :ex/john path [:ex/birthYear] violates constraint :sh/pattern of shape _:fdb-3 - value \":ex/ref\" does not match pattern \"(19|20)[0-9][0-9]\"."
                  (ex-message db-ref-value))))))))
 
+(deftest language-constraints
+  (let [conn    @(fluree/connect {:method :memory})
+        ledger  @(fluree/create conn "validation-report")
+        context ["https://ns.flur.ee" test-utils/default-str-context
+                 {"ex" "http://example.com/ns/"}]
+        db0     (fluree/db ledger)]
+    (testing "language-in"
+      (let [db1 @(fluree/stage db0 {"@context" context
+                                    "insert"
+                                    {"@id"           "ex:langShape"
+                                     "type"          "sh:NodeShape"
+                                     "sh:targetNode" {"@id" "ex:a"}
+                                     "sh:property"   [{"sh:path"       {"@id" "ex:label"}
+                                                       "sh:languageIn" ["en" "fr"]}]}})]
+        (testing "no error when language conforms"
+          (let [db2 @(fluree/stage db1 {"@context" context
+                                        "insert"
+                                        {"@id"      "ex:a"
+                                         "ex:label" {"@value" "foo" "@language" "en"}}})]
+            (is (nil? (ex-data db2)))))
+        (testing "error when disallowed language transacted"
+          (let [db2 @(fluree/stage db1 {"@context" context
+                                        "insert"
+                                        {"@id"      "ex:a"
+                                         "ex:label" {"@value" "foo" "@language" "cz"}}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    {"type"        "sh:ValidationReport",
+                     "sh:conforms" false,
+                     "sh:result"
+                     [{"sh:constraintComponent" "sh:languageIn",
+                       "sh:focusNode"           "ex:a",
+                       "sh:resultSeverity"      "sh:Violation",
+                       "sh:value"               "foo",
+                       "sh:resultPath"          ["ex:label"],
+                       "type"                   "sh:ValidationResult",
+                       "sh:resultMessage"
+                       "value \"foo\" does not have language tag in [\"en\" \"fr\"]",
+                       "sh:sourceShape"         "_:fdb-2",
+                       "f:expectation"          ["en" "fr"]}]}}
+                   (ex-data db2)))
+            (is (= "Subject ex:a path [\"ex:label\"] violates constraint sh:languageIn of shape _:fdb-2 - value \"foo\" does not have language tag in [\"en\" \"fr\"]."
+                   (ex-message db2)))))))
+    (testing "unique-lang"
+      (let [db1 @(fluree/stage db0 {"@context" context
+                                    "insert"
+                                    {"@id"           "ex:langShape"
+                                     "type"          "sh:NodeShape"
+                                     "sh:targetNode" {"@id" "ex:a"}
+                                     "sh:property"   [{"sh:path"       {"@id" "ex:label"}
+                                                       "sh:uniqueLang" true}]}})]
+        (testing "no error when all langs unique"
+          (let [db2 @(fluree/stage db1 {"@context" context
+                                        "insert"
+                                        {"@id"      "ex:a"
+                                         "ex:label" [{"@value" "foo" "@language" "en"}
+                                                     {"@value" "feuou" "@language" "fr"}]}})]
+            (is (nil? (ex-data db2)))))
+        (testing "error when a lang is repeated"
+          (let [db2 @(fluree/stage db1 {"@context" context
+                                        "insert"
+                                        {"@id"      "ex:a"
+                                         "ex:label" [{"@value" "foo" "@language" "en"}
+                                                     {"@value" "bar" "@language" "en"}]}})]
+            (is (= {:status 400,
+                    :error  :shacl/violation,
+                    :report
+                    {"type"        "sh:ValidationReport",
+                     "sh:conforms" false,
+                     "sh:result"
+                     [{"sh:constraintComponent" "sh:uniqueLang",
+                       "sh:focusNode"           "ex:a",
+                       "sh:resultSeverity"      "sh:Violation",
+                       "sh:value"               false,
+                       "sh:resultPath"          ["ex:label"],
+                       "type"                   "sh:ValidationResult",
+                       "sh:resultMessage"       "values [\"bar\" \"foo\"] do not have unique language tags",
+                       "sh:sourceShape"         "_:fdb-6",
+                       "f:expectation"          true}]}}
+                   (ex-data db2)))
+            (is (= "Subject ex:a path [\"ex:label\"] violates constraint sh:uniqueLang of shape _:fdb-6 - values [\"bar\" \"foo\"] do not have unique language tags."
+                   (ex-message db2)))))))))
+
 (deftest ^:integration shacl-multiple-properties-test
   (testing "multiple properties works"
     (let [conn       (test-utils/create-conn)
@@ -2721,7 +2805,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)]
     (testing "severity"
-      (testing "default severity"
+      (testing "no severity specified defaults to sh:Violation"
         (let [db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                       "insert"
                                       {"@id"           "ex:friendShape"
@@ -2739,7 +2823,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                      (get "sh:result")
                      (get 0)
                      (get "sh:resultSeverity"))))))
-      (testing "custom severity"
+      (testing "severity specified on shape overrides default severity"
         (let [db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                       "insert"
                                       {"@id"           "ex:friendShape"
@@ -2759,7 +2843,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                      (get 0)
                      (get "sh:resultSeverity")))))))
     (testing "message"
-      (testing "default message"
+      (testing "no sh:message specified on shape defaults to implementation-specific message"
         (let [db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                       "insert"
                                       {"@id"           "ex:friendShape"
@@ -2777,7 +2861,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                      (get "sh:result")
                      (get 0)
                      (get "sh:resultMessage"))))))
-      (testing "custom message"
+      (testing "custom sh:message on shape overrides implmentation-specific message"
         (let [db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                       "insert"
                                       {"@id"           "ex:friendShape"
@@ -2796,3 +2880,98 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                      (get "sh:result")
                      (get 0)
                      (get "sh:resultMessage")))))))))
+
+(deftest target-subjects-of
+  (let [conn    @(fluree/connect {:method :memory})
+        ledger  @(fluree/create conn "validation-report")
+        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.com/ns/"}]
+        db0     (fluree/db ledger)
+
+        db1 @(fluree/stage db0 {"@context" context
+                                "insert"
+                                {"type"                "sh:NodeShape"
+                                 "sh:targetSubjectsOf" {"@id" "ex:myProperty"}
+                                 "sh:property"         [{"sh:path"     {"@id" "ex:myProperty"}
+                                                         "sh:maxCount" 1}]}})]
+    (testing "valid target with no violations passes validation"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert" {"id" "ex:valid"
+                                              "ex:myProperty" "A"}})]
+        (is (nil? (ex-data db2)))))
+    (testing "invalid target produces validation errors"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert" {"id" "ex:invalid"
+                                              "ex:myProperty" ["A" "B"]}})]
+        (is (= 400
+               (:status (ex-data db2))))))))
+
+(deftest target-node
+  (let [conn    @(fluree/connect {:method :memory})
+        ledger  @(fluree/create conn "validation-report")
+        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.com/ns/"}]
+        db0     (fluree/db ledger)
+
+        db1 @(fluree/stage db0 {"@context" context
+                                "insert"
+                                {"type"          "sh:NodeShape"
+                                 "sh:targetNode" [{"@id" "ex:nodeA"} {"@id" "ex:nodeB"}]
+                                 "sh:property"   [{"sh:path"     {"@id" "ex:letter"}
+                                                   "sh:maxCount" 1}]}})]
+    (testing "valid target with no violations passes validation"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert"   {"id"        "ex:nodeA"
+                                                "ex:letter" "A"}})]
+        (is (nil? (ex-data db2)))))
+    (testing "invalid target produces validation erros"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert"   {"id"        "ex:nodeB"
+                                                "ex:letter" ["A" "B"]}})]
+        (is (= 400
+               (:status (ex-data db2))))))))
+
+(deftest alternative-path
+  (let [conn    @(fluree/connect {:method :memory})
+        ledger  @(fluree/create conn "validation-report")
+        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.com/ns/"}]
+        db0     (fluree/db ledger)
+
+        db1 @(fluree/stage db0 {"@context" context
+                                "insert"
+                                {"type"           "sh:NodeShape"
+                                 "sh:targetClass" {"@id" "ex:Alt"}
+                                 "sh:property"    [{"sh:path"     {"sh:alternativePath"
+                                                                   [{"@id" "ex:property1"} {"@id" "ex:property2"}]}
+                                                    "sh:minCount" 2}]}})]
+    (testing "constraint is satisfied when constrained by sh:alternativePath"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert"
+                                    {"id"           "ex:valid"
+                                     "type"         "ex:Alt"
+                                     "ex:property1" "One"
+                                     "ex:property2" "Two"}})]
+        (is (nil? (ex-data db2)))))
+    (testing "constraint is violated when constrained by sh:alternativePath"
+      (let [db2 @(fluree/stage db1 {"@context" context
+                                    "insert"
+                                    {"id"           "ex:invalid"
+                                     "type"         "ex:Alt"
+                                     "ex:property1" "One"
+                                     "ex:property3" "Three"}})]
+        (is (= {:status 400,
+                :error  :shacl/violation,
+                :report
+                {"type"        "sh:ValidationReport",
+                 "sh:conforms" false,
+                 "sh:result"
+                 [{"sh:constraintComponent" "sh:minCount",
+                   "sh:focusNode"           "ex:invalid",
+                   "sh:resultSeverity"      "sh:Violation",
+                   "sh:value"               1,
+                   "sh:resultPath"          [{"sh:alternativePath" "ex:property1"}],
+                   "type"                   "sh:ValidationResult",
+                   "sh:resultMessage"       "count 1 is less than minimum count of 2",
+                   "sh:sourceShape"         "_:fdb-3",
+                   "f:expectation"          2}]}}
+               (ex-data db2)))
+        (is (= "Subject ex:invalid path [{\"sh:alternativePath\" \"ex:property1\"}] violates constraint sh:minCount of shape _:fdb-3 - count 1 is less than minimum count of 2."
+               (ex-message db2)))))))

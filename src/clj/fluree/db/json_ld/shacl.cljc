@@ -192,7 +192,7 @@
 (defn object-node
   "Take a flake and create a value node out of the object. A value node is a tuple of [value dt]."
   [flake]
-  [(flake/o flake) (flake/dt flake)])
+  [(flake/o flake) (flake/dt flake) (:lang (flake/m flake))])
 
 (defn resolve-predicate-path
   [data-db focus-node pred-path]
@@ -202,15 +202,32 @@
   [data-db focus-node inverse-path]
   (query-range/index-range data-db :opst = [focus-node inverse-path] {:flake-xf (map subject-node)}))
 
+(defn resolve-alternative-path
+  [data-db focus-node alternative-path]
+  (go-try
+    (loop [[pid & r] alternative-path
+           value-nodes    []]
+      (if pid
+        (let [value-nodes* (<? (query-range/index-range data-db :spot = [focus-node pid]
+                                                        {:flake-xf (map object-node)}))]
+          (recur r (into value-nodes value-nodes*)))
+        value-nodes))))
+
 (defn resolve-segment
   "Return the value nodes corresponding to the path segment from the focus-node."
   [data-db focus-node segment]
   (go-try
     (if (iri/sid? segment)
       (<? (resolve-predicate-path data-db focus-node segment))
-      (let [{[inverse-path] const/sh_inversePath} segment]
-        (cond inverse-path (<? (resolve-inverse-path data-db focus-node inverse-path))
-              :else (throw (ex-info "Unsupported property path segment." {:segment segment})))))))
+      (let [{[inverse-path]   const/sh_inversePath
+             alternative-path const/sh_alternativePath
+             [zero-or-one]    const/sh_zeroOrOnePath
+             [zero-or-more]   const/sh_zeroOrMorePath
+             [one-or-more]    const/sh_oneOrMorePath}
+            segment]
+        (cond inverse-path     (<? (resolve-inverse-path data-db focus-node inverse-path))
+              alternative-path (<? (resolve-alternative-path data-db focus-node alternative-path))
+              :else            (throw (ex-info "Unsupported property path segment." {:segment segment})))))))
 
 (defn resolve-value-nodes
   "Return the value nodes resolved via the path from the focus node."
@@ -409,6 +426,7 @@
                            bnode?   (iri/blank-node-sid? v)
                            literal? (not (iri/sid? v))]
                        (condp = nodekind
+                         const/sh_Literal            literal?
                          const/sh_BlankNode          bnode?
                          const/sh_IRI                iri?
                          const/sh_BlankNodeOrIRI     (or iri? bnode?)
@@ -585,8 +603,47 @@
                                          (str "value " (pr-str (str value)) " does not match pattern " (pr-str pattern-str)
                                               (when (seq valid-flags)
                                                 (str " with " (display const/sh_flags) " " (str/join ", " flags)))))))))))))
-#_(defmethod validate-constraint const/sh_languageIn [v-ctx constraint focus-flakes]) ; not supported
-#_(defmethod validate-constraint const/sh_uniqueLang [v-ctx constraint focus-flakes]) ; not supported
+
+(defmethod validate-constraint const/sh_languageIn
+  [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (go-try
+    (let [{expect constraint} shape
+
+          langs  (into #{} expect)
+          result (base-result v-ctx shape constraint focus-node)]
+      (->> value-nodes
+           (remove (fn [[_v _dt lang]] (contains? langs lang)))
+           (mapv (fn [[v _dt lang]]
+                   (let [value (display v)]
+                     (assoc result
+                            :value v
+                            :message (or (:message result)
+                                         (str "value " (pr-str (str value))
+                                              " does not have language tag in "
+                                              (pr-str expect)))))))))))
+
+(defmethod validate-constraint const/sh_uniqueLang
+  [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (go-try
+    (let [{[unique?] constraint} shape
+
+          result (base-result v-ctx shape constraint focus-node)]
+      (when unique?
+        (when-let [violations (->> value-nodes
+                                   (group-by (fn [[_v _dt lang]] lang))
+                                   (reduce-kv (fn [violations lang lang-nodes]
+                                                (if (> (count lang-nodes) 1)
+                                                  (assoc violations lang lang-nodes)
+                                                  violations))
+                                              {})
+                                   (not-empty))]
+          (let [values  (->> (apply concat (vals violations))
+                             (mapv first)
+                             (mapv display))]
+            [(assoc result
+                    :value false
+                    :message (or (:message result)
+                                 (str "values " values " do not have unique language tags")))]))))))
 
 ;; property pair constraints
 (defmethod validate-constraint const/sh_equals
@@ -711,9 +768,79 @@
                                                            (display (get not-shape const/$id))))))))))
         (not-empty results)))))
 
-#_(defmethod validate-constraint const/sh_and [v-ctx constraint focus-flakes]) ; not supported
-#_(defmethod validate-constraint const/sh_or [v-ctx constraint focus-flakes])  ; not supported
-#_(defmethod validate-constraint const/sh_xone [v-ctx constraint focus-flakes]) ; not supported
+(defmethod validate-constraint const/sh_and
+  [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (go-try
+    (let [and-shapes (get shape const/sh_and)]
+      (loop [[and-shape & r] and-shapes
+             nonconforming?  false]
+        (if and-shape
+          (if-let [results* (if (property-shape? and-shape)
+                              (<? (validate-property-shape v-ctx and-shape focus-node))
+                              (<? (validate-node-shape v-ctx and-shape focus-node value-nodes)))]
+            ;; short-circuit if there's a validation result
+            (recur nil true)
+            (recur r nonconforming?))
+          (when nonconforming?
+            (let [result (base-result v-ctx shape constraint focus-node)]
+              [(-> result
+                   (dissoc :expect)
+                   (assoc :value (display focus-node)
+                          :message (or (:message result)
+                                       (str (display focus-node) " failed to conform to all " (display const/sh_and)
+                                            " shapes: " (mapv (comp display #(get % const/$id)) and-shapes)))))])))))))
+
+(defmethod validate-constraint const/sh_or
+  [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (go-try
+    (let [or-shapes (get shape const/sh_or)]
+      (loop [[or-shape & r]  or-shapes
+             none-conformed? true]
+        (if or-shape
+          (let [results (if (property-shape? or-shape)
+                          (<? (validate-property-shape v-ctx or-shape focus-node))
+                          (<? (validate-node-shape v-ctx or-shape focus-node value-nodes)))]
+
+            (if results
+              (recur r none-conformed?)
+              ;; short-circuit if there's a single conforming shape
+              (recur nil false)))
+
+          (when none-conformed?
+            (let [result (base-result v-ctx shape constraint focus-node)]
+              [(-> result
+                   (dissoc :expect)
+                   (assoc :value (display focus-node)
+                          :message (or (:message result)
+                                       (str (display focus-node) " failed to conform to any of the following shapes: "
+                                            (mapv (comp display #(get % const/$id)) or-shapes)))))])))))))
+
+(defmethod validate-constraint const/sh_xone
+  [{:keys [display] :as v-ctx} shape constraint focus-node value-nodes]
+  (go-try
+    (let [xone-shapes (get shape const/sh_xone)
+
+          result (base-result v-ctx shape constraint focus-node)]
+      (loop [[xone-shape & r] xone-shapes
+             conforms         []]
+        (if xone-shape
+          (let [results (if (property-shape? xone-shape)
+                          (<? (validate-property-shape v-ctx xone-shape focus-node))
+                          (<? (validate-node-shape v-ctx xone-shape focus-node value-nodes)))]
+            (if results
+              (recur r conforms)
+              (recur r (conj conforms (get xone-shape const/$id)))))
+
+          (when (not= 1 (count conforms))
+            (let [values (mapv (comp display first) value-nodes)]
+              [(-> result
+                   (dissoc :expect)
+                   (assoc :value values
+                          :message (or (:message result)
+                                       (str "values conformed to "
+                                            (count conforms) " of the following " (display const/sh_xone) " shapes: "
+                                            (mapv (comp display #(get % const/$id)) xone-shapes)
+                                            "; must only conform to one"))))])))))))
 
 ;; shape-based constraints
 (defmethod validate-constraint const/sh_node
