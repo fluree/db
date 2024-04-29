@@ -209,16 +209,20 @@
     (update component ::fn partial solution)
     component))
 
+(defn assign-matched-component
+  [component solution]
+  (let [component* (assign-solution-filter component solution)]
+    (if-let [match (some->> component ::var (get solution))]
+      match
+      component*)))
+
 (defn assign-matched-values
   "Assigns the value of any variables within the supplied `triple-pattern` that
   were previously matched in the supplied solution map `solution` to their
   values from `solution`."
   [triple-pattern solution]
   (mapv (fn [component]
-          (let [component* (assign-solution-filter component solution)]
-            (if-let [match (some->> component ::var (get solution))]
-              match
-              component*)))
+          (assign-matched-component component solution))
         triple-pattern))
 
 (defn match-subject
@@ -349,10 +353,14 @@
 
 (defn compute-sid
   [s-mch db]
-  (let [db-alias (:alias db)
-        s-iri    (::iri s-mch)]
-    (when-let [sid (iri/encode-iri db s-iri)]
-      (match-sid s-mch db-alias sid))))
+  (let [db-alias (:alias db)]
+    (if (and (matched-iri? s-mch)
+             (not (get-sid s-mch db-alias)))
+      (let [db-alias (:alias db)
+            s-iri    (::iri s-mch)]
+        (when-let [sid (iri/encode-iri db s-iri)]
+          (match-sid s-mch db-alias sid)))
+      s-mch)))
 
 (defn compute-datatype-sid
   [o-mch db]
@@ -364,21 +372,13 @@
 
 (defn compute-sids
   [db [s p o]]
-  (let [db-alias (:alias db)
-        s*       (if (and (matched-iri? s)
-                          (not (get-sid s db-alias)))
-                   (compute-sid s db)
-                   s)
-        p*       (if (and (matched-iri? p)
-                          (not (get-sid p db-alias)))
-                   (compute-sid p db)
-                   p)
-        o*       (if (and (matched-iri? o)
-                          (not (get-sid o db-alias)))
-                   (compute-sid o db)
-                   (if (unmatched-var? o)
-                     o
-                     (compute-datatype-sid o db)))]
+  (let [s* (compute-sid s db)
+        p* (compute-sid p db)
+        o* (if (unmatched-var? o)
+             o
+             (if (matched-iri? o)
+               (compute-sid o db)
+               (compute-datatype-sid o db)))]
     (when (and (some? s*) (some? p*) (some? o*))
       [s* p* o*])))
 
