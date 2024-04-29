@@ -366,8 +366,7 @@
                   (parse-subject context))
         attrs (dissoc m const/iri-id)]
     (if (empty? attrs)
-      (let [o-mch (-> s-mch ::where/iri where/anonymous-value)]
-        [[s-mch id-predicate-match o-mch]])
+      [(where/->pattern :id s-mch)]
       (parse-statements s-mch attrs vars context))))
 
 (defn parse-node-map
