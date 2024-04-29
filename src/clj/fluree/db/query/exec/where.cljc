@@ -392,6 +392,37 @@
   (doto (async/chan)
     async/close!))
 
+(defn match-id
+  [db fuel-tracker solution s-mch error-ch]
+  (let [matched-ch (async/chan 2 (comp cat
+                                       (partition-by flake/s)
+                                       (map first)
+                                       (map (fn [f]
+                                              (if (unmatched-var? s-mch)
+                                                (let [{::keys [var]} s-mch
+                                                      matched (match-subject s-mch db f)]
+                                                  (assoc solution var matched))
+                                                solution)))))
+        s-mch*     (assign-matched-component s-mch solution)]
+    (if-let [s (compute-sid db s-mch*)]
+      (-> db
+          (resolve-flake-range fuel-tracker error-ch [s])
+          (async/pipe matched-ch))
+      (async/close! matched-ch))
+    matched-ch))
+
+(defmethod match-pattern :id
+  [ds fuel-tracker solution pattern error-ch]
+  (let [s-mch (pattern-data pattern)]
+    (if-let [active-graph (dataset/active ds)]
+      (if (sequential? active-graph)
+        (->> active-graph
+             (map (fn [graph]
+                    (match-id graph fuel-tracker solution s-mch error-ch)))
+             async/merge)
+        (match-id active-graph fuel-tracker solution s-mch error-ch))
+      nil-channel)))
+
 (defn match-tuple
   [db fuel-tracker solution tuple error-ch]
   (let [matched-ch (async/chan 2 (comp cat
