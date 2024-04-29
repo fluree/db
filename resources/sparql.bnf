@@ -1,7 +1,7 @@
 <Query> ::=  <COMMENT?> WS Prologue WS ( SelectQuery | ConstructQuery | DescribeQuery | AskQuery ) WS Modifiers
 UpdateUnit ::= Update
 Prologue ::= ( BaseDecl | PrefixDecl )*
-BaseDecl ::= 'BASE' WS IRIREF
+BaseDecl ::= <'BASE'> WS IRIREF
 PrefixDecl ::= <'PREFIX'> WS PNAME_NS WS IRIREF
 SelectQuery ::= WS SelectClause WS DatasetClause* WS WhereClause WS SolutionModifier WS
 SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause
@@ -182,12 +182,12 @@ BuiltInCall	  ::=  	  Aggregate
 | NotExistsFunc
 
 
-RegexExpression	  ::=  	'REGEX' '(' Expression ',' Expression ( ',' Expression )? ')'
-SubstringExpression	  ::=  	'SUBSTR' '(' Expression ',' Expression ( ',' Expression )? ')'
-StrReplaceExpression	  ::=  	'REPLACE' '(' Expression ',' Expression ',' Expression ( ',' Expression )? ')'
-ExistsFunc	  ::=  	'EXISTS' GroupGraphPattern
-NotExistsFunc	  ::=  	'NOT' 'EXISTS' GroupGraphPattern
-Aggregate	  ::=  	  'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
+RegexExpression   ::=   <'REGEX'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
+SubstringExpression   ::=   <'SUBSTR'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
+StrReplaceExpression    ::=   <'REPLACE'> <'('> Expression <','> Expression <','> Expression ( <','> Expression )? <')'>
+ExistsFunc    ::=   <'EXISTS'> GroupGraphPattern
+NotExistsFunc   ::=   <'NOT'> <'EXISTS'> GroupGraphPattern
+Aggregate   ::=     'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
 | 'SUM' WS <'('> WS 'DISTINCT'? Expression <')'>
 | 'MIN' <'('>  WS 'DISTINCT'? Expression <')'>
 | 'MAX' <'('>  WS 'DISTINCT'? Expression <')'>
