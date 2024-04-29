@@ -138,7 +138,7 @@
           (add-new-children-to-parents db props new-child-parents new-parent-children)
           (add-new-parents-to-children db props new-parent-children new-child-parents))))
 
-(defn update-equivalent-properties
+(defn update-related-properties
   "Adds owl:equivalentProperty and rdfs:subPropertyOf rules to the schema map as the
   appropriate equivalent properties for query purposes only.
 
@@ -193,7 +193,7 @@
 
       (or (= const/$owl:equivalentProperty pid)
           (= const/$rdfs:subPropertyOf pid))
-      (update-equivalent-properties db pred-map sid pid obj)
+      (update-related-properties db pred-map sid pid obj)
 
       :else pred-map)))
 
@@ -231,11 +231,23 @@
                         :pred  {}})
      :subclasses (delay {})}))
 
-(defn reset-shapes
-  "Resets the shapes cache - called when new shapes added to db"
-  [{:keys [shapes] :as _schema}]
-  (reset! shapes {:class {}
-                  :pred  {}}))
+(defn modified-shape?
+  [s-flakes]
+  (some (fn [[_ p o :as _f]]
+          (or
+            ;; modified a subject with a shape type
+            (and (= p const/$rdf:type)
+                 (or (= o const/sh_NodeShape)
+                     (= o const/sh_PropertyShape)))
+            ;; most property shapes don't have a type, but do need a path
+            (= p const/sh_path)))
+        s-flakes))
+
+(defn invalidate-shape-cache!
+  "Invalidates the shape cache if _any_ shape is modified."
+  [db subject-mods]
+  (when (some modified-shape? (vals subject-mods))
+    (reset! (-> db :schema :shapes) {})))
 
 (defn infer-predicate-ids
   [f]
@@ -262,7 +274,7 @@
 
 (defn datatype-constraint?
   [f]
-  (-> f flake/p (= const/$sh:datatype)))
+  (-> f flake/p (= const/sh_datatype)))
 
 (defn descending
   [x y]
@@ -283,7 +295,7 @@
                                    (map flake/o)
                                    first)]
         (let [path (->> s-flakes
-                        (filter #(= const/$sh:path (flake/p %)))
+                        (filter #(= const/sh_path (flake/p %)))
                         (sort-by list-index descending)
                         (map flake/o)
                         first)]
@@ -308,15 +320,14 @@
 
 (defn add-pid
   [db preds pid]
-  (let [{:keys [iri] :as p-map} (initial-property-map db pid)]
-    (assoc preds pid p-map, iri p-map)))
+  (if (contains? preds pid)
+    preds
+    (let [{:keys [iri] :as p-map} (initial-property-map db pid)]
+      (assoc preds pid p-map, iri p-map))))
 
 (defn add-predicates
   [db pred-map pids]
-  (reduce (fn [preds pid]
-            (if (contains? preds pid)
-              preds
-              (add-pid db preds pid)))
+  (reduce (partial add-pid db)
           pred-map pids))
 
 (defn build-schema
@@ -330,25 +341,45 @@
 (defn hydrate-schema
   "Updates the :schema key of db by processing just the vocabulary flakes out of
   the new flakes."
-  [db new-flakes]
-  (let [pred-sids    (collect-predicate-ids db new-flakes)
-        vocab-flakes (into #{}
-                           (filter (fn [f]
-                                     (or (contains? pred-sids (flake/s f))
-                                         (contains? jld-ledger/predicate-refs (flake/p f)))))
-                           new-flakes)
-        schema       (-> (build-schema db pred-sids vocab-flakes)
-                         (add-pred-datatypes (pred-dt-constraints new-flakes)))]
-    (assoc db :schema schema)))
+  ([db new-flakes]
+   (hydrate-schema db new-flakes {}))
+  ([db new-flakes mods]
+   (let [pred-sids    (collect-predicate-ids db new-flakes)
+         vocab-flakes (into #{}
+                            (filter (fn [f]
+                                      (or (contains? pred-sids (flake/s f))
+                                          (contains? jld-ledger/predicate-refs (flake/p f)))))
+                            new-flakes)
+         schema       (-> (build-schema db pred-sids vocab-flakes)
+                          (add-pred-datatypes (pred-dt-constraints new-flakes)))]
+     (invalidate-shape-cache! db mods)
+     (assoc db :schema schema))))
+
+(defn serialize-schema-predicates
+  [schema]
+  (reduce (fn [root [k {:keys [datatype]}]]
+            (if (iri/sid? k)
+              (let [sid (iri/serialize-sid k)]
+                (if datatype
+                  (conj root [sid (iri/serialize-sid datatype)])
+                  (conj root [sid])))
+              root))
+          []
+          (:pred schema)))
 
 (defn load-schema
-  [{:keys [preds t] :as db}]
+  [{:keys [t] :as db} preds]
   (go-try
-    (loop [[[pred-sid] & r] preds
-           vocab-flakes (flake/sorted-set-by flake/cmp-flakes-spot)]
-      (if pred-sid
-        (let [pred-flakes (<? (query-range/index-range db :spot = [pred-sid]))]
-          (recur r (into vocab-flakes pred-flakes)))
-        (-> (build-schema db preds vocab-flakes)
-            ;; only use predicates that have a dt
+    (loop [[[pid] & r]  preds
+           vocab-flakes (flake/sorted-set-by flake/cmp-flakes-spot)
+           pred-map     (-> db :schema :pred)]
+      (if pid
+        (let [pred-flakes   (<? (query-range/index-range db :spot = [pid]))
+              vocab-flakes* (into vocab-flakes pred-flakes)
+              pred-map*     (add-pid db pred-map pid)]
+          (recur r vocab-flakes* pred-map*))
+        (-> db
+            :schema
+            (assoc :pred pred-map)
+            (update-with db t vocab-flakes)
             (add-pred-datatypes (filterv #(> (count %) 1) preds)))))))

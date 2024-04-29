@@ -35,7 +35,7 @@
       (testing "A standard relationship"
         (let [grandparent-db  @(fluree/stage
                                  db0
-                                 {"@context" {"f"  "http://flur.ee/ns/ledger#"
+                                 {"@context" {"f"  "https://ns.flur.ee/ledger#"
                                               "ex" "http://example.org/"},
                                   "insert"
                                   {"@id"    "ex:grandParentRule"
@@ -67,7 +67,7 @@
       (testing "A filter rule works"
         (let [senior-db  @(fluree/stage
                             db0
-                            {"@context" {"f"  "http://flur.ee/ns/ledger#"
+                            {"@context" {"f"  "https://ns.flur.ee/ledger#"
                                          "ex" "http://example.org/"},
                              "insert"   {"@id"    "ex:seniorRule"
                                          "f:rule" {"@type"  "@json"
@@ -94,7 +94,7 @@
       (testing "Inferring based on a relationship and IRI value"
         (let [brother-db  @(fluree/stage
                              db0
-                             {"@context" {"f"  "http://flur.ee/ns/ledger#"
+                             {"@context" {"f"  "https://ns.flur.ee/ledger#"
                                           "ex" "http://example.org/"}
                               "insert"   {"@id"    "ex:brotherRule"
                                           "f:rule" {"@type"  "@json"
@@ -126,7 +126,7 @@
           db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
 
       (testing "A recursive relationship"
-        (let [grandparents-db @(fluree/reason db0 :datalog {"@context" {"f"  "http://flur.ee/ns/ledger#"
+        (let [grandparents-db @(fluree/reason db0 :datalog {"@context" {"f"  "https://ns.flur.ee/ledger#"
                                                                         "ex" "http://example.org/"},
                                                             "@id"      "ex:grandParentRule"
                                                             "f:rule"   {"@type"  "@json"
@@ -181,7 +181,7 @@
       (testing "A recursive relationship"
         (let [db1  @(fluree/stage
                       db0
-                      {"@context" {"f"  "http://flur.ee/ns/ledger#"
+                      {"@context" {"f"  "https://ns.flur.ee/ledger#"
                                    "ex" "http://example.org/"},
                        "insert"
                        [{"@id"    "ex:hasSubTaskRule"

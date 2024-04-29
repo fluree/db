@@ -1,9 +1,12 @@
 (ns fluree.db.reasoner.resolve
-  (:require [fluree.db.constants :as const]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.query.fql.parse :as parse]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as exec-where]
+            [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.log :as log]))
@@ -21,25 +24,33 @@
   [rules post-flakes]
   :TODO)
 
-(defn extract-pattern*
-  [patterns]
-  (reduce
-    (fn [acc triple-pattern]
-      (conj acc
-            (mapv
-              (fn [individual]
-                (if (contains? individual ::exec-where/var)
-                  nil
-                  (::exec-where/iri individual)))
-              triple-pattern)))
-    #{}
-    patterns))
-
 (defn extract-pattern
-  [rule-statement context]
-  (let [patterns (-> (parse/parse-where-clause rule-statement nil context)
-                     ::exec-where/patterns)]
-    (extract-pattern* patterns)))
+  [triple-pattern]
+  (mapv
+    (fn [individual]
+      (if (contains? individual ::exec-where/var)
+        nil
+        (::exec-where/iri individual)))
+    triple-pattern))
+
+(defn extract-patterns
+  [where-patterns]
+  (reduce
+    (fn [acc pattern]
+      (case (first pattern)
+        :class (conj acc (extract-pattern (second pattern)))
+        :union (reduce
+                 (fn [acc* union-pattern]
+                   (into acc*
+                         (extract-patterns (::exec-where/patterns union-pattern))))
+                 acc
+                 (second pattern))
+        :optional (into acc (extract-patterns (::exec-where/patterns pattern)))
+        :bind acc ;; bind can only use patterns/vars already established, nothing to add
+        ;; else
+        (conj acc (extract-pattern pattern))))
+    #{}
+    where-patterns))
 
 (defn flake-tests
   "Generates 'test' flakes to test if any patterns in this rule match
@@ -57,10 +68,10 @@
                                 json-ld/parse-context)
         where           (get rule "where")
         insert          (get rule "insert")
-        rule-parsed (q-parse/parse-txn  {const/iri-where  [{:value where}]
-                                         const/iri-insert [{:value insert}]} context)
-        where-patterns  (extract-pattern* (::exec-where/patterns (:where rule-parsed)))
-        insert-patterns (extract-pattern* (:insert rule-parsed))]
+        rule-parsed     (q-parse/parse-txn {const/iri-where  [{:value where}]
+                                            const/iri-insert [{:value insert}]} context)
+        where-patterns  (extract-patterns (::exec-where/patterns (:where rule-parsed)))
+        insert-patterns (extract-patterns (:insert rule-parsed))]
     {:deps        where-patterns
      :gens        insert-patterns
      :flake-tests (flake-tests where-patterns)
@@ -83,10 +94,34 @@
     {}
     rules))
 
-(defn find-rules
-  "Returns core async channel with rules query result"
+(defn extract-owl2rl-from-db
   [db]
-  (fql/query db nil
-             {:select ["?s" "?rule"]
-              :where  {"@id"                           "?s",
-                       "http://flur.ee/ns/ledger#rule" "?rule"}}))
+  (async/go
+    (let [all-rules (async/<! (fql/query db nil
+                                         {:select {"?s" ["*"]}
+                                          :where  [["union"
+                                                    {"@id"   "?s",
+                                                     "@type" const/iri-owl:Class}
+                                                    {"@id"   "?s",
+                                                     "@type" const/iri-owl:ObjectProperty}
+                                                    {"@id"                "?s",
+                                                     const/iri-owl:sameAs nil}]]
+                                          :depth  6}))]
+      (if (util/exception? all-rules)
+        (do
+          (log/error "Error extracting owl2rl from db:" (ex-message all-rules))
+          all-rules)
+        ;; blank nodes can be part of OWL logic (nested), but we won't assign class or
+        ;; property names to blank nodes
+        (remove iri/blank-node? all-rules)))))
+
+(defn rules-from-db
+  "Returns core async channel with rules query result"
+  [db method]
+  (case method
+    :datalog (fql/query db nil
+                        {:select ["?s" "?rule"]
+                         :where  {"@id"          "?s",
+                                  const/iri-rule "?rule"}})
+    :owl2rl (extract-owl2rl-from-db db)))
+

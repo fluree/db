@@ -601,3 +601,11 @@
   "Returns approx number of bytes in a collection of flakes."
   [flakes]
   (reduce (fn [size f] (+ size (size-flake f))) 0 flakes))
+
+(defn class-flake?
+  [f]
+  (= const/$rdf:type (p f)))
+
+(defn ref-flake?
+  [f]
+  (= const/$xsd:anyURI (dt f)))

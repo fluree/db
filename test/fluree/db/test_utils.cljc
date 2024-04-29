@@ -4,8 +4,7 @@
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.fql.parse :as parse]
-            [fluree.db.json-ld.commit :as commit]
+            [fluree.db.json-ld.iri :as iri]
             #?@(:cljs [[clojure.core.async.interop :refer [<p!]]])
             [clojure.string :as str]))
 
@@ -250,10 +249,6 @@
       (log/warn "commit-id? falsey result from:" s))
     result))
 
-(defn blank-node-id?
-  [s]
-  (str/starts-with? s parse/blank-node-prefix))
-
 (defn pred-match?
   "Does a deep compare of expected and actual map values but any predicate fns
   in expected are run with the equivalent value from actual and the result is
@@ -276,3 +271,10 @@
                 (zipmap expected actual))
 
         :else false)))
+
+(defn deterministic-blank-node-fixture
+  [f]
+  (let [counter (atom 0)
+        deterministic-new-blank-node-id (fn [] (str "_:fdb-" (swap! counter inc)))]
+    (with-redefs [fluree.db.json-ld.iri/new-blank-node-id deterministic-new-blank-node-id]
+      (f))))

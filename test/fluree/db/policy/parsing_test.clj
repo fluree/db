@@ -2,6 +2,7 @@
   "Tests to ensure policy enforcement parsing is accurate"
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.constants :as const]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.did :as did]
@@ -98,7 +99,7 @@
                                                   const/iri-target-role {"@id" iri-userRole}
                                                   :function             [true
                                                                          ::replaced-policy-function]
-                                                  "@id"                 test-utils/blank-node-id?}}}}
+                                                  "@id"                 iri/blank-node-id?}}}}
                             const/iri-view
                             {:class
                              {iri-User {iri-ssn  {const/iri-equals      [{"@id" const/iri-$identity}

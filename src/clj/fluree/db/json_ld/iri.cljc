@@ -4,6 +4,7 @@
             [fluree.db.util.bytes :as bytes]
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]
+            [nano-id.core :refer [nano-id]]
             #?(:cljs [fluree.db.sid :refer [SID]]))
   #?(:clj (:import (fluree.db SID))))
 
@@ -149,6 +150,13 @@
 (def serialize-sid
   (juxt get-ns-code get-name))
 
+(defn serialized-sid?
+  [x]
+  (and (vector? x)
+       (= (count x) 2)
+       (number? (nth x 0))
+       (string? (nth x 1))))
+
 #?(:clj (defmethod print-method SID [^SID sid ^java.io.Writer w]
           (doto w
             (.write "#fluree/SID ")
@@ -163,6 +171,11 @@
 (defn sid?
   [x]
   (instance? SID x))
+
+(defn blank-node-sid?
+  [x]
+  (and (sid? x)
+       (= (get-namespace x) "_:")))
 
 (def min-sid
   (->sid 0 ""))
@@ -208,3 +221,26 @@
 (defn fluree-iri
   [nme]
   (str f-ns nme))
+
+(def blank-node-prefix
+  "_:fdb")
+
+(defn blank-node-id?
+  [s]
+  (str/starts-with? s blank-node-prefix))
+
+(defn blank-node?
+  [node]
+  (when-let [id (util/get-id node)]
+    (if (string? id)
+      (blank-node-id? id)
+      (throw (ex-info (str "JSON-LD node improperly formed, @id values must be strings, but found: " id
+                           " in node: " node ".")
+                      {:status 500
+                       :error  :db/unexpected-error})))))
+
+(defn new-blank-node-id
+  []
+  (let [now (util/current-time-millis)
+        suf (nano-id 8)]
+    (str/join "-" [blank-node-prefix now suf])))

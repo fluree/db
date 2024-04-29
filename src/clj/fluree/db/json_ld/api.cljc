@@ -17,7 +17,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.connection :refer [notify-ledger]]
-            [fluree.db.reasoner.core :as reasoner]
+            [fluree.db.reasoner :as reasoner]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy :as perm])
   (:refer-clojure :exclude [merge load range exists?]))
@@ -355,35 +355,53 @@
    (json-ld/expand-iri compact-iri
                        (json-ld/parse-context context))))
 
-(defn internal-id
-  "Returns the internal Fluree integer id for a given IRI.
+(defn encode-iri
+  "Returns the internal Fluree IRI identifier (a compact form).
   This can be used for doing range scans, slices and for other
   more advanced needs."
   [db iri]
   (iri/encode-iri db iri))
 
+(defn internal-id
+  "Deprecated, use encode-iri instead."
+  {:deprecated true}
+  [db iri]
+  (do
+    (println "WARNING: (internal-id db iri) is deprecated, use (encode-iri db iri).")
+    (encode-iri db iri)))
+
+(defn decode-iri
+  "Opposite of encode-iri. When doing more advanced features
+  like direct range-scans of indexes, IRIs are returned in their
+  internal compact format. This allows the IRI to be returned
+  as a full string IRI."
+  [db iri]
+  (iri/decode-sid db iri))
+
 ;; reasoning APIs
 
 (defn reason
-  "Sets the reasoner type(s) to perform on a db.
+  "Sets the reasoner methods(s) to perform on a db.
+  Supported methods are :datalog and :owl2rl.
+  One or more methods can be supplied as a sequential list/vector.
+
   Reasoning is done in-memory at the db-level and is not persisted.
 
-  Reasoning types currently supported are :datalog and :owl2rl.
-
-  You can give a single reasoning type as an argument, or multiple
-  as a sequential list/vector."
-  ([db regimes] (reason db regimes nil nil))
-  ([db regimes graph] (reason db regimes graph nil))
-  ([db regimes graph opts]
+  A rules graph containing rules in JSON-LD format can be supplied,
+  or if no rules graph is supplied, the rules will be looked for within
+  the db itself."
+  ([db methods] (reason db methods nil nil))
+  ([db methods rules-graph] (reason db methods rules-graph nil))
+  ([db methods rules-graph opts]
    (promise-wrap
-     (reasoner/reason db regimes graph opts))))
+     (reasoner/reason db methods rules-graph opts))))
 
 (defn reasoned-count
   "Returns a count of reasoned facts in the provided db."
   [db]
   (let [spot (-> db :novelty :spot)]
     (reduce (fn [n flake]
-              (if (-> flake flake/m :reasoned)
+              (if (reasoner/reasoned-rule? flake)
                 (inc n)
                 n))
             0 spot)))
@@ -399,21 +417,27 @@
   NOTE: Currently returns internal fluree ids for subject, property and object.
   This will be changed to return IRIs in a future release.
 
-  Optional opts map can include:
-  :group-by - :rule (default), :subject, :property"
-  ([db] (reasoned-facts db {:group-by :rule}))
+  Optional opts map specified grouping, or no grouping (default):
+  {:group-by :rule} - group by rule IRI
+  {:group-by :subject} - group by the reasoned triples' subject
+  {:group-by ::property} - group by the reasoned triples' property IRI"
+  ([db] (reasoned-facts db nil))
   ([db opts]
    (let [group-fn (case (:group-by opts)
                     nil nil
                     :subject (fn [p] (nth p 0))
                     :property (fn [p] (nth p 1))
                     :rule (fn [p] (nth p 3)))
+         triples+ (juxt #(decode-iri db (flake/s %))
+                        #(decode-iri db (flake/p %))
+                        #(as-> (flake/o %) o
+                               (if (iri/sid? o)
+                                 (decode-iri db o)
+                                 o))
+                        #(reasoner/reasoned-rule? %))
          result   (->> db :novelty :spot
                        reasoner/reasoned-flakes
-                       (map (fn [flake] [(flake/s flake)
-                                         (flake/p flake)
-                                         (flake/o flake)
-                                         (-> flake flake/m :reasoned)])))]
+                       (mapv triples+))]
      (if group-fn
        (group-by group-fn result)
        result))))

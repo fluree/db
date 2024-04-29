@@ -156,6 +156,14 @@
   #?(:clj  (Integer/parseInt s)
      :cljs (js/parseInt s)))
 
+(defn str->long
+  "Converts string to long integer. Assumes you've already verified the string is
+  parsable to a long.
+
+  Note JS only has precision to 2^53-1, so this will not work for larger numbers."
+  [s]
+  #?(:clj  (Long/parseLong s)
+     :cljs (js/parseInt s)))
 
 (defn keyword->str
   "Converts a keyword to string. Can safely be called on a
@@ -406,19 +414,34 @@
 
 (defn get-first
   [json-ld k]
-  (get-in json-ld [k 0]))
+  (let [v (get json-ld k)]
+    (if (sequential? v)
+      (first v)
+      v)))
+
+(defn get-value
+  [val]
+  (if (map? val)
+    (or (:value val)
+        (get val "@value"))
+    val))
 
 (defn get-first-value
   [json-ld k]
   (-> json-ld
       (get-first k)
-      :value))
+      get-value))
+
+(defn get-id
+  [json-ld]
+  (or (:id json-ld)
+      (get json-ld "@id")))
 
 (defn get-first-id
   [json-ld k]
   (-> json-ld
       (get-first k)
-      :id))
+      get-id))
 
 (defn parse-opts
   [opts]

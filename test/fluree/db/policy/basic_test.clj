@@ -4,6 +4,7 @@
             [fluree.crypto :as crypto]
             [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]))
@@ -94,7 +95,7 @@
                          :schema/email     "alice@flur.ee",
                          :schema/birthDate "2022-08-17",
                          :schema/ssn       "111-11-1111",
-                         :ex/location      {:id         test-utils/blank-node-id?,
+                         :ex/location      {:id         iri/blank-node-id?,
                                             :ex/state   "NC",
                                             :ex/country "USA"}}
                         {:id               :ex/john,
@@ -117,7 +118,7 @@
                          :schema/email     "alice@flur.ee",
                          :schema/birthDate "2022-08-17",
                          :schema/ssn       "111-11-1111",
-                         :ex/location      {:id         test-utils/blank-node-id?,
+                         :ex/location      {:id         iri/blank-node-id?,
                                             :ex/state   "NC",
                                             :ex/country "USA"}}
                         {:id               :ex/john,

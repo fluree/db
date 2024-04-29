@@ -40,23 +40,24 @@
           ;; passed all property policies, allow everything!
           true)))))
 
-
 (defn allowed?
   "Returns true if all policy enforcement passes, else exception related to
   first policy the fails."
-  [{:keys [db-after add]} {:keys [subj-mods] :as _tx-state}]
-  (let [{:keys [policy]} db-after
-        subj-mods' @subj-mods]
+  [{:keys [db-after add mods]}]
+  (let [{:keys [policy]} db-after]
     (go-try
       (if (validate/unrestricted-modify? db-after)
         db-after
         (loop [[s-flakes & r] (partition-by flake/s add)]
           (if s-flakes
-            (let [fflake         (first s-flakes)
-                  sid            (flake/s fflake)
-                  {:keys [classes]} (get subj-mods' sid)
-                  class-iris (map (partial iri/decode-sid db-after)
-                                  classes)
+            (let [fflake  (first s-flakes)
+                  sid     (flake/s fflake)
+                  classes (->> (get mods sid)
+                               (into #{} (comp (filter flake/class-flake?)
+                                               (map flake/o))))
+
+                  class-iris     (map (partial iri/decode-sid db-after)
+                                      classes)
                   {defaults :default props :property}
                   (validate/group-policies-by-default policy const/iri-modify
                                                       class-iris)
