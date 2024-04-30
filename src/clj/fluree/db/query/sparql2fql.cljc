@@ -15,16 +15,6 @@
        str/join
        (str "?")))
 
-(defn valid-modifiers?
-  "[:Modifiers [:PrettyPrint]]"
-  [modifiers]
-  (if (and (= (first modifiers) :Modifiers)
-           (vector? (second modifiers)))
-    true
-    (throw (ex-info (str "Improperly formatted SPARQL query. Note: FlureeDB does not support all SPARQL features. Trouble parsing query modifiers: " modifiers)
-                    {:status 400
-                     :error  :db/invalid-query}))))
-
 (defn handle-iri-ref
   [ref]
   (subs ref 1 (-> ref count dec)))
@@ -649,21 +639,22 @@
 
 (defn parsed->fql
   [parsed]
-  (reduce (fn [query top-level]
-            (case (first top-level)
+  (reduce (fn [query [tag & body]]
+            (case tag
               :Prologue
-              (let [prologue (rest top-level)]
+              (let [prologue body]
                 (assoc-if (seq prologue)
                   query :context (handle-prologue prologue)))
 
               :Modifiers
-              (when valid-modifiers?
-                (handle-modifiers query (rest top-level)))
+              (handle-modifiers query body)
 
               :SelectQuery
-              (handle-select query (rest top-level))
+              (handle-select query body)
 
-              (throw (ex-info (str "Improperly formatted SPARQL query. Note: FlureeDB does not support all SPARQL features. Trouble parsing: " (first top-level))
+              (throw (ex-info (str "Improperly formatted SPARQL query. "
+                                   "Note: FlureeDB does not support all SPARQL features. Trouble parsing: "
+                                   tag)
                               {:status 400
                                :error  :db/invalid-query}))))
           {} parsed))
