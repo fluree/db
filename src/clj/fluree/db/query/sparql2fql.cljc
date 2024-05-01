@@ -217,14 +217,14 @@
 (defn handle-triples-block
   "TriplesSameSubjectPath ( <'.'> TriplesBlock? )?"
   [triples-block]
-  (->> (map (fn [triple-item]
-              (case (first triple-item)
-                :TriplesBlock
-                (handle-triples-block (rest triple-item))
+  (mapcat (fn [triple-item]
+            (case (first triple-item)
+              :TriplesBlock
+              (handle-triples-block (rest triple-item))
 
-                :TriplesSameSubjectPath
-                (handle-triples-same-subject-path (rest triple-item)))) triples-block)
-       (apply concat)))
+              :TriplesSameSubjectPath
+              (handle-triples-same-subject-path (rest triple-item))))
+          triples-block))
 
 (declare handle-arg-list)
 (declare handle-expression)
