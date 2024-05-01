@@ -461,7 +461,7 @@
   "BNF -- GroupGraphPattern ( <'UNION'> GroupGraphPattern )*
   {\"union\": [ [[s p o][s1 p1 p1]] [[s2 p2 o2]] ]   "
   [group-or-union]
-  [:union (mapv handle-where-clause group-or-union)])
+  (into [:union] (mapcat handle-where-clause group-or-union)))
 
 (defn handle-optional-graph-pattern
   [optional]
