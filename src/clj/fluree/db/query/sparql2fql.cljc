@@ -578,46 +578,55 @@
                     {:status 400
                      :error  :db/invalid-query}))))
 
-(defn handle-select
-  [query select]
+(defn handle-select-clause
+  [query select-clause]
   (loop [query query
-         [item & r] select]
-    (if-not item
+         [item & r] select-clause]
+    (if item
+      (if (string? item)
+        (if (= "*" item)
+          (recur (-> query
+                     (assoc :selectKey :select)
+                     (update :select conj "*")) r)
+          (recur (assoc query
+                        :selectKey
+                        (keyword (str "select" (str/capitalize item)))) r))
+
+        (case (first item)
+          :Var
+          (recur (update query :select concat [(handle-var (rest item))]) r)
+
+          :Expression
+          (let [exp (-> item rest handle-expression first)
+                next-as? (= "AS" (first r))
+                [exp r] (if next-as?
+                          [(str "(as " exp " " (handle-var (-> r second rest)) ")") (drop 2 r)]
+                          [exp r])]
+            (recur (update query :select concat [exp]) r))))
+
       (let [q (update query :select vec)]
         (if-let [select-key (:selectKey q)]
           (-> (set/rename-keys q {:select select-key})
               (dissoc :selectKey))
-          q))
-      (let [[q r] (if (string? item)
-                    (if (= "*" item)
-                      [(-> query
-                           (assoc :selectKey :select)
-                           (update :select conj "*")) r]
-                      [(assoc query
-                         :selectKey
-                         (keyword (str "select" (str/capitalize item)))) r])
+          q)))))
 
-                    (case (first item)
-                      :Var
-                      [(update query :select concat [(handle-var (rest item))]) r]
+(defn handle-select
+  [query select]
+  (reduce (fn [query [tag & body]]
+            (case tag
+              :SelectClause
+              (handle-select-clause query body)
 
-                      :Expression
-                      (let [exp      (-> item rest handle-expression first)
-                            next-as? (= "AS" (first r))
-                            [exp r] (if next-as?
-                                      [(str "(as " exp " " (handle-var (-> r second rest)) ")") (drop 2 r)]
-                                      [exp r])]
-                        [(update query :select concat [exp]) r])
+              :WhereClause
+              (assoc query :where (vec (handle-where-clause (first body))))
 
-                      :WhereClause
-                      [(assoc query :where (vec (handle-where-clause (second item)))) r]
+              :SolutionModifier
+              (merge query (handle-solution-modifier body))
 
-                      :SolutionModifier
-                      [(merge query (handle-solution-modifier (rest item))) r]
-
-                      :DatasetClause
-                      [(assoc query :from (handle-dataset-clause (-> item rest second))) r]))]
-        (recur q r)))))
+              :DatasetClause
+              (assoc query :from (handle-dataset-clause (second body)))))
+          query
+          select))
 
 (defn handle-prologue
   "BNF -- ( BaseDecl | PrefixDecl )*"
