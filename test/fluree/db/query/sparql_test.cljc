@@ -126,9 +126,9 @@
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:union
-               [[{"@id" "?person", "person:age" 70}
-                 {"@id" "?person", "person:handle" "dsanchez"}]
-                [{"@id" "?person", "person:handle" "anguyen"}]]]
+               {"@id" "?person", "person:age" 70}
+               {"@id" "?person", "person:handle" "dsanchez"}
+               {"@id" "?person", "person:handle" "anguyen"}]
               {"@id" "?person", "person:age" "?age"}]
              where))))
   (testing "FILTER"
