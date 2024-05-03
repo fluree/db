@@ -67,7 +67,7 @@
           current-dag-map  (<? (ipfs-dir/refresh-state ipfs-endpoint (str "/ipns/" ipns-address)))
           updated-dir-map  (<? (ipfs-dir/update-directory! current-dag-map ipfs-endpoint relative-address hash size))
           _                (swap! ledger-state update-in [:push :pending] assoc :t t :dag updated-dir-map)
-          ipns-key         (<? (ipfs-key/key ipfs-endpoint ipns-address))
+          ipns-key         (<? (ipfs-key/profile ipfs-endpoint ipns-address))
           _                (when-not ipns-key
                              (throw (ex-info (str "IPNS key for address: " ipns-address " appears to no longer be registered "
                                                   "with the connected IPFS server: " ipfs-endpoint ". Unable to publish updates.")

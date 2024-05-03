@@ -39,24 +39,13 @@
   [flake]
   (-> flake flake/m (contains? :i)))
 
-(defn unwrap-singleton
-  ([coll]
-   (if (= 1 (count coll))
-     (first coll)
-     coll))
-
-  ([iri context coll]
-   (if (#{:list :set} (-> context (get iri) :container))
-     coll
-     (unwrap-singleton coll))))
-
 (defn type-value
   [db cache compact-fn type-flakes]
   (->> type-flakes
        (into [] (comp (map flake/o)
                       (map (partial cache-sid->iri db cache compact-fn))
                       (map :as)))
-       unwrap-singleton))
+       util/unwrap-singleton))
 
 (defn format-reference
   [db spec sid]
@@ -91,7 +80,7 @@
                                       p-flakes)]
                       (->> p-flakes*
                            (mapv (partial format-object db spec))
-                           (unwrap-singleton p-iri context))))]
+                           (util/unwrap-singleton p-iri context))))]
         [p-iri v]))))
 
 (defn format-subject-xf
@@ -239,7 +228,7 @@
          (async/transduce (comp cat sid-xf)
                           (completing conj
                                       (fn [result]
-                                        [as (unwrap-singleton result)]))
+                                        [as (util/unwrap-singleton result)]))
                           []))))
 
 (defn format-reverse-property

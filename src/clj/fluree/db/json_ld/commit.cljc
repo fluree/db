@@ -269,6 +269,7 @@
           db***         (ledger/-commit-update! ledger branch (dissoc db** :txns))
           push-res      (<? (nameservice/push! conn (assoc new-commit**
                                                            :meta commit-res
+                                                           :json-ld jld-commit
                                                            :ledger-state state)))]
       {:commit-res  commit-res
        :push-res    push-res

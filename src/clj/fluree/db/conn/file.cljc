@@ -120,6 +120,7 @@
   "Create a new file system connection."
   [{:keys [defaults parallelism storage-path lru-cache-atom memory serializer nameservices]
     :or   {serializer (json-serde)} :as _opts}]
+  (log/debug "Initialized file connection with options: " _opts)
   (go
     (let [conn-id        (str (random-uuid))
           state          (connection/blank-state)

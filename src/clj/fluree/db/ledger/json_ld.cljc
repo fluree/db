@@ -271,12 +271,15 @@
   [conn ledger-chan address]
   (go-try
     (let [commit-addr  (<? (nameservice/lookup-commit conn address))
+          _            (log/debug "Attempting to load from address:" address
+                                  "with commit address:" commit-addr)
           _            (when-not commit-addr
-                         (throw (ex-info (str "Unable to load. No commit exists for: " address)
+                         (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
                                          {:status 400 :error :db/invalid-commit-address})))
           [commit _]   (<? (jld-reify/read-commit conn commit-addr))
           _            (when-not commit
-                         (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
+                         (throw (ex-info (str "Unable to load. Commit file for ledger: " address
+                                              " at location: " commit-addr " is not found.")
                                          {:status 400 :error :db/invalid-db})))
           _            (log/debug "load commit:" commit)
           ledger-alias (commit->ledger-alias conn address commit)

@@ -48,23 +48,17 @@
       commit-data)))
 
 (defn lookup
-  [data-atom ledger-address]
+  [data-atom ledger-alias]
   (go #?(:clj
-         (if-let [head-commit (read-address data-atom ledger-address)]
-           (-> head-commit (get "address"))
-           (throw (ex-info (str "Unable to lookup ledger address from conn: "
-                                ledger-address)
-                           {:status 500 :error :db/missing-head})))
+         (when-let [head-commit (read-address data-atom ledger-alias)]
+           (-> head-commit (get "address")))
 
          :cljs
          (if platform/BROWSER
-           (if-let [head-commit (read-address data-atom ledger-address)]
-             (memory-address head-commit)
-             (throw (ex-info (str "Unable to lookup ledger address from localStorage: "
-                                  ledger-address)
-                             {:status 500 :error :db/missing-head})))
+           (when-let [head-commit (read-address data-atom ledger-alias)]
+             (memory-address head-commit))
            (throw (ex-info (str "Cannot lookup ledger address with memory connection: "
-                                ledger-address)
+                                ledger-alias)
                            {:status 500 :error :db/invalid-ledger}))))))
 
 (defn ledger-list
@@ -78,12 +72,12 @@
 (defrecord MemoryNameService
   [state-atom sync?]
   ns-proto/iNameService
-  (-lookup [_ ledger-address] (lookup state-atom ledger-address))
+  (-lookup [_ ledger-alias] (lookup state-atom ledger-alias))
+  (-lookup [_ ledger-alias opts] (lookup state-atom ledger-alias)) ;; TODO - doesn't support branches yet
   (-push [_ commit-data] (push! state-atom commit-data))
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported MemoryNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported MemoryNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
-  (-exists? [_ ledger-address] (go (boolean (read-address state-atom ledger-address))))
   (-ledgers [_ opts] (ledger-list state-atom opts))
   (-address [_ ledger-alias opts]
     (address ledger-alias opts))
