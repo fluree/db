@@ -65,7 +65,7 @@
               :t            t
               :garbage      garbage}
         ser  (serdeproto/-serialize-garbage (serde conn) data)]
-    (connection/-index-file-write conn ledger :garbage ser)))
+    (connection/-index-file-write conn alias :garbage ser)))
 
 (defn write-db-root
   [db]
