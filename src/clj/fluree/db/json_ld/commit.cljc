@@ -251,7 +251,7 @@
           ledger-commit (:commit (ledger/-status ledger branch))
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
-          [new-commit* jld-commit] (commit-data/commit-jsonld new-commit)
+          [new-commit* jld-commit] (commit-data/commit->jsonld new-commit)
           signed-commit (if did
                           (<? (cred/generate jld-commit private (:id did)))
                           jld-commit)

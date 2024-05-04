@@ -180,16 +180,17 @@
      :schema          (vocab/base-schema)}))
 
 (defn load
-  [conn ledger-alias branch commit]
+  [conn ledger-alias branch commit-jsonld]
   (go-try
-    (let [root-map   (if-let [{:keys [address]} (:index commit)]
+    (let [commit-map (commit-data/jsonld->clj commit-jsonld)
+          root-map   (if-let [{:keys [address]} (:index commit-map)]
                        (<? (index-storage/read-db-root conn address))
                        (genesis-root-map ledger-alias))
           indexed-db (-> root-map
                          (assoc :conn conn
                                 :alias ledger-alias
                                 :branch branch
-                                :commit commit
+                                :commit commit-map
                                 :tt-id nil
                                 :comparators index/comparators
                                 :staged []

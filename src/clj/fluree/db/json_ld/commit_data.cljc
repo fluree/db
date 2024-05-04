@@ -184,25 +184,25 @@
         ns          (get-first jsonld const/iri-ns)
         index       (get-first jsonld const/iri-index)]
 
-    (cond-> {:id             id
-             :v              v
-             :alias          alias
-             :branch         branch
-             :time           time
-             :message        message
-             :tag            (mapv :value tags)
-             :previous       {:id      (:id prev-commit)
-                              :address (get-first-value prev-commit const/iri-address)}
-             :data           (parse-db-data data)}
-      address (assoc :address address)
-      ns      (assoc :ns (->> ns
-                              util/sequential
-                              (mapv (fn [namespace]
-                                      (select-keys namespace [:id])))))
-      index   (assoc :index {:id      (:id index)
-                             :address (get-first-value index const/iri-address)
-                             :data    (parse-db-data (get-first index const/iri-data))})
-      issuer  (assoc :issuer (select-keys issuer [:id])))))
+    (cond-> {:id      id
+             :v       v
+             :alias   alias
+             :branch  branch
+             :time    time
+             :tag     (mapv :value tags)
+             :data    (parse-db-data data)}
+      address     (assoc :address address)
+      prev-commit (assoc :previous       {:id      (:id prev-commit)
+                                          :address (get-first-value prev-commit const/iri-address)})
+      message     (assoc :message message)
+      ns          (assoc :ns (->> ns
+                                  util/sequential
+                                  (mapv (fn [namespace]
+                                          (select-keys namespace [:id])))))
+      index       (assoc :index {:id      (:id index)
+                                 :address (get-first-value index const/iri-address)
+                                 :data    (parse-db-data (get-first index const/iri-data))})
+      issuer      (assoc :issuer (select-keys issuer [:id])))))
 
 (defn update-index-roots
   [commit-map {:keys [spot post opst tspo]}]
@@ -251,7 +251,7 @@
                 (crypto/sha2-256 :base32))]
     (str "fluree:db:sha256:b" hsh)))
 
-(defn commit-jsonld
+(defn commit->jsonld
   "Generates JSON-LD commit map, and hash to include the @id value.
   Return a two-tuple of the updated commit map and the final json-ld document"
   [commit]
@@ -261,22 +261,27 @@
         jld*        (assoc jld "id" commit-id)]
     [commit-map* jld*]))
 
-
 (defn blank-commit
   "Creates a skeleton blank commit map."
   [alias branch ns-addresses]
-  {:alias  alias
-   :v      0
-   :branch (if branch
-             (util/keyword->str branch)
-             "main")
-   :data   {:t 0
-            :flakes 0
-            :size 0}
-   :ns     (mapv #(if (map? %)
-                    %
-                    {:id %})
-                 ns-addresses)})
+  (let [commit-json  (->json-ld {:alias  alias
+                                 :v      0
+                                 :branch (if branch
+                                           (util/keyword->str branch)
+                                           "main")
+                                 :data   {:t      0
+                                          :flakes 0
+                                          :size   0}
+                                 :time   (util/current-time-iso)
+                                 :ns     (mapv #(if (map? %)
+                                                  %
+                                                  {:id %})
+                                               ns-addresses)})
+        db-json      (get commit-json "data")
+        dbid         (db-json->db-id db-json)
+        commit-json* (assoc-in commit-json ["data" "id"] dbid)
+        commit-id    (commit-json->commit-id commit-json*)]
+    (assoc commit-json* "id" commit-id)))
 
 (defn new-index
   "Creates a new commit index record, given the commit-map used to trigger
@@ -426,7 +431,7 @@
   db-sid. Used when committing to an in-memory ledger value and when reifying
   a ledger from storage on load."
   [{:keys [address alias branch data id time v author txn] :as _commit} t commit-sid db-sid]
-  (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data]
+  (let [{ db-t :t db-address :address :keys [flakes size]} data]
     [;; commit flakes
      ;; address
      (flake/create commit-sid const/$_address address const/$xsd:string t true nil)
@@ -437,7 +442,8 @@
      ;; v
      (flake/create commit-sid const/$_v v const/$xsd:int t true nil)
      ;; time
-     (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil) ;; data
+     (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil)
+     ;; data
      (flake/create commit-sid const/$_commit:data db-sid const/$xsd:anyURI t true nil)
      ;; author
      (flake/create commit-sid const/$_commit:author author const/$xsd:string t true nil)

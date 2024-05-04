@@ -4,6 +4,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.json-ld :as json-ld]
             [fluree.db.util.log :as log :include-macros true])
 
   (:refer-clojure :exclude [name]))
@@ -15,7 +16,8 @@
   current-branch."
   [conn ledger-alias branch-name ns-addresses]
   (go-try
-    (let [initial-commit (commit-data/blank-commit ledger-alias branch-name ns-addresses)
+    (let [initial-commit (json-ld/expand
+                           (commit-data/blank-commit ledger-alias branch-name ns-addresses))
           initial-db     (<? (jld-db/load conn ledger-alias branch-name initial-commit))]
       {:name       branch-name
        :current-db initial-db})))
