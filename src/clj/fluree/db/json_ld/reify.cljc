@@ -380,10 +380,9 @@
             (recur commit-tuple commit-t commit-tuples*)))))))
 
 (defn load-db-idx
-  [ledger db latest-commit commit-address]
+  [{:keys [conn] :as _ledger} db latest-commit commit-address]
   (go-try
-    (let [{:keys [conn]} ledger
-          idx-meta   (get-first latest-commit const/iri-index) ; get persistent
+    (let [idx-meta   (get-first latest-commit const/iri-index) ; get persistent
                                                                ; index meta if
                                                                ; ledger has
                                                                ; indexes

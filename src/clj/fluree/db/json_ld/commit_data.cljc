@@ -244,6 +244,13 @@
                      (crypto/sha2-256 :base32))]
     (str "fluree:commit:sha256:b" b32-hash)))
 
+(defn db-json->db-id
+  [payload]
+  (let [hsh (-> payload
+                json-ld/normalize-data
+                (crypto/sha2-256 :base32))]
+    (str "fluree:db:sha256:b" hsh)))
+
 (defn commit-jsonld
   "Generates JSON-LD commit map, and hash to include the @id value.
   Return a two-tuple of the updated commit map and the final json-ld document"

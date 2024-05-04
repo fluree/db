@@ -13,7 +13,6 @@
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [clojure.set :refer [map-invert]]
             [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]])
   #?(:clj (:import (java.io Writer))))
 

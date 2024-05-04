@@ -153,11 +153,6 @@
      :stats          stats}))
 
 
-(defn db-json->db-id
-  [payload]
-  (->> (crypto/sha2-256 payload :base32)
-       (str "fluree:db:sha256:b")))
-
 (defn commit-flakes
   "Returns commit flakes from novelty based on 't' value."
   [{:keys [novelty t] :as _db}]
@@ -235,7 +230,7 @@
                       (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
                       (:size stats) (assoc (compact const/iri-size) (:size stats)))
         ;; TODO - this is re-normalized below, can try to do it just once
-        dbid        (-> db-json json-ld/normalize-data db-json->db-id)
+        dbid        (commit-data/db-json->db-id db-json)
         db-json*    (-> db-json
                         (assoc id-key dbid)
                         (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
