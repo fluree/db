@@ -8,19 +8,19 @@
             [clojure.string :as str]
             [fluree.db.util.bytes :as bytes]))
 
+(defn s3-address [bucket prefix k]
+  (s3/s3-address bucket prefix k))
+
 (defrecord S3Store [client bucket prefix]
   storage/Store
-  (address [_ k]
-    (s3/s3-address bucket prefix k))
-
-  (write [store k v]
+  (write [_ k v]
     (go
       (let [hash    (crypto/sha2-256 v)
             bytes   (if (string? v)
                      (bytes/string->UTF8 v)
                      v)
             result  (<! (s3/write-s3-data client bucket prefix k bytes))
-            address (storage/address store k)]
+            address (s3-address bucket prefix k)]
         (if (instance? Throwable result)
           result
           {:hash    hash
