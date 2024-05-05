@@ -16,12 +16,13 @@
   (let [relative-path (:local (storage/parse-address address))]
     (full-path root relative-path)))
 
+(defn file-address
+  [path]
+  (storage/build-fluree-address method-name path))
+
 (defrecord FileStore [root]
   storage/Store
-  (address [_ path]
-    (storage/build-fluree-address method-name path))
-
-  (write [store path v]
+  (write [_ path v]
     (go-try
       (when (not (storage/hashable? v))
         (throw (ex-info "Must serialize v before writing to FileStore."
@@ -35,7 +36,7 @@
                     v)]
         (<? (fs/write-file path* bytes))
         {:path    path
-         :address (storage/address store path)
+         :address (file-address path)
          :hash    hash
          :size    (count bytes)})))
 
