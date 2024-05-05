@@ -33,10 +33,9 @@
           bytes    (bytes/string->UTF8 json)
           hash     (crypto/sha2-256 bytes :hex)
           type-dir (name data-type)
-          path     (str alias
-                        (when branch (str "/" branch))
-                        (str "/" type-dir "/")
-                        hash ".json")
+          path     (->> [alias branch type-dir hash]
+                        (remove nil?)
+                        (str/join "/"))
 
           {:keys [hash address]} (<? (storage/write store path bytes))]
       {:name    path

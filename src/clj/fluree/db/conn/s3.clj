@@ -1,5 +1,6 @@
 (ns fluree.db.conn.s3
   (:require [cognitect.aws.client.api :as aws]
+            [clojure.string :as str]
             [fluree.db.nameservice.s3 :as ns-s3]
             [clojure.core.async :as async :refer [go]]
             [fluree.crypto :as crypto]
@@ -32,10 +33,9 @@
           bytes    (.getBytes ^String json)
           hash     (crypto/sha2-256 bytes :hex)
           type-dir (name data-type)
-          path     (str alias
-                        (when branch (str "/" branch))
-                        (str "/" type-dir "/")
-                        hash ".json")
+          path     (->> [alias branch type-dir hash]
+                        (remove nil?)
+                        (str/join "/"))
           result   (<? (storage/write store path bytes))]
       {:name    path
        :hash    hash
