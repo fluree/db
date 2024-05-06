@@ -13,14 +13,15 @@
 
 (defrecord S3Store [client bucket prefix]
   storage/Store
-  (write [_ k v]
+  (write [_ dir data]
     (go
-      (let [hash    (crypto/sha2-256 v)
-            bytes   (if (string? v)
-                     (bytes/string->UTF8 v)
-                     v)
-            result  (<! (s3/write-s3-data client bucket prefix k bytes))
-            address (s3-address bucket prefix k)]
+      (let [hash    (crypto/sha2-256 data)
+            bytes   (if (string? data)
+                     (bytes/string->UTF8 data)
+                     data)
+            path    (str/join "/" [dir hash])
+            result  (<! (s3/write-s3-data client bucket prefix path bytes))
+            address (s3/s3-address bucket prefix path)]
         (if (instance? Throwable result)
           result
           {:hash    hash

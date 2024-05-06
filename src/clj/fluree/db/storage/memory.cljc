@@ -12,15 +12,15 @@
 
 (defrecord MemoryStore [contents]
   storage/Store
-  (write [_ path v]
+  (write [_ _ v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v
                        (pr-str v))
             hash     (crypto/sha2-256 hashable)]
-        (swap! contents assoc path v)
-        {:path    path
-         :address (memory-address path)
+        (swap! contents assoc hash v)
+        {:path    hash
+         :address (memory-address hash)
          :hash    hash
          :size    (count hashable)})))
 

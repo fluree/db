@@ -2,7 +2,6 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.string :as str]
-            [fluree.crypto :as crypto]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
             [fluree.db.index :as index]
@@ -28,11 +27,9 @@
                      (json-ld/normalize-data data))
           bytes    (bytes/string->UTF8 json)
           type-dir (name data-type)
-          hash     (crypto/sha2-256 bytes :hex)
-          filename (str hash ".json")
-          path     (str/join "/" [ledger-alias type-dir filename])
+          path     (str/join "/" [ledger-alias type-dir])
 
-          {:keys [hash address]} (<? (storage/write store path bytes))]
+          {:keys [path hash address]} (<? (storage/write store path bytes))]
       {:name    path
        :hash    hash
        :json    json

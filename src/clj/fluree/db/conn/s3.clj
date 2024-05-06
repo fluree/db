@@ -3,7 +3,6 @@
             [clojure.string :as str]
             [fluree.db.nameservice.s3 :as ns-s3]
             [clojure.core.async :as async :refer [go]]
-            [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.connection :as connection]
             [fluree.db.index :as index]
@@ -26,17 +25,14 @@
     (let [json     (if (string? data)
                      data
                      (json-ld/normalize-data data))
-          bytes    (.getBytes ^String json)
           type-dir (name data-type)
-          hash     (crypto/sha2-256 bytes :hex)
-          filename (str hash ".json")
-          path     (str/join "/" [ledger-alias type-dir filename])
-          result   (<? (storage/write store path bytes))]
+          dir      (str/join "/" [ledger-alias type-dir])
+          {:keys [address hash path]}  (<? (storage/write store dir json))]
       {:name    path
        :hash    hash
        :json    json
        :size    (count json)
-       :address (:address result)})))
+       :address address})))
 
 (defn read-commit
   [{:keys [store] :as _conn} address]

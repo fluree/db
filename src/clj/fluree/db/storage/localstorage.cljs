@@ -4,8 +4,7 @@
             [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.platform :as platform]
-            [fluree.db.storage :as storage]
-            [fluree.json-ld :as json-ld]))
+            [fluree.db.storage :as storage]))
 
 (def method-name "localstorage")
 
@@ -19,7 +18,7 @@
     (go
       (let [hashable (if (storage/hashable? v)
                        v
-                       (json-ld/normalize-data v))
+                       (pr-str v))
             hash     (crypto/sha2-256 hashable)]
         (.setItem js/localStorage k v)
         {:path    k
