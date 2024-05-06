@@ -4,7 +4,6 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.json-ld :as json-ld]
             [fluree.db.util.log :as log :include-macros true])
 
   (:refer-clojure :exclude [name]))
@@ -14,11 +13,9 @@
 (defn new-branch-map
   "Returns a new branch map for specified branch name off of supplied
   current-branch."
-  [conn ledger-alias branch-name ns-addresses]
+  [conn ledger-alias branch-name initial-commit]
   (go-try
-    (let [initial-commit (json-ld/expand
-                           (commit-data/blank-commit ledger-alias branch-name ns-addresses))
-          initial-db     (<? (jld-db/load conn ledger-alias branch-name initial-commit))]
+    (let [initial-db (<? (jld-db/load conn ledger-alias branch-name initial-commit))]
       {:name       branch-name
        :current-db initial-db})))
 

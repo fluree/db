@@ -14,7 +14,7 @@
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.connection :as connection :refer [register-ledger release-ledger]]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.index :as index]
+            [fluree.json-ld :as json-ld]
             [fluree.db.util.log :as log]
             [fluree.db.flake :as flake])
   (:refer-clojure :exclude [load]))
@@ -215,8 +215,10 @@
           ledger-alias* (normalize-alias ledger-alias)
           address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
+          initial-commit (json-ld/expand
+                           (commit-data/blank-commit ledger-alias branch ns-addresses))
           ;; map of all branches and where they are branched from
-          branches      {branch (<? (branch/new-branch-map conn ledger-alias* branch ns-addresses))}]
+          branches      {branch (<? (branch/new-branch-map conn ledger-alias* branch initial-commit))}]
       (map->JsonLDLedger
         {:id      (random-uuid)
          :did     did*
