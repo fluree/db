@@ -121,7 +121,7 @@
 (defn- enrich-commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
   [ledger
-   {:keys [branch t commit stats] :as _db}
+   {:keys [branch t commit] :as _db}
    {:keys [context did private message tag file-data? index-files-ch] :as _opts}]
   (let [context*      (parse-commit-context context)
         private*      (or private
@@ -155,8 +155,8 @@
      :branch-name    (util/keyword->str branch)
      :id-key         (json-ld/compact "@id" compact-fn)
      :type-key       (json-ld/compact "@type" compact-fn)
-     :index-files-ch index-files-ch ;; optional async chan passed in which will stream out all new index files created (for consensus)
-     :stats          stats}))
+     :index-files-ch index-files-ch})) ;; optional async chan passed in which will stream out all new index files created (for consensus)
+
 
 
 (defn commit-flakes
@@ -216,7 +216,7 @@
 
 (defn db->jsonld
   "Creates the JSON-LD map containing a new ledger update"
-  [{:keys [commit] :as db} {:keys [type-key compact ctx-used-atom t v id-key stats] :as commit-opts}]
+  [{:keys [commit stats] :as db} {:keys [type-key compact ctx-used-atom t v id-key] :as commit-opts}]
   (let [prev-dbid   (commit-data/data-id commit)
         {:keys [assert retract refs-ctx]} (generate-commit db commit-opts)
         prev-db-key (compact const/iri-previous)
