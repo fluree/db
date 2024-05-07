@@ -21,6 +21,8 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(def data-version 0)
+
 (defn get-s-iri
   "Returns an IRI from a subject id (sid)."
   [sid db compact-fn]
@@ -228,7 +230,7 @@
         db-json     (cond-> {id-key                nil ;; comes from hash later
                              type-key              [(compact const/iri-DB)]
                              (compact const/iri-t) t
-                             (compact const/iri-v) v}
+                             (compact const/iri-v) data-version}
                       prev-dbid (assoc prev-db-key prev-dbid)
                       (seq assert) (assoc assert-key assert)
                       (seq retract) (assoc retract-key retract)
