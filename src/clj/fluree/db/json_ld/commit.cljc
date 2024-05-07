@@ -138,7 +138,6 @@
     {:message        message
      :tag            tag
      :file-data?     file-data? ;; if instead of returning just a db from commit, return also the written files (for consensus)
-     :alias          (ledger/-alias ledger)
      :t              t
      :v              0
      :prev-commit    (:address commit)
