@@ -94,7 +94,7 @@
   [ledger db opts]
   (let [{:keys [branch] :as opts*}
         (normalize-opts opts)
-        {:keys [t] :as db*} (or db (ledger/-db ledger (:branch opts*)))
+        {:keys [t] :as db*} (or db (ledger/-db ledger branch))
         committed-t                (ledger/latest-commit-t ledger branch)]
     (if (= t (flake/next-t committed-t))
       (jld-commit/commit ledger db* opts*)

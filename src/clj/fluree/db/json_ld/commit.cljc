@@ -108,16 +108,22 @@
         {} context)
       context)))
 
+(defn parse-commit-context
+  [context]
+  (let [f-context      {"f" "https://ns.flur.ee/ledger#"}
+        parsed-context (if context
+                         (-> context
+                             json-ld/parse-context
+                             (json-ld/parse-context f-context))
+                         (json-ld/parse-context f-context))]
+    (stringify-context parsed-context)))
+
 (defn- enrich-commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
   [ledger
-   {:keys [branch schema t commit stats] :as _db}
+   {:keys [branch t commit stats] :as _db}
    {:keys [context did private message tag file-data? index-files-ch] :as _opts}]
-  (let [context*      (-> (if context
-                            (json-ld/parse-context (:context schema) context)
-                            (:context schema))
-                          (json-ld/parse-context {"f" "https://ns.flur.ee/ledger#"})
-                          stringify-context)
+  (let [context*      (parse-commit-context context)
         private*      (or private
                           (:private did)
                           (:private (ledger/-did ledger)))
