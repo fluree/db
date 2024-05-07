@@ -176,7 +176,7 @@
                  WHERE {VALUES ?handle { \"dsanchez\" }
                         ?person person:handle ?handle.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [[:bind {"?handle" "dsanchez"}]
+      (is (= [[:bind "?handle" "dsanchez"]
               {"@id" "?person", "person:handle" "?handle"}]
              where))))
   (testing "BIND"
@@ -184,7 +184,7 @@
                  WHERE {BIND (\"dsanchez\" AS ?handle)
                         ?person person:handle ?handle.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [[:bind {"?handle" "dsanchez"}]
+      (is (= [[:bind "?handle" "dsanchez"]
               {"@id" "?person", "person:handle" "?handle"}]
              where)))))
 
@@ -254,7 +254,7 @@
                  WHERE {?e person:favNums ?favNums.}
                  GROUP BY ?e HAVING(SUM(?favNums) > 1000)"
           {:keys [groupBy having]} (sparql/->fql query)]
-      (is (= "?e"
+      (is (= ["?e"]
              groupBy))
       (is (= "(> (sum ?favNums) 1000)"
              having))))

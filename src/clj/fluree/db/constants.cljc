@@ -59,6 +59,8 @@
 (def ^:const iri-rule (fluree-iri "rule"))
 
 (def ^:const iri-context "@context")
+(def ^:const iri-base "@base")
+(def ^:const iri-vocab "@vocab")
 (def ^:const iri-id "@id")
 (def ^:const iri-value "@value")
 (def ^:const iri-language "@language")

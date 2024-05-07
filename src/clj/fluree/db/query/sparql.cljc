@@ -3,9 +3,10 @@
             #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
+            [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.util.docs :as docs]
             [fluree.db.util.log :as log]
-            [fluree.db.query.sparql2fql :refer [parsed->fql]]))
+            #_[fluree.db.query.sparql2fql :refer [parsed->fql]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -30,4 +31,7 @@
         (log/trace "Parsed SPARQL query:" parsed)
         parsed))))
 
-(def ->fql (comp parsed->fql parse))
+(defn ->fql
+  [sparql]
+  (let [parsed (sparql.translator/parse-stage-1 sparql)]
+    (sparql.translator/parse-stage-2 parsed)))
