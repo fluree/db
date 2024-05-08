@@ -20,6 +20,7 @@
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.query.dataset :refer [dataset?]]
+            [fluree.db.reasoner :as reasoner]
             [fluree.db.validation :as v]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -116,8 +117,11 @@
                  db)
           db** (-> (if t
                      (<? (time-travel/as-of db* t))
-                     db*))]
-      (assoc-in db** [:policy :cache] (atom {})))))
+                     db*))
+          db*** (if-let [reasoners (:reasoners opts)]
+                  (<? (reasoner/reason db** reasoners nil nil))
+                  db**)]
+      (assoc-in db*** [:policy :cache] (atom {})))))
 
 (defn track-query
   [ds max-fuel query]
