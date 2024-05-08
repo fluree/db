@@ -1,6 +1,7 @@
 (ns fluree.db.query.sparql.translator
   (:require [fluree.db.constants :as const]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            #?(:cljs [cljs.tools.reader :refer [read-string]])))
 
 (defn rule?
   [x]
