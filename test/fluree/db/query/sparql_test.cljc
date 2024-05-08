@@ -296,6 +296,24 @@
 ;; TODO
 #_(deftest parse-functions)
 
+(deftest subject-iri
+  (let [query
+        "PREFIX psm: <http://srv.ktbl.de/data/psm/>
+PREFIX ex: <http://example.org/>
+
+SELECT ?p ?o
+FROM <cookbook/base>
+WHERE {
+    ex:andrew ?p ?o. # Should provide just the triples related to andrew
+}"
+        fql (sparql/->fql query)]
+    (is (= {:context {"psm" "http://srv.ktbl.de/data/psm/", "ex" "http://example.org/"},
+            :select ["?p" "?o"],
+            :from "cookbook/base",
+            :where
+            [{"@id" "ex:andrew" "?p" "?o"}]}
+           fql))))
+
 (deftest parsing-error
   (testing "invalid query throws expected error"
     (let [query "SELECT ?person
