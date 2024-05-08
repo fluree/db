@@ -140,6 +140,20 @@
       (is (= [{"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:favNums" "?num"}
               [:filter ["(> ?num 10)"]]]
+             where)))
+    (let [query "PREFIX psm: <http://srv.ktbl.de/data/psm/>
+                 PREFIX schema: <http://schema.org/>
+                 SELECT ?s ?t ?name
+                 FROM <cookbook/base>
+                 WHERE {
+                   ?s <@type> ?t.
+                   ?s schema:name ?name.
+                   FILTER REGEX(?name, \"^Jon\", \"i\")
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s", "@type" "?t"}
+              {"@id" "?s", "schema:name" "?name"}
+              [:filter ["(regex ?name \"^Jon\" \"i\")"]]]
              where))))
   (testing "OPTIONAL"
     (let [query "SELECT ?handle ?num
