@@ -1,10 +1,6 @@
 (ns fluree.db.query.sparql.translator
   (:require [fluree.db.constants :as const]
-            [clojure.string :as str]
-            #?(:clj [clojure.java.io :as io])
-            #?(:clj  [instaparse.core :as insta :refer [defparser]]
-               :cljs [instaparse.core :as insta :refer-macros [defparser]])
-            #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])))
+            [clojure.string :as str]))
 
 (defn rule?
   [x]
@@ -333,6 +329,7 @@
 (defmethod parse-term :PathMod
   ;; PathMod ::= '?' | '*' | ('+' INTEGER?) WS
   [[_ mod degree]]
+  ;; TODO: this does nothing in FQL
   (str mod degree))
 
 (defmethod parse-term :PathSequence
@@ -487,45 +484,8 @@
   [[_ & modifiers]]
   (mapcat parse-rule modifiers))
 
-(defn parse-stage-2
+(defn translate
   [parsed]
-  (def parsed parsed)
-  (reduce (fn [fql rule]
-            (let [entries (parse-rule rule)]
-              (println "DEP parsed" (pr-str entries))
-              (into fql entries)))
+  (reduce (fn [fql rule] (into fql (parse-rule rule)))
           {}
           parsed))
-
-(def grammar #?(:clj  (io/resource "sparql2.bnf")
-                :cljs (inline-resource "sparql2.bnf")))
-
-(defparser parser grammar)
-
-(defn parse-stage-1
-  [sparql]
-  (let [parsed (parser sparql)]
-    (if (insta/failure? parsed)
-      (throw (ex-info (str "Improperly formatted SPARQL query: " sparql)
-                      {:status   400 :error    :db/invalid-query}))
-      parsed)))
-
-(comment
-  (def parsed
-    (parse-stage-1
-      "PREFIX person: <http://example.org/Person#>
-                          SELECT (CONCAT(?handle, '-', ?fullName) AS ?hfn)
-                          WHERE {?person person:handle ?handle.
-                                 ?person person:fullName ?fullName.}"))
-
-  (-> (parse-stage-1 "PREFIX person: <http://example.org/Person#>
-                          SELECT ?handle
-                          WHERE {?person person:handle ?handle.}
-                          ORDER BY DESC(?handle)")
-
-      (parse-stage-2))
-
-  parsed
-
-
-  ,)
