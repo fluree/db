@@ -233,14 +233,14 @@
                    WHERE {?person person:favNums ?favNums}
                    ORDER BY ASC(?favNums)"
             {:keys [orderBy]} (sparql/->fql query)]
-        (is (= ["asc" "?favNums"]
+        (is (= [["asc" "?favNums"]]
                orderBy))))
     (testing "DESC"
       (let [query "SELECT ?favNums
                    WHERE {?person person:favNums ?favNums}
                    ORDER BY DESC(?favNums)"
             {:keys [orderBy]} (sparql/->fql query)]
-        (is (= ["desc" "?favNums"]
+        (is (= [["desc" "?favNums"]]
                orderBy)))))
   (testing "PRETTY-PRINT"
     (let [query "SELECT ?person
