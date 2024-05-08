@@ -437,16 +437,12 @@
   ;; OrderClause ::= <'ORDER' WS 'BY'> WS OrderCondition+ WS
   ;; <OrderCondition> ::= ExplicitOrderCondition | Constraint | Var
   [[_ & conditions]]
-  (if (> (count conditions) 1)
-    (throw (ex-info "Multiple ORDER BY conditions are not supported"
-                    {:status 400 :error :db/invalid-query}))
-    [[:orderBy (first
-                 (mapv (fn [condition]
-                         (cond (= "ASC" (first condition)) ["asc" (parse-term (second condition))]
-                               (= "DESC" (first condition)) ["desc" (parse-term (second condition))]
-                               :else
-                               (parse-term condition)))
-                       conditions))]]))
+  [[:orderBy (mapv (fn [condition]
+                     (cond (= "ASC" (first condition)) ["asc" (parse-term (second condition))]
+                           (= "DESC" (first condition)) ["desc" (parse-term (second condition))]
+                           :else
+                           (parse-term condition)))
+                   conditions)]])
 
 (defmethod parse-term :GroupCondition
   ;; GroupCondition ::= BuiltInCall | FunctionCall | <'('> Expression ( WS 'AS' WS Var )? <')'> | Var
