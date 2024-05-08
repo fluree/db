@@ -7,6 +7,14 @@
   (and (sequential? x)
        (keyword? (first x))))
 
+(defn literal-quote
+  "Quote a non-variable string literal for use in an expression."
+  [x]
+  (if (and (string? x)
+           (not (str/starts-with? x "?")))
+    (str "\"" x "\"")
+    x))
+
 ;; take a term rule and return a value
 (defmulti parse-term (fn [[tag & _]] tag))
 ;; take a rule return a sequence of entry tuples [[k v]...]
@@ -51,6 +59,12 @@
     (throw (ex-info (str "Unsupported aggregate function: " func)
                     {:status 400 :error :db/invalid-query}))))
 
+(defmethod parse-term :RegexExpression
+  ;; RegexExpression ::= <'REGEX'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
+  [[_ text pattern flags]]
+  (str "(regex " (literal-quote (parse-term text)) " " (literal-quote (parse-term pattern))
+       (when flags (str " " (literal-quote (parse-term flags)))) ")"))
+
 (def supported-scalar-functions
   {"COALESCE"  "coalesce"
    "STR"       "str"
@@ -74,27 +88,10 @@
 (defmethod parse-term :Func
   [[_ func & args]]
   (if-let [f (get supported-scalar-functions func)]
-    (str "(" f " " (str/join " "
-                             (->> (mapv parse-term args)
-                                  (flatten)
-                                  (map (fn [arg]
-                                         (if (and (string? arg)
-                                                  (not (str/starts-with? arg "?")))
-                                           (str \" arg \")
-                                           arg))))
-                             #_(reduce
-                               (fn [parsed-args expr]
-                                 (let [parsed (parse-term expr)]
-                                   (cond
-                                     ;; We need to quote literals to embed in the func string.
-                                     ;; (contains? (set (flatten expr)) :RDFLiteral)
-                                     ;; (conj parsed-args (str \" parsed \"))
-                                     ;; handle the nesting from :ExpressionList
-                                     (vector? parsed)    (into parsed-args parsed)
-                                     ;; no special handling necessary
-                                     :else               (conj parsed-args parsed ))))
-                               []
-                               args)) ")")
+    (str "(" f " " (str/join " " (->> (mapv parse-term args)
+                                      ;; clobber an :ExpressionList down to the same level as :Expressions
+                                      (flatten)
+                                      (map literal-quote))) ")")
     (throw (ex-info (str "Unsupported function: " func)
                     {:status 400 :error :db/invalid-query}))))
 
