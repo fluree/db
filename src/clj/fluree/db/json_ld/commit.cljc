@@ -110,10 +110,11 @@
         {} context)
       context)))
 
+(def f-context {"f" "https://ns.flur.ee/ledger#"})
+
 (defn parse-commit-context
   [context]
-  (let [f-context      {"f" "https://ns.flur.ee/ledger#"}
-        parsed-context (if context
+  (let [parsed-context (if context
                          (-> context
                              json-ld/parse-context
                              (json-ld/parse-context f-context))
