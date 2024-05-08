@@ -125,13 +125,15 @@ MultiplicativeExpression	  ::=  	UnaryExpression ( '*' UnaryExpression | '/' Una
 <PrimaryExpression>	  ::=  	BrackettedExpression | BuiltInCall | iriOrFunction | RDFLiteral | NumericLiteral | BooleanLiteral | Var
 BrackettedExpression	  ::=  	<'('> WS Expression WS <')'>
 
-BuiltInCall ::= Aggregate
+<BuiltInCall> ::= Aggregate
 | ExistsFunc
 | NotExistsFunc
 | RegexExpression
 | StrReplaceExpression
 | SubstringExpression
-| 'ABS' <'('> Expression <')'>
+| Func
+
+Func ::= 'ABS' <'('> Expression <')'>
 | 'BNODE' ( <'('> Expression <')'> | NIL )
 | 'BOUND' <'('> Var <')'>
 | 'CEIL' <'('> Expression <')'>
