@@ -208,6 +208,31 @@
               :pending  {:t   0
                          :dag nil}}})
 
+(defn validate-indexer
+  [indexer reindex-min-bytes reindex-max-bytes]
+  (cond
+    (satisfies? indexer/iIndex indexer)
+    indexer
+
+    indexer
+    (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
+                         "Provided: " indexer)
+                    {:status 400 :error :db/invalid-indexer}))
+
+    :else
+    (idx-default/create
+      (util/without-nils
+        {:reindex-min-bytes reindex-min-bytes
+         :reindex-max-bytes reindex-max-bytes}))))
+
+(defn parse-did
+  [conn did]
+  (if did
+    (if (map? did)
+      did
+      {:id did})
+    (connection/-did conn)))
+
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
@@ -216,25 +241,8 @@
            :or   {branch :main}}
           opts
 
-          did*    (if did
-                    (if (map? did)
-                      did
-                      {:id did})
-                    (connection/-did conn))
-          indexer (cond
-                    (satisfies? indexer/iIndex indexer)
-                    indexer
-
-                    indexer
-                    (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
-                                         "Provided: " indexer)
-                                    {:status 400 :error :db/invalid-indexer}))
-
-                    :else
-                    (idx-default/create
-                      (util/without-nils
-                        {:reindex-min-bytes reindex-min-bytes
-                         :reindex-max-bytes reindex-max-bytes})))
+          did*           (parse-did conn did)
+          indexer        (validate-indexer indexer reindex-min-bytes reindex-max-bytes)
           ledger-alias*  (normalize-alias ledger-alias)
           address        (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses   (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
