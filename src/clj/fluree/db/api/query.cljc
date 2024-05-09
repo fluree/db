@@ -120,7 +120,6 @@
                                (<? (time-travel/as-of policy-db t))
                                policy-db))
           reasoned-db    (let [{:keys [reasoners reasoner-rules reasoner-rules-db]} opts]
-                           (println reasoner-rules-db)
                            (if reasoners
                              ;; Currently we only support one rule source, so we take the first db or first
                              ;; reason graph that we find.
