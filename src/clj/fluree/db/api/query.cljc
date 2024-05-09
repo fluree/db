@@ -237,11 +237,17 @@
   (go-try
     (try*
       (let [[alias explicit-t] (extract-query-string-t alias)
-            address (<? (nameservice/primary-address conn alias nil))
-            ledger  (<? (jld-ledger/load conn address))
-            db      (ledger/-db ledger)
-            t*      (or explicit-t t)]
-        (<? (restrict-db db t* context opts)))
+            address            (<? (nameservice/primary-address conn alias nil))
+            ledger             (<? (jld-ledger/load conn address))
+            db                 (ledger/-db ledger)
+            t*                 (or explicit-t t)
+            rules-db           (let [db-or-alias (:reasoner-rules-db opts)]
+                                 (if (string? (first db-or-alias))
+                                   [(ledger/-db (<? (jld-ledger/load conn (first db-or-alias)))
+                                                {})]
+                                   db-or-alias))
+            opts*              (assoc opts :reasoner-rules-db rules-db)]
+        (<? (restrict-db db t* context opts*)))
       (catch* e
               (throw (contextualize-ledger-400-error
                        (str "Error loading ledger " alias ": ")
