@@ -233,16 +233,22 @@
       {:id did})
     (connection/-did conn)))
 
+(defn parse-ledger-options
+  [conn {:keys [did branch indexer reindex-min-bytes reindex-max-bytes]
+         :or   {branch :main}}]
+  (let [did*    (parse-did conn did)
+        indexer (validate-indexer indexer reindex-min-bytes reindex-max-bytes)]
+    {:did     did*
+     :branch  branch
+     :indexer indexer}))
+
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [did branch indexer reindex-min-bytes reindex-max-bytes]
-           :or   {branch :main}}
-          opts
+    (let [{:keys [did branch indexer]}
+          (parse-ledger-options conn opts)
 
-          did*           (parse-did conn did)
-          indexer        (validate-indexer indexer reindex-min-bytes reindex-max-bytes)
           ledger-alias*  (normalize-alias ledger-alias)
           address        (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses   (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
@@ -252,7 +258,7 @@
           branches       {branch (<? (branch/load-branch-map conn ledger-alias* branch genesis-commit))}]
       (map->JsonLDLedger
         {:id       (random-uuid)
-         :did      did*
+         :did      did
          :state    (atom (initial-state branches branch))
          :alias    ledger-alias*
          :address  address
