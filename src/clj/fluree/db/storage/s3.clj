@@ -19,7 +19,7 @@
             bytes   (if (string? data)
                      (bytes/string->UTF8 data)
                      data)
-            path    (str/join "/" [dir hash])
+            path    (str/join "/" [dir hash ".json"])
             result  (<! (s3/write-s3-data client bucket prefix path bytes))
             address (s3/s3-address bucket prefix path)]
         (if (instance? Throwable result)
