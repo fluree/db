@@ -354,13 +354,15 @@
   "Returns a commit map with a new db registered.
   Assumes commit is not yet created (but db is persisted), so
   commit-id and commit-address are added after finalizing and persisting commit."
-  [{:keys [old-commit issuer message tag dbid t db-address flakes size author txn-id annotation]
+  [{:keys [old-commit issuer message tag dbid t db-address flakes size author
+           txn-id annotation]
     :as   _commit}]
   (let [prev-data   (select-keys (data old-commit) [:id :address])
         data-commit (new-db-commit dbid t db-address prev-data flakes size)
         prev-commit (not-empty (select-keys old-commit [:id :address]))
         commit      (-> old-commit
-                        (dissoc :id :address :data :issuer :time :message :tag :prev-commit)
+                        (dissoc :id :address :data :issuer :time :message :tag
+                                :prev-commit)
                         (assoc :address ""
                                :author author
                                :txn  txn-id

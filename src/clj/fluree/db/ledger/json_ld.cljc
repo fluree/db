@@ -184,6 +184,18 @@
     (subs ledger-alias 1)
     ledger-alias))
 
+(defn write-genesis-commit
+  [conn ledger-alias branch ns-addresses]
+  (go-try
+    (let [genesis-commit            (commit-data/blank-commit ledger-alias branch ns-addresses)
+          initial-context           (get genesis-commit "@context")
+          initial-db-data           (-> genesis-commit
+                                        (get "data")
+                                        (assoc "@context" initial-context))
+          {db-address :address}     (<? (connection/-c-write conn ledger-alias initial-db-data))
+          genesis-commit*           (assoc-in genesis-commit ["data" "address"] db-address)
+          {commit-address :address} (<? (connection/-c-write conn ledger-alias genesis-commit*))]
+      (assoc genesis-commit* "address" commit-address))))
 
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
@@ -212,30 +224,30 @@
                       (util/without-nils
                         {:reindex-min-bytes reindex-min-bytes
                          :reindex-max-bytes reindex-max-bytes})))
-          ledger-alias* (normalize-alias ledger-alias)
-          address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
-          ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
-          initial-commit (json-ld/expand
-                           (commit-data/blank-commit ledger-alias branch ns-addresses))
+          ledger-alias*  (normalize-alias ledger-alias)
+          address        (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
+          ns-addresses   (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
+          genesis-commit (json-ld/expand
+                           (<? (write-genesis-commit conn ledger-alias branch ns-addresses)))
           ;; map of all branches and where they are branched from
-          branches      {branch (<? (branch/new-branch-map conn ledger-alias* branch initial-commit))}]
+          branches       {branch (<? (branch/new-branch-map conn ledger-alias* branch genesis-commit))}]
       (map->JsonLDLedger
-        {:id      (random-uuid)
-         :did     did*
-         :state   (atom {:closed?  false
-                         :branches branches
-                         :branch   branch
-                         :graphs   {}
-                         :push     {:complete {:t   0
-                                               :dag nil}
-                                    :pending  {:t   0
-                                               :dag nil}}})
-         :alias   ledger-alias*
-         :address address
-         :cache   (atom {})
-         :indexer indexer
+        {:id       (random-uuid)
+         :did      did*
+         :state    (atom {:closed?  false
+                          :branches branches
+                          :branch   branch
+                          :graphs   {}
+                          :push     {:complete {:t   0
+                                                :dag nil}
+                                     :pending  {:t   0
+                                                :dag nil}}})
+         :alias    ledger-alias*
+         :address  address
+         :cache    (atom {})
+         :indexer  indexer
          :reasoner #{}
-         :conn    conn}))))
+         :conn     conn}))))
 
 (defn create
   [conn ledger-alias opts]
