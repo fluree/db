@@ -10,12 +10,11 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn new-branch-map
-  "Returns a new branch map for specified branch name off of supplied
-  current-branch."
-  [conn ledger-alias branch-name initial-commit]
+(defn load-branch-map
+  "Returns a branch map for specified branch name at supplied commit"
+  [conn ledger-alias branch-name commit]
   (go-try
-    (let [initial-db (<? (jld-db/load conn ledger-alias branch-name initial-commit))]
+    (let [initial-db (<? (jld-db/load conn ledger-alias branch-name commit))]
       {:name       branch-name
        :current-db initial-db})))
 
