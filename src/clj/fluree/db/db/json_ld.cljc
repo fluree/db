@@ -1,6 +1,7 @@
 (ns fluree.db.db.json-ld
   (:refer-clojure :exclude [load])
-  (:require [fluree.db.dbproto :as dbproto]
+  (:require [fluree.json-ld :as json-ld]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql :as fql]
             [fluree.db.index :as index]
@@ -182,7 +183,7 @@
 (defn load
   [conn ledger-alias branch commit-jsonld]
   (go-try
-    (let [commit-map (commit-data/jsonld->clj commit-jsonld)
+    (let [commit-map (-> commit-jsonld json-ld/expand commit-data/jsonld->clj)
           root-map   (if-let [{:keys [address]} (:index commit-map)]
                        (<? (index-storage/read-db-root conn address))
                        (genesis-root-map ledger-alias))
