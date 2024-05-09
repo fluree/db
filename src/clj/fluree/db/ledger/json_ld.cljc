@@ -197,6 +197,17 @@
           {commit-address :address} (<? (connection/-c-write conn ledger-alias genesis-commit*))]
       (assoc genesis-commit* "address" commit-address))))
 
+(defn initial-state
+  [branches current-branch]
+  {:closed?  false
+   :branches branches
+   :branch   current-branch
+   :graphs   {}
+   :push     {:complete {:t   0
+                         :dag nil}
+              :pending  {:t   0
+                         :dag nil}}})
+
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
@@ -234,14 +245,7 @@
       (map->JsonLDLedger
         {:id       (random-uuid)
          :did      did*
-         :state    (atom {:closed?  false
-                          :branches branches
-                          :branch   branch
-                          :graphs   {}
-                          :push     {:complete {:t   0
-                                                :dag nil}
-                                     :pending  {:t   0
-                                                :dag nil}}})
+         :state    (atom (initial-state branches branch))
          :alias    ledger-alias*
          :address  address
          :cache    (atom {})
