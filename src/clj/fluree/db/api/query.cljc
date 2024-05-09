@@ -3,6 +3,7 @@
   that are directly exposed"
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
+            [fluree.json-ld :as json-ld]
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
@@ -112,16 +113,21 @@
 (defn restrict-db
   [db t context opts]
   (go-try
-    (let [db*  (if-let [policy-identity (perm/parse-policy-identity opts context)]
-                 (<? (perm/wrap-policy db policy-identity))
-                 db)
-          db** (-> (if t
-                     (<? (time-travel/as-of db* t))
-                     db*))
-          db*** (if-let [reasoners (:reasoners opts)]
-                  (<? (reasoner/reason db** reasoners nil nil))
-                  db**)]
-      (assoc-in db*** [:policy :cache] (atom {})))))
+    (let [policy-db      (if-let [policy-identity (perm/parse-policy-identity opts context)]
+                           (<? (perm/wrap-policy db policy-identity))
+                           db)
+          time-travel-db (-> (if t
+                               (<? (time-travel/as-of policy-db t))
+                               policy-db))
+          reasoned-db    (let [{:keys [reasoners reasoner-rules reasoner-rules-db]} opts]
+                           (println reasoner-rules-db)
+                           (if reasoners
+                             ;; Currently we only support one rule source, so we take the first db or first
+                             ;; reason graph that we find.
+                             (<? (reasoner/reason
+                                  time-travel-db reasoners (or (first reasoner-rules-db) (first reasoner-rules)) opts))
+                             time-travel-db))]
+      (assoc-in reasoned-db [:policy :cache] (atom {})))))
 
 (defn track-query
   [ds max-fuel query]
