@@ -109,7 +109,7 @@
 
 ;; ================ end Jsonld record support fns ============================
 
-(defrecord JsonLdDb [alias branch commit t tt-id stats spot post opst tspo
+(defrecord JsonLdDb [conn alias branch commit t tt-id stats spot post opst tspo
                      schema comparators staged novelty policy namespaces
                      namespace-codes]
   dbproto/IFlureeDb
