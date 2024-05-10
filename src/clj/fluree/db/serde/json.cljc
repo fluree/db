@@ -36,17 +36,17 @@
         m  (-> flake-vec (get flake/m-pos) deserialize-meta)]
     (flake/create s p o dt t op m)))
 
-(defn deserialize-rhs
-  [rhs]
-  (when rhs
-    (deserialize-flake rhs)))
+(defn deserialize-flake-bound
+  [flake-bound]
+  (when flake-bound
+    (deserialize-flake flake-bound)))
 
 (defn deserialize-child-node
   "Turns :first and :rhs into flakes"
   [child-node]
   (-> child-node
-      (update :first deserialize-flake)
-      (update :rhs deserialize-rhs)))
+      (update :first deserialize-flake-bound)
+      (update :rhs deserialize-flake-bound)))
 
 (defn parse-int
   [x]
