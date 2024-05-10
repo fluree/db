@@ -291,10 +291,7 @@
 (defmethod parse-term :InlineDataOneVar
   ;; InlineDataOneVar ::= Var <'{'> WS DataBlockValue* <'}'>
   [[_ var & data-block-values]]
-  (if (> (count data-block-values) 1)
-    (throw (ex-info "Multiple inline data values not supported"
-                    {:status 400 :error :db/invalid-query}))
-    [:bind (parse-term var) (parse-term (first data-block-values))]))
+  [:values [(parse-term var) (mapv parse-term data-block-values)]])
 
 (defmethod parse-term :InlineData
   ;; InlineData ::= <'VALUES'> WS DataBlock
@@ -485,8 +482,17 @@
   [[_ & modifiers]]
   (mapcat parse-rule modifiers))
 
+(defn format-values
+  [{:keys [where] :as fql}]
+  (let [{values true
+         patterns false}
+        (group-by (fn [pattern] (= (first pattern) :values)) where)]
+    (cond-> (assoc fql :where patterns)
+      (seq values) (assoc :values (->> (mapv second values)
+                                       (apply mapv (fn [& values] (vec values))))))))
+
 (defn translate
   [parsed]
-  (reduce (fn [fql rule] (into fql (parse-rule rule)))
-          {}
-          parsed))
+  (->> parsed
+       (reduce (fn [fql rule] (into fql (parse-rule rule))) {})
+       (format-values)))
