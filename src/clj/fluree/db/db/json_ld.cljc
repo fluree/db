@@ -1,9 +1,9 @@
 (ns fluree.db.db.json-ld
   (:refer-clojure :exclude [load])
-  (:require [fluree.json-ld :as json-ld]
-            [fluree.db.dbproto :as dbproto]
+  (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql :as fql]
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.index :as index]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.query.range :as query-range]
@@ -13,6 +13,7 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.util.log :as log]
+            [fluree.db.json-ld.reify :as reify]
             [fluree.db.json-ld.commit-data :as commit-data]
             [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]])
   #?(:clj (:import (java.io Writer))))
@@ -183,7 +184,7 @@
 (defn load
   [conn ledger-alias branch commit-jsonld]
   (go-try
-    (let [commit-map (-> commit-jsonld json-ld/expand commit-data/jsonld->clj)
+    (let [commit-map (commit-data/jsonld->clj commit-jsonld)
           root-map   (if-let [{:keys [address]} (:index commit-map)]
                        (<? (index-storage/read-db-root conn address))
                        (genesis-root-map ledger-alias))
@@ -196,5 +197,16 @@
                                 :comparators index/comparators
                                 :staged []
                                 :policy root-policy-map)
-                         map->JsonLdDb)]
-      indexed-db)))
+                         map->JsonLdDb)
+          commit-t   (-> commit-jsonld
+                         (get-first const/iri-data)
+                         (get-first-value const/iri-t))
+          index-t    (:t indexed-db)]
+      (if (= commit-t index-t)
+        indexed-db
+        (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
+               db                 indexed-db]
+          (if commit-tuple
+            (let [new-db (<? (reify/merge-commit conn db commit-tuple))]
+              (recur r new-db))
+            db))))))

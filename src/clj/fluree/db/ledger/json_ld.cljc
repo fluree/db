@@ -252,7 +252,8 @@
           ledger-alias*  (normalize-alias ledger-alias)
           address        (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses   (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
-          genesis-commit (<? (write-genesis-commit conn ledger-alias branch ns-addresses))
+          genesis-commit (json-ld/expand
+                           (<? (write-genesis-commit conn ledger-alias branch ns-addresses)))
           ;; map of all branches and where they are branched from
           branches       {branch (<? (branch/load-branch-map conn ledger-alias* branch genesis-commit))}]
       (map->JsonLDLedger
@@ -315,12 +316,22 @@
           _            (log/debug "load commit:" commit)
           ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
-          ledger       (<? (create* conn ledger-alias {:branch branch}))
-          db           (ledger/-db ledger)
-          db*          (<? (jld-reify/load-db-idx ledger db commit commit-addr))]
-      (ledger/-commit-update! ledger branch db*)
+
+          {:keys [did branch indexer]} (parse-ledger-options conn {:branch branch})
+
+          branches {branch (<? (branch/load-branch-map conn ledger-alias branch commit))}
+          ledger   (map->JsonLDLedger
+                     {:id       (random-uuid)
+                      :did      did
+                      :state    (atom (initial-state branches branch))
+                      :alias    ledger-alias
+                      :address  address
+                      :cache    (atom {})
+                      :indexer  indexer
+                      :reasoner #{}
+                      :conn     conn})]
       (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
-      (async/put! ledger-chan ledger) ; note, ledger can be an exception!
+      (async/put! ledger-chan ledger)
       ledger)))
 
 (def fluree-address-prefix
