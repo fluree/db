@@ -188,11 +188,18 @@
   (testing "VALUES"
     (let [query "SELECT ?handle
                  WHERE {VALUES ?handle { \"dsanchez\" }
-                        ?person person:handle ?handle.}"
-          {:keys [where]} (sparql/->fql query)]
-      (is (= [[:bind "?handle" "dsanchez"]
-              {"@id" "?person", "person:handle" "?handle"}]
-             where))))
+                        ?person person:handle ?handle.}"]
+      (is (= {:where [{"@id" "?person", "person:handle" "?handle"}],
+              :values [["?handle"] [["dsanchez"]]]}
+             (select-keys (sparql/->fql query) [:where :values]))
+          "single var, single val"))
+    (let [query "SELECT ?handle
+                 WHERE {VALUES ?handle { \"dsanchez\" \"coolguy\"}
+                        ?person person:handle ?handle.}"]
+      (is (= {:where [{"@id" "?person", "person:handle" "?handle"}],
+              :values [["?handle"] [["dsanchez" "coolguy"]]]}
+             (select-keys (sparql/->fql query) [:where :values]))
+          "single var, multiple values")))
   (testing "BIND"
     (let [query "SELECT ?person ?handle
                  WHERE {BIND (\"dsanchez\" AS ?handle)
