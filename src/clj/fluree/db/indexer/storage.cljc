@@ -128,25 +128,6 @@
   (let [namespaces (-> root-map :namespace-codes map-invert)]
     (assoc root-map :namespaces namespaces)))
 
-(defn reify-db-root
-  "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
-  [blank-db root-data]
-  (go-try
-    (let [{:keys [t stats preds namespaces namespace-codes]}
-          root-data
-          db         (assoc blank-db
-                            :t t
-                            :stats stats
-                            :namespaces namespaces
-                            :namespace-codes namespace-codes)
-          indexed-db (reduce
-                       (fn [db* idx]
-                         (let [idx-root (get root-data idx)]
-                           (assoc db* idx idx-root)))
-                       db index/types)
-          schema     (<? (vocab/load-schema indexed-db preds))]
-      (assoc indexed-db :schema schema))))
-
 
 (defn read-garbage
   "Returns garbage file data for a given index t."
@@ -174,15 +155,6 @@
                             idx-address ".")
                        {:status 400
                         :error  :db/unavailable}))))))
-
-
-(defn reify-db
-  "Reifies db at specified index point. If unable to read db-root at index,
-  throws."
-  ([conn blank-db idx-address]
-   (go-try
-     (let [db-root (<? (read-db-root conn idx-address))]
-       (<? (reify-db-root blank-db db-root))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]

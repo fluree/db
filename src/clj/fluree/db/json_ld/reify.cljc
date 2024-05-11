@@ -6,7 +6,6 @@
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.connection :as connection]
-            [fluree.db.indexer.storage :as storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
             [fluree.db.datatype :as datatype]
@@ -378,32 +377,3 @@
           commit-tuples*
           (let [commit-tuple (<? (read-commit conn prev-commit-addr))]
             (recur commit-tuple commit-t commit-tuples*)))))))
-
-(defn load-db-idx
-  [{:keys [conn] :as _ledger} db latest-commit commit-address]
-  (go-try
-    (let [idx-meta   (get-first latest-commit const/iri-index) ; get persistent
-                                                               ; index meta if
-                                                               ; ledger has
-                                                               ; indexes
-          db-base    (if-let [idx-address (get-first-value idx-meta const/iri-address)]
-                       (<? (storage/reify-db conn db idx-address))
-                       db)
-          commit-map (commit-data/json-ld->map latest-commit
-                                               commit-address
-                                               (select-keys db-base index/types))
-          _          (log/debug "load-db-idx commit-map:" commit-map)
-          db-base*   (assoc db-base :commit commit-map)
-          index-t    (commit-data/index-t commit-map)
-          commit-t   (commit-data/t commit-map)]
-      (if (= commit-t index-t)
-        db-base* ;; if index-t is same as latest commit, no additional commits to load
-        ;; trace to the first unindexed commit TODO - load in parallel
-        (loop [[commit-tuple & r] (<? (trace-commits conn [latest-commit nil] (if index-t
-                                                                                (inc index-t)
-                                                                                1)))
-               db* db-base*]
-          (if commit-tuple
-            (let [new-db (<? (merge-commit conn db* commit-tuple))]
-              (recur r new-db))
-            db*))))))
