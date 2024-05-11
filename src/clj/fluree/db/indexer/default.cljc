@@ -89,6 +89,9 @@
 (defn lock-indexer
   "Generates a new indexing state if indexing wasn't already in-process.
 
+  If indexing was in-process, updates the update-commit-fn so latest commit file
+  is used for updated indexing.
+
   Returns two-tuple of lock status (true if successful, else false), and status
   map containing the assigned tempid, promise chan, and others (see code)."
   [state-atom branch t update-commit-fn]
@@ -97,7 +100,7 @@
                               (fn [{:keys [indexing] :as branch-state}]
                                 (if (:tempid indexing)      ;; if id exists, already indexing
                                   ;; Commits continue while indexing, update-commit-fn will always contain a closure of the latest committed db.
-                                  (assoc branch-state :update-commit-fn update-commit-fn)
+                                  (assoc-in branch-state [:indexing :update-commit-fn] update-commit-fn)
                                   ;; not indexing, establish
                                   (let [indexing-state {:tempid           tempid
                                                         :t                t
@@ -502,6 +505,7 @@
 (defn do-index
   "Performs an index operation and returns a promise-channel of the latest db once complete"
   [indexer {:keys [t branch] :as db} {:keys [update-commit changes-ch] :as opts}]
+  ;; note, lock-indexer will either acquire lock, or update `update-commit` fn to use latest commit
   (let [[lock? index-state]   (lock-indexer (:state-atom indexer) branch t update-commit)
         {:keys [tempid port]} index-state]
     (if lock?
