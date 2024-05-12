@@ -16,6 +16,7 @@
   (go-try
     (let [initial-db (<? (jld-db/load conn ledger-alias branch-name commit))]
       {:name       branch-name
+       :commit     commit
        :current-db initial-db})))
 
 (defn skipped-t?
@@ -81,7 +82,7 @@
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
   [branch-map {new-commit :commit, db-t :t, :as db}]
-  (let [current-commit (-> branch-map current-db :commit)
+  (let [current-commit (:commit branch-map)
         current-t      (commit-data/t current-commit)
         new-t          (commit-data/t new-commit)]
     (if (= db-t new-t)
