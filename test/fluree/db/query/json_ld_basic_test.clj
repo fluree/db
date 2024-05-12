@@ -8,7 +8,7 @@
     (let [conn    (test-utils/create-conn)
           movies  (test-utils/load-movies conn)
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
-          db      (fluree/db movies)]
+          db      @(fluree/db movies)]
       (testing "basic wildcard single subject query"
         (let [q         {:context context
                          :select  {:wiki/Q836821 [:*]}}
@@ -84,7 +84,7 @@
     (let [conn    (test-utils/create-conn)
           movies  (test-utils/load-movies conn)
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
-          db      (fluree/db movies)]
+          db      @(fluree/db movies)]
       (testing "basic analytical RFD type query"
         (let [query-res @(fluree/query db {:context context
                                            :select  '{?s [:* {:schema/isBasedOn [:*]}]}
@@ -134,7 +134,7 @@
           movies  (test-utils/load-movies conn)
           context [test-utils/default-context {:ex "http://example.org/ns/"}]]
       (testing "define @list container in context"
-        (let [db        @(fluree/stage (fluree/db movies)
+        (let [db        @(fluree/stage @(fluree/db movies)
                                        {"@context" ["https://ns.flur.ee" context]
                                         "insert"
                                         {:context {:id      "@id"
@@ -148,7 +148,7 @@
                  query-res)
               "Order of query result is different from transaction.")))
       (testing "define @list directly on subject"
-        (let [db        @(fluree/stage (fluree/db movies)
+        (let [db        @(fluree/stage @(fluree/db movies)
                                        {"@context" ["https://ns.flur.ee" context]
                                         "insert"
                                         {:context {:id "@id"}
@@ -166,7 +166,7 @@
         ledger  @(fluree/create conn "query/simple-subject-crawl")
         context [test-utils/default-context {:ex "http://example.org/ns/"}]
         db      @(fluree/stage
-                   (fluree/db ledger)
+                   @(fluree/db ledger)
                    {"@context" ["https://ns.flur.ee" context]
                     "insert"
                     [{:id           :ex/brian,
@@ -350,7 +350,7 @@
     (let [conn   (test-utils/create-conn)
           alias  "faux-compact-iri-query"
           ledger @(fluree/create conn alias)
-          db0    @(fluree/stage (fluree/db ledger)
+          db0    @(fluree/stage @(fluree/db ledger)
                                 {"@context" ["https://ns.flur.ee"
                                              test-utils/default-str-context]
                                  "insert"
@@ -359,7 +359,7 @@
                                   {"id"      "foaf:bar"
                                    "ex:name" "Bar"}]})
           _      @(fluree/commit! ledger db0)
-          db1    (->> alias (fluree/load conn) deref fluree/db)]
+          db1    (->> alias (fluree/load conn) deref fluree/db deref)]
 
       (is (= [["foaf:bar" "Bar"] ["foo" "Foo"]]
              @(fluree/query db1 {"@context" test-utils/default-str-context

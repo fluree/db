@@ -162,7 +162,7 @@
            "modify transaction in credential")
 
        (is (= []
-              @(fluree/query (fluree/db ledger) (async/<!! (cred/generate query (:private pleb-auth)))))
+              @(fluree/query @(fluree/db ledger) (async/<!! (cred/generate query (:private pleb-auth)))))
            "query credential w/ policy forbidding access")
        (is (= [{"id"         (:id auth)
                 "ct:name"    "D"

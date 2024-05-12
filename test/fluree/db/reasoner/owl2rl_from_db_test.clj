@@ -6,7 +6,7 @@
   (testing "Testing nested owl restrictions coming from same db as data"
     (let [conn          (test-utils/create-conn)
           ledger        @(fluree/create conn "reasoner/owl-in-db" nil)
-          db-base       @(fluree/stage (fluree/db ledger)
+          db-base       @(fluree/stage @(fluree/db ledger)
                                        {"@context" {"ex" "http://example.org/"}
                                         "insert"   [{"@id"   "ex:winery1"
                                                      "@type" "ex:Winery"}

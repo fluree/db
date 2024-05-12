@@ -8,7 +8,7 @@
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query-context")
-        db     @(fluree/stage (fluree/db ledger) {"@context" ["https://ns.flur.ee"
+        db     @(fluree/stage @(fluree/db ledger) {"@context" ["https://ns.flur.ee"
                                                               test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
                                                   "insert"   [{:id :ex/dan :ex/x 1}
@@ -83,7 +83,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/everything")
           db     @(fluree/stage
-                    (fluree/db ledger)
+                    @(fluree/db ledger)
                     {"@context" ["https://ns.flur.ee"
                                  test-utils/default-context
                                  {:ex "http://example.org/ns/"}]
@@ -222,7 +222,7 @@
   (testing "Illegal reference queries"
     (let [conn   (test-utils/create-conn)
           people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          db     @(fluree/db people)]
       (testing "with non-string objects"
         (let [test-subject @(fluree/query db {:context [test-utils/default-context
                                                         {:ex "http://example.org/ns/"}]
@@ -248,7 +248,7 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/class")
         db     @(fluree/stage
-                  (fluree/db ledger)
+                  @(fluree/db ledger)
                   {"@context" ["https://ns.flur.ee"
                                test-utils/default-context
                                {:ex "http://example.org/ns/"}]
@@ -286,7 +286,7 @@
                                      :where   '{:id ?s, :type ?class}})))))
     (testing "shacl targetClass"
       (let [shacl-db @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee"
                                      test-utils/default-context
                                      {:ex "http://example.org/ns/"}]
@@ -305,7 +305,7 @@
 (deftest ^:integration type-handling
   (let [conn   @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "type-handling")
-        db0    (fluree/db ledger)
+        db0    @(fluree/db ledger)
         db1    @(fluree/stage db0 {"@context" ["https://ns.flur.ee"
                                                test-utils/default-str-context
                                                {"ex" "http://example.org/ns/"}]

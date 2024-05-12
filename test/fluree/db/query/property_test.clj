@@ -8,8 +8,7 @@
   (testing "Equivalent properties"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "query/equivalent-properties")
-          db      (-> ledger
-                      (fluree/db)
+          db      (-> @(fluree/db ledger)
                       (fluree/stage {"@context" {"vocab1" "http://vocab1.example.org/"
                                                  "vocab2" "http://vocab2.example.org/"
                                                  "vocab3" "http://vocab3.example.fr/"
@@ -74,8 +73,7 @@
   (testing "Sub-properties - rdfs:subPropertyOf"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/rdfs-subpropertyof")
-          db     (-> ledger
-                     (fluree/db)
+          db     (-> @(fluree/db ledger)
                      (fluree/stage {"@context" {"ex"   "http://example.org/ns/"
                                                 "rdf"  "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
@@ -146,7 +144,7 @@
   (testing "predicate iri-cache loookups"
     (let [conn    @(fluree/connect {:method :memory})
           ledger  @(fluree/create conn "propertypathstest")
-          db0     (fluree/db ledger)
+          db0     @(fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/"}]
           db1     @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                       "insert"   [{"@id"            "ex:unlabeled-pred"
@@ -219,7 +217,7 @@
                      {"ex"  "http://example.com/"
                       "owl" "http://www.w3.org/2002/07/owl#"}]
           ledger    @(fluree/create conn ledger-id)
-          db0       (->> @(fluree/stage (fluree/db ledger) {"@context" ["https://ns.flur.ee" context]
+          db0       (->> @(fluree/stage @(fluree/db ledger) {"@context" ["https://ns.flur.ee" context]
                                                             "insert"   {"ex:new" true}})
                          (fluree/commit! ledger)
                          (deref))
@@ -250,7 +248,7 @@
                                        "ex:fool" false
                                        "ex:cool" true}]})
           loaded @(fluree/load conn ledger-id)
-          dbl    (fluree/db loaded)]
+          dbl    @(fluree/db loaded)]
       (testing "before load"
         (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
                 {"id" "ex:dan", "ex:givenName" "Dan"}]

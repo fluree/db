@@ -1,9 +1,7 @@
 (ns fluree.db.shacl.shacl-logical-test
-  (:require [clojure.string :as str]
-            [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]))
+            [fluree.db.test-utils :as test-utils]))
 
 (use-fixtures :each test-utils/deterministic-blank-node-fixture)
 
@@ -16,7 +14,7 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id             :ex/UserShape
@@ -130,7 +128,7 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id             :ex/UserShape
@@ -273,7 +271,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id             :ex/UserShape
@@ -426,7 +424,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "shacl-and")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
-        db0     (fluree/db ledger)
+        db0     @(fluree/db ledger)
         db1     @(fluree/stage db0 {"@context" context
                                     "insert"
                                     {"@id" "ex:andShape"
@@ -470,7 +468,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "shacl-or")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
-        db0     (fluree/db ledger)
+        db0     @(fluree/db ledger)
         db1     @(fluree/stage db0 {"@context" context
                                     "insert"
                                     {"@id" "ex:orShape"
@@ -514,7 +512,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "shacl-or")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
-        db0     (fluree/db ledger)
+        db0     @(fluree/db ledger)
         db1     @(fluree/stage db0 {"@context" context
                                     "insert"
                                     {"@id"           "ex:orShape"

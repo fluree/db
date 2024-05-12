@@ -9,7 +9,7 @@
   (testing "only gets results from that t"
     (let [conn   (test-utils/create-conn)
           ledger (test-utils/load-movies conn)
-          db     (fluree/db ledger)
+          db     @(fluree/db ledger)
           movies @(fluree/query db {:context [test-utils/default-context
                                               {:ex "http://example.org/ns/"}]
                                     :select  '{?s [:*]}
@@ -52,7 +52,7 @@
                                                   (fn [] start-iso)}
                                    (fn []
                                      (let [db1 @(fluree/stage
-                                                  (fluree/db ledger)
+                                                  @(fluree/db ledger)
                                                   {"@context" ["https://ns.flur.ee"
                                                                test-utils/default-context
                                                                {:ex "http://example.org/ns/"}]
@@ -64,7 +64,7 @@
                                                   (fn [] three-loaded-iso)}
                                    (fn []
                                      (let [db2 @(fluree/stage
-                                                  (fluree/db ledger)
+                                                  @(fluree/db ledger)
                                                   {"@context" ["https://ns.flur.ee"
                                                                test-utils/default-context
                                                                {:ex "http://example.org/ns/"}]
@@ -76,13 +76,13 @@
                                                   (fn [] all-loaded-iso)}
                                    (fn []
                                      (let [db3 @(fluree/stage
-                                                  (fluree/db ledger)
+                                                  @(fluree/db ledger)
                                                   {"@context" ["https://ns.flur.ee"
                                                                test-utils/default-context
                                                                {:ex "http://example.org/ns/"}]
                                                    "insert"   (nth test-utils/movies 2)})]
                                        @(fluree/commit! ledger db3))))
-          db                     (fluree/db ledger)
+          db                     @(fluree/db ledger)
           base-query             {:context test-utils/default-context
                                   :select  '{?s [:*]}
                                   :where   '{:id ?s, :type :schema/Movie}}

@@ -29,7 +29,7 @@
   (testing "owl equality semantics tests eq-sym and eq-trans"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base @(fluree/stage (fluree/db ledger)
+          db-base @(fluree/stage @(fluree/db ledger)
                                  {"@context" {"ex" "http://example.org/"}
                                   "insert"   [{"@id"        "ex:carol"
                                                "ex:zipCode" 60657}
@@ -75,7 +75,7 @@
 
       (testing "Testing owl:sameAs transitivity (eq-trans)"
         (let [ledger      @(fluree/create conn "reasoner/eq-trans" nil)
-              db-same     @(fluree/stage (fluree/db ledger)
+              db-same     @(fluree/stage @(fluree/db ledger)
                                          {"@context" {"ex"   "http://example.org/"
                                                       "owl"  "http://www.w3.org/2002/07/owl#"
                                                       "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
@@ -111,7 +111,7 @@
       ;; and for now eq-rep-p is not supported. It would act like owl:equivalentProperty
       (testing "Testing owl:sameAs (eq-rep-s, eq-rep-o)"
         (let [ledger        @(fluree/create conn "reasoner/eq-rep" nil)
-              db-same       @(fluree/stage (fluree/db ledger)
+              db-same       @(fluree/stage @(fluree/db ledger)
                                            {"@context" {"ex"   "http://example.org/"
                                                         "owl"  "http://www.w3.org/2002/07/owl#"
                                                         "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
@@ -179,7 +179,7 @@
   (testing "rdfs:domain and rdfs:range tests"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+          db-base @(fluree/stage @(fluree/db ledger) reasoning-db-data)]
 
       (testing "Testing rdfs:domain - rule: prp-dom"
         (let [db-prp-dom @(fluree/reason
@@ -276,7 +276,7 @@
   (testing "owl:FunctionalProperty tests"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
+          db-base     @(fluree/stage @(fluree/db ledger)
                                      {"@context" {"ex" "http://example.org/"}
                                       "insert"   [{"@id"       "ex:brian"
                                                    "ex:mother" [{"@id" "ex:carol"} {"@id" "ex:carol2"}]}
@@ -333,7 +333,7 @@
   (testing "owl:InverseFunctionalProperty tests"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
+          db-base     @(fluree/stage @(fluree/db ledger)
                                      {"@context" {"ex" "http://example.org/"}
                                       "insert"   [{"@id"      "ex:brian"
                                                    "ex:email" "brian@example.org"}
@@ -374,7 +374,7 @@
   (testing "owl:SymetricProperty tests"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+          db-base @(fluree/stage @(fluree/db ledger) reasoning-db-data)]
 
       (testing "Testing owl:SymetricProperty - rule: prp-symp"
         (let [db-livesWith @(fluree/stage db-base
@@ -404,7 +404,7 @@
   (testing "owl:TransitiveProperty tests  - rule: prp-trp"
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base      @(fluree/stage (fluree/db ledger) reasoning-db-data)
+          db-base      @(fluree/stage @(fluree/db ledger) reasoning-db-data)
           db-livesWith @(fluree/stage db-base
                                       {"@context" {"ex"   "http://example.org/"
                                                    "owl"  "http://www.w3.org/2002/07/owl#"
@@ -437,7 +437,7 @@
   (testing "rdfs:subPropertyOf tests  - rule: prp-spo1"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/owl2rl-rdfs-subPropertyOf" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
+          db-base     @(fluree/stage @(fluree/db ledger)
                                      {"@context" {"ex" "http://example.org/"}
                                       "insert"   [{"@id"       "ex:bob"
                                                    "ex:mother" {"@id" "ex:alice-mom"}
@@ -470,7 +470,7 @@
   (testing "owl:propertyChainAxiom tests  - rule: prp-spo2"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
+          db-base     @(fluree/stage @(fluree/db ledger)
                                      {"@context" {"ex" "http://example.org/"}
                                       "insert"   [{"@id"       "ex:person-a"
                                                    "ex:parent" [{"@id" "ex:mom"} {"@id" "ex:dad"}]}
@@ -523,7 +523,7 @@
   (testing "owl:inverseOf tests"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
+          db-base     @(fluree/stage @(fluree/db ledger)
                                      {"@context" {"ex" "http://example.org/"}
                                       "insert"   [{"@id"       "ex:son"
                                                    "ex:parent" [{"@id" "ex:mom"} {"@id" "ex:dad"}]}
@@ -568,7 +568,7 @@
   (testing "owl:hasKey tests"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
+          db-base     @(fluree/stage @(fluree/db ledger)
                                      {"@context" {"ex" "http://example.org/"}
                                       "insert"   [{"@id"                "ex:brian"
                                                    "@type"              ["ex:RegisteredPatient"]

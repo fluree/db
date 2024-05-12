@@ -10,7 +10,7 @@
           ledger @(fluree/create conn "query/reverse")
           context          [test-utils/default-context {:ex "http://example.org/ns/"}]
           db     @(fluree/stage
-                    (fluree/db ledger)
+                    @(fluree/db ledger)
                     {"@context" ["https://ns.flur.ee" context]
                      "insert"
                      [{:id           :ex/brian
@@ -50,7 +50,7 @@
 (deftest ^:integration reverse-preds-in-where-and-select
   (let [conn   @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "reverse")
-        db0    (fluree/db ledger)
+        db0    @(fluree/db ledger)
 
         db1 @(fluree/stage db0 {"@context" {"ex" "http://example.org/ns/"}
                                 "insert"   [{"@id"      "ex:dad"

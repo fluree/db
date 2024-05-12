@@ -12,7 +12,7 @@
           ledger  @(fluree/create conn "query/index-range")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db      @(fluree/stage
-                     (fluree/db ledger)
+                     @(fluree/db ledger)
                      {"@context" ["https://ns.flur.ee" context]
                       "insert"
                       [{:id           :ex/brian,

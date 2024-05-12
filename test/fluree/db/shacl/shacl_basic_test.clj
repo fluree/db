@@ -1,9 +1,7 @@
 (ns fluree.db.shacl.shacl-basic-test
-  (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]))
+            [fluree.db.test-utils :as test-utils]))
 
 (use-fixtures :each test-utils/deterministic-blank-node-fixture)
 
@@ -13,7 +11,7 @@
           ledger    @(fluree/create conn "class/testing")
           context   [test-utils/default-context {:ex "http://example.org/ns/"}]
           db1       @(fluree/stage
-                      (fluree/db ledger)
+                      @(fluree/db ledger)
                       {"@context" ["https://ns.flur.ee" context]
                        "insert"   {:id                 :ex/MyClass
                                    :schema/description "Just a basic object not used as a class"}})
@@ -39,7 +37,7 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                          (fluree/db ledger)
+                          @(fluree/db ledger)
                           {"@context" ["https://ns.flur.ee" context]
                            "insert"
                            {:id             :ex/UserShape
@@ -127,7 +125,7 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id             :ex/UserShape
@@ -212,7 +210,7 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id                   :ex/UserShape
@@ -272,7 +270,7 @@
                       :where   {:id '?s, :type :ex/User}}]
       (testing "single-cardinality equals"
         (let [db @(fluree/stage
-                    (fluree/db ledger)
+                    @(fluree/db ledger)
                     {"@context" ["https://ns.flur.ee" context]
                      "insert"
                      {:id             :ex/EqualNamesShape
@@ -323,7 +321,7 @@
                    @(fluree/query db-ok user-query))))))
       (testing "multi-cardinality equals"
         (let [db @(fluree/stage
-                    (fluree/db ledger)
+                    @(fluree/db ledger)
                     {"@context" ["https://ns.flur.ee" context]
                      "insert"
                      {:id             :ex/EqualNamesShape
@@ -471,7 +469,7 @@
                    @(fluree/query db-ok2 user-query))))))
       (testing "disjoint"
         (let [db @(fluree/stage
-                    (fluree/db ledger)
+                    @(fluree/db ledger)
                     {"@context" ["https://ns.flur.ee" context]
                      "insert"
                      {:id             :ex/DisjointShape
@@ -583,7 +581,7 @@
                      (ex-message db-not-disjoint3)))))))
       (testing "lessThan"
         (let [db     @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id             :ex/LessThanShape
@@ -765,7 +763,7 @@
                      (ex-message db-iris)))))))
       (testing "lessThanOrEquals"
         (let [db @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id             :ex/LessThanOrEqualsShape
@@ -928,7 +926,7 @@
                       :where   {:id '?s, :type :ex/User}}]
       (testing "exclusive constraints"
         (let [db @(fluree/stage
-                    (fluree/db ledger)
+                    @(fluree/db ledger)
                     {"@context" ["https://ns.flur.ee" context]
                      "insert"
                      {:id             :ex/ExclusiveNumRangeShape
@@ -1003,7 +1001,7 @@
                      (ex-message db-too-high)))))))
       (testing "inclusive constraints"
         (let [db @(fluree/stage
-                    (fluree/db ledger)
+                    @(fluree/db ledger)
                     {"@context" ["https://ns.flur.ee" context]
                      "insert"
                      {:id             :ex/InclusiveNumRangeShape
@@ -1088,7 +1086,7 @@
                      (ex-message db-too-high)))))))
       (testing "non-numeric values"
         (let [db         @(fluree/stage
-                            (fluree/db ledger)
+                            @(fluree/db ledger)
                             {"@context" ["https://ns.flur.ee" context]
                              "insert"
                              {:id             :ex/NumRangeShape
@@ -1157,7 +1155,7 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id             :ex/UserShape
@@ -1304,7 +1302,7 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id             :ex/UserShape
@@ -1430,7 +1428,7 @@ WORLD!")
         ledger  @(fluree/create conn "validation-report")
         context ["https://ns.flur.ee" test-utils/default-str-context
                  {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     @(fluree/db ledger)]
     (testing "language-in"
       (let [db1 @(fluree/stage db0 {"@context" context
                                     "insert"
@@ -1518,7 +1516,7 @@ WORLD!")
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                        (fluree/db ledger)
+                        @(fluree/db ledger)
                         {"@context" ["https://ns.flur.ee" context]
                          "insert"
                          {:id             :ex/UserShape
@@ -1681,7 +1679,7 @@ WORLD!")
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "propertypathstest")
         context [test-utils/default-str-context {"ex" "http://example.com/"}]
-        db0     (fluree/db ledger)]
+        db0     @(fluree/db ledger)]
     (testing "inverse path"
       (let [;; a valid Parent is anybody who is the object of a parent predicate
             db1          @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
@@ -1910,7 +1908,7 @@ WORLD!")
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "classtest")
         context test-utils/default-str-context
-        db0     (fluree/db ledger)
+        db0     @(fluree/db ledger)
         db1     @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                     "insert"   [{"@type"          "sh:NodeShape"
                                                  "sh:targetClass" {"@id" "https://example.com/Country"}
@@ -2021,7 +2019,7 @@ WORLD!")
     (let [conn    @(fluree/connect {:method :memory})
           ledger  @(fluree/create conn "shacl-in-test")
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-          db0     (fluree/db ledger)
+          db0     @(fluree/db ledger)
           db1     @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                       "insert"   [{"type"           ["sh:NodeShape"]
                                                    "sh:targetClass" {"id" "ex:Pony"}
@@ -2053,7 +2051,7 @@ WORLD!")
   (testing "node refs"
     (let [conn    @(fluree/connect {:method :memory})
           ledger  @(fluree/create conn "shacl-in-test")
-          db0     (fluree/db ledger)
+          db0     @(fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1     @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                       "insert"   [{"type"           ["sh:NodeShape"]
@@ -2110,7 +2108,7 @@ WORLD!")
   (testing "mixed values and refs"
     (let [conn    @(fluree/connect {:method :memory})
           ledger  @(fluree/create conn "shacl-in-test")
-          db0     (fluree/db ledger)
+          db0     @(fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1     @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                       "insert"   [{"type"           ["sh:NodeShape"]
@@ -2148,7 +2146,7 @@ WORLD!")
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "shacl-target-objects-of-test")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     @(fluree/db ledger)]
     (testing "subject and object of constrained predicate in the same txn"
       (testing "datatype constraint"
         (let [db1                @(fluree/stage db0
@@ -2409,7 +2407,7 @@ WORLD!")
   (testing "sh:node"
     (let [conn    @(fluree/connect {:method :memory})
           ledger  @(fluree/create conn "shape-constaints")
-          db0     (fluree/db ledger)
+          db0     @(fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
 
           db1            @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
@@ -2459,7 +2457,7 @@ WORLD!")
   (testing "sh:qualifiedValueShape property shape"
     (let [conn        @(fluree/connect {:method :memory})
           ledger      @(fluree/create conn "shape-constaints")
-          db0         (fluree/db ledger)
+          db0         @(fluree/db ledger)
           context     [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1         @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                           "insert"   [{"id"             "ex:KidShape"
@@ -2516,7 +2514,7 @@ WORLD!")
   (testing "sh:qualifiedValueShape node shape"
     (let [conn   @(fluree/connect {:method :memory})
           ledger @(fluree/create conn "shape-constaints")
-          db0    (fluree/db ledger)
+          db0    @(fluree/db ledger)
 
           context     [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1         @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
@@ -2579,7 +2577,7 @@ WORLD!")
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn   @(fluree/connect {:method :memory})
           ledger @(fluree/create conn "shape-constraints")
-          db0    (fluree/db ledger)
+          db0    @(fluree/db ledger)
 
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1     @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
@@ -2670,7 +2668,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "post-processing")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     @(fluree/db ledger)]
     (testing "shacl-objects-of-test"
       (let [db1                 @(fluree/stage db0
                                                {"@context" ["https://ns.flur.ee" context]
@@ -2803,7 +2801,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "validation-report")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     @(fluree/db ledger)]
     (testing "severity"
       (testing "no severity specified defaults to sh:Violation"
         (let [db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
@@ -2885,7 +2883,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "validation-report")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)
+        db0     @(fluree/db ledger)
 
         db1 @(fluree/stage db0 {"@context" context
                                 "insert"
@@ -2909,7 +2907,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "validation-report")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)
+        db0     @(fluree/db ledger)
 
         db1 @(fluree/stage db0 {"@context" context
                                 "insert"
@@ -2933,7 +2931,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "validation-report")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)
+        db0     @(fluree/db ledger)
 
         db1 @(fluree/stage db0 {"@context" context
                                 "insert"

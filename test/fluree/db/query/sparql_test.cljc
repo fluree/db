@@ -350,6 +350,7 @@
                       (fluree/create "people")
                       deref
                       fluree/db
+                      deref
                       (fluree/stage {"@context" ["https://ns.flur.ee"
                                                  test-utils/default-str-context
                                                  {"person" "http://example.org/Person#"}]

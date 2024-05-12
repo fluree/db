@@ -263,10 +263,11 @@
   and/or permissioned to a specific identity."
   ([ledger] (db ledger nil))
   ([ledger opts]
-   (if opts
-     (throw (ex-info "DB opts not yet implemented"
-                     {:status 500 :error :db/unexpected-error}))
-     (ledger/-db ledger opts))))
+   (promise-wrap
+     (if opts
+       (throw (ex-info "DB opts not yet implemented"
+                       {:status 500 :error :db/unexpected-error}))
+       (ledger/-db ledger opts)))))
 
 
 (defn wrap-policy
@@ -328,7 +329,7 @@
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   [ledger query]
-  (let [latest-db (ledger/-db ledger)
+  (let [latest-db @(db ledger)
         res-chan  (query-api/history latest-db query)]
     (promise-wrap res-chan)))
 
@@ -441,4 +442,3 @@
      (if group-fn
        (group-by group-fn result)
        result))))
-

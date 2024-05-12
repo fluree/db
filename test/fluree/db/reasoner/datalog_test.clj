@@ -28,7 +28,7 @@
   (testing "Some basic datalog rules"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "reasoner/basic-datalog" nil)
-          db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+          db0    @(fluree/stage @(fluree/db ledger) reasoning-db-data)]
 
 
 
@@ -123,7 +123,7 @@
   (testing "Datalog rules given as JSON-LD at query-time"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "reasoner/basic-datalog-rules" nil)
-          db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+          db0    @(fluree/stage @(fluree/db ledger) reasoning-db-data)]
 
       (testing "A recursive relationship"
         (let [grandparents-db @(fluree/reason db0 :datalog {"@context" {"f"  "https://ns.flur.ee/ledger#"
@@ -153,7 +153,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "reasoner/recursive-datalog" nil)
           db0    @(fluree/stage
-                    (fluree/db ledger)
+                    @(fluree/db ledger)
                     {"@context" {"ex" "http://example.org/"}
                      "insert"   [{"@id"                    "ex:task1"
                                   "ex:description"         "Task 1 (Top Level)"

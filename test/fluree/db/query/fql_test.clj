@@ -7,7 +7,7 @@
   (testing "grouped queries"
     (let [conn   (test-utils/create-conn)
           people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          db     @(fluree/db people)]
       (testing "with a single grouped-by field"
         (let [qry     {:context  [test-utils/default-context
                                   {:ex "http://example.org/ns/"}]
@@ -72,7 +72,7 @@
   (testing "Distinct queries"
     (let [conn   (test-utils/create-conn)
           people (test-utils/load-people conn)
-          db     (fluree/db people)
+          db     @(fluree/db people)
           q      {:context         [test-utils/default-context
                                     {:ex "http://example.org/ns/"}]
                   :select-distinct '[?name ?email]
@@ -91,7 +91,7 @@
   (testing "Queries with pre-specified values"
     (let [conn   (test-utils/create-conn)
           people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          db     @(fluree/db people)]
       (testing "binding a single variable"
         (testing "with a single value"
           (let [q {:context [test-utils/default-context
@@ -169,7 +169,7 @@
 (deftest ^:integration bind-query-test
   (let [conn   (test-utils/create-conn)
         people (test-utils/load-people conn)
-        db     (fluree/db people)]
+        db     @(fluree/db people)]
     (testing "with 2 separate fn binds"
       (let [q   {:context  [test-utils/default-context
                             {:ex "http://example.org/ns/"}]
@@ -221,7 +221,7 @@
 (deftest ^:integration iri-test
   (let [conn   (test-utils/create-conn)
         movies (test-utils/load-movies conn)
-        db     (fluree/db movies)]
+        db     @(fluree/db movies)]
     (testing "iri references"
       (let [test-subject @(fluree/query db {:context test-utils/default-context
                                             :select  '[?name]
@@ -233,7 +233,7 @@
 (deftest ^:integration id-test
   (let [conn   (test-utils/create-conn)
         movies (test-utils/load-movies conn)
-        db     (fluree/db movies)]
+        db     @(fluree/db movies)]
     (testing "searching for bare id maps"
       (let [test-subject @(fluree/query db {:context test-utils/default-context
                                             :select  '[?id]
@@ -263,7 +263,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "jobs")
           db     @(fluree/stage
-                    (fluree/db ledger)
+                    @(fluree/db ledger)
                     {"@context" ["https://ns.flur.ee"
                                  {"ex"         "http://example.com/vocab/"
                                   "occupation" {"@id"        "ex:occupation"
@@ -323,7 +323,7 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "people")
         db     @(fluree/stage
-                  (fluree/db ledger)
+                  @(fluree/db ledger)
                   {"@context" ["https://ns.flur.ee"
                                test-utils/default-context
                                {:ex "http://example.org/ns/"}]
@@ -349,7 +349,7 @@
 (deftest ^:integration subject-object-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "test/love")
-        db     @(fluree/stage (fluree/db ledger)
+        db     @(fluree/stage @(fluree/db ledger)
                               {"@context" ["https://ns.flur.ee"
                                            {"id"     "@id",
                                             "type"   "@type",
@@ -394,7 +394,7 @@
 (deftest ^:integration select-star-no-graph-crawl-test
   (let [conn   (test-utils/create-conn)
         ledger (test-utils/load-people conn)
-        db     (fluree/db ledger)]
+        db     @(fluree/db ledger)]
     (testing "select * w/o graph crawl returns all vars bound in where clause"
       (let [query   {:context [test-utils/default-context
                                {:ex "http://example.org/ns/"}]

@@ -25,7 +25,7 @@
              check1       @(fluree/exists? conn ledger-alias)
              ledger       @(fluree/create conn ledger-alias)
              check2       @(fluree/exists? conn ledger-alias)
-             _            @(fluree/stage (fluree/db ledger)
+             _            @(fluree/stage @(fluree/db ledger)
                                          {"@context" ["https://ns.flur.ee"
                                                       test-utils/default-context]
                                           "insert"
@@ -39,7 +39,7 @@
        (let [conn         (test-utils/create-conn)
              ledger-alias "testledger"
              ledger       @(fluree/create conn ledger-alias)
-             db           @(fluree/stage (fluree/db ledger)
+             db           @(fluree/stage @(fluree/db ledger)
                                          {"@context" ["https://ns.flur.ee"
                                                       test-utils/default-context]
                                           "insert"
@@ -56,7 +56,8 @@
           (let [conn         (<! (test-utils/create-conn))
                 ledger-alias "testledger"
                 ledger       (<p! (fluree/create conn ledger-alias))
-                db           (<p! (fluree/stage (fluree/db ledger)
+                db0          (<p! (fluree/db ledger))
+                db           (<p! (fluree/stage db0
                                                 {"@context" ["https://ns.flur.ee"
                                                              test-utils/default-context]
                                                  "insert"
@@ -76,7 +77,7 @@
                ledger-alias "load-from-file-test-single-card"
                ledger       @(fluree/create conn ledger-alias )
                db           @(fluree/stage
-                               (fluree/db ledger)
+                               @(fluree/db ledger)
                                {"@context" ["https://ns.flur.ee"
                                             test-utils/default-context
                                             {:ex "http://example.org/ns/"}]
@@ -109,7 +110,7 @@
                target-t  (:t db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                loaded    (test-utils/load-to-t conn ledger-alias target-t 100)
-               loaded-db (fluree/db loaded)]
+               loaded-db @(fluree/db loaded)]
            (is (= target-t (:t loaded-db))))))
 
      (testing "can load a file ledger with multi-cardinality predicates"
@@ -118,7 +119,7 @@
                ledger-alias "load-from-file-test-multi-card"
                ledger       @(fluree/create conn ledger-alias)
                db           @(fluree/stage
-                               (fluree/db ledger)
+                               @(fluree/db ledger)
                                {"@context" ["https://ns.flur.ee"
                                             test-utils/default-context
                                             {:ex "http://example.org/ns/"}]
@@ -158,7 +159,7 @@
                target-t  (:t db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                loaded    (test-utils/load-to-t conn ledger-alias target-t 100)
-               loaded-db (fluree/db loaded)]
+               loaded-db @(fluree/db loaded)]
            (is (= target-t (:t loaded-db))))))
 
      (testing "query returns the correct results from a loaded ledger"
@@ -167,7 +168,7 @@
                ledger-alias "load-from-file-query"
                ledger       @(fluree/create conn ledger-alias)
                db           @(fluree/stage
-                               (fluree/db ledger)
+                               @(fluree/db ledger)
                                {"@context" ["https://ns.flur.ee"
                                             {:id     "@id"
                                              :type   "@type"
@@ -185,7 +186,7 @@
                res1         @(fluree/query db query)
                _            @(fluree/commit! ledger db)
                loaded       (test-utils/retry-load conn ledger-alias 100)
-               loaded-db    (fluree/db loaded)
+               loaded-db    @(fluree/db loaded)
                res2         @(fluree/query loaded-db query)]
            (is (= res1 res2)))))
 
@@ -197,7 +198,7 @@
                ledger       @(fluree/create conn ledger-alias
                                             {:reindex-min-bytes 0}) ; force reindex on every commit
                db           @(fluree/stage
-                               (fluree/db ledger)
+                               @(fluree/db ledger)
                                {"@context" ["https://ns.flur.ee"
                                             test-utils/default-context
                                             {:ex "http://example.org/ns/"}]
@@ -213,7 +214,7 @@
                db           @(fluree/commit! ledger db)
                target-t     (:t db)
                loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
-               loaded-db    (fluree/db loaded)]
+               loaded-db    @(fluree/db loaded)]
            (is (= target-t (:t loaded-db)))
            (testing "query returns expected `list` values"
              (is (= [{:id         :ex/alice,
@@ -235,7 +236,7 @@
                  ledger-alias "load-policy-test"
                  ledger       @(fluree/create conn ledger-alias)
                  db           @(fluree/stage
-                                 (fluree/db ledger)
+                                 @(fluree/db ledger)
                                  {"@context" ["https://ns.flur.ee"
                                               test-utils/default-context
                                               {:ex "http://example.org/ns/"}]
@@ -277,7 +278,7 @@
                  target-t     (:t db+policy)
                  loaded       (test-utils/load-to-t conn ledger-alias target-t
                                                     100)
-                 loaded-db    (fluree/db loaded)]
+                 loaded-db    @(fluree/db loaded)]
              (is (= target-t (:t loaded-db)))
              (testing "query returns expected policy"
                (is (= [{:id            :ex/UserPolicy,
@@ -309,7 +310,7 @@
                                         :storage-path storage-path})
                ledger @(fluree/create conn "index/datetimes")
                db     @(fluree/stage
-                         (fluree/db ledger)
+                         @(fluree/db ledger)
                          {"@context" ["https://ns.flur.ee"
                                       test-utils/default-str-context
                                       {"ex" "http://example.org/ns/"}]
@@ -335,7 +336,7 @@
                                       {"ex" "http://example.org/ns/"}]
                           "select"   {"?s" ["*"]}
                           "where"    {"@id" "?s", "type" "ex:Bar"}}]
-           (is (= @(fluree/query (fluree/db loaded) q)
+           (is (= @(fluree/query @(fluree/db loaded) q)
                   @(fluree/query db q))))))))
 
 #?(:clj
@@ -345,7 +346,7 @@
              ledger-alias "load-from-memory-test-single-card"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
-                             (fluree/db ledger)
+                             @(fluree/db ledger)
                              {"@context" ["https://ns.flur.ee"
                                           test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
@@ -377,7 +378,7 @@
              target-t  (:t db)
              ;; TODO: Replace this w/ :syncTo equivalent once we have it
              loaded    (test-utils/load-to-t conn ledger-alias target-t 100)
-             loaded-db (fluree/db loaded)]
+             loaded-db @(fluree/db loaded)]
          (is (= target-t (:t loaded-db)))))
 
      (testing "can load a memory ledger with multi-cardinality predicates"
@@ -385,7 +386,7 @@
              ledger-alias "load-from-memory-test-multi-card"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
-                             (fluree/db ledger)
+                             @(fluree/db ledger)
                              {"@context" ["https://ns.flur.ee"
                                           test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
@@ -425,7 +426,7 @@
              target-t  (:t db)
              ;; TODO: Replace this w/ :syncTo equivalent once we have it
              loaded    (test-utils/load-to-t conn ledger-alias target-t 100)
-             loaded-db (fluree/db loaded)]
+             loaded-db @(fluree/db loaded)]
          (is (= target-t (:t loaded-db)))))
 
      (testing "query returns the correct results from a loaded ledger"
@@ -433,7 +434,7 @@
              ledger-alias   "load-from-memory-query"
              ledger         @(fluree/create conn ledger-alias)
              db             @(fluree/stage
-                               (fluree/db ledger)
+                               @(fluree/db ledger)
                                {"@context" ["https://ns.flur.ee"
                                             {:id     "@id"
                                              :type   "@type"
@@ -451,7 +452,7 @@
              res1           @(fluree/query db query)
              _              @(fluree/commit! ledger db)
              loaded         (test-utils/retry-load conn ledger-alias 100)
-             loaded-db      (fluree/db loaded)
+             loaded-db      @(fluree/db loaded)
              res2           @(fluree/query loaded-db query)]
          (is (= res1 res2))))
 
@@ -460,7 +461,7 @@
              ledger-alias "load-lists-test"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
-                             (fluree/db ledger)
+                             @(fluree/db ledger)
                              {"@context" ["https://ns.flur.ee"
                                           test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
@@ -476,7 +477,7 @@
              db           @(fluree/commit! ledger db)
              target-t     (:t db)
              loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
-             loaded-db    (fluree/db loaded)]
+             loaded-db    @(fluree/db loaded)]
          (is (= target-t (:t loaded-db)))
          (testing "query returns expected `list` values"
            (is (= #{{:id         :ex/cam,
@@ -496,7 +497,7 @@
                ledger-alias "load-policy-test"
                ledger       @(fluree/create conn ledger-alias)
                db           @(fluree/stage
-                               (fluree/db ledger)
+                               @(fluree/db ledger)
                                {"@context" ["https://ns.flur.ee"
                                             test-utils/default-context
                                             {:ex "http://example.org/ns/"}]
@@ -533,7 +534,7 @@
                db+policy    @(fluree/commit! ledger db+policy)
                target-t     (:t db+policy)
                loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
-               loaded-db    (fluree/db loaded)]
+               loaded-db    @(fluree/db loaded)]
            (is (= target-t (:t loaded-db)))
            (testing "query returns expected policy"
              (is (= [{:id            :ex/UserPolicy
@@ -589,7 +590,7 @@
                   "type"           "sh:NodeShape",
                   "sh:targetClass" {"id" "schema:Person"},
                   "sh:property"    {"sh:path" {"id" "schema:familyName"}, "sh:datatype" {"id" "xsd:string"}}}]
-                @(fluree/query (fluree/db loaded1) property-query)))
+                @(fluree/query @(fluree/db loaded1) property-query)))
          (testing "load ref retracts"
            (let [db2     @(test-utils/transact loaded1
                                                {"@context" ["https://ns.flur.ee"
@@ -610,13 +611,13 @@
                       "type"           "sh:NodeShape",
                       "sh:targetClass" {"id" "schema:Person"},
                       "sh:property"    {"sh:path" {"id" "schema:age"}, "sh:datatype" {"id" "xsd:string"}}}]
-                    @(fluree/query (fluree/db loaded2) property-query)))))))
+                    @(fluree/query @(fluree/db loaded2) property-query)))))))
     (testing "can load after deletion of entire subjects"
       (let [conn              @(fluree/connect {:method :memory})
             ledger-alias      "tx/delete"
             ledger            @(fluree/create conn ledger-alias)
             db1               @(fluree/stage
-                                 (fluree/db ledger)
+                                 @(fluree/db ledger)
                                  {"@context" ["https://ns.flur.ee"
                                               test-utils/default-context
                                               {:ex "http://example.org/ns/"}]
@@ -640,7 +641,7 @@
                                :where   '{:id ?s, :schema/description ?description}}
             _                 @(fluree/commit! ledger db1)
             loaded1           (test-utils/retry-load conn ledger-alias 100)
-            loaded-db1        (fluree/db loaded1)
+            loaded-db1        @(fluree/db loaded1)
             db2               @(fluree/stage
                                  loaded-db1
                                  {"@context" ["https://ns.flur.ee"
@@ -650,7 +651,7 @@
                                   "delete"   {:id :ex/mosquitos, "?p" "?o"}})
             _                 @(fluree/commit! ledger db2)
             loaded2           (test-utils/retry-load conn ledger-alias 100)
-            loaded-db2        (fluree/db loaded2)]
+            loaded-db2        @(fluree/db loaded2)]
         (is (= [{:id :ex/fluree} {:id :ex/w3c} {:id :ex/kittens}]
                 @(fluree/query loaded-db2 description-query))
              "The id :ex/mosquitos should be removed")
@@ -665,7 +666,7 @@
                                          "?p"  "?o"}})
               _          @(fluree/commit! ledger db3)
               loaded3    (test-utils/retry-load conn ledger-alias 100)
-              loaded-db3 (fluree/db loaded3)]
+              loaded-db3 @(fluree/db loaded3)]
           (is (= [{:id :ex/kittens}]
                   @(fluree/query loaded-db3 description-query))
                "Only :ex/kittens should be left"))))))
@@ -685,14 +686,15 @@
       #?(:clj
          (let [conn    (test-utils/create-conn)
                ledger  (test-utils/load-people conn)
-               results @(fluree/query (fluree/db ledger) query)]
+               results @(fluree/query @(fluree/db ledger) query)]
            (is (= expected results)))
          :cljs
          (async done
            (go
              (let [conn    (<! (test-utils/create-conn))
                    ledger  (<! (test-utils/load-people conn))
-                   results (<p! (fluree/query (fluree/db ledger) query))]
+                   db0     (<p! (fluree/db ledger))
+                   results (<p! (fluree/query db0 query))]
                (is (= expected results))
                (done))))))))
 
@@ -701,7 +703,7 @@
      (testing "fuel tracking"
        (let [conn   (test-utils/create-conn)
              ledger @(fluree/create conn "test/fuel-tracking")
-             db0    (fluree/db ledger)]
+             db0    @(fluree/db ledger)]
          (testing "transactions"
            (testing "with the `:meta` option"
              (let [response    @(fluree/stage db0 {"@context" ["https://ns.flur.ee"
@@ -769,7 +771,7 @@
          (testing "fuel tracking"
            (let [conn   (<! (test-utils/create-conn))
                  ledger (<p! (fluree/create conn "test/fuel-tracking"))
-                 db0    (fluree/db ledger)]
+                 db0    (<p! (fluree/db ledger))]
              (testing "transactions"
                (testing "with the `:meta` option"
                  (let [response    (<p! (fluree/stage db0 {"@context" ["https://ns.flur.ee"
@@ -842,7 +844,7 @@
      (let [conn      @(fluree/connect {:method :memory})
            ledger-id "update-syntax"
            ledger    @(fluree/create conn ledger-id)
-           db0       (fluree/db ledger)
+           db0       @(fluree/db ledger)
 
            db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee"
                                                test-utils/default-str-context

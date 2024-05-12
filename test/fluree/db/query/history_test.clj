@@ -940,7 +940,7 @@
           root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
           root-did     (:id (did/private->did-map root-privkey))
 
-          db0 (fluree/db ledger)
+          db0 @(fluree/db ledger)
           db1 @(fluree/stage db0 {"@context" context
                                   "insert"   [{"@id"         "ex:betty"
                                                "@type"       "ex:Yeti"
@@ -998,7 +998,7 @@
             ledger       @(fluree/create conn ledger-name)
             context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
 
-            db0 (fluree/db ledger)
+            db0 @(fluree/db ledger)
             db1 (->> @(fluree/stage db0 {"@context" context
                                          "insert" [{"@id" "ex:betty"
                                                     "@type" "ex:Yeti"

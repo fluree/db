@@ -73,8 +73,9 @@
       (if-not (<? (nameservice/exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))
         (let [ledger (<? (jld-ledger/load conn address))
-              db     (<? (stage (ledger/-db ledger) txn* parsed-opts))]
-          (<? (ledger/-commit! ledger db)))))))
+              db     (<? (ledger/-db ledger))
+              staged (<? (stage db txn* parsed-opts))]
+          (<? (ledger/-commit! ledger staged)))))))
 
 (defn create-with-txn
   [conn txn]
@@ -99,5 +100,6 @@
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
         (let [ledger (<? (jld-ledger/create conn ledger-id parsed-opts))
-              db     (<? (stage (ledger/-db ledger) txn* parsed-opts))]
-          (<? (ledger/-commit! ledger db)))))))
+              db     (<? (ledger/-db ledger))
+              staged (<? (stage db txn* parsed-opts))]
+          (<? (ledger/-commit! ledger staged)))))))

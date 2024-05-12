@@ -9,7 +9,7 @@
           ledger @(fluree/create conn "stable-commit-id")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db0    @(fluree/stage
-                    (fluree/db ledger)
+                    @(fluree/db ledger)
                     {"@context" ["https://ns.flur.ee" context]
                      "insert"
                      [{:id           :ex/alice

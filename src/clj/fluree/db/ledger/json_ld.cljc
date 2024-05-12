@@ -33,12 +33,13 @@
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn db
   [ledger {:keys [branch]}]
-  (let [branch-meta (ledger/-branch ledger branch)]
-    ;; if branch is nil, will return default
-    (when-not branch-meta
-      (throw (ex-info (str "Invalid branch: " branch ".")
-                      {:status 400 :error :db/invalid-branch})))
-    (branch/current-db branch-meta)))
+  (go-try
+    (let [branch-meta (ledger/-branch ledger branch)]
+      ;; if branch is nil, will return default
+      (when-not branch-meta
+        (throw (ex-info (str "Invalid branch: " branch ".")
+                        {:status 400 :error :db/invalid-branch})))
+      (branch/current-db branch-meta))))
 
 (defn db-update
   "Updates db, will throw if not next 't' from current db.
@@ -92,15 +93,16 @@
 
 (defn commit!
   [ledger db opts]
-  (let [{:keys [branch] :as opts*}
-        (normalize-opts opts)
-        {:keys [t] :as db*} (or db (ledger/-db ledger branch))
-        committed-t                (ledger/latest-commit-t ledger branch)]
-    (if (= t (flake/next-t committed-t))
-      (jld-commit/commit ledger db* opts*)
-      (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
-                           " is no longer consistent with staged db 't' value of: " t ".")
-                      {:status 400 :error :db/invalid-commit})))))
+  (go-try
+    (let [{:keys [branch] :as opts*}
+          (normalize-opts opts)
+          {:keys [t] :as db*} (or db (<? (ledger/-db ledger branch)))
+          committed-t                (ledger/latest-commit-t ledger branch)]
+      (if (= t (flake/next-t committed-t))
+        (<? (jld-commit/commit ledger db* opts*))
+        (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
+                             " is no longer consistent with staged db 't' value of: " t ".")
+                        {:status 400 :error :db/invalid-commit}))))))
 
 (defn close-ledger
   "Shuts down ledger and resources."
@@ -125,7 +127,7 @@
           commit-t   (-> expanded-commit
                          (get-first const/iri-data)
                          (get-first-value const/iri-t))
-          current-db (ledger/-db ledger {:branch branch})
+          current-db (<? (ledger/-db ledger {:branch branch}))
           current-t  (:t current-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
                  "where current cached db t value is:" current-t)

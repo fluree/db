@@ -8,7 +8,7 @@
     (let [conn           (test-utils/create-conn)
           ledger         @(fluree/create conn "tx/retract")
           db             @(fluree/stage
-                            (fluree/db ledger)
+                            @(fluree/db ledger)
                             {"@context" ["https://ns.flur.ee"]
                              "insert"
                              {:context [test-utils/default-context

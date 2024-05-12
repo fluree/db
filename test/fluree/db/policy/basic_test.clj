@@ -18,7 +18,7 @@
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db        @(fluree/stage
-                       (fluree/db ledger)
+                       @(fluree/db ledger)
                        {"@context"          context
                         "insert"
                         [{:id               :ex/alice,
@@ -291,7 +291,7 @@
           ledger      @(fluree/create conn ledger-name)
           alice-did   "did:fluree:Tf6i5oh2ssYNRpxxUM2zea1Yo7x4uRqyTeU"
           db          @(fluree/stage
-                         (fluree/db ledger)
+                         @(fluree/db ledger)
                          {"@context" ["https://ns.flur.ee"
                                       {:id     "@id"
                                        :type   "@type"
@@ -363,7 +363,7 @@
 (deftest ^:integration missing-type
   (let [conn      @(fluree/connect {:method :memory})
         ledger    @(fluree/create conn "policy")
-        db0       (fluree/db ledger)
+        db0       @(fluree/db ledger)
         context   [test-utils/default-str-context {"ex" "http://example.com/"}]
         alice-did "did:fluree:Tf6i5oh2ssYNRpxxUM2zea1Yo7x4uRqyTeU"
 
@@ -410,7 +410,7 @@
                        "f"      "https://ns.flur.ee/ledger#"}
         ledger        @(fluree/create conn "test/root-read")
         root-read-did (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
-        db            @(fluree/stage (fluree/db ledger )
+        db            @(fluree/stage @(fluree/db ledger )
                                      {"@context" context
                                       "insert"   [{"@id"         "ex:betty"
                                                    "@type"       "ex:Yeti"
@@ -471,7 +471,7 @@
         pleb-did     (:id (did/private->did-map pleb-privkey))
         root-privkey "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
         root-did     (:id (did/private->did-map root-privkey))
-        db           @(fluree/stage (fluree/db ledger )
+        db           @(fluree/stage @(fluree/db ledger )
                                     {"@context" context
                                      "insert"   [{"@id"         "ex:betty"
                                                   "@type"       "ex:Yeti"

@@ -124,9 +124,9 @@
   [conn]
   (let [ledger @(fluree/create conn "test/movies")]
     (doseq [movie movies]
-      (let [staged @(fluree/stage (fluree/db ledger) {"@context" ["https://ns.flur.ee"
-                                                                  default-str-context]
-                                                      "insert" movie})]
+      (let [staged @(fluree/stage @(fluree/db ledger) {"@context" ["https://ns.flur.ee"
+                                                                   default-str-context]
+                                                       "insert" movie})]
         @(fluree/commit! ledger staged
                          {:message (str "Commit " (get movie "name"))
                           :push?   true})))
@@ -137,10 +137,12 @@
   (#?(:clj do, :cljs go)
     (let [ledger-p (fluree/create conn "test/people")
           ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
-          staged-p (fluree/stage (fluree/db ledger) {"@context" ["https://ns.flur.ee"
-                                                                 default-context
-                                                                 {:ex "http://example.org/ns/"}]
-                                                     "insert" people})
+          db-p     (fluree/db ledger)
+          db       #?(:clj @db-p :cljs (<p! db-p))
+          staged-p (fluree/stage db {"@context" ["https://ns.flur.ee"
+                                                 default-context
+                                                 {:ex "http://example.org/ns/"}]
+                                     "insert" people})
           staged   #?(:clj @staged-p, :cljs (<p! staged-p))
           commit-p (fluree/commit! ledger staged {:message "Adding people"
                                                   :push? true})]
@@ -151,7 +153,7 @@
   ([ledger data]
    (transact ledger data {}))
   ([ledger data commit-opts]
-   (let [staged @(fluree/stage (fluree/db ledger) data)]
+   (let [staged @(fluree/stage @(fluree/db ledger) data)]
      (fluree/commit! ledger staged commit-opts))))
 
 (defn retry-promise-wrapped
@@ -190,7 +192,7 @@
   (let [attempts-per-batch (/ max-attempts 10)]
     (loop [attempts-left (- max-attempts attempts-per-batch)]
       (let [ledger (retry-load conn ledger-alias attempts-per-batch)
-            db-t   (-> ledger fluree/db :t)]
+            db-t   (:t @(fluree/db ledger))]
         (if (and (< db-t t) (pos-int? attempts-left))
           (recur (- attempts-left attempts-per-batch))
           ledger)))))

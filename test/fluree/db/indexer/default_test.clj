@@ -15,7 +15,7 @@
             context (merge test-utils/default-str-context {"ex" "http://example.org/ns/"})
             ledger  @(fluree/create conn "index/datetimes")
             db      @(fluree/stage
-                       (fluree/db ledger)
+                       @(fluree/db ledger)
                        {"@context" ["https://ns.flur.ee" context]
                         "insert"
                         [{"@id"   "ex:Foo",
@@ -38,5 +38,5 @@
             q         {"@context" context
                        "select"   {"?s" ["*"]}
                        "where"    {"@id" "?s", "type" "ex:Bar"}}]
-        (is (= @(fluree/query (fluree/db loaded) q)
+        (is (= @(fluree/query @(fluree/db loaded) q)
                @(fluree/query db q)))))))

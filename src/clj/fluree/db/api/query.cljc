@@ -229,7 +229,7 @@
       (let [[alias explicit-t] (extract-query-string-t alias)
             address (<? (nameservice/primary-address conn alias nil))
             ledger  (<? (jld-ledger/load conn address))
-            db      (ledger/-db ledger)
+            db      (<? (ledger/-db ledger))
             t*      (or explicit-t t)]
         (<? (restrict-db db t* context opts)))
       (catch* e

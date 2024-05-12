@@ -7,7 +7,7 @@
   (testing "Deletions of entire subjects."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "tx/delete")
-          db     @(fluree/stage (fluree/db ledger)
+          db     @(fluree/stage @(fluree/db ledger)
                                 {"@context" ["https://ns.flur.ee"
                                              test-utils/default-context
                                              {:ex "http://example.org/ns/"}]
@@ -160,7 +160,7 @@
 (deftest transaction-functions
   (let [conn   @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "functions")
-        db1    (fluree/db ledger)]
+        db1    @(fluree/db ledger)]
 
     (testing "hash functions"
       (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
@@ -509,7 +509,7 @@
                    "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
                    "schema" "http://schema.org/",
                    "xsd"    "http://www.w3.org/2001/XMLSchema#"}
-        love      @(fluree/stage (fluree/db ledger)
+        love      @(fluree/stage @(fluree/db ledger)
                                  {"@context" ["https://ns.flur.ee" context]
                                   "insert"
                                   [{"@id"                "ex:fluree",
@@ -546,7 +546,7 @@
                                        "schema:description" ?o
                                        ?p                   ?o}
                           "delete"   '{"id" "?s", "?p" "?o"}})
-      (let [db2     (fluree/db @(fluree/load conn ledger-id))
+      (let [db2     @(fluree/db @(fluree/load conn ledger-id))
             q       {:context context
                      :select '[?s ?p ?o]
                      :where  '{"id"                 ?s
@@ -562,7 +562,7 @@
     (let [conn        (test-utils/create-conn)
           ledger-name "rando-txn"
           ledger      @(fluree/create conn "rando-txn")
-          db0         (fluree/db ledger)
+          db0         @(fluree/db ledger)
           db1         @(fluree/stage
                          db0
                          {"@context" ["https://ns.flur.ee"
@@ -600,7 +600,7 @@
   (testing "Updating data with iri values bindings"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "update-without-insert")
-          db0    (fluree/db ledger)
+          db0    @(fluree/db ledger)
           db1    @(fluree/stage db0
                                 {"@context" ["https://ns.flur.ee"
                                              test-utils/default-context

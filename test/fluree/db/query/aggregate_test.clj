@@ -7,7 +7,7 @@
   (testing "aggregate queries"
     (let [conn   (test-utils/create-conn)
           people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          db     @(fluree/db people)]
       (testing "with explicit grouping"
         (let [qry     {:context  [test-utils/default-context
                                   {:ex "http://example.org/ns/"}]

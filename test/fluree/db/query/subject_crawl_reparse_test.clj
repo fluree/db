@@ -15,7 +15,7 @@
                   :vocab2 "http://vocab2.example.org"}]
         ledger @(fluree/create conn "query/parse")
         db     @(fluree/stage
-                  (fluree/db ledger)
+                  @(fluree/db ledger)
                   {"@context" ["https://ns.flur.ee"
                                context]
                    "insert"

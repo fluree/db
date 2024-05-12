@@ -15,7 +15,7 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "ledger/datatype")]
     (testing "Querying predicates with mixed datatypes"
-      (let [mixed-db @(fluree/stage (fluree/db ledger)
+      (let [mixed-db @(fluree/stage @(fluree/db ledger)
                                      {"@context" "https://ns.flur.ee"
                                       "insert"
                                       [{:context     default-context
