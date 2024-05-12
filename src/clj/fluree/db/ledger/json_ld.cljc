@@ -41,15 +41,6 @@
                         {:status 400 :error :db/invalid-branch})))
       (branch/current-db branch-meta))))
 
-(defn db-update
-  "Updates db, will throw if not next 't' from current db.
-  Returns original db, or if index has since been updated then
-  updated db with new index point."
-  [{:keys [state] :as _ledger} {:keys [branch] :as db}]
-  (-> state
-      (swap! update-in [:branches branch] branch/update-db db)
-      (get-in [:branches branch :current-db])))
-
 (defn commit-update
   "Updates both latest db and commit db. If latest registered index is
   newer than provided db, updates index before storing.
