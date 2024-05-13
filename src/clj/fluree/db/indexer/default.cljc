@@ -518,11 +518,11 @@
                 {:keys [update-commit-fn port]} index-state*]
             ;; in case event listener wanted final indexed db, put on established port
             (when (fn? update-commit-fn)
-              (let [result (<! (update-commit-fn indexed-db))]
+              (let [result (<! (update-commit-fn indexed-db))] ;; will return 'nil if commit not updated
                 (when (util/exception? result)
                   (log/error result "Exception updating commit with new index: " (ex-message result))
                   (throw result))
-                (when changes-ch
+                (when (and changes-ch result)
                   (>! changes-ch {:event :new-commit
                                   :data  result}))))
 

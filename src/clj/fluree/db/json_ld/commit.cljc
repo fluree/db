@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.commit
-  (:require [fluree.json-ld :as json-ld]
+  (:require [fluree.db.json-ld.branch :as branch]
+            [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]
             [fluree.db.datatype :as datatype]
             [fluree.db.serde.json :as serde-json]
@@ -248,37 +249,64 @@
         (flake/t-after? (commit-data/t db-commit)
                         ledger-t))))
 
-(defn do-commit+push
-  "Writes commit and pushes, kicks off indexing if necessary."
-  [ledger {:keys [commit] :as db} {:keys [branch did private] :as _opts}]
-  (go-try
-    (let [{:keys [conn state]} ledger
-          ledger-commit (:commit (ledger/-status ledger branch))
-          new-commit    (commit-data/use-latest-index commit ledger-commit)
-          _             (log/debug "do-commit+push new-commit:" new-commit)
-          [new-commit* jld-commit] (commit-data/commit-jsonld new-commit)
-          signed-commit (if did
-                          (<? (cred/generate jld-commit private (:id did)))
-                          jld-commit)
-          commit-res    (<? (connection/-c-write conn ledger signed-commit)) ;; write commit credential
-          new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
-          db*           (assoc db :commit new-commit**)
-          db**          (if (new-t? ledger-commit commit)
-                          (commit-data/add-commit-flakes (:prev-commit db) db*)
-                          db*)
-          db***         (ledger/-commit-update! ledger branch (dissoc db** :txns))
-          push-res      (<? (nameservice/push! conn (assoc new-commit**
-                                                           :meta commit-res
-                                                           :json-ld jld-commit
-                                                           :ledger-state state)))]
-      {:commit-res  commit-res
-       :push-res    push-res
-       :db          db***})))
-
 (defn newer-commit?
   [db commit]
   (flake/t-after? (commit-data/t (:commit db))
                   (commit-data/t commit)))
+
+;; stores latest index commit for each ledger on active transaction server
+;; that is updating indexes. If server is not updating indexes, this will be nil
+(def latest-index-atom (atom nil))
+
+(defn update-latest-index
+  "When a new index is available, updates in the latest-index-atom if newer than
+  last registered index. New commits will always consult here for latest index
+  before writing."
+  [ledger index-commit]
+  (let [ledger-id (:id ledger)]
+    (swap! latest-index-atom update ledger-id
+           (fn [ledger-commit]
+             (if (branch/updated-index? ledger-commit index-commit)
+               index-commit
+               ledger-commit)))))
+
+(defn do-commit+push
+  "Writes commit and pushes, kicks off indexing if necessary."
+  [ledger {:keys [commit] :as db} {:keys [branch did private index-update?] :as _opts}]
+  (go-try
+   (let [{:keys [conn state]} ledger
+         ledger-commit (:commit (ledger/-status ledger branch))
+         new-commit    (commit-data/use-latest-index commit (or (get @latest-index-atom (:id ledger))
+                                                             ledger-commit))
+         _             (log/debug "do-commit+push new-commit:" new-commit)
+         [new-commit* jld-commit] (commit-data/commit-jsonld new-commit)
+         signed-commit (if did
+                         (<? (cred/generate jld-commit private (:id did)))
+                         jld-commit)
+         commit-res    (<? (connection/-c-write conn ledger signed-commit)) ;; write commit credential
+         new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
+         db*           (assoc db :commit new-commit**)
+         db**          (if (new-t? ledger-commit commit)
+                         (commit-data/add-commit-flakes (:prev-commit db) db*)
+                         db*)]
+     (if (or (not index-update?)
+             ;; if an index-update?, check latest committed 't' one last time.
+             (not (newer-commit? (ledger/-db ledger) commit)))
+       (let [db***    (ledger/-commit-update! ledger branch (dissoc db** :txns))
+             push-res (<? (nameservice/push! conn (assoc new-commit**
+                                                    :meta commit-res
+                                                    :json-ld jld-commit
+                                                    :ledger-state state)))]
+         {:commit-res commit-res
+          :push-res   push-res
+          :db         db***})
+       (log/info "Index completion for t:" (commit-data/index-t commit)
+                 "attempted to update commit for t:" (commit-data/t commit)
+                 "however while preparing the commit, a newer db @ t:"
+                 (commit-data/t (:commit (ledger/-status ledger branch)))
+                 "was written. Server is likely under heavy load, skipping index update."
+                 "Either commit for t:" (commit-data/t (:commit (ledger/-status ledger branch)))
+                 "or next commit will pick up latest index.")))))
 
 (defn update-commit-fn
   "Returns a fn that receives a newly indexed db as its only argument.
@@ -286,11 +314,12 @@
   a new commit and push to the name service(s) if configured to do so."
   [ledger committed-db commit-opts]
   (fn [indexed-db]
+    (update-latest-index ledger (:commit indexed-db))
     (let [indexed-commit (:commit indexed-db)
           new-db         (if (newer-commit? committed-db indexed-commit)
                            (dbproto/-index-update committed-db (:index indexed-commit))
                            indexed-db)]
-      (do-commit+push ledger new-db commit-opts))))
+      (do-commit+push ledger new-db (assoc commit-opts :index-update? true)))))
 
 (defn run-index
   "Runs indexer. Will update the latest commit file with new index point
