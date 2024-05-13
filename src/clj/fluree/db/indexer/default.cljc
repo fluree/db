@@ -535,7 +535,9 @@
               (async/close! changes-ch)))
           (catch* e
                   (log/error e "Error encountered creating index for db: " db ". "
-                             "Indexing stopped."))))
+                             "Indexing stopped.")
+                  (when changes-ch
+                    (async/close! changes-ch)))))
       (when changes-ch ;; if we don't have a lock, nothing to index so close changes-ch if it exists
         (async/close! changes-ch)))
     port))
