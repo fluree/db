@@ -241,11 +241,10 @@
             ledger             (<? (jld-ledger/load conn address))
             db                 (ledger/-db ledger)
             t*                 (or explicit-t t)
-            rules-db           (let [db-or-alias (:reasoner-rules-db opts)]
-                                 (if (string? (first db-or-alias))
-                                   [(ledger/-db (<? (jld-ledger/load conn (first db-or-alias)))
-                                                {})]
-                                   db-or-alias))
+            rules-db           (let [dbs-or-aliases (:reasoner-rules-db opts)]
+                                 (if (string? (first dbs-or-aliases))
+                                   [(ledger/-db (<? (jld-ledger/load conn (first dbs-or-aliases))))]
+                                   dbs-or-aliases))
             opts*              (assoc opts :reasoner-rules-db rules-db)]
         (<? (restrict-db db t* context opts*)))
       (catch* e
