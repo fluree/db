@@ -34,7 +34,10 @@
    201 #{300 301}}
 
    Initial pred-items argument looks like:
-   #{{:iri 'http://schema.org/Patient', :class true, :subclassOf [1002], :id 1003} ...}
+   #{{:id #fluree/SID[8 'address'],
+      :iri 'http://schema.org/Patient',
+      :subclassOf #{#fluree/SID[8 'location']}
+      :datatype nil} ...}
    "
   [pred-items]
   (let [subclass-map (reduce
@@ -72,16 +75,13 @@
 
 (defn initial-property-map
   [db sid]
-  (if (= sid const/$rdf:type)
-    {:id    sid ; rdf:type is predefined, so flakes to build map won't be present.
-     :class false}
-    (let [iri (iri/decode-sid db sid)]
-      {:id          sid
-       :iri         iri
-       :class       true ; default
-       :subclassOf  #{}
-       :parentProps #{}
-       :childProps  #{}})))
+  (let [iri (iri/decode-sid db sid)]
+    {:id          sid
+     :iri         iri
+     :subclassOf  #{}
+     :parentProps #{}
+     :childProps  #{}
+     :datatype    nil}))
 
 (defn add-subclass
   [prop-map subclass]
@@ -175,19 +175,8 @@
   [db pred-map vocab-flake]
   (let [[sid pid obj]   ((juxt flake/s flake/p flake/o) vocab-flake)
         initial-map     (initial-property-map db sid)
-        with-properties (fnil assoc initial-map)
         with-subclass   (fnil add-subclass initial-map)]
     (cond
-      (= const/$rdf:type pid)
-      (if (contains? property-sids obj)
-        (if (= const/$owl:ObjectProperty obj)
-          (update pred-map sid with-properties :class false)
-          (update pred-map sid with-properties :class false))
-        (if (= const/$xsd:anyURI obj)
-          (update pred-map sid with-properties :class false)
-          ;; it is a class, but we already did :class true as a default
-          pred-map))
-
       (= const/$rdfs:subClassOf pid)
       (update pred-map sid with-subclass obj)
 
