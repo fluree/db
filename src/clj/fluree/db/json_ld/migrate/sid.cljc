@@ -52,13 +52,13 @@
           retracted-flakes (reify/retract-flakes ns-mapping t-new retract)
           db*              (set-namespaces db ns-mapping)
 
-          {:keys [previous issuer message] :as commit-metadata}
+          {:keys [previous issuer message data] :as commit-metadata}
           (commit-data/json-ld->map commit db*)
 
           commit-id          (:id commit-metadata)
           commit-sid         (iri/encode-iri db* commit-id)
           [prev-commit _]    (some->> previous :address (reify/read-commit conn) <?)
-          db-sid             (iri/encode-iri db* alias)
+          db-sid             (iri/encode-iri db* (:id data))
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new commit-sid db-sid)
           previous-id        (when prev-commit (:id prev-commit))
