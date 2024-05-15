@@ -1,7 +1,8 @@
 (ns fluree.db.json-ld.commit-data
   (:require [fluree.crypto :as crypto]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [get-first get-first-value]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
+            [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
@@ -391,22 +392,29 @@
    (update-novelty db add []))
 
   ([db add rem]
-   (let [ref-add     (ref-flakes add)
-         ref-rem     (ref-flakes rem)
-         flake-count (cond-> 0
-                             add (+ (count add))
-                             rem (- (count rem)))
-         flake-size  (cond-> 0
-                             add (+ (flake/size-bytes add))
-                             rem (- (flake/size-bytes rem)))]
-     (-> db
-         (update-in [:novelty :spot] flake/revise add rem)
-         (update-in [:novelty :post] flake/revise add rem)
-         (update-in [:novelty :opst] flake/revise ref-add ref-rem)
-         (update-in [:novelty :tspo] flake/revise add rem)
-         (update-in [:novelty :size] + flake-size)
-         (update-in [:stats :size] + flake-size)
-         (update-in [:stats :flakes] + flake-count)))))
+   (try*
+    (let [ref-add     (ref-flakes add)
+          ref-rem     (ref-flakes rem)
+          flake-count (cond-> 0
+                              add (+ (count add))
+                              rem (- (count rem)))
+          flake-size  (cond-> 0
+                              add (+ (flake/size-bytes add))
+                              rem (- (flake/size-bytes rem)))]
+      (-> db
+          (update-in [:novelty :spot] flake/revise add rem)
+          (update-in [:novelty :post] flake/revise add rem)
+          (update-in [:novelty :opst] flake/revise ref-add ref-rem)
+          (update-in [:novelty :tspo] flake/revise add rem)
+          (update-in [:novelty :size] + flake-size)
+          (update-in [:stats :size] + flake-size)
+          (update-in [:stats :flakes] + flake-count)))
+    (catch* e
+            (log/error (str "Update novelty unexpected error while attempting to updated db: "
+                            (pr-str db) " due to exception: " (ex-message e))
+                       {:add-flakes add
+                        :rem-flakes rem})
+            (throw e)))))
 
 (defn add-tt-id
   "Associates a unique tt-id for any in-memory staged db in their index roots.
