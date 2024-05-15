@@ -261,8 +261,8 @@
                              [:binding ::function]]]
     ::where-op             [:and
                             :keyword
-                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind"}
-                             :graph :filter :optional :union :bind]]
+                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind, values"}
+                             :graph :filter :optional :union :bind :values]]
     ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
@@ -294,6 +294,9 @@
                             [:union [:catn
                                      [:op ::where-op]
                                      [:clauses ::union]]]
+                            [:values [:catn
+                                      [:op ::where-op]
+                                      [:patterns ::values]]]
                             [:bind [:catn
                                     [:op ::where-op]
                                     [:bindings ::bind]]]
