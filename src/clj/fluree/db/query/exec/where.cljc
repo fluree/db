@@ -566,6 +566,11 @@
                           clause-ch)
     out-ch))
 
+(defmethod match-pattern :values
+  [db fuel-tracker solution pattern error-ch]
+  (let [[_ inline-solutions] pattern]
+    (async/to-chan! (mapv (partial merge solution) inline-solutions))))
+
 (defn with-default
   "Return a transducer that transforms an input stream of solutions to include the
   `default-solution` if and only if the stream was empty."
