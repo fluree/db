@@ -285,7 +285,7 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates
   respective indexes and returns updated db"
-  [conn {:keys [alias] :as db} [commit _proof]]
+  [conn db [commit _proof]]
   (go-try
     (let [db-address       (-> commit
                                (get-first const/iri-data)
@@ -297,14 +297,14 @@
           retract          (db-retract db-data)
           retracted-flakes (retract-flakes db t-new retract)
 
-          {:keys [previous issuer message] :as commit-map}
-          (commit-data/json-ld->map commit (select-keys db index/types))
+          {:keys [previous issuer message data] :as commit-metadata}
+          (commit-data/json-ld->map commit db)
 
-          commit-id          (:id commit-map)
+          commit-id          (:id commit-metadata)
           commit-sid         (iri/encode-iri db commit-id)
           [prev-commit _]    (some->> previous :address (read-commit conn) <?)
-          db-sid             (iri/encode-iri db alias)
-          metadata-flakes    (commit-data/commit-metadata-flakes commit-map
+          db-sid             (iri/encode-iri db (:id data))
+          metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new commit-sid db-sid)
           previous-id        (when prev-commit (:id prev-commit))
           prev-commit-flakes (when previous-id
@@ -331,10 +331,10 @@
                                      message-flakes (into message-flakes)))]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
-                      commit-map))
+                      commit-metadata))
       (-> db
           (merge-flakes t-new all-flakes)
-          (assoc :commit commit-map)))))
+          (assoc :commit commit-metadata)))))
 
 
 (defn trace-commits

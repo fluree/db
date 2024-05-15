@@ -6,8 +6,8 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.index :as index]
             [fluree.db.indexer.default :as indexer]
+            [fluree.db.db.json-ld :as db]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
@@ -52,13 +52,13 @@
           retracted-flakes (reify/retract-flakes ns-mapping t-new retract)
           db*              (set-namespaces db ns-mapping)
 
-          {:keys [previous issuer message] :as commit-metadata}
-          (commit-data/json-ld->map commit (select-keys db* index/types))
+          {:keys [previous issuer message data] :as commit-metadata}
+          (commit-data/json-ld->map commit db*)
 
           commit-id          (:id commit-metadata)
           commit-sid         (iri/encode-iri db* commit-id)
           [prev-commit _]    (some->> previous :address (reify/read-commit conn) <?)
-          db-sid             (iri/encode-iri db* alias)
+          db-sid             (iri/encode-iri db* (:id data))
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new commit-sid db-sid)
           previous-id        (when prev-commit (:id prev-commit))
@@ -96,7 +96,7 @@
   [{:keys [conn indexer] :as ledger} commit-opts tuples-chans]
   (go-try
     (loop [[[commit-tuple ch] & r] tuples-chans
-           db                      (jld-ledger/db ledger nil)]
+           db                      (db/create ledger)]
       (if commit-tuple
         (let [merged-db     (<? (merge-commit conn db commit-tuple))
               update-commit (commit/update-commit-fn ledger merged-db commit-opts)
@@ -116,7 +116,7 @@
           ledger-alias      (jld-ledger/commit->ledger-alias conn address first-commit)
           branch            (or (keyword (get-first-value first-commit const/iri-branch))
                                 :main)
-          ledger            (<? (jld-ledger/create* conn ledger-alias {:branch branch}))
+          ledger            (<? (jld-ledger/->ledger conn ledger-alias {:branch branch}))
           commit-opts*      (assoc commit-opts :branch branch)
           tuples-chans      (map (fn [commit-tuple]
                                    [commit-tuple (async/chan)])

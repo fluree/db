@@ -39,10 +39,8 @@
 (defn- jsonld-root-db [this]
   (assoc this :policy root-policy-map))
 
-(defn- jsonld-p-prop [{:keys [schema]} property predicate]
-  (assert (#{:name :id :iri :type :unique :multi :index :upsert :datatype
-             :component :noHistory :spec :specDoc :txSpec :txSpecDoc :restrictTag
-             :retractDuplicates :subclassOf :new?}
+(defn- jsonld-p-prop [schema property predicate]
+  (assert (#{:id :iri :subclassOf :parentProps :childProps :datatype}
             property)
           (str "Invalid predicate property: " (pr-str property)))
   (get-in schema [:pred predicate property]))
@@ -114,11 +112,11 @@
                      namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
-  (-class-prop [_this property class]
-    (if (= :subclasses property)
+  (-class-prop [_this meta-key class]
+    (if (= :subclasses meta-key)
       (get @(:subclasses schema) class)
-      (get-in schema [:pred class property])))
-  (-p-prop [this property predicate] (jsonld-p-prop this property predicate))
+      (jsonld-p-prop schema meta-key class)))
+  (-p-prop [_ meta-key property] (jsonld-p-prop schema meta-key property))
   (-class-ids [this subject] (class-ids this subject))
   (-query [this query-map]
     (fql/query this query-map))
