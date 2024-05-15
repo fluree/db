@@ -96,17 +96,6 @@
   (butil/string->UTF8 (stringify x)))
 
 
-(defn parse-json-flakes
-  [db flakes]
-  (log/debug "parse-json-flakes flakes:" flakes)
-  ;; TODO: Should we cache these predicate id -> type mappings?
-  (map (fn [f]
-         (if (= :json (dbproto/-p-prop db :type (flake/p f)))
-           (update f :o parse)
-           f))
-       flakes))
-
-
 (defn- valid-coordinates?
   "Given a sequence of coordinates, ensure that, for the given depth:
    1) they contain only sequences until
