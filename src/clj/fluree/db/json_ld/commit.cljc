@@ -238,32 +238,47 @@
         (flake/t-after? (commit-data/t db-commit)
                         ledger-t))))
 
+(defn write-commit
+  [conn alias {:keys [did private]} commit]
+  (go-try
+    (let [[commit* jld-commit] (commit-data/commit->jsonld commit)
+          signed-commit        (if did
+                                 (<? (cred/generate jld-commit private (:id did)))
+                                 jld-commit)
+          commit-res           (<? (connection/-c-write conn alias signed-commit))
+          commit**             (commit-data/update-commit-address commit* (:address commit-res))]
+      {:commit-map    commit**
+       :commit-jsonld jld-commit
+       :write-result  commit-res})))
+
+(defn push-commit
+  [conn {:keys [state] :as _ledger} {:keys [commit-map commit-jsonld write-result]}]
+  (nameservice/push! conn (assoc commit-map
+                                 :meta write-result
+                                 :json-ld commit-jsonld
+                                 :ledger-state state)))
+
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
-  [{:keys [alias] :as ledger} {:keys [commit branch] :as db} {:keys [did private] :as _opts}]
+  [{:keys [conn alias] :as ledger} {:keys [commit branch] :as db} opts]
   (go-try
-    (let [{:keys [conn state]} ledger
-          ledger-commit (:commit (ledger/-status ledger branch))
+    (let [ledger-commit (:commit (ledger/-status ledger branch))
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
-          [new-commit* jld-commit] (commit-data/commit->jsonld new-commit)
-          signed-commit (if did
-                          (<? (cred/generate jld-commit private (:id did)))
-                          jld-commit)
-          commit-res    (<? (connection/-c-write conn alias signed-commit)) ; write commit credential
-          new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
-          db*           (assoc db :commit new-commit**)
-          db**          (if (new-t? ledger-commit commit)
-                          (commit-data/add-commit-flakes (:prev-commit db) db*)
-                          db*)
-          db***         (ledger/-commit-update! ledger branch (dissoc db** :txns))
-          push-res      (<? (nameservice/push! conn (assoc new-commit**
-                                                           :meta commit-res
-                                                           :json-ld jld-commit
-                                                           :ledger-state state)))]
-      {:commit-res  commit-res
-       :push-res    push-res
-       :db          db***})))
+          keypair       (select-keys opts [:did :private])
+
+          {:keys [commit-map write-result] :as commit-write-map}
+          (<? (write-commit conn alias keypair new-commit))
+
+          db*   (assoc db :commit commit-map)
+          db**  (if (new-t? ledger-commit commit)
+                  (commit-data/add-commit-flakes (:prev-commit db) db*)
+                  db*)
+          db*** (ledger/-commit-update! ledger branch (dissoc db** :txns))
+          push-res      (<? (push-commit conn ledger commit-write-map))]
+      {:commit-res write-result
+       :push-res   push-res
+       :db         db***})))
 
 (defn newer-commit?
   [db commit]
