@@ -6,20 +6,21 @@
 
 (def method-name "memory")
 
+(defn memory-address
+  [path]
+  (storage/build-fluree-address method-name path))
+
 (defrecord MemoryStore [contents]
   storage/Store
-  (address [_ path]
-    (storage/build-fluree-address method-name path))
-
-  (write [store path v]
+  (write [_ _ v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v
                        (pr-str v))
             hash     (crypto/sha2-256 hashable)]
-        (swap! contents assoc path v)
-        {:path    path
-         :address (storage/address store path)
+        (swap! contents assoc hash v)
+        {:path    hash
+         :address (memory-address hash)
          :hash    hash
          :size    (count hashable)})))
 

@@ -10,7 +10,6 @@
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
-            [fluree.crypto :as crypto]
             [fluree.db.storage :as storage]
             [fluree.db.storage.memory :as memory-storage]
             #?(:cljs [fluree.db.platform :as platform]))
@@ -21,17 +20,13 @@
 ;; Memory Connection object
 
 (defn- write-data!
-  [store data]
+  [store type data]
   (go-try
-    (let [json (json-ld/normalize-data data)
-          hash (crypto/sha2-256 json)
-
-          {:keys [path address]}
-          (<? (storage/write store hash data))]
+    (let [{:keys [address path hash size]}
+          (<? (storage/write store type data))]
       {:name    path
        :hash    hash
-       :json    json
-       :size    (count json)
+       :size    size
        :address address})))
 
 (defn- read-data
@@ -53,9 +48,9 @@
 
   connection/iStorage
   (-c-read [_ commit-key] (read-data store commit-key))
-  (-c-write [_ _ledger commit-data] (write-data! store commit-data))
+  (-c-write [_ _ledger commit-data] (write-data! store :commit commit-data))
   (-txn-read [_ txn-key] (read-data store txn-key))
-  (-txn-write [_ _ledger txn-data] (write-data! store txn-data))
+  (-txn-write [_ _ledger txn-data] (write-data! store :transaction txn-data))
 
   connection/iConnection
   (-close [_] (close id state))

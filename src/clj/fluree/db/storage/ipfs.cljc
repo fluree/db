@@ -13,12 +13,13 @@
   [method local]
   (str/join "/" ["" method local]))
 
+(defn ipfs-address
+  [path]
+  (storage/build-fluree-address method-name path))
+
 (defrecord IpfsStore [endpoint]
   storage/Store
-  (address [_ path]
-    (storage/build-fluree-address method-name path))
-
-  (write [store path v]
+  (write [_ path v]
     (go-try
       (let [content (if (string? v)
                       v
@@ -32,7 +33,7 @@
               {:status 500 :error :db/push-ipfs :result res})))
         {:path    hash
          :hash    hash
-         :address (storage/address store hash)
+         :address (ipfs-address hash)
          :size    size})))
 
   (list [_ prefix]
