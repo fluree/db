@@ -34,7 +34,10 @@
    201 #{300 301}}
 
    Initial pred-items argument looks like:
-   #{{:iri 'http://schema.org/Patient', :class true, :subclassOf [1002], :id 1003} ...}
+   #{{:id #fluree/SID[8 'address'],
+      :iri 'http://schema.org/Patient',
+      :subclassOf #{#fluree/SID[8 'location']}
+      :datatype nil} ...}
    "
   [pred-items]
   (let [subclass-map (reduce
@@ -70,18 +73,19 @@
                      const/$owl:DatatypeProperty
                      const/$owl:ObjectProperty})
 
+(def ^:const base-property-map
+  {:id          nil
+   :iri         nil
+   :subclassOf  #{}
+   :parentProps #{}
+   :childProps  #{}
+   :datatype    nil})
+
 (defn initial-property-map
   [db sid]
-  (if (= sid const/$rdf:type)
-    {:id    sid ; rdf:type is predefined, so flakes to build map won't be present.
-     :class false}
-    (let [iri (iri/decode-sid db sid)]
-      {:id          sid
-       :iri         iri
-       :class       true ; default
-       :subclassOf  #{}
-       :parentProps #{}
-       :childProps  #{}})))
+  (let [iri (iri/decode-sid db sid)]
+    (assoc base-property-map :id sid
+                             :iri iri)))
 
 (defn add-subclass
   [prop-map subclass]
@@ -175,19 +179,8 @@
   [db pred-map vocab-flake]
   (let [[sid pid obj]   ((juxt flake/s flake/p flake/o) vocab-flake)
         initial-map     (initial-property-map db sid)
-        with-properties (fnil assoc initial-map)
         with-subclass   (fnil add-subclass initial-map)]
     (cond
-      (= const/$rdf:type pid)
-      (if (contains? property-sids obj)
-        (if (= const/$owl:ObjectProperty obj)
-          (update pred-map sid with-properties :class false)
-          (update pred-map sid with-properties :class false))
-        (if (= const/$xsd:anyURI obj)
-          (update pred-map sid with-properties :class false)
-          ;; it is a class, but we already did :class true as a default
-          pred-map))
-
       (= const/$rdfs:subClassOf pid)
       (update pred-map sid with-subclass obj)
 
@@ -383,3 +376,106 @@
             (assoc :pred pred-map)
             (update-with db t vocab-flakes)
             (add-pred-datatypes (filterv #(> (count %) 1) preds)))))))
+
+;; schema serialization
+(def ^:const serialized-pred-keys [:id :datatype :subclassOf :parentProps :childProps])
+(def ^:const serialized-pred-keys-reverse (reverse serialized-pred-keys))
+
+(defn schema-tuple
+  [pred-map]
+  (reduce
+   (fn [acc next-key]
+     (let [next-val (get pred-map next-key)]
+       (cond
+         (set? next-val)
+         (if (seq next-val) ;; non-empty?
+           (conj acc
+                 (mapv #(if (iri/sid? %)
+                          (iri/serialize-sid %)
+                          %)
+                       next-val))
+           (if (seq acc) ;; if 'acc' is still empty, keep it that if nothing to add
+             (conj acc nil)
+             acc))
+
+         (iri/sid? next-val)
+         (conj acc (iri/serialize-sid next-val))
+
+         (nil? next-val)
+         (if (empty? acc)
+           acc
+           (conj acc nil))
+
+         :else
+         (conj acc next-val))))
+   (list)
+   serialized-pred-keys-reverse))
+
+(defn serialize-schema
+  "Serializes the schema map to a semi-compact json form which can be stored
+  in the index root file, allowing fast reification of the schema map without
+  requiring database queries to do so."
+  [{:keys [t pred] :as _db-schema}]
+  (let [pred-keys (mapv name serialized-pred-keys)
+        pred-vals (->> pred
+                       (filter #(string? (key %))) ;; every pred map is duplicated for both keys iri, and sid - keep only 1
+                       vals
+                       (mapv schema-tuple))]
+    {"t"    t
+     "pred" {"keys" pred-keys
+             "vals" pred-vals}}))
+
+(defn deserialize-pred-tuple
+  "Takes list of keys and tuples containing values
+  and turns them into a map with the respective keys and tuples"
+  [namespace-codes positions pred-vals]
+  (let [base-map base-property-map
+        max-idx  (dec (count pred-vals))]
+    (loop [[[idx k] & r] positions
+           acc base-map]
+      (let [acc*  (if-let [raw-val (nth pred-vals idx)]
+                    (case k
+                      :id (let [sid (iri/deserialize-sid raw-val)]
+                            (assoc acc :id sid
+                                       :iri (iri/sid->iri sid namespace-codes)))
+                      :datatype (assoc acc :datatype (iri/deserialize-sid raw-val))
+                      :subclassOf (assoc acc :subclassOf (into (:subclassOf base-map) (map iri/deserialize-sid raw-val)))
+                      :parentProps (assoc acc :parentProps (into (:parentProps base-map) (map iri/deserialize-sid raw-val)))
+                      :childProps (assoc acc :childProps (into (:childProps base-map) (map iri/deserialize-sid raw-val)))
+                      ;; else
+                      (throw (ex-info (str "Cannot deserialize schema from index root. "
+                                           "Unrecognized schema property key found: " k
+                                           "which contains a value of: " raw-val)
+                                      {:status 500
+                                       :error  :db/invalid-index})))
+                    acc)]
+        (if (= idx max-idx)
+          acc*
+          (recur r acc*))))))
+
+(defn deserialize-preds
+  [namespace-codes pred-tuples]
+  (let [pred-keys      (mapv keyword (get pred-tuples "keys"))
+        pred-positions (map-indexed vector pred-keys)
+        pred-vals      (get pred-tuples "vals")
+        pred-maps      (map
+                        (partial deserialize-pred-tuple namespace-codes pred-positions)
+                        pred-vals)]
+    (reduce
+     (fn [acc pred-map]
+       (assoc acc (:id pred-map) pred-map
+                  (:iri pred-map) pred-map))
+     {}
+     pred-maps)))
+
+(defn deserialize-schema
+  "Deserializes the schema map from a semi-compact json."
+  [serialized-schema namespace-codes]
+  (let [{pred-tuples "pred"
+         t           "t"} serialized-schema
+        pred (deserialize-preds namespace-codes pred-tuples)]
+    (-> (base-schema)
+        (assoc :t t
+               :pred pred)
+        (refresh-subclasses))))
+

@@ -70,14 +70,14 @@
 (defn write-db-root
   [db]
   (let [{:keys [conn ledger commit t stats spot psot post opst tspo
-                schema namespace-codes]}
+                schema namespaces]}
         db
 
         ledger-alias (:id commit)
-        preds        (vocab/serialize-schema-predicates schema)
         data         {:ledger-alias    ledger-alias
                       :t               t
-                      :preds           preds
+                      :v               1 ;; version of db root file
+                      :schema          (vocab/serialize-schema schema)
                       :stats           (select-keys stats [:flakes :size])
                       :spot            (child-data spot)
                       :psot            (child-data psot)
@@ -86,7 +86,7 @@
                       :tspo            (child-data tspo)
                       :timestamp       (util/current-time-millis)
                       :prevIndex       (or (:indexed stats) 0)
-                      :namespace-codes namespace-codes}
+                      :namespaces      namespaces}
         ser          (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn ledger :root ser)))
 
@@ -119,31 +119,72 @@
                                  :t t
                                  :leftmost? true))))
 
+(defn reify-db-root-v0
+  "Reify db root for version 0 of the file.
 
-(defn reify-db-root
-  "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
+  This legacy version requires many queries to hydrate
+  the schema and will be slow for large dbs"
   [conn blank-db root-data]
   (go-try
-    (let [{:keys [t stats preds namespace-codes]}
-          root-data
-          namespaces (map-invert namespace-codes)
-          db         (assoc blank-db
-                            :t t
-                            :namespaces namespaces
-                            :namespace-codes namespace-codes
-                            :stats (assoc stats :indexed t))
-          indexed-db (reduce
-                       (fn [db* idx]
-                         (let [idx-root (reify-index-root conn db* idx (get root-data idx))]
-                           (assoc db* idx idx-root)))
-                       db index/types)
-          preds*     (mapv (fn [p]
-                             (if (iri/serialized-sid? p)
-                               (iri/deserialize-sid p)
-                               (mapv iri/deserialize-sid p)))
-                           preds)
-          schema     (<? (vocab/load-schema indexed-db preds*))]
-      (assoc indexed-db :schema schema))))
+   (let [{:keys [t stats preds namespace-codes]}
+         root-data
+         namespaces (map-invert namespace-codes)
+         db         (assoc blank-db
+                      :t t
+                      :namespaces namespaces
+                      :namespace-codes namespace-codes
+                      :stats (assoc stats :indexed t))
+         indexed-db (reduce
+                     (fn [db* idx]
+                       (let [idx-root (reify-index-root conn db* idx (get root-data idx))]
+                         (assoc db* idx idx-root)))
+                     db index/types)
+         preds*     (mapv (fn [p]
+                            (if (iri/serialized-sid? p)
+                              (iri/deserialize-sid p)
+                              (mapv iri/deserialize-sid p)))
+                          preds)
+         schema     (<? (vocab/load-schema indexed-db preds*))]
+     (assoc indexed-db :schema schema))))
+
+(defn reify-db-root-v1
+  [blank-db root-data]
+  (go-try
+   (let [{:keys [t stats schema namespaces]}
+         root-data
+         namespace-codes (map-invert namespaces)
+         db         (assoc blank-db
+                      :t t
+                      :namespaces namespaces
+                      :namespace-codes namespace-codes
+                      :stats (assoc stats :indexed t))
+         indexed-db (reduce
+                     (fn [db* idx]
+                       (let [idx-root (reify-index-root nil db* idx (get root-data idx))]
+                         (assoc db* idx idx-root)))
+                     db index/types)
+         schema     (vocab/deserialize-schema schema namespace-codes)]
+     (assoc indexed-db :schema schema))))
+
+(defn reify-db-root
+  "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes.
+
+  Returns async chan"
+  [conn blank-db {:keys [v] :as root-data}]
+  (cond
+    (= 1 v)
+    (go (reify-db-root-v1 blank-db root-data))
+
+    (nil? v) ;; version 0
+    (reify-db-root-v0 conn blank-db root-data)
+
+    :else
+    (do
+      (log/warn "Index db-root files not recognized. File contents: " root-data)
+      (throw (ex-info (str "Invalid db-root index file - version or file not recognized. "
+                           "Attempting to reify index for db: " blank-db)
+                      {:status 500
+                       :error  :db/invalid-index})))))
 
 
 (defn read-garbage

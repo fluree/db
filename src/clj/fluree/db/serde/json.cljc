@@ -64,13 +64,15 @@
 (defn- deserialize-db-root
   "Assumes all data comes in as keywordized JSON."
   [db-root]
-  (let [{:keys [spot post opst tspo]} db-root]
-    (-> db-root
-        (update :namespace-codes numerize-keys)
-        (assoc :spot   (deserialize-child-node spot)
-               :post   (deserialize-child-node post)
-               :opst   (deserialize-child-node opst)
-               :tspo   (deserialize-child-node tspo)))))
+  (let [{:keys [v spot post opst tspo]} db-root]
+    (cond-> (assoc db-root :spot (deserialize-child-node spot)
+                           :post (deserialize-child-node post)
+                           :opst (deserialize-child-node opst)
+                           :tspo (deserialize-child-node tspo))
+
+            ;; following only needed for v0 of db-root
+            (nil? v) (update :namespace-codes numerize-keys))))
+
 
 (defn- deserialize-branch-node
   [branch]
