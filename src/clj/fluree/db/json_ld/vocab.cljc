@@ -73,15 +73,19 @@
                      const/$owl:DatatypeProperty
                      const/$owl:ObjectProperty})
 
+(def ^:const base-property-map
+  {:id          nil
+   :iri         nil
+   :subclassOf  #{}
+   :parentProps #{}
+   :childProps  #{}
+   :datatype    nil})
+
 (defn initial-property-map
   [db sid]
   (let [iri (iri/decode-sid db sid)]
-    {:id          sid
-     :iri         iri
-     :subclassOf  #{}
-     :parentProps #{}
-     :childProps  #{}
-     :datatype    nil}))
+    (assoc base-property-map :id sid
+                             :iri iri)))
 
 (defn add-subclass
   [prop-map subclass]
