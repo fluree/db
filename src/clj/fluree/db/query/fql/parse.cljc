@@ -98,11 +98,11 @@
     (zipmap vars binding)))
 
 (defn parse-values
-  [q context]
-  (when-let [values (:values q)]
+  [values context]
+  (when values
     (let [[vars vals] values
-          vars*     (keep parse-var-name (util/sequential vars))
-          vals*     (mapv util/sequential vals)
+          vars* (keep parse-var-name (util/sequential vars))
+          vals* (mapv util/sequential vals)
           var-count (count vars*)]
       (if (every? (fn [binding]
                     (= (count binding) var-count))
@@ -408,6 +408,11 @@
   (let [parsed (parse-bind-map binds)]
     [(where/->pattern :bind parsed)]))
 
+(defmethod parse-pattern :values
+  [[_ values] vars context]
+  (let [[_vars solutions] (parse-values values context)]
+    [(where/->pattern :values solutions)]))
+
 (defmethod parse-pattern :graph
   [[_ graph where] vars context]
   (let [graph* (or (parse-variable graph)
@@ -570,7 +575,7 @@
 (defn parse-analytical-query
   [q]
   (let [context       (context/extract q)
-        [vars values] (parse-values q context)
+        [vars values] (parse-values (:values q) context)
         where         (parse-where q vars context)
         grouping      (parse-grouping q)
         ordering      (parse-ordering q)]
@@ -684,8 +689,8 @@
 
 (defn parse-txn
   [txn context]
-  (let [vals-map      {:values (util/get-first-value txn const/iri-values)}
-        [vars values] (parse-values vals-map context)
+  (let [values        (util/get-first-value txn const/iri-values)
+        [vars values] (parse-values values context)
         where-map     {:where (util/get-first-value txn const/iri-where)}
         where         (parse-where where-map vars context)
         bound-vars    (-> where where/bound-variables (into vars))
