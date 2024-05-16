@@ -59,8 +59,9 @@
   (contains? mch ::sids))
 
 (defn get-sid
-  [iri-mch db-alias]
-  (get-in iri-mch [::sids db-alias]))
+  [iri-mch db]
+  (let [db-alias (:alias db)]
+    (get-in iri-mch [::sids db-alias])))
 
 (defn get-datatype-iri
   [mch]
@@ -286,14 +287,14 @@
   be changed to `nil`. This ensures that all necessary flakes are considered
   from the spot index when scanned, and this is necessary because the `p` value
   is `nil`."
-  [idx s p o o-fn alias]
+  [db idx s p o o-fn]
   (if (and (#{:spot} idx)
            (nil? p)
            (and s o))
     (let [f (if o-fn
               (fn [mch]
                 (and (#{o} (or (get-value mch)
-                               (get-sid mch alias)))
+                               (get-sid mch db)))
                      (o-fn mch)))
               (fn [mch]
                 (#{o} (get-value mch))))]
@@ -304,13 +305,13 @@
   ([db fuel-tracker error-ch components]
    (resolve-flake-range db fuel-tracker nil error-ch components))
 
-  ([{:keys [alias t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
-   (let [s    (get-sid s-mch alias)
+  ([{:keys [t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
+   (let [s    (get-sid s-mch db)
          s-fn (::fn s-mch)
-         p    (get-sid p-mch alias)
+         p    (get-sid p-mch db)
          p-fn (::fn p-mch)
          o    (or (get-value o-mch)
-                  (get-sid o-mch alias))
+                  (get-sid o-mch db))
          o-fn (::fn o-mch)
          o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
 
@@ -318,7 +319,7 @@
                            (catch* e
                              (log/error e "Error resolving flake range")
                              (async/put! error-ch e)))
-         [o* o-fn*]  (augment-object-fn idx s p o o-fn alias)
+         [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
          start-flake (flake/create s p o* o-dt nil nil util/min-integer)
          end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
          track-fuel  (when fuel-tracker
@@ -353,14 +354,13 @@
 
 (defn compute-sid
   [s-mch db]
-  (let [db-alias (:alias db)]
-    (if (and (matched-iri? s-mch)
-             (not (get-sid s-mch db-alias)))
-      (let [db-alias (:alias db)
-            s-iri    (::iri s-mch)]
-        (when-let [sid (iri/encode-iri db s-iri)]
-          (match-sid s-mch db-alias sid)))
-      s-mch)))
+  (if (and (matched-iri? s-mch)
+           (not (get-sid s-mch db)))
+    (let [db-alias (:alias db)
+          s-iri    (::iri s-mch)]
+      (when-let [sid (iri/encode-iri db s-iri)]
+        (match-sid s-mch db-alias sid)))
+    s-mch))
 
 (defn compute-datatype-sid
   [o-mch db]
@@ -431,7 +431,7 @@
         db-alias   (:alias db)
         triple     (assign-matched-values tuple solution)]
     (if-let [[s p o] (compute-sids db triple)]
-      (let [pid (get-sid p db-alias)]
+      (let [pid (get-sid p db)]
         (if-let [props (and pid (get-child-properties db pid))]
           (let [prop-ch (-> props (conj pid) async/to-chan!)]
             (async/pipeline-async 2
@@ -494,7 +494,7 @@
         db-alias   (:alias db)
         triple     (assign-matched-values triple solution)]
     (if-let [[s p o] (compute-sids db triple)]
-      (let [cls        (get-sid o db-alias)
+      (let [cls        (get-sid o db)
             sub-obj    (dissoc o ::sids ::iri)
             class-objs (into [o]
                              (comp (map (fn [cls]
