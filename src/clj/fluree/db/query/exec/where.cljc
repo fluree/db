@@ -173,6 +173,11 @@
   [patterns]
   (vec patterns))
 
+(defprotocol Searchable
+  (match-id [s fuel-tracker solution s-match error-ch])
+  (match-triple [s fuel-tracker solution triple error-ch])
+  (match-class [s fuel-tracker solution triple error-c]))
+
 (defn pattern-type
   [pattern]
   (if (map-entry? pattern)
