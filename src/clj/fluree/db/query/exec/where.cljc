@@ -159,18 +159,6 @@
       unmatched-var
       (with-filter f)))
 
-(defn ->val-filter
-  "Build a query function specification for the explicit value `val` out of the
-  boolean function `f`. `f` should accept a single flake where-match map."
-  ([val f]
-   (-> val
-       anonymous-value
-       (with-filter f)))
-  ([val dt-iri f]
-   (-> val
-       (anonymous-value dt-iri)
-       (with-filter f))))
-
 (defn ->predicate
   "Build a pattern that already matches the explicit predicate value `value`."
   ([iri]
