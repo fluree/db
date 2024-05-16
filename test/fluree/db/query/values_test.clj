@@ -13,6 +13,7 @@
         db1     @(fluree/stage db0 {"@context" context
                                     "insert" (into test-utils/people-strings
                                                    [{"@id" "ex:nikola"
+                                                     "schema:name" "Nikola"
                                                      "ex:cool" true}])})]
     (testing "clause"
       (testing "no where clause"
@@ -36,10 +37,11 @@
                                             {"@id" "?s" "schema:email" "?email"}
                                             ["values"
                                              ["?s" [{"@type" "xsd:anyURI" "@value" "ex:cam"}]]]]}))))
-      #_(testing "multiple vars"
-        (is (= [["foo1" "bar1"] ["foo2" "bar2"] ["foo3" "bar3"]]
-               @(fluree/query db0 {"@context" context
-                                   "select" ["?foo" "?bar"]
+      (testing "nested scope"
+        (is (= [["Nikola" nil true]]
+               @(fluree/query db1 {"@context" context
+                                   "select" ["?name" "?age" "?cool"]
                                    "where" [["optional"
-                                             [["values" [["?foo" "?bar"]
-                                                         [["foo1" "bar1"] ["foo2" "bar2"] ["foo3" "bar3"]]]]]]]})))))))
+                                             [{"@id" "?s" "schema:name" "?name"
+                                               "ex:cool" "?cool"}
+                                              ["values" ["?s" [{"@type" "xsd:anyURI" "@value" "ex:nikola"}]]]]]]})))))))
