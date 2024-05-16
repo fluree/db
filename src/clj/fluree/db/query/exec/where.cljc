@@ -568,8 +568,20 @@
 
 (defmethod match-pattern :values
   [db fuel-tracker solution pattern error-ch]
-  (let [[_ inline-solutions] pattern]
-    (async/to-chan! (mapv (partial merge solution) inline-solutions))))
+  (let [[_ inline-solutions] pattern
+        ;; need to compute sids on inline data so they can match equal solutions
+        inline-solutions* (mapv (fn [solution]
+                                  (->> solution
+                                       (mapv (fn [[var match]]
+                                               [var (if (matched-iri? match) (compute-sid match db) match)]))
+                                       (into {} )))
+                                inline-solutions)]
+    ;; filter out any solutions that don't match inline solution data
+    (if (every? (fn [inline-solution] (= (select-keys solution (keys inline-solution))
+                                         inline-solution))
+                inline-solutions*)
+      (async/to-chan! (mapv (partial merge solution) inline-solutions))
+      nil-channel)))
 
 (defn with-default
   "Return a transducer that transforms an input stream of solutions to include the
