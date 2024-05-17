@@ -5,6 +5,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util]
+            [fluree.db.index :as index]
             #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc]))
   #?(:clj (:import (java.time.format DateTimeFormatter))))
@@ -35,13 +36,17 @@
         m  (-> flake-vec (get flake/m-pos) deserialize-meta)]
     (flake/create s p o dt t op m)))
 
-(defn- deserialize-child-node
+(defn deserialize-flake-bound
+  [flake-bound]
+  (when flake-bound
+    (deserialize-flake flake-bound)))
+
+(defn deserialize-child-node
   "Turns :first and :rhs into flakes"
   [child-node]
-  (assoc child-node
-         :first (some-> child-node :first deserialize-flake)
-         :rhs   (some-> child-node :rhs deserialize-flake)))
-
+  (-> child-node
+      (update :first deserialize-flake-bound)
+      (update :rhs deserialize-flake-bound)))
 
 (defn parse-int
   [x]
@@ -61,25 +66,25 @@
                  (assoc numerized int-k v)))
              {} m))
 
-(defn- deserialize-db-root
+(defn deserialize-db-root
   "Assumes all data comes in as keywordized JSON."
   [db-root]
-  (let [{:keys [spot post opst tspo]} db-root]
-    (-> db-root
-        (update :namespace-codes numerize-keys)
-        (assoc :spot   (deserialize-child-node spot)
-               :post   (deserialize-child-node post)
-               :opst   (deserialize-child-node opst)
-               :tspo   (deserialize-child-node tspo)))))
+  (let [db-root* (reduce (fn [root-data idx]
+                           (update root-data idx deserialize-child-node))
+                         db-root index/types)]
+    (update db-root* :namespace-codes numerize-keys)))
 
-(defn- deserialize-branch-node
+(defn deserialize-children
+  [children]
+  (mapv deserialize-child-node children))
+
+(defn deserialize-branch-node
   [branch]
-  (assoc branch
-         :children (mapv deserialize-child-node (:children branch))
-         :rhs (some-> (:rhs branch)
-                      (deserialize-flake))))
+  (-> branch
+      deserialize-child-node
+      (update :children deserialize-children)))
 
-(defn- deserialize-leaf-node
+(defn deserialize-leaf-node
   [leaf]
   (assoc leaf :flakes (mapv deserialize-flake (:flakes leaf))))
 

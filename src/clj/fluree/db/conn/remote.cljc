@@ -10,7 +10,6 @@
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.method.remote.core :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
-            [fluree.db.indexer.default :as idx-default]
             [clojure.string :as str])
   #?(:clj (:import (java.io Writer))))
 
@@ -39,7 +38,6 @@
                       (log/warn "-msg-out: " msg)
                       :TODO))
   (-nameservices [_] nameservices)
-  (-new-indexer [_ opts] (idx-default/create opts))
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 

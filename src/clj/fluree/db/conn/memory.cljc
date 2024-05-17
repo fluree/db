@@ -8,7 +8,6 @@
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
             [fluree.db.storage :as storage]
             [fluree.db.storage.memory :as memory-storage]
@@ -48,14 +47,13 @@
 
   connection/iStorage
   (-c-read [_ commit-key] (read-data store commit-key))
-  (-c-write [_ _ledger commit-data] (write-data! store :commit commit-data))
+  (-c-write [_ _ledger-alias commit-data] (write-data! store :commit commit-data))
   (-txn-read [_ txn-key] (read-data store txn-key))
-  (-txn-write [_ _ledger txn-data] (write-data! store :transaction txn-data))
+  (-txn-write [_ _ledger-alias txn-data] (write-data! store :transaction txn-data))
 
   connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
-  (-new-indexer [_ opts] (idx-default/create opts)) ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      ;; TODO - push into state machine

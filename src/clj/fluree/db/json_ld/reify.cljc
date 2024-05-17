@@ -6,7 +6,6 @@
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.connection :as connection]
-            [fluree.db.indexer.storage :as storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
             [fluree.db.datatype :as datatype]
@@ -241,7 +240,7 @@
     commit-retract))
 
 ;; TODO - validate commit signatures
-(defn validate-commit
+(defn validate-commit-proof
   "Run proof validation, if exists.
   Return actual commit data. In the case of a VerifiableCredential this is
   the `credentialSubject`."
@@ -249,18 +248,18 @@
   ;; TODO - returning true for now
   true)
 
-(defn parse-commit
+(defn has-proof?
+  [commit-data]
+  (contains? commit-data const/iri-cred-subj))
+
+(defn verify-commit
   "Given a full commit json, returns two-tuple of [commit-data commit-proof]"
   [commit-data]
-  (let [has-proof? (contains? commit-data const/iri-cred-subj)
-        commit     (if has-proof?
-                     (get-first commit-data const/iri-cred-subj)
-                     commit-data)]
-    (if has-proof?
-      (do
-        (validate-commit commit-data)
-        [commit commit-data])
-      [commit nil])))
+  (if (has-proof? commit-data)
+    (let [credential-subject (get-first commit-data const/iri-cred-subj)]
+      (validate-commit-proof commit-data)
+      [credential-subject commit-data])
+    [commit-data nil]))
 
 (defn read-commit
   [conn commit-address]
@@ -274,7 +273,7 @@
         (-> commit-data
             (assoc-in addr-key-path commit-address)
             json-ld/expand
-            parse-commit)))))
+            verify-commit)))))
 
 (defn read-db
   [conn db-address]
@@ -286,17 +285,13 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates
   respective indexes and returns updated db"
-  [conn {:keys [alias t] :as db} merged-db? [commit _proof]]
+  [conn db [commit _proof]]
   (go-try
     (let [db-address       (-> commit
                                (get-first const/iri-data)
                                (get-first-value const/iri-address))
           db-data          (<? (read-db conn db-address))
           t-new            (db-t db-data)
-          _                (when (and (not= t-new (inc t))
-                                      (not merged-db?)) ;; when including multiple dbs, t values will get reused.
-                             (throw (ex-info (str "Cannot merge commit with t " t-new " into db of t " t ".")
-                                             {:status 500 :error :db/invalid-commit})))
           assert           (db-assert db-data)
           asserted-flakes  (assert-flakes db t-new assert)
           retract          (db-retract db-data)
@@ -337,7 +332,9 @@
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
-      (merge-flakes db t-new all-flakes))))
+      (-> db
+          (merge-flakes t-new all-flakes)
+          (assoc :commit commit-metadata)))))
 
 
 (defn trace-commits
@@ -380,47 +377,3 @@
           commit-tuples*
           (let [commit-tuple (<? (read-commit conn prev-commit-addr))]
             (recur commit-tuple commit-t commit-tuples*)))))))
-
-
-(defn load-db
-  [{:keys [ledger] :as db} latest-commit-tuple merged-db?]
-  (go-try
-    (let [{:keys [conn]} ledger
-          commit-tuples (<? (trace-commits conn latest-commit-tuple 1))]
-      (loop [[commit-tuple & r] commit-tuples
-             db* db]
-        (if commit-tuple
-          (let [new-db (<? (merge-commit conn db* merged-db? commit-tuple))]
-            (recur r new-db))
-          db*)))))
-
-
-(defn load-db-idx
-  [ledger db latest-commit commit-address merged-db?]
-  (go-try
-    (let [{:keys [conn]} ledger
-          idx-meta   (get-first latest-commit const/iri-index) ; get persistent
-                                                               ; index meta if
-                                                               ; ledger has
-                                                               ; indexes
-          db-base    (if-let [idx-address (get-first-value idx-meta const/iri-address)]
-                       (<? (storage/reify-db conn db idx-address))
-                       db)
-          commit-map (commit-data/json-ld->map latest-commit
-                                               (-> (select-keys db-base index/types)
-                                                   (assoc :commit-address commit-address)))
-          _          (log/debug "load-db-idx commit-map:" commit-map)
-          db-base*   (assoc db-base :commit commit-map)
-          index-t    (commit-data/index-t commit-map)
-          commit-t   (commit-data/t commit-map)]
-      (if (= commit-t index-t)
-        db-base* ;; if index-t is same as latest commit, no additional commits to load
-        ;; trace to the first unindexed commit TODO - load in parallel
-        (loop [[commit-tuple & r] (<? (trace-commits conn [latest-commit nil] (if index-t
-                                                                                (inc index-t)
-                                                                                1)))
-               db* db-base*]
-          (if commit-tuple
-            (let [new-db (<? (merge-commit conn db* merged-db? commit-tuple))]
-              (recur r new-db))
-            db*))))))

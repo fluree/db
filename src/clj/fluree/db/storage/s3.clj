@@ -8,17 +8,21 @@
             [clojure.string :as str]
             [fluree.db.util.bytes :as bytes]))
 
+(defn s3-address [bucket prefix k]
+  (s3/s3-address bucket prefix k))
+
 (defrecord S3Store [client bucket prefix]
   storage/Store
   (write [_ dir data]
     (go
-      (let [hash    (crypto/sha2-256 data)
-            bytes   (if (string? data)
-                     (bytes/string->UTF8 data)
-                     data)
-            path    (str/join "/" [dir hash ".json"])
-            result  (<! (s3/write-s3-data client bucket prefix path bytes))
-            address (s3/s3-address bucket prefix path)]
+      (let [hash     (crypto/sha2-256 data)
+            bytes    (if (string? data)
+                       (bytes/string->UTF8 data)
+                       data)
+            filename (str hash ".json")
+            path     (str/join "/" [dir filename])
+            result   (<! (s3/write-s3-data client bucket prefix path bytes))
+            address  (s3/s3-address bucket prefix path)]
         (if (instance? Throwable result)
           result
           {:hash    hash

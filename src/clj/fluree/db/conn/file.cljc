@@ -9,12 +9,10 @@
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.indexer.storage :as index-storage]
-            [fluree.db.indexer.default :as idx-default]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
-            [fluree.db.ledger :as ledger]
             [fluree.db.storage :as storage]
             [fluree.db.storage.file :as file-storage])
   #?(:clj (:import (java.io Writer))))
@@ -22,18 +20,14 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn- write-data
-  [{:keys [store] :as _conn} ledger data-type data]
+  [{:keys [store] :as _conn} ledger-alias data-type data]
   (go-try
-    (let [alias    (ledger/-alias ledger)
-          branch   (name (:name (ledger/-branch ledger)))
-          json     (if (string? data)
+    (let [json     (if (string? data)
                      data
                      (json-ld/normalize-data data))
           bytes    (bytes/string->UTF8 json)
           type-dir (name data-type)
-          path     (->> [alias branch type-dir]
-                        (remove nil?)
-                        (str/join "/"))
+          path     (str/join "/" [ledger-alias type-dir])
 
           {:keys [path hash address]} (<? (storage/write store path bytes))]
       {:name    path
@@ -56,21 +50,21 @@
                            nameservices serializer msg-out-ch lru-cache-atom]
 
   connection/iStorage
-  (-c-read [conn commit-key] (read-data conn commit-key false))
-  (-c-write [conn ledger commit-data] (write-data conn ledger :commit commit-data))
-  (-txn-read [conn txn-key] (read-data conn txn-key false))
-  (-txn-write [conn ledger txn-data] (write-data conn ledger :txn txn-data))
-  (-index-file-write [conn ledger index-type index-data]
-    (write-data conn ledger (str "index/" (name index-type)) index-data))
+  (-c-read [conn commit-key]
+    (read-data conn commit-key false))
+  (-c-write [conn ledger-alias commit-data]
+    (write-data conn ledger-alias :commit commit-data))
+  (-txn-read [conn txn-key]
+    (read-data conn txn-key false))
+  (-txn-write [conn ledger-alias txn-data]
+    (write-data conn ledger-alias :txn txn-data))
+  (-index-file-write [conn ledger-alias index-type index-data]
+    (write-data conn ledger-alias (str "index/" (name index-type)) index-data))
   (-index-file-read [conn index-address] (read-data conn index-address true))
 
   connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
-  (-new-indexer [_ opts]
-    (let [indexer-fn (:indexer ledger-defaults)]
-      (indexer-fn opts)))
-  ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection op: msg-in" {})))
   (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection op: msg-out" {})))
@@ -111,20 +105,8 @@
     s))
 
 (defn ledger-defaults
-  [{:keys [did indexer]}]
-  {:did     did
-   :indexer (cond
-              (fn? indexer)
-              indexer
-
-              (or (map? indexer) (nil? indexer))
-              (fn [opts]
-                (idx-default/create (merge indexer opts)))
-
-              :else
-              (throw (ex-info (str "Expected an indexer constructor fn or "
-                                   "default indexer options map. Provided: " indexer)
-                              {:status 400 :error :db/invalid-file-connection})))})
+  [{:keys [did]}]
+  {:did did})
 
 (defn default-file-nameservice
   "Returns file nameservice or will throw if storage-path generates an exception."

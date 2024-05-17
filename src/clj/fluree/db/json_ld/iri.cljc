@@ -218,6 +218,16 @@
   (encode-iri [codec iri])
   (decode-sid [codec sid]))
 
+(defn namespace-codec
+  [namespace-codes]
+  (let [namespaces (map-invert namespace-codes)]
+    (reify
+      IRICodec
+      (encode-iri [_ iri]
+        (iri->sid iri namespaces))
+      (decode-sid [_ sid]
+        (sid->iri sid namespace-codes)))))
+
 (defn fluree-iri
   [nme]
   (str f-ns nme))

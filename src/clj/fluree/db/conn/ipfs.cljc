@@ -9,7 +9,6 @@
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async :refer [chan]]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.indexer.default :as idx-default]
             [fluree.db.nameservice.ipns :as ns-ipns]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
             [fluree.db.conn.cache :as conn-cache]
@@ -44,9 +43,6 @@
   connection/iConnection
   (-close [_] (close id state))
   (-closed? [_] (boolean (:closed? @state)))
-  (-new-indexer [_ opts] ;; default new ledger indexer
-    (let [indexer-fn (:indexer ledger-defaults)]
-      (indexer-fn opts)))
   (-did [_] (:did ledger-defaults))
   ;; (-msg-in [_ msg] (go-try
   ;;                    ;; TODO - push into state machine
@@ -87,20 +83,8 @@
        (pr (connection/printer-map conn)))))
 
 (defn ledger-defaults
-  [{:keys [did indexer]}]
-  {:did     did
-   :indexer (cond
-              (fn? indexer)
-              indexer
-
-              (or (map? indexer) (nil? indexer))
-              (fn [opts]
-                (idx-default/create (merge indexer opts)))
-
-              :else
-              (throw (ex-info (str "Expected an indexer constructor fn or "
-                                   "default indexer options map. Provided: " indexer)
-                              {:status 400 :error :db/invalid-file-connection})))})
+  [{:keys [did]}]
+  {:did did})
 
 (defn validate-http-url
   "Tests that URL starts with http:// or https://, returns exception or

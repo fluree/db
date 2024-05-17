@@ -1,7 +1,7 @@
 (ns fluree.db.connection
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
-            [fluree.db.util.core :as util :refer [try* catch* get-first-value]]
+            [fluree.db.util.core :as util :refer [get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.json-ld :as json-ld]
@@ -12,7 +12,6 @@
 (defprotocol iConnection
   (-close [conn] "Closes all resources for this connection")
   (-closed? [conn] "Indicates if connection is open or closed")
-  (-new-indexer [conn opts] "Returns optional default new indexer object for a new ledger with optional opts.")
   (-did [conn] "Returns optional default did map if set at connection level")
   (-msg-in [conn msg] "Handler for incoming message from nameservices")
   (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")
@@ -21,10 +20,10 @@
 
 (defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")
-  (-c-write [conn ledger commit-data] "Writes a commit to storage")
-  (-txn-write [conn ledger txn-data] "Writes a transaction to storage and returns the key. Expects string keys.")
+  (-c-write [conn ledger-alias commit-data] "Writes a commit to storage")
+  (-txn-write [conn ledger-alias txn-data] "Writes a transaction to storage and returns the key. Expects string keys.")
   (-txn-read [conn txn-key] "Reads a transaction from storage")
-  (-index-file-write [conn ledger idx-type index-data] "Writes an index item to storage")
+  (-index-file-write [conn ledger-alias idx-type index-data] "Writes an index item to storage")
   (-index-file-read [conn file-address] "Reads an index item from storage"))
 
 (comment
