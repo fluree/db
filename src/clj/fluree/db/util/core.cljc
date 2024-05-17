@@ -206,7 +206,7 @@
   (reduce-kv
     (fn [acc k v]
       (if (keyword? k)
-        (assoc acc (name k) v)
+        (assoc acc (subs (str k) 1) v)
         (assoc acc k v)))
     {} m))
 
