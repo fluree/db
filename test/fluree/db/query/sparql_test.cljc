@@ -195,20 +195,54 @@
                   [:filter ["(> ?num 10)"]]]]]
                where)))))
   (testing "VALUES"
-    (let [query "SELECT ?handle
+    (testing "pattern"
+      (let [query "SELECT ?handle
                  WHERE {VALUES ?handle { \"dsanchez\" }
                         ?person person:handle ?handle.}"]
-      (is (= {:where [{"@id" "?person", "person:handle" "?handle"}],
-              :values [["?handle"] [["dsanchez"]]]}
-             (select-keys (sparql/->fql query) [:where :values]))
-          "single var, single val"))
-    (let [query "SELECT ?handle
-                 WHERE {VALUES ?handle { \"dsanchez\" \"coolguy\"}
+        (is (= [[:values ["?handle" ["dsanchez"]]]
+                {"@id" "?person", "person:handle" "?handle"}]
+               (:where (sparql/->fql query)))
+            "where pattern: single var, single val"))
+      (let [query "SELECT ?handle
+                 WHERE {VALUES ?person { :personA :personB }
                         ?person person:handle ?handle.}"]
-      (is (= {:where [{"@id" "?person", "person:handle" "?handle"}],
-              :values [["?handle"] [["dsanchez" "coolguy"]]]}
-             (select-keys (sparql/->fql query) [:where :values]))
-          "single var, multiple values")))
+        (is (= [[:values
+                 ["?person"
+                  [{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                    "@value" ":personA"}
+                   {"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                    "@value" ":personB"}]]]
+                {"@id" "?person", "person:handle" "?handle"}]
+               (:where (sparql/->fql query)))
+            "where pattern: single var, multiple values"))
+      (let [query "SELECT * WHERE {
+                     VALUES (?color ?direction) {
+                     ( dm:red  \"north\" )
+                     ( dm:blue  \"west\" )
+                   }}"]
+        (is (= [[:values
+                 [["?color" "?direction"]]
+                 [[{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                    "@value" "dm:red"}
+                   "north"]
+                  [{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                    "@value" "dm:blue"}
+                   "west"]]]]
+               (:where (sparql/->fql query)))
+            "multiple vars, multiple values")))
+    (testing "clause"
+      (let [query "SELECT ?handle
+                   WHERE { ?person person:handle ?handle.}
+                   VALUES ?person { :personA :personB }"]
+        (is (= {:where [{"@id" "?person", "person:handle" "?handle"}],
+                :values
+                ["?person"
+                 [{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                   "@value" ":personA"}
+                  {"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                   "@value" ":personB"}]]}
+               (select-keys (sparql/->fql query) [:where :values]))
+            "where pattern: single var, multiple values"))))
   (testing "BIND"
     (let [query "SELECT ?person ?handle
                  WHERE {BIND (\"dsanchez\" AS ?handle)

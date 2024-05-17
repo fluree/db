@@ -277,16 +277,27 @@
 
 (defmethod parse-term :DataBlockValue
   ;; DataBlockValue ::= iri | RDFLiteral | NumericLiteral | BooleanLiteral | 'UNDEF' WS
-  [[_ value]]
-  (if (= value "UNDEF")
-    nil
-    (parse-term value)))
+  [[_ [tag :as value]]]
+  (cond
+    ;; iri values need to be wrapped in a value-map
+    (= tag :iri) {const/iri-type const/iri-anyURI const/iri-value (parse-term value)}
+    (= value "UNDEF")      nil
+    :else                  (parse-term value)))
+
+(defmethod parse-term :VarList
+  ;; VarList ::= ( <'('> Var* <')'> )
+  [[_ & vars]]
+  (mapv parse-term vars))
+
+(defmethod parse-term :ValueList
+  ;; ValueList ::= ( <'('> WS DataBlockValue* <')'> )
+  [[_ & values]]
+  (mapv parse-term values))
 
 (defmethod parse-term :InlineDataFull
-  ;; InlineDataFull ::= ( NIL | '(' Var* ')' ) '{' ( '(' DataBlockValue* ')' | NIL )* '}'
-  [_ data]
-  (throw (ex-info "Multiple inline data values not supported"
-                  {:status 400 :error :db/invalid-query})))
+  ;; InlineDataFull ::= ( NIL | VarList ) WS <'{'> WS ( ValueList WS | NIL )* <'}'>
+  [[_ vars & data]]
+  [:values [(parse-term vars)] (mapv parse-term data)])
 
 (defmethod parse-term :InlineDataOneVar
   ;; InlineDataOneVar ::= Var <'{'> WS DataBlockValue* <'}'>
@@ -302,7 +313,7 @@
 (defmethod parse-term :GraphPatternNotTriples
   ;; GraphPatternNotTriples ::= GroupOrUnionGraphPattern | OptionalGraphPattern | MinusGraphPattern | GraphGraphPattern | ServiceGraphPattern | Filter | Bind | InlineData
   [[_ & non-triples]]
-  (into [] (mapv parse-term non-triples)))
+  (mapv parse-term non-triples))
 
 (defmethod parse-term :PrefixedName
   [[_ & name]]
@@ -413,6 +424,11 @@
   [[_ & patterns]]
   [[:where (into [] (mapcat parse-term patterns))]])
 
+(defmethod parse-rule :ValuesClause
+  ;; ValuesClause ::= ( <'VALUES'> WS DataBlock )? WS
+  [[_ datablock]]
+  [(parse-term datablock)])
+
 (defmethod parse-rule :OffsetClause
   ;; OffsetClause ::= <'OFFSET'> WS INTEGER
   [[_ offset]]
@@ -482,17 +498,7 @@
   [[_ & modifiers]]
   (mapcat parse-rule modifiers))
 
-(defn format-values
-  [{:keys [where] :as fql}]
-  (let [{values true
-         patterns false}
-        (group-by (fn [pattern] (= (first pattern) :values)) where)]
-    (cond-> (assoc fql :where patterns)
-      (seq values) (assoc :values (->> (mapv second values)
-                                       (apply mapv (fn [& values] (vec values))))))))
-
 (defn translate
   [parsed]
   (->> parsed
-       (reduce (fn [fql rule] (into fql (parse-rule rule))) {})
-       (format-values)))
+       (reduce (fn [fql rule] (into fql (parse-rule rule))) {})))
