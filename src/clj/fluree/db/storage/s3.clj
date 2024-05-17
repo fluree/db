@@ -12,13 +12,14 @@
   storage/Store
   (write [_ dir data]
     (go
-      (let [hash    (crypto/sha2-256 data)
-            bytes   (if (string? data)
-                     (bytes/string->UTF8 data)
-                     data)
-            path    (str/join "/" [dir hash ".json"])
-            result  (<! (s3/write-s3-data client bucket prefix path bytes))
-            address (s3/s3-address bucket prefix path)]
+      (let [hash     (crypto/sha2-256 data)
+            bytes    (if (string? data)
+                       (bytes/string->UTF8 data)
+                       data)
+            filename (str hash ".json")
+            path     (str/join "/" [dir filename])
+            result   (<! (s3/write-s3-data client bucket prefix path bytes))
+            address  (s3/s3-address bucket prefix path)]
         (if (instance? Throwable result)
           result
           {:hash    hash
@@ -43,6 +44,6 @@
    (open bucket prefix nil))
   ([bucket prefix endpoint-override]
    (let [aws-opts (cond-> {:api :s3}
-                    endpoint-override (assoc :endpoint-override endpoint-override))
+                          endpoint-override (assoc :endpoint-override endpoint-override))
          client   (aws/client aws-opts)]
      (->S3Store client bucket prefix))))

@@ -31,7 +31,8 @@
                          :path dir
                          :data data})))
       (let [hash     (crypto/sha2-256 data :hex)
-            path     (str/join "/" [dir hash ".json"])
+            filename (str hash ".json")
+            path     (str/join "/" [dir filename])
             absolute (full-path root path)
             bytes    (if (string? data)
                        (bytes/string->UTF8 data)
