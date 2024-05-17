@@ -1,7 +1,8 @@
 (ns fluree.db.database.async
   (:require [fluree.db.database :as database :refer [Database]]
             [fluree.db.util.async :refer [<? go-try]]
-            [clojure.core.async :as async]
+            [clojure.core.async :as async :refer [<! go]]
+            [fluree.db.query.exec.where :as where]
             [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]])
   #?(:clj (:import (java.io Writer))))
 
@@ -21,7 +22,35 @@
       (if-let [db (<? db-chan)]
         (<? (database/stage db tx))
         (throw (ex-info (str "Database for " alias "/" branch " at `t` = " t " not delivered.")
-                        {:status 500 :error :db/not-delivered}))))))
+                        {:status 500 :error :db/not-delivered})))))
+
+  where/Searchable
+  (match-id [_ fuel-tracker solution s-match error-ch]
+    (let [match-ch (async/chan)]
+      (go
+        (let [db (<! db-chan)]
+          (-> db
+              (where/match-id fuel-tracker solution s-match error-ch)
+              (async/pipe match-ch))))
+      match-ch))
+
+  (match-triple [_ fuel-tracker solution triple error-ch]
+    (let [match-ch (async/chan)]
+      (go
+        (let [db (<! db-chan)]
+          (-> db
+              (where/match-triple fuel-tracker solution triple error-ch)
+              (async/pipe match-ch))))
+      match-ch))
+
+  (match-class [_ fuel-tracker solution triple error-ch]
+    (let [match-ch (async/chan)]
+      (go
+        (let [db (<! db-chan)]
+          (-> db
+              (where/match-class fuel-tracker solution triple error-ch)
+              (async/pipe match-ch))))
+      match-ch)))
 
 (def ^String label "#fluree/AsyncDB ")
 

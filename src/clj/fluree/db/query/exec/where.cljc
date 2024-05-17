@@ -180,7 +180,7 @@
 (defprotocol Searchable
   (match-id [s fuel-tracker solution s-match error-ch])
   (match-triple [s fuel-tracker solution triple error-ch])
-  (match-class [s fuel-tracker solution triple error-c]))
+  (match-class [s fuel-tracker solution triple error-ch]))
 
 (defn pattern-type
   [pattern]
