@@ -3,6 +3,7 @@
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql :as fql]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.index :as index]
             [fluree.db.indexer.storage :as index-storage]
@@ -15,6 +16,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.json-ld.commit-data :as commit-data]
+            [clojure.core.async :as async]
             [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]])
   #?(:clj (:import (java.io Writer))))
 
@@ -105,6 +107,101 @@
     (force-index-update db commit-index)
     db))
 
+(defn match-id
+  [db fuel-tracker solution s-mch error-ch]
+  (let [matched-ch (async/chan 2 (comp cat
+                                       (partition-by flake/s)
+                                       (map first)
+                                       (map (fn [f]
+                                              (if (where/unmatched-var? s-mch)
+                                                (let [var (where/get-variable s-mch)
+                                                      matched (where/match-subject s-mch db f)]
+                                                  (assoc solution var matched))
+                                                solution)))))
+        s-mch*     (where/assign-matched-component s-mch solution)]
+    (if-let [s (where/compute-sid db s-mch*)]
+      (-> db
+          (where/resolve-flake-range fuel-tracker error-ch [s])
+          (async/pipe matched-ch))
+      (async/close! matched-ch))
+    matched-ch))
+
+(defn match-triple
+  [db fuel-tracker solution tuple error-ch]
+  (let [matched-ch (async/chan 2 (comp cat
+                                       (map (fn [flake]
+                                              (where/match-flake solution tuple db flake)))))
+        db-alias   (:alias db)
+        triple     (where/assign-matched-values tuple solution)]
+    (if-let [[s p o] (where/compute-sids db triple)]
+      (let [pid (where/get-sid p db)]
+        (if-let [props (and pid (where/get-child-properties db pid))]
+          (let [prop-ch (-> props (conj pid) async/to-chan!)]
+            (async/pipeline-async 2
+                                  matched-ch
+                                  (fn [prop ch]
+                                    (let [p* (where/match-sid p db-alias prop)]
+                                      (-> db
+                                          (where/resolve-flake-range fuel-tracker error-ch [s p* o])
+                                          (async/pipe ch))))
+                                  prop-ch))
+
+          (-> db
+              (where/resolve-flake-range fuel-tracker error-ch [s p o])
+              (async/pipe matched-ch))))
+      (async/close! matched-ch))
+    matched-ch))
+
+(defn with-distinct-subjects
+  "Return a transducer that filters a stream of flakes by removing any flakes with
+  subject ids repeated from previously processed flakes."
+  []
+  (fn [rf]
+    (let [seen-sids (volatile! #{})]
+      (fn
+        ;; Initialization: do nothing but initialize the supplied reducing fn
+        ([]
+         (rf))
+
+        ;; Iteration: keep track of subject ids seen; only pass flakes with new
+        ;; subject ids through to the supplied reducing fn.
+        ([result f]
+         (let [sid (flake/s f)]
+           (if (contains? @seen-sids sid)
+             result
+             (do (vswap! seen-sids conj sid)
+                 (rf result f)))))
+
+        ;; Termination: do nothing but terminate the supplied reducing fn
+        ([result]
+         (rf result))))))
+
+(defn match-class
+  [db fuel-tracker solution triple error-ch]
+  (let [matched-ch (async/chan 2 (comp cat
+                                       (with-distinct-subjects)
+                                       (map (fn [flake]
+                                              (where/match-flake solution triple db flake)))))
+        db-alias   (:alias db)
+        triple     (where/assign-matched-values triple solution)]
+    (if-let [[s p o] (where/compute-sids db triple)]
+      (let [cls        (where/get-sid o db)
+            sub-obj    (dissoc o ::sids ::iri)
+            class-objs (into [o]
+                             (comp (map (fn [cls]
+                                          (where/match-sid sub-obj db-alias cls)))
+                                   (remove nil?))
+                             (dbproto/-class-prop db :subclasses cls))
+            class-ch   (async/to-chan! class-objs)]
+        (async/pipeline-async 2
+                              matched-ch
+                              (fn [class-obj ch]
+                                (-> (where/resolve-flake-range db fuel-tracker error-ch [s p class-obj])
+                                    (async/pipe ch)))
+                              class-ch))
+      (async/close! matched-ch))
+    matched-ch))
+
 ;; ================ end Jsonld record support fns ============================
 
 (defrecord JsonLdDb [conn alias branch commit t tt-id stats spot post opst tspo
@@ -129,7 +226,17 @@
   (encode-iri [_ iri]
     (iri/iri->sid iri namespaces))
   (decode-sid [_ sid]
-    (iri/sid->iri sid namespace-codes)))
+    (iri/sid->iri sid namespace-codes))
+
+  where/Searchable
+  (match-id [db fuel-tracker solution s-mch error-ch]
+    (match-id db fuel-tracker solution s-mch error-ch))
+
+  (match-triple [db fuel-tracker solution s-mch error-ch]
+    (match-triple db fuel-tracker solution s-mch error-ch))
+
+  (match-class [db fuel-tracker solution s-mch error-ch]
+    (match-class db fuel-tracker solution s-mch error-ch)))
 
 (def ^String label "#fluree/JsonLdDb ")
 
