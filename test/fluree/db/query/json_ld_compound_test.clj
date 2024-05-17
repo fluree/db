@@ -128,7 +128,7 @@
                                  :select  [?name ?favNums]
                                  :where   {:schema/name ?name
                                            :ex/favNums  ?favNums}
-                                 :orderBy [?name [desc ?favNums]]})
+                                 :orderBy [?name (desc ?favNums)]})
              [["Alice" 76] ["Alice" 42] ["Alice" 9] ["Brian" 7] ["Cam" 10] ["Cam" 5]])
           "Ordering of multiple variables not working.")
 
