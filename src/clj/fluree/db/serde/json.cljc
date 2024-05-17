@@ -60,11 +60,11 @@
   [db-root]
   (let [{:keys [spot post opst tspo]} db-root]
     (-> db-root
+        (update :namespace-codes numerize-keys)
         (assoc :spot (deserialize-child-node spot)
                :post (deserialize-child-node post)
                :opst (deserialize-child-node opst)
-               :tspo (deserialize-child-node tspo))
-        (update :namespace-codes numerize-keys))))
+               :tspo (deserialize-child-node tspo)))))
 
 
 (defn- deserialize-branch-node
