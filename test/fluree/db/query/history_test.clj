@@ -971,10 +971,10 @@
                                              root-privkey))]
       (is (= [{"f:author" "", "f:txn" "", "f:data" {"f:t" 1}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-               "f:txn" "fluree:memory://9f321be5fd184f43d998ef7b02cdded2625579cc52b95e1d8f12c9b28cd7a5b0",
+               "f:txn" "fluree:memory://8bf810310a1f54a186acde9c7f05c91e0cf0facf6fb9ce5aa17987be0957bfd9",
                "f:data" {"f:t" 2}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-               "f:txn" "fluree:memory://5e7e5ce8d21011c95844d6b8f804e162a0afdda7c794c1dc2b52bc19565bfc64",
+               "f:txn" "fluree:memory://3b4f6c72ffbea9b6c601fb30d1df4934520dfffc20139ece2aecb15b6a610804",
                "f:data" {"f:t" 3}}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true
@@ -1024,11 +1024,11 @@
                      (fluree/commit! ledger)
                      (deref))]
         (testing "annotations in commit-details"
-          (is (= [{"f:txn" "fluree:memory://5c54eee1fd6be197402fcd76b035cd6f42b55723f35c294992d76e6eea2cf874"}
-                  {"f:txn" "fluree:memory://6ab2e58c44af9db30feb461c212b3b566a35fdfe92d53b61018eab425ca0c342"
+          (is (= [{"f:txn" "fluree:memory://2c28ed0d4102ff436641911c90f47f0681a9ae251640823f7f361f7e22a57fef"}
+                  {"f:txn" "fluree:memory://cd26d7c28c0a5368694a6b8fbd11c573f0623313c06ae96c15ff016572972568"
                    "f:annotation" {"id" "_:fdb-3" "ex:data" "ok" "ex:originator" "opts"}}
 
-                  {"f:txn" "fluree:memory://22738244510e8c756cbc14eedc3d223e4b66024ffbc3debb856c7d7b063798df"
+                  {"f:txn" "fluree:memory://40ce18ee7469c565297e9b9e348788a891ab1bca8fdfda2116d7a2b6c2c82a86"
                    "f:annotation" {"id" "_:fdb-5" "ex:data" "ok" "ex:originator" "txn"}}]
                  (->> @(fluree/history ledger {:context        context
                                                :commit-details true

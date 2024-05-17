@@ -3,7 +3,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
-            [fluree.db.storage :as storage]))
+            [fluree.db.storage :as storage]
+            [clojure.string :as str]))
 
 (def method-name "file")
 
@@ -16,26 +17,28 @@
   (let [relative-path (:local (storage/parse-address address))]
     (full-path root relative-path)))
 
+(defn file-address
+  [path]
+  (storage/build-fluree-address method-name path))
+
 (defrecord FileStore [root]
   storage/Store
-  (address [_ path]
-    (storage/build-fluree-address method-name path))
-
-  (write [store path v]
+  (write [_ dir data]
     (go-try
-      (when (not (storage/hashable? v))
+      (when (not (storage/hashable? data))
         (throw (ex-info "Must serialize v before writing to FileStore."
                         {:root root
-                         :path path
-                         :v    v})))
-      (let [hash  (crypto/sha2-256 v)
-            path* (str (fs/local-path root) "/" path)
-            bytes (if (string? v)
-                    (bytes/string->UTF8 v)
-                    v)]
-        (<? (fs/write-file path* bytes))
+                         :path dir
+                         :data data})))
+      (let [hash     (crypto/sha2-256 data :hex)
+            path     (str/join "/" [dir hash ".json"])
+            absolute (full-path root path)
+            bytes    (if (string? data)
+                       (bytes/string->UTF8 data)
+                       data)]
+        (<? (fs/write-file absolute bytes))
         {:path    path
-         :address (storage/address store path)
+         :address (file-address path)
          :hash    hash
          :size    (count bytes)})))
 
