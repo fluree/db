@@ -42,15 +42,9 @@
          :first (some-> child-node :first deserialize-flake)
          :rhs   (some-> child-node :rhs deserialize-flake)))
 
-
-(defn parse-int
-  [x]
-  #?(:clj (Integer/parseInt x)
-     :cljs (js/parseInt x)))
-
 (defn keyword->int
   [k]
-  (-> k name parse-int))
+  (-> k name util/str->int))
 
 (defn numerize-keys
   "Convert the keys of the provided map `m` to integers. Assumes that the keys are
@@ -64,14 +58,13 @@
 (defn- deserialize-db-root
   "Assumes all data comes in as keywordized JSON."
   [db-root]
-  (let [{:keys [v spot post opst tspo]} db-root]
-    (cond-> (assoc db-root :spot (deserialize-child-node spot)
-                           :post (deserialize-child-node post)
-                           :opst (deserialize-child-node opst)
-                           :tspo (deserialize-child-node tspo))
-
-            ;; following only needed for v0 of db-root
-            (nil? v) (update :namespace-codes numerize-keys))))
+  (let [{:keys [spot post opst tspo]} db-root]
+    (-> db-root
+        (update :namespace-codes numerize-keys)
+        (assoc :spot (deserialize-child-node spot)
+               :post (deserialize-child-node post)
+               :opst (deserialize-child-node opst)
+               :tspo (deserialize-child-node tspo)))))
 
 
 (defn- deserialize-branch-node

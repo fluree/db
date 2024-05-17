@@ -70,7 +70,7 @@
 (defn write-db-root
   [db]
   (let [{:keys [conn ledger commit t stats spot psot post opst tspo
-                schema namespaces]}
+                schema namespace-codes]}
         db
 
         ledger-alias (:id commit)
@@ -86,7 +86,7 @@
                       :tspo            (child-data tspo)
                       :timestamp       (util/current-time-millis)
                       :prevIndex       (or (:indexed stats) 0)
-                      :namespaces      namespaces}
+                      :namespace-codes  namespace-codes}
         ser          (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn ledger :root ser)))
 
@@ -149,22 +149,21 @@
 
 (defn reify-db-root-v1
   [blank-db root-data]
-  (go-try
-   (let [{:keys [t stats schema namespaces]}
-         root-data
-         namespace-codes (map-invert namespaces)
-         db         (assoc blank-db
-                      :t t
-                      :namespaces namespaces
-                      :namespace-codes namespace-codes
-                      :stats (assoc stats :indexed t))
-         indexed-db (reduce
-                     (fn [db* idx]
-                       (let [idx-root (reify-index-root nil db* idx (get root-data idx))]
-                         (assoc db* idx idx-root)))
-                     db index/types)
-         schema     (vocab/deserialize-schema schema namespace-codes)]
-     (assoc indexed-db :schema schema))))
+  (let [{:keys [t stats schema namespace-codes]}
+        root-data
+        namespaces (map-invert namespace-codes)
+        db         (assoc blank-db
+                     :t t
+                     :namespaces namespaces
+                     :namespace-codes namespace-codes
+                     :stats (assoc stats :indexed t))
+        indexed-db (reduce
+                    (fn [db* idx]
+                      (let [idx-root (reify-index-root nil db* idx (get root-data idx))]
+                        (assoc db* idx idx-root)))
+                    db index/types)
+        schema     (vocab/deserialize-schema schema namespace-codes)]
+    (assoc indexed-db :schema schema)))
 
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes.
