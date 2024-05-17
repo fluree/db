@@ -426,15 +426,15 @@
 (defmethod parse-term :ExplicitOrderCondition
   ;; ExplicitOrderCondition ::= ( 'ASC' | 'DESC' ) WS BrackettedExpression
   [[_ order expr]]
-  [(str/lower-case order) (parse-term expr)])
+  (list (str/lower-case order) (parse-term expr)))
 
 (defmethod parse-rule :OrderClause
   ;; OrderClause ::= <'ORDER' WS 'BY'> WS OrderCondition+ WS
   ;; <OrderCondition> ::= ExplicitOrderCondition | Constraint | Var
   [[_ & conditions]]
   [[:orderBy (mapv (fn [condition]
-                     (cond (= "ASC" (first condition)) ["asc" (parse-term (second condition))]
-                           (= "DESC" (first condition)) ["desc" (parse-term (second condition))]
+                     (cond (= "ASC" (first condition)) (list "asc" (parse-term (second condition)))
+                           (= "DESC" (first condition)) (list "desc" (parse-term (second condition)))
                            :else
                            (parse-term condition)))
                    conditions)]])

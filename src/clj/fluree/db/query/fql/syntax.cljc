@@ -136,7 +136,7 @@
                        [:desc [:fn desc?]]]
     ::ordering        [:orn {:error/message "Ordering must be a var or two-tuple formatted ['ASC' or 'DESC', var]"}
                        [:scalar ::var]
-                       [:vector [:and sequential?
+                       [:vector [:and list?
                                  [:catn
                                   [:direction ::direction]
                                   [:dimension ::var]]]]]
