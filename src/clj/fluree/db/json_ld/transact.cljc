@@ -148,7 +148,7 @@
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
   along with performing any final validation and policy enforcement."
-  [fuel-tracker tx-state [db flakes]]
+  [tx-state [db flakes]]
   (go-try
     (-> (final-db db flakes tx-state)
         <?
@@ -177,4 +177,4 @@
            tx-state   (->tx-state :db db*, :context context, :txn raw-txn, :author-did did
                                   :annotation annotation)
            flakes     (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
-       (<? (flakes->final-db fuel-tracker tx-state flakes))))))
+       (<? (flakes->final-db tx-state flakes))))))
