@@ -145,18 +145,12 @@
                         (vocab/hydrate-schema add mods))]
       {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
 
-(defn flakes->final-db
-  "Takes final set of proposed staged flakes and turns them into a new db value
-  along with performing any final validation and policy enforcement."
-  [tx-state [db flakes]]
+(defn validate-db-update
+  [updated-db]
   (go-try
-    (-> (final-db db flakes tx-state)
-        <?
-        validate
-        <?
-        (policy/allowed?)
-        <?
-        dbproto/-rootdb)))
+    (let [validated-db (<? (validate updated-db))
+          allowed-db   (<? (policy/allowed? validated-db))]
+      (dbproto/-rootdb allowed-db))))
 
 (defn stage
   ([db txn parsed-opts]
@@ -174,7 +168,8 @@
                         (<? (perm/wrap-policy db policy-identity))
                         db)
 
-           tx-state   (->tx-state :db db*, :context context, :txn raw-txn, :author-did did
-                                  :annotation annotation)
-           flakes     (<? (generate-flakes db fuel-tracker parsed-txn tx-state))]
-       (<? (flakes->final-db tx-state flakes))))))
+           tx-state          (->tx-state :db db*, :context context, :txn raw-txn, :author-did did
+                                         :annotation annotation)
+           [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
+           updated-db        (<? (final-db db** new-flakes tx-state))]
+       (<? (validate-db-update updated-db))))))
