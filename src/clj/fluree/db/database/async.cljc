@@ -1,5 +1,6 @@
 (ns fluree.db.database.async
   (:require [fluree.db.database :as database :refer [Database]]
+            [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async :refer [<! go]]
             [fluree.db.query.exec.where :as where]
@@ -82,6 +83,10 @@
       :db-chan
       (async/put! db)))
 
-(defn ->db
-  [alias branch t]
-  (->AsyncDB alias branch t (async/promise-chan)))
+(defn load
+  [conn ledger-alias branch t commit]
+  (let [async-db (->AsyncDB ledger-alias branch t (async/promise-chan))]
+    (go
+      (let [db (<! (jld-db/load conn ledger-alias branch commit))]
+        (deliver! async-db db)))
+    async-db))
