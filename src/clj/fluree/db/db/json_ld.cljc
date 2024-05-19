@@ -242,7 +242,7 @@
 
 (defn display
   [db]
-  (select-keys db [:alias :t :stats :policy]))
+  (select-keys db [:alias :branch :t :stats :policy]))
 
 #?(:cljs
    (extend-type JsonLdDb
