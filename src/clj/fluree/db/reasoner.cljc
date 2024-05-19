@@ -64,14 +64,11 @@
   [db fuel-tracker rule-id full-rule]
   (go-try
     (let [tx-state   (transact/->tx-state :db db, :reasoned-from-iri rule-id)
-          parsed-txn (:rule-parsed full-rule)
-          _          (when-not (:where parsed-txn)
-                       (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
-                                       {:status 400 :error :db/invalid-transaction})))
-          flakes     (async/<! (transact/generate-flakes db fuel-tracker parsed-txn tx-state))]
-      (when (util/exception? flakes)
-        (throw flakes))
-      flakes)))
+          parsed-txn (:rule-parsed full-rule)]
+      (when-not (:where parsed-txn)
+        (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
+                        {:status 400 :error :db/invalid-transaction})))
+      (<? (transact/generate-flakes db fuel-tracker parsed-txn tx-state)))))
 
 (defn filter-same-as-trans
   "Note - this remove 'self' from sameAs transitive
@@ -247,7 +244,7 @@
 
 (defn reason
   [db methods graph-or-db {:keys [max-fuel reasoner-max]
-                           :or   {reasoner-max 10} :as opts}]
+                           :or   {reasoner-max 10} :as _opts}]
   (go-try
     (let [methods*        (set (util/sequential methods))
           fuel-tracker    (fuel/tracker max-fuel)
