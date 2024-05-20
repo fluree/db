@@ -60,6 +60,16 @@
     (throw (ex-info (str "Unsupported aggregate function: " func)
                     {:status 400 :error :db/invalid-query}))))
 
+(defmethod parse-term :ExistsFunc
+  [r]
+  (throw (ex-info "EXISTS is not a supported SPARQL clause"
+                  {:status 400 :error :db/invalid-query})))
+
+(defmethod parse-term :NotExistsFunc
+  [r]
+  (throw (ex-info "NOT EXISTS is not a supported SPARQL clause"
+                  {:status 400 :error :db/invalid-query})))
+
 (defmethod parse-term :RegexExpression
   ;; RegexExpression ::= <'REGEX'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
   [[_ text pattern flags]]
