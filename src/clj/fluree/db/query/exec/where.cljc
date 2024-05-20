@@ -176,7 +176,7 @@
   [patterns]
   (vec patterns))
 
-(defprotocol Searchable
+(defprotocol Matcher
   (-match-id [s fuel-tracker solution s-match error-ch])
   (-match-triple [s fuel-tracker solution triple error-ch])
   (-match-class [s fuel-tracker solution triple error-ch]))

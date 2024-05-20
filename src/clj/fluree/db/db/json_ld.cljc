@@ -352,7 +352,7 @@
   (decode-sid [_ sid]
     (iri/sid->iri sid namespace-codes))
 
-  where/Searchable
+  where/Matcher
   (-match-id [db fuel-tracker solution s-mch error-ch]
     (match-id db fuel-tracker solution s-mch error-ch))
 

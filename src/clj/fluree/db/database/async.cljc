@@ -26,7 +26,7 @@
         (throw (ex-info (str "Database for " alias "/" branch " at `t` = " t " not delivered.")
                         {:status 500 :error :db/not-delivered})))))
 
-  where/Searchable
+  where/Matcher
   (-match-id [_ fuel-tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
       (go
