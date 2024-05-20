@@ -3,18 +3,18 @@
             [fluree.db.ledger :as ledger]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.branch :as branch]
-            [fluree.db.db.json-ld :as jld-db]
             [fluree.db.json-ld.commit :as jld-commit]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
             [fluree.db.indexer :as indexer]
+            [fluree.db.indexer.default :as idx-default]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.connection :as connection :refer [register-ledger release-ledger]]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.index :as index]
+            [fluree.json-ld :as json-ld]
             [fluree.db.util.log :as log]
             [fluree.db.flake :as flake])
   (:refer-clojure :exclude [load]))
@@ -94,7 +94,7 @@
   [ledger db opts]
   (let [{:keys [branch] :as opts*}
         (normalize-opts opts)
-        {:keys [t] :as db*} (or db (ledger/-db ledger (:branch opts*)))
+        {:keys [t] :as db*} (or db (ledger/-db ledger branch))
         committed-t                (ledger/latest-commit-t ledger branch)]
     (if (= t (flake/next-t committed-t))
       (jld-commit/commit ledger db* opts*)
@@ -117,11 +117,14 @@
   If commit successful, returns successfully updated db."
   [{:keys [conn] :as ledger} expanded-commit]
   (go-try
-    (let [[commit proof] (jld-reify/parse-commit expanded-commit)
-          branch    (keyword (get-first-value expanded-commit const/iri-branch))
-          commit-t  (-> expanded-commit
-                        (get-first const/iri-data)
-                        (get-first-value const/iri-t))
+    (let [[commit proof] (jld-reify/verify-commit expanded-commit)
+
+          branch     (-> expanded-commit
+                         (get-first-value const/iri-branch)
+                         keyword)
+          commit-t   (-> expanded-commit
+                         (get-first const/iri-data)
+                         (get-first-value const/iri-t))
           current-db (ledger/-db ledger {:branch branch})
           current-t  (:t current-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
@@ -130,10 +133,8 @@
       (cond
 
         (= commit-t (flake/next-t current-t))
-        (let [updated-db  (<? (jld-reify/merge-commit conn current-db false [commit proof]))
-              commit-map  (commit-data/json-ld->map commit (select-keys updated-db index/types))
-              updated-db* (assoc updated-db :commit commit-map)]
-          (commit-update ledger branch updated-db*))
+        (let [updated-db  (<? (jld-reify/merge-commit conn current-db [commit proof]))]
+          (commit-update ledger branch updated-db))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
         (flake/t-after? commit-t (flake/next-t current-t))
@@ -183,68 +184,88 @@
     (subs ledger-alias 1)
     ledger-alias))
 
+(defn write-genesis-commit
+  [conn ledger-alias branch ns-addresses]
+  (go-try
+    (let [genesis-commit            (commit-data/blank-commit ledger-alias branch ns-addresses)
+          initial-context           (get genesis-commit "@context")
+          initial-db-data           (-> genesis-commit
+                                        (get "data")
+                                        (assoc "@context" initial-context))
+          {db-address :address}     (<? (connection/-c-write conn ledger-alias initial-db-data))
+          genesis-commit*           (assoc-in genesis-commit ["data" "address"] db-address)
+          {commit-address :address} (<? (connection/-c-write conn ledger-alias genesis-commit*))]
+      (assoc genesis-commit* "address" commit-address))))
 
-(defn ->ledger
+(defn initial-state
+  [branches current-branch]
+  {:closed?  false
+   :branches branches
+   :branch   current-branch
+   :graphs   {}
+   :push     {:complete {:t   0
+                         :dag nil}
+              :pending  {:t   0
+                         :dag nil}}})
+
+(defn validate-indexer
+  [indexer reindex-min-bytes reindex-max-bytes]
+  (cond
+    (satisfies? indexer/iIndex indexer)
+    indexer
+
+    indexer
+    (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
+                         "Provided: " indexer)
+                    {:status 400 :error :db/invalid-indexer}))
+
+    :else
+    (idx-default/create
+      (util/without-nils
+        {:reindex-min-bytes reindex-min-bytes
+         :reindex-max-bytes reindex-max-bytes}))))
+
+(defn parse-did
+  [conn did]
+  (if did
+    (if (map? did)
+      did
+      {:id did})
+    (connection/-did conn)))
+
+(defn parse-ledger-options
+  [conn {:keys [did branch indexer reindex-min-bytes reindex-max-bytes]
+         :or   {branch :main}}]
+  (let [did*    (parse-did conn did)
+        indexer (validate-indexer indexer reindex-min-bytes reindex-max-bytes)]
+    {:did     did*
+     :branch  branch
+     :indexer indexer}))
+
+(defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [did branch indexer reindex-min-bytes reindex-max-bytes]
-           :or   {branch :main}}
-          opts
+    (let [{:keys [did branch indexer]}
+          (parse-ledger-options conn opts)
 
-          did*    (if did
-                    (if (map? did)
-                      did
-                      {:id did})
-                    (connection/-did conn))
-          indexer (cond
-                    (satisfies? indexer/iIndex indexer)
-                    indexer
-
-                    indexer
-                    (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
-                                         "Provided: " indexer)
-                                    {:status 400 :error :db/invalid-indexer}))
-
-                    :else
-                    (connection/-new-indexer
-                      conn (util/without-nils
-                             {:reindex-min-bytes reindex-min-bytes
-                              :reindex-max-bytes reindex-max-bytes})))
-          ledger-alias* (normalize-alias ledger-alias)
-          address       (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
-          ns-addresses  (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
+          ledger-alias*  (normalize-alias ledger-alias)
+          address        (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
+          ns-addresses   (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
+          genesis-commit (json-ld/expand
+                           (<? (write-genesis-commit conn ledger-alias branch ns-addresses)))
           ;; map of all branches and where they are branched from
-          branches      {branch (branch/new-branch-map ledger-alias* branch ns-addresses)}]
+          branches       {branch (<? (branch/load-branch-map conn ledger-alias* branch genesis-commit))}]
       (map->JsonLDLedger
-        {:id      (random-uuid)
-         :did     did*
-         :state   (atom {:closed?  false
-                         :branches branches
-                         :branch   branch
-                         :graphs   {}
-                         :push     {:complete {:t   0
-                                               :dag nil}
-                                    :pending  {:t   0
-                                               :dag nil}}})
-         :alias   ledger-alias*
-         :address address
-         :cache   (atom {})
-         :indexer indexer
+        {:id       (random-uuid)
+         :did      did
+         :state    (atom (initial-state branches branch))
+         :alias    ledger-alias*
+         :address  address
+         :cache    (atom {})
+         :indexer  indexer
          :reasoner #{}
-         :conn    conn}))))
-
-(defn initialize-db!
-  [ledger]
-  (let [db (jld-db/create ledger)]
-    (db-update ledger db)))
-
-(defn create*
-  [conn ledger-alias opts]
-  (go-try
-    (let [ledger (<? (->ledger conn ledger-alias opts))]
-      (initialize-db! ledger)
-      ledger)))
+         :conn     conn}))))
 
 (defn create
   [conn ledger-alias opts]
@@ -295,12 +316,22 @@
           _            (log/debug "load commit:" commit)
           ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
-          ledger       (<? (create* conn ledger-alias {:branch branch}))
-          db           (ledger/-db ledger)
-          db*          (<? (jld-reify/load-db-idx ledger db commit commit-addr false))]
-      (ledger/-commit-update! ledger branch db*)
+
+          {:keys [did branch indexer]} (parse-ledger-options conn {:branch branch})
+
+          branches {branch (<? (branch/load-branch-map conn ledger-alias branch commit))}
+          ledger   (map->JsonLDLedger
+                     {:id       (random-uuid)
+                      :did      did
+                      :state    (atom (initial-state branches branch))
+                      :alias    ledger-alias
+                      :address  address
+                      :cache    (atom {})
+                      :indexer  indexer
+                      :reasoner #{}
+                      :conn     conn})]
       (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
-      (async/put! ledger-chan ledger) ; note, ledger can be an exception!
+      (async/put! ledger-chan ledger)
       ledger)))
 
 (def fluree-address-prefix
