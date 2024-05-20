@@ -98,30 +98,30 @@
   (mapv parse-term expressions))
 
 (def supported-scalar-functions
-  {"COALESCE"  "coalesce"
-   "STR"       "str"
-   "RAND"      "rand"
-   "ABS"       "abs"
+  {"ABS"       "abs"
+   "BOUND"     "bound"
    "CEIL"      "ceil"
-   "FLOOR"     "floor"
+   "COALESCE"  "coalesce"
    "CONCAT"    "concat"
-   "STRLEN"    "count"
-   "STRSTARTS" "strStarts"
-   "STRENDS"   "strEnds"
+   "FLOOR"     "floor"
    "IF"        "if"
+   "RAND"      "rand"
    "SHA256"    "sha256"
    "SHA512"    "sha512"
-   "BOUND"     "bound"})
+   "STR"       "str"
+   "STRENDS"   "strEnds"
+   "STRLEN"    "count"
+   "STRSTARTS" "strStarts"})
 
 (defmethod parse-term :Func
   [[_ func & args]]
   (let [f (get supported-scalar-functions func)]
     (case f
-      "concat" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
       "abs"    (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
-      "sha512" (str "(" f " " (literal-quote (parse-term (first args))) ")")
-      "ceil"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "bound"  (str "(" f " " (parse-term (first args)) ")")
+      "ceil"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "concat" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
+      "sha512" (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
