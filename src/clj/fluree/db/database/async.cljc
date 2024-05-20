@@ -4,6 +4,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async :refer [<! go]]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.json-ld.transact :as transact]
             [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]])
   #?(:clj (:import (java.io Writer))))
 
@@ -51,7 +52,13 @@
           (-> db
               (where/-match-class fuel-tracker solution triple error-ch)
               (async/pipe match-ch))))
-      match-ch)))
+      match-ch))
+
+  transact/Transactable
+  (-stage-db [_ fuel-tracker context identity annotation raw-txn parsed-txn]
+    (go-try
+      (let [db (<! db-chan)]
+        (<? (transact/-stage-db db fuel-tracker context identity annotation raw-txn parsed-txn))))))
 
 (def ^String label "#fluree/AsyncDB ")
 
