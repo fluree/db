@@ -9,7 +9,6 @@
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.policy.enforce-tx :as policy]
-            [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
@@ -162,11 +161,10 @@
 (defn stage
   ([db txn parsed-opts]
    (stage db nil txn parsed-opts))
-  ([db fuel-tracker txn parsed-opts]
+  ([db fuel-tracker parsed-txn parsed-opts]
    (go-try
      (let [{:keys [context raw-txn did]} parsed-opts
 
-           parsed-txn (q-parse/parse-txn txn context)
            annotation (extract-annotation context parsed-txn parsed-opts)
            db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                         (<? (perm/wrap-policy db policy-identity))
