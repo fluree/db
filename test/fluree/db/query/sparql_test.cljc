@@ -250,6 +250,15 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:bind "?handle" "dsanchez"]
               {"@id" "?person", "person:handle" "?handle"}]
+             where)))
+    (let [query "SELECT ?person ?prefix ?foofix
+                 WHERE {BIND (SUBSTR(?handle, 4) AS ?prefix)
+                        BIND (REPLACE(?prefix, \"abc\", \"FOO\") AS ?foofix)
+                        ?person person:handle ?handle.}"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [[:bind "?prefix" "(subStr ?handle 4)"]
+              [:bind "?foofix" "(replace ?prefix \"abc\" \"FOO\")"]
+              {"@id" "?person", "person:handle" "?handle"}]
              where)))))
 
 ;;TODO: not yet supported
