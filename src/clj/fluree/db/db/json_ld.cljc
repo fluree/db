@@ -196,14 +196,17 @@
                                 :staged []
                                 :policy root-policy-map)
                          map->JsonLdDb)
+          indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
+                        (<? (vocab/load-schema indexed-db (:preds root-map)))
+                        indexed-db)
           commit-t   (-> commit-jsonld
                          (get-first const/iri-data)
                          (get-first-value const/iri-t))
-          index-t    (:t indexed-db)]
+          index-t    (:t indexed-db*)]
       (if (= commit-t index-t)
-        indexed-db
+        indexed-db*
         (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
-               db                 indexed-db]
+               db                 indexed-db*]
           (if commit-tuple
             (let [new-db (<? (reify/merge-commit conn db commit-tuple))]
               (recur r new-db))
