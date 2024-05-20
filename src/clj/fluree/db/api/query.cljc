@@ -20,6 +20,7 @@
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.reasoner :as reasoner]
             [fluree.db.validation :as v]))
 
 #?(:clj (set! *warn-on-reflection* true))
