@@ -110,18 +110,20 @@
    "STRENDS"   "strEnds"
    "IF"        "if"
    "SHA256"    "sha256"
-   "SHA512"    "sha512"})
+   "SHA512"    "sha512"
+   "BOUND"     "bound"})
 
 (defmethod parse-term :Func
   [[_ func & args]]
   (let [f (get supported-scalar-functions func)]
     (case f
-        "concat" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
-        "abs"    (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
-        "sha512" (str "(" f " " (literal-quote (parse-term (first args))) ")")
-        "ceil"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
-        (throw (ex-info (str "Unsupported function: " func)
-                        {:status 400 :error :db/invalid-query})))))
+      "concat" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
+      "abs"    (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
+      "sha512" (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "ceil"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "bound"  (str "(" f " " (parse-term (first args)) ")")
+      (throw (ex-info (str "Unsupported function: " func)
+                      {:status 400 :error :db/invalid-query})))))
 
 (defmethod parse-term :NumericLiteral
   ;; NumericLiteral   ::=   NumericLiteralUnsigned WS | NumericLiteralPositive WS | NumericLiteralNegative WS
