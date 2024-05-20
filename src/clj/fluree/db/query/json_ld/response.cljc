@@ -47,11 +47,15 @@
                       (map :as)))
        util/unwrap-singleton))
 
+(defn encode-reference
+  [iri spec]
+  {::reference {:iri  iri
+                :spec spec}})
+
 (defn format-reference
   [db spec sid]
   (let [iri (iri/decode-sid db sid)]
-    {::reference {:iri  iri
-                  :spec spec}}))
+    (encode-reference iri spec)))
 
 (defn format-object
   [db spec f]
