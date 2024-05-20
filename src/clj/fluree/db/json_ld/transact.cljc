@@ -152,6 +152,13 @@
           allowed-db   (<? (policy/allowed? validated-db))]
       (dbproto/-rootdb allowed-db))))
 
+(defn extract-annotation
+  [context parsed-txn parsed-opts]
+  (some-> (or (:annotation parsed-txn) (:annotation parsed-opts))
+          (json-ld/expand context)
+          util/sequential
+          validate-annotation))
+
 (defn stage
   ([db txn parsed-opts]
    (stage db nil txn parsed-opts))
@@ -160,10 +167,7 @@
      (let [{:keys [context raw-txn did]} parsed-opts
 
            parsed-txn (q-parse/parse-txn txn context)
-           annotation (some-> (or (:annotation parsed-txn) (:annotation parsed-opts))
-                              (json-ld/expand context)
-                              (util/sequential)
-                              (validate-annotation))
+           annotation (extract-annotation context parsed-txn parsed-opts)
            db*        (if-let [policy-identity (perm/parse-policy-identity parsed-opts context)]
                         (<? (perm/wrap-policy db policy-identity))
                         db)
