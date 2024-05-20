@@ -26,30 +26,30 @@
                         {:status 500 :error :db/not-delivered})))))
 
   where/Searchable
-  (match-id [_ fuel-tracker solution s-match error-ch]
+  (-match-id [_ fuel-tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
       (go
         (let [db (<! db-chan)]
           (-> db
-              (where/match-id fuel-tracker solution s-match error-ch)
+              (where/-match-id fuel-tracker solution s-match error-ch)
               (async/pipe match-ch))))
       match-ch))
 
-  (match-triple [_ fuel-tracker solution triple error-ch]
+  (-match-triple [_ fuel-tracker solution triple error-ch]
     (let [match-ch (async/chan)]
       (go
         (let [db (<! db-chan)]
           (-> db
-              (where/match-triple fuel-tracker solution triple error-ch)
+              (where/-match-triple fuel-tracker solution triple error-ch)
               (async/pipe match-ch))))
       match-ch))
 
-  (match-class [_ fuel-tracker solution triple error-ch]
+  (-match-class [_ fuel-tracker solution triple error-ch]
     (let [match-ch (async/chan)]
       (go
         (let [db (<! db-chan)]
           (-> db
-              (where/match-class fuel-tracker solution triple error-ch)
+              (where/-match-class fuel-tracker solution triple error-ch)
               (async/pipe match-ch))))
       match-ch)))
 

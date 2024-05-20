@@ -178,9 +178,9 @@
   (vec patterns))
 
 (defprotocol Searchable
-  (match-id [s fuel-tracker solution s-match error-ch])
-  (match-triple [s fuel-tracker solution triple error-ch])
-  (match-class [s fuel-tracker solution triple error-ch]))
+  (-match-id [s fuel-tracker solution s-match error-ch])
+  (-match-triple [s fuel-tracker solution triple error-ch])
+  (-match-class [s fuel-tracker solution triple error-ch]))
 
 (defn pattern-type
   [pattern]
@@ -396,9 +396,9 @@
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [graph]
-                    (match-id graph fuel-tracker solution s-mch error-ch)))
+                    (-match-id graph fuel-tracker solution s-mch error-ch)))
              async/merge)
-        (match-id active-graph fuel-tracker solution s-mch error-ch))
+        (-match-id active-graph fuel-tracker solution s-mch error-ch))
       nil-channel)))
 
 (defmethod match-pattern :tuple
@@ -408,9 +408,9 @@
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [graph]
-                    (match-triple graph fuel-tracker solution tuple error-ch)))
+                    (-match-triple graph fuel-tracker solution tuple error-ch)))
              async/merge)
-        (match-triple active-graph fuel-tracker solution tuple error-ch))
+        (-match-triple active-graph fuel-tracker solution tuple error-ch))
       nil-channel)))
 
 (defmethod match-pattern :class
@@ -421,9 +421,9 @@
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [graph]
-                    (match-class graph fuel-tracker solution triple error-ch)))
+                    (-match-class graph fuel-tracker solution triple error-ch)))
              async/merge)
-        (match-class active-graph fuel-tracker solution triple error-ch)))
+        (-match-class active-graph fuel-tracker solution triple error-ch)))
     nil-channel))
 
 (defmethod match-pattern :filter

@@ -353,13 +353,13 @@
     (iri/sid->iri sid namespace-codes))
 
   where/Searchable
-  (match-id [db fuel-tracker solution s-mch error-ch]
+  (-match-id [db fuel-tracker solution s-mch error-ch]
     (match-id db fuel-tracker solution s-mch error-ch))
 
-  (match-triple [db fuel-tracker solution s-mch error-ch]
+  (-match-triple [db fuel-tracker solution s-mch error-ch]
     (match-triple db fuel-tracker solution s-mch error-ch))
 
-  (match-class [db fuel-tracker solution s-mch error-ch]
+  (-match-class [db fuel-tracker solution s-mch error-ch]
     (match-class db fuel-tracker solution s-mch error-ch))
 
   jld-transact/Transactable
