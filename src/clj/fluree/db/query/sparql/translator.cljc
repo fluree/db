@@ -66,6 +66,19 @@
   (str "(regex " (literal-quote (parse-term text)) " " (literal-quote (parse-term pattern))
        (when flags (str " " (literal-quote (parse-term flags)))) ")"))
 
+(defmethod parse-term :SubstringExpression
+  ;; SubstringExpression ::= <'SUBSTR'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
+  [[_ source starting-loc length]]
+  (str "(subStr " (literal-quote (parse-term source)) " " (parse-term starting-loc)
+       (when length (str " " (parse-term length))) ")"))
+
+(defmethod parse-term :StrReplaceExpression
+  ;; StrReplaceExpression ::= <'REPLACE'> <'('> Expression <','> Expression <','> Expression ( <','> Expression )? <')'>
+  [[_ arg pattern replacement flags]]
+  (str "(replace " (literal-quote (parse-term arg)) " " (literal-quote (parse-term pattern))
+       " " (literal-quote (parse-term replacement))
+       (when flags (str " " (literal-quote (parse-term flags)))) ")"))
+
 (def supported-scalar-functions
   {"COALESCE"  "coalesce"
    "STR"       "str"
