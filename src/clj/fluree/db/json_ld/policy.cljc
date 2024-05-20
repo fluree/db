@@ -3,7 +3,6 @@
             [fluree.db.constants :as const]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.policy-validate :as validate]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
@@ -482,12 +481,6 @@
      (if (and role context)
        (update identity :role json-ld/expand-iri context)
        identity))))
-
-(defn role-sids-for-sid
-  [db sid]
-  (go-try
-    (->> (<? (query-range/index-range db :spot = [sid const/$f:role] {:flake-xf (map flake/o)}))
-         (into #{}))))
 
 (defn roles-for-did
   [db did]
