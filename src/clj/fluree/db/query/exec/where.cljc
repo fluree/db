@@ -8,7 +8,6 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.datatype :as datatype]
             [fluree.db.query.dataset :as dataset]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri])
   #?(:clj (:import (clojure.lang MapEntry))))

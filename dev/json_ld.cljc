@@ -8,7 +8,6 @@
             [fluree.db.util.async :refer [<?? go-try channel?]]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.did :as did]
             [fluree.db.connection :as connection]
             [fluree.db.util.json :as json]

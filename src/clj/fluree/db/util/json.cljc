@@ -4,9 +4,7 @@
             #?(:clj [cheshire.generate :refer [add-encoder encode-seq remove-encoder]])
             #?(:cljs [goog.object :as gobject])
             [fluree.db.util.bytes :as butil]
-            [fluree.db.util.core :as cutil]
             [fluree.db.util.log :as log]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake])
   #?(:clj
      (:import (fluree.db.flake Flake)

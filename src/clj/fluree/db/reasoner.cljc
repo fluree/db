@@ -1,6 +1,5 @@
 (ns fluree.db.reasoner
-  (:require [clojure.core.async :as async :refer [alts! go]]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -8,7 +7,6 @@
             [fluree.db.db.json-ld :as db]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
-            [fluree.db.json-ld.transact :as transact]
             [fluree.db.fuel :as fuel]
             [fluree.db.constants :as const]
             [fluree.json-ld :as json-ld]
