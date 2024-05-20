@@ -429,26 +429,25 @@
   "Takes list of keys and tuples containing values
   and turns them into a map with the respective keys and tuples"
   [namespace-codes positions pred-vals]
-  (let [base-map base-property-map
-        max-idx  (dec (count pred-vals))]
+  (let [max-idx (dec (count pred-vals))]
     (loop [[[idx k] & r] positions
-           acc base-map]
-      (let [acc*  (if-let [raw-val (nth pred-vals idx)]
-                    (case k
-                      :id (let [sid (iri/deserialize-sid raw-val)]
-                            (assoc acc :id sid
-                                       :iri (iri/sid->iri sid namespace-codes)))
-                      :datatype (assoc acc :datatype (iri/deserialize-sid raw-val))
-                      :subclassOf (assoc acc :subclassOf (into (:subclassOf base-map) (map iri/deserialize-sid raw-val)))
-                      :parentProps (assoc acc :parentProps (into (:parentProps base-map) (map iri/deserialize-sid raw-val)))
-                      :childProps (assoc acc :childProps (into (:childProps base-map) (map iri/deserialize-sid raw-val)))
-                      ;; else
-                      (throw (ex-info (str "Cannot deserialize schema from index root. "
-                                           "Unrecognized schema property key found: " k
-                                           "which contains a value of: " raw-val)
-                                      {:status 500
-                                       :error  :db/invalid-index})))
-                    acc)]
+           acc base-property-map]
+      (let [acc* (if-let [raw-val (nth pred-vals idx)]
+                   (case k
+                     :id (let [sid (iri/deserialize-sid raw-val)]
+                           (assoc acc :id sid
+                                      :iri (iri/sid->iri sid namespace-codes)))
+                     :datatype (assoc acc :datatype (iri/deserialize-sid raw-val))
+                     :subclassOf (assoc acc :subclassOf (into (:subclassOf base-property-map) (map iri/deserialize-sid raw-val)))
+                     :parentProps (assoc acc :parentProps (into (:parentProps base-property-map) (map iri/deserialize-sid raw-val)))
+                     :childProps (assoc acc :childProps (into (:childProps base-property-map) (map iri/deserialize-sid raw-val)))
+                     ;; else
+                     (throw (ex-info (str "Cannot deserialize schema from index root. "
+                                          "Unrecognized schema property key found: " k
+                                          "which contains a value of: " raw-val)
+                                     {:status 500
+                                      :error  :db/invalid-index})))
+                   acc)]
         (if (= idx max-idx)
           acc*
           (recur r acc*))))))
