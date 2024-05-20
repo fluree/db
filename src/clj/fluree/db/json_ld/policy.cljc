@@ -492,8 +492,7 @@
 (defn roles-for-did
   [db did]
   (go-try
-    (let [ns-codes (:namespace-codes db)
-          did-sid  (iri/encode-iri db did)]
+    (let [did-sid  (iri/encode-iri db did)]
       (into #{}
             (<? (query-range/index-range db :spot = [did-sid const/$f:role]
                                          {:flake-xf (comp (map flake/o)
