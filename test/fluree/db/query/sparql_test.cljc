@@ -254,6 +254,19 @@
               [:bind "?num1" "(* (/ (* (* ?age 4) 3) -2) (/ -4 2))"]
               {"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:age" "?age"}]
+             where)))
+    (let [query "SELECT ?person ?abs ?bound ?ceil ?concat
+                 WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
+                        BIND (BOUND(?abs) AS ?bound)
+                        BIND (CEIL(1.8) AS ?ceil)
+                        BIND (CONCAT(\"foo\", \"bar\") AS ?concat)
+                        ?person person:age ?age.}"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
+              [:bind "?bound" "(bound ?abs)"]
+              [:bind "?ceil" "(ceil \"1.8\")"]
+              [:bind "?concat" "(concat \"foo\" \"bar\")"]
+              {"@id" "?person", "person:age" "?age"}]
              where)))))
 
 ;;TODO: not yet supported
