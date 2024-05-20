@@ -89,6 +89,11 @@
        " " (literal-quote (parse-term replacement))
        (when flags (str " " (literal-quote (parse-term flags)))) ")"))
 
+(defmethod parse-term :ExpressionList
+  ;; ExpressionList ::= NIL | <'('> Expression ( <','> Expression )* <')'>
+  [[_ & expressions]]
+  (mapv parse-term expressions))
+
 (def supported-scalar-functions
   {"COALESCE"  "coalesce"
    "STR"       "str"
@@ -104,20 +109,16 @@
    "SHA256"    "sha256"
    "SHA512"    "sha512"})
 
-(defmethod parse-term :ExpressionList
-  ;; ExpressionList ::= NIL | <'('> Expression ( <','> Expression )* <')'>
-  [[_ & expressions]]
-  (mapv parse-term expressions))
-
 (defmethod parse-term :Func
   [[_ func & args]]
-  (if-let [f (get supported-scalar-functions func)]
-    (str "(" f " " (str/join " " (->> (mapv parse-term args)
-                                      ;; clobber an :ExpressionList down to the same level as :Expressions
-                                      (flatten)
-                                      (map literal-quote))) ")")
-    (throw (ex-info (str "Unsupported function: " func)
-                    {:status 400 :error :db/invalid-query}))))
+  (let [f (get supported-scalar-functions func)]
+    (case f
+        "concat" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
+        "abs"    (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
+        "sha512" (str "(" f " " (literal-quote (parse-term (first args))) ")")
+        "ceil"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
+        (throw (ex-info (str "Unsupported function: " func)
+                        {:status 400 :error :db/invalid-query})))))
 
 (defmethod parse-term :NumericLiteral
   ;; NumericLiteral   ::=   NumericLiteralUnsigned WS | NumericLiteralPositive WS | NumericLiteralNegative WS
