@@ -35,19 +35,6 @@
                    (mapcat (partial remove :value)))) ; remove value objects
        not-empty))
 
-(defn validate-annotation
-  "Validate that the commit annotation is just a single json-ld node."
-  [[annotation :as expanded]]
-  (when-let [specified-id (:id annotation)]
-    (throw (ex-info "Commit annotation cannot specify a subject identifier."
-                    {:status 400, :error :db/invalid-annotation :id specified-id})))
-  (when (or (> (count expanded) 1)
-            (nested-nodes? annotation))
-      (throw (ex-info "Commit annotation must only have a single subject."
-                      {:status 400, :error :db/invalid-annotation})))
-  ;; everything is good
-  expanded)
-
 ;; TODO - can use transient! below
 (defn stage-update-novelty
   "If a db is staged more than once, any retractions in a previous stage will
@@ -153,10 +140,19 @@
 
 (defn extract-annotation
   [context parsed-txn parsed-opts]
-  (some-> (or (:annotation parsed-txn) (:annotation parsed-opts))
-          (json-ld/expand context)
-          util/sequential
-          validate-annotation))
+  (let [[annotation :as expanded]
+        (some-> (or (:annotation parsed-txn) (:annotation parsed-opts))
+                (json-ld/expand context)
+                util/sequential)]
+    (when-let [specified-id (:id annotation)]
+      (throw (ex-info "Commit annotation cannot specify a subject identifier."
+                      {:status 400, :error :db/invalid-annotation :id specified-id})))
+    (when (or (> (count expanded) 1)
+              (nested-nodes? annotation))
+      (throw (ex-info "Commit annotation must only have a single subject."
+                      {:status 400, :error :db/invalid-annotation})))
+    ;; everything is good
+    expanded))
 
 (defn stage
   ([db txn parsed-opts]
