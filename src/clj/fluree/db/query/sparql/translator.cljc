@@ -120,8 +120,22 @@
                     {:status 400 :error :db/invalid-query}))))
 
 (defmethod parse-term :NumericLiteral
-  [[_ num-str]]
-  (read-string num-str))
+  ;; NumericLiteral   ::=   NumericLiteralUnsigned WS | NumericLiteralPositive WS | NumericLiteralNegative WS
+  ;; <NumericLiteralUnsigned>   ::=   INTEGER | DECIMAL | DOUBLE
+  ;; <NumericLiteralPositive>   ::=   INTEGER_POSITIVE | DECIMAL_POSITIVE | DOUBLE_POSITIVE
+  ;; <NumericLiteralNegative>   ::=   INTEGER_NEGATIVE | DECIMAL_NEGATIVE | DOUBLE_NEGATIVE
+  ;; <INTEGER_POSITIVE>   ::=   '+' INTEGER
+  ;; <DECIMAL_POSITIVE>   ::=   '+' DECIMAL
+  ;; <DOUBLE_POSITIVE>    ::=   '+' DOUBLE
+  ;; <INTEGER_NEGATIVE>   ::=   '-' INTEGER
+  ;; <DECIMAL_NEGATIVE>   ::=   '-' DECIMAL
+  ;; <DOUBLE_NEGATIVE>    ::=   '-' DOUBLE
+  ;; <INTEGER>    ::=   #"[0-9]+"
+  ;; <DECIMAL>    ::=  #"[0-9]*\.[0-9]*"
+  ;; <DOUBLE>   ::=   #"[0-9]+\.[0-9]*|(\.[0-9]+)|([0-9]+)" EXPONENT
+  ;; EXPONENT   ::=   #"[eE][+-]?[0-9]+"
+  [[_ sign num-str]]
+  (read-string (str sign num-str)))
 
 (defmethod parse-term :MultiplicativeExpression
   ;; MultiplicativeExpression ::= UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
@@ -130,8 +144,16 @@
   ;; | '-' PrimaryExpression
   ;; | PrimaryExpression
   ;; <PrimaryExpression> ::= BrackettedExpression | BuiltInCall | iriOrFunction | RDFLiteral | NumericLiteral | BooleanLiteral | Var
-  [[_ & expression]]
-  (str/join " " (mapv parse-term expression)))
+  [[_ & [expr0 & [op1 expr1 & exprs]]]]
+  (if op1
+    ;; we need to recursively compose expressions
+    (loop [[op expr & r] exprs
+           result  (str "(" op1 " " (parse-term expr0) " " (parse-term expr1) ")")]
+      (if (and op expr)
+        (recur r (str "(" op " " result " " (parse-term expr) ")"))
+        result))
+    ;; A single UnaryExpression doesn't need to be composed with anything else
+    (parse-term expr0)))
 
 (defmethod parse-term :NumericExpression
   ;; NumericExpression ::= WS AdditiveExpression WS

@@ -242,14 +242,18 @@
       (is (= [[:bind "?handle" "dsanchez"]
               {"@id" "?person", "person:handle" "?handle"}]
              where)))
-    (let [query "SELECT ?person ?prefix ?foofix
+    (let [query "SELECT ?person ?prefix ?foofix ?num1
                  WHERE {BIND (SUBSTR(?handle, 4) AS ?prefix)
                         BIND (REPLACE(?prefix, \"abc\", \"FOO\") AS ?foofix)
-                        ?person person:handle ?handle.}"
+                        BIND (?age*4*3/-2*(-4/2) AS ?num1)
+                        ?person person:handle ?handle.
+                        ?person person:age ?age}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:bind "?prefix" "(subStr ?handle 4)"]
               [:bind "?foofix" "(replace ?prefix \"abc\" \"FOO\")"]
-              {"@id" "?person", "person:handle" "?handle"}]
+              [:bind "?num1" "(* (/ (* (* ?age 4) 3) -2) (/ -4 2))"]
+              {"@id" "?person", "person:handle" "?handle"}
+              {"@id" "?person", "person:age" "?age"}]
              where)))))
 
 ;;TODO: not yet supported
