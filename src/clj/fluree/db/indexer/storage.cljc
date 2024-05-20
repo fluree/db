@@ -73,20 +73,20 @@
                 namespace-codes]}
         db
 
-        data         {:ledger-alias    alias
-                      :t               t
-                      :v               1 ;; version of db root file
-                      :schema          (vocab/serialize-schema schema)
-                      :stats           (select-keys stats [:flakes :size])
-                      :spot            (child-data spot)
-                      :psot            (child-data psot)
-                      :post            (child-data post)
-                      :opst            (child-data opst)
-                      :tspo            (child-data tspo)
-                      :timestamp       (util/current-time-millis)
-                      :prevIndex       (or (:indexed stats) 0)
-                      :namespace-codes  namespace-codes}
-        ser          (serdeproto/-serialize-db-root (serde conn) data)]
+        data {:ledger-alias    alias
+              :t               t
+              :v               1 ;; version of db root file
+              :schema          (vocab/serialize-schema schema)
+              :stats           (select-keys stats [:flakes :size])
+              :spot            (child-data spot)
+              :psot            (child-data psot)
+              :post            (child-data post)
+              :opst            (child-data opst)
+              :tspo            (child-data tspo)
+              :timestamp       (util/current-time-millis)
+              :prevIndex       (or (:indexed stats) 0)
+              :namespace-codes namespace-codes}
+        ser  (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn alias :root ser)))
 
 
