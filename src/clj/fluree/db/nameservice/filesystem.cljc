@@ -151,6 +151,22 @@ changes from different branches into existing metadata map"
          (some #(when (= (get % "@id") branch-iri)
                   (get % "address"))))))
 
+(defn convert-legacy-ns-record
+  [alias commit-address local-path legacy-path]
+  (async/go
+    (let [ns-address (str "fluree:file://" alias)
+          ns-record  (ns-record ns-address commit-address {"alias" alias, "branch" "main"})]
+      (let [successful? (async/<! (write-ns-record ns-record local-path alias))]
+        (if (util/exception? successful?)
+          (log/error successful?
+                     (str "Unable to update legacy nameservice file for ledger: " alias
+                          "with exception: " (ex-message successful?)))
+          #?(:clj (try
+                    (.renameTo (io/file legacy-path) (io/file (str legacy-path ".legacy")))
+                    (catch Exception e
+                      (log/error "Exception renaming legacy nameservice file for ledger: " alias
+                                 "with exception: " (ex-message e))))))))))
+
 (defn try-legacy-ns-lookup
   "This is for legacy filesystem nameservice file format only.
   It should be removed once Fluree v3 is GA, but will allow for
@@ -158,37 +174,27 @@ changes from different branches into existing metadata map"
   If deemed important, this can be done in an upgrade script instead as part of
   the v3 GA launch."
   [local-path alias]
-  (let [path           (str local-path "/" alias "/main/head")
-        commit-address (when-let [address (fs/read-file path)]
-                         (cond
-                           (str/starts-with? address "//")
-                           (str "fluree:file:" address)
+  (go-try
+    (let [legacy-path    (str local-path "/" alias "/main/head")
+          commit-address (when-let [address (<? (fs/read-file legacy-path))]
+                           (cond
+                             (str/starts-with? address "//")
+                             (str "fluree:file:" address)
 
-                           (str/starts-with? address "fluree:")
-                           address
+                             (str/starts-with? address "fluree:")
+                             address
 
-                           :else
-                           (do
-                             (log/warn "Unexpected commit address format in legacy nameservice file:" path
-                                       "with address:" address)
-                             nil)))]
-    (when commit-address
-      ;; write out new NS file record format in the background
-      (async/go
-        (let [ns-address (str "fluree:file://" alias)
-              ns-record  (ns-record ns-address commit-address {"alias" alias, "branch" "main"})]
-          (let [successful? (async/<! (write-ns-record ns-record local-path alias))]
-            (if (util/exception? successful?)
-              (log/error successful?
-                         (str "Unable to update legacy nameservice file for ledger: " alias
-                              "with exception: " (ex-message successful?)))
-              #?(:clj (try
-                        (.renameTo (io/file path) (io/file (str path ".legacy")))
-                        (catch Exception e
-                          (log/error "Exception renaming legacy nameservice file for ledger: " alias
-                                     "with exception: " (ex-message e)))))))))
+                             :else
+                             (do
+                               (log/warn "Unexpected commit address format in legacy nameservice file:"
+                                         legacy-path
+                                         "with address:" address)
+                               nil)))]
+      (when commit-address
+        ;; write out new NS file record format in the background
+        (convert-legacy-ns-record alias commit-address local-path legacy-path)
 
-      commit-address)))
+        commit-address))))
 
 (defn lookup
   "When provided a 'relative' ledger alias, looks in file system to see if
@@ -202,7 +208,7 @@ changes from different branches into existing metadata map"
             (throw (ex-info (str "No nameservice record found for ledger alias: " ns-address)
                             {:status 404 :error :db/ledger-not-found})))
         ;; Note, below is for leagacy conversion only, will get removed in v3 GA
-        (try-legacy-ns-lookup local-path alias)))))
+        (<? (try-legacy-ns-lookup local-path alias))))))
 
 
 (defrecord FileNameService

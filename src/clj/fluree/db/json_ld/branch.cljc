@@ -2,47 +2,22 @@
   (:require [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.flake :as flake]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log :include-macros true])
 
   (:refer-clojure :exclude [name]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-;; branch operations on json-ld ledger
-
-(defn current-branch
-  "Returns current branch name."
-  [ledger]
-  (-> ledger
-      :state
-      deref
-      :branch))
-
-(defn branch-meta
-  "Returns branch map data for current branch, or specified branch"
-  ([ledger]
-   (branch-meta ledger (current-branch ledger)))
-  ([ledger branch]
-   (-> ledger
-       :state
-       deref
-       :branches
-       (get branch))))
-
-;; TODO - if you branch from an uncommitted branch, and then commit, commit the current-branch too
-(defn new-branch-map
-  "Returns a new branch map for specified branch name off of supplied
-  current-branch."
-  ([ledger-alias branch-name ns-addresses]
-   (new-branch-map nil ledger-alias branch-name ns-addresses))
-  ([current-branch-map ledger-alias branch-name ns-addresses]
-   (let [{:keys [current-db]} current-branch-map]
-     (let [initial-commit (commit-data/blank-commit ledger-alias branch-name ns-addresses)]
-       (cond-> {:name      branch-name
-                :commit    initial-commit
-                :current-db current-db}
-         (not-empty current-branch-map)
-         (assoc :from (select-keys current-branch-map [:name :commit])))))))
+(defn load-branch-map
+  "Returns a branch map for specified branch name at supplied commit"
+  [conn ledger-alias branch-name commit]
+  (go-try
+    (let [initial-db (<? (jld-db/load conn ledger-alias branch-name commit))]
+      {:name       branch-name
+       :commit     commit
+       :current-db initial-db})))
 
 (defn skipped-t?
   [new-t current-t]
@@ -96,29 +71,32 @@
              (not (flake/t-after? new-t current-t))) ; index update may come after multiple commits
         (= new-t (inc current-t)))))
 
+(defn current-db
+  "Returns current db from branch data"
+  [branch-map]
+  (:current-db branch-map))
+
 (defn update-commit
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
   [branch-map {new-commit :commit, db-t :t, :as db}]
-  (let [{current-commit :commit} branch-map
-        current-t                (commit-data/t current-commit)
-        new-t                    (commit-data/t new-commit)]
+  (let [current-commit (:commit branch-map)
+        current-t      (commit-data/t current-commit)
+        new-t          (commit-data/t new-commit)]
     (if (= db-t new-t)
       (if (updatable-commit? current-commit new-commit)
         (update-db branch-map db)
-        (throw (ex-info (str "Commit failed, latest committed db is " current-t
-                             " and you are trying to commit at db at t value of: "
-                             new-t ". These should be one apart. Likely db was "
-                             "updated by another user or process.")
-                        {:status 400 :error :db/invalid-commit})))
+        (do
+          (log/warn "Commit update failure.\n  Current commit:" current-commit
+                    "\n  New commit:" new-commit)
+          (throw (ex-info (str "Commit failed, latest committed db is " current-t
+                               " and you are trying to commit at db at t value of: "
+                               new-t ". These should be one apart. Likely db was "
+                               "updated by another user or process.")
+                          {:status 400 :error :db/invalid-commit}))))
       (throw (ex-info (str "Unexpected Error updating commit database. "
                            "New database has an inconsistent t from its commit:"
                            db-t " and " new-t " respectively.")
                       {:status 500 :error :db/invalid-db})))))
-
-(defn current-db
-  "Returns latest db from branch data"
-  [branch-map]
-  (:current-db branch-map))

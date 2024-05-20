@@ -8,7 +8,7 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.query.dataset :as dataset]
+            [fluree.db.query.dataset :as dataset :refer [dataset?]]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.log :as log]
             [fluree.db.query.history :as history]
@@ -20,8 +20,6 @@
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.query.dataset :refer [dataset?]]
-            [fluree.db.reasoner :as reasoner]
             [fluree.db.validation :as v]))
 
 #?(:clj (set! *warn-on-reflection* true))

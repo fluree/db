@@ -36,16 +36,16 @@
 
 (defn write-leaf
   "Serializes and writes the index leaf node `leaf` to storage."
-  [{:keys [conn ledger] :as _db} idx-type leaf]
+  [{:keys [alias conn] :as _db} idx-type leaf]
   (let [ser (serdeproto/-serialize-leaf (serde conn) leaf)]
-    (connection/-index-file-write conn ledger idx-type ser)))
+    (connection/-index-file-write conn alias idx-type ser)))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key.
   Returns two-tuple of response output and raw bytes written."
-  [{:keys [conn ledger] :as _db} idx-type data]
+  [{:keys [alias conn] :as _db} idx-type data]
   (let [ser (serdeproto/-serialize-branch (serde conn) data)]
-    (connection/-index-file-write conn ledger idx-type ser)))
+    (connection/-index-file-write conn alias idx-type ser)))
 
 (defn write-branch
   "Writes the child attributes index branch node `branch` to storage."
@@ -59,36 +59,34 @@
 (defn write-garbage
   "Writes garbage record out for latest index."
   [db garbage]
-  (let [{:keys [conn ledger ledger-alias t]} db
+  (let [{:keys [alias conn t]} db
 
-        data {:ledger-alias ledger-alias
+        data {:ledger-alias alias
               :t            t
               :garbage      garbage}
         ser  (serdeproto/-serialize-garbage (serde conn) data)]
-    (connection/-index-file-write conn ledger :garbage ser)))
+    (connection/-index-file-write conn alias :garbage ser)))
 
 (defn write-db-root
   [db]
-  (let [{:keys [conn ledger commit t stats spot psot post opst tspo
-                schema namespace-codes]}
+  (let [{:keys [alias conn schema t stats spot psot post opst tspo
+                namespace-codes]}
         db
 
-        ledger-alias (:id commit)
-        preds        (vocab/serialize-schema-predicates schema)
-        data         {:ledger-alias    ledger-alias
-                      :t               t
-                      :preds           preds
-                      :stats           (select-keys stats [:flakes :size])
-                      :spot            (child-data spot)
-                      :psot            (child-data psot)
-                      :post            (child-data post)
-                      :opst            (child-data opst)
-                      :tspo            (child-data tspo)
-                      :timestamp       (util/current-time-millis)
-                      :prevIndex       (or (:indexed stats) 0)
-                      :namespace-codes namespace-codes}
-        ser          (serdeproto/-serialize-db-root (serde conn) data)]
-    (connection/-index-file-write conn ledger :root ser)))
+        preds (vocab/serialize-schema-predicates schema)
+        data  {:ledger-alias    alias
+               :t               t
+               :preds           preds
+               :stats           (select-keys stats [:flakes :size])
+               :spot            (child-data spot)
+               :psot            (child-data psot)
+               :post            (child-data post)
+               :opst            (child-data opst)
+               :tspo            (child-data tspo)
+               :timestamp       (util/current-time-millis)
+               :namespace-codes namespace-codes}
+        ser   (serdeproto/-serialize-db-root (serde conn) data)]
+    (connection/-index-file-write conn alias :root ser)))
 
 
 (defn read-branch
@@ -104,46 +102,31 @@
       (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
-  "Turns each index root node into an unresolved node."
-  [_conn {:keys [ledger-alias comparators t]} index index-data]
-  (let [cmp (or (get comparators index)
-                (throw (ex-info (str "Internal error reifying db index root: "
-                                     (pr-str index))
-                                {:status 500
-                                 :error  :db/unexpected-error})))]
-    (cond-> index-data
-      (:rhs index-data)   (update :rhs flake/parts->Flake)
-      (:first index-data) (update :first flake/parts->Flake)
-      true                (assoc :comparator cmp
-                                 :ledger-alias ledger-alias
-                                 :t t
-                                 :leftmost? true))))
+  [index-data ledger-alias comparator t]
+  (assoc index-data
+         :ledger-alias ledger-alias
+         :t t
+         :comparator comparator))
 
+(defn reify-index-roots
+  [{:keys [t ledger-alias] :as root-data}]
+  (reduce (fn [root idx]
+            (let [comparator (get index/comparators idx)]
+              (update root idx reify-index-root ledger-alias comparator t)))
+          root-data index/types))
 
-(defn reify-db-root
-  "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
-  [conn blank-db root-data]
-  (go-try
-    (let [{:keys [t stats preds namespace-codes]}
-          root-data
-          namespaces (map-invert namespace-codes)
-          db         (assoc blank-db
-                            :t t
-                            :namespaces namespaces
-                            :namespace-codes namespace-codes
-                            :stats (assoc stats :indexed t))
-          indexed-db (reduce
-                       (fn [db* idx]
-                         (let [idx-root (reify-index-root conn db* idx (get root-data idx))]
-                           (assoc db* idx idx-root)))
-                       db index/types)
-          preds*     (mapv (fn [p]
-                             (if (iri/serialized-sid? p)
-                               (iri/deserialize-sid p)
-                               (mapv iri/deserialize-sid p)))
-                           preds)
-          schema     (<? (vocab/load-schema indexed-db preds*))]
-      (assoc indexed-db :schema schema))))
+(defn deserialize-preds
+  [preds]
+  (mapv (fn [p]
+          (if (iri/serialized-sid? p)
+            (iri/deserialize-sid p)
+            (mapv iri/deserialize-sid p)))
+        preds))
+
+(defn reify-namespaces
+  [root-map]
+  (let [namespaces (-> root-map :namespace-codes map-invert)]
+    (assoc root-map :namespaces namespaces)))
 
 
 (defn read-garbage
@@ -160,24 +143,18 @@
   "Returns all data for a db index root of a given t."
   ([conn idx-address]
    (go-try
-     (let [data (<? (connection/-index-file-read conn idx-address))]
-       (when data
-         (serdeproto/-deserialize-db-root (serde conn) data))))))
-
-
-(defn reify-db
-  "Reifies db at specified index point. If unable to read db-root at index,
-  throws."
-  ([conn blank-db idx-address]
-   (go-try
-     (let [db-root (<? (read-db-root conn idx-address))]
-       (if-not db-root
-         (throw (ex-info (str "Database " (:address blank-db)
-                              " could not be loaded at index point: "
-                              idx-address ".")
-                         {:status 400
-                          :error  :db/unavailable}))
-         (<? (reify-db-root conn blank-db db-root)))))))
+     (if-let [data (<? (connection/-index-file-read conn idx-address))]
+       (let [{:keys [t] :as root-data}
+             (serdeproto/-deserialize-db-root (serde conn) data)]
+         (-> root-data
+             reify-index-roots
+             reify-namespaces
+             (update :stats assoc :indexed t)
+             (update :preds deserialize-preds)))
+       (throw (ex-info (str "Could not load index point at address: "
+                            idx-address ".")
+                       {:status 400
+                        :error  :db/unavailable}))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]

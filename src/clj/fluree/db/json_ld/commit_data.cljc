@@ -1,7 +1,8 @@
 (ns fluree.db.json-ld.commit-data
   (:require [fluree.crypto :as crypto]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [get-first get-first-value]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
+            [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
@@ -165,51 +166,65 @@
    :flakes  (get-first-value data const/iri-flakes)
    :size    (get-first-value data const/iri-size)})
 
-(defn json-ld->map
-  "Turns json-ld commit meta into the clojure map structure."
-  [commit-json-ld {:keys [commit-address spot post opst tspo]}]
-  (let [id          (:id commit-json-ld)
-        address     (-> commit-json-ld
-                        (get-first-value const/iri-address)
-                        not-empty
-                        (or commit-address)) ; address, if using something like
-                                             ; IPFS, is empty string
-        v           (get-first-value commit-json-ld const/iri-v)
-        alias       (get-first-value commit-json-ld const/iri-alias)
-        branch      (get-first-value commit-json-ld const/iri-branch)
+(defn jsonld->clj
+  [jsonld]
+  (let [id      (:id jsonld)
+        v       (get-first-value jsonld const/iri-v)
+        alias   (get-first-value jsonld const/iri-alias)
+        branch  (get-first-value jsonld const/iri-branch)
+        address (-> jsonld
+                    (get-first-value const/iri-address)
+                    not-empty)
 
-        time        (get-first-value commit-json-ld const/iri-time)
-        message     (get-first-value commit-json-ld const/iri-message)
-        tags        (get-first commit-json-ld const/iri-tag)
-        issuer      (get-first commit-json-ld const/iri-issuer)
-        prev-commit (get-first commit-json-ld const/iri-previous)
-        data        (get-first commit-json-ld const/iri-data)
-        ns          (get-first commit-json-ld const/iri-ns)
+        time        (get-first-value jsonld const/iri-time)
+        message     (get-first-value jsonld const/iri-message)
+        tags        (get-first jsonld const/iri-tag)
+        issuer      (get-first jsonld const/iri-issuer)
+        prev-commit (get-first jsonld const/iri-previous)
+        data        (get-first jsonld const/iri-data)
+        ns          (get-first jsonld const/iri-ns)
+        index       (get-first jsonld const/iri-index)]
 
-        index       (get-first commit-json-ld const/iri-index)]
-    (cond-> {:id             id
-             :address        address
-             :v              v
-             :alias          alias
-             :branch         branch
-             :time           time
-             :message        message
-             :tag            (mapv :value tags)
-             :previous       {:id      (:id prev-commit)
-                              :address (get-first-value prev-commit const/iri-address)}
-             :data           (parse-db-data data)}
-            ns (assoc :ns (->> ns
-                               util/sequential
-                               (mapv (fn [namespace] {:id (:id namespace)}))))
-            index (assoc :index {:id      (:id index)
+    (cond-> {:id      id
+             :v       v
+             :alias   alias
+             :branch  branch
+             :time    time
+             :tag     (mapv :value tags)
+             :data    (parse-db-data data)}
+      address     (assoc :address address)
+      prev-commit (assoc :previous       {:id      (:id prev-commit)
+                                          :address (get-first-value prev-commit const/iri-address)})
+      message     (assoc :message message)
+      ns          (assoc :ns (->> ns
+                                  util/sequential
+                                  (mapv (fn [namespace]
+                                          (select-keys namespace [:id])))))
+      index       (assoc :index {:id      (:id index)
                                  :address (get-first-value index const/iri-address)
-                                 :data    (parse-db-data (get-first index const/iri-data))
-                                 :spot    spot
-                                 :post    post
-                                 :opst    opst
-                                 :tspo    tspo})
-            issuer (assoc :issuer {:id (:id issuer)}))))
+                                 :data    (parse-db-data (get-first index const/iri-data))})
+      issuer      (assoc :issuer (select-keys issuer [:id])))))
 
+(defn update-index-roots
+  [commit-map {:keys [spot post opst tspo]}]
+  (if (contains? commit-map :index)
+    (update commit-map :index assoc :spot spot, :post post, :opst opst, :tspo tspo)
+    commit-map))
+
+(defn json-ld->map
+  ([commit-jsonld index-roots]
+   (json-ld->map commit-jsonld nil index-roots))
+
+  ([commit-jsonld fallback-address index-roots]
+   (let [commit-map (jsonld->clj commit-jsonld)]
+     (cond-> commit-map
+       (and (some? fallback-address)
+            (not (contains? commit-map :address)))
+       (assoc :address fallback-address) ; address, if using something like
+                                         ; IPFS, is empty string
+
+       true
+       (update-index-roots index-roots)))))
 
 (defn update-commit-id
   "Once a commit id is known (by hashing json-ld version of commit), update
@@ -230,7 +245,14 @@
                      (crypto/sha2-256 :base32))]
     (str "fluree:commit:sha256:b" b32-hash)))
 
-(defn commit-jsonld
+(defn db-json->db-id
+  [payload]
+  (let [hsh (-> payload
+                json-ld/normalize-data
+                (crypto/sha2-256 :base32))]
+    (str "fluree:db:sha256:b" hsh)))
+
+(defn commit->jsonld
   "Generates JSON-LD commit map, and hash to include the @id value.
   Return a two-tuple of the updated commit map and the final json-ld document"
   [commit]
@@ -240,19 +262,27 @@
         jld*        (assoc jld "id" commit-id)]
     [commit-map* jld*]))
 
-
 (defn blank-commit
   "Creates a skeleton blank commit map."
   [alias branch ns-addresses]
-  {:alias  alias
-   :v      0
-   :branch (if branch
-             (util/keyword->str branch)
-             "main")
-   :ns     (mapv #(if (map? %)
-                    %
-                    {:id %})
-                 ns-addresses)})
+  (let [commit-json  (->json-ld {:alias  alias
+                                 :v      0
+                                 :branch (if branch
+                                           (util/keyword->str branch)
+                                           "main")
+                                 :data   {:t      0
+                                          :flakes 0
+                                          :size   0}
+                                 :time   (util/current-time-iso)
+                                 :ns     (mapv #(if (map? %)
+                                                  %
+                                                  {:id %})
+                                               ns-addresses)})
+        db-json      (get commit-json "data")
+        dbid         (db-json->db-id db-json)
+        commit-json* (assoc-in commit-json ["data" "id"] dbid)
+        commit-id    (commit-json->commit-id commit-json*)]
+    (assoc commit-json* "id" commit-id)))
 
 (defn new-index
   "Creates a new commit index record, given the commit-map used to trigger
@@ -325,13 +355,15 @@
   "Returns a commit map with a new db registered.
   Assumes commit is not yet created (but db is persisted), so
   commit-id and commit-address are added after finalizing and persisting commit."
-  [{:keys [old-commit issuer message tag dbid t db-address flakes size author txn-id annotation]
+  [{:keys [old-commit issuer message tag dbid t db-address flakes size author
+           txn-id annotation]
     :as   _commit}]
   (let [prev-data   (select-keys (data old-commit) [:id :address])
         data-commit (new-db-commit dbid t db-address prev-data flakes size)
         prev-commit (not-empty (select-keys old-commit [:id :address]))
         commit      (-> old-commit
-                        (dissoc :id :address :data :issuer :time :message :tag :prev-commit)
+                        (dissoc :id :address :data :issuer :time :message :tag
+                                :prev-commit)
                         (assoc :address ""
                                :author author
                                :txn  txn-id
@@ -360,22 +392,29 @@
    (update-novelty db add []))
 
   ([db add rem]
-   (let [ref-add     (ref-flakes add)
-         ref-rem     (ref-flakes rem)
-         flake-count (cond-> 0
-                             add (+ (count add))
-                             rem (- (count rem)))
-         flake-size  (cond-> 0
-                             add (+ (flake/size-bytes add))
-                             rem (- (flake/size-bytes rem)))]
-     (-> db
-         (update-in [:novelty :spot] flake/revise add rem)
-         (update-in [:novelty :post] flake/revise add rem)
-         (update-in [:novelty :opst] flake/revise ref-add ref-rem)
-         (update-in [:novelty :tspo] flake/revise add rem)
-         (update-in [:novelty :size] + flake-size)
-         (update-in [:stats :size] + flake-size)
-         (update-in [:stats :flakes] + flake-count)))))
+   (try*
+    (let [ref-add     (ref-flakes add)
+          ref-rem     (ref-flakes rem)
+          flake-count (cond-> 0
+                              add (+ (count add))
+                              rem (- (count rem)))
+          flake-size  (cond-> 0
+                              add (+ (flake/size-bytes add))
+                              rem (- (flake/size-bytes rem)))]
+      (-> db
+          (update-in [:novelty :spot] flake/revise add rem)
+          (update-in [:novelty :post] flake/revise add rem)
+          (update-in [:novelty :opst] flake/revise ref-add ref-rem)
+          (update-in [:novelty :tspo] flake/revise add rem)
+          (update-in [:novelty :size] + flake-size)
+          (update-in [:stats :size] + flake-size)
+          (update-in [:stats :flakes] + flake-count)))
+    (catch* e
+            (log/error (str "Update novelty unexpected error while attempting to updated db: "
+                            (pr-str db) " due to exception: " (ex-message e))
+                       {:add-flakes add
+                        :rem-flakes rem})
+            (throw e)))))
 
 (defn add-tt-id
   "Associates a unique tt-id for any in-memory staged db in their index roots.
@@ -402,7 +441,7 @@
   db-sid. Used when committing to an in-memory ledger value and when reifying
   a ledger from storage on load."
   [{:keys [address alias branch data id time v author txn] :as _commit} t commit-sid db-sid]
-  (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data]
+  (let [{ db-t :t db-address :address :keys [flakes size]} data]
     [;; commit flakes
      ;; address
      (flake/create commit-sid const/$_address address const/$xsd:string t true nil)
@@ -413,7 +452,8 @@
      ;; v
      (flake/create commit-sid const/$_v v const/$xsd:int t true nil)
      ;; time
-     (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil) ;; data
+     (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil)
+     ;; data
      (flake/create commit-sid const/$_commit:data db-sid const/$xsd:anyURI t true nil)
      ;; author
      (flake/create commit-sid const/$_commit:author author const/$xsd:string t true nil)

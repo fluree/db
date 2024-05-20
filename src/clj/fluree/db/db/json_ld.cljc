@@ -1,18 +1,20 @@
 (ns fluree.db.db.json-ld
+  (:refer-clojure :exclude [load])
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql :as fql]
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.index :as index]
+            [fluree.db.indexer.storage :as index-storage]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.util.log :as log]
+            [fluree.db.json-ld.reify :as reify]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [clojure.set :refer [map-invert]]
             [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]])
   #?(:clj (:import (java.io Writer))))
 
@@ -37,10 +39,8 @@
 (defn- jsonld-root-db [this]
   (assoc this :policy root-policy-map))
 
-(defn- jsonld-p-prop [{:keys [schema]} property predicate]
-  (assert (#{:name :id :iri :type :unique :multi :index :upsert :datatype
-             :component :noHistory :spec :specDoc :txSpec :txSpecDoc :restrictTag
-             :retractDuplicates :subclassOf :new?}
+(defn- jsonld-p-prop [schema property predicate]
+  (assert (#{:id :iri :subclassOf :parentProps :childProps :datatype}
             property)
           (str "Invalid predicate property: " (pr-str property)))
   (get-in schema [:pred predicate property]))
@@ -107,16 +107,16 @@
 
 ;; ================ end Jsonld record support fns ============================
 
-(defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot post opst
-                     tspo schema comparators staged novelty policy namespaces
+(defrecord JsonLdDb [conn alias branch commit t tt-id stats spot post opst tspo
+                     schema comparators staged novelty policy namespaces
                      namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
-  (-class-prop [_this property class]
-    (if (= :subclasses property)
+  (-class-prop [_this meta-key class]
+    (if (= :subclasses meta-key)
       (get @(:subclasses schema) class)
-      (get-in schema [:pred class property])))
-  (-p-prop [this property predicate] (jsonld-p-prop this property predicate))
+      (jsonld-p-prop schema meta-key class)))
+  (-p-prop [_ meta-key property] (jsonld-p-prop schema meta-key property))
   (-class-ids [this subject] (class-ids this subject))
   (-query [this query-map]
     (fql/query this query-map))
@@ -164,37 +164,47 @@
                        flake/sorted-set-by)))
     {:size 0} index/types))
 
-(defn create
-  [{:keys [alias conn] :as ledger}]
-  (let [novelty (new-novelty-map index/default-comparators)
-        {spot-cmp :spot
-         post-cmp :post
-         opst-cmp :opst
-         tspo-cmp :tspo} index/default-comparators
+(defn genesis-root-map
+  [ledger-alias]
+  (let [{spot-cmp :spot, post-cmp :post, opst-cmp :opst, tspo-cmp :tspo}
+        index/comparators]
+    {:t               0
+     :spot            (index/empty-branch ledger-alias spot-cmp)
+     :post            (index/empty-branch ledger-alias post-cmp)
+     :opst            (index/empty-branch ledger-alias opst-cmp)
+     :tspo            (index/empty-branch ledger-alias tspo-cmp)
+     :stats           {:flakes 0, :size 0, :indexed 0}
+     :namespaces      iri/default-namespaces
+     :namespace-codes iri/default-namespace-codes
+     :novelty         (new-novelty-map index/comparators)
+     :schema          (vocab/base-schema)}))
 
-        spot          (index/empty-branch alias spot-cmp)
-        post          (index/empty-branch alias post-cmp)
-        opst          (index/empty-branch alias opst-cmp)
-        tspo          (index/empty-branch alias tspo-cmp)
-        stats         {:flakes 0, :size 0, :indexed 0}
-        schema        (vocab/base-schema)
-        branch        (branch/branch-meta ledger)]
-    (map->JsonLdDb {:ledger          ledger
-                    :conn            conn
-                    :alias           alias
-                    :branch          (:name branch)
-                    :commit          (:commit branch)
-                    :t               0
-                    :tt-id           nil
-                    :stats           stats
-                    :spot            spot
-                    :post            post
-                    :opst            opst
-                    :tspo            tspo
-                    :schema          schema
-                    :comparators     index/default-comparators
-                    :staged          []
-                    :novelty         novelty
-                    :policy          root-policy-map
-                    :namespaces      iri/default-namespaces
-                    :namespace-codes iri/default-namespace-codes})))
+(defn load
+  [conn ledger-alias branch commit-jsonld]
+  (go-try
+    (let [commit-map (commit-data/jsonld->clj commit-jsonld)
+          root-map   (if-let [{:keys [address]} (:index commit-map)]
+                       (<? (index-storage/read-db-root conn address))
+                       (genesis-root-map ledger-alias))
+          indexed-db (-> root-map
+                         (assoc :conn conn
+                                :alias ledger-alias
+                                :branch branch
+                                :commit commit-map
+                                :tt-id nil
+                                :comparators index/comparators
+                                :staged []
+                                :policy root-policy-map)
+                         map->JsonLdDb)
+          commit-t   (-> commit-jsonld
+                         (get-first const/iri-data)
+                         (get-first-value const/iri-t))
+          index-t    (:t indexed-db)]
+      (if (= commit-t index-t)
+        indexed-db
+        (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
+               db                 indexed-db]
+          (if commit-tuple
+            (let [new-db (<? (reify/merge-commit conn db commit-tuple))]
+              (recur r new-db))
+            db))))))

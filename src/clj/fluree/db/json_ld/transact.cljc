@@ -1,7 +1,6 @@
 (ns fluree.db.json-ld.transact
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.util.log :as log]
-            [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]

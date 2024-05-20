@@ -21,6 +21,8 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(def data-version 0)
+
 (defn get-s-iri
   "Returns an IRI from a subject id (sid)."
   [sid db compact-fn]
@@ -108,16 +110,20 @@
         {} context)
       context)))
 
+(def f-context {"f" "https://ns.flur.ee/ledger#"})
+
+(defn parse-commit-context
+  [context]
+  (let [parsed-context (if context
+                         (-> context
+                             json-ld/parse-context
+                             (json-ld/parse-context f-context))
+                         (json-ld/parse-context f-context))]
+    (stringify-context parsed-context)))
+
 (defn- enrich-commit-opts
-  "Takes commit opts and merges in with defaults defined for the db."
-  [ledger
-   {:keys [branch schema t commit stats] :as _db}
-   {:keys [context did private message tag file-data? index-files-ch] :as _opts}]
-  (let [context*      (-> (if context
-                            (json-ld/parse-context (:context schema) context)
-                            (:context schema))
-                          (json-ld/parse-context {"f" "https://ns.flur.ee/ledger#"})
-                          stringify-context)
+  [ledger {:keys [context did private message tag file-data? index-files-ch] :as _opts}]
+  (let [context*      (parse-commit-context context)
         private*      (or private
                           (:private did)
                           (:private (ledger/-did ledger)))
@@ -126,37 +132,21 @@
                           did
                           (ledger/-did ledger))
         ctx-used-atom (atom {})
-        compact-fn    (json-ld/compact-fn context* ctx-used-atom)
-        commit-time   (util/current-time-iso)]
-    (log/debug "Committing t" t "at" commit-time)
+        compact-fn    (json-ld/compact-fn context* ctx-used-atom)]
     {:message        message
      :tag            tag
      :file-data?     file-data? ;; if instead of returning just a db from commit, return also the written files (for consensus)
-     :alias          (ledger/-alias ledger)
-     :t              t
-     :v              0
-     :prev-commit    (:address commit)
-     :prev-dbid      (:dbid commit)
-     :ledger-address nil ;; TODO
-     :time           commit-time
      :context        context*
      :private        private*
      :did            did*
      :ctx-used-atom  ctx-used-atom
      :compact-fn     compact-fn
      :compact        (fn [iri] (json-ld/compact iri compact-fn))
-     :branch         branch
-     :branch-name    (util/keyword->str branch)
      :id-key         (json-ld/compact "@id" compact-fn)
      :type-key       (json-ld/compact "@type" compact-fn)
-     :index-files-ch index-files-ch ;; optional async chan passed in which will stream out all new index files created (for consensus)
-     :stats          stats}))
+     :index-files-ch index-files-ch})) ;; optional async chan passed in which will stream out all new index files created (for consensus)
 
 
-(defn db-json->db-id
-  [payload]
-  (->> (crypto/sha2-256 payload :base32)
-       (str "fluree:db:sha256:b")))
 
 (defn commit-flakes
   "Returns commit flakes from novelty based on 't' value."
@@ -215,7 +205,7 @@
 
 (defn db->jsonld
   "Creates the JSON-LD map containing a new ledger update"
-  [{:keys [commit] :as db} {:keys [type-key compact ctx-used-atom t v id-key stats] :as commit-opts}]
+  [{:keys [t commit stats] :as db} {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
   (let [prev-dbid   (commit-data/data-id commit)
         {:keys [assert retract refs-ctx]} (generate-commit db commit-opts)
         prev-db-key (compact const/iri-previous)
@@ -228,14 +218,14 @@
         db-json     (cond-> {id-key                nil ;; comes from hash later
                              type-key              [(compact const/iri-DB)]
                              (compact const/iri-t) t
-                             (compact const/iri-v) v}
+                             (compact const/iri-v) data-version}
                       prev-dbid (assoc prev-db-key prev-dbid)
                       (seq assert) (assoc assert-key assert)
                       (seq retract) (assoc retract-key retract)
                       (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
                       (:size stats) (assoc (compact const/iri-size) (:size stats)))
         ;; TODO - this is re-normalized below, can try to do it just once
-        dbid        (-> db-json json-ld/normalize-data db-json->db-id)
+        dbid        (commit-data/db-json->db-id db-json)
         db-json*    (-> db-json
                         (assoc id-key dbid)
                         (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
@@ -248,32 +238,47 @@
         (flake/t-after? (commit-data/t db-commit)
                         ledger-t))))
 
+(defn write-commit
+  [conn alias {:keys [did private]} commit]
+  (go-try
+    (let [[commit* jld-commit] (commit-data/commit->jsonld commit)
+          signed-commit        (if did
+                                 (<? (cred/generate jld-commit private (:id did)))
+                                 jld-commit)
+          commit-res           (<? (connection/-c-write conn alias signed-commit))
+          commit**             (commit-data/update-commit-address commit* (:address commit-res))]
+      {:commit-map    commit**
+       :commit-jsonld jld-commit
+       :write-result  commit-res})))
+
+(defn push-commit
+  [conn {:keys [state] :as _ledger} {:keys [commit-map commit-jsonld write-result]}]
+  (nameservice/push! conn (assoc commit-map
+                                 :meta write-result
+                                 :json-ld commit-jsonld
+                                 :ledger-state state)))
+
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
-  [ledger {:keys [commit] :as db} {:keys [branch did private] :as _opts}]
+  [{:keys [conn alias] :as ledger} {:keys [commit branch] :as db} opts]
   (go-try
-    (let [{:keys [conn state]} ledger
-          ledger-commit (:commit (ledger/-status ledger branch))
+    (let [ledger-commit (:commit (ledger/-status ledger branch))
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
-          [new-commit* jld-commit] (commit-data/commit-jsonld new-commit)
-          signed-commit (if did
-                          (<? (cred/generate jld-commit private (:id did)))
-                          jld-commit)
-          commit-res    (<? (connection/-c-write conn ledger signed-commit)) ;; write commit credential
-          new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
-          db*           (assoc db :commit new-commit**)
-          db**          (if (new-t? ledger-commit commit)
-                          (commit-data/add-commit-flakes (:prev-commit db) db*)
-                          db*)
-          db***         (ledger/-commit-update! ledger branch (dissoc db** :txns))
-          push-res      (<? (nameservice/push! conn (assoc new-commit**
-                                                           :meta commit-res
-                                                           :json-ld jld-commit
-                                                           :ledger-state state)))]
-      {:commit-res  commit-res
-       :push-res    push-res
-       :db          db***})))
+          keypair       (select-keys opts [:did :private])
+
+          {:keys [commit-map write-result] :as commit-write-map}
+          (<? (write-commit conn alias keypair new-commit))
+
+          db*   (assoc db :commit commit-map)
+          db**  (if (new-t? ledger-commit commit)
+                  (commit-data/add-commit-flakes (:prev-commit db) db*)
+                  db*)
+          db*** (ledger/-commit-update! ledger branch (dissoc db** :txns))
+          push-res      (<? (push-commit conn ledger commit-write-map))]
+      {:commit-res write-result
+       :push-res   push-res
+       :db         db***})))
 
 (defn newer-commit?
   [db commit]
@@ -307,12 +312,12 @@
                                  :changes-ch    changes-ch}))))
 
 (defn write-transactions!
-  [conn ledger staged]
+  [conn {:keys [alias] :as _ledger} staged]
   (go-try
     (loop [[[txn author-did annotation] & r] staged
            results                []]
       (if txn
-        (let [{txn-id :address} (<? (connection/-txn-write conn ledger txn))]
+        (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
           (recur r (conj results [txn-id author-did annotation])))
         results))))
 
@@ -320,24 +325,29 @@
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [conn] :as ledger} {:keys [t stats commit staged] :as db} opts]
+  [{:keys [alias conn] :as ledger} {:keys [t stats commit staged] :as db} opts]
   (go-try
     (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
-          (enrich-commit-opts ledger db opts)
+          (enrich-commit-opts ledger opts)
 
           txns (<? (write-transactions! conn ledger staged))
 
           [[txn-id author annotation]] txns
 
           [dbid db-jsonld]  (db->jsonld db opts*)
-          ledger-update-res (<? (connection/-c-write conn ledger db-jsonld)) ;; write commit data
-          db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
+          ledger-update-res (<? (connection/-c-write conn alias db-jsonld)) ; write commit data
+          db-address        (:address ledger-update-res) ; may not have address (e.g. IPFS) until after writing file
+
+          commit-time   (util/current-time-iso)
+          _ (log/debug "Committing t" t "at" commit-time)
+
           base-commit-map   {:old-commit commit
                              :issuer     did
                              :message    message
                              :tag        tag
                              :dbid       dbid
                              :t          t
+                             :time       commit-time
                              :db-address db-address
                              :author     (or author "")
                              :annotation annotation
