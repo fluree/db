@@ -1,4 +1,5 @@
 (ns fluree.db.database.async
+  (:refer-clojure :exclude [load])
   (:require [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async :refer [<! go]]
