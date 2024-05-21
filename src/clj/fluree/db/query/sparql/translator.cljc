@@ -139,7 +139,8 @@
    "YEAR"           "year"
    "isBLANK"        "isBlank"
    "isIRI"          "isIri"
-   "isLITERAL"      "isLiteral"})
+   "isLITERAL"      "isLiteral"
+   "isNUMERIC"      "isNumeric"})
 
 (defmethod parse-term :Func
   [[_ func & args]]
@@ -200,6 +201,7 @@
       "isBlank"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "isIri"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "isLiteral"    (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "isNumeric"    (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
