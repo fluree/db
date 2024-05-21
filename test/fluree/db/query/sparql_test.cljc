@@ -264,11 +264,12 @@
               {"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:age" "?age"}]
              where)))
-    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?concat
+    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat
                  WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
                         BIND (BNODE(?foobar) AS ?bnode)
                         BIND (BOUND(?abs) AS ?bound)
                         BIND (CEIL(1.8) AS ?ceil)
+                        BIND (COALESCE(?num1, 2) AS ?coalesce)
                         BIND (CONCAT(\"foo\", \"bar\") AS ?concat)
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
@@ -276,6 +277,7 @@
               [:bind "?bnode" "(bnode ?foobar)"]
               [:bind "?bound" "(bound ?abs)"]
               [:bind "?ceil" "(ceil \"1.8\")"]
+              [:bind "?coalesce" "(coalesce ?num1 \"2\")"]
               [:bind "?concat" "(concat \"foo\" \"bar\")"]
               {"@id" "?person", "person:age" "?age"}]
              where)))))
