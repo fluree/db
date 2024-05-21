@@ -120,6 +120,7 @@
    "MONTH"          "month"
    "NOW"            "now"
    "RAND"           "rand"
+   "ROUND"          "round"
    "SHA256"         "sha256"
    "SHA512"         "sha512"
    "STR"            "str"
@@ -157,6 +158,7 @@
       "month"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "now"          (str "(" f ")")
       "rand"         (str "(" f ")")
+      "round"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
