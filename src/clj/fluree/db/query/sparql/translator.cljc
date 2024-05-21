@@ -95,39 +95,41 @@
   (mapv parse-term expressions))
 
 (def supported-scalar-functions
-  {"ABS"       "abs"
-   "BNODE"     "bnode"
-   "BOUND"     "bound"
-   "CEIL"      "ceil"
-   "COALESCE"  "coalesce"
-   "CONCAT"    "concat"
-   "CONTAINS"  "contains"
-   "DATATYPE"  "datatype"
-   "DAY"       "day"
-   "FLOOR"     "floor"
-   "IF"        "if"
-   "RAND"      "rand"
-   "SHA256"    "sha256"
-   "SHA512"    "sha512"
-   "STR"       "str"
-   "STRENDS"   "strEnds"
-   "STRLEN"    "count"
-   "STRSTARTS" "strStarts"})
+  {"ABS"            "abs"
+   "BNODE"          "bnode"
+   "BOUND"          "bound"
+   "CEIL"           "ceil"
+   "COALESCE"       "coalesce"
+   "CONCAT"         "concat"
+   "CONTAINS"       "contains"
+   "DATATYPE"       "datatype"
+   "DAY"            "day"
+   "ENCODE_FOR_URI" "encodeForUri"
+   "FLOOR"          "floor"
+   "IF"             "if"
+   "RAND"           "rand"
+   "SHA256"         "sha256"
+   "SHA512"         "sha512"
+   "STR"            "str"
+   "STRENDS"        "strEnds"
+   "STRLEN"         "count"
+   "STRSTARTS"      "strStarts"})
 
 (defmethod parse-term :Func
   [[_ func & args]]
   (let [f (get supported-scalar-functions func)]
     (case f
-      "abs"      (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
-      "bnode"    (str "(" f " " (literal-quote (parse-term (first args))) ")")
-      "bound"    (str "(" f " " (parse-term (first args)) ")")
-      "ceil"     (str "(" f " " (literal-quote (parse-term (first args))) ")")
-      "coalesce" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
-      "concat"   (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
-      "contains" (str "(" f " " (literal-quote (parse-term (first args))) " " (literal-quote (parse-term (second args))) ")")
-      "datatype" (str "(" f " " (literal-quote (parse-term (first args))) ")")
-      "day"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
-      "sha512"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "abs"          (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
+      "bnode"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "bound"        (str "(" f " " (parse-term (first args)) ")")
+      "ceil"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "coalesce"     (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
+      "concat"       (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
+      "contains"     (str "(" f " " (literal-quote (parse-term (first args))) " " (literal-quote (parse-term (second args))) ")")
+      "datatype"     (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "day"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "encodeForUri" (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
