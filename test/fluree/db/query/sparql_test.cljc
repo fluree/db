@@ -255,7 +255,7 @@
               {"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:age" "?age"}]
              where)))
-    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore ?strDt
+    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore ?strDt ?strEnds
                  WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
                         BIND (BNODE(?foobar) AS ?bnode)
                         BIND (BOUND(?abs) AS ?bound)
@@ -287,6 +287,7 @@
                         BIND (STRAFTER(\"abc\", \"b\") AS ?strAfter)
                         BIND (STRBEFORE(\"abc\", \"b\") AS ?strBefore)
                         BIND (STRDT(\"iiii\", \"http://example.com/romanNumeral\") AS ?strDt)
+                        BIND (STRENDS(\"foobar\", \"bar\") AS ?strEnds)
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
@@ -320,6 +321,7 @@
               [:bind "?strAfter" "(strAfter \"abc\" \"b\")"]
               [:bind "?strBefore" "(strBefore \"abc\" \"b\")"]
               [:bind "?strDt" "(strDt \"iiii\" \"http://example.com/romanNumeral\")"]
+              [:bind "?strEnds" "(strEnds \"foobar\" \"bar\")"]
               {"@id" "?person", "person:age" "?age"}]
              where)))))
 
