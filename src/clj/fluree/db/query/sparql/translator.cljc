@@ -111,6 +111,7 @@
    "IRI"            "iri"
    "LANG"           "lang"
    "LANGMATCHES"    "langMatches"
+   "LCASE"          "lcase"
    "RAND"           "rand"
    "SHA256"         "sha256"
    "SHA512"         "sha512"
@@ -143,6 +144,7 @@
       "lang"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "langMatches"  (str "(" f " " (literal-quote (parse-term (first args))) " "
                           (literal-quote (parse-term (first (next args)))) ")")
+      "lcase"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
