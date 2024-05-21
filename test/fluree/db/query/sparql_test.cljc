@@ -392,7 +392,19 @@
           {:keys [context]} (sparql/->fql query)]
       (is (= {"foaf" "http://xmlns.com/foaf/0.1/"
               "ex"   "http://example.org/ns/"}
-             context)))))
+             context))))
+  (testing "comments"
+    (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+                 PREFIX ex: <http://example.org/ns/>
+                 # THIS IS IGNORED
+                 SELECT ?name ?mbox # THIS TOO
+                 WHERE {?x foaf:name ?name.
+                        # DEFINITELY IGNORED
+                        ?x foaf:mbox ?mbox}"]
+      (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/", "ex" "http://example.org/ns/"},
+              :select ["?name" "?mbox"],
+              :where [{"@id" "?x", "foaf:name" "?name"} {"@id" "?x", "foaf:mbox" "?mbox"}]}
+             (sparql/->fql query))))))
 
 (deftest parse-modifiers
   (testing "LIMIT"
