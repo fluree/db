@@ -102,6 +102,7 @@
    "COALESCE"  "coalesce"
    "CONCAT"    "concat"
    "CONTAINS"  "contains"
+   "DATATYPE"  "datatype"
    "FLOOR"     "floor"
    "IF"        "if"
    "RAND"      "rand"
@@ -123,6 +124,7 @@
       "coalesce" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
       "concat"   (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
       "contains" (str "(" f " " (literal-quote (parse-term (first args))) " " (literal-quote (parse-term (second args))) ")")
+      "datatype" (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha512"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
