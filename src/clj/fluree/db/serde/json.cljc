@@ -48,14 +48,9 @@
       (update :first deserialize-flake-bound)
       (update :rhs deserialize-flake-bound)))
 
-(defn parse-int
-  [x]
-  #?(:clj (Integer/parseInt x)
-     :cljs (js/parseInt x)))
-
 (defn keyword->int
   [k]
-  (-> k name parse-int))
+  (-> k name util/str->int))
 
 (defn numerize-keys
   "Convert the keys of the provided map `m` to integers. Assumes that the keys are

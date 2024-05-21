@@ -191,8 +191,12 @@
    (iri->sid iri default-namespaces))
   ([iri namespaces]
    (let [[ns nme] (decompose iri)]
-     (when-let [ns-code (get namespaces ns)]
-       (->sid ns-code nme)))))
+     (if-let [ns-code (get namespaces ns)]
+       (->sid ns-code nme)
+       (throw (ex-info (str "Unexpected error: Namespace not registered in the database "
+                            "for iri: " iri ".")
+                       {:status 500
+                        :error :db/unexpected-error}))))))
 
 (defn next-namespace-code
   [namespaces]
