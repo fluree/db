@@ -112,6 +112,7 @@
    "HOURS"          "hours"
    "IF"             "if"
    "IRI"            "iri"
+   "LANG"           "lang"
    "RAND"           "rand"
    "SHA256"         "sha256"
    "SHA512"         "sha512"
@@ -141,6 +142,7 @@
                           (literal-quote (parse-term (first (next args)))) " "
                           (literal-quote (parse-term (first (nnext args)))) ")")
       "iri"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "lang"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
