@@ -18,7 +18,6 @@
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.policy.enforce-tx :as tx-policy]
-            [fluree.db.util.json :as json]
             [fluree.db.query.json-ld.response :as jld-response]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.reify :as reify]
@@ -34,21 +33,22 @@
   {const/iri-view   {:root? true}
    const/iri-modify {:root? true}})
 
+;; ================ Jsonld record support fns ================================
+
+(defn root-db
+  [this]
+  (assoc this :policy root-policy-map))
+
 (defn class-ids
   "Returns list of class-ids for given subject-id"
   [db subject-id]
   (go-try
-    (map flake/o
-         (-> (dbproto/-rootdb db)
-             (query-range/index-range :spot = [subject-id const/$rdf:type])
-             <?))))
+    (let [root (root-db db)]
+      (<? (query-range/index-range root :spot = [subject-id const/$rdf:type]
+                                   {:flake-xf (map flake/o)})))))
 
-;; ================ Jsonld record support fns ================================
-
-(defn- jsonld-root-db [this]
-  (assoc this :policy root-policy-map))
-
-(defn- jsonld-p-prop [schema property predicate]
+(defn p-prop
+  [schema property predicate]
   (assert (#{:id :iri :subclassOf :parentProps :childProps :datatype}
             property)
           (str "Invalid predicate property: " (pr-str property)))
@@ -236,7 +236,7 @@
 
         commit-t  (-> db :commit commit-data/t)
         t         (flake/next-t commit-t)
-        db-before (dbproto/-rootdb db)]
+        db-before (root-db db)]
     {:db-before     db-before
      :context       context
      :txn           txn
@@ -308,10 +308,9 @@
 (defn validate-db-update
   [{:keys [db-after db-before mods context] :as staged-map}]
   (go-try
-    (let [root-db    (dbproto/-rootdb db-after)
-          _          (<? (shacl/validate! db-before root-db (vals mods) context))
-          allowed-db (<? (tx-policy/allowed? staged-map))]
-      (dbproto/-rootdb allowed-db))))
+    (<? (shacl/validate! db-before (root-db db-after) (vals mods) context))
+    (let [allowed-db (<? (tx-policy/allowed? staged-map))]
+      (root-db allowed-db))))
 
 (defn stage
   [db fuel-tracker context identity annotation raw-txn parsed-txn]
@@ -334,12 +333,12 @@
                      schema comparators staged novelty policy namespaces
                      namespace-codes]
   dbproto/IFlureeDb
-  (-rootdb [this] (jsonld-root-db this))
+  (-rootdb [this] (root-db this))
   (-class-prop [_this meta-key class]
     (if (= :subclasses meta-key)
       (get @(:subclasses schema) class)
-      (jsonld-p-prop schema meta-key class)))
-  (-p-prop [_ meta-key property] (jsonld-p-prop schema meta-key property))
+      (p-prop schema meta-key class)))
+  (-p-prop [_ meta-key property] (p-prop schema meta-key property))
   (-class-ids [this subject] (class-ids this subject))
   (-query [this query-map]
     (fql/query this query-map))
