@@ -3,6 +3,8 @@
   (:require [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async :refer [<! go]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
+            [fluree.db.constants :as const]
             [fluree.db.query.exec.where :as where]
             [fluree.db.json-ld.transact :as transact]
             [fluree.db.query.json-ld.response :as jld-response]
@@ -98,9 +100,12 @@
       (async/put! db)))
 
 (defn load
-  [conn ledger-alias branch t commit]
-  (let [async-db (->AsyncDB ledger-alias branch t (async/promise-chan))]
+  [conn ledger-alias branch commit-jsonld]
+  (let [t (-> commit-jsonld
+              (get-first const/iri-data)
+              (get-first-value const/iri-t))
+        async-db (->AsyncDB ledger-alias branch t (async/promise-chan))]
     (go
-      (let [db (<! (jld-db/load conn ledger-alias branch commit))]
+      (let [db (<! (jld-db/load conn ledger-alias branch commit-jsonld))]
         (deliver! async-db db)))
     async-db))
