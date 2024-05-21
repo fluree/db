@@ -96,6 +96,7 @@
 
 (def supported-scalar-functions
   {"ABS"       "abs"
+   "BNODE"     "bnode"
    "BOUND"     "bound"
    "CEIL"      "ceil"
    "COALESCE"  "coalesce"
@@ -115,6 +116,7 @@
   (let [f (get supported-scalar-functions func)]
     (case f
       "abs"    (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
+      "bnode"  (or (str "(" f " " (parse-term (first args)) ")") (str "(" f " " (literal-quote (parse-term (first args))) ")") nil)
       "bound"  (str "(" f " " (parse-term (first args)) ")")
       "ceil"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "concat" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
