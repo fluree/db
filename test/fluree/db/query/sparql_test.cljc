@@ -264,6 +264,7 @@
                         BIND (CONCAT(\"foo\", \"bar\") AS ?concat)
                         BIND (CONTAINS(\"foobar\", \"foo\") AS ?contains)
                         BIND (DATATYPE(\"foobar\") AS ?datatype)
+                        BIND (DAY(\"2024-4-1T14:45:13.815-05:00\") AS ?day)
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
@@ -274,6 +275,7 @@
               [:bind "?concat" "(concat \"foo\" \"bar\")"]
               [:bind "?contains" "(contains \"foobar\" \"foo\")"]
               [:bind "?datatype" "(datatype \"foobar\")"]
+              [:bind "?day" "(day \"2024-4-1T14:45:13.815-05:00\")"]
               {"@id" "?person", "person:age" "?age"}]
              where)))))
 
