@@ -116,6 +116,7 @@
    "LANGMATCHES"    "langMatches"
    "LCASE"          "lcase"
    "MD5"            "md5"
+   "MINUTES"        "minutes"
    "RAND"           "rand"
    "SHA256"         "sha256"
    "SHA512"         "sha512"
@@ -150,6 +151,7 @@
                           (literal-quote (parse-term (first (next args)))) ")")
       "lcase"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "md5"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "minutes"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
