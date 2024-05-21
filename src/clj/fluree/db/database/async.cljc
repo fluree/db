@@ -1,6 +1,5 @@
 (ns fluree.db.database.async
-  (:require [fluree.db.database :as database :refer [Database]]
-            [fluree.db.db.json-ld :as jld-db]
+  (:require [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async :refer [<! go]]
             [fluree.db.query.exec.where :as where]
@@ -11,21 +10,6 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defrecord AsyncDB [alias branch t db-chan]
-  Database
-  (query [_ q]
-    (go-try
-      (if-let [db (<? db-chan)]
-        (<? (database/query db q))
-        (throw (ex-info (str "Database for " alias "/" branch " at `t` = " t " not delivered.")
-                        {:status 500 :error :db/not-delivered})))))
-
-  (stage [_ tx]
-    (go-try
-      (if-let [db (<? db-chan)]
-        (<? (database/stage db tx))
-        (throw (ex-info (str "Database for " alias "/" branch " at `t` = " t " not delivered.")
-                        {:status 500 :error :db/not-delivered})))))
-
   where/Matcher
   (-match-id [_ fuel-tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
