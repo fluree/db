@@ -84,7 +84,21 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id"           "?person"
                "person:handle" "jdoe"}]
-             where))))
+             where)))
+    (let [query  "SELECT ?person WHERE {?person person:handle \"Los Angeles\"@en .}"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?person",
+               "person:handle" {"@value" "Los Angeles", "@language" "en"}}]
+             where)
+          "lang literal"))
+    (let [query "SELECT ?person
+                 WHERE {?person person:birthday \"2011-01-10T14:45:13.815-05:00\"^^xsd:dateTime .}"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?person",
+               "person:birthday"
+               {"@value" "2011-01-10T14:45:13.815-05:00", "@type" "xsd:dateTime"}}]
+             where)
+          "datatype literal")))
   (testing "multi clause"
     (let [query "SELECT ?person ?nums
                  WHERE {?person person:handle \"jdoe\".
@@ -356,9 +370,6 @@
               [:bind "?sameTerm" "(sameTerm ?str ?str)"]
               {"@id" "?person", "person:age" "?age"}]
              where)))))
-
-;;TODO: not yet supported
-#_(testing "language labels")
 
 (deftest parse-prefixes
   (testing "PREFIX"
