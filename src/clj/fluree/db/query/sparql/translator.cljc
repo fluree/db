@@ -115,12 +115,13 @@
   [[_ func & args]]
   (let [f (get supported-scalar-functions func)]
     (case f
-      "abs"    (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
-      "bnode"  (or (str "(" f " " (parse-term (first args)) ")") (str "(" f " " (literal-quote (parse-term (first args))) ")") nil)
-      "bound"  (str "(" f " " (parse-term (first args)) ")")
-      "ceil"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
-      "concat" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
-      "sha512" (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "abs"      (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
+      "bnode"    (or (str "(" f " " (parse-term (first args)) ")") (str "(" f " " (literal-quote (parse-term (first args))) ")") nil)
+      "bound"    (str "(" f " " (parse-term (first args)) ")")
+      "ceil"     (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "coalesce" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
+      "concat"   (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
+      "sha512"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
