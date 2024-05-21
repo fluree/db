@@ -144,7 +144,8 @@
    "isIRI"          "isIri"
    "isLITERAL"      "isLiteral"
    "isNUMERIC"      "isNumeric"
-   "isURI"          "isUri"})
+   "isURI"          "isUri"
+   "sameTerm"       "sameTerm"})
 
 (defmethod parse-term :Func
   [[_ func & args]]
@@ -207,6 +208,8 @@
       "isLiteral"    (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "isNumeric"    (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "isUri"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "sameTerm"     (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
