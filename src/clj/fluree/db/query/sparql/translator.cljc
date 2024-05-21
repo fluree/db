@@ -285,6 +285,21 @@
       ;; op: =, <, >, <=, >=
       (str "(" op " " expr " " (parse-term op-or-exp) ")"))))
 
+(defmethod parse-term :ConditionalOrExpression
+  ;; ConditionalOrExpression ::= ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
+  [[_ expr & exprs]]
+  (if (seq exprs)
+    (str "(or " (parse-term expr) " " (str/join " " (mapv parse-term exprs)) ")")
+    (parse-term expr)))
+
+(defmethod parse-term :ConditionalAndExpression
+  ;; ConditionalAndExpression ::= ValueLogical ( <'&&'> ValueLogical )*
+  ;; <ValueLogical> ::= RelationalExpression
+  [[_ expr & exprs]]
+  (if (seq exprs)
+    (str "(and " (parse-term expr) " " (str/join " " (mapv parse-term exprs)) ")")
+    (parse-term expr)))
+
 (defmethod parse-term :Expression
   ;; Expression ::= WS ConditionalOrExpression WS
   ;; <ConditionalOrExpression> ::= ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
