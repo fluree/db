@@ -3,7 +3,6 @@
             [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.permissions-validate :as validate]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.query.dataset :as dataset]
             [fluree.db.util.log :as log :include-macros true]

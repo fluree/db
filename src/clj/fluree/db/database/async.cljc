@@ -4,6 +4,7 @@
             [clojure.core.async :as async :refer [<! go]]
             [fluree.db.query.exec.where :as where]
             [fluree.db.json-ld.transact :as transact]
+            [fluree.db.query.json-ld.response :as jld-response]
             [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]])
   #?(:clj (:import (java.io Writer))))
 
@@ -37,6 +38,27 @@
               (where/-match-class fuel-tracker solution triple error-ch)
               (async/pipe match-ch))))
       match-ch))
+
+
+  jld-response/NodeFormatter
+  (-forward-properties [_ iri select-spec context compact-fn cache fuel-tracker error-ch]
+    (let [prop-ch (async/chan)]
+      (go
+        (let [db (<! db-chan)]
+          (-> db
+              (jld-response/-forward-properties iri select-spec context compact-fn cache fuel-tracker error-ch)
+              (async/pipe prop-ch))))
+      prop-ch))
+
+  (-reverse-property [_ iri reverse-spec compact-fn cache fuel-tracker error-ch]
+    (let [prop-ch (async/chan)]
+      (go
+        (let [db (<! db-chan)]
+          (-> db
+              (jld-response/-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
+              (async/pipe prop-ch))))
+      prop-ch))
+
 
   transact/Transactable
   (-stage-db [_ fuel-tracker context identity annotation raw-txn parsed-txn]
