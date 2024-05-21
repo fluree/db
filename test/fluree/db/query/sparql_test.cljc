@@ -457,6 +457,14 @@
           {:keys [groupBy]} (sparql/->fql query)]
       (is (= ["?person" "?handle"]
              groupBy))))
+  (testing "mutiple HAVING constraints"
+    (let [query "SELECT ?handle
+                 WHERE {?person person:handle ?handle.}
+                 GROUP BY ?person ?handle
+                 HAVING(STRLEN(?handle) < 5 && (STRSTARTS(?handle, \"foo\") || STRSTARTS(?handle, \"bar\")))"
+          {:keys [having]} (sparql/->fql query)]
+      (is (= "(and (< (strLen ?handle) 5) (or (strStarts ?handle \"foo\") (strStarts ?handle \"bar\")))"
+             having))))
   (testing "DISTINCT"
     (let [query "SELECT DISTINCT ?person ?fullName
                  WHERE {?person person:fullName ?fullName}"
