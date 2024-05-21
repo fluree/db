@@ -136,7 +136,8 @@
    "UCASE"          "ucase"
    "URI"            "uri"
    "UUID"           "uuid"
-   "YEAR"           "year"})
+   "YEAR"           "year"
+   "isBLANK"        "isBlank"})
 
 (defmethod parse-term :Func
   [[_ func & args]]
@@ -194,6 +195,7 @@
       "uri"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "uuid"         (str "(" f ")")
       "year"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "isBlank"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
