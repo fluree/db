@@ -106,6 +106,7 @@
    "DAY"            "day"
    "ENCODE_FOR_URI" "encodeForUri"
    "FLOOR"          "floor"
+   "HOURS"          "hours"
    "IF"             "if"
    "RAND"           "rand"
    "SHA256"         "sha256"
@@ -130,6 +131,7 @@
       "day"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "encodeForUri" (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "floor"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "hours"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
