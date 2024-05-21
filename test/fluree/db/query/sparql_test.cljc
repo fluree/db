@@ -264,7 +264,7 @@
               {"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:age" "?age"}]
              where)))
-    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes
+    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes ?month
                  WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
                         BIND (BNODE(?foobar) AS ?bnode)
                         BIND (BOUND(?abs) AS ?bound)
@@ -283,7 +283,8 @@
                         BIND (LANGMATCHES(?lang, \"FR\") AS ?langMatches)
                         BIND (LCASE(\"FOO\") AS ?lcase)
                         BIND (MD5(\"abc\") AS ?md5)
-                        BIND (MINUTES(\"2024-4-1T14:45:13.815-05:00\") AS ?minutes) 
+                        BIND (MINUTES(\"2024-4-1T14:45:13.815-05:00\") AS ?minutes)
+                        BIND (MONTH(\"2024-4-1T14:45:13.815-05:00\") AS ?month)
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
@@ -305,6 +306,7 @@
               [:bind "?lcase" "(lcase \"FOO\")"]
               [:bind "?md5" "(md5 \"abc\")"]
               [:bind "?minutes" "(minutes \"2024-4-1T14:45:13.815-05:00\")"]
+              [:bind "?month" "(month \"2024-4-1T14:45:13.815-05:00\")"]
               {"@id" "?person", "person:age" "?age"}]
              where)))))
 
