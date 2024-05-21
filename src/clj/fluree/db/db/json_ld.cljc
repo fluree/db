@@ -28,6 +28,7 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.serde.json :as serde-json]
             [fluree.db.query.json-ld.response :as jld-response]
+            [fluree.db.query.fql :as fql]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.json-ld.commit-data :as commit-data]
@@ -364,6 +365,7 @@
                      reindex-max-bytes]
   dbproto/IFlureeDb
   (-rootdb [this] (root-db this))
+  (-query [this query-map] (fql/query this query-map))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
   (-class-ids [this subject] (class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))
