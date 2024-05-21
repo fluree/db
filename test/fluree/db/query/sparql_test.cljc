@@ -255,7 +255,7 @@
               {"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:age" "?age"}]
              where)))
-    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes ?month ?now ?rand ?round ?seconds ?sha1
+    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes ?month ?now ?rand ?round ?seconds ?sha1 ?sha256
                  WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
                         BIND (BNODE(?foobar) AS ?bnode)
                         BIND (BOUND(?abs) AS ?bound)
@@ -281,6 +281,7 @@
                         BIND (ROUND(1.8) AS ?round)
                         BIND (SECONDS(\"2024-4-1T14:45:13.815-05:00\") AS ?seconds)
                         BIND (SHA1(\"abc\") AS ?sha1)
+                        BIND (SHA256(\"abc\") AS ?sha256)
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
@@ -308,6 +309,7 @@
               [:bind "?round" "(round \"1.8\")"]
               [:bind "?seconds" "(seconds \"2024-4-1T14:45:13.815-05:00\")"]
               [:bind "?sha1" "(sha1 \"abc\")"]
+              [:bind "?sha256" "(sha256 \"abc\")"]
               {"@id" "?person", "person:age" "?age"}]
              where)))))
 
