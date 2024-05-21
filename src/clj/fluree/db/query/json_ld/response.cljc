@@ -4,15 +4,16 @@
             [fluree.db.permissions-validate :as validate]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.flake :as flake]
-            [fluree.db.fuel :as fuel]
             [fluree.db.constants :as const]
             [fluree.db.query.dataset :as dataset]
-            [fluree.db.query.range :as query-range]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.json :as json]
             [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(defprotocol NodeFormatter
+  (-forward-properties [db iri select-spec context compact-fn cache fuel-tracker error-ch])
+  (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch]))
 
 (defn cache-sid->iri
   [db cache compact-fn sid]
@@ -30,88 +31,6 @@
         (let [spec* (assoc spec :as (compact-fn (:iri spec)))]
           (vswap! cache assoc iri spec*)
           spec*))))
-
-(defn rdf-type?
-  [pid]
-  (= const/$rdf:type pid))
-
-(defn list-element?
-  [flake]
-  (-> flake flake/m (contains? :i)))
-
-(defn type-value
-  [db cache compact-fn type-flakes]
-  (->> type-flakes
-       (into [] (comp (map flake/o)
-                      (map (partial cache-sid->iri db cache compact-fn))
-                      (map :as)))
-       util/unwrap-singleton))
-
-(defn encode-reference
-  [iri spec]
-  {::reference {:iri  iri
-                :spec spec}})
-
-(defn format-reference
-  [db spec sid]
-  (let [iri (iri/decode-sid db sid)]
-    (encode-reference iri spec)))
-
-(defn format-object
-  [db spec f]
-  (let [obj (flake/o f)
-        dt (flake/dt f)]
-    (if (= const/$xsd:anyURI dt)
-      (format-reference db spec obj)
-      (if (= const/$rdf:json dt)
-        (json/parse obj false)
-        obj))))
-
-(defn format-property
-  [db cache context compact-fn {:keys [wildcard?] :as select-spec} p-flakes]
-  (let [ff  (first p-flakes)
-        pid (flake/p ff)
-        iri (iri/decode-sid db pid)]
-    (when-let [spec (or (get select-spec iri)
-                        (when wildcard?
-                          (or (wildcard-spec db cache compact-fn iri)
-                              (cache-sid->iri db cache compact-fn pid))))]
-      (let [p-iri (:as spec)
-            v     (if (rdf-type? pid)
-                    (type-value db cache compact-fn p-flakes)
-                    (let [p-flakes* (if (list-element? ff)
-                                      (sort-by (comp :i flake/m) p-flakes)
-                                      p-flakes)]
-                      (->> p-flakes*
-                           (mapv (partial format-object db spec))
-                           (util/unwrap-singleton p-iri context))))]
-        [p-iri v]))))
-
-(defn format-subject-xf
-  [db cache context compact-fn select-spec]
-  (comp (partition-by flake/p)
-        (map (partial format-property db cache context
-                      compact-fn select-spec))
-        (remove nil?)))
-
-(defn flake-bounds
-  [db idx match]
-  (let [[start-test start-match end-test end-match]
-        (query-range/expand-range-interval idx = match)
-
-        [s1 p1 o1 t1 op1 m1]
-        (query-range/match->flake-parts db idx start-match)
-
-        [s2 p2 o2 t2 op2 m2]
-        (query-range/match->flake-parts db idx end-match)
-
-        start-flake (query-range/resolve-match-flake start-test s1 p1 o1 t1 op1 m1)
-        end-flake   (query-range/resolve-match-flake end-test s2 p2 o2 t2 op2 m2)]
-    [start-flake end-flake]))
-
-(defn reference?
-  [v]
-  (some? (::reference v)))
 
 (defn combine-objects
   [obj1 obj2]
@@ -162,6 +81,15 @@
                (log/error e "Error appending subject iri")
                (>! error-ch e))))))
 
+(defn encode-reference
+  [iri spec]
+  {::reference {:iri  iri
+                :spec spec}})
+
+(defn reference?
+  [v]
+  (some? (::reference v)))
+
 (defn display-reference
   [ds o-iri spec select-spec cache context compact-fn current-depth fuel-tracker error-ch]
   (let [max-depth (:depth select-spec)
@@ -210,31 +138,6 @@
                 (recur r resolved-attrs)))
             resolved-attrs)))))
 
-(defn reverse-property
-  [{:keys [t] :as db} o-iri {:keys [as spec], p-iri :iri, :as reverse-spec} compact-fn cache fuel-tracker error-ch]
-  (let [oid                     (iri/encode-iri db o-iri)
-        pid                     (iri/encode-iri db p-iri)
-        [start-flake end-flake] (flake-bounds db :opst [oid pid])
-        flake-xf                (if fuel-tracker
-                                  (comp (fuel/track fuel-tracker error-ch)
-                                        (map flake/s))
-                                  (map flake/s))
-        range-opts              {:from-t      t
-                                 :to-t        t
-                                 :start-flake start-flake
-                                 :end-flake   end-flake
-                                 :flake-xf    flake-xf}
-        sid-xf                  (if spec
-                                  (map (partial format-reference db reverse-spec))
-                                  (comp (map (partial cache-sid->iri db cache compact-fn))
-                                        (map :as)))]
-    (->> (query-range/resolve-flake-slices db :opst error-ch range-opts)
-         (async/transduce (comp cat sid-xf)
-                          (completing conj
-                                      (fn [result]
-                                        [as (util/unwrap-singleton result)]))
-                          []))))
-
 (defn format-reverse-property
   [ds o-iri reverse-spec compact-fn cache fuel-tracker error-ch]
   (if (dataset/dataset? ds)
@@ -243,7 +146,7 @@
       (async/pipeline-async 2
                             prop-ch
                             (fn [db ch]
-                              (-> (reverse-property db o-iri reverse-spec compact-fn cache fuel-tracker error-ch)
+                              (-> (-reverse-property db o-iri reverse-spec compact-fn cache fuel-tracker error-ch)
                                   (async/pipe ch)))
                             db-ch)
       (async/reduce (fn [combined-prop db-prop]
@@ -254,7 +157,7 @@
                           db-prop)))
                     []
                     prop-ch))
-    (reverse-property ds o-iri reverse-spec compact-fn cache fuel-tracker error-ch)))
+    (-reverse-property ds o-iri reverse-spec compact-fn cache fuel-tracker error-ch)))
 
 (defn format-reverse-properties
   [ds iri reverse-map compact-fn cache fuel-tracker error-ch]
@@ -269,23 +172,6 @@
 
     (async/reduce conj {} out-ch)))
 
-(defn forward-properties
-  [{:keys [t] :as db} iri select-spec context compact-fn cache fuel-tracker error-ch]
-  (let [sid                     (iri/encode-iri db iri)
-        [start-flake end-flake] (flake-bounds db :spot [sid])
-        flake-xf                (when fuel-tracker
-                                  (comp (fuel/track fuel-tracker error-ch)))
-        range-opts              {:from-t      t
-                                 :to-t        t
-                                 :start-flake start-flake
-                                 :end-flake   end-flake
-                                 :flake-xf    flake-xf}
-        subj-xf                 (comp cat
-                                      (format-subject-xf db cache context compact-fn
-                                                         select-spec))]
-    (->> (query-range/resolve-flake-slices db :spot error-ch range-opts)
-         (async/transduce subj-xf (completing conj) {}))))
-
 (defn format-forward-properties
   [ds iri select-spec context compact-fn cache fuel-tracker error-ch]
   (if (dataset/dataset? ds)
@@ -294,11 +180,11 @@
       (async/pipeline-async 4
                             prop-ch
                             (fn [db ch]
-                              (-> (forward-properties db iri select-spec context compact-fn cache fuel-tracker error-ch)
+                              (-> (-forward-properties db iri select-spec context compact-fn cache fuel-tracker error-ch)
                                   (async/pipe ch)))
                             db-ch)
       (async/reduce merge-subgraphs {} prop-ch))
-    (forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)))
+    (-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)))
 
 (defn format-node
   ([ds iri context compact-fn select-spec cache fuel-tracker error-ch]
@@ -314,22 +200,3 @@
      (->> subject-ch
           (resolve-references ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
           (append-id ds iri select-spec cache compact-fn error-ch)))))
-
-(defn format-subject-flakes
-  "current-depth param is the depth of the graph crawl. Each successive 'ref'
-  increases the graph depth, up to the requested depth within the select-spec"
-  [db cache context compact-fn {:keys [reverse] :as select-spec} current-depth fuel-tracker error-ch s-flakes]
-  (if (not-empty s-flakes)
-    (let [sid           (->> s-flakes first flake/s)
-          s-iri         (iri/decode-sid db sid)
-          subject-attrs (into {}
-                              (format-subject-xf db cache context compact-fn select-spec)
-                              s-flakes)
-          subject-ch    (if reverse
-                          (let [reverse-ch (format-reverse-properties db s-iri reverse compact-fn cache fuel-tracker error-ch)]
-                            (async/reduce conj subject-attrs reverse-ch))
-                          (go subject-attrs))]
-      (->> subject-ch
-           (resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-           (append-id db s-iri select-spec cache compact-fn error-ch)))
-    (go)))

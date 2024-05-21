@@ -2,8 +2,8 @@
   (:refer-clojure :exclude [load])
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.query.fql :as fql]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.index :as index]
             [fluree.db.indexer.storage :as index-storage]
@@ -18,6 +18,8 @@
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.policy.enforce-tx :as tx-policy]
+            [fluree.db.util.json :as json]
+            [fluree.db.query.json-ld.response :as jld-response]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.json-ld.commit-data :as commit-data]
@@ -346,11 +348,13 @@
   (-stage [db fuel-tracker json-ld opts] (jld-transact/stage db fuel-tracker json-ld opts))
   (-index-update [db commit-index] (index-update db commit-index))
 
+
   iri/IRICodec
   (encode-iri [_ iri]
     (iri/iri->sid iri namespaces))
   (decode-sid [_ sid]
     (iri/sid->iri sid namespace-codes))
+
 
   where/Matcher
   (-match-id [db fuel-tracker solution s-mch error-ch]
@@ -362,9 +366,19 @@
   (-match-class [db fuel-tracker solution s-mch error-ch]
     (match-class db fuel-tracker solution s-mch error-ch))
 
+
   jld-transact/Transactable
   (-stage-db [db fuel-tracker context identity annotation raw-txn parsed-txn]
-    (stage db fuel-tracker context identity annotation raw-txn parsed-txn)))
+    (stage db fuel-tracker context identity annotation raw-txn parsed-txn))
+
+
+  jld-response/NodeFormatter
+  (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
+    (jld-format/forward-properties db iri spec context compact-fn cache fuel-tracker error-ch))
+
+  (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch]
+    (jld-format/reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch)))
+
 
 (def ^String label "#fluree/JsonLdDb ")
 
