@@ -104,6 +104,7 @@
    "CEIL"      "ceil"
    "COALESCE"  "coalesce"
    "CONCAT"    "concat"
+   "CONTAINS"  "contains"
    "FLOOR"     "floor"
    "IF"        "if"
    "RAND"      "rand"
@@ -124,6 +125,7 @@
       "ceil"     (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "coalesce" (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
       "concat"   (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
+      "contains" (str "(" f " " (literal-quote (parse-term (first args))) " " (literal-quote (parse-term (second args))) ")")
       "sha512"   (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
