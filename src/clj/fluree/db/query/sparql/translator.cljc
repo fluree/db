@@ -379,9 +379,28 @@
   [[_ source]]
   [[:from (parse-term source)]])
 
+(defmethod parse-term :LANGTAG
+  ;; LANGTAG ::= #"@[a-zA-Z]+(-[a-zA-Z0-9]+)*" WS
+  [[_ langstr]]
+  ;; just drop the @ prefix
+  (subs langstr 1))
+
 (defmethod parse-term :RDFLiteral
+  ;; RDFLiteral ::= String WS ( LANGTAG | ( '^^' iri ) )? WS
+  ;; LANGTAG    ::=   #"@[a-zA-Z]+-[a-zA-Z0-9]*" WS
   [[_ & literal]]
-  (apply str literal))
+  (loop [[char & r] literal
+         result     ""]
+    (if char
+      (cond
+        ;; datatype :iri
+        (= "^^" char)             (recur nil {const/iri-value result const/iri-type (parse-term (first r))})
+        ;; LANGTAG
+        (= :LANGTAG (first char)) (recur nil {const/iri-value result const/iri-language (parse-term char)})
+        ;; String
+        :else
+        (recur r (str result char)))
+      result)))
 
 (defmethod parse-term :Bind
   [[_ & bindings]]
