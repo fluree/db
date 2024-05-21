@@ -255,7 +255,7 @@
               {"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:age" "?age"}]
              where)))
-    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore ?strDt ?strEnds ?strLang ?strLen ?strStarts
+    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore ?strDt ?strEnds ?strLang ?strLen ?strStarts ?strUuid
                  WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
                         BIND (BNODE(?foobar) AS ?bnode)
                         BIND (BOUND(?abs) AS ?bound)
@@ -291,6 +291,7 @@
                         BIND (STRLANG(\"chat\", \"en\") AS ?strLang)
                         BIND (STRLEN(\"chat\") AS ?strLen)
                         BIND (STRSTARTS(\"foobar\", \"foo\") AS ?strStarts)
+                        BIND (STRUUID() AS ?strUuid)
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
@@ -328,6 +329,7 @@
               [:bind "?strLang" "(strLang \"chat\" \"en\")"]
               [:bind "?strLen" "(strLen \"chat\")"]
               [:bind "?strStarts" "(strStarts \"foobar\" \"foo\")"]
+              [:bind "?strUuid" "(strUuid)"]
               {"@id" "?person", "person:age" "?age"}]
              where)))))
 

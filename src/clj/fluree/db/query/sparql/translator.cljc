@@ -129,7 +129,8 @@
    "STRENDS"        "strEnds"
    "STRLANG"        "strLang"
    "STRLEN"         "strLen"
-   "STRSTARTS"      "strStarts"})
+   "STRSTARTS"      "strStarts"
+   "STRUUID"        "strUuid"})
 
 (defmethod parse-term :Func
   [[_ func & args]]
@@ -180,6 +181,7 @@
       "strLen"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "strStarts"    (str "(" f " " (literal-quote (parse-term (first args))) " "
                           (literal-quote (parse-term (first (next args)))) ")")
+      "strUuid"      (str "(" f ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
