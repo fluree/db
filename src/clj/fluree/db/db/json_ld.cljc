@@ -340,11 +340,6 @@
       (p-prop schema meta-key class)))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
   (-class-ids [this subject] (class-ids this subject))
-  (-query [this query-map]
-    (fql/query this query-map))
-  (-stage [db json-ld] (jld-transact/stage db json-ld nil))
-  (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
-  (-stage [db fuel-tracker json-ld opts] (jld-transact/stage db fuel-tracker json-ld opts))
   (-index-update [db commit-index] (index-update db commit-index))
 
 
