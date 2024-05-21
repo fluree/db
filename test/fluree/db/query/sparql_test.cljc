@@ -255,7 +255,7 @@
               {"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:age" "?age"}]
              where)))
-    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang
+    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches
                  WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
                         BIND (BNODE(?foobar) AS ?bnode)
                         BIND (BOUND(?abs) AS ?bound)
@@ -271,6 +271,7 @@
                         BIND (IF(\"true\", \"yes\", \"no\") AS ?if)
                         BIND (IRI(\"http://example.com\") AS ?iri)
                         BIND (LANG(\"Robert\"\"@en\") AS ?lang)
+                        BIND (LANGMATCHES(?lang, \"FR\") AS ?langMatches)
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
@@ -288,6 +289,7 @@
               [:bind "?if" "(if \"true\" \"yes\" \"no\")"]
               [:bind "?iri" "(iri \"http://example.com\")"]
               [:bind "?lang" "(lang \"Robert\"\"@en\")"]
+              [:bind "?langMatches" "(langMatches ?lang \"FR\")"]
               {"@id" "?person", "person:age" "?age"}]
              where)))))
 
