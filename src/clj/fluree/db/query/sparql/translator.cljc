@@ -442,6 +442,11 @@
   [[_ & optional]]
   (into [:optional] (mapv parse-term optional)))
 
+(defmethod parse-term :ServiceGraphPattern
+  [_]
+  (throw (ex-info "SERVICE is not a supported SPARQL pattern"
+                  {:status 400 :error :db/invalid-query})))
+
 (defmethod parse-term :DataBlockValue
   ;; DataBlockValue ::= iri | RDFLiteral | NumericLiteral | BooleanLiteral | 'UNDEF' WS
   [[_ [tag :as value]]]
