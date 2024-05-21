@@ -264,7 +264,7 @@
               {"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:age" "?age"}]
              where)))
-    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore ?strDt ?strEnds ?strLang ?strLen ?strStarts ?strUuid ?timezone ?tz ?ucase
+    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore ?strDt ?strEnds ?strLang ?strLen ?strStarts ?strUuid ?timezone ?tz ?ucase ?uri
                  WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
                         BIND (BNODE(?foobar) AS ?bnode)
                         BIND (BOUND(?abs) AS ?bound)
@@ -304,6 +304,7 @@
                         BIND (TIMEZONE(\"2024-4-1T14:45:13.815-05:00\") AS ?timezone)
                         BIND (TZ(\"2024-4-1T14:45:13.815-05:00\") AS ?tz)
                         BIND (UCASE(\"foobar\") AS ?ucase)
+                        BIND (URI(\"http://example.com\") AS ?uri)
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
@@ -345,6 +346,7 @@
               [:bind "?timezone" "(timezone \"2024-4-1T14:45:13.815-05:00\")"]
               [:bind "?tz" "(tz \"2024-4-1T14:45:13.815-05:00\")"]
               [:bind "?ucase" "(ucase \"foobar\")"]
+              [:bind "?uri" "(uri \"http://example.com\")"]
               {"@id" "?person", "person:age" "?age"}]
              where)))))
 
