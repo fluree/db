@@ -4,9 +4,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log :include-macros true])
-
-  (:refer-clojure :exclude [name]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
