@@ -140,7 +140,8 @@
    "URI"            "uri"
    "UUID"           "uuid"
    "YEAR"           "year"
-   "isBLANK"        "isBlank"})
+   "isBLANK"        "isBlank"
+   "isIRI"          "isIri"})
 
 (defmethod parse-term :Func
   [[_ func & args]]
@@ -199,6 +200,7 @@
       "uuid"         (str "(" f ")")
       "year"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "isBlank"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "isIri"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
