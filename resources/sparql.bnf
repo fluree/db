@@ -111,8 +111,8 @@ VarOrIri	  ::=  	Var | iri WS
 Var	  ::=  	VAR1 WS | VAR2 WS
 <GraphTerm>	  ::=  	iri | RDFLiteral | NumericLiteral | BooleanLiteral | BlankNode | NIL
 Expression	  ::=  	WS ConditionalOrExpression WS
-<ConditionalOrExpression>	  ::=  	ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
-<ConditionalAndExpression>	  ::=  	ValueLogical ( <'&&'> ValueLogical )*
+ConditionalOrExpression ::= ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
+ConditionalAndExpression ::= ValueLogical ( <'&&'> ValueLogical )*
 <ValueLogical>	  ::=  	RelationalExpression
 RelationalExpression	  ::=  	NumericExpression WS ( '=' NumericExpression | '!=' NumericExpression | '<' NumericExpression | '>' NumericExpression | '<=' NumericExpression | '>=' NumericExpression | 'IN' ExpressionList | 'NOT' 'IN' ExpressionList )?
 NumericExpression	  ::=  	WS AdditiveExpression WS
