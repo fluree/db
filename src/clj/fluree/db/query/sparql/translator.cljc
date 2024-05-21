@@ -165,6 +165,7 @@
       "sha1"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha256"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "str"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
