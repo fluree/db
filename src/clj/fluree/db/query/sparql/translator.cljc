@@ -126,12 +126,16 @@
       "ceil"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "coalesce"     (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
       "concat"       (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
-      "contains"     (str "(" f " " (literal-quote (parse-term (first args))) " " (literal-quote (parse-term (second args))) ")")
+      "contains"     (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
       "datatype"     (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "day"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "encodeForUri" (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "floor"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "hours"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "if"           (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) " "
+                          (literal-quote (parse-term (first (nnext args)))) ")")
       "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
