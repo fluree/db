@@ -153,6 +153,7 @@
       "minutes"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "month"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "now"          (str "(" f ")")
+      "rand"         (str "(" f ")")
       "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
