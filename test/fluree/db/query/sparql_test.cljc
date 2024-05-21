@@ -264,7 +264,7 @@
               {"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:age" "?age"}]
              where)))
-    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri
+    (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day ?encodeForUri ?floor
                  WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
                         BIND (BNODE(?foobar) AS ?bnode)
                         BIND (BOUND(?abs) AS ?bound)
@@ -275,6 +275,7 @@
                         BIND (DATATYPE(\"foobar\") AS ?datatype)
                         BIND (DAY(\"2024-4-1T14:45:13.815-05:00\") AS ?day)
                         BIND (ENCODE_FOR_URI(\"Los Angeles\") AS ?encodeForUri)
+                        BIND (FLOOR(1.8) AS ?floor)
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
@@ -287,6 +288,7 @@
               [:bind "?datatype" "(datatype \"foobar\")"]
               [:bind "?day" "(day \"2024-4-1T14:45:13.815-05:00\")"]
               [:bind "?encodeForUri" "(encodeForUri \"Los Angeles\")"]
+              [:bind "?floor" "(floor \"1.8\")"]
               {"@id" "?person", "person:age" "?age"}]
              where)))))
 
