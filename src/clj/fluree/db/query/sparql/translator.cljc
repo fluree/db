@@ -126,6 +126,8 @@
    "SHA256"         "sha256"
    "SHA512"         "sha512"
    "STR"            "str"
+   "STRAFTER"       "strAfter"
+   "STRBEFORE"      "strBefore"
    "STRENDS"        "strEnds"
    "STRLEN"         "count"
    "STRSTARTS"      "strStarts"})
@@ -166,6 +168,10 @@
       "sha256"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "str"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "strAfter"     (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      "strBefore"    (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
