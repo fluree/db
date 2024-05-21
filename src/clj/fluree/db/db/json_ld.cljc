@@ -379,6 +379,10 @@
   (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch]
     (jld-format/reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch)))
 
+(defn db?
+  [x]
+  (instance? JsonLdDb x))
+
 
 (def ^String label "#fluree/JsonLdDb ")
 

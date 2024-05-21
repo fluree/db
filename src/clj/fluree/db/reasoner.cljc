@@ -4,7 +4,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.db.db.json-ld :as db]
+            [fluree.db.db.json-ld :as db :refer [db?]]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
             [fluree.db.fuel :as fuel]
@@ -12,7 +12,6 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
-            [fluree.db.dbproto :refer [db?]]
             [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
 
 #?(:clj (set! *warn-on-reflection* true))
