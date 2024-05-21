@@ -133,7 +133,8 @@
    "STRLANG"        "strLang"
    "STRLEN"         "strLen"
    "STRSTARTS"      "strStarts"
-   "STRUUID"        "strUuid"})
+   "STRUUID"        "strUuid"
+   "TIMEZONE"       "timezone"})
 
 (defmethod parse-term :Func
   [[_ func & args]]
@@ -185,6 +186,7 @@
       "strStarts"    (str "(" f " " (literal-quote (parse-term (first args))) " "
                           (literal-quote (parse-term (first (next args)))) ")")
       "strUuid"      (str "(" f ")")
+      "timezone"     (str "(" f " " (literal-quote (parse-term (first args))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
 
