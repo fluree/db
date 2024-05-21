@@ -246,7 +246,7 @@
           genesis-commit (json-ld/expand
                            (<? (write-genesis-commit conn ledger-alias branch ns-addresses)))
           ;; map of all branches and where they are branched from
-          branches       {branch (<? (branch/load-branch-map conn ledger-alias* branch genesis-commit))}]
+          branches       {branch (branch/state-map conn ledger-alias* branch genesis-commit)}]
       (map->JsonLDLedger
         {:id       (random-uuid)
          :did      did
@@ -310,7 +310,7 @@
 
           {:keys [did branch indexer]} (parse-ledger-options conn {:branch branch})
 
-          branches {branch (<? (branch/load-branch-map conn ledger-alias branch commit))}
+          branches {branch (branch/state-map conn ledger-alias branch commit)}
           ledger   (map->JsonLDLedger
                      {:id       (random-uuid)
                       :did      did

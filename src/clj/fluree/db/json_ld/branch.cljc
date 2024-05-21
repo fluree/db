@@ -2,20 +2,18 @@
   (:require [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.flake :as flake]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.db.json-ld :as jld-db]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.database.async :as async-db]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn load-branch-map
+(defn state-map
   "Returns a branch map for specified branch name at supplied commit"
-  [conn ledger-alias branch-name commit]
-  (go-try
-    (let [initial-db (<? (jld-db/load conn ledger-alias branch-name commit))]
-      {:name       branch-name
-       :commit     commit
-       :current-db initial-db})))
+  [conn ledger-alias branch-name commit-jsonld]
+  (let [initial-db (async-db/load conn ledger-alias branch-name commit-jsonld)]
+    {:name       branch-name
+     :commit     commit-jsonld
+     :current-db initial-db}))
 
 (defn skipped-t?
   [new-t current-t]
