@@ -54,6 +54,12 @@
           (str "Invalid predicate property: " (pr-str property)))
   (get-in schema [:pred predicate property]))
 
+(defn class-prop
+  [{:keys [schema] :as _db} meta-key class]
+  (if (= :subclasses meta-key)
+    (get @(:subclasses schema) class)
+    (p-prop schema meta-key class)))
+
 (defn empty-all-novelty
   [db]
   (let [cleared (reduce (fn [db* idx]
@@ -198,7 +204,7 @@
                              (comp (map (fn [cls]
                                           (where/match-sid sub-obj db-alias cls)))
                                    (remove nil?))
-                             (dbproto/-class-prop db :subclasses cls))
+                             (class-prop db :subclasses cls))
             class-ch   (async/to-chan! class-objs)]
         (async/pipeline-async 2
                               matched-ch
@@ -334,10 +340,8 @@
                      namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (root-db this))
-  (-class-prop [_this meta-key class]
-    (if (= :subclasses meta-key)
-      (get @(:subclasses schema) class)
-      (p-prop schema meta-key class)))
+  (-class-prop [this meta-key class]
+    (class-prop this meta-key class))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
   (-class-ids [this subject] (class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))
