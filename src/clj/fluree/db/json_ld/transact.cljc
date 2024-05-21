@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.transact
-  (:require [fluree.db.json-ld.policy :as perm]
-            [fluree.db.util.async :refer [<? go-try]]
+  (:require [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]))
 
@@ -36,12 +35,11 @@
     expanded))
 
 (defn stage
-  ([db txn parsed-opts]
-   (stage db nil txn parsed-opts))
-  ([db fuel-tracker parsed-txn parsed-opts]
+  ([db identity txn parsed-opts]
+   (stage db nil identity txn parsed-opts))
+  ([db fuel-tracker identity parsed-txn parsed-opts]
    (go-try
      (let [{:keys [context raw-txn]} parsed-opts
 
-           identity   (perm/parse-policy-identity parsed-opts context)
            annotation (extract-annotation context parsed-txn parsed-opts)]
        (<? (-stage-db db fuel-tracker context identity annotation raw-txn parsed-txn))))))
