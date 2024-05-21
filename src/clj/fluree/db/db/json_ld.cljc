@@ -340,8 +340,6 @@
                      namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (root-db this))
-  (-class-prop [this meta-key class]
-    (class-prop this meta-key class))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
   (-class-ids [this subject] (class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))

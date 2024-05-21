@@ -1,7 +1,7 @@
 (ns fluree.db.time-travel
   (:require [clojure.core.async :as async]
+            [fluree.db.db.json-ld :as db]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
@@ -22,7 +22,7 @@
                         [epoch-datetime current-time]
                         [current-time epoch-datetime])
           flakes         (-> db
-                             dbproto/-rootdb
+                             db/root-db
                              (query-range/index-range
                                :post
                                > [const/$_commit:time start]
