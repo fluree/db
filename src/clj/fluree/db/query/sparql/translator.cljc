@@ -127,6 +127,7 @@
    "STRBEFORE"      "strBefore"
    "STRDT"          "strDt"
    "STRENDS"        "strEnds"
+   "STRLANG"        "strLang"
    "STRLEN"         "count"
    "STRSTARTS"      "strStarts"})
 
@@ -173,6 +174,8 @@
       "strDt"        (str "(" f " " (literal-quote (parse-term (first args))) " "
                           (literal-quote (parse-term (first (next args)))) ")")
       "strEnds"      (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      "strLang"      (str "(" f " " (literal-quote (parse-term (first args))) " "
                           (literal-quote (parse-term (first (next args)))) ")")
       (throw (ex-info (str "Unsupported function: " func)
                       {:status 400 :error :db/invalid-query})))))
