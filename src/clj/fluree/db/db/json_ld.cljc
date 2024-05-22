@@ -437,39 +437,41 @@
      :schema          (vocab/base-schema)}))
 
 (defn load
-  [conn ledger-alias branch commit-jsonld
-   {:keys [reindex-min-bytes reindex-max-bytes]
-    :or   {reindex-min-bytes 100000                         ; 100 kb
-           reindex-max-bytes 1000000}}]                     ; 1 mb
-  (go-try
-    (let [commit-map (commit-data/jsonld->clj commit-jsonld)
-          root-map   (if-let [{:keys [address]} (:index commit-map)]
-                       (<? (index-storage/read-db-root conn address))
-                       (genesis-root-map ledger-alias))
-          indexed-db (-> root-map
-                         (assoc :conn conn
-                                :alias ledger-alias
-                                :branch branch
-                                :commit commit-map
-                                :tt-id nil
-                                :comparators index/comparators
-                                :staged []
-                                :policy root-policy-map
-                                :reindex-min-bytes reindex-min-bytes
-                                :reindex-max-bytes reindex-max-bytes)
-                         map->JsonLdDb)
-          indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
-                        (<? (vocab/load-schema indexed-db (:preds root-map)))
-                        indexed-db)
-          commit-t   (-> commit-jsonld
-                         (get-first const/iri-data)
-                         (get-first-value const/iri-t))
-          index-t    (:t indexed-db*)]
-      (if (= commit-t index-t)
-        indexed-db*
-        (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
-               db                 indexed-db*]
-          (if commit-tuple
-            (let [new-db (<? (reify/merge-commit conn db commit-tuple))]
-              (recur r new-db))
-            db))))))
+  ([conn ledger-alias branch commit-jsonld]
+   (load conn ledger-alias branch commit-jsonld {}))
+  ([conn ledger-alias branch commit-jsonld
+    {:keys [reindex-min-bytes reindex-max-bytes]
+     :or   {reindex-min-bytes 100000                         ; 100 kb
+            reindex-max-bytes 1000000}}]                     ; 1 mb
+   (go-try
+     (let [commit-map (commit-data/jsonld->clj commit-jsonld)
+           root-map   (if-let [{:keys [address]} (:index commit-map)]
+                        (<? (index-storage/read-db-root conn address))
+                        (genesis-root-map ledger-alias))
+           indexed-db (-> root-map
+                          (assoc :conn conn
+                                 :alias ledger-alias
+                                 :branch branch
+                                 :commit commit-map
+                                 :tt-id nil
+                                 :comparators index/comparators
+                                 :staged []
+                                 :policy root-policy-map
+                                 :reindex-min-bytes reindex-min-bytes
+                                 :reindex-max-bytes reindex-max-bytes)
+                          map->JsonLdDb)
+           indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
+                         (<? (vocab/load-schema indexed-db (:preds root-map)))
+                         indexed-db)
+           commit-t   (-> commit-jsonld
+                          (get-first const/iri-data)
+                          (get-first-value const/iri-t))
+           index-t    (:t indexed-db*)]
+       (if (= commit-t index-t)
+         indexed-db*
+         (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
+                db                 indexed-db*]
+           (if commit-tuple
+             (let [new-db (<? (reify/merge-commit conn db commit-tuple))]
+               (recur r new-db))
+             db)))))))
