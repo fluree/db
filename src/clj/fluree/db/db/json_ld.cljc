@@ -364,7 +364,7 @@
 
 
   jld-transact/Transactable
-  (-stage-db [db fuel-tracker context identity annotation raw-txn parsed-txn]
+  (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
     (stage db fuel-tracker context identity annotation raw-txn parsed-txn))
 
 

@@ -64,10 +64,10 @@
 
 
   transact/Transactable
-  (-stage-db [_ fuel-tracker context identity annotation raw-txn parsed-txn]
+  (-stage-txn [_ fuel-tracker context identity annotation raw-txn parsed-txn]
     (go-try
       (let [db (<! db-chan)]
-        (<? (transact/-stage-db db fuel-tracker context identity annotation raw-txn parsed-txn))))))
+        (<? (transact/-stage-txn db fuel-tracker context identity annotation raw-txn parsed-txn))))))
 
 (def ^String label "#fluree/AsyncDB ")
 
