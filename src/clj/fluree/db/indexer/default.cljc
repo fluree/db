@@ -29,13 +29,13 @@
 
 (defn novelty-min?
   "Returns true if ledger is beyond novelty-min threshold."
-  [{:keys [reindex-min-bytes]} db]
+  [db reindex-min-bytes]
   (let [novelty-size (get-in db [:novelty :size])]
     (> novelty-size reindex-min-bytes)))
 
 (defn novelty-max?
   "Returns true if ledger is beyond novelty-max threshold."
-  [reindex-max db]
+  [db reindex-max]
   (let [novelty-size (get-in db [:novelty :size])]
     (> novelty-size reindex-max)))
 
@@ -449,7 +449,7 @@
                          :t            t
                          :novelty-size novelty-size
                          :start-time   (util/current-time-iso)}]
-      (if  (dirty? db)
+      (if (dirty? db)
         (do (log/info "Refreshing Index:" init-stats)
             (let [error-ch   (async/chan)
                   refresh-ch (refresh-all db changes-ch error-ch)]
@@ -536,8 +536,8 @@
     port))
 
 (defn index
-  [indexer db {:keys [changes-ch] :as opts}]
-  (if (novelty-min? indexer db)
+  [{:keys [reindex-min-bytes] :as indexer} db {:keys [changes-ch] :as opts}]
+  (if (novelty-min? db reindex-min-bytes)
     (do-index indexer db opts)
     (go
       (when changes-ch

@@ -339,7 +339,7 @@
 
 (defrecord JsonLdDb [conn alias branch commit t tt-id stats spot post opst tspo
                      schema comparators staged novelty policy namespaces
-                     namespace-codes]
+                     namespace-codes reindex-min-bytes reindex-max-bytes]
   dbproto/IFlureeDb
   (-rootdb [this] (root-db this))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
@@ -379,7 +379,9 @@
 
   indexer/Indexed
   (collect [db changes-ch]
-    (idx-default/refresh db changes-ch)))
+    (if (idx-default/novelty-min? db reindex-min-bytes)
+      (idx-default/refresh db changes-ch)
+      (go))))
 
 (defn db?
   [x]
@@ -435,7 +437,10 @@
      :schema          (vocab/base-schema)}))
 
 (defn load
-  [conn ledger-alias branch commit-jsonld]
+  [conn ledger-alias branch commit-jsonld
+   {:keys [reindex-min-bytes reindex-max-bytes]
+    :or   {reindex-min-bytes 100000                         ; 100 kb
+           reindex-max-bytes 1000000}}]                     ; 1 mb
   (go-try
     (let [commit-map (commit-data/jsonld->clj commit-jsonld)
           root-map   (if-let [{:keys [address]} (:index commit-map)]
@@ -449,7 +454,9 @@
                                 :tt-id nil
                                 :comparators index/comparators
                                 :staged []
-                                :policy root-policy-map)
+                                :policy root-policy-map
+                                :reindex-min-bytes reindex-min-bytes
+                                :reindex-max-bytes reindex-max-bytes)
                          map->JsonLdDb)
           indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
                         (<? (vocab/load-schema indexed-db (:preds root-map)))
