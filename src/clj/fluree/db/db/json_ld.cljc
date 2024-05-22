@@ -7,6 +7,8 @@
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.index :as index]
             [fluree.db.indexer.storage :as index-storage]
+            [fluree.db.indexer :as indexer]
+            [fluree.db.indexer.default :as idx-default]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
@@ -373,7 +375,11 @@
     (jld-format/forward-properties db iri spec context compact-fn cache fuel-tracker error-ch))
 
   (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch]
-    (jld-format/reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch)))
+    (jld-format/reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch))
+
+  indexer/Indexed
+  (collect [db changes-ch]
+    (idx-default/refresh db changes-ch)))
 
 (defn db?
   [x]

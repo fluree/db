@@ -11,3 +11,7 @@
   (-close [indexer]  "Shuts down indexer, removes all watches after notification.")
   (-status [indexer]  "Returns current status of reindexing.")
   (-reindex [indexer db]  "Executes a full reindex on db."))
+
+
+(defprotocol Indexed
+  (collect [indexed changes-ch]))
