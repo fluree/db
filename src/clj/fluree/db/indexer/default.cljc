@@ -445,9 +445,7 @@
         (async/reduce tally {:db db, :indexes [], :garbage #{}}))))
 
 (defn refresh
-  [indexer
-   {:keys [novelty t alias] :as db}
-   {:keys [remove-preds changes-ch]}]
+  [{:keys [novelty t alias] :as db} remove-preds changes-ch]
   (go-try
     (let [start-time-ms (util/current-time-millis)
           novelty-size  (:size novelty)
@@ -504,7 +502,7 @@
 
 (defn do-index
   "Performs an index operation and returns a promise-channel of the latest db once complete"
-  [indexer {:keys [t branch] :as db} {:keys [update-commit changes-ch] :as opts}]
+  [indexer {:keys [t branch] :as db} {:keys [update-commit remove-preds changes-ch] :as opts}]
   ;; note, lock-indexer will either acquire lock, or update `update-commit` fn to use latest commit
   (let [[lock? index-state]   (lock-indexer (:state-atom indexer) branch t update-commit)
         {:keys [tempid port]} index-state]
@@ -513,7 +511,7 @@
       (go
         (try*
           (push-index-event indexer :index-start index-state)
-          (let [indexed-db   (<? (refresh indexer db opts))
+          (let [indexed-db   (<? (refresh db remove-preds changes-ch))
                 index-state* (unlock-indexer (:state-atom indexer) branch tempid indexed-db)
                 {:keys [update-commit-fn port]} index-state*]
             ;; in case event listener wanted final indexed db, put on established port
