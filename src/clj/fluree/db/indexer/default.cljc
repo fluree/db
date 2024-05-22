@@ -242,30 +242,28 @@
     [leaf]))
 
 (defn update-leaf
-  [leaf t novelty remove-preds]
-  (let [new-flakes (index/novelty-subrange leaf t novelty)
-        to-remove  (filter-predicates remove-preds (:flakes leaf) new-flakes)]
-    (if (or (seq new-flakes) (seq to-remove))
-      (let [new-leaves (-> leaf
-                           (dissoc :id)
-                           (index/add-flakes new-flakes)
-                           (index/rem-flakes to-remove)
-                           rebalance-leaf)]
-        (map (fn [l]
-               (assoc l
-                 :id (random-uuid)
-                 :t t))
-             new-leaves))
-      [leaf])))
+  [leaf t novelty]
+  (if-let [new-flakes (-> leaf
+                          (index/novelty-subrange t novelty)
+                          not-empty)]
+    (let [new-leaves (-> leaf
+                         (dissoc :id)
+                         (index/add-flakes new-flakes)
+                         rebalance-leaf)]
+      (map (fn [l]
+             (assoc l
+                    :id (random-uuid)
+                    :t t))
+           new-leaves))
+    [leaf]))
 
 (defn integrate-novelty
   "Returns a transducer that transforms a stream of index nodes in depth first
-  order by incorporating the novelty flakes into the nodes, removing flakes with
-  predicates in remove-preds, rebalancing the leaves so that none is bigger than
-  *overflow-bytes*, and rebalancing the branches so that none have more children
-  than *overflow-children*. Maintains a 'lifo' stack to preserve the depth-first
-  order of the transformed stream."
-  [t novelty remove-preds]
+  order by incorporating the novelty flakes into the nodes, rebalancing the
+  leaves so that none is bigger than *overflow-bytes*, and rebalancing the
+  branches so that none have more children than *overflow-children*. Maintains a
+  'lifo' stack to preserve the depth-first order of the transformed stream."
+  [t novelty]
   (fn [xf]
     (let [stack (volatile! [])]
       (fn
@@ -282,7 +280,7 @@
         ;;   3. Iterate each resulting node with the nested transformer.
         ([result node]
          (if (index/leaf? node)
-           (let [leaves (update-leaf node t novelty remove-preds)]
+           (let [leaves (update-leaf node t novelty)]
              (vswap! stack into leaves)
              result)
 
@@ -406,24 +404,22 @@
 
 
 (defn refresh-index
-  [{:keys [conn] :as db} changes-ch error-ch {::keys [idx t novelty remove-preds root]}]
+  [{:keys [conn] :as db} changes-ch error-ch {::keys [idx t novelty root]}]
   (let [refresh-xf (comp (map preserve-id)
-                         (integrate-novelty t novelty remove-preds))
+                         (integrate-novelty t novelty))
         novel?     (fn [node]
-                     (or (seq remove-preds)
-                         (seq (index/novelty-subrange node t novelty))))]
+                     (seq (index/novelty-subrange node t novelty)))]
     (->> (index/tree-chan conn root novel? 1 refresh-xf error-ch)
          (write-resolved-nodes db idx changes-ch error-ch))))
 
 (defn extract-root
-  [{:keys [novelty t] :as db} remove-preds idx]
+  [{:keys [novelty t] :as db} idx]
   (let [index-root    (get db idx)
         index-novelty (get novelty idx)]
     {::idx          idx
      ::root         index-root
      ::novelty      index-novelty
-     ::t            t
-     ::remove-preds remove-preds}))
+     ::t            t}))
 
 
 (defn tally
@@ -436,16 +432,16 @@
 
 (defn refresh-all
   ([db error-ch]
-   (refresh-all db #{} nil error-ch))
-  ([db remove-preds changes-ch error-ch]
+   (refresh-all db nil error-ch))
+  ([db changes-ch error-ch]
    (->> index/types
-        (map (partial extract-root db remove-preds))
+        (map (partial extract-root db))
         (map (partial refresh-index db changes-ch error-ch))
         async/merge
         (async/reduce tally {:db db, :indexes [], :garbage #{}}))))
 
 (defn refresh
-  [{:keys [novelty t alias] :as db} remove-preds changes-ch]
+  [{:keys [novelty t alias] :as db} changes-ch]
   (go-try
     (let [start-time-ms (util/current-time-millis)
           novelty-size  (:size novelty)
@@ -453,11 +449,10 @@
                          :t            t
                          :novelty-size novelty-size
                          :start-time   (util/current-time-iso)}]
-      (if (or (dirty? db)
-              (seq remove-preds))
+      (if  (dirty? db)
         (do (log/info "Refreshing Index:" init-stats)
             (let [error-ch   (async/chan)
-                  refresh-ch (refresh-all db remove-preds changes-ch error-ch)]
+                  refresh-ch (refresh-all db changes-ch error-ch)]
               (async/alt!
                 error-ch
                 ([e]
@@ -502,7 +497,7 @@
 
 (defn do-index
   "Performs an index operation and returns a promise-channel of the latest db once complete"
-  [indexer {:keys [t branch] :as db} {:keys [update-commit remove-preds changes-ch] :as opts}]
+  [indexer {:keys [t branch] :as db} {:keys [update-commit changes-ch] :as _opts}]
   ;; note, lock-indexer will either acquire lock, or update `update-commit` fn to use latest commit
   (let [[lock? index-state]   (lock-indexer (:state-atom indexer) branch t update-commit)
         {:keys [tempid port]} index-state]
@@ -511,7 +506,7 @@
       (go
         (try*
           (push-index-event indexer :index-start index-state)
-          (let [indexed-db   (<? (refresh db remove-preds changes-ch))
+          (let [indexed-db   (<? (refresh db changes-ch))
                 index-state* (unlock-indexer (:state-atom indexer) branch tempid indexed-db)
                 {:keys [update-commit-fn port]} index-state*]
             ;; in case event listener wanted final indexed db, put on established port
