@@ -21,7 +21,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn branch-meta
+(defn get-branch-meta
   "Retrieves branch metadata from ledger state"
   [{:keys [state] :as _ledger} requested-branch]
   (let [{:keys [branch branches]} @state]
@@ -33,7 +33,7 @@
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn db
   [ledger {:keys [branch]}]
-  (let [branch-meta (ledger/-branch ledger branch)]
+  (let [branch-meta (get-branch-meta ledger branch)]
     ;; if branch is nil, will return default
     (when-not branch-meta
       (throw (ex-info (str "Invalid branch: " branch ".")
@@ -156,8 +156,6 @@
   ledger/iLedger
   (-db [ledger] (db ledger nil))
   (-db [ledger opts] (db ledger opts))
-  (-branch [ledger] (branch-meta ledger nil))
-  (-branch [ledger branch] (branch-meta ledger branch))
   (-commit-update! [ledger branch db] (commit-update ledger branch db))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))

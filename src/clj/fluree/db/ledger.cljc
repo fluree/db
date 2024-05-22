@@ -12,7 +12,6 @@
   ;; retrieving/updating DBs
   (-db [ledger] [ledger opts] "Returns queryable db with specified options")
   ;; branching
-  (-branch [ledger] [ledger branch] "Returns all branch metadata, or metadata for just specified branch. :default branch is always current default.")
   ;; committing
   (-commit-update! [ledger branch db] "Once a commit completes, update ledger state to reflect.")
   (-status [ledger] [ledger branch] "Returns status for branch (default branch if nil)")
