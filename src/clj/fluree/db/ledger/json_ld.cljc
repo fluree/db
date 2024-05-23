@@ -243,7 +243,7 @@
   [ledger db opts]
   (let [{:keys [branch] :as opts*}
         (normalize-opts opts)
-        {:keys [t] :as db*} (or db (ledger/-db ledger branch))
+        {:keys [t] :as db*} (or db (latest-db ledger branch))
         committed-t                (ledger/latest-commit-t ledger branch)]
     (if (= t (flake/next-t committed-t))
       (commit ledger db* opts*)
@@ -274,7 +274,7 @@
           commit-t   (-> expanded-commit
                          (get-first const/iri-data)
                          (get-first-value const/iri-t))
-          current-db (ledger/-db ledger {:branch branch})
+          current-db (latest-db ledger {:branch branch})
           current-t  (:t current-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
                  "where current cached db t value is:" current-t)
