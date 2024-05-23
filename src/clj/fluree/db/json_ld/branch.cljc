@@ -40,8 +40,6 @@
                           :current-db initial-db})
         idx-q      (index-queue state)]
     {:name       branch-name
-     :commit     commit-jsonld
-     :current-db initial-db
      :state      state
      :indexer    idx-q}))
 
@@ -82,11 +80,12 @@
 
 (defn update-db
   "Updates the latest staged db and returns new branch data."
-  [{:keys [current-db] :as branch-data} db]
-  (let [{:keys [commit] :as current-db*} (use-latest db current-db)]
-    (assoc branch-data
-           :commit commit
-           :current-db current-db*)))
+  [{:keys [state] :as branch-data} db]
+  (swap! state (fn [{:keys [current-db] :as _current-state}]
+                 (let [{:keys [commit] :as current-db*} (use-latest db current-db)]
+                   {:commit commit
+                    :current-db current-db*})))
+  branch-data)
 
 (defn updatable-commit?
   [current-commit new-commit]
@@ -99,16 +98,16 @@
 
 (defn current-db
   "Returns current db from branch data"
-  [branch-map]
-  (:current-db branch-map))
+  [{:keys [state] :as _branch-map}]
+  (:current-db @state))
 
 (defn update-commit
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
-  [branch-map {new-commit :commit, db-t :t, :as db}]
-  (let [current-commit (:commit branch-map)
+  [{:keys [state] :as branch-map} {new-commit :commit, db-t :t, :as db}]
+  (let [current-commit (:commit @state)
         current-t      (commit-data/t current-commit)
         new-t          (commit-data/t new-commit)]
     (if (= db-t new-t)

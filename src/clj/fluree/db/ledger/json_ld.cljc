@@ -51,24 +51,22 @@
   [{:keys [state] :as ledger} branch-name db]
   (log/debug "Attempting to update ledger:" (:alias ledger)
              "and branch:" branch-name "with new commit to t" (:t db))
-  (when-not (get-in @state [:branches branch-name])
-    (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
-                         "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
-                    {:status 400 :error :db/invalid-branch})))
-  (-> state
-      (swap! update-in [:branches branch-name] branch/update-commit db)
-      (get-in [:branches branch-name :current-db])))
+  (let [branch-meta (get-branch-meta ledger branch-name)]
+    (when-not branch-meta
+      (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
+                           "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
+                      {:status 400 :error :db/invalid-branch})))
+    (branch/update-commit branch-meta db)
+    (branch/current-db branch-meta)))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
-  [{:keys [state address alias] :as _ledger} requested-branch]
-  (let [{:keys [branch branches]} @state
-        branch-data (if requested-branch
-                      (get branches requested-branch)
-                      (get branches branch))
-        {:keys [current-db]} branch-data
+  [{:keys [address alias] :as ledger} requested-branch]
+  (let [branch-data (get-branch-meta ledger requested-branch)
+        current-db  (branch/current-db branch-data)
         {:keys [commit stats t]} current-db
-        {:keys [size flakes]} stats]
+        {:keys [size flakes]} stats
+        branch (or requested-branch (:branch @(:state ledger)))]
     {:address address
      :alias   alias
      :branch  branch
@@ -244,7 +242,7 @@
   (let [{:keys [branch] :as opts*}
         (normalize-opts opts)
         {:keys [t] :as db*} (or db (latest-db ledger branch))
-        committed-t                (ledger/latest-commit-t ledger branch)]
+        committed-t         (ledger/latest-commit-t ledger branch)]
     (if (= t (flake/next-t committed-t))
       (commit ledger db* opts*)
       (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
