@@ -615,28 +615,31 @@
 
 (defn db->jsonld
   "Creates the JSON-LD map containing a new ledger update"
-  [{:keys [t commit stats] :as db} {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
-  (let [prev-dbid   (commit-data/data-id commit)
+  [{:keys [t commit stats staged] :as db} {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
+  (let [prev-dbid                         (commit-data/data-id commit)
         {:keys [assert retract refs-ctx]} (generate-commit db commit-opts)
+
         prev-db-key (compact const/iri-previous)
         assert-key  (compact const/iri-assert)
         retract-key (compact const/iri-retract)
         refs-ctx*   (cond-> refs-ctx
-                      prev-dbid (assoc-in [prev-db-key "@type"] "@id")
-                      (seq assert) (assoc-in [assert-key "@container"] "@graph")
+                      prev-dbid     (assoc-in [prev-db-key "@type"] "@id")
+                      (seq assert)  (assoc-in [assert-key "@container"] "@graph")
                       (seq retract) (assoc-in [retract-key "@container"] "@graph"))
         db-json     (cond-> {id-key                nil ;; comes from hash later
                              type-key              [(compact const/iri-DB)]
                              (compact const/iri-t) t
                              (compact const/iri-v) data-version}
-                      prev-dbid (assoc prev-db-key prev-dbid)
-                      (seq assert) (assoc assert-key assert)
-                      (seq retract) (assoc retract-key retract)
+                      prev-dbid       (assoc prev-db-key prev-dbid)
+                      (seq assert)    (assoc assert-key assert)
+                      (seq retract)   (assoc retract-key retract)
                       (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
-                      (:size stats) (assoc (compact const/iri-size) (:size stats)))
+                      (:size stats)   (assoc (compact const/iri-size) (:size stats)))
         ;; TODO - this is re-normalized below, can try to do it just once
         dbid        (commit-data/db-json->db-id db-json)
         db-json*    (-> db-json
                         (assoc id-key dbid)
                         (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
-    [dbid db-json*]))
+    {:dbid        dbid
+     :db-jsonld   db-json*
+     :staged-txns staged}))

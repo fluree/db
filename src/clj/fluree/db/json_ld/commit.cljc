@@ -21,7 +21,6 @@
   (let [acct-id (crypto/account-id-from-private private-key)]
     (str "did:fluree:" acct-id)))
 
-
 (defn stringify-context
   "Contexts that use clojure keywords will not translate into valid JSON for
   serialization. Here we change any keywords to strings."
@@ -171,16 +170,17 @@
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [alias conn] :as ledger} {:keys [t stats commit staged] :as db} opts]
+  [{:keys [alias conn] :as ledger} {:keys [t stats commit] :as db} opts]
   (go-try
     (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
           (enrich-commit-opts ledger opts)
 
-          txns (<? (write-transactions! conn ledger staged))
+          {:keys [dbid db-jsonld staged-txns]}
+          (jld-db/db->jsonld db opts*)
 
-          [[txn-id author annotation]] txns
+          [[txn-id author annotation] :as txns]
+          (<? (write-transactions! conn ledger staged-txns))
 
-          [dbid db-jsonld]  (jld-db/db->jsonld db opts*)
           ledger-update-res (<? (connection/-c-write conn alias db-jsonld)) ; write commit data
           db-address        (:address ledger-update-res) ; may not have address (e.g. IPFS) until after writing file
 
