@@ -1,19 +1,49 @@
 (ns fluree.db.json-ld.branch
   (:require [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.indexer :as indexer]
             [fluree.db.flake :as flake]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.database.async :as async-db]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.log :as log :include-macros true]
+            [clojure.core.async :as async :refer [<! go-loop]]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(defn update-index
+  [current-state indexed-db]
+  )
+
+(defn index-queue
+  [branch-state]
+  (let [buf   (async/sliding-buffer 1)
+        queue (async/chan buf)]
+    (go-loop []
+      (when-let [{:keys [db index-files-ch]} (<! queue)]
+        (try*
+          (when-let [new-db (<? (indexer/collect db index-files-ch))]
+            (swap! branch-state update-index new-db))
+          (catch* e
+                  (log/error e "Error updating index"))
+          (finally
+            (async/close! index-files-ch)))
+        (recur)))
+    queue))
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
   [conn ledger-alias branch-name commit-jsonld]
-  (let [initial-db (async-db/load conn ledger-alias branch-name commit-jsonld)]
+  (let [initial-db (async-db/load conn ledger-alias branch-name commit-jsonld)
+        commit-map (commit-data/jsonld->clj commit-jsonld)
+        state      (atom {:commit commit-map
+                          :current-db initial-db})
+        idx-q      (index-queue state)]
     {:name       branch-name
      :commit     commit-jsonld
-     :current-db initial-db}))
+     :current-db initial-db
+     :state      state
+     :indexer    idx-q}))
 
 (defn skipped-t?
   [new-t current-t]
