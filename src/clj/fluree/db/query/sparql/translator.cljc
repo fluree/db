@@ -379,17 +379,18 @@
   ;; NamedGraphClause ::= <'NAMED'> SourceSelector
   ;; <SourceSelector> ::= iri
   [[_ source]]
-  (throw (ex-info "FROM NAMED is not a supported SPARQL clause"
-                  {:status 400 :error :db/invalid-query}))
   (parse-term source))
 
 (defmethod parse-rule :DatasetClause
-  ;; DatasetClause ::= <'FROM'> WS ( DefaultGraphClause | NamedGraphClause )
-  ;; DefaultGraphClause ::= SourceSelector
-  ;; NamedGraphClause ::= <'NAMED'> SourceSelector
-  ;; <SourceSelector> ::= iri
-  [[_ source]]
-  [[:from (parse-term source)]])
+  ;; DatasetClause ::= FromClause*
+  ;; FromClause   ::=   <'FROM'> WS ( DefaultGraphClause | NamedGraphClause )
+  [[_ & clauses]]
+  (let [{from  :DefaultGraphClause
+         named :NamedGraphClause}
+        (group-by first clauses)]
+    (cond-> []
+      (seq from)  (conj [:from (mapv parse-term from)])
+      (seq named) (conj [:from-named (mapv parse-term named)]))))
 
 (defmethod parse-term :LANGTAG
   ;; LANGTAG ::= #"@[a-zA-Z]+(-[a-zA-Z0-9]+)*" WS
