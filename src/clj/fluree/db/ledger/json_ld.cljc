@@ -31,7 +31,7 @@
       (get branches branch))))
 
 ;; TODO - no time travel, only latest db on a branch thus far
-(defn db
+(defn latest-db
   [ledger {:keys [branch]}]
   (let [branch-meta (get-branch-meta ledger branch)]
     ;; if branch is nil, will return default
@@ -154,8 +154,8 @@
   (-notify [ledger expanded-commit] (notify ledger expanded-commit))
 
   ledger/iLedger
-  (-db [ledger] (db ledger nil))
-  (-db [ledger opts] (db ledger opts))
+  (-db [ledger] (latest-db ledger nil))
+  (-db [ledger opts] (latest-db ledger opts))
   (-commit-update! [ledger branch db] (commit-update ledger branch db))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))
