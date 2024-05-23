@@ -314,12 +314,8 @@
   ledger/iLedger
   (-db [ledger] (latest-db ledger nil))
   (-db [ledger opts] (latest-db ledger opts))
-  (-commit-update! [ledger branch db] (commit-update ledger branch db))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))
-  (-did [_] did)
-  (-alias [_] alias)
-  (-address [_] address)
   (-close [ledger] (close-ledger ledger)))
 
 
