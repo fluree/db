@@ -4,6 +4,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.core :as util]
+            [fluree.db.util.context :as context]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.connection :as connection]
             [fluree.db.ledger :as ledger]
@@ -21,26 +22,6 @@
   (let [acct-id (crypto/account-id-from-private private-key)]
     (str "did:fluree:" acct-id)))
 
-(defn stringify-context
-  "Contexts that use clojure keywords will not translate into valid JSON for
-  serialization. Here we change any keywords to strings."
-  [context]
-  (if (sequential? context)
-    (mapv stringify-context context)
-    (if (map? context)
-      (reduce-kv
-        (fn [acc k v]
-          (let [k* (if (keyword? k)
-                     (name k)
-                     k)
-                v* (if (and (map? v)
-                            (not (contains? v :id)))
-                     (stringify-context v)
-                     v)]
-            (assoc acc k* v*)))
-        {} context)
-      context)))
-
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
 (defn parse-commit-context
@@ -50,7 +31,7 @@
                              json-ld/parse-context
                              (json-ld/parse-context f-context))
                          (json-ld/parse-context f-context))]
-    (stringify-context parsed-context)))
+    (context/stringify parsed-context)))
 
 (defn- enrich-commit-opts
   [ledger {:keys [context did private message tag file-data? index-files-ch] :as _opts}]
