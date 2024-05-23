@@ -1,6 +1,6 @@
 (ns fluree.db.json-ld.commit
   (:require [fluree.json-ld :as json-ld]
-            [fluree.crypto :as crypto]
+            [fluree.db.did :as did]
             [fluree.db.flake :as flake]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.core :as util]
@@ -16,11 +16,6 @@
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn- did-from-private
-  [private-key]
-  (let [acct-id (crypto/account-id-from-private private-key)]
-    (str "did:fluree:" acct-id)))
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
@@ -39,8 +34,7 @@
         private*      (or private
                           (:private did)
                           (:private (ledger/-did ledger)))
-        did*          (or (some-> private*
-                                  did-from-private)
+        did*          (or (some-> private* did/private->did)
                           did
                           (ledger/-did ledger))
         ctx-used-atom (atom {})
