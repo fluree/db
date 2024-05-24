@@ -368,7 +368,7 @@
 
 (defmethod parse-rule :DatasetClause
   ;; DatasetClause ::= FromClause*
-  ;; FromClause   ::=   <'FROM'> WS ( DefaultGraphClause | NamedGraphClause )
+  ;; <FromClause>  ::= <'FROM'> WS ( DefaultGraphClause | NamedGraphClause )
   [[_ & clauses]]
   (let [{from  :DefaultGraphClause
          named :NamedGraphClause}
