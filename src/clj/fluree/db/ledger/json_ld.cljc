@@ -45,6 +45,16 @@
                        {:status 400 :error :db/invalid-branch})))
      (branch/current-db branch-meta))))
 
+(defn latest-commit
+  ([ledger]
+   (latest-commit ledger nil))
+  ([ledger branch]
+   (let [branch-meta (get-branch-meta ledger branch)]
+     ;; if branch is nil, will return default
+     (when-not branch-meta
+       (throw (ex-info (str "Invalid branch: " branch ".")
+                       {:status 400 :error :db/invalid-branch})))
+     (branch/current-commit branch-meta))))
 
 (defn commit-update
   "Updates both latest db and commit db. If latest registered index is
@@ -155,7 +165,7 @@
   "Writes commit and pushes, kicks off indexing if necessary."
   [{:keys [conn alias] :as ledger} {:keys [commit branch] :as db} keypair]
   (go-try
-    (let [ledger-commit (:commit (status ledger branch))
+    (let [ledger-commit (latest-commit ledger branch)
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
 

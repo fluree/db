@@ -101,6 +101,10 @@
   [{:keys [state] :as _branch-map}]
   (:current-db @state))
 
+(defn current-commit
+  [{:keys [state] :as _branch-map}]
+  (:commit @state))
+
 (defn update-commit
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
