@@ -35,13 +35,16 @@
 
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn latest-db
-  [ledger {:keys [branch]}]
-  (let [branch-meta (get-branch-meta ledger branch)]
-    ;; if branch is nil, will return default
-    (when-not branch-meta
-      (throw (ex-info (str "Invalid branch: " branch ".")
-                      {:status 400 :error :db/invalid-branch})))
-    (branch/current-db branch-meta)))
+  ([ledger]
+   (latest-db ledger nil))
+  ([ledger branch]
+   (let [branch-meta (get-branch-meta ledger branch)]
+     ;; if branch is nil, will return default
+     (when-not branch-meta
+       (throw (ex-info (str "Invalid branch: " branch ".")
+                       {:status 400 :error :db/invalid-branch})))
+     (branch/current-db branch-meta))))
+
 
 (defn commit-update
   "Updates both latest db and commit db. If latest registered index is
@@ -272,7 +275,7 @@
           commit-t   (-> expanded-commit
                          (get-first const/iri-data)
                          (get-first-value const/iri-t))
-          current-db (latest-db ledger {:branch branch})
+          current-db (latest-db ledger branch)
           current-t  (:t current-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
                  "where current cached db t value is:" current-t)
@@ -310,8 +313,7 @@
   (-notify [ledger expanded-commit] (notify ledger expanded-commit))
 
   ledger/iLedger
-  (-db [ledger] (latest-db ledger nil))
-  (-db [ledger opts] (latest-db ledger opts))
+  (-db [ledger] (latest-db ledger))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))
   (-close [ledger] (close-ledger ledger)))

@@ -10,7 +10,7 @@
 
 (defprotocol iLedger
   ;; retrieving/updating DBs
-  (-db [ledger] [ledger opts] "Returns queryable db with specified options")
+  (-db [ledger] "Returns queryable db with specified options")
   ;; committing
   (-status [ledger] [ledger branch] "Returns status for branch (default branch if nil)")
   (-close [ledger] "Shuts down ledger processes and clears used resources."))
