@@ -3,9 +3,10 @@
   (:require [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.indexer :as indexer]
-            [clojure.core.async :as async :refer [<! go]]
-            [fluree.db.util.core :as util :refer [get-first get-first-value]]
+            [clojure.core.async :as async :refer [<! >! go]]
+            [fluree.db.util.core :as util :refer [try* catch* get-first get-first-value]]
             [fluree.db.constants :as const]
+            [fluree.db.util.log :as log]
             [fluree.db.query.exec.where :as where]
             [fluree.db.json-ld.transact :as transact]
             [fluree.db.query.json-ld.response :as jld-response]
@@ -19,28 +20,40 @@
   (-match-id [_ fuel-tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
       (go
-        (let [db (<! db-chan)]
-          (-> db
-              (where/-match-id fuel-tracker solution s-match error-ch)
-              (async/pipe match-ch))))
+        (try*
+          (let [db (<? db-chan)]
+            (-> db
+                (where/-match-id fuel-tracker solution s-match error-ch)
+                (async/pipe match-ch)))
+          (catch* e
+                  (log/error e "Error loading database")
+                  (>! error-ch e))))
       match-ch))
 
   (-match-triple [_ fuel-tracker solution triple error-ch]
     (let [match-ch (async/chan)]
       (go
-        (let [db (<! db-chan)]
-          (-> db
-              (where/-match-triple fuel-tracker solution triple error-ch)
-              (async/pipe match-ch))))
+        (try*
+          (let [db (<? db-chan)]
+            (-> db
+                (where/-match-triple fuel-tracker solution triple error-ch)
+                (async/pipe match-ch)))
+          (catch* e
+                  (log/error e "Error loading database")
+                  (>! error-ch e))))
       match-ch))
 
   (-match-class [_ fuel-tracker solution triple error-ch]
     (let [match-ch (async/chan)]
       (go
-        (let [db (<! db-chan)]
-          (-> db
-              (where/-match-class fuel-tracker solution triple error-ch)
-              (async/pipe match-ch))))
+        (try*
+          (let [db (<? db-chan)]
+            (-> db
+                (where/-match-class fuel-tracker solution triple error-ch)
+                (async/pipe match-ch)))
+          (catch* e
+                  (log/error e "Error loading database")
+                  (>! error-ch e))))
       match-ch))
 
 
@@ -48,19 +61,27 @@
   (-forward-properties [_ iri select-spec context compact-fn cache fuel-tracker error-ch]
     (let [prop-ch (async/chan)]
       (go
-        (let [db (<! db-chan)]
-          (-> db
-              (jld-response/-forward-properties iri select-spec context compact-fn cache fuel-tracker error-ch)
-              (async/pipe prop-ch))))
+        (try*
+          (let [db (<? db-chan)]
+            (-> db
+                (jld-response/-forward-properties iri select-spec context compact-fn cache fuel-tracker error-ch)
+                (async/pipe prop-ch)))
+          (catch* e
+                  (log/error e "Error loading database")
+                  (>! error-ch e))))
       prop-ch))
 
   (-reverse-property [_ iri reverse-spec compact-fn cache fuel-tracker error-ch]
     (let [prop-ch (async/chan)]
       (go
-        (let [db (<! db-chan)]
-          (-> db
-              (jld-response/-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
-              (async/pipe prop-ch))))
+        (try*
+          (let [db (<? db-chan)]
+            (-> db
+                (jld-response/-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
+                (async/pipe prop-ch)))
+          (catch* e
+                  (log/error e "Error loading database")
+                  (>! error-ch e))))
       prop-ch))
 
 
