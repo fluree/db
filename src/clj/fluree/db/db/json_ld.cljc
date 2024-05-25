@@ -474,7 +474,8 @@
            root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root conn address))
                          (genesis-root-map ledger-alias))
-           max-ns-code (-> root-map :namespace-codes get-max-ns-code)
+           max-ns-code (max iri/last-default-code
+                            (-> root-map :namespace-codes get-max-ns-code))
            indexed-db  (-> root-map
                            (assoc :conn conn
                                   :alias ledger-alias
@@ -620,11 +621,22 @@
            :retract  retract
            :flakes   flakes})))))
 
+(defn new-namespaces
+  [{:keys [max-namespace-code namespace-codes] :as _db}]
+  (->> namespace-codes
+       (filter (fn [[k _v]]
+                 (> k max-namespace-code)))
+       (sort-by key)
+       (mapv val)))
+
 (defn db->jsonld
   "Creates the JSON-LD map containing a new ledger update"
-  [{:keys [t commit stats staged] :as db} {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
-  (let [prev-dbid                         (commit-data/data-id commit)
-        {:keys [assert retract refs-ctx]} (generate-commit db commit-opts)
+  [{:keys [t commit stats staged max-namespace-code] :as db}
+   {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
+  (let [prev-dbid (commit-data/data-id commit)
+
+        {:keys [assert retract refs-ctx]}
+        (generate-commit db commit-opts)
 
         prev-db-key (compact const/iri-previous)
         assert-key  (compact const/iri-assert)
@@ -633,6 +645,7 @@
                       prev-dbid     (assoc-in [prev-db-key "@type"] "@id")
                       (seq assert)  (assoc-in [assert-key "@container"] "@graph")
                       (seq retract) (assoc-in [retract-key "@container"] "@graph"))
+        nses        (new-namespaces db)
         db-json     (cond-> {id-key                nil ;; comes from hash later
                              type-key              [(compact const/iri-DB)]
                              (compact const/iri-t) t
@@ -640,6 +653,7 @@
                       prev-dbid       (assoc prev-db-key prev-dbid)
                       (seq assert)    (assoc assert-key assert)
                       (seq retract)   (assoc retract-key retract)
+                      (seq nses)      (assoc (compact const/iri-namespaces) nses)
                       (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
                       (:size stats)   (assoc (compact const/iri-size) (:size stats)))
         ;; TODO - this is re-normalized below, can try to do it just once

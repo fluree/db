@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.reify
   (:require [fluree.json-ld :as json-ld]
             [fluree.db.flake :as flake]
+            [clojure.set :refer [map-invert]]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
@@ -282,6 +283,21 @@
           db        (assoc file-data "f:address" db-address)]
       (json-ld/expand db))))
 
+(defn with-namespaces
+  [{:keys [namespaces max-namespace-code] :as db} new-namespaces]
+  (let [new-ns-map          (into namespaces
+                                  (map-indexed (fn [i ns]
+                                                 (let [ns-code (+ (inc i)
+                                                                  max-namespace-code)]
+                                                   [ns ns-code])))
+                                  new-namespaces)
+        new-ns-codes        (map-invert new-ns-map)
+        max-namespace-code* (apply max (vals new-ns-map))]
+    (assoc db
+           :namespaces new-ns-map
+           :namespace-codes new-ns-codes
+           :max-namespace-code max-namespace-code*)))
+
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates
   respective indexes and returns updated db"
@@ -293,32 +309,35 @@
           db-data          (<? (read-db conn db-address))
           t-new            (db-t db-data)
           assert           (db-assert db-data)
-          asserted-flakes  (assert-flakes db t-new assert)
+          nses             (map :value
+                                (get db-data const/iri-namespaces))
+          db*              (with-namespaces db nses)
+          asserted-flakes  (assert-flakes db* t-new assert)
           retract          (db-retract db-data)
-          retracted-flakes (retract-flakes db t-new retract)
+          retracted-flakes (retract-flakes db* t-new retract)
 
           {:keys [previous issuer message data] :as commit-metadata}
-          (commit-data/json-ld->map commit db)
+          (commit-data/json-ld->map commit db*)
 
           commit-id          (:id commit-metadata)
-          commit-sid         (iri/encode-iri db commit-id)
+          commit-sid         (iri/encode-iri db* commit-id)
           [prev-commit _]    (some->> previous :address (read-commit conn) <?)
-          db-sid             (iri/encode-iri db (:id data))
+          db-sid             (iri/encode-iri db* (:id data))
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new commit-sid db-sid)
           previous-id        (when prev-commit (:id prev-commit))
           prev-commit-flakes (when previous-id
-                               (commit-data/prev-commit-flakes db t-new commit-sid
+                               (commit-data/prev-commit-flakes db* t-new commit-sid
                                                                previous-id))
           prev-data-id       (get-first-id prev-commit const/iri-data)
           prev-db-flakes     (when prev-data-id
-                               (commit-data/prev-data-flakes db db-sid t-new
+                               (commit-data/prev-data-flakes db* db-sid t-new
                                                              prev-data-id))
           issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                               (commit-data/issuer-flakes db t-new commit-sid issuer-iri))
+                               (commit-data/issuer-flakes db* t-new commit-sid issuer-iri))
           message-flakes     (when message
                                (commit-data/message-flakes t-new commit-sid message))
-          all-flakes         (-> db
+          all-flakes         (-> db*
                                  (get-in [:novelty :spot])
                                  empty
                                  (into metadata-flakes)
@@ -332,7 +351,7 @@
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
-      (-> db
+      (-> db*
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
