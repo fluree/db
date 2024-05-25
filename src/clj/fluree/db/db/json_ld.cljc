@@ -360,7 +360,8 @@
 
 (defrecord JsonLdDb [conn alias branch commit t tt-id stats spot post opst tspo
                      schema comparators staged novelty policy namespaces
-                     namespace-codes reindex-min-bytes reindex-max-bytes]
+                     namespace-codes max-namespace-code reindex-min-bytes
+                     reindex-max-bytes]
   dbproto/IFlureeDb
   (-rootdb [this] (root-db this))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
@@ -457,6 +458,10 @@
      :novelty         (new-novelty-map index/comparators)
      :schema          (vocab/base-schema)}))
 
+(defn get-max-ns-code
+  [ns-codes]
+  (->> ns-codes keys (apply max)))
+
 (defn load
   ([conn ledger-alias branch commit-jsonld]
    (load conn ledger-alias branch commit-jsonld {}))
@@ -465,29 +470,31 @@
      :or   {reindex-min-bytes 100000                         ; 100 kb
             reindex-max-bytes 1000000}}]                     ; 1 mb
    (go-try
-     (let [commit-map (commit-data/jsonld->clj commit-jsonld)
-           root-map   (if-let [{:keys [address]} (:index commit-map)]
-                        (<? (index-storage/read-db-root conn address))
-                        (genesis-root-map ledger-alias))
-           indexed-db (-> root-map
-                          (assoc :conn conn
-                                 :alias ledger-alias
-                                 :branch branch
-                                 :commit commit-map
-                                 :tt-id nil
-                                 :comparators index/comparators
-                                 :staged []
-                                 :policy root-policy-map
-                                 :reindex-min-bytes reindex-min-bytes
-                                 :reindex-max-bytes reindex-max-bytes)
-                          map->JsonLdDb)
+     (let [commit-map  (commit-data/jsonld->clj commit-jsonld)
+           root-map    (if-let [{:keys [address]} (:index commit-map)]
+                         (<? (index-storage/read-db-root conn address))
+                         (genesis-root-map ledger-alias))
+           max-ns-code (-> root-map :namespace-codes get-max-ns-code)
+           indexed-db  (-> root-map
+                           (assoc :conn conn
+                                  :alias ledger-alias
+                                  :branch branch
+                                  :commit commit-map
+                                  :tt-id nil
+                                  :comparators index/comparators
+                                  :staged []
+                                  :policy root-policy-map
+                                  :max-namespace-code max-ns-code
+                                  :reindex-min-bytes reindex-min-bytes
+                                  :reindex-max-bytes reindex-max-bytes)
+                           map->JsonLdDb)
            indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
                          (<? (vocab/load-schema indexed-db (:preds root-map)))
                          indexed-db)
-           commit-t   (-> commit-jsonld
-                          (get-first const/iri-data)
-                          (get-first-value const/iri-t))
-           index-t    (:t indexed-db*)]
+           commit-t    (-> commit-jsonld
+                           (get-first const/iri-data)
+                           (get-first-value const/iri-t))
+           index-t     (:t indexed-db*)]
        (if (= commit-t index-t)
          indexed-db*
          (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
