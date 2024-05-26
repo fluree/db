@@ -12,7 +12,8 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.json-ld.transact :as transact]
             [fluree.db.query.json-ld.response :as jld-response]
-            [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]])
+            [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
+            [fluree.db.json-ld.policy :as policy])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -146,7 +147,25 @@
           (catch* e
                   (log/error e "Error loading database for commit range")
                   (>! error-ch e))))
-      commit-ch)))
+      commit-ch))
+
+
+  policy/Restrictable
+  (wrap-policy [_ identity]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (policy/wrap-policy db identity)))))
+  (root [_]
+    (let [root-ch (async/promise-chan)
+          root-db (->AsyncDB alias branch t root-ch)]
+      (go
+        (try*
+          (let [db (<? db-chan)]
+            (async/put! root-ch (policy/root db)))
+          (catch* e
+                  (log/error e "Error loading db while setting root policy")
+                  (async/put! root-ch e))))
+      root-db)))
 
 
 (def ^String label "#fluree/AsyncDB ")
