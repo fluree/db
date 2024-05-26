@@ -95,7 +95,7 @@
     ::context         ::v/context
     ::history-query   (history-query-schema [])}))
 
-(def coerce-history-query
+(def coerce-history-query*
   "Provide a time range :t and either :history or :commit-details, or both.
 
   :history - either a subject iri or a vector in the pattern [s p o] with either the
@@ -115,11 +115,28 @@
        - :latest keyword"
   (m/coercer ::history-query syntax/fql-transformer {:registry registry}))
 
+(defn coerce-history-query
+  [query-map]
+  (try*
+    (coerce-history-query* query-map)
+    (catch* e
+            (throw
+              (ex-info
+                (-> e
+                    v/explain-error
+                    (v/format-explained-errors nil))
+                {:status  400
+                 :error   :db/invalid-query})))))
+
 (def explain-error
   (m/explainer ::history-query {:registry registry}))
 
-(def parse-history-query
+(def parse-history-query*
   (m/parser ::history-query {:registry registry}))
+
+(defn parse-history-query
+  [query-map]
+  (-> query-map coerce-history-query parse-history-query*))
 
 (defn s-flakes->json-ld
   "Build a subject map out a set of flakes with the same subject.

@@ -24,12 +24,9 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn history*
-  [db {:keys [opts] :as query-map}]
+  [db {:keys [history t commit-details opts] :as parsed-query}]
   (go-try
-    (let [{:keys [history t commit-details] :as parsed}
-          (history/parse-history-query query-map)
-
-          context (ctx-util/extract parsed)
+    (let [context (ctx-util/extract parsed-query)
           db*     (if-let [policy-identity (perm/parse-policy-identity opts context)]
                     (<? (perm/wrap-policy db policy-identity))
                     db)
@@ -86,21 +83,12 @@
   "Return a summary of the changes over time, optionally with the full commit details included."
   [db query-map]
   (go-try
-   (let [{query-map :subject, did :did} (or (<? (cred/verify query-map))
-                                            {:subject query-map})
-         coerced-query (try*
-                         (history/coerce-history-query query-map)
-                         (catch* e
-                           (throw
-                             (ex-info
-                               (-> e
-                                   v/explain-error
-                                   (v/format-explained-errors nil))
-                               {:status  400
-                                :error   :db/invalid-query}))))
-         history-query (cond-> coerced-query
-                         did (assoc-in [:opts :did] did))]
-     (<? (history* db history-query)))))
+    (let [{query-map :subject, did :did} (or (<? (cred/verify query-map))
+                                             {:subject query-map})
+
+          history-query (cond-> (history/parse-history-query query-map)
+                          did (assoc-in [:opts :did] did))]
+      (<? (history* db history-query)))))
 
 (defn sanitize-query-options
   [opts did]
