@@ -3,6 +3,7 @@
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.permissions-validate :as validate]
             [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.util.core :as util :refer [get-first get-first-value vswap!]]
@@ -408,7 +409,36 @@
   (collect [db changes-ch]
     (if (idx-default/novelty-min? db reindex-min-bytes)
       (idx-default/refresh db changes-ch)
-      (go))))
+      (go)))
+
+
+  TimeTravel
+  (datetime->t [db datetime]
+    (go-try
+      (log/debug "datetime->t db:" (pr-str db))
+      (let [epoch-datetime (util/str->epoch-ms datetime)
+            current-time (util/current-time-millis)
+            [start end] (if (< epoch-datetime current-time)
+                          [epoch-datetime current-time]
+                          [current-time epoch-datetime])
+            flakes         (-> db
+                               root-db
+                               (query-range/index-range
+                                 :post
+                                 > [const/$_commit:time start]
+                                 < [const/$_commit:time end])
+                               <?)]
+        (log/debug "datetime->t index-range:" (pr-str flakes))
+        (if (empty? flakes)
+          (:t db)
+          (let [t (-> flakes first flake/t flake/prev-t)]
+            (if (zero? t)
+              (throw (ex-info (str "There is no data as of " datetime)
+                              {:status 400, :error :db/invalid-query}))
+              t))))))
+
+  (-as-of [db t]
+    (assoc db :t t)))
 
 (defn db?
   [x]
