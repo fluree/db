@@ -40,6 +40,8 @@
                           :current-db initial-db})
         idx-q      (index-queue state)]
     {:name       branch-name
+     :conn       conn
+     :alias      ledger-alias
      :state      state
      :indexer    idx-q}))
 
@@ -105,7 +107,7 @@
   [{:keys [state] :as _branch-map}]
   (:commit @state))
 
-(defn update-commit
+(defn update-commit!
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest

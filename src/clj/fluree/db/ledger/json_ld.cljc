@@ -56,6 +56,14 @@
                        {:status 400 :error :db/invalid-branch})))
      (branch/current-commit branch-meta))))
 
+(defn current-t
+  ([ledger]
+   (current-t ledger nil))
+  ([ledger branch]
+   (-> ledger
+       (current-commit branch)
+       commit-data/t)))
+
 (defn commit-update
   "Updates both latest db and commit db. If latest registered index is
   newer than provided db, updates index before storing.
@@ -69,7 +77,7 @@
       (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                            "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
                       {:status 400 :error :db/invalid-branch})))
-    (branch/update-commit branch-meta db)
+    (branch/update-commit! branch-meta db)
     (branch/current-db branch-meta)))
 
 (defn status
@@ -243,19 +251,12 @@
          :db               db**}
         db**))))
 
-
-
-
-
-
-
-
 (defn commit!
   [ledger db opts]
   (let [{:keys [branch] :as opts*}
         (normalize-opts opts)
         {:keys [t] :as db*} (or db (current-db ledger branch))
-        committed-t         (ledger/latest-commit-t ledger branch)]
+        committed-t         (current-t ledger branch)]
     (if (= t (flake/next-t committed-t))
       (commit ledger db* opts*)
       (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
