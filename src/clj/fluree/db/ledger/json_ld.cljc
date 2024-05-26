@@ -34,9 +34,9 @@
       (get branches branch))))
 
 ;; TODO - no time travel, only latest db on a branch thus far
-(defn latest-db
+(defn current-db
   ([ledger]
-   (latest-db ledger nil))
+   (current-db ledger nil))
   ([ledger branch]
    (let [branch-meta (get-branch-meta ledger branch)]
      ;; if branch is nil, will return default
@@ -45,9 +45,9 @@
                        {:status 400 :error :db/invalid-branch})))
      (branch/current-db branch-meta))))
 
-(defn latest-commit
+(defn current-commit
   ([ledger]
-   (latest-commit ledger nil))
+   (current-commit ledger nil))
   ([ledger branch]
    (let [branch-meta (get-branch-meta ledger branch)]
      ;; if branch is nil, will return default
@@ -165,7 +165,7 @@
   "Writes commit and pushes, kicks off indexing if necessary."
   [{:keys [conn alias] :as ledger} {:keys [commit branch] :as db} keypair]
   (go-try
-    (let [ledger-commit (latest-commit ledger branch)
+    (let [ledger-commit (current-commit ledger branch)
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
 
@@ -254,7 +254,7 @@
   [ledger db opts]
   (let [{:keys [branch] :as opts*}
         (normalize-opts opts)
-        {:keys [t] :as db*} (or db (latest-db ledger branch))
+        {:keys [t] :as db*} (or db (current-db ledger branch))
         committed-t         (ledger/latest-commit-t ledger branch)]
     (if (= t (flake/next-t committed-t))
       (commit ledger db* opts*)
@@ -285,7 +285,7 @@
           commit-t   (-> expanded-commit
                          (get-first const/iri-data)
                          (get-first-value const/iri-t))
-          current-db (latest-db ledger branch)
+          current-db (current-db ledger branch)
           current-t  (:t current-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
                  "where current cached db t value is:" current-t)
@@ -323,7 +323,7 @@
   (-notify [ledger expanded-commit] (notify ledger expanded-commit))
 
   ledger/iLedger
-  (-db [ledger] (latest-db ledger))
+  (-db [ledger] (current-db ledger))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))
   (-close [ledger] (close-ledger ledger)))

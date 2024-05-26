@@ -249,14 +249,14 @@
   ;; TODO - returning true for now
   true)
 
-(defn has-proof?
+(defn credential?
   [commit-data]
   (contains? commit-data const/iri-cred-subj))
 
 (defn verify-commit
   "Given a full commit json, returns two-tuple of [commit-data commit-proof]"
   [commit-data]
-  (if (has-proof? commit-data)
+  (if (credential? commit-data)
     (let [credential-subject (get-first commit-data const/iri-cred-subj)]
       (validate-commit-proof commit-data)
       [credential-subject commit-data])
