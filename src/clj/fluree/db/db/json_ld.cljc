@@ -4,6 +4,8 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
             [fluree.db.time-travel :refer [TimeTravel]]
+            [fluree.db.query.history :refer [AuditLog]]
+            [fluree.db.db.json-ld.history :as history]
             [fluree.db.permissions-validate :as validate]
             [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.util.core :as util :refer [get-first get-first-value vswap!]]
@@ -438,7 +440,14 @@
               t))))))
 
   (-as-of [db t]
-    (assoc db :t t)))
+    (assoc db :t t))
+
+
+  AuditLog
+  (-history [db context from-t to-t commit-details? error-ch history-q]
+    (history/query-history db context from-t to-t commit-details? error-ch history-q))
+  (-commits [db context from-t to-t error-ch]
+    (history/query-commits db context from-t to-t error-ch)))
 
 (defn db?
   [x]
