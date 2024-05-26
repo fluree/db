@@ -1,142 +1,17 @@
 (ns fluree.db.query.history
   (:require [clojure.core.async :as async :refer [go >! <!]]
-            [fluree.db.query.fql.syntax :as syntax]
-            [malli.core :as m]
+            [fluree.db.query.history.parse :as parse]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.db.json-ld.format :as jld-format]
-            [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
             [fluree.db.index :as index]
+            [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
-            [fluree.db.validation :as v]
             [fluree.db.json-ld.iri :as iri]))
-
-(defn history-query-schema
-  "Returns schema for history queries, with any extra key/value pairs `extra-kvs`
-  added to the query map.
-  This allows eg http-api-gateway to amend the schema with required key/value pairs
-  it wants to require, which are not required/supported here in the db library."
-  [extra-kvs]
-  [:and
-   [:map-of ::json-ld-keyword :any]
-   [:fn {:error/message "Must supply a value for either \"history\" or \"commit-details\""}
-    (fn [{:keys [history commit-details t]}]
-      (or (string? history) (keyword? history) (seq history) commit-details))]
-   (into
-     [:map
-      [:history {:optional true}
-       [:orn {:error/message
-              "Value of \"history\" must be a subject, or a vector containing one or more of subject, predicate, object"}
-        [:subject {:error/message "Invalid iri"} ::iri]
-        [:flake
-         [:or {:error/message "Must provide a tuple of one more more iris"}
-          [:catn
-           [:s ::iri]]
-          [:catn
-           [:s [:maybe ::iri]]
-           [:p ::iri]]
-          [:catn
-           [:s [:maybe ::iri]]
-           [:p ::iri]
-           [:o [:not :nil]]]]]]]
-      [:commit-details {:optional true
-                        :error/message "Invalid value of \"commit-details\" key"} :boolean]
-      [:context {:optional true} ::context]
-      [:opts {:optional true} [:map-of :keyword :any]]
-      [:t
-       [:and
-        [:map-of {:error/message "Value of \"t\" must be a map"} :keyword :any]
-        [:map
-         [:from {:optional true}
-          [:or {:error/message "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
-           [:= :latest]
-           [:int {:min 0
-                  :error/message "Must be a positive value"}]
-           [:re datatype/iso8601-datetime-re]]]
-         [:to {:optional true}
-          [:or {:error/message "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
-           [:=  :latest]
-           [:int {:min 0
-                  :error/message "Must be a positive value"}]
-           [:re datatype/iso8601-datetime-re]]]
-         [:at {:optional true}
-          [:or {:error/message "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
-           [:= :latest]
-           [:int {:min 0
-                  :error/message "Must be a positive value"}]
-           [:re datatype/iso8601-datetime-re]]]]
-        [:fn {:error/message "Must provide: either \"from\" or \"to\", or the key \"at\" "}
-         (fn [{:keys [from to at]}]
-           ;; if you have :at, you cannot have :from or :to
-           (if at
-             (not (or from to))
-             (or from to)))]
-        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value"}
-         (fn [{:keys [from to]}] (if (and (number? from) (number? to))
-                                   (<= from to)
-                                   true))]]]]
-     extra-kvs)])
-
-
-(def registry
-  (merge
-   (m/base-schemas)
-   (m/type-schemas)
-   (m/predicate-schemas)
-   (m/comparator-schemas)
-   (m/sequence-schemas)
-   v/registry
-   {::iri             ::v/iri
-    ::json-ld-keyword ::v/json-ld-keyword
-    ::context         ::v/context
-    ::history-query   (history-query-schema [])}))
-
-(def coerce-history-query*
-  "Provide a time range :t and either :history or :commit-details, or both.
-
-  :history - either a subject iri or a vector in the pattern [s p o] with either the
-  s or the p is required. If the o is supplied it must not be nil.
-
-  :context or \"@context\" - json-ld context to use in expanding the :history iris.
-
-  :commit-details - if true, each result will have a :commit key with the commit map as a value.
-
-  :t  - a map containing either:
-  - :at
-  - either :from or :to
-
-  accepted values for t maps:
-       - positive t-value
-       - datetime string
-       - :latest keyword"
-  (m/coercer ::history-query syntax/fql-transformer {:registry registry}))
-
-(defn coerce-history-query
-  [query-map]
-  (try*
-    (coerce-history-query* query-map)
-    (catch* e
-            (throw
-              (ex-info
-                (-> e
-                    v/explain-error
-                    (v/format-explained-errors nil))
-                {:status  400
-                 :error   :db/invalid-query})))))
-
-(def explain-error
-  (m/explainer ::history-query {:registry registry}))
-
-(def parse-history-query*
-  (m/parser ::history-query {:registry registry}))
-
-(defn parse-history-query
-  [query-map]
-  (-> query-map coerce-history-query parse-history-query*))
 
 (defn s-flakes->json-ld
   "Build a subject map out a set of flakes with the same subject.
@@ -411,3 +286,53 @@
         ch))
      chunked-ch)
     out-ch))
+
+(defn find-t-endpoints
+  [db {:keys [from to at] :as _t}]
+  (go-try
+    (if at
+      (let [t (cond (= :latest at) (:t db)
+                    (string? at)   (<? (time-travel/datetime->t db at))
+                    (number? at)   at)]
+        [t t])
+      ;; either (:from or :to)
+      [(cond (= :latest from) (:t db)
+             (string? from)   (<? (time-travel/datetime->t db from))
+             (number? from)   from
+             (nil? from)      1)
+       (cond (= :latest to) (:t db)
+             (string? to)   (<? (time-travel/datetime->t db to))
+             (number? to)   to
+             (nil? to)      (:t db))])))
+
+(defn query
+  [db context q]
+  (go-try
+    (let [{:keys [history t commit-details] :as _parsed-query}
+          (parse/parse-history-query q)
+          ;; from and to are positive ints, need to convert to negative or fill in default values
+          [from-t to-t] (<? (find-t-endpoints db t))
+          error-ch      (async/chan)]
+     (if history
+       ;; filter flakes for history pattern
+       (let [[pattern idx]        (<? (history-pattern db context history))
+             flake-slice-ch       (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t})
+             flakes               (async/<! (async/reduce into [] flake-slice-ch))
+             history-results-chan (history-flakes->json-ld db context error-ch flakes)]
+         (if commit-details
+           ;; annotate with commit details
+           (async/alt! (async/into [] (add-commit-details db context error-ch history-results-chan))
+                       ([result] result)
+                       error-ch ([e] e))
+
+           ;; we're already done
+           (async/alt! (async/into [] history-results-chan)
+                       ([result] result)
+                       error-ch ([e] e))))
+
+       ;; just commits over a range of time
+       (let [flake-slice-ch    (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
+             commit-results-ch (commit-flakes->json-ld db context error-ch flake-slice-ch)]
+         (async/alt! (async/into [] commit-results-ch)
+                     ([result] result)
+                     error-ch ([e] e)))))))
