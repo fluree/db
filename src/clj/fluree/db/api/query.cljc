@@ -54,16 +54,10 @@
           error-ch      (async/chan)]
      (if history
        ;; filter flakes for history pattern
-       (let [[pattern idx]  (<? (history/history-pattern db* context history))
-             flake-slice-ch (query-range/time-range db* idx = pattern {:from-t from-t :to-t to-t})
-             flake-ch       (async/chan 1 cat)
-
-             _ (async/pipe flake-slice-ch flake-ch)
-
-             flakes (async/<! (async/into [] flake-ch))
-
+       (let [[pattern idx]        (<? (history/history-pattern db* context history))
+             flake-slice-ch       (query-range/time-range db* idx = pattern {:from-t from-t :to-t to-t})
+             flakes               (async/<! (async/reduce into [] flake-slice-ch))
              history-results-chan (history/history-flakes->json-ld db* context error-ch flakes)]
-
          (if commit-details
            ;; annotate with commit details
            (async/alt! (async/into [] (history/add-commit-details db* context error-ch history-results-chan))
