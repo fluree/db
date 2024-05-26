@@ -11,7 +11,7 @@
 (defprotocol NodeFormatter
   (-forward-properties [db iri select-spec context compact-fn cache fuel-tracker error-ch])
   (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch])
-  (-iri-allowed? [db iri]))
+  (-iri-visible? [db iri]))
 
 (defn combine-objects
   [obj1 obj2]
@@ -43,7 +43,7 @@
                            (contains? select-spec const/iri-id))
                      (if (some? (loop [[db & r] (dataset/all ds)]
                                   (if db
-                                    (if (<? (-iri-allowed? db iri))
+                                    (if (<? (-iri-visible? db iri))
                                       db
                                       (recur r))
                                     nil)))

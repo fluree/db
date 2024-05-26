@@ -84,10 +84,10 @@
                   (>! error-ch e))))
       prop-ch))
 
-  (-iri-allowed? [_ iri]
+  (-iri-visible? [_ iri]
     (go-try
       (let [db (<? db-chan)]
-        (<? (jld-response/-iri-allowed? db iri)))))
+        (<? (jld-response/-iri-visible? db iri)))))
 
 
   transact/Transactable

@@ -400,7 +400,7 @@
   (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch]
     (jld-format/reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch))
 
-  (-iri-allowed? [db iri]
+  (-iri-visible? [db iri]
     (let [sid (iri/encode-iri db iri)]
       (validate/allow-iri? db sid)))
 
