@@ -8,7 +8,6 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
             [fluree.db.index :as index]
-            [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]

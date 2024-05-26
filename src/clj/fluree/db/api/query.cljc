@@ -23,44 +23,44 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn- history*
-  [db query-map]
+(defn history*
+  [db {:keys [opts] :as query-map}]
   (go-try
-   (let [{:keys [opts]} query-map
-         {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map)
+    (let [{:keys [history t commit-details] :as parsed}
+          (history/parse-history-query query-map)
 
-         ctx (ctx-util/extract parsed)
-         db* (if-let [policy-identity (perm/parse-policy-identity opts ctx)]
-               (<? (perm/wrap-policy db policy-identity))
-               db)
-         ;; from and to are positive ints, need to convert to negative or fill in default values
-         {:keys [from to at]} t
-         [from-t to-t] (if at
-                         (let [t (cond (= :latest at) (:t db*)
-                                       (string? at) (<? (time-travel/datetime->t db* at))
-                                       (number? at) at)]
-                           [t t])
-                         ;; either (:from or :to)
-                         [(cond (= :latest from) (:t db*)
-                                (string? from) (<? (time-travel/datetime->t db* from))
-                                (number? from) from
-                                (nil? from) 1)
-                          (cond (= :latest to) (:t db*)
-                                (string? to) (<? (time-travel/datetime->t db* to))
-                                (number? to) to
-                                (nil? to) (:t db*))])
+          context (ctx-util/extract parsed)
+          db*     (if-let [policy-identity (perm/parse-policy-identity opts context)]
+                    (<? (perm/wrap-policy db policy-identity))
+                    db)
 
-         context        (ctx-util/extract parsed)
-         error-ch       (async/chan)]
+          ;; from and to are positive ints, need to convert to negative or fill in default values
+          {:keys [from to at]} t
+          [from-t to-t]        (if at
+                                 (let [t (cond (= :latest at) (:t db*)
+                                               (string? at)   (<? (time-travel/datetime->t db* at))
+                                               (number? at)   at)]
+                                   [t t])
+                                 ;; either (:from or :to)
+                                 [(cond (= :latest from) (:t db*)
+                                        (string? from)   (<? (time-travel/datetime->t db* from))
+                                        (number? from)   from
+                                        (nil? from)      1)
+                                  (cond (= :latest to) (:t db*)
+                                        (string? to)   (<? (time-travel/datetime->t db* to))
+                                        (number? to)   to
+                                        (nil? to)      (:t db*))])
+
+          error-ch (async/chan)]
      (if history
        ;; filter flakes for history pattern
-       (let [[pattern idx] (<? (history/history-pattern db* context history))
-             flake-slice-ch       (query-range/time-range db* idx = pattern {:from-t from-t :to-t to-t})
-             flake-ch             (async/chan 1 cat)
+       (let [[pattern idx]  (<? (history/history-pattern db* context history))
+             flake-slice-ch (query-range/time-range db* idx = pattern {:from-t from-t :to-t to-t})
+             flake-ch       (async/chan 1 cat)
 
-             _                    (async/pipe flake-slice-ch flake-ch)
+             _ (async/pipe flake-slice-ch flake-ch)
 
-             flakes               (async/<! (async/into [] flake-ch))
+             flakes (async/<! (async/into [] flake-ch))
 
              history-results-chan (history/history-flakes->json-ld db* context error-ch flakes)]
 
