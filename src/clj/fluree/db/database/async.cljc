@@ -84,6 +84,11 @@
                   (>! error-ch e))))
       prop-ch))
 
+  (-iri-allowed? [_ iri]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (jld-response/-iri-allowed? db iri)))))
+
 
   transact/Transactable
   (-stage-txn [_ fuel-tracker context identity annotation raw-txn parsed-txn]

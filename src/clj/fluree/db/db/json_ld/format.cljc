@@ -3,11 +3,20 @@
             [clojure.core.async :as async :refer [go]]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
-            [fluree.db.util.core :as util :refer [get-first get-first-value]]
+            [fluree.db.util.core :as util]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.util.json :as json]))
+
+(defn cache-sid->iri
+  [db cache compact-fn sid]
+  (let [cache-key [(:alias db) sid]]
+    (or (get @cache cache-key)
+        (when-let [iri (or (some-> db :schema :pred (get sid) :iri compact-fn)
+                           (some-> (iri/decode-sid db sid) compact-fn))]
+          (vswap! cache assoc cache-key {:as iri})
+          {:as iri}))))
 
 (defn flake-bounds
   [db idx match]
@@ -36,7 +45,7 @@
   [db cache compact-fn type-flakes]
   (->> type-flakes
        (into [] (comp (map flake/o)
-                      (map (partial jld-response/cache-sid->iri db cache compact-fn))
+                      (map (partial cache-sid->iri db cache compact-fn))
                       (map :as)))
        util/unwrap-singleton))
 
@@ -55,6 +64,14 @@
         (json/parse obj false)
         obj))))
 
+(defn wildcard-spec
+  [db cache compact-fn iri]
+  (or (get @cache iri)
+      (when-let [spec (get-in db [:schema :pred iri])]
+        (let [spec* (assoc spec :as (compact-fn (:iri spec)))]
+          (vswap! cache assoc iri spec*)
+          spec*))))
+
 (defn format-property
   [db cache context compact-fn {:keys [wildcard?] :as select-spec} p-flakes]
   (let [ff  (first p-flakes)
@@ -62,8 +79,8 @@
         iri (iri/decode-sid db pid)]
     (when-let [spec (or (get select-spec iri)
                         (when wildcard?
-                          (or (jld-response/wildcard-spec db cache compact-fn iri)
-                              (jld-response/cache-sid->iri db cache compact-fn pid))))]
+                          (or (wildcard-spec db cache compact-fn iri)
+                              (cache-sid->iri db cache compact-fn pid))))]
       (let [p-iri (:as spec)
             v     (if (rdf-type? pid)
                     (type-value db cache compact-fn p-flakes)
@@ -115,7 +132,7 @@
                                  :flake-xf    flake-xf}
         sid-xf                  (if spec
                                   (map (partial format-reference db reverse-spec))
-                                  (comp (map (partial jld-response/cache-sid->iri db cache compact-fn))
+                                  (comp (map (partial cache-sid->iri db cache compact-fn))
                                         (map :as)))]
     (->> (query-range/resolve-flake-slices db :opst error-ch range-opts)
          (async/transduce (comp cat sid-xf)
@@ -140,5 +157,5 @@
                           (go subject-attrs))]
       (->> subject-ch
            (jld-response/resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-           (jld-response/append-id db s-iri select-spec cache compact-fn error-ch)))
+           (jld-response/append-id db s-iri select-spec compact-fn error-ch)))
     (go)))

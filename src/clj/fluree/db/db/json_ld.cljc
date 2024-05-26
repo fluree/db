@@ -3,6 +3,7 @@
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.permissions-validate :as validate]
             [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.util.core :as util :refer [get-first get-first-value vswap!]]
             [fluree.db.index :as index]
@@ -398,6 +399,10 @@
 
   (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch]
     (jld-format/reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch))
+
+  (-iri-allowed? [db iri]
+    (let [sid (iri/encode-iri db iri)]
+      (validate/allow-iri? db sid)))
 
   indexer/Indexed
   (collect [db changes-ch]

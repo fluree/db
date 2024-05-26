@@ -1,35 +1,17 @@
 (ns fluree.db.query.json-ld.response
   (:require [fluree.db.util.async :refer [<?]]
             [clojure.core.async :as async :refer [<! >! go]]
-            [fluree.db.permissions-validate :as validate]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.constants :as const]
             [fluree.db.query.dataset :as dataset]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.json-ld.iri :as iri]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol NodeFormatter
   (-forward-properties [db iri select-spec context compact-fn cache fuel-tracker error-ch])
-  (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch]))
-
-(defn cache-sid->iri
-  [db cache compact-fn sid]
-  (let [cache-key [(:alias db) sid]]
-    (or (get @cache cache-key)
-        (when-let [iri (or (some-> db :schema :pred (get sid) :iri compact-fn)
-                           (some-> (iri/decode-sid db sid) compact-fn))]
-          (vswap! cache assoc cache-key {:as iri})
-          {:as iri}))))
-
-(defn wildcard-spec
-  [db cache compact-fn iri]
-  (or (get @cache iri)
-      (when-let [spec (get-in db [:schema :pred iri])]
-        (let [spec* (assoc spec :as (compact-fn (:iri spec)))]
-          (vswap! cache assoc iri spec*)
-          spec*))))
+  (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch])
+  (-iri-allowed? [db iri]))
 
 (defn combine-objects
   [obj1 obj2]
@@ -48,9 +30,9 @@
 (declare format-node)
 
 (defn append-id
-  ([ds iri cache compact-fn error-ch]
-   (append-id ds iri nil cache compact-fn error-ch nil))
-  ([ds iri {:keys [wildcard?] :as select-spec} cache compact-fn error-ch node-ch]
+  ([ds iri compact-fn error-ch]
+   (append-id ds iri nil compact-fn error-ch nil))
+  ([ds iri {:keys [wildcard?] :as select-spec} compact-fn error-ch node-ch]
    (go
      (try*
        (let [node  (if (nil? node-ch)
@@ -59,18 +41,16 @@
              node* (if (or (nil? select-spec)
                            wildcard?
                            (contains? select-spec const/iri-id))
-                     (if-let [allowing-db (loop [[db & r] (dataset/all ds)]
-                                            (if db
-                                              (let [sid (iri/encode-iri db iri)]
-                                                (if (<? (validate/allow-iri? db sid))
-                                                  db
-                                                  (recur r)))
-                                              nil))]
+                     (if (some? (loop [[db & r] (dataset/all ds)]
+                                  (if db
+                                    (if (<? (-iri-allowed? db iri))
+                                      db
+                                      (recur r))
+                                    nil)))
                        (let [;; TODO: we generate id-key here every time, this
                              ;; should be done in the :spec once beforehand and
                              ;; used from there
-                             id-key (:as (or (wildcard-spec allowing-db cache compact-fn const/$id)
-                                             (cache-sid->iri allowing-db cache compact-fn const/$id)))
+                             id-key (compact-fn const/iri-id)
                              iri*   (compact-fn iri)]
                          (assoc node id-key iri*))
                        node)
@@ -105,7 +85,7 @@
                    fuel-tracker error-ch)
 
       :else
-      (append-id ds o-iri cache compact-fn error-ch))))
+      (append-id ds o-iri compact-fn error-ch))))
 
 (defn resolve-reference
   [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
@@ -198,4 +178,4 @@
                       forward-ch)]
      (->> subject-ch
           (resolve-references ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-          (append-id ds iri select-spec cache compact-fn error-ch)))))
+          (append-id ds iri select-spec compact-fn error-ch)))))
