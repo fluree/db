@@ -6,6 +6,7 @@
             [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.query.history :refer [AuditLog]]
             [fluree.db.db.json-ld.history :as history]
+            [fluree.db.db.json-ld.policy :as db-policy]
             [fluree.db.permissions-validate :as validate]
             [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.util.core :as util :refer [get-first get-first-value vswap!]]
@@ -38,16 +39,11 @@
 
 (def data-version 0)
 
-(def root-policy-map
-  "Base policy (permissions) map that will give access to all flakes."
-  {const/iri-view   {:root? true}
-   const/iri-modify {:root? true}})
-
 ;; ================ Jsonld record support fns ================================
 
 (defn root-db
   [this]
-  (assoc this :policy root-policy-map))
+  (policy/root this))
 
 (defn class-ids
   "Returns list of class-ids for given subject-id"
@@ -450,7 +446,13 @@
   (-history [db context from-t to-t commit-details? error-ch history-q]
     (history/query-history db context from-t to-t commit-details? error-ch history-q))
   (-commits [db context from-t to-t error-ch]
-    (history/query-commits db context from-t to-t error-ch)))
+    (history/query-commits db context from-t to-t error-ch))
+
+  policy/Restrictable
+  (wrap-policy [db identity]
+    (db-policy/wrap-policy db identity))
+  (root [db]
+    (db-policy/root db)))
 
 (defn db?
   [x]
@@ -531,11 +533,11 @@
                                   :tt-id nil
                                   :comparators index/comparators
                                   :staged []
-                                  :policy root-policy-map
                                   :max-namespace-code max-ns-code
                                   :reindex-min-bytes reindex-min-bytes
                                   :reindex-max-bytes reindex-max-bytes)
-                           map->JsonLdDb)
+                           map->JsonLdDb
+                           policy/root)
            indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
                          (<? (vocab/load-schema indexed-db (:preds root-map)))
                          indexed-db)
