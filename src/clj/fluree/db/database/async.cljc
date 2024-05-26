@@ -1,6 +1,7 @@
 (ns fluree.db.database.async
   (:refer-clojure :exclude [load])
   (:require [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.indexer :as indexer]
             [clojure.core.async :as async :refer [<! >! go]]
@@ -101,7 +102,27 @@
   (collect [_ changes-ch]
     (go-try
       (let [db (<? db-chan)]
-        (<? (indexer/collect db changes-ch))))))
+        (<? (indexer/collect db changes-ch)))))
+
+
+  time-travel/TimeTravel
+  (datetime->t [_ datetime]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (time-travel/datetime->t db datetime)))))
+
+  (-as-of [_ t]
+    (let [db-chan-at-t (async/promise-chan)
+          db-at-t      (->AsyncDB alias branch t db-chan-at-t)]
+      (go
+        (try*
+          (let [db (<? db-chan)]
+            (async/put! db-chan-at-t
+                        (time-travel/-as-of db t)))
+          (catch* e
+                  (log/error e "Error in time-traveling database")
+                  (async/put! db-chan-at-t e))))
+      db-at-t)))
 
 
 (def ^String label "#fluree/AsyncDB ")
