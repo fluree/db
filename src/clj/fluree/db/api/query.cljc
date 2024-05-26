@@ -23,6 +23,24 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn find-t-endpoints
+  [db {:keys [from to at] :as _t}]
+  (go-try
+    (if at
+      (let [t (cond (= :latest at) (:t db)
+                    (string? at)   (<? (time-travel/datetime->t db at))
+                    (number? at)   at)]
+        [t t])
+      ;; either (:from or :to)
+      [(cond (= :latest from) (:t db)
+             (string? from)   (<? (time-travel/datetime->t db from))
+             (number? from)   from
+             (nil? from)      1)
+       (cond (= :latest to) (:t db)
+             (string? to)   (<? (time-travel/datetime->t db to))
+             (number? to)   to
+             (nil? to)      (:t db))])))
+
 (defn history*
   [db {:keys [history t commit-details opts] :as parsed-query}]
   (go-try
@@ -32,23 +50,8 @@
                     db)
 
           ;; from and to are positive ints, need to convert to negative or fill in default values
-          {:keys [from to at]} t
-          [from-t to-t]        (if at
-                                 (let [t (cond (= :latest at) (:t db*)
-                                               (string? at)   (<? (time-travel/datetime->t db* at))
-                                               (number? at)   at)]
-                                   [t t])
-                                 ;; either (:from or :to)
-                                 [(cond (= :latest from) (:t db*)
-                                        (string? from)   (<? (time-travel/datetime->t db* from))
-                                        (number? from)   from
-                                        (nil? from)      1)
-                                  (cond (= :latest to) (:t db*)
-                                        (string? to)   (<? (time-travel/datetime->t db* to))
-                                        (number? to)   to
-                                        (nil? to)      (:t db*))])
-
-          error-ch (async/chan)]
+          [from-t to-t] (<? (find-t-endpoints db* t))
+          error-ch      (async/chan)]
      (if history
        ;; filter flakes for history pattern
        (let [[pattern idx]  (<? (history/history-pattern db* context history))
