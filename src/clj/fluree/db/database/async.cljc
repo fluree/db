@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [load])
   (:require [fluree.db.db.json-ld :as jld-db]
             [fluree.db.time-travel :as time-travel]
+            [fluree.db.query.history :as history]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.indexer :as indexer]
             [clojure.core.async :as async :refer [<! >! go]]
@@ -125,7 +126,27 @@
           (catch* e
                   (log/error e "Error in time-traveling database")
                   (async/put! db-chan-at-t e))))
-      db-at-t)))
+      db-at-t))
+
+
+  history/AuditLog
+  (-history [_ context from-t to-t commit-details? error-ch history-q]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (history/-history db context from-t to-t commit-details? error-ch history-q)))))
+
+  (-commits [_ context from-t to-t error-ch]
+    (let [commit-ch (async/chan)]
+      (go
+        (try*
+          (let [db (<? db-chan)]
+            (-> db
+                (history/-commits context from-t to-t error-ch)
+                (async/pipe commit-ch)))
+          (catch* e
+                  (log/error e "Error loading database for commit range")
+                  (>! error-ch e))))
+      commit-ch)))
 
 
 (def ^String label "#fluree/AsyncDB ")
