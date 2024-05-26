@@ -8,6 +8,7 @@
 
 (defprotocol TimeTravel
   (datetime->t [db datetime])
+  (latest-t [db])
   (-as-of [db t]))
 
 (defn as-of

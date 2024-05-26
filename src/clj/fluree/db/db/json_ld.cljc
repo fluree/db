@@ -439,6 +439,9 @@
                               {:status 400, :error :db/invalid-query}))
               t))))))
 
+  (latest-t [_]
+    t)
+
   (-as-of [db t]
     (assoc db :t t))
 

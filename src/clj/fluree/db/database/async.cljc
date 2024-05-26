@@ -111,6 +111,9 @@
       (let [db (<? db-chan)]
         (<? (time-travel/datetime->t db datetime)))))
 
+  (latest-t [_]
+    t)
+
   (-as-of [_ t]
     (let [db-chan-at-t (async/promise-chan)
           db-at-t      (->AsyncDB alias branch t db-chan-at-t)]
