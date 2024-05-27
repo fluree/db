@@ -511,6 +511,16 @@
   [ns-codes]
   (->> ns-codes keys (apply max)))
 
+(defn load-novelty
+  [conn indexed-db index-t commit-jsonld]
+  (go-try
+    (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
+           db                 indexed-db]
+      (if commit-tuple
+        (let [new-db (<? (reify/merge-commit conn db commit-tuple))]
+          (recur r new-db))
+        db))))
+
 (defn load
   ([conn ledger-alias branch commit-pair]
    (load conn ledger-alias branch commit-pair {}))
@@ -546,12 +556,7 @@
            index-t     (:t indexed-db*)]
        (if (= commit-t index-t)
          indexed-db*
-         (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
-                db                 indexed-db*]
-           (if commit-tuple
-             (let [new-db (<? (reify/merge-commit conn db commit-tuple))]
-               (recur r new-db))
-             db)))))))
+         (<? (load-novelty conn indexed-db* index-t commit-jsonld)))))))
 
 (defn get-s-iri
   "Returns a compact IRI from a subject id (sid)."
