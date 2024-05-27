@@ -23,15 +23,6 @@
   [restriction-map]
   (:modify? restriction-map))
 
-(defn conform-values-map
-  "Values map is a simple map of keys to values.
-  The query values format is that of a tuple-pattern followed
-  by a sequence of tuple-values"
-  [values-map]
-  (let [ks (into [] (keys values-map))
-        vs (into [] (vals values-map))]
-    [ks [vs]]))
-
 (defn extract-query
   [restriction]
   (-> restriction
@@ -155,12 +146,12 @@
 (defn wrap-policy
   [db policy-rules default-allow? values-map]
   (go-try
-   (let [policy-rules  (->> (parse-rules-graph policy-rules)
-                            (parse-policy-rules db))]
+   (let [policy-rules (->> (parse-rules-graph policy-rules)
+                           (parse-policy-rules db))]
      (log/trace "policy-rules: " policy-rules)
-     (assoc db :policy (cond-> (assoc policy-rules :cache (atom {})
-                                                   :values-map values-map
-                                                   :default-allow? default-allow?))))))
+     (assoc db :policy (assoc policy-rules :cache (atom {})
+                                           :values-map values-map
+                                           :default-allow? default-allow?)))))
 
 (defn policy-from-query
   "For now, extracting a policy from a `select` clause does not retain the
@@ -173,6 +164,6 @@
   (mapv
    #(if-let [query (get % const/iri-query)]
       (assoc % const/iri-query {"@value" query
-                                "@type" "@json"})
+                                "@type"  "@json"})
       %)
    query-results))
