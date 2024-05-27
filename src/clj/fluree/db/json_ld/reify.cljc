@@ -343,11 +343,10 @@
                                  (into metadata-flakes)
                                  (into retracted-flakes)
                                  (into asserted-flakes)
-                                 (cond->
-                                     prev-commit-flakes (into prev-commit-flakes)
-                                     prev-db-flakes (into prev-db-flakes)
-                                     issuer-flakes  (into issuer-flakes)
-                                     message-flakes (into message-flakes)))]
+                                 (cond-> prev-commit-flakes (into prev-commit-flakes)
+                                         prev-db-flakes (into prev-db-flakes)
+                                         issuer-flakes  (into issuer-flakes)
+                                         message-flakes (into message-flakes)))]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))

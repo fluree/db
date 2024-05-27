@@ -94,8 +94,6 @@
   (let [current-t (commit-data/t current-commit)
         new-t     (commit-data/t new-commit)]
     (or (nil? current-t)
-        (and (updated-index? current-commit new-commit)
-             (not (flake/t-after? new-t current-t))) ; index update may come after multiple commits
         (= new-t (inc current-t)))))
 
 (defn update-commit!
