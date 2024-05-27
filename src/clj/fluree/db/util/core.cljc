@@ -491,9 +491,9 @@
 
   Elides any scalar values (those without an @id key)."
   [json-ld k]
-  (->> (get json-ld k)
-       unwrap-list
-       (keep get-id)))
+  (some->> (get json-ld k)
+           unwrap-list
+           (keep get-id)))
 
 (defn parse-opts
   [opts]
