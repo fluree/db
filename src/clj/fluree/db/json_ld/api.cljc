@@ -18,12 +18,16 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.connection :refer [notify-ledger]]
+            [fluree.db.policy.rules :as policy-rules]
+            [fluree.db.constants :as const]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy :as perm])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(declare query)
 
 (defn promise-wrap
   "Wraps an async channel that will contain a response in a promise."
@@ -270,21 +274,38 @@
                      {:status 500 :error :db/unexpected-error}))
      (ledger/-db ledger))))
 
-
 (defn wrap-policy
-  "Wraps a db object with specified permission attributes.
-  When requesting a db from a ledger, permission attributes can
-  be requested at that point, however if one has a db already, this
-  allows the permission attributes to be modified.
-
-  Returns promise"
-  ([db identity-map]
-   (wrap-policy db identity-map nil))
-  ([db identity-map context]
+  ([db policy default-allow?]
    (promise-wrap
-     (let [parsed-ctx (json-ld/parse-context context)
-           policy-id  (perm/parse-policy-identity identity-map parsed-ctx)]
-       (perm/wrap-policy db policy-id)))))
+    (policy-rules/wrap-policy db policy default-allow? nil)))
+  ([db policy default-allow? values-map]
+   (promise-wrap
+    (policy-rules/wrap-policy db policy default-allow? values-map))))
+
+(defn wrap-policy-from-identity
+  "For provided identity, locates specific property f:policyClass on
+  the identity containing a list of class IRIs that identity the policies
+  that should be applied to the identity.
+
+  With the policy classes, finds all policies containing that class
+  declaration."
+  [db identity default-allow?]
+  (let [policies  @(query db {"select" {"?policy" ["*"]}
+                              "where"  [{"@id"                 identity
+                                         const/iri-policyClass "?classes"}
+                                        {"@id"   "?policy"
+                                         "@type" "?classes"}]})
+        policies* (if (util/exception? policies)
+                    policies
+                    (policy-rules/policy-from-query policies))
+        val-map   {"?$identity" {"@value" identity
+                                 "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}}]
+    (if (util/exception? policies*)
+      (throw (ex-info (str "Unable to extract policies for identity: " identity
+                           " with error: " (ex-message policies*))
+                      {:status 400 :error :db/policy-exception}
+                      policies*))
+      (wrap-policy db policies* default-allow? val-map))))
 
 (defn dataset
   "Creates a composed dataset from multiple resolved graph databases.

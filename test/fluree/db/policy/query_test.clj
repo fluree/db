@@ -7,7 +7,7 @@
 (deftest ^:integration property-policy-query-enforcement
   (testing "Global restrictions on properties"
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "policy/global-property-restriction")
+          ledger    @(fluree/create conn "policy/property-policy-query-enforcement")
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db        @(fluree/stage
@@ -50,9 +50,9 @@
                                                 "where"    {"@id"     "?$identity"
                                                             "ex:user" {"@id" "?$this"}}}}}]
 
-          policy-db @(fluree/wrap-policy2 db policy
-                                          {"?$identity" {"@value" alice-did
-                                                         "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}})]
+          policy-db @(fluree/wrap-policy db policy true
+                                         {"?$identity" {"@value" alice-did
+                                                        "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}})]
 
       (testing " with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
@@ -101,7 +101,7 @@
 (deftest ^:integration class-policy-query-enforcement
   (testing "Restrict an entire class for viewing via relationship "
     (let [conn            (test-utils/create-conn)
-          ledger          @(fluree/create conn "policy/global-class-restriction")
+          ledger          @(fluree/create conn "policy/class-policy-query-enforcement")
           root-did        (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did       (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           john-did        (:id (did/private->did-map "d0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c99"))
@@ -151,13 +151,13 @@
                                         "@value" {"@context" {"ex" "http://example.org/ns/"}
                                                   "where"    [{"@id"               "?$identity"
                                                                "ex:productManager" {"@id" "?$this"}}]}}}
-          john-policy-db  @(fluree/wrap-policy2
-                            db policy
+          john-policy-db  @(fluree/wrap-policy
+                            db policy true
                             {"?$identity" {"@value" john-did
                                            "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}})
 
-          alice-policy-db @(fluree/wrap-policy2
-                            db policy
+          alice-policy-db @(fluree/wrap-policy
+                            db policy true
                             {"?$identity" {"@value" alice-did
                                            "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}})]
 

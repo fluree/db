@@ -11,7 +11,7 @@
 (deftest ^:integration property-policy-tx-enforcement
   (testing "Restrict an entire class for modification"
     (let [conn              (test-utils/create-conn)
-          ledger            @(fluree/create conn "policy/global-class-restriction")
+          ledger            @(fluree/create conn "policy/property-policy-tx-enforcement")
           root-did          (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did         (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           john-did          (:id (did/private->did-map "d0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c99"))
@@ -61,7 +61,7 @@
                                            "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}}
 
           john-allowed      @(fluree/stage
-                              @(fluree/wrap-policy2 db policy john-params)
+                              @(fluree/wrap-policy db policy true john-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
                                            "f"      "https://ns.flur.ee/ledger#"}
@@ -73,7 +73,7 @@
                                            "schema:email" "updatedEmail@flur.ee"}})
 
           alice-not-allowed @(fluree/stage
-                              @(fluree/wrap-policy2 db policy alice-params)
+                              @(fluree/wrap-policy db policy true alice-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
                                            "f"      "https://ns.flur.ee/ledger#"}
@@ -95,7 +95,7 @@
 (deftest ^:integration class-policy-tx-enforcement
   (testing "Restrict an entire class for modification"
     (let [conn              (test-utils/create-conn)
-          ledger            @(fluree/create conn "policy/global-class-restriction")
+          ledger            @(fluree/create conn "policy/class-policy-tx-enforcement")
           root-did          (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did         (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           john-did          (:id (did/private->did-map "d0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c99"))
@@ -154,7 +154,7 @@
                                            "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}}
 
           john-allowed      @(fluree/stage
-                              @(fluree/wrap-policy2 db policy john-params)
+                              @(fluree/wrap-policy db policy true john-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
                                            "f"      "https://ns.flur.ee/ledger#"}
@@ -165,7 +165,7 @@
                                "insert"   {"@id"         "ex:widget",
                                            "schema:name" "Widget - Updated"}})
           alice-not-allowed @(fluree/stage
-                              @(fluree/wrap-policy2 db policy alice-params)
+                              @(fluree/wrap-policy db policy true alice-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
                                            "f"      "https://ns.flur.ee/ledger#"}

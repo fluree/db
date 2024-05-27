@@ -4,6 +4,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
+            [fluree.db.policy.enforce :as enforce]
             [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -16,41 +17,36 @@
   [{:keys [policy] :as _db}]
   (true? (get-in policy [const/iri-modify :root?])))
 
+(defn class-restrictions?
+  [policy]
+  (get-in policy [const/iri-view :class]))
+
+(defn property-restrictions?
+  [policy]
+  (get-in policy [const/iri-view :property]))
+
 (defn allow-flake?
   "Returns one of:
   (a) exception if there was an error
   (b) truthy value if flake is allowed
-  (c) falsey value if flake not allowed
-
-  Note this should only be called if the db is permissioned, don't call if the
-  root user as the results will not come back correctly."
+  (c) falsey value if flake not allowed"
   [{:keys [policy] :as db} flake]
   (go-try
-    (or (unrestricted-view? db)
-        (let [sid     (flake/s flake)
-              s-iri   (iri/decode-sid db sid)
-              pid     (flake/p flake)
-              p-iri   (iri/decode-sid db pid)
-              classes (or (get @(:cache policy) s-iri)
-                          (let [class-sids (<? (dbproto/-class-ids db sid))
-                                class-iris (map (fn [c]
-                                                  (iri/decode-sid db c))
-                                                class-sids)]
-                            ;; note, classes will return empty list if none found ()
-                            (swap! (:cache policy) assoc s-iri class-iris)
-                            class-iris))
-              fns     (keep #(or (get-in policy [const/iri-view :class % p-iri :function])
-                                 (get-in policy [const/iri-view :class % :default :function]))
-                            classes)]
-          (loop [[[async? f] & r] fns]
-            ;; return first truthy response, else false
-            (if f
-              (let [res (if async?
-                          (<? (f db flake))
-                          (f db flake))]
-                (or res
-                    (recur r)))
-              false))))))
+   (cond
+
+     (enforce/unrestricted? policy false)
+     true
+
+     ;; currently property-restrictions override class restrictions if present
+     (property-restrictions? policy)
+     (<? (enforce/property-allow? db false flake))
+
+     (class-restrictions? policy)
+     (let [sid       (flake/s flake)]
+       (<? (enforce/class-allow? db sid false nil)))
+
+     :else ;; no restrictions, use default
+     (:default-allow? policy))))
 
 (defn allow-iri?
   [db sid]
