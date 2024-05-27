@@ -103,10 +103,6 @@
     {:message opts}
     opts))
 
-
-
-
-
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
 (defn parse-commit-context

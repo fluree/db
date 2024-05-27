@@ -80,14 +80,14 @@
               (dbproto/-index-update new-db (:index latest-commit))
               new-db)))))))
 
-(defn update-db
-  "Updates the latest staged db and returns new branch data."
-  [{:keys [state] :as branch-data} db]
-  (swap! state (fn [{:keys [current-db] :as _current-state}]
-                 (let [{:keys [commit] :as current-db*} (use-latest db current-db)]
-                   {:commit commit
-                    :current-db current-db*})))
-  branch-data)
+(defn current-db
+  "Returns current db from branch data"
+  [{:keys [state] :as _branch-map}]
+  (:current-db @state))
+
+(defn current-commit
+  [{:keys [state] :as _branch-map}]
+  (:commit @state))
 
 (defn updatable-commit?
   [current-commit new-commit]
@@ -98,36 +98,32 @@
              (not (flake/t-after? new-t current-t))) ; index update may come after multiple commits
         (= new-t (inc current-t)))))
 
-(defn current-db
-  "Returns current db from branch data"
-  [{:keys [state] :as _branch-map}]
-  (:current-db @state))
-
-(defn current-commit
-  [{:keys [state] :as _branch-map}]
-  (:commit @state))
-
 (defn update-commit!
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
   [{:keys [state] :as branch-map} {new-commit :commit, db-t :t, :as db}]
-  (let [current-commit (:commit @state)
-        current-t      (commit-data/t current-commit)
-        new-t          (commit-data/t new-commit)]
-    (if (= db-t new-t)
-      (if (updatable-commit? current-commit new-commit)
-        (update-db branch-map db)
-        (do
-          (log/warn "Commit update failure.\n  Current commit:" current-commit
-                    "\n  New commit:" new-commit)
-          (throw (ex-info (str "Commit failed, latest committed db is " current-t
-                               " and you are trying to commit at db at t value of: "
-                               new-t ". These should be one apart. Likely db was "
-                               "updated by another user or process.")
-                          {:status 400 :error :db/invalid-commit}))))
-      (throw (ex-info (str "Unexpected Error updating commit database. "
-                           "New database has an inconsistent t from its commit:"
-                           db-t " and " new-t " respectively.")
-                      {:status 500 :error :db/invalid-db})))))
+  (swap! state
+         (fn [{:keys [current-db] :as current-state}]
+           (let [current-commit (:commit current-state)
+                 current-t      (commit-data/t current-commit)
+                 new-t          (commit-data/t new-commit)]
+             (if (= db-t new-t)
+               (if (updatable-commit? current-commit new-commit)
+                 (let [{:keys [commit] :as current-db*} (use-latest db current-db)]
+                   {:commit commit
+                    :current-db current-db*})
+                 (do
+                   (log/warn "Commit update failure.\n  Current commit:" current-commit
+                             "\n  New commit:" new-commit)
+                   (throw (ex-info (str "Commit failed, latest committed db is " current-t
+                                        " and you are trying to commit at db at t value of: "
+                                        new-t ". These should be one apart. Likely db was "
+                                        "updated by another user or process.")
+                                   {:status 400 :error :db/invalid-commit}))))
+               (throw (ex-info (str "Unexpected Error updating commit database. "
+                                    "New database has an inconsistent t from its commit:"
+                                    db-t " and " new-t " respectively.")
+                               {:status 500 :error :db/invalid-db}))))))
+  branch-map)
