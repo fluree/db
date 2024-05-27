@@ -57,7 +57,11 @@
 (def ^:const iri-insert (fluree-iri "insert"))
 (def ^:const iri-delete (fluree-iri "delete"))
 (def ^:const iri-rule (fluree-iri "rule"))
-
+(def ^:const iri-query (fluree-iri "query"))
+(def ^:const iri-onClass (fluree-iri "onClass"))
+(def ^:const iri-onProperty (fluree-iri "onProperty"))
+(def ^:const iri-exMessage (fluree-iri "exMessage"))
+(def ^:const iri-policyClass (fluree-iri "policyClass"))
 (def ^:const iri-context "@context")
 (def ^:const iri-id "@id")
 (def ^:const iri-value "@value")
