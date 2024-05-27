@@ -175,6 +175,8 @@
         address (-> jsonld
                     (get-first-value const/iri-address)
                     not-empty)
+        author  (get-first-value jsonld const/iri-author)
+        txn     (get-first-value jsonld const/iri-txn)
 
         time        (get-first-value jsonld const/iri-time)
         message     (get-first-value jsonld const/iri-message)
@@ -191,7 +193,9 @@
              :branch  branch
              :time    time
              :tag     (mapv :value tags)
-             :data    (parse-db-data data)}
+             :data    (parse-db-data data)
+             :author  author
+             :txn     txn}
       address     (assoc :address address)
       prev-commit (assoc :previous       {:id      (:id prev-commit)
                                           :address (get-first-value prev-commit const/iri-address)})
@@ -440,8 +444,8 @@
   "Builds and returns the commit metadata flakes for the given commit, t, and
   db-sid. Used when committing to an in-memory ledger value and when reifying
   a ledger from storage on load."
-  [{:keys [address alias branch data id time v author txn] :as _commit} t commit-sid db-sid]
-  (let [{ db-t :t db-address :address :keys [flakes size]} data]
+  [{:keys [address alias branch data time v author txn] :as _commit} t commit-sid db-sid]
+  (let [{db-t :t db-address :address :keys [flakes size]} data]
     [;; commit flakes
      ;; address
      (flake/create commit-sid const/$_address address const/$xsd:string t true nil)
