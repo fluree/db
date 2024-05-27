@@ -3,6 +3,7 @@
   (:require [fluree.db.db.json-ld :as jld-db]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.history :as history]
+            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.indexer :as indexer]
             [clojure.core.async :as async :refer [<! >! go]]
@@ -18,7 +19,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defrecord AsyncDB [alias branch t db-chan]
+(defrecord AsyncDB [alias branch commit t db-chan]
   where/Matcher
   (-match-id [_ fuel-tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
@@ -118,7 +119,7 @@
 
   (-as-of [_ t]
     (let [db-chan-at-t (async/promise-chan)
-          db-at-t      (->AsyncDB alias branch t db-chan-at-t)]
+          db-at-t      (->AsyncDB alias branch commit t db-chan-at-t)]
       (go
         (try*
           (let [db (<? db-chan)]
@@ -157,7 +158,7 @@
         (<? (policy/wrap-policy db identity)))))
   (root [_]
     (let [root-ch (async/promise-chan)
-          root-db (->AsyncDB alias branch t root-ch)]
+          root-db (->AsyncDB alias branch commit t root-ch)]
       (go
         (try*
           (let [db (<? db-chan)]
@@ -200,11 +201,10 @@
 
 (defn load
   [conn ledger-alias branch commit-jsonld]
-  (let [t (-> commit-jsonld
-              (get-first const/iri-data)
-              (get-first-value const/iri-t))
-        async-db (->AsyncDB ledger-alias branch t (async/promise-chan))]
+  (let [commit-map (commit-data/jsonld->clj commit-jsonld)
+        t          (-> commit-map :data :t)
+        async-db   (->AsyncDB ledger-alias branch commit-map t (async/promise-chan))]
     (go
-      (let [db (<! (jld-db/load conn ledger-alias branch commit-jsonld))]
+      (let [db (<! (jld-db/load conn ledger-alias branch [commit-jsonld commit-map]))]
         (deliver! async-db db)))
     async-db))

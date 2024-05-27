@@ -512,15 +512,14 @@
   (->> ns-codes keys (apply max)))
 
 (defn load
-  ([conn ledger-alias branch commit-jsonld]
-   (load conn ledger-alias branch commit-jsonld {}))
-  ([conn ledger-alias branch commit-jsonld
+  ([conn ledger-alias branch commit-pair]
+   (load conn ledger-alias branch commit-pair {}))
+  ([conn ledger-alias branch [commit-jsonld commit-map]
     {:keys [reindex-min-bytes reindex-max-bytes]
      :or   {reindex-min-bytes 100000                         ; 100 kb
             reindex-max-bytes 1000000}}]                     ; 1 mb
    (go-try
-     (let [commit-map  (commit-data/jsonld->clj commit-jsonld)
-           root-map    (if-let [{:keys [address]} (:index commit-map)]
+     (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root conn address))
                          (genesis-root-map ledger-alias))
            max-ns-code (max iri/last-default-code
