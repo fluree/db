@@ -324,7 +324,7 @@
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
 
-          mods (<? (modified-subjects db add))
+          mods (<? (modified-subjects (root-db db) add))
 
           db-after  (-> db
                         (update :staged conj [txn author-did annotation])
