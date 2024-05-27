@@ -24,9 +24,9 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.policy.enforce-tx :as tx-policy]
             [fluree.db.datatype :as datatype]
             [fluree.db.serde.json :as serde-json]
+            [fluree.db.policy.modify :as tx-policy]
             [fluree.db.query.json-ld.response :as jld-response]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.log :as log]
@@ -340,15 +340,12 @@
   (go-try
     (<? (shacl/validate! db-before (root-db db-after) (vals mods) context))
     (let [allowed-db (<? (tx-policy/allowed? staged-map))]
-      (root-db allowed-db))))
+      allowed-db)))
 
 (defn stage
   [db fuel-tracker context identity annotation raw-txn parsed-txn]
   (go-try
-    (let [db*               (if identity
-                              (<? (policy/wrap-policy db identity))
-                              db)
-          tx-state          (->tx-state :db db*
+    (let [tx-state          (->tx-state :db db
                                         :context context
                                         :txn raw-txn
                                         :author-did (:did identity)
