@@ -54,13 +54,6 @@
                        {:status 400 :error :db/invalid-branch})))
      (branch/current-commit branch-meta))))
 
-(defn current-t
-  ([ledger]
-   (current-t ledger nil))
-  ([ledger branch]
-   (-> ledger
-       (current-commit branch)
-       commit-data/t)))
 
 (defn commit-update
   "Updates both latest db and commit db. If latest registered index is
@@ -180,9 +173,9 @@
 
           db*      (assoc db :commit commit-map)
           db**     (if (new-t? ledger-commit new-commit)
-                     (commit-data/add-commit-flakes (:prev-commit db) db*)
+                     (commit-data/add-commit-flakes db* (:prev-commit db))
                      db*)
-          db***    (commit-update ledger branch (dissoc db** :txns) index-files-ch)
+          db***    (commit-update ledger branch db** index-files-ch)
           push-res (<? (push-commit conn ledger commit-write-map))]
       {:commit-res write-result
        :push-res   push-res
@@ -198,14 +191,14 @@
           (recur r (conj results [txn-id author-did annotation])))
         results))))
 
-(defn commit
+(defn commit!
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
   [{:keys [alias conn] :as ledger} {:keys [t stats commit] :as db} opts]
   (go-try
     (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
-          (enrich-commit-opts ledger opts)
+          (->> opts normalize-opts (enrich-commit-opts ledger))
 
           {:keys [dbid db-jsonld staged-txns]}
           (jld-db/db->jsonld db opts*)
@@ -248,18 +241,6 @@
          :commit-file-meta commit-file-meta
          :db               db**}
         db**))))
-
-(defn commit!
-  [ledger db opts]
-  (let [{:keys [branch] :as opts*}
-        (normalize-opts opts)
-        {:keys [t] :as db*} (or db (current-db ledger branch))
-        committed-t         (current-t ledger branch)]
-    (if (= t (flake/next-t committed-t))
-      (commit ledger db* opts*)
-      (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
-                           " is no longer consistent with staged db 't' value of: " t ".")
-                      {:status 400 :error :db/invalid-commit})))))
 
 (defn close-ledger
   "Shuts down ledger and resources."

@@ -539,7 +539,7 @@
 
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
-  [prev-commit {:keys [commit] :as db}]
+  [{:keys [commit] :as db} prev-commit]
   (let [{:keys [data id issuer message annotation]} commit
         {db-t :t, db-id :id}                        data
         {previous-id :id prev-data :data}           prev-commit
