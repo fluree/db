@@ -369,6 +369,20 @@
               [:bind "?isUri" "(isUri ?uri)"]
               [:bind "?sameTerm" "(sameTerm ?str ?str)"]
               {"@id" "?person", "person:age" "?age"}]
+             where))))
+  (testing "GRAPH"
+    (let [query "SELECT ?who ?g ?mbox
+                 FROM <http://example.org/dft.ttl>
+                 FROM NAMED <http://example.org/alice>
+                 FROM NAMED <http://example.org/bob>
+                 WHERE
+                 {
+                    ?g dc:publisher ?who .
+                    GRAPH ?g { ?x foaf:mbox ?mbox }
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?g", "dc:publisher" "?who"}
+	      [:graph "?g" [{"@id" "?x", "foaf:mbox" "?mbox"}]]]
              where)))))
 
 (deftest parse-prefixes
@@ -502,7 +516,7 @@ WHERE {
         fql (sparql/->fql query)]
     (is (= {:context {"psm" "http://srv.ktbl.de/data/psm/", "ex" "http://example.org/"},
             :select ["?p" "?o"],
-            :from "cookbook/base",
+            :from ["cookbook/base"],
             :where
             [{"@id" "ex:andrew" "?p" "?o"}]}
            fql))))
