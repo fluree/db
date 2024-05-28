@@ -524,7 +524,7 @@ WHERE {
         fql (sparql/->fql query)]
     (is (= {:context {"psm" "http://srv.ktbl.de/data/psm/", "ex" "http://example.org/"},
             :select ["?p" "?o"],
-            :from "cookbook/base",
+            :from ["cookbook/base"],
             :where
             [{"@id" "ex:andrew" "?p" "?o"}]}
            fql))))
