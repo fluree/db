@@ -139,6 +139,15 @@
         (when have-value?
           (apply array-map (persistent! acc)))))))
 
+(defn data-map->json-ld
+  [data-map]
+  (let [prev-data-map  (:previous data-map)
+        prev-data      (when (not-empty prev-data-map)
+                         (merge-template prev-data-map json-ld-prev-data-template))]
+    (-> data-map
+        (assoc :previous prev-data)
+        (merge-template json-ld-data-template))))
+
 (defn ->json-ld
   "Converts a clojure commit map to a JSON-LD version.
   Uses the JSON-LD template, and only incorporates values
@@ -146,16 +155,14 @@
   except for some defaults (like rdf:type) which are not in
   our internal commit map, but are part of json-ld."
   [{:keys [previous data ns index issuer] :as commit-map}]
-  (let [prev-data   (when (not-empty (:previous data))
-                      (merge-template (:previous data) json-ld-prev-data-template))
-        commit-map* (assoc commit-map
-                      :previous (merge-template previous json-ld-prev-commit-template)
-                      :data (merge-template (assoc data :previous prev-data) json-ld-data-template)
-                      :issuer (merge-template issuer json-ld-issuer-template)
-                      :ns (mapv #(merge-template % json-ld-ns-template) ns)
-                      :index (-> (merge-template (:data index) json-ld-data-template) ;; index has an embedded db map
-                                 (#(assoc index :data %))
-                                 (merge-template json-ld-index-template)))]
+  (let [commit-map*    (assoc commit-map
+                              :previous (merge-template previous json-ld-prev-commit-template)
+                              :data (data-map->json-ld data)
+                              :issuer (merge-template issuer json-ld-issuer-template)
+                              :ns (mapv #(merge-template % json-ld-ns-template) ns)
+                              :index (-> index
+                                         (update :data data-map->json-ld) ; index has an embedded db map
+                                         (merge-template json-ld-index-template)))]
     (merge-template commit-map* json-ld-base-template)))
 
 (defn parse-db-data
