@@ -193,7 +193,7 @@
                   "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
                  ["fluree:commit:sha256:bbotrki6dconqj6toctgbuu7qjpfrfywu6srolrk32yaogy5xmsvl"
                   :f/address
-                  "fluree:memory://b39f77d4944c00d4fc2be335142dedff977e249c8f5e6b6b9f507a9157b4b3f8"]
+                  "fluree:memory://6a39be21ed7e25ca8f8f7b93ed02b5d53d060bea043471c4e14086f09af9f346"]
                  ["fluree:commit:sha256:bbotrki6dconqj6toctgbuu7qjpfrfywu6srolrk32yaogy5xmsvl"
                   :f/alias
                   "query/everything"]

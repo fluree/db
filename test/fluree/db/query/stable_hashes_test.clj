@@ -31,7 +31,7 @@
         (is (= "fluree:commit:sha256:bc4pgf733mfhelp4ueeciwbfftthr4juvh2btondbmzjbvf6zpf5"
                (get-in db1 [:commit :id]))))
       (testing "stable commit address"
-        (is (= "fluree:memory://fad18a633a1966f56e9acde375d307d08942983f74c335c1113bbf474a3ccc90"
+        (is (= "fluree:memory://10e1db9dc617a4d4b01a3fbdea6eb97a52f4173a8b01c2cdbb66ec05f90a41c7"
                (get-in db1 [:commit :address]))))
       (testing "stable db id"
         (is (= "fluree:db:sha256:bbsfu5hq2mkalfpirabumzsohpwwz3legce6hie6tpb6nlqwvzigc"
