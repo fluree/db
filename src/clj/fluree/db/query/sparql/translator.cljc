@@ -366,6 +366,16 @@
   [[_ source]]
   (parse-term source))
 
+(defmethod parse-term :GraphGraphPattern
+  ;; GraphGraphPattern ::= <'GRAPH'> VarOrIri GroupGraphPattern
+  [[_ & [var-or-iri group-graph-pattern]]]
+  [:graph (parse-term var-or-iri) (into [] (parse-term group-graph-pattern))])
+
+(defmethod parse-term :VarOrIri
+  ;; <VarOrIri> ::= Var | iri WS
+  [[_ var-or-iri]]
+  (parse-term var-or-iri))
+
 (defmethod parse-rule :DatasetClause
   ;; DatasetClause ::= FromClause*
   ;; <FromClause>  ::= <'FROM'> WS ( DefaultGraphClause | NamedGraphClause )
