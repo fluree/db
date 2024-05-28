@@ -263,7 +263,12 @@
   "Retrieves latest db, or optionally a db at a moment in time
   and/or permissioned to a specific identity."
   ([ledger]
-   (ledger/-db ledger)))
+   (db ledger nil))
+  ([ledger opts]
+   (if opts
+     (throw (ex-info "DB opts not yet implemented"
+                     {:status 500 :error :db/unexpected-error}))
+     (ledger/-db ledger))))
 
 
 (defn wrap-policy
