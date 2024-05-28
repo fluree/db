@@ -10,9 +10,56 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn same-commit?
+  [current-commit indexed-commit]
+  (let [current-t (commit-data/t current-commit)
+        indexed-t (commit-data/t indexed-commit)]
+    (and (= current-t indexed-t)
+         (= (:id current-t)
+            (:id indexed-t)))))
+
+(defn older-commit?
+  [current-commit indexed-commit]
+  (let [current-t (commit-data/t current-commit)
+        indexed-t (commit-data/t indexed-commit)]
+    (> current-t indexed-t)))
+
+(defn newer-index?
+  [commit-x commit-y]
+  (let [x-index-t (commit-data/index-t commit-x)
+        y-index-t (commit-data/index-t commit-y)]
+    (and (some? x-index-t)
+         (or (nil? y-index-t)
+             (> x-index-t y-index-t)))))
+
+(defn commit-map->commit-jsonld
+  [commit-map]
+  (-> commit-map commit-data/->json-ld json-ld/expand))
+
 (defn update-index
-  [current-state indexed-db]
-  )
+  [{current-commit :commit, :as current-state}
+   {:keys [conn alias branch], indexed-commit :commit, :as indexed-db}]
+  (if (same-commit? current-commit indexed-commit)
+    (if (newer-index? indexed-commit current-commit)
+      (assoc current-state
+             :commit     indexed-commit
+             :current-db indexed-db)
+      current-state)
+    (if (older-commit? current-commit indexed-commit)
+      (if (newer-index? indexed-commit current-commit)
+        (let [latest-index         (:index indexed-commit)
+              latest-commit        (assoc current-commit :index latest-index)
+              latest-commit-jsonld (commit-map->commit-jsonld latest-commit)
+              latest-db            (async-db/load conn alias branch latest-commit-jsonld)]
+          (assoc current-state
+                 :commit     latest-commit
+                 :current-db latest-db))
+        current-state)
+      (do (log/warn "Rejecting index update for future commit at transaction:"
+                    (commit-data/t indexed-commit)
+                    "because it is after the current transaction value:"
+                    (commit-data/t current-commit))
+          current-state))))
 
 (defn index-queue
   [branch-state]
@@ -21,14 +68,18 @@
     (go-loop []
       (when-let [{:keys [db index-files-ch]} (<! queue)]
         (try*
-          (when-let [new-db (<? (indexer/collect db index-files-ch))]
-            (swap! branch-state update-index new-db))
+          (when-let [indexed-db (<? (indexer/collect db index-files-ch))]
+            (swap! branch-state update-index indexed-db))
           (catch* e
                   (log/error e "Error updating index"))
           (finally
             (async/close! index-files-ch)))
         (recur)))
     queue))
+
+(defn enqueue-index!
+  [idx-q db index-files-ch]
+  (async/put! idx-q {:db db, :index-files-ch index-files-ch}))
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
@@ -53,18 +104,6 @@
          (= (-> new-commit :previous :id)
             (:id current-commit)))))
 
-(defn newer-index?
-  [current-commit new-commit]
-  (let [current-index-t (commit-data/index-t current-commit)
-        new-index-t (commit-data/index-t new-commit)]
-    (and (some? current-index-t)
-         (or (nil? new-index-t)
-             (> current-index-t new-index-t)))))
-
-(defn commit-map->commit-jsonld
-  [commit-map]
-  (-> commit-map commit-data/->json-ld json-ld/expand))
-
 (defn update-commit
   [{current-commit :commit, :as current-state}
    {:keys [conn alias branch], new-commit :commit, :as new-db}]
@@ -72,7 +111,7 @@
     (if (newer-index? current-commit new-commit)
       (let [latest-index         (:index current-commit)
             latest-commit        (assoc new-commit :index latest-index)
-            latest-commit-jsonld (commit-map->commit-jsonld new-commit)
+            latest-commit-jsonld (commit-map->commit-jsonld latest-commit)
             latest-db            (async-db/load conn alias branch latest-commit-jsonld)]
         (assoc current-state
                :commit     latest-commit
@@ -96,11 +135,11 @@
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
-  [{:keys [state] :as branch-map} new-db index-files-ch]
+  [{:keys [state index-queue] :as branch-map} new-db index-files-ch]
   (let [updated-db (-> state
                        (swap! update-commit new-db)
                        :current-db)]
-
+    (enqueue-index! index-queue updated-db index-files-ch)
     branch-map))
 
 (defn current-db
