@@ -475,6 +475,19 @@
       (when-not (async/<! (match-clause ds fuel-tracker solution clause error-ch))
         solution))))
 
+(defmethod match-pattern :minus
+  [ds fuel-tracker solution pattern error-ch]
+  (let [clause (pattern-data pattern)
+        out-ch (async/chan 2 (filter (fn [minus-solution]
+                                       (let [vars (keys minus-solution)]
+                                         (= minus-solution (select-keys solution vars))))))]
+    (go
+      ;; if there are any matches, remove the solution
+      (when-not (-> (match-clause ds fuel-tracker solution clause error-ch)
+                    (async/pipe out-ch)
+                    (async/<!))
+        solution))))
+
 (defmethod match-pattern :graph
   [ds fuel-tracker solution pattern error-ch]
   (let [[g clause] (pattern-data pattern)]
