@@ -504,7 +504,6 @@
      :stats           {:flakes 0, :size 0, :indexed 0}
      :namespaces      iri/default-namespaces
      :namespace-codes iri/default-namespace-codes
-     :novelty         (new-novelty-map index/comparators)
      :schema          (vocab/base-schema)}))
 
 (defn get-max-ns-code
@@ -542,6 +541,7 @@
                                   :tt-id nil
                                   :comparators index/comparators
                                   :staged []
+                                  :novelty (new-novelty-map index/comparators)
                                   :max-namespace-code max-ns-code
                                   :reindex-min-bytes reindex-min-bytes
                                   :reindex-max-bytes reindex-max-bytes)
