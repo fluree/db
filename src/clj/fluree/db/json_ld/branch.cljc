@@ -73,7 +73,8 @@
           (catch* e
                   (log/error e "Error updating index"))
           (finally
-            (async/close! index-files-ch)))
+            (when index-files-ch
+              (async/close! index-files-ch))))
         (recur)))
     queue))
 
