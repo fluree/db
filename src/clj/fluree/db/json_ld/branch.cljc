@@ -3,7 +3,6 @@
             [fluree.db.indexer :as indexer]
             [fluree.json-ld :as json-ld]
             [fluree.db.database.async :as async-db]
-            [fluree.db.db.json-ld :as jld-db]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log :include-macros true]
@@ -49,8 +48,10 @@
   [current-commit new-commit]
   (let [current-t (commit-data/t current-commit)
         new-t     (commit-data/t new-commit)]
-    (or (nil? current-t)
-        (= new-t (inc current-t)))))
+    (and (or (nil? current-t)
+             (= new-t (inc current-t)))
+         (= (-> new-commit :previous :id)
+            (:id current-commit)))))
 
 (defn newer-index?
   [current-commit new-commit]
