@@ -1,7 +1,6 @@
 (ns fluree.db.db.json-ld.policy
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
-            [fluree.json-ld :as json-ld]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.policy-validate :as validate]
             [fluree.db.util.core :as util :refer [try* catch*]]

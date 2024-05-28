@@ -3,8 +3,7 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
-            [fluree.db.query.exec :as exec]
-            [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]])
+            [fluree.db.query.exec :as exec])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -44,9 +43,7 @@
    (if (cache? query-map)
      (cache-query ds query-map)
      (let [q   (try*
-                 (let [parsed (parse/parse-query query-map)]
-                   (or (re-parse-as-simple-subj-crawl parsed ds)
-                       parsed))
+                 (parse/parse-query query-map)
                  (catch* e e))
            db* (assoc ds :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
        (if (util/exception? q)
