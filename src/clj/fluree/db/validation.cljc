@@ -260,13 +260,15 @@
                             [:schema [:ref ::where]]]
     ::not-exists           [:+ {:error/message "not-exists pattern must be a sequence of valid where clauses."}
                             [:schema [:ref ::where]]]
+    ::minus                [:+ {:error/message "minus pattern must be a sequence of valid where clauses."}
+                            [:schema [:ref ::where]]]
     ::bind                 [:+ {:error/message "bind values must be mappings from variables to functions"}
                             [:catn [:var ::var]
                              [:binding ::function]]]
     ::where-op             [:and
                             :keyword
-                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind, values, exists, not-exists"}
-                             :graph :filter :optional :union :bind :values :exists :not-exists]]
+                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind, values, exists, not-exists, minus"}
+                             :graph :filter :optional :union :bind :values :exists :not-exists :minus]]
     ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
@@ -301,6 +303,9 @@
                             [:values [:catn
                                       [:op ::where-op]
                                       [:patterns ::values]]]
+                            [:minus [:catn
+                                     [:op ::where-op]
+                                     [:patterns ::minus]]]
                             [:exists [:catn
                                       [:op ::where-op]
                                       [:patterns ::exists]]]
