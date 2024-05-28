@@ -383,7 +383,21 @@
                 [:bind "?isUri" "(isUri ?uri)"]
                 [:bind "?sameTerm" "(sameTerm ?str ?str)"]
                 {"@id" "?person", "person:age" "?age"}]
-               where))))))
+               where)))))
+  (testing "GRAPH"
+    (let [query "SELECT ?who ?g ?mbox
+                 FROM <http://example.org/dft.ttl>
+                 FROM NAMED <http://example.org/alice>
+                 FROM NAMED <http://example.org/bob>
+                 WHERE
+                 {
+                    ?g dc:publisher ?who .
+                    GRAPH ?g { ?x foaf:mbox ?mbox }
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?g", "dc:publisher" "?who"}
+        [:graph "?g" [{"@id" "?x", "foaf:mbox" "?mbox"}]]]
+             where)))))
 
 (deftest parse-prefixes
   (testing "PREFIX"
