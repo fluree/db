@@ -167,21 +167,23 @@
 
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
-  [{:keys [conn alias] :as ledger} {:keys [commit branch] :as db} keypair index-files-ch]
+  [{:keys [conn alias] :as ledger}
+   {:keys [branch], new-commit :commit, :as db}
+   keypair
+   index-files-ch]
   (go-try
+    (log/debug "do-commit+push new-commit:" new-commit)
     (let [ledger-commit (current-commit ledger branch)
-          new-commit    (commit-data/use-latest-index commit ledger-commit)
-          _             (log/debug "do-commit+push new-commit:" new-commit)
 
           {:keys [commit-map write-result] :as commit-write-map}
           (<? (write-commit conn alias keypair new-commit))
 
-          db*   (assoc db :commit commit-map)
-          db**  (if (new-t? ledger-commit commit)
-                  (commit-data/add-commit-flakes (:prev-commit db) db*)
-                  db*)
-          db*** (commit-update ledger branch (dissoc db** :txns) index-files-ch)
-          push-res      (<? (push-commit conn ledger commit-write-map))]
+          db*      (assoc db :commit commit-map)
+          db**     (if (new-t? ledger-commit new-commit)
+                     (commit-data/add-commit-flakes (:prev-commit db) db*)
+                     db*)
+          db***    (commit-update ledger branch (dissoc db** :txns) index-files-ch)
+          push-res (<? (push-commit conn ledger commit-write-map))]
       {:commit-res write-result
        :push-res   push-res
        :db         db***})))
