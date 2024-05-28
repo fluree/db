@@ -3,5 +3,5 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defprotocol Indexed
-  (collect [indexed changes-ch]))
+(defprotocol Indexable
+  (index [indexed changes-ch]))

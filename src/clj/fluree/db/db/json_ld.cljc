@@ -403,8 +403,8 @@
     (let [sid (iri/encode-iri db iri)]
       (validate/allow-iri? db sid)))
 
-  indexer/Indexed
-  (collect [db changes-ch]
+  indexer/Indexable
+  (index [db changes-ch]
     (if (idx-default/novelty-min? db reindex-min-bytes)
       (idx-default/refresh db changes-ch)
       (go)))

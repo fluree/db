@@ -68,7 +68,7 @@
     (go-loop []
       (when-let [{:keys [db index-files-ch]} (<! queue)]
         (try*
-          (when-let [indexed-db (<? (indexer/collect db index-files-ch))]
+          (when-let [indexed-db (<? (indexer/index db index-files-ch))]
             (swap! branch-state update-index indexed-db))
           (catch* e
                   (log/error e "Error updating index"))

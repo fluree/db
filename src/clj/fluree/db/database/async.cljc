@@ -101,11 +101,11 @@
         (<? (transact/-stage-txn db fuel-tracker context identity annotation raw-txn parsed-txn)))))
 
 
-  indexer/Indexed
-  (collect [_ changes-ch]
+  indexer/Indexable
+  (index [_ changes-ch]
     (go-try
       (let [db (<? db-chan)]
-        (<? (indexer/collect db changes-ch)))))
+        (<? (indexer/index db changes-ch)))))
 
 
   time-travel/TimeTravel
