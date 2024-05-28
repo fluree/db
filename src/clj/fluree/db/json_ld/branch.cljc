@@ -96,9 +96,12 @@
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
-  [{:keys [state] :as branch-map} new-db]
-  (swap! state update-commit new-db)
-  branch-map)
+  [{:keys [state] :as branch-map} new-db index-files-ch]
+  (let [updated-db (-> state
+                       (swap! update-commit new-db)
+                       :current-db)]
+
+    branch-map))
 
 (defn current-db
   "Returns current db from branch data"

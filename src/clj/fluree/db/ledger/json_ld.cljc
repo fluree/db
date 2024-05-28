@@ -69,7 +69,7 @@
   newer than provided db, updates index before storing.
 
   If index in provided db is newer, updates latest index held in ledger state."
-  [{:keys [state] :as ledger} branch-name db]
+  [{:keys [state] :as ledger} branch-name db index-files-ch]
   (log/debug "Attempting to update ledger:" (:alias ledger)
              "and branch:" branch-name "with new commit to t" (:t db))
   (let [branch-meta (get-branch-meta ledger branch-name)]
@@ -77,7 +77,7 @@
       (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                            "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
                       {:status 400 :error :db/invalid-branch})))
-    (branch/update-commit! branch-meta db)
+    (branch/update-commit! branch-meta db index-files-ch)
     (branch/current-db branch-meta)))
 
 (defn status
@@ -167,7 +167,7 @@
 
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
-  [{:keys [conn alias] :as ledger} {:keys [commit branch] :as db} keypair]
+  [{:keys [conn alias] :as ledger} {:keys [commit branch] :as db} keypair index-files-ch]
   (go-try
     (let [ledger-commit (current-commit ledger branch)
           new-commit    (commit-data/use-latest-index commit ledger-commit)
@@ -180,7 +180,7 @@
           db**  (if (new-t? ledger-commit commit)
                   (commit-data/add-commit-flakes (:prev-commit db) db*)
                   db*)
-          db*** (commit-update ledger branch (dissoc db** :txns))
+          db*** (commit-update ledger branch (dissoc db** :txns) index-files-ch)
           push-res      (<? (push-commit conn ledger commit-write-map))]
       {:commit-res write-result
        :push-res   push-res
@@ -239,7 +239,7 @@
 
           {db**             :db
            commit-file-meta :commit-res}
-          (<? (do-commit+push ledger db* keypair))]
+          (<? (do-commit+push ledger db* keypair index-files-ch))]
 
       (if file-data?
         {:data-file-meta   ledger-update-res
