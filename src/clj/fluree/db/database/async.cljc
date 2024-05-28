@@ -199,6 +199,10 @@
       :db-chan
       (async/put! db)))
 
+(defn deref-async
+  [^AsyncDB async-db]
+  (:db-chan async-db))
+
 (defn load
   [conn ledger-alias branch commit-jsonld]
   (let [commit-map (commit-data/jsonld->clj commit-jsonld)

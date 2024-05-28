@@ -7,6 +7,8 @@
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
+            #?@(:clj ([fluree.db.database.async :as async-db]
+                      [clojure.core.async :as async]))
             #?(:clj  [test-with-files.tools :refer [with-tmp-dir]
                       :as twf]
                :cljs [test-with-files.tools :as-alias twf])))
@@ -697,7 +699,7 @@
      (testing "fuel tracking"
        (let [conn   (test-utils/create-conn)
              ledger @(fluree/create conn "test/fuel-tracking")
-             db0    (fluree/db ledger)]
+             db0    (async/<!! (async-db/deref-async (fluree/db ledger)))]
          (testing "transactions"
            (testing "with the `:meta` option"
              (let [response    @(fluree/stage db0 {"@context" ["https://ns.flur.ee"
