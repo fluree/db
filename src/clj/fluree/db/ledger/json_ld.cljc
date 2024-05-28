@@ -10,8 +10,6 @@
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
-            [fluree.db.indexer :as indexer]
-            [fluree.db.indexer.default :as idx-default]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
@@ -263,8 +261,7 @@
 
 (defn close-ledger
   "Shuts down ledger and resources."
-  [{:keys [indexer cache state conn alias] :as _ledger}]
-  (indexer/-close indexer)
+  [{:keys [cache state conn alias] :as _ledger}]
   (reset! state {:closed? true})
   (reset! cache {})
   (release-ledger conn alias)) ;; remove ledger from conn cache
@@ -315,7 +312,7 @@
                     " however, latest t is more current: " current-t)
           false)))))
 
-(defrecord JsonLDLedger [id address alias did indexer state cache conn reasoner]
+(defrecord JsonLDLedger [id address alias did state cache conn reasoner]
   ledger/iCommit
   (-commit! [ledger db] (commit! ledger db nil))
   (-commit! [ledger db opts] (commit! ledger db opts))
@@ -360,23 +357,6 @@
               :pending  {:t   0
                          :dag nil}}})
 
-(defn validate-indexer
-  [indexer reindex-min-bytes reindex-max-bytes]
-  (cond
-    (satisfies? indexer/iIndex indexer)
-    indexer
-
-    indexer
-    (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
-                         "Provided: " indexer)
-                    {:status 400 :error :db/invalid-indexer}))
-
-    :else
-    (idx-default/create
-      (util/without-nils
-        {:reindex-min-bytes reindex-min-bytes
-         :reindex-max-bytes reindex-max-bytes}))))
-
 (defn parse-did
   [conn did]
   (if did
@@ -386,19 +366,17 @@
     (connection/-did conn)))
 
 (defn parse-ledger-options
-  [conn {:keys [did branch indexer reindex-min-bytes reindex-max-bytes]
+  [conn {:keys [did branch]
          :or   {branch :main}}]
-  (let [did*    (parse-did conn did)
-        indexer (validate-indexer indexer reindex-min-bytes reindex-max-bytes)]
+  (let [did*    (parse-did conn did)]
     {:did     did*
-     :branch  branch
-     :indexer indexer}))
+     :branch  branch}))
 
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [did branch indexer]}
+    (let [{:keys [did branch]}
           (parse-ledger-options conn opts)
 
           ledger-alias*  (normalize-alias ledger-alias)
@@ -415,7 +393,6 @@
          :alias    ledger-alias*
          :address  address
          :cache    (atom {})
-         :indexer  indexer
          :reasoner #{}
          :conn     conn}))))
 
@@ -469,7 +446,7 @@
           ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
 
-          {:keys [did branch indexer]} (parse-ledger-options conn {:branch branch})
+          {:keys [did branch]} (parse-ledger-options conn {:branch branch})
 
           branches {branch (branch/state-map conn ledger-alias branch commit)}
           ledger   (map->JsonLDLedger
@@ -479,7 +456,6 @@
                       :alias    ledger-alias
                       :address  address
                       :cache    (atom {})
-                      :indexer  indexer
                       :reasoner #{}
                       :conn     conn})]
       (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
