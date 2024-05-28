@@ -69,16 +69,18 @@
   newer than provided db, updates index before storing.
 
   If index in provided db is newer, updates latest index held in ledger state."
-  [{:keys [state] :as ledger} branch-name db index-files-ch]
-  (log/debug "Attempting to update ledger:" (:alias ledger)
-             "and branch:" branch-name "with new commit to t" (:t db))
-  (let [branch-meta (get-branch-meta ledger branch-name)]
-    (when-not branch-meta
-      (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
-                           "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
-                      {:status 400 :error :db/invalid-branch})))
-    (branch/update-commit! branch-meta db index-files-ch)
-    (branch/current-db branch-meta)))
+  ([ledger branch-name db]
+   (commit-update ledger branch-name db nil))
+  ([{:keys [state] :as ledger} branch-name db index-files-ch]
+   (log/debug "Attempting to update ledger:" (:alias ledger)
+              "and branch:" branch-name "with new commit to t" (:t db))
+   (let [branch-meta (get-branch-meta ledger branch-name)]
+     (when-not branch-meta
+       (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
+                            "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
+                       {:status 400 :error :db/invalid-branch})))
+     (branch/update-commit! branch-meta db index-files-ch)
+     (branch/current-db branch-meta))))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
