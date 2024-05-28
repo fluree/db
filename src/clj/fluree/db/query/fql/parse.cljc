@@ -417,6 +417,14 @@
   (let [[_vars solutions] (parse-values values context)]
     [(where/->pattern :values solutions)]))
 
+(defmethod parse-pattern :exists
+  [[_ patterns] vars context]
+  [(where/->pattern :exists (mapcat #(parse-pattern % vars context) (util/sequential patterns)))])
+
+(defmethod parse-pattern :not-exists
+  [[_ patterns] vars context]
+  [(where/->pattern :not-exists (mapcat #(parse-pattern % vars context) (util/sequential patterns)))])
+
 (defmethod parse-pattern :graph
   [[_ graph where] vars context]
   (let [graph* (or (parse-variable graph)
