@@ -90,28 +90,3 @@
       (log/warn (str "Policy f:equals only supports equals paths that start with f:$identity currently. "
                      "Ignoring provided rule: " rule))
       [false (constantly false)])))
-
-(defn resolve-contains-rule
-  "When using a contains rule, calculates a given path's value and stores in local cache.
-
-  Contains, unlike 'equals' will return a set of all possible results at the leaf of the
-  defined path."
-  [{:keys [policy] :as db} path-pids equals-rule]
-  (go-try
-    (let [{:keys [cache ident]} policy]
-      (loop [[next-pid & rest-path] path-pids
-             last-results #{ident}]
-        (if next-pid
-          (loop [[next-result & r] last-results
-                 acc #{}]
-            (if next-result
-              (let [next-res (<? (query-range/index-range db :spot = [next-result next-pid]))]
-                (recur r (reduce (fn [acc* res-flake]
-                                   (if (= const/$xsd:anyURI (flake/dt res-flake))
-                                     (conj acc* (flake/o res-flake))
-                                     acc*))
-                                 acc next-res)))
-              (recur rest-path acc)))
-          (do
-            (swap! cache assoc equals-rule last-results)
-            last-results))))))

@@ -6,6 +6,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.log :as log]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn unrestricted?
   [policy modify?]
   (if modify?

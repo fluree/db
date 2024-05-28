@@ -6,6 +6,7 @@
             [fluree.db.util.async :refer [go-try]]
             [fluree.db.util.log :as log]))
 
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn property-restriction?
   [restriction-map]
