@@ -43,18 +43,6 @@
                        {:status 400 :error :db/invalid-branch})))
      (branch/current-db branch-meta))))
 
-(defn current-commit
-  ([ledger]
-   (current-commit ledger nil))
-  ([ledger branch]
-   (let [branch-meta (get-branch-meta ledger branch)]
-     ;; if branch is nil, will return default
-     (when-not branch-meta
-       (throw (ex-info (str "Invalid branch: " branch ".")
-                       {:status 400 :error :db/invalid-branch})))
-     (branch/current-commit branch-meta))))
-
-
 (defn update-commit!
   "Updates both latest db and commit db. If latest registered index is
   newer than provided db, updates index before storing.
@@ -132,12 +120,15 @@
      :type-key       (json-ld/compact "@type" compact-fn)
      :index-files-ch index-files-ch})) ;; optional async chan passed in which will stream out all new index files created (for consensus)
 
-(defn new-t?
-  [ledger-commit db-commit]
-  (let [ledger-t (commit-data/t ledger-commit)]
-    (or (nil? ledger-t)
-        (flake/t-after? (commit-data/t db-commit)
-                        ledger-t))))
+(defn write-transactions!
+  [conn {:keys [alias] :as _ledger} staged]
+  (go-try
+    (loop [[[txn author-did annotation] & r] staged
+           results                []]
+      (if txn
+        (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
+          (recur r (conj results [txn-id author-did annotation])))
+        results))))
 
 (defn write-commit
   [conn alias {:keys [did private]} commit]
@@ -160,60 +151,30 @@
                                  :ledger-state state)))
 
 (defn formalize-commit
-  [db commit-map ledger-commit]
-  (cond-> db
-    true
-    (assoc :commit commit-map)
-
-    (new-t? ledger-commit commit-map)
-    (commit-data/add-commit-flakes (:prev-commit db))))
-
-(defn do-commit+push
-  "Writes commit and pushes, kicks off indexing if necessary."
-  [{:keys [conn alias] :as ledger}
-   {:keys [branch], new-commit :commit, :as db}
-   keypair
-   index-files-ch]
-  (go-try
-    (log/debug "do-commit+push new-commit:" new-commit)
-    (let [{:keys [commit-map write-result] :as commit-write-map}
-          (<? (write-commit conn alias keypair new-commit))
-
-          ledger-commit (current-commit ledger branch)
-          db*           (formalize-commit db commit-map ledger-commit)
-          db**          (update-commit! ledger branch db* index-files-ch)
-          push-res      (<? (push-commit conn ledger commit-write-map))]
-      {:commit-res write-result
-       :push-res   push-res
-       :db         db**})))
-
-(defn write-transactions!
-  [conn {:keys [alias] :as _ledger} staged]
-  (go-try
-    (loop [[[txn author-did annotation] & r] staged
-           results                []]
-      (if txn
-        (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
-          (recur r (conj results [txn-id author-did annotation])))
-        results))))
+  [{prev-commit :commit :as staged-db} new-commit]
+  (-> staged-db
+      (update :staged empty)
+      (assoc :commit new-commit
+             :prev-commit prev-commit)
+      (commit-data/add-commit-flakes prev-commit)))
 
 (defn commit!
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [alias conn] :as ledger} {:keys [t stats commit] :as db} opts]
+  [{:keys [alias conn] :as ledger} {:keys [branch t stats commit] :as staged-db} opts]
   (go-try
     (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
           (->> opts normalize-opts (enrich-commit-opts ledger))
 
           {:keys [dbid db-jsonld staged-txns]}
-          (jld-db/db->jsonld db opts*)
+          (jld-db/db->jsonld staged-db opts*)
 
           [[txn-id author annotation] :as txns]
           (<? (write-transactions! conn ledger staged-txns))
 
-          ledger-update-res (<? (connection/-c-write conn alias db-jsonld)) ; write commit data
-          db-address        (:address ledger-update-res) ; may not have address (e.g. IPFS) until after writing file
+          data-write-result (<? (connection/-c-write conn alias db-jsonld)) ; write commit data
+          db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
 
           commit-time (util/current-time-iso)
           _           (log/debug "Committing t" t "at" commit-time)
@@ -232,21 +193,21 @@
                            :flakes     (:flakes stats)
                            :size       (:size stats)}
           new-commit      (commit-data/new-db-commit-map base-commit-map)
-          db*             (-> db
-                              (update :staged empty)
-                              (assoc :commit new-commit
-                                     :prev-commit commit))
           keypair         (select-keys opts* [:did :private])
 
-          {db**             :db
-           commit-file-meta :commit-res}
-          (<? (do-commit+push ledger db* keypair index-files-ch))]
+          {:keys [commit-map write-result] :as commit-write-map}
+          (<? (write-commit conn alias keypair new-commit))
+
+          db  (formalize-commit staged-db commit-map)
+          db* (update-commit! ledger branch db index-files-ch)]
+
+      (<? (push-commit conn ledger commit-write-map))
 
       (if file-data?
-        {:data-file-meta   ledger-update-res
-         :commit-file-meta commit-file-meta
-         :db               db**}
-        db**))))
+        {:data-file-meta   data-write-result
+         :commit-file-meta write-result
+         :db               db*}
+        db*))))
 
 (defn close-ledger
   "Shuts down ledger and resources."
