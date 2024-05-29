@@ -158,6 +158,15 @@
                                  :json-ld commit-jsonld
                                  :ledger-state state)))
 
+(defn formalize-commit
+  [db commit-map ledger-commit]
+  (cond-> db
+    true
+    (assoc :commit commit-map)
+
+    (new-t? ledger-commit commit-map)
+    (commit-data/add-commit-flakes (:prev-commit db))))
+
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
   [{:keys [conn alias] :as ledger}
@@ -166,20 +175,16 @@
    index-files-ch]
   (go-try
     (log/debug "do-commit+push new-commit:" new-commit)
-    (let [ledger-commit (current-commit ledger branch)
-
-          {:keys [commit-map write-result] :as commit-write-map}
+    (let [{:keys [commit-map write-result] :as commit-write-map}
           (<? (write-commit conn alias keypair new-commit))
 
-          db*      (assoc db :commit commit-map)
-          db**     (if (new-t? ledger-commit new-commit)
-                     (commit-data/add-commit-flakes db* (:prev-commit db))
-                     db*)
-          db***    (commit-update ledger branch db** index-files-ch)
-          push-res (<? (push-commit conn ledger commit-write-map))]
+          ledger-commit (current-commit ledger branch)
+          db*           (formalize-commit db commit-map ledger-commit)
+          db**          (commit-update ledger branch db* index-files-ch)
+          push-res      (<? (push-commit conn ledger commit-write-map))]
       {:commit-res write-result
        :push-res   push-res
-       :db         db***})))
+       :db         db**})))
 
 (defn write-transactions!
   [conn {:keys [alias] :as _ledger} staged]
