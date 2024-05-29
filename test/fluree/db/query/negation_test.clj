@@ -3,7 +3,7 @@
              [fluree.db.json-ld.api :as fluree]
              [fluree.db.test-utils :as test-utils]))
 
-(deftest minus
+(deftest negation
   (let [conn    @(fluree/connect {:method :memory})
         ledger  @(fluree/create conn "negation-test")
         context ["https://flur.ee"
@@ -27,20 +27,24 @@
              @(fluree/query db1 {"@context" context
                                  "select" ["?person"]
                                  "where" [{"@id" "?person" "@type" {"@id" "ex:Person"}}
-                                          ["not-exists" [{"@id" "?person" "ex:name" "?name"}]]]})))
+                                          ["not-exists" [{"@id" "?person" "ex:name" "?name"}]]]}))
+          "returns ex:Person who does not have an ex:name")
       (is (= []
              @(fluree/query db1 {"@context" context
                                  "select" ["?person"]
                                  "where" [{"@id" "?person" "@type" {"@id" "ex:Person"}}
-                                          ["not-exists" [{"@id" "?person" "ex:givenName" "?name"}]]]}))))
+                                          ["not-exists" [{"@id" "?person" "ex:givenName" "?name"}]]]}))
+          "returns ex:Person who does not have an ex:givenName (none)"))
     (testing "exists"
       (is (= [["ex:alice"]]
              @(fluree/query db1 {"@context" context
                                  "select" ["?person"]
                                  "where" [{"@id" "?person" "@type" {"@id" "ex:Person"}}
-                                          ["exists" [{"@id" "?person" "ex:givenName" "?name"}]]]})))
+                                          ["exists" [{"@id" "?person" "ex:givenName" "?name"}]]]}))
+          "returns ex:Person who has an ex:givenName")
       (is (= []
              @(fluree/query db1 {"@context" context
                                  "select" ["?person"]
                                  "where" [{"@id" "?person" "@type" {"@id" "ex:Person"}}
-                                          ["exists" [{"@id" "?person" "ex:name" "?name"}]]]}))))))
+                                          ["exists" [{"@id" "?person" "ex:name" "?name"}]]]}))
+          "returns ex:Person who has an ex:name (none)"))))
