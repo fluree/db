@@ -107,7 +107,13 @@
                "person:birthday"
                {"@value" "2011-01-10T14:45:13.815-05:00", "@type" "xsd:dateTime"}}]
              where)
-          "datatype literal")))
+          "datatype literal"))
+    (let [query "SELECT ?person
+                 WHERE { ?person a schema:Person . }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?person", "@type" "schema:Person"}]
+             where)
+          "a as an alias for @type")))
   (testing "multi clause"
     (let [query "SELECT ?person ?nums
                  WHERE {?person person:handle \"jdoe\".
