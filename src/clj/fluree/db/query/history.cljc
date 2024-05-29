@@ -4,6 +4,7 @@
             [malli.core :as m]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
+            [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
             [fluree.db.index :as index]
@@ -125,9 +126,9 @@
   "Build a subject map out a set of flakes with the same subject.
   {:id :ex/foo :ex/x 1 :ex/y 2}"
   [db cache context compact error-ch s-flakes]
-  (json-ld-resp/format-subject-flakes db cache context compact
-                            {:wildcard? true, :depth 0}
-                            0 nil error-ch s-flakes))
+  (jld-format/format-subject-flakes db cache context compact
+                                {:wildcard? true, :depth 0}
+                                0 nil error-ch s-flakes))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
@@ -294,13 +295,13 @@
                      t-flakes)
            [assert-flakes* annotation-flakes] (extract-annotation-flakes commit-wrapper-flakes assert-flakes)
 
-           commit-wrapper-chan (json-ld-resp/format-subject-flakes db cache context compact
-                                                                   {:wildcard? true, :depth 0}
-                                                                   0 nil error-ch commit-wrapper-flakes)
+           commit-wrapper-chan (jld-format/format-subject-flakes db cache context compact
+                                                             {:wildcard? true, :depth 0}
+                                                             0 nil error-ch commit-wrapper-flakes)
 
-           commit-meta-chan    (json-ld-resp/format-subject-flakes db cache context compact
-                                                         {:wildcard? true, :depth 0}
-                                                         0 nil error-ch commit-meta-flakes)
+           commit-meta-chan    (jld-format/format-subject-flakes db cache context compact
+                                                             {:wildcard? true, :depth 0}
+                                                             0 nil error-ch commit-meta-flakes)
 
            commit-wrapper      (<! commit-wrapper-chan)
            commit-meta         (<! commit-meta-chan)

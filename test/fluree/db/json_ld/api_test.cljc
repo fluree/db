@@ -4,12 +4,8 @@
             #?@(:cljs [[clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]])
             [fluree.db.did :as did]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.query.range :as query-range]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.async :refer [<?? <?]]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]
             #?(:clj  [test-with-files.tools :refer [with-tmp-dir]
                       :as twf]

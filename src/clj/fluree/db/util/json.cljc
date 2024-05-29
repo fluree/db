@@ -4,9 +4,7 @@
             #?(:clj [cheshire.generate :refer [add-encoder encode-seq remove-encoder]])
             #?(:cljs [goog.object :as gobject])
             [fluree.db.util.bytes :as butil]
-            [fluree.db.util.core :as cutil]
             [fluree.db.util.log :as log]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake])
   #?(:clj
      (:import (fluree.db.flake Flake)
@@ -94,17 +92,6 @@
 (defn stringify-UTF8
   [x]
   (butil/string->UTF8 (stringify x)))
-
-
-(defn parse-json-flakes
-  [db flakes]
-  (log/debug "parse-json-flakes flakes:" flakes)
-  ;; TODO: Should we cache these predicate id -> type mappings?
-  (map (fn [f]
-         (if (= :json (dbproto/-p-prop db :type (flake/p f)))
-           (update f :o parse)
-           f))
-       flakes))
 
 
 (defn- valid-coordinates?

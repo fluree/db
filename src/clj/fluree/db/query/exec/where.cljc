@@ -8,7 +8,6 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.datatype :as datatype]
             [fluree.db.query.dataset :as dataset]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri])
   #?(:clj (:import (clojure.lang MapEntry))))
@@ -59,8 +58,9 @@
   (contains? mch ::sids))
 
 (defn get-sid
-  [iri-mch db-alias]
-  (get-in iri-mch [::sids db-alias]))
+  [iri-mch db]
+  (let [db-alias (:alias db)]
+    (get-in iri-mch [::sids db-alias])))
 
 (defn get-datatype-iri
   [mch]
@@ -104,6 +104,10 @@
 (defn get-value
   [match]
   (::val match))
+
+(defn get-variable
+  [match]
+  (::var match))
 
 (defn get-binding
   [match]
@@ -158,18 +162,6 @@
       unmatched-var
       (with-filter f)))
 
-(defn ->val-filter
-  "Build a query function specification for the explicit value `val` out of the
-  boolean function `f`. `f` should accept a single flake where-match map."
-  ([val f]
-   (-> val
-       anonymous-value
-       (with-filter f)))
-  ([val dt-iri f]
-   (-> val
-       (anonymous-value dt-iri)
-       (with-filter f))))
-
 (defn ->predicate
   "Build a pattern that already matches the explicit predicate value `value`."
   ([iri]
@@ -183,6 +175,11 @@
   collection."
   [patterns]
   (vec patterns))
+
+(defprotocol Matcher
+  (-match-id [s fuel-tracker solution s-match error-ch])
+  (-match-triple [s fuel-tracker solution triple error-ch])
+  (-match-class [s fuel-tracker solution triple error-ch]))
 
 (defn pattern-type
   [pattern]
@@ -286,14 +283,14 @@
   be changed to `nil`. This ensures that all necessary flakes are considered
   from the spot index when scanned, and this is necessary because the `p` value
   is `nil`."
-  [idx s p o o-fn alias]
+  [db idx s p o o-fn]
   (if (and (#{:spot} idx)
            (nil? p)
            (and s o))
     (let [f (if o-fn
               (fn [mch]
                 (and (#{o} (or (get-value mch)
-                               (get-sid mch alias)))
+                               (get-sid mch db)))
                      (o-fn mch)))
               (fn [mch]
                 (#{o} (get-value mch))))]
@@ -304,13 +301,13 @@
   ([db fuel-tracker error-ch components]
    (resolve-flake-range db fuel-tracker nil error-ch components))
 
-  ([{:keys [alias t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
-   (let [s    (get-sid s-mch alias)
+  ([{:keys [t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
+   (let [s    (get-sid s-mch db)
          s-fn (::fn s-mch)
-         p    (get-sid p-mch alias)
+         p    (get-sid p-mch db)
          p-fn (::fn p-mch)
          o    (or (get-value o-mch)
-                  (get-sid o-mch alias))
+                  (get-sid o-mch db))
          o-fn (::fn o-mch)
          o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
 
@@ -318,7 +315,7 @@
                            (catch* e
                              (log/error e "Error resolving flake range")
                              (async/put! error-ch e)))
-         [o* o-fn*]  (augment-object-fn idx s p o o-fn alias)
+         [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
          start-flake (flake/create s p o* o-dt nil nil util/min-integer)
          end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
          track-fuel  (when fuel-tracker
@@ -353,14 +350,13 @@
 
 (defn compute-sid
   [s-mch db]
-  (let [db-alias (:alias db)]
-    (if (and (matched-iri? s-mch)
-             (not (get-sid s-mch db-alias)))
-      (let [db-alias (:alias db)
-            s-iri    (::iri s-mch)]
-        (when-let [sid (iri/encode-iri db s-iri)]
-          (match-sid s-mch db-alias sid)))
-      s-mch)))
+  (if (and (matched-iri? s-mch)
+           (not (get-sid s-mch db)))
+    (let [db-alias (:alias db)
+          s-iri    (::iri s-mch)]
+      (when-let [sid (iri/encode-iri db s-iri)]
+        (match-sid s-mch db-alias sid)))
+    s-mch))
 
 (defn compute-datatype-sid
   [o-mch db]
@@ -392,25 +388,6 @@
   (doto (async/chan)
     async/close!))
 
-(defn match-id
-  [db fuel-tracker solution s-mch error-ch]
-  (let [matched-ch (async/chan 2 (comp cat
-                                       (partition-by flake/s)
-                                       (map first)
-                                       (map (fn [f]
-                                              (if (unmatched-var? s-mch)
-                                                (let [{::keys [var]} s-mch
-                                                      matched (match-subject s-mch db f)]
-                                                  (assoc solution var matched))
-                                                solution)))))
-        s-mch*     (assign-matched-component s-mch solution)]
-    (if-let [s (compute-sid db s-mch*)]
-      (-> db
-          (resolve-flake-range fuel-tracker error-ch [s])
-          (async/pipe matched-ch))
-      (async/close! matched-ch))
-    matched-ch))
-
 (defmethod match-pattern :id
   [ds fuel-tracker solution pattern error-ch]
   (let [s-mch (pattern-data pattern)]
@@ -418,36 +395,10 @@
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [graph]
-                    (match-id graph fuel-tracker solution s-mch error-ch)))
+                    (-match-id graph fuel-tracker solution s-mch error-ch)))
              async/merge)
-        (match-id active-graph fuel-tracker solution s-mch error-ch))
+        (-match-id active-graph fuel-tracker solution s-mch error-ch))
       nil-channel)))
-
-(defn match-tuple
-  [db fuel-tracker solution tuple error-ch]
-  (let [matched-ch (async/chan 2 (comp cat
-                                       (map (fn [flake]
-                                              (match-flake solution tuple db flake)))))
-        db-alias   (:alias db)
-        triple     (assign-matched-values tuple solution)]
-    (if-let [[s p o] (compute-sids db triple)]
-      (let [pid (get-sid p db-alias)]
-        (if-let [props (and pid (get-child-properties db pid))]
-          (let [prop-ch (-> props (conj pid) async/to-chan!)]
-            (async/pipeline-async 2
-                                  matched-ch
-                                  (fn [prop ch]
-                                    (let [p* (match-sid p db-alias prop)]
-                                      (-> db
-                                          (resolve-flake-range fuel-tracker error-ch [s p* o])
-                                          (async/pipe ch))))
-                                  prop-ch))
-
-          (-> db
-              (resolve-flake-range fuel-tracker error-ch [s p o])
-              (async/pipe matched-ch))))
-      (async/close! matched-ch))
-    matched-ch))
 
 (defmethod match-pattern :tuple
   [ds fuel-tracker solution pattern error-ch]
@@ -456,60 +407,10 @@
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [graph]
-                    (match-tuple graph fuel-tracker solution tuple error-ch)))
+                    (-match-triple graph fuel-tracker solution tuple error-ch)))
              async/merge)
-        (match-tuple active-graph fuel-tracker solution tuple error-ch))
+        (-match-triple active-graph fuel-tracker solution tuple error-ch))
       nil-channel)))
-
-(defn with-distinct-subjects
-  "Return a transducer that filters a stream of flakes by removing any flakes with
-  subject ids repeated from previously processed flakes."
-  []
-  (fn [rf]
-    (let [seen-sids (volatile! #{})]
-      (fn
-        ;; Initialization: do nothing but initialize the supplied reducing fn
-        ([]
-         (rf))
-
-        ;; Iteration: keep track of subject ids seen; only pass flakes with new
-        ;; subject ids through to the supplied reducing fn.
-        ([result f]
-         (let [sid (flake/s f)]
-           (if (contains? @seen-sids sid)
-             result
-             (do (vswap! seen-sids conj sid)
-                 (rf result f)))))
-
-        ;; Termination: do nothing but terminate the supplied reducing fn
-        ([result]
-         (rf result))))))
-
-(defn match-class
-  [db fuel-tracker solution triple error-ch]
-  (let [matched-ch (async/chan 2 (comp cat
-                                       (with-distinct-subjects)
-                                       (map (fn [flake]
-                                              (match-flake solution triple db flake)))))
-        db-alias   (:alias db)
-        triple     (assign-matched-values triple solution)]
-    (if-let [[s p o] (compute-sids db triple)]
-      (let [cls        (get-sid o db-alias)
-            sub-obj    (dissoc o ::sids ::iri)
-            class-objs (into [o]
-                             (comp (map (fn [cls]
-                                          (match-sid sub-obj db-alias cls)))
-                                   (remove nil?))
-                             (dbproto/-class-prop db :subclasses cls))
-            class-ch   (async/to-chan! class-objs)]
-        (async/pipeline-async 2
-                              matched-ch
-                              (fn [class-obj ch]
-                                (-> (resolve-flake-range db fuel-tracker error-ch [s p class-obj])
-                                    (async/pipe ch)))
-                              class-ch))
-      (async/close! matched-ch))
-    matched-ch))
 
 (defmethod match-pattern :class
   [ds fuel-tracker solution pattern error-ch]
@@ -519,9 +420,9 @@
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [graph]
-                    (match-class graph fuel-tracker solution triple error-ch)))
+                    (-match-class graph fuel-tracker solution triple error-ch)))
              async/merge)
-        (match-class active-graph fuel-tracker solution triple error-ch)))
+        (-match-class active-graph fuel-tracker solution triple error-ch)))
     nil-channel))
 
 (defmethod match-pattern :filter
