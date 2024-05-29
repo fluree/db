@@ -4,7 +4,7 @@
             [fluree.db.conn.memory :as memory-conn]
             [fluree.db.conn.remote :as remote-conn]
             [fluree.json-ld :as json-ld]
-            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.flake.flake-db :as flake-db]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.platform :as platform]
@@ -479,7 +479,7 @@
   [db]
   (let [spot (-> db :novelty :spot)]
     (reduce (fn [n flake]
-              (if (jld-db/reasoned-rule? flake)
+              (if (flake-db/reasoned-rule? flake)
                 (inc n)
                 n))
             0 spot)))
@@ -512,9 +512,9 @@
                                (if (iri/sid? o)
                                  (decode-iri db o)
                                  o))
-                        #(jld-db/reasoned-rule? %))
+                        #(flake-db/reasoned-rule? %))
          result   (->> db :novelty :spot
-                       jld-db/reasoned-flakes
+                       flake-db/reasoned-flakes
                        (mapv triples+))]
      (if group-fn
        (group-by group-fn result)

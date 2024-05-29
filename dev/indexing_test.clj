@@ -1,6 +1,6 @@
 (ns indexing-test
   (:require [fluree.db.method.ipfs.core :as ipfs]
-            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.json-ld.transact :as jld-tx]
             [clojure.core.async :as async]
             [fluree.db.flake :as flake]

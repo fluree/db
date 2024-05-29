@@ -1,23 +1,28 @@
-(ns fluree.db.db.json-ld
+(ns fluree.db.flake.flake-db
   (:refer-clojure :exclude [load vswap!])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [go]]
             [clojure.set :refer [map-invert]]
             [fluree.db.connection :as connection]
-            [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
-            [fluree.db.db.json-ld.format :as jld-format]
-            [fluree.db.db.json-ld.history :as history]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.time-travel :refer [TimeTravel]]
+            [fluree.db.query.history :refer [AuditLog]]
+            [fluree.db.flake.history :as history]
+            [fluree.db.flake.format :as jld-format]
+            [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
+            [fluree.db.util.core :as util :refer [get-first get-first-value
+                                                  get-first-id vswap!]]
             [fluree.db.index :as index]
             [fluree.db.indexer :as indexer]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.query.fql :as fql]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
             [fluree.db.json-ld.policy.rules :as policy-rules]
@@ -27,15 +32,10 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.policy.modify :as tx-policy]
             [fluree.db.query.exec.update :as update]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.query.history :refer [AuditLog]]
             [fluree.db.query.json-ld.response :as jld-response]
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serde-json]
-            [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-value
-                                                  get-first-id vswap!]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
@@ -980,7 +980,7 @@
 
 (defn db->jsonld
   "Creates the JSON-LD map containing a new ledger update"
-  [{:keys [t commit stats staged max-namespace-code] :as db}
+  [{:keys [t commit stats staged] :as db}
    {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
   (let [prev-dbid   (commit-data/data-id commit)
 
