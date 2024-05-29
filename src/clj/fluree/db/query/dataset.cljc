@@ -1,7 +1,9 @@
 (ns fluree.db.query.dataset
   (:refer-clojure :exclude [alias])
   (:require [fluree.db.util.core :as util]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.json-ld.response :as resp]
             [clojure.core.async :as async]))
 
 
@@ -34,6 +36,20 @@
          (concat (-> ds :named vals))
          (into [] (distinct)))
     [ds]))
+
+(defn merge-objects
+  [obj1 obj2]
+  (if (sequential? obj1)
+    (if (sequential? obj2)
+      (into obj1 obj2)
+      (conj obj1 obj2))
+    (if (sequential? obj2)
+      (into [obj1] obj2)
+      [obj1 obj2])))
+
+(defn merge-subgraphs
+  [sg1 sg2]
+  (merge-with merge-objects sg1 sg2))
 
 (extend-type DataSet
   where/Matcher
@@ -71,7 +87,47 @@
     (activate ds alias))
 
   (-aliases [ds]
-    (names ds)))
+    (names ds))
+
+
+  resp/NodeFormatter
+  (-forward-properties [ds iri select-spec context compact-fn cache fuel-tracker error-ch]
+    (let [db-ch   (->> ds all async/to-chan!)
+          prop-ch (async/chan)]
+      (async/pipeline-async 4
+                            prop-ch
+                            (fn [db ch]
+                              (-> (resp/-forward-properties db iri select-spec context compact-fn cache fuel-tracker error-ch)
+                                  (async/pipe ch)))
+                            db-ch)
+      (async/reduce merge-subgraphs {} prop-ch)))
+
+  (-reverse-property [ds iri reverse-spec compact-fn cache fuel-tracker error-ch]
+    (let [db-ch   (->> ds all async/to-chan!)
+          prop-ch (async/chan)]
+      (async/pipeline-async 2
+                            prop-ch
+                            (fn [db ch]
+                              (-> (resp/-reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch)
+                                  (async/pipe ch)))
+                            db-ch)
+      (async/reduce (fn [combined-prop db-prop]
+                      (let [[as results] combined-prop]
+                        (if results
+                          (let [[_as next-result] db-prop]
+                            [as (merge-objects results next-result)])
+                          db-prop)))
+                    []
+                    prop-ch)))
+
+  (-iri-visible? [ds iri]
+    (go-try
+      (some? (loop [[db & r] (all ds)]
+               (if db
+                 (if (<? (resp/-iri-visible? db iri))
+                   db
+                   (recur r))
+                 nil))))))
 
 (defn combine
   [named-map defaults]

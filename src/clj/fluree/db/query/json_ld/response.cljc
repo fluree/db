@@ -3,7 +3,6 @@
             [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.constants :as const]
-            [fluree.db.query.dataset :as dataset]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -12,20 +11,6 @@
   (-forward-properties [db iri select-spec context compact-fn cache fuel-tracker error-ch])
   (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch])
   (-iri-visible? [db iri]))
-
-(defn combine-objects
-  [obj1 obj2]
-  (if (sequential? obj1)
-    (if (sequential? obj2)
-      (into obj1 obj2)
-      (conj obj1 obj2))
-    (if (sequential? obj2)
-      (into [obj1] obj2)
-      [obj1 obj2])))
-
-(defn merge-subgraphs
-  [sg1 sg2]
-  (merge-with combine-objects sg1 sg2))
 
 (declare format-node)
 
@@ -41,12 +26,7 @@
              node* (if (or (nil? select-spec)
                            wildcard?
                            (contains? select-spec const/iri-id))
-                     (if (some? (loop [[db & r] (dataset/all ds)]
-                                  (if db
-                                    (if (<? (-iri-visible? db iri))
-                                      db
-                                      (recur r))
-                                    nil)))
+                     (if (<? (-iri-visible? ds iri))
                        (let [;; TODO: we generate id-key here every time, this
                              ;; should be done in the :spec once beforehand and
                              ;; used from there
@@ -117,27 +97,6 @@
                 (recur r resolved-attrs)))
             resolved-attrs)))))
 
-(defn format-reverse-property
-  [ds o-iri reverse-spec compact-fn cache fuel-tracker error-ch]
-  (if (dataset/dataset? ds)
-    (let [db-ch   (->> ds dataset/all async/to-chan!)
-          prop-ch (async/chan)]
-      (async/pipeline-async 2
-                            prop-ch
-                            (fn [db ch]
-                              (-> (-reverse-property db o-iri reverse-spec compact-fn cache fuel-tracker error-ch)
-                                  (async/pipe ch)))
-                            db-ch)
-      (async/reduce (fn [combined-prop db-prop]
-                      (let [[as results] combined-prop]
-                        (if results
-                          (let [[_as next-result] db-prop]
-                            [as (combine-objects results next-result)])
-                          db-prop)))
-                    []
-                    prop-ch))
-    (-reverse-property ds o-iri reverse-spec compact-fn cache fuel-tracker error-ch)))
-
 (defn format-reverse-properties
   [ds iri reverse-map compact-fn cache fuel-tracker error-ch]
   (let [out-ch (async/chan 32)]
@@ -145,31 +104,17 @@
                           out-ch
                           (fn [reverse-spec ch]
                             (-> ds
-                                (format-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
+                                (-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
                                 (async/pipe ch)))
                           (async/to-chan! (vals reverse-map)))
 
     (async/reduce conj {} out-ch)))
 
-(defn format-forward-properties
-  [ds iri select-spec context compact-fn cache fuel-tracker error-ch]
-  (if (dataset/dataset? ds)
-    (let [db-ch   (->> ds dataset/all async/to-chan!)
-          prop-ch (async/chan)]
-      (async/pipeline-async 4
-                            prop-ch
-                            (fn [db ch]
-                              (-> (-forward-properties db iri select-spec context compact-fn cache fuel-tracker error-ch)
-                                  (async/pipe ch)))
-                            db-ch)
-      (async/reduce merge-subgraphs {} prop-ch))
-    (-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)))
-
 (defn format-node
   ([ds iri context compact-fn select-spec cache fuel-tracker error-ch]
    (format-node ds iri context compact-fn select-spec cache 0 fuel-tracker error-ch))
   ([ds iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
-   (let [forward-ch (format-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
+   (let [forward-ch (-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
          subject-ch (if reverse
                       (let [reverse-ch (format-reverse-properties ds iri reverse compact-fn cache fuel-tracker error-ch)]
                         (->> [forward-ch reverse-ch]
