@@ -31,3 +31,23 @@
 (defn extract
   [jsonld]
   (-> jsonld extract-supplied-context json-ld/parse-context))
+
+(defn stringify
+  "Contexts that use clojure keywords will not translate into valid JSON for
+  serialization. Here we change any keywords to strings."
+  [context]
+  (if (sequential? context)
+    (mapv stringify context)
+    (if (map? context)
+      (reduce-kv
+        (fn [acc k v]
+          (let [k* (if (keyword? k)
+                     (name k)
+                     k)
+                v* (if (and (map? v)
+                            (not (contains? v :id)))
+                     (stringify v)
+                     v)]
+            (assoc acc k* v*)))
+        {} context)
+      context)))

@@ -6,7 +6,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol Transactable
-  (-stage-db [db fuel-tracker context identity annotation raw-txn parsed-txn]))
+  (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]))
 
 (defn nested-nodes?
   "Returns truthy if the provided node has any nested nodes."
@@ -42,4 +42,4 @@
      (let [{:keys [context raw-txn]} parsed-opts
 
            annotation (extract-annotation context parsed-txn parsed-opts)]
-       (<? (-stage-db db fuel-tracker context identity annotation raw-txn parsed-txn))))))
+       (<? (-stage-txn db fuel-tracker context identity annotation raw-txn parsed-txn))))))

@@ -1,14 +1,15 @@
 (ns fluree.db.ledger.json-ld
   (:require [clojure.core.async :as async :refer [<!]]
             [fluree.db.ledger :as ledger]
+            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.did :as did]
+            [fluree.db.util.context :as context]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.branch :as branch]
-            [fluree.db.json-ld.commit :as jld-commit]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
-            [fluree.db.indexer :as indexer]
-            [fluree.db.indexer.default :as idx-default]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
@@ -21,7 +22,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn branch-meta
+(defn get-branch-meta
   "Retrieves branch metadata from ledger state"
   [{:keys [state] :as _ledger} requested-branch]
   (let [{:keys [branch branches]} @state]
@@ -31,50 +32,44 @@
       (get branches branch))))
 
 ;; TODO - no time travel, only latest db on a branch thus far
-(defn db
-  [ledger {:keys [branch]}]
-  (let [branch-meta (ledger/-branch ledger branch)]
-    ;; if branch is nil, will return default
-    (when-not branch-meta
-      (throw (ex-info (str "Invalid branch: " branch ".")
-                      {:status 400 :error :db/invalid-branch})))
-    (branch/current-db branch-meta)))
+(defn current-db
+  ([ledger]
+   (current-db ledger nil))
+  ([ledger branch]
+   (let [branch-meta (get-branch-meta ledger branch)]
+     ;; if branch is nil, will return default
+     (when-not branch-meta
+       (throw (ex-info (str "Invalid branch: " branch ".")
+                       {:status 400 :error :db/invalid-branch})))
+     (branch/current-db branch-meta))))
 
-(defn db-update
-  "Updates db, will throw if not next 't' from current db.
-  Returns original db, or if index has since been updated then
-  updated db with new index point."
-  [{:keys [state] :as _ledger} {:keys [branch] :as db}]
-  (-> state
-      (swap! update-in [:branches branch] branch/update-db db)
-      (get-in [:branches branch :current-db])))
-
-(defn commit-update
+(defn update-commit!
   "Updates both latest db and commit db. If latest registered index is
   newer than provided db, updates index before storing.
 
   If index in provided db is newer, updates latest index held in ledger state."
-  [{:keys [state] :as ledger} branch-name db]
-  (log/debug "Attempting to update ledger:" (:alias ledger)
-             "and branch:" branch-name "with new commit to t" (:t db))
-  (when-not (get-in @state [:branches branch-name])
-    (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
-                         "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
-                    {:status 400 :error :db/invalid-branch})))
-  (-> state
-      (swap! update-in [:branches branch-name] branch/update-commit db)
-      (get-in [:branches branch-name :current-db])))
+  ([ledger branch-name db]
+   (update-commit! ledger branch-name db nil))
+  ([{:keys [state] :as ledger} branch-name db index-files-ch]
+   (log/debug "Attempting to update ledger:" (:alias ledger)
+              "and branch:" branch-name "with new commit to t" (:t db))
+   (let [branch-meta (get-branch-meta ledger branch-name)]
+     (when-not branch-meta
+       (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
+                            "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
+                       {:status 400 :error :db/invalid-branch})))
+     (-> branch-meta
+         (branch/update-commit! db index-files-ch)
+         branch/current-db))))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
-  [{:keys [state address alias] :as _ledger} requested-branch]
-  (let [{:keys [branch branches]} @state
-        branch-data (if requested-branch
-                      (get branches requested-branch)
-                      (get branches branch))
-        {:keys [current-db]} branch-data
+  [{:keys [address alias] :as ledger} requested-branch]
+  (let [branch-data (get-branch-meta ledger requested-branch)
+        current-db  (branch/current-db branch-data)
         {:keys [commit stats t]} current-db
-        {:keys [size flakes]} stats]
+        {:keys [size flakes]} stats
+        branch (or requested-branch (:branch @(:state ledger)))]
     {:address address
      :alias   alias
      :branch  branch
@@ -90,22 +85,133 @@
     {:message opts}
     opts))
 
+(def f-context {"f" "https://ns.flur.ee/ledger#"})
+
+(defn parse-commit-context
+  [context]
+  (let [parsed-context (if context
+                         (-> context
+                             json-ld/parse-context
+                             (json-ld/parse-context f-context))
+                         (json-ld/parse-context f-context))]
+    (context/stringify parsed-context)))
+
+(defn- enrich-commit-opts
+  [ledger {:keys [context did private message tag file-data? index-files-ch] :as _opts}]
+  (let [context*      (parse-commit-context context)
+        private*      (or private
+                          (:private did)
+                          (-> ledger :did :private))
+        did*          (or (some-> private* did/private->did)
+                          did
+                          (:did ledger))
+        ctx-used-atom (atom {})
+        compact-fn    (json-ld/compact-fn context* ctx-used-atom)]
+    {:message        message
+     :tag            tag
+     :file-data?     file-data? ;; if instead of returning just a db from commit, return also the written files (for consensus)
+     :context        context*
+     :private        private*
+     :did            did*
+     :ctx-used-atom  ctx-used-atom
+     :compact-fn     compact-fn
+     :compact        (fn [iri] (json-ld/compact iri compact-fn))
+     :id-key         (json-ld/compact "@id" compact-fn)
+     :type-key       (json-ld/compact "@type" compact-fn)
+     :index-files-ch index-files-ch})) ;; optional async chan passed in which will stream out all new index files created (for consensus)
+
+(defn write-transactions!
+  [conn {:keys [alias] :as _ledger} staged]
+  (go-try
+    (loop [[[txn author-did annotation] & r] staged
+           results                []]
+      (if txn
+        (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
+          (recur r (conj results [txn-id author-did annotation])))
+        results))))
+
+(defn write-commit
+  [conn alias {:keys [did private]} commit]
+  (go-try
+    (let [[commit* jld-commit] (commit-data/commit->jsonld commit)
+          signed-commit        (if did
+                                 (<? (cred/generate jld-commit private (:id did)))
+                                 jld-commit)
+          commit-res           (<? (connection/-c-write conn alias signed-commit))
+          commit**             (commit-data/update-commit-address commit* (:address commit-res))]
+      {:commit-map    commit**
+       :commit-jsonld jld-commit
+       :write-result  commit-res})))
+
+(defn push-commit
+  [conn {:keys [state] :as _ledger} {:keys [commit-map commit-jsonld write-result]}]
+  (nameservice/push! conn (assoc commit-map
+                                 :meta write-result
+                                 :json-ld commit-jsonld
+                                 :ledger-state state)))
+
+(defn formalize-commit
+  [{prev-commit :commit :as staged-db} new-commit]
+  (-> staged-db
+      (update :staged empty)
+      (assoc :commit new-commit
+             :prev-commit prev-commit)
+      (commit-data/add-commit-flakes prev-commit)))
+
 (defn commit!
-  [ledger db opts]
-  (let [{:keys [branch] :as opts*}
-        (normalize-opts opts)
-        {:keys [t] :as db*} (or db (ledger/-db ledger branch))
-        committed-t                (ledger/latest-commit-t ledger branch)]
-    (if (= t (flake/next-t committed-t))
-      (jld-commit/commit ledger db* opts*)
-      (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
-                           " is no longer consistent with staged db 't' value of: " t ".")
-                      {:status 400 :error :db/invalid-commit})))))
+  "Finds all uncommitted transactions and wraps them in a Commit document as the subject
+  of a VerifiableCredential. Persists according to the :ledger :conn :method and
+  returns a db with an updated :commit."
+  [{:keys [alias conn] :as ledger} {:keys [branch t stats commit] :as staged-db} opts]
+  (go-try
+    (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
+          (->> opts normalize-opts (enrich-commit-opts ledger))
+
+          {:keys [dbid db-jsonld staged-txns]}
+          (jld-db/db->jsonld staged-db opts*)
+
+          [[txn-id author annotation] :as txns]
+          (<? (write-transactions! conn ledger staged-txns))
+
+          data-write-result (<? (connection/-c-write conn alias db-jsonld)) ; write commit data
+          db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
+
+          commit-time (util/current-time-iso)
+          _           (log/debug "Committing t" t "at" commit-time)
+
+          base-commit-map {:old-commit commit
+                           :issuer     did
+                           :message    message
+                           :tag        tag
+                           :dbid       dbid
+                           :t          t
+                           :time       commit-time
+                           :db-address db-address
+                           :author     (or author "")
+                           :annotation annotation
+                           :txn-id     (if (= 1 (count txns)) txn-id "")
+                           :flakes     (:flakes stats)
+                           :size       (:size stats)}
+          new-commit      (commit-data/new-db-commit-map base-commit-map)
+          keypair         (select-keys opts* [:did :private])
+
+          {:keys [commit-map write-result] :as commit-write-map}
+          (<? (write-commit conn alias keypair new-commit))
+
+          db  (formalize-commit staged-db commit-map)
+          db* (update-commit! ledger branch db index-files-ch)]
+
+      (<? (push-commit conn ledger commit-write-map))
+
+      (if file-data?
+        {:data-file-meta   data-write-result
+         :commit-file-meta write-result
+         :db               db*}
+        db*))))
 
 (defn close-ledger
   "Shuts down ledger and resources."
-  [{:keys [indexer cache state conn alias] :as _ledger}]
-  (indexer/-close indexer)
+  [{:keys [cache state conn alias] :as _ledger}]
   (reset! state {:closed? true})
   (reset! cache {})
   (release-ledger conn alias)) ;; remove ledger from conn cache
@@ -125,7 +231,7 @@
           commit-t   (-> expanded-commit
                          (get-first const/iri-data)
                          (get-first-value const/iri-t))
-          current-db (ledger/-db ledger {:branch branch})
+          current-db (current-db ledger branch)
           current-t  (:t current-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
                  "where current cached db t value is:" current-t)
@@ -134,7 +240,7 @@
 
         (= commit-t (flake/next-t current-t))
         (let [updated-db  (<? (jld-reify/merge-commit conn current-db [commit proof]))]
-          (commit-update ledger branch updated-db))
+          (update-commit! ledger branch updated-db))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
         (flake/t-after? commit-t (flake/next-t current-t))
@@ -156,23 +262,16 @@
                     " however, latest t is more current: " current-t)
           false)))))
 
-(defrecord JsonLDLedger [id address alias did indexer state cache conn reasoner]
+(defrecord JsonLDLedger [id address alias did state cache conn reasoner]
   ledger/iCommit
   (-commit! [ledger db] (commit! ledger db nil))
   (-commit! [ledger db opts] (commit! ledger db opts))
   (-notify [ledger expanded-commit] (notify ledger expanded-commit))
 
   ledger/iLedger
-  (-db [ledger] (db ledger nil))
-  (-db [ledger opts] (db ledger opts))
-  (-branch [ledger] (branch-meta ledger nil))
-  (-branch [ledger branch] (branch-meta ledger branch))
-  (-commit-update! [ledger branch db] (commit-update ledger branch db))
+  (-db [ledger] (current-db ledger))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))
-  (-did [_] did)
-  (-alias [_] alias)
-  (-address [_] address)
   (-close [ledger] (close-ledger ledger)))
 
 
@@ -208,23 +307,6 @@
               :pending  {:t   0
                          :dag nil}}})
 
-(defn validate-indexer
-  [indexer reindex-min-bytes reindex-max-bytes]
-  (cond
-    (satisfies? indexer/iIndex indexer)
-    indexer
-
-    indexer
-    (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
-                         "Provided: " indexer)
-                    {:status 400 :error :db/invalid-indexer}))
-
-    :else
-    (idx-default/create
-      (util/without-nils
-        {:reindex-min-bytes reindex-min-bytes
-         :reindex-max-bytes reindex-max-bytes}))))
-
 (defn parse-did
   [conn did]
   (if did
@@ -234,19 +316,17 @@
     (connection/-did conn)))
 
 (defn parse-ledger-options
-  [conn {:keys [did branch indexer reindex-min-bytes reindex-max-bytes]
+  [conn {:keys [did branch]
          :or   {branch :main}}]
-  (let [did*    (parse-did conn did)
-        indexer (validate-indexer indexer reindex-min-bytes reindex-max-bytes)]
+  (let [did*    (parse-did conn did)]
     {:did     did*
-     :branch  branch
-     :indexer indexer}))
+     :branch  branch}))
 
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [did branch indexer]}
+    (let [{:keys [did branch]}
           (parse-ledger-options conn opts)
 
           ledger-alias*  (normalize-alias ledger-alias)
@@ -255,7 +335,7 @@
           genesis-commit (json-ld/expand
                            (<? (write-genesis-commit conn ledger-alias branch ns-addresses)))
           ;; map of all branches and where they are branched from
-          branches       {branch (<? (branch/load-branch-map conn ledger-alias* branch genesis-commit))}]
+          branches       {branch (branch/state-map conn ledger-alias* branch genesis-commit)}]
       (map->JsonLDLedger
         {:id       (random-uuid)
          :did      did
@@ -263,7 +343,6 @@
          :alias    ledger-alias*
          :address  address
          :cache    (atom {})
-         :indexer  indexer
          :reasoner #{}
          :conn     conn}))))
 
@@ -317,9 +396,9 @@
           ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
 
-          {:keys [did branch indexer]} (parse-ledger-options conn {:branch branch})
+          {:keys [did branch]} (parse-ledger-options conn {:branch branch})
 
-          branches {branch (<? (branch/load-branch-map conn ledger-alias branch commit))}
+          branches {branch (branch/state-map conn ledger-alias branch commit)}
           ledger   (map->JsonLDLedger
                      {:id       (random-uuid)
                       :did      did
@@ -327,7 +406,6 @@
                       :alias    ledger-alias
                       :address  address
                       :cache    (atom {})
-                      :indexer  indexer
                       :reasoner #{}
                       :conn     conn})]
       (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications

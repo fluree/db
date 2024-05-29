@@ -6,7 +6,7 @@
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.did :as did]
-            [fluree.db.json-ld.policy :as policy]))
+            [fluree.db.db.json-ld.policy :as db-policy]))
 
 (def non-policy-keys #{:ident :roles :root? :cache})
 
@@ -90,7 +90,7 @@
         (let [iri-User      (fluree/expand-iri context :ex/User)
               iri-ssn       (fluree/expand-iri context :schema/ssn)
               iri-userRole  (fluree/expand-iri context :ex/userRole)
-              policy-alice  (-> @(fluree/promise-wrap (policy/policy-map db alice-did #{iri-userRole} nil))
+              policy-alice  (-> @(fluree/promise-wrap (db-policy/policy-map db alice-did #{iri-userRole} nil))
                                 replace-policy-fns)]
           (is (pred-match? {const/iri-modify
                             {:class
@@ -118,7 +118,7 @@
               "Policies for only :ex/userRole should return")))
       (testing "Root policy contains {:root? true} for each applicable :f/action"
         (let [iri-rootRole (fluree/expand-iri context :ex/rootRole)
-              policy-root  (-> @(fluree/promise-wrap (policy/policy-map db root-did #{iri-rootRole} nil))
+              policy-root  (-> @(fluree/promise-wrap (db-policy/policy-map db root-did #{iri-rootRole} nil))
                                replace-policy-fns)]
           (is (= {"https://ns.flur.ee/ledger#modify" {:root? true}
                   "https://ns.flur.ee/ledger#view"   {:root? true}
@@ -144,7 +144,7 @@
                                           "f:action"     [{"id" "f:view"} {"id" "f:modify"}]}]}]})]
       (testing "Root policy contains {:root? true} for each applicable :f/action"
         (let [iri-rootRole (fluree/expand-iri context "ex:rootRole")
-              policy-root  (-> @(fluree/promise-wrap (policy/policy-map db root-did #{iri-rootRole} nil))
+              policy-root  (-> @(fluree/promise-wrap (db-policy/policy-map db root-did #{iri-rootRole} nil))
                                replace-policy-fns)]
           (is (= {"https://ns.flur.ee/ledger#modify" {:root? true}
                   "https://ns.flur.ee/ledger#view"   {:root? true}

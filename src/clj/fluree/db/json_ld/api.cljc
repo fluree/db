@@ -4,6 +4,7 @@
             [fluree.db.conn.memory :as memory-conn]
             [fluree.db.conn.remote :as remote-conn]
             [fluree.json-ld :as json-ld]
+            [fluree.db.db.json-ld :as jld-db]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.platform :as platform]
@@ -261,12 +262,13 @@
 (defn db
   "Retrieves latest db, or optionally a db at a moment in time
   and/or permissioned to a specific identity."
-  ([ledger] (db ledger nil))
+  ([ledger]
+   (db ledger nil))
   ([ledger opts]
    (if opts
      (throw (ex-info "DB opts not yet implemented"
                      {:status 500 :error :db/unexpected-error}))
-     (ledger/-db ledger opts))))
+     (ledger/-db ledger))))
 
 
 (defn wrap-policy
@@ -401,7 +403,7 @@
   [db]
   (let [spot (-> db :novelty :spot)]
     (reduce (fn [n flake]
-              (if (reasoner/reasoned-rule? flake)
+              (if (jld-db/reasoned-rule? flake)
                 (inc n)
                 n))
             0 spot)))
@@ -434,11 +436,10 @@
                                (if (iri/sid? o)
                                  (decode-iri db o)
                                  o))
-                        #(reasoner/reasoned-rule? %))
+                        #(jld-db/reasoned-rule? %))
          result   (->> db :novelty :spot
-                       reasoner/reasoned-flakes
+                       jld-db/reasoned-flakes
                        (mapv triples+))]
      (if group-fn
        (group-by group-fn result)
        result))))
-
