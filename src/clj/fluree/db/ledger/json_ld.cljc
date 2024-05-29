@@ -55,13 +55,13 @@
      (branch/current-commit branch-meta))))
 
 
-(defn commit-update
+(defn update-commit!
   "Updates both latest db and commit db. If latest registered index is
   newer than provided db, updates index before storing.
 
   If index in provided db is newer, updates latest index held in ledger state."
   ([ledger branch-name db]
-   (commit-update ledger branch-name db nil))
+   (update-commit! ledger branch-name db nil))
   ([{:keys [state] :as ledger} branch-name db index-files-ch]
    (log/debug "Attempting to update ledger:" (:alias ledger)
               "and branch:" branch-name "with new commit to t" (:t db))
@@ -70,8 +70,9 @@
        (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                             "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
                        {:status 400 :error :db/invalid-branch})))
-     (branch/update-commit! branch-meta db index-files-ch)
-     (branch/current-db branch-meta))))
+     (-> branch-meta
+         (branch/update-commit! db index-files-ch)
+         branch/current-db))))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
@@ -180,7 +181,7 @@
 
           ledger-commit (current-commit ledger branch)
           db*           (formalize-commit db commit-map ledger-commit)
-          db**          (commit-update ledger branch db* index-files-ch)
+          db**          (update-commit! ledger branch db* index-files-ch)
           push-res      (<? (push-commit conn ledger commit-write-map))]
       {:commit-res write-result
        :push-res   push-res
@@ -278,7 +279,7 @@
 
         (= commit-t (flake/next-t current-t))
         (let [updated-db  (<? (jld-reify/merge-commit conn current-db [commit proof]))]
-          (commit-update ledger branch updated-db))
+          (update-commit! ledger branch updated-db))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
         (flake/t-after? commit-t (flake/next-t current-t))
