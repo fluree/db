@@ -4,6 +4,7 @@
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.flake :as flake]
+            [fluree.db.json-ld.policy :refer [root]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -79,7 +80,7 @@
      ;; return first truthy response, else false
      (if p-map
        (let [query  (policy-query db sid values-map p-map)
-             result (<? (dbproto/-query (dbproto/-rootdb db) query))]
+             result (<? (dbproto/-query (root db) query))]
          (if (seq result)
            true
            (recur r)))

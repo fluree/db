@@ -7,7 +7,8 @@
             [fluree.db.query.history :refer [AuditLog]]
             [fluree.db.db.json-ld.history :as history]
             [fluree.db.db.json-ld.policy :as db-policy]
-            [fluree.db.permissions-validate :as validate]
+            [fluree.db.json-ld.policy :as policy]
+            [fluree.db.policy.query :as qpolicy]
             [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.util.core :as util :refer [get-first get-first-value vswap!]]
             [fluree.db.index :as index]
@@ -23,7 +24,6 @@
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.transact :as jld-transact]
-            [fluree.db.json-ld.policy :as policy]
             [fluree.db.datatype :as datatype]
             [fluree.db.serde.json :as serde-json]
             [fluree.db.policy.modify :as tx-policy]
@@ -400,7 +400,7 @@
 
   (-iri-visible? [db iri]
     (let [sid (iri/encode-iri db iri)]
-      (validate/allow-iri? db sid)))
+      (qpolicy/allow-iri? db sid)))
 
   indexer/Indexable
   (index [db changes-ch]
