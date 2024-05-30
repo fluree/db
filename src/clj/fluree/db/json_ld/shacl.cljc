@@ -1102,14 +1102,16 @@
   `modified-subjects` is a sequence of s-flakes of modified subjects."
   [shape-db data-db modified-subjects context]
   (go-try
-    (doseq [s-flakes modified-subjects]
-      (doseq [shape-sid (<? (all-node-shape-ids shape-db))]
-        (let [shape   (<? (build-shape shape-db shape-sid))
-              v-ctx   {:display  (make-display data-db context)
-                       :context  context
-                       :shape-db shape-db
-                       :data-db  data-db}]
-          ;; only enforce activated shapes
-          (when (not (get shape const/sh_deactivated))
-            (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
-              (throw-shacl-violation context results))))))))
+    (let [node-shapes (<? (all-node-shape-ids shape-db))]
+      (log/info "Processing" (count modified-subjects) "subjects for shacl validation")
+      (doseq [s-flakes modified-subjects]
+        (doseq [shape-sid node-shapes]
+          (let [shape   (<? (build-shape shape-db shape-sid))
+                v-ctx   {:display  (make-display data-db context)
+                         :context  context
+                         :shape-db shape-db
+                         :data-db  data-db}]
+            ;; only enforce activated shapes
+            (when (not (get shape const/sh_deactivated))
+              (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
+                (throw-shacl-violation context results)))))))))
