@@ -1111,6 +1111,5 @@
                        :data-db  data-db}]
           ;; only enforce activated shapes
           (when (not (get shape const/sh_deactivated))
-            (let [results (<? (validate-node-shape v-ctx shape s-flakes))]
-              (when results
-                (throw-shacl-violation context results)))))))))
+            (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
+              (throw-shacl-violation context results))))))))
