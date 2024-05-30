@@ -1104,8 +1104,7 @@
   (go-try
     (doseq [s-flakes modified-subjects]
       (doseq [shape-sid (<? (all-node-shape-ids shape-db))]
-        (let [subject (-> s-flakes first flake/s)
-              shape   (<? (build-shape shape-db shape-sid))
+        (let [shape   (<? (build-shape shape-db shape-sid))
               v-ctx   {:display  (make-display data-db context)
                        :context  context
                        :shape-db shape-db
