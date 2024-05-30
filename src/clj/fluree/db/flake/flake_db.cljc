@@ -655,10 +655,9 @@
 
 ;; ================ end Jsonld record support fns ============================
 
-(defrecord JsonLdDb [conn alias branch commit t tt-id stats spot post opst tspo
-                     schema comparators staged novelty policy namespaces
-                     namespace-codes max-namespace-code reindex-min-bytes
-                     reindex-max-bytes]
+(defrecord FlakeDB [conn alias branch commit t tt-id stats spot post opst tspo
+                    schema comparators staged novelty policy namespaces namespace-codes
+                    max-namespace-code reindex-min-bytes reindex-max-bytes]
   dbproto/IFlureeDb
   (-query [this query-map] (fql/query this query-map))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
@@ -758,28 +757,28 @@
 
 (defn db?
   [x]
-  (instance? JsonLdDb x))
+  (instance? FlakeDB x))
 
-(def ^String label "#fluree/JsonLdDb ")
+(def ^String label "#fluree/FlakeDB ")
 
 (defn display
   [db]
   (select-keys db [:alias :branch :t :stats :policy]))
 
 #?(:cljs
-   (extend-type JsonLdDb
+   (extend-type FlakeDB
      IPrintWithWriter
      (-pr-writer [db w _opts]
        (-write w label)
        (-write w (-> db display pr)))))
 
 #?(:clj
-   (defmethod print-method JsonLdDb [^JsonLdDb db, ^Writer w]
+   (defmethod print-method FlakeDB [^FlakeDB db, ^Writer w]
      (.write w label)
      (binding [*out* w]
        (-> db display pr))))
 
-(defmethod pprint/simple-dispatch JsonLdDb
+(defmethod pprint/simple-dispatch FlakeDB
   [db]
   (print label)
   (-> db display pprint))
@@ -841,7 +840,7 @@
                                   :max-namespace-code max-ns-code
                                   :reindex-min-bytes reindex-min-bytes
                                   :reindex-max-bytes reindex-max-bytes)
-                           map->JsonLdDb
+                           map->FlakeDB
                            policy/root)
            indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
                          (<? (vocab/load-schema indexed-db (:preds root-map)))
