@@ -6,7 +6,6 @@
             [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.query.history :refer [AuditLog]]
             [fluree.db.db.json-ld.history :as history]
-            [fluree.db.db.json-ld.policy :as db-policy]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
             [fluree.db.json-ld.policy.rules :as policy-rules]
@@ -454,7 +453,7 @@
   (wrap-identity-policy [db identity default-allow? values-map]
     (policy-rules/wrap-identity-policy db identity default-allow? values-map))
   (root [db]
-    (db-policy/root db)))
+    (policy/root db)))
 
 (defn db?
   [x]
