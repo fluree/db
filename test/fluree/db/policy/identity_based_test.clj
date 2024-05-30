@@ -39,10 +39,7 @@
                                     "f:policyClass" [{"@id" "ex:EmployeePolicy"}]
                                     "ex:user"       {"@id" "ex:alice"}}
                                    ;; embedded policy
-                                   {"@context"     {"ex"     "http://example.org/ns/"
-                                                    "schema" "http://schema.org/"
-                                                    "f"      "https://ns.flur.ee/ledger#"}
-                                    "@id"          "ex:ssnRestriction"
+                                   {"@id"          "ex:ssnRestriction"
                                     "@type"        ["f:AccessPolicy" "ex:EmployeePolicy"]
                                     "f:onProperty" [{"@id" "schema:ssn"}]
                                     "f:action"     {"@id" "f:view"}

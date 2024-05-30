@@ -26,7 +26,7 @@
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.datatype :as datatype]
             [fluree.db.serde.json :as serde-json]
-            [fluree.db.policy.modify :as tx-policy]
+            [fluree.db.json-ld.policy.modify :as tx-policy]
             [fluree.db.query.json-ld.response :as jld-response]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.log :as log]
