@@ -448,7 +448,7 @@
   (wrap-identity-policy [db identity default-allow? values-map]
     (policy-rules/wrap-identity-policy db identity default-allow? values-map))
   (root [db]
-    (policy/root db)))
+    (policy/root-db db)))
 
 (defn db?
   [x]

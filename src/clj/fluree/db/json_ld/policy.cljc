@@ -20,7 +20,7 @@
   {const/iri-view   {:root? true}
    const/iri-modify {:root? true}})
 
-(defn root
+(defn root-db
   [db]
   (assoc db :policy root-policy-map))
 
