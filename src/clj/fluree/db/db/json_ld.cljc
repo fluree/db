@@ -56,7 +56,7 @@
 (defn p-prop
   [schema property predicate]
   (assert (#{:id :iri :subclassOf :parentProps :childProps :datatype}
-            property)
+           property)
           (str "Invalid predicate property: " (pr-str property)))
   (get-in schema [:pred predicate property]))
 
@@ -133,7 +133,7 @@
                                        (map first)
                                        (map (fn [f]
                                               (if (where/unmatched-var? s-mch)
-                                                (let [var (where/get-variable s-mch)
+                                                (let [var     (where/get-variable s-mch)
                                                       matched (where/match-subject s-mch db f)]
                                                   (assoc solution var matched))
                                                 solution)))))
@@ -257,7 +257,7 @@
      :policy        policy
      :stage-update? (= t db-t) ; if a previously staged db is getting updated again before committed
      :t             t
-     :reasoner-max  10         ; maximum number of reasoner iterations before exception
+     :reasoner-max  10 ; maximum number of reasoner iterations before exception
      :reasoned      reasoned-from-iri}))
 
 (defn into-flakeset
@@ -307,7 +307,7 @@
   [db flakes]
   (go-try
     (loop [[s-flakes & r] (partition-by flake/s flakes)
-           sid->s-flakes  {}]
+           sid->s-flakes {}]
       (if s-flakes
         (let [sid             (some-> s-flakes first flake/s)
               existing-flakes (<? (query-range/index-range db :spot = [sid]))]
@@ -323,15 +323,15 @@
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
 
-          mods (<? (modified-subjects db add))
+          mods     (<? (modified-subjects db add))
 
-          db-after  (-> db
-                        (update :staged conj [txn author-did annotation])
-                        (assoc :policy policy) ;; re-apply policy to db-after
-                        (assoc :t t)
-                        (commit-data/update-novelty add remove)
-                        (commit-data/add-tt-id)
-                        (vocab/hydrate-schema add mods))]
+          db-after (-> db
+                       (update :staged conj [txn author-did annotation])
+                       (assoc :policy policy) ;; re-apply policy to db-after
+                       (assoc :t t)
+                       (commit-data/update-novelty add remove)
+                       (commit-data/add-tt-id)
+                       (vocab/hydrate-schema add mods))]
       {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
 
 (defn validate-db-update
@@ -344,16 +344,16 @@
 (defn stage
   [db fuel-tracker context identity annotation raw-txn parsed-txn]
   (go-try
-    (let [db*               (if identity
-                              (<? (policy/wrap-policy db identity))
-                              db)
-          tx-state          (->tx-state :db db*
-                                        :context context
-                                        :txn raw-txn
-                                        :author-did (:did identity)
-                                        :annotation annotation)
+    (let [db*        (if identity
+                       (<? (policy/wrap-policy db identity))
+                       db)
+          tx-state   (->tx-state :db db*
+                                 :context context
+                                 :txn raw-txn
+                                 :author-did (:did identity)
+                                 :annotation annotation)
           [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
-          updated-db        (<? (final-db db** new-flakes tx-state))]
+          updated-db (<? (final-db db** new-flakes tx-state))]
       (<? (validate-db-update updated-db)))))
 
 ;; ================ end Jsonld record support fns ============================
@@ -368,13 +368,11 @@
   (-class-ids [this subject] (class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))
 
-
   iri/IRICodec
   (encode-iri [_ iri]
     (iri/iri->sid iri namespaces))
   (decode-sid [_ sid]
     (iri/sid->iri sid namespace-codes))
-
 
   where/Matcher
   (-match-id [db fuel-tracker solution s-mch error-ch]
@@ -386,11 +384,9 @@
   (-match-class [db fuel-tracker solution s-mch error-ch]
     (match-class db fuel-tracker solution s-mch error-ch))
 
-
   jld-transact/Transactable
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
     (stage db fuel-tracker context identity annotation raw-txn parsed-txn))
-
 
   jld-response/NodeFormatter
   (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
@@ -409,22 +405,21 @@
       (idx-default/refresh db changes-ch)
       (go)))
 
-
   TimeTravel
   (datetime->t [db datetime]
     (go-try
       (log/debug "datetime->t db:" (pr-str db))
       (let [epoch-datetime (util/str->epoch-ms datetime)
-            current-time (util/current-time-millis)
+            current-time   (util/current-time-millis)
             [start end] (if (< epoch-datetime current-time)
                           [epoch-datetime current-time]
                           [current-time epoch-datetime])
             flakes         (-> db
                                root-db
                                (query-range/index-range
-                                 :post
-                                 > [const/$_commit:time start]
-                                 < [const/$_commit:time end])
+                                :post
+                                > [const/$_commit:time start]
+                                < [const/$_commit:time end])
                                <?)]
         (log/debug "datetime->t index-range:" (pr-str flakes))
         (if (empty? flakes)
@@ -441,7 +436,6 @@
   (-as-of [db t]
     (assoc db :t t))
 
-
   AuditLog
   (-history [db context from-t to-t commit-details? error-ch history-q]
     (history/query-history db context from-t to-t commit-details? error-ch history-q))
@@ -457,7 +451,6 @@
 (defn db?
   [x]
   (instance? JsonLdDb x))
-
 
 (def ^String label "#fluree/JsonLdDb ")
 
@@ -486,11 +479,11 @@
 (defn new-novelty-map
   [comparators]
   (reduce
-    (fn [m idx]
-      (assoc m idx (-> comparators
-                       (get idx)
-                       flake/sorted-set-by)))
-    {:size 0} index/types))
+   (fn [m idx]
+     (assoc m idx (-> comparators
+                      (get idx)
+                      flake/sorted-set-by)))
+   {:size 0} index/types))
 
 (defn genesis-root-map
   [ledger-alias]
@@ -514,7 +507,7 @@
   [conn indexed-db index-t commit-jsonld]
   (go-try
     (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
-           db                 indexed-db]
+           db indexed-db]
       (if commit-tuple
         (let [new-db (<? (reify/merge-commit conn db commit-tuple))]
           (recur r new-db))
@@ -525,8 +518,8 @@
    (load conn ledger-alias branch commit-pair {}))
   ([conn ledger-alias branch [commit-jsonld commit-map]
     {:keys [reindex-min-bytes reindex-max-bytes]
-     :or   {reindex-min-bytes 100000                         ; 100 kb
-            reindex-max-bytes 1000000}}]                     ; 1 mb
+     :or   {reindex-min-bytes 100000 ; 100 kb
+            reindex-max-bytes 1000000}}] ; 1 mb
    (go-try
      (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root conn address))
@@ -567,9 +560,9 @@
   [db compact-fn list? p-flakes]
   (loop [[p-flake & r] p-flakes
          all-refs? nil
-         acc      nil]
-    (let [pdt       (flake/dt p-flake)
-          ref?      (= const/$xsd:anyURI pdt)
+         acc       nil]
+    (let [pdt  (flake/dt p-flake)
+          ref? (= const/$xsd:anyURI pdt)
           [obj all-refs?] (if ref?
                             [{"@id" (get-s-iri db (flake/o p-flake) compact-fn)}
                              (if (nil? all-refs?) true all-refs?)]
@@ -577,13 +570,13 @@
                                            flake/o
                                            (serde-json/serialize-object pdt))}
                              false])
-          obj*      (cond-> obj
-                      list? (assoc :i (-> p-flake flake/m :i))
+          obj* (cond-> obj
+                 list? (assoc :i (-> p-flake flake/m :i))
 
-                      ;; need to retain the `@type` for times so they will be
-                      ;; coerced correctly when loading
-                      (datatype/time-type? pdt)
-                      (assoc "@type" (get-s-iri db pdt compact-fn)))
+                  ;; need to retain the `@type` for times so they will be
+                  ;; coerced correctly when loading
+                 (datatype/time-type? pdt)
+                 (assoc "@type" (get-s-iri db pdt compact-fn)))
           acc' (conj acc obj*)]
       (if (seq r)
         (recur r all-refs? acc')
@@ -601,20 +594,20 @@
 (defn- subject-block
   [s-flakes db ^clojure.lang.Volatile ctx compact-fn]
   (loop [[p-flakes & r] (partition-by flake/p s-flakes)
-         acc            nil]
-    (let [fflake           (first p-flakes)
-          list?            (-> fflake flake/m :i)
-          pid              (flake/p fflake)
-          p-iri            (get-s-iri db pid compact-fn)
+         acc nil]
+    (let [fflake          (first p-flakes)
+          list?           (-> fflake flake/m :i)
+          pid             (flake/p fflake)
+          p-iri           (get-s-iri db pid compact-fn)
           [objs all-refs?] (subject-block-pred db compact-fn list?
                                                p-flakes)
-          handle-all-refs  (partial set-refs-type-in-ctx ctx p-iri)
-          objs*            (cond-> objs
-                             ;; next line is for compatibility with json-ld/parse-type's expectations; should maybe revisit
-                             (and all-refs? (not list?)) handle-all-refs
-                             list?                       handle-list-values
-                             (= 1 (count objs))          first)
-          acc'         (assoc acc p-iri objs*)]
+          handle-all-refs (partial set-refs-type-in-ctx ctx p-iri)
+          objs*           (cond-> objs
+                                 ;; next line is for compatibility with json-ld/parse-type's expectations; should maybe revisit
+                            (and all-refs? (not list?)) handle-all-refs
+                            list? handle-list-values
+                            (= 1 (count objs)) first)
+          acc'            (assoc acc p-iri objs*)]
       (if (seq r)
         (recur r acc')
         acc'))))
@@ -642,8 +635,8 @@
     (log/trace "generate-commit flakes:" flakes)
     (let [ctx (volatile! {})]
       (loop [[s-flakes & r] (partition-by flake/s flakes)
-             assert         []
-             retract        []]
+             assert  []
+             retract []]
         (if s-flakes
           (let [sid   (flake/s (first s-flakes))
                 s-iri (get-s-iri db sid compact-fn)
@@ -686,7 +679,7 @@
   "Creates the JSON-LD map containing a new ledger update"
   [{:keys [t commit stats staged max-namespace-code] :as db}
    {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
-  (let [prev-dbid (commit-data/data-id commit)
+  (let [prev-dbid   (commit-data/data-id commit)
 
         {:keys [assert retract refs-ctx]}
         (generate-commit db commit-opts)
@@ -695,20 +688,20 @@
         assert-key  (compact const/iri-assert)
         retract-key (compact const/iri-retract)
         refs-ctx*   (cond-> refs-ctx
-                      prev-dbid     (assoc-in [prev-db-key "@type"] "@id")
-                      (seq assert)  (assoc-in [assert-key "@container"] "@graph")
+                      prev-dbid (assoc-in [prev-db-key "@type"] "@id")
+                      (seq assert) (assoc-in [assert-key "@container"] "@graph")
                       (seq retract) (assoc-in [retract-key "@container"] "@graph"))
         nses        (new-namespaces db)
         db-json     (cond-> {id-key                nil ;; comes from hash later
                              type-key              [(compact const/iri-DB)]
                              (compact const/iri-t) t
                              (compact const/iri-v) data-version}
-                      prev-dbid       (assoc prev-db-key prev-dbid)
-                      (seq assert)    (assoc assert-key assert)
-                      (seq retract)   (assoc retract-key retract)
-                      (seq nses)      (assoc (compact const/iri-namespaces) nses)
+                      prev-dbid (assoc prev-db-key prev-dbid)
+                      (seq assert) (assoc assert-key assert)
+                      (seq retract) (assoc retract-key retract)
+                      (seq nses) (assoc (compact const/iri-namespaces) nses)
                       (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
-                      (:size stats)   (assoc (compact const/iri-size) (:size stats)))
+                      (:size stats) (assoc (compact const/iri-size) (:size stats)))
         ;; TODO - this is re-normalized below, can try to do it just once
         dbid        (commit-data/db-json->db-id db-json)
         db-json*    (-> db-json
