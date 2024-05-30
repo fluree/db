@@ -183,6 +183,8 @@
                      (policy-from-query policies))
          val-map   (assoc values-map "?$identity" {"@value" identity
                                                    "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"})]
+     (log/trace "wrap-identity-policy - extracted policy from identity: " identity
+                " policy: " policies*)
      (if (util/exception? policies*)
        (throw (ex-info (str "Unable to extract policies for identity: " identity
                             " with error: " (ex-message policies*))
