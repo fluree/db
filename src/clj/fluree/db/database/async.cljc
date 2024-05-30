@@ -1,20 +1,19 @@
 (ns fluree.db.database.async
   (:refer-clojure :exclude [load])
-  (:require [fluree.db.db.json-ld :as jld-db]
-            [fluree.db.time-travel :as time-travel]
-            [fluree.db.query.history :as history]
-            [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.indexer :as indexer]
+  (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [<! >! go]]
-            [fluree.db.util.core :as util :refer [try* catch* get-first get-first-value]]
-            [fluree.db.constants :as const]
-            [fluree.db.util.log :as log]
-            [fluree.db.query.exec.where :as where]
+            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.indexer :as indexer]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.transact :as transact]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.history :as history]
             [fluree.db.query.json-ld.response :as jld-response]
-            [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
-            [fluree.db.json-ld.policy :as policy])
+            [fluree.db.time-travel :as time-travel]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.log :as log])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -97,6 +96,14 @@
     (go-try
       (let [db (<? db-chan)]
         (<? (transact/-stage-txn db fuel-tracker context identity annotation raw-txn parsed-txn)))))
+  (-merge-commit [_ new-commit]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (transact/-merge-commit db new-commit)))))
+  (-merge-commit [_ new-commit proof]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (transact/-merge-commit db new-commit proof)))))
 
   indexer/Indexable
   (index [_ changes-ch]
