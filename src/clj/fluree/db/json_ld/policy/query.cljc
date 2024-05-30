@@ -30,7 +30,7 @@
   (go-try
    (cond
 
-     (unrestricted? policy)
+     (enforce/unrestricted? policy false)
      true
 
      ;; currently property-restrictions override class restrictions if present
