@@ -8,7 +8,7 @@
             [fluree.db.db.json-ld.history :as history]
             [fluree.db.db.json-ld.policy :as db-policy]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.policy.query :as qpolicy]
+            [fluree.db.json-ld.policy.query :as qpolicy]
             [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.util.core :as util :refer [get-first get-first-value vswap!]]
             [fluree.db.index :as index]

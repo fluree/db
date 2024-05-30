@@ -9,7 +9,7 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.common :refer [filter-subject]]
-            [fluree.db.policy.query :as policy :refer [filter-subject-flakes]]
+            [fluree.db.json-ld.policy.query :as policy :refer [filter-subject-flakes]]
             [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))

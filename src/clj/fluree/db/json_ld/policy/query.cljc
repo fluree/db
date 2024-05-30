@@ -1,12 +1,10 @@
-(ns fluree.db.policy.query
+(ns fluree.db.json-ld.policy.query
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.policy.enforce :as enforce]
+            [fluree.db.json-ld.policy.enforce :as enforce]
             [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
