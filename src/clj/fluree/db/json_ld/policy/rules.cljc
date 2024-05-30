@@ -4,7 +4,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.core :as util]
-            [fluree.db.util.async :refer [go-try]]
+            [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
