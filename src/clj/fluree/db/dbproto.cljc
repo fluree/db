@@ -1,7 +1,6 @@
 (ns fluree.db.dbproto)
 
 (defprotocol IFlureeDb
-  (-rootdb [db] "Returns root db version of this db.")
   (-query [db query] "Performs a query.")
   ;; schema-related
   (-p-prop [db property predicate] "Returns the property specified for the given predicate.")

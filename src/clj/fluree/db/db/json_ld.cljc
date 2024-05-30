@@ -42,15 +42,11 @@
 
 ;; ================ Jsonld record support fns ================================
 
-(defn root-db
-  [this]
-  (policy/root this))
-
 (defn class-ids
   "Returns list of class-ids for given subject-id"
   [db subject-id]
   (go-try
-    (let [root (root-db db)]
+    (let [root (policy/root db)]
       (<? (query-range/index-range root :spot = [subject-id const/$rdf:type]
                                    {:flake-xf (map flake/o)})))))
 
@@ -249,7 +245,7 @@
 
         commit-t  (-> db :commit commit-data/t)
         t         (flake/next-t commit-t)
-        db-before (root-db db)]
+        db-before (policy/root db)]
     {:db-before     db-before
      :context       context
      :txn           txn
@@ -324,7 +320,7 @@
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
 
-          mods (<? (modified-subjects (root-db db) add))
+          mods (<? (modified-subjects (policy/root db) add))
 
           db-after  (-> db
                         (update :staged conj [txn author-did annotation])
@@ -338,7 +334,7 @@
 (defn validate-db-update
   [{:keys [db-after db-before mods context] :as staged-map}]
   (go-try
-    (<? (shacl/validate! db-before (root-db db-after) (vals mods) context))
+    (<? (shacl/validate! db-before (policy/root db-after) (vals mods) context))
     (let [allowed-db (<? (tx-policy/allowed? staged-map))]
       allowed-db)))
 
@@ -361,7 +357,6 @@
                      namespace-codes max-namespace-code reindex-min-bytes
                      reindex-max-bytes]
   dbproto/IFlureeDb
-  (-rootdb [this] (root-db this))
   (-query [this query-map] (fql/query this query-map))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
   (-class-ids [this subject] (class-ids this subject))
@@ -419,7 +414,7 @@
                           [epoch-datetime current-time]
                           [current-time epoch-datetime])
             flakes         (-> db
-                               root-db
+                               policy/root
                                (query-range/index-range
                                  :post
                                  > [const/$_commit:time start]

@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.policy-validate
   (:require [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.policy :as policy]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.core.async :as async]
             [fluree.db.query.range :as query-range]
@@ -20,7 +21,7 @@
   [{:keys [policy] :as db} path equals-rule]
   (go-try
     (let [{:keys [cache ident]} policy
-          db-root (dbproto/-rootdb db)]
+          db-root (policy/root db)]
       (loop [[next-iri & r] path
              last-result    ident]
         (if (and last-result next-iri)
