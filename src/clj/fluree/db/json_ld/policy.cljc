@@ -16,5 +16,6 @@
 
 
 (defprotocol Restrictable
-  (wrap-policy [db identity])
+  (wrap-policy [db policy-rules default-allow? values-map])
+  (wrap-identity-policy [db identity default-allow? values-map])
   (root [db]))

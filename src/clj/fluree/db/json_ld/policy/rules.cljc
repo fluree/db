@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.policy.rules
   (:require [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.core :as util]
@@ -144,16 +145,6 @@
    {}
    policy-rules))
 
-(defn wrap-policy
-  [db policy-rules default-allow? values-map]
-  (go-try
-   (let [policy-rules (->> (parse-rules-graph policy-rules)
-                           (parse-policy-rules db))]
-     (log/trace "policy-rules: " policy-rules)
-     (assoc db :policy (assoc policy-rules :cache (atom {})
-                                           :values-map values-map
-                                           :default-allow? default-allow?)))))
-
 (defn policy-from-query
   "For now, extracting a policy from a `select` clause does not retain the
   @value: 'x', @type: '@json' structure for the value of `f:query` which
@@ -168,3 +159,33 @@
                                 "@type"  "@json"})
       %)
    query-results))
+
+(defn wrap-policy
+  [db policy-rules default-allow? values-map]
+  (go-try
+   (let [policy-rules (->> (parse-rules-graph policy-rules)
+                           (parse-policy-rules db))]
+     (log/trace "policy-rules: " policy-rules)
+     (assoc db :policy (assoc policy-rules :cache (atom {})
+                                           :values-map values-map
+                                           :default-allow? default-allow?)))))
+
+(defn wrap-identity-policy
+  [db identity default-allow? values-map]
+  (go-try
+   (let [policies  (dbproto/-query db {"select" {"?policy" ["*"]}
+                                       "where"  [{"@id"                 identity
+                                                  const/iri-policyClass "?classes"}
+                                                 {"@id"   "?policy"
+                                                  "@type" "?classes"}]})
+         policies* (if (util/exception? policies)
+                     policies
+                     (policy-from-query policies))
+         val-map   (assoc values-map "?$identity" {"@value" identity
+                                                   "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"})]
+     (if (util/exception? policies*)
+       (throw (ex-info (str "Unable to extract policies for identity: " identity
+                            " with error: " (ex-message policies*))
+                       {:status 400 :error :db/policy-exception}
+                       policies*))
+       (wrap-policy db policies* default-allow? val-map)))))

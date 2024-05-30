@@ -9,6 +9,7 @@
             [fluree.db.db.json-ld.policy :as db-policy]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
+            [fluree.db.json-ld.policy.rules :as policy-rules]
             [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.util.core :as util :refer [get-first get-first-value vswap!]]
             [fluree.db.index :as index]
@@ -448,8 +449,10 @@
     (history/query-commits db context from-t to-t error-ch))
 
   policy/Restrictable
-  (wrap-policy [db identity]
-    (db-policy/wrap-policy db identity))
+  (wrap-policy [db policy default-allow? values-map]
+    (policy-rules/wrap-policy db policy default-allow? values-map))
+  (wrap-identity-policy [db identity default-allow? values-map]
+    (policy-rules/wrap-identity-policy db identity default-allow? values-map))
   (root [db]
     (db-policy/root db)))
 

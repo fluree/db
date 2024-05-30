@@ -39,7 +39,7 @@
   [db t context opts]
   (go-try
     (let [db*  (if-let [policy-identity (perm/parse-policy-identity opts context)]
-                 (<? (perm/wrap-policy db policy-identity))
+                 (<? (perm/wrap-identity-policy db policy-identity false nil))
                  db)
           db** (-> (if t
                      (<? (time-travel/as-of db* t))

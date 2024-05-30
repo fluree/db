@@ -51,7 +51,7 @@
                                                               "where"    {"@id"     "?$identity"
                                                                           "ex:user" {"@id" "?$this"}}}}}]})
 
-          policy-db @(fluree/wrap-policy-from-identity db alice-did true)]
+          policy-db @(fluree/wrap-identity-policy db alice-did true)]
 
       (testing " with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
