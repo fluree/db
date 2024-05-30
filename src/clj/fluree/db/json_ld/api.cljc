@@ -18,7 +18,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.connection :refer [notify-ledger]]
-            [fluree.db.policy.rules :as policy-rules]
+            [fluree.db.json-ld.policy.rules :as policy-rules]
             [fluree.db.constants :as const]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.flake :as flake]

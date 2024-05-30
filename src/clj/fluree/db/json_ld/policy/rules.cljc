@@ -1,4 +1,4 @@
-(ns fluree.db.policy.rules
+(ns fluree.db.json-ld.policy.rules
   (:require [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]

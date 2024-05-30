@@ -1,10 +1,10 @@
-(ns fluree.db.policy.modify
+(ns fluree.db.json-ld.policy.modify
   (:require [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
-            [fluree.db.policy.enforce :as enforce]))
+            [fluree.db.json-ld.policy.enforce :as enforce]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

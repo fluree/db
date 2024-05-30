@@ -1,4 +1,4 @@
-(ns fluree.db.policy.enforce
+(ns fluree.db.json-ld.policy.enforce
   (:require [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]

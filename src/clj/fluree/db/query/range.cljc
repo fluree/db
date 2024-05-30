@@ -6,7 +6,7 @@
             [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go >!] :as async]
                :cljs [cljs.core.async :refer [chan  >!] :refer-macros [go] :as async])
-            [fluree.db.policy.query :as policy]
+            [fluree.db.json-ld.policy.query :as policy]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.iri :as iri]))
 
