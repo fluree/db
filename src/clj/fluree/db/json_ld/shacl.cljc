@@ -1102,7 +1102,7 @@
   `modified-subjects` is a sequence of s-flakes of modified subjects."
   [shape-db data-db modified-subjects context]
   (go-try
-    (when-let [node-shape-sids (not-empty (<? (all-node-shape-ids shape-db)))]
+    (when-let [node-shape-sids (seq (<? (all-node-shape-ids shape-db)))]
       (doseq [s-flakes modified-subjects]
         (doseq [shape-sid node-shape-sids]
           (let [shape   (<? (build-shape shape-db shape-sid))
