@@ -67,13 +67,16 @@
                     (commit-data/t current-commit))
           current-state))))
 
+(defn reload-with-index
+  [{:keys [commit] :as _db} conn alias branch index]
+  (let [indexed-commit (assoc commit :index index)]
+    (load-db conn alias branch indexed-commit)))
+
 (defn use-latest-index
-  [{db-commit :commit, :as db} conn alias branch idx-commit]
-  (if (and idx-commit
-           (newer-index? idx-commit db-commit))
-    (let [latest-index  (:index idx-commit)
-          latest-commit (assoc db-commit :index latest-index)]
-      (load-db conn alias branch latest-commit))
+  [{db-commit :commit, :as db} idx-commit conn alias branch]
+  (if (newer-index? idx-commit db-commit)
+    (let [latest-index  (:index idx-commit)]
+      (reload-with-index db conn alias branch latest-index))
     db))
 
 (defn index-queue
@@ -82,7 +85,7 @@
         queue (async/chan buf)]
     (go-loop [last-index-commit nil]
       (when-let [{:keys [db index-files-ch]} (<! queue)]
-        (let [db* (use-latest-index db conn alias branch last-index-commit)]
+        (let [db* (use-latest-index db last-index-commit conn alias branch)]
           (if-let [indexed-db (try* (<? (indexer/index db* index-files-ch))
                                     (catch* e
                                       (log/error e "Error updating index")))]
