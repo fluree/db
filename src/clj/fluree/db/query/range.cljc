@@ -98,7 +98,7 @@
 (defn authorize-flake-exception
   "Wraps upstream exception and logs out a warning message"
   [e db flake]
-  (let [e* (ex-info (str "Error authorizing flake in db "
+  (let [e* (ex-info (str "Policy exception authorizing Flake in "
                          (:alias db) "?t=" (:t db)
                          ". " (ex-message e))
                     {:error  :db/policy-exception
