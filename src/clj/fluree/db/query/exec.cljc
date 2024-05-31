@@ -52,6 +52,7 @@
           result-ch (->> (where/search ds q fuel-tracker error-ch)
                          (group/combine q)
                          (having/filter q error-ch)
+                         (select/modify q)
                          (order/arrange q)
                          (select/format ds q fuel-tracker error-ch)
                          (drop-offset q)
