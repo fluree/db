@@ -696,7 +696,6 @@
   (-aliases [_]
     [alias])
 
-
   jld-transact/Transactable
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
     (stage db fuel-tracker context identity annotation raw-txn parsed-txn))
