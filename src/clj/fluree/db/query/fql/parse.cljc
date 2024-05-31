@@ -79,8 +79,10 @@
         (let [expanded (json-ld/expand-iri val context)]
           (where/match-iri var-match expanded))
         (where/match-value var-match val dt-iri))
-      (let [dt (datatype/infer-iri val)]
-        (where/match-value var-match val dt)))))
+      (if-let [lang (get attrs const/iri-language)]
+        (where/match-value var-match val const/iri-string {:lang lang})
+        (let [dt (datatype/infer-iri val)]
+          (where/match-value var-match val dt))))))
 
 (defn match-value-binding
   [var-match value context]
