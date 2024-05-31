@@ -433,7 +433,6 @@
         ex-msg (or (ex-message e)
                    ;; note: NullPointerException is common but has no ex-message, create one
                    (let [ex-type (str (type e))] ;; attempt to make JS compatible
-                     (log/warn "ex-type is: " ex-type)
                      (if (= ex-type "class java.lang.NullPointerException")
                        "Variable has null value, cannot apply filter"
                        "Unknown error")))
