@@ -6,7 +6,8 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol Transactable
-  (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]))
+  (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn])
+  (-merge-commit [db commit] [db commit proof]))
 
 (defn nested-nodes?
   "Returns truthy if the provided node has any nested nodes."
