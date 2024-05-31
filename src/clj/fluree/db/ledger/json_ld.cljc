@@ -3,6 +3,7 @@
             [fluree.db.ledger :as ledger]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.json-ld.credential :as cred]
+            [fluree.db.json-ld.transact :as transact]
             [fluree.db.did :as did]
             [fluree.db.util.context :as context]
             [fluree.db.util.async :refer [<? go-try]]
@@ -221,7 +222,7 @@
   the provided commit was not the next expected commit.
 
   If commit successful, returns successfully updated db."
-  [{:keys [conn] :as ledger} expanded-commit]
+  [ledger expanded-commit]
   (go-try
     (let [[commit proof] (jld-reify/verify-commit expanded-commit)
 
@@ -239,7 +240,7 @@
       (cond
 
         (= commit-t (flake/next-t current-t))
-        (let [updated-db  (<? (jld-reify/merge-commit conn current-db [commit proof]))]
+        (let [updated-db  (<? (transact/-merge-commit current-db commit proof))]
           (update-commit! ledger branch updated-db))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
@@ -273,7 +274,6 @@
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))
   (-close [ledger] (close-ledger ledger)))
-
 
 (defn normalize-alias
   "For a ledger alias, removes any preceding '/' or '#' if exists."
