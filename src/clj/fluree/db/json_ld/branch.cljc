@@ -2,6 +2,7 @@
   (:require [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.indexer :as indexer]
             [fluree.json-ld :as json-ld]
+            [fluree.db.db.json-ld :as jld-db]
             [fluree.db.database.async :as async-db]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<?]]
@@ -66,21 +67,28 @@
                     (commit-data/t current-commit))
           current-state))))
 
+(defn use-latest-index
+  [{db-commit :commit, :as db} conn alias branch idx-commit]
+  (if (and idx-commit
+           (newer-index? idx-commit db-commit))
+    (let [latest-index  (:index idx-commit)
+          latest-commit (assoc db-commit :index latest-index)]
+      (load-db conn alias branch latest-commit))
+    db))
+
 (defn index-queue
-  [branch-state]
+  [conn alias branch branch-state]
   (let [buf   (async/sliding-buffer 1)
         queue (async/chan buf)]
-    (go-loop []
+    (go-loop [last-index-commit nil]
       (when-let [{:keys [db index-files-ch]} (<! queue)]
-        (try*
-          (when-let [indexed-db (<? (indexer/index db index-files-ch))]
-            (swap! branch-state update-index indexed-db))
-          (catch* e
-                  (log/error e "Error updating index"))
-          (finally
-            (when index-files-ch
-              (async/close! index-files-ch))))
-        (recur)))
+        (let [db* (use-latest-index db conn alias branch last-index-commit)]
+          (if-let [indexed-db (try* (<? (indexer/index db* index-files-ch))
+                                    (catch* e
+                                      (log/error e "Error updating index")))]
+            (do (swap! branch-state update-index indexed-db)
+                (recur (:commit indexed-db)))
+            (recur last-index-commit)))))
     queue))
 
 (defn enqueue-index!
@@ -94,7 +102,7 @@
         commit-map (commit-data/jsonld->clj commit-jsonld)
         state      (atom {:commit     commit-map
                           :current-db initial-db})
-        idx-q      (index-queue state)]
+        idx-q      (index-queue conn ledger-alias branch-name state)]
     {:name        branch-name
      :conn        conn
      :alias       ledger-alias
