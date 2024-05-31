@@ -52,7 +52,7 @@
   ([ledger branch-name db]
    (update-commit! ledger branch-name db nil))
   ([{:keys [state] :as ledger} branch-name db index-files-ch]
-   (log/info "Attempting to update ledger:" (:alias ledger)
+   (log/debug "Attempting to update ledger:" (:alias ledger)
               "and branch:" branch-name "with new commit to t" (:t db))
    (let [branch-meta (get-branch-meta ledger branch-name)]
      (when-not branch-meta
@@ -62,8 +62,6 @@
      (let [new-db (-> branch-meta
                       (branch/update-commit! db index-files-ch)
                       branch/current-db)]
-       (log/info "Updating ledger:" (:alias ledger)
-                 "and branch:" branch-name "with new commit to t" (:t db) "successful")
        new-db))))
 
 (defn status
