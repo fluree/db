@@ -385,7 +385,7 @@
                (map parse-code)
                (map eval/compile)
                (apply every-pred))]
-    [(where/->pattern :filter f)]))
+    [(where/->pattern :filter (with-meta f {:fns codes}))]))
 
 (defmethod parse-pattern :union
   [[_ & unions] vars context]

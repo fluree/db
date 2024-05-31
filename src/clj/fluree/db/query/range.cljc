@@ -95,6 +95,19 @@
   [f]
   (= f ::unauthorized))
 
+(defn authorize-flake-exception
+  "Wraps upstream exception and logs out a warning message"
+  [e db flake]
+  (let [e* (ex-info (str "Error authorizing flake in db "
+                         (:alias db) "?t=" (:t db)
+                         ". " (ex-message e))
+                    {:error  :db/policy-exception
+                     :status 400
+                     :flake  flake}
+                    e)]
+    (log/warn (ex-message e*))
+    e*))
+
 (defn authorize-flake
   [db error-ch flake]
   (go
@@ -103,10 +116,7 @@
             flake
             ::unauthorized)
           (catch* e
-                  (log/error e
-                             "Error authorizing flake in ledger"
-                             (select-keys db [:network :ledger-id :t]))
-                  (>! error-ch e)))))
+                  (>! error-ch (authorize-flake-exception e db flake))))))
 
 (defn authorize-flakes
   "Authorize each flake in the supplied `flakes` collection asynchronously,
