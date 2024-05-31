@@ -59,10 +59,9 @@
        (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                             "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
                        {:status 400 :error :db/invalid-branch})))
-     (let [new-db (-> branch-meta
-                      (branch/update-commit! db index-files-ch)
-                      branch/current-db)]
-       new-db))))
+     (-> branch-meta
+         (branch/update-commit! db index-files-ch)
+         branch/current-db))))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
