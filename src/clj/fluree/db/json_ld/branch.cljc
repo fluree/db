@@ -6,7 +6,8 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log :include-macros true]
-            [clojure.core.async :as async :refer [<! go-loop]]))
+            [clojure.core.async :as async :refer [<! go-loop]]
+            [fluree.db.index :as index]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -36,6 +37,11 @@
   [commit-map]
   (-> commit-map commit-data/->json-ld json-ld/expand))
 
+(defn load-db
+  [conn alias branch commit]
+  (let [commit-jsonld (commit-map->commit-jsonld commit)]
+    (async-db/load conn alias branch commit-jsonld)))
+
 (defn update-index
   [{current-commit :commit, :as current-state}
    {:keys [conn alias branch], indexed-commit :commit, :as indexed-db}]
@@ -47,10 +53,9 @@
       current-state)
     (if (older-commit? current-commit indexed-commit)
       (if (newer-index? indexed-commit current-commit)
-        (let [latest-index         (:index indexed-commit)
-              latest-commit        (assoc current-commit :index latest-index)
-              latest-commit-jsonld (commit-map->commit-jsonld latest-commit)
-              latest-db            (async-db/load conn alias branch latest-commit-jsonld)]
+        (let [latest-index  (:index indexed-commit)
+              latest-commit (assoc current-commit :index latest-index)
+              latest-db     (load-db conn alias branch latest-commit)]
           (assoc current-state
                  :commit     latest-commit
                  :current-db latest-db))
@@ -110,10 +115,9 @@
    {:keys [conn alias branch], new-commit :commit, :as new-db}]
   (if (next-commit? current-commit new-commit)
     (if (newer-index? current-commit new-commit)
-      (let [latest-index         (:index current-commit)
-            latest-commit        (assoc new-commit :index latest-index)
-            latest-commit-jsonld (commit-map->commit-jsonld latest-commit)
-            latest-db            (async-db/load conn alias branch latest-commit-jsonld)]
+      (let [latest-index  (:index current-commit)
+            latest-commit (assoc new-commit :index latest-index)
+            latest-db     (load-db conn alias branch latest-commit)]
         (assoc current-state
                :commit     latest-commit
                :current-db latest-db))
