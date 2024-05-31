@@ -99,20 +99,6 @@
                          ", however provided db is only at t value: " (:t db))
                     {:status 500 :error :db/indexing}))))
 
-(defn force-index-update
-  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
-  (let [index-t (:t data-map)
-        commit* (assoc commit :index commit-index)]
-    (-> db
-        (empty-novelty index-t)
-        (assoc :commit commit*
-               :novelty* (empty-novelty db index-t)
-               :spot spot
-               :post post
-               :opst opst
-               :tspo tspo)
-        (assoc-in [:stats :indexed] index-t))))
-
 (defn newer-index?
   [commit {data-map :data, :as _commit-index}]
   (if data-map
@@ -125,9 +111,18 @@
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [commit] :as db} commit-index]
+  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
   (if (newer-index? commit commit-index)
-    (force-index-update db commit-index)
+    (let [index-t (:t data-map)
+          commit* (assoc commit :index commit-index)]
+      (-> db
+          (empty-novelty index-t)
+          (assoc :commit commit*
+                 :spot spot
+                 :post post
+                 :opst opst
+                 :tspo tspo)
+          (assoc-in [:stats :indexed] index-t)))
     db))
 
 (defn match-id
