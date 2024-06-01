@@ -59,6 +59,13 @@
             (>! error-ch e))))
       match-ch))
 
+  (-activate-alias [db alias']
+    (when (= alias alias')
+      db))
+
+  (-aliases [_]
+    [alias])
+
   jld-response/NodeFormatter
   (-forward-properties [_ iri select-spec context compact-fn cache fuel-tracker error-ch]
     (let [prop-ch (async/chan)]

@@ -225,6 +225,7 @@
       (async/close! matched-ch))
     matched-ch))
 
+
 ;; TODO - can use transient! below
 (defn stage-update-novelty
   "If a db is staged more than once, any retractions in a previous stage will
@@ -692,6 +693,13 @@
 
   (-match-class [db fuel-tracker solution s-mch error-ch]
     (match-class db fuel-tracker solution s-mch error-ch))
+
+  (-activate-alias [db alias']
+    (when (= alias alias')
+      db))
+
+  (-aliases [_]
+    [alias])
 
   jld-transact/Transactable
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]

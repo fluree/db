@@ -7,7 +7,6 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.datatype :as datatype]
-            [fluree.db.query.dataset :as dataset]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri])
   #?(:clj (:import (clojure.lang MapEntry))))
@@ -179,7 +178,9 @@
 (defprotocol Matcher
   (-match-id [s fuel-tracker solution s-match error-ch])
   (-match-triple [s fuel-tracker solution triple error-ch])
-  (-match-class [s fuel-tracker solution triple error-ch]))
+  (-match-class [s fuel-tracker solution triple error-ch])
+  (-activate-alias [s alias])
+  (-aliases [s]))
 
 (defn pattern-type
   [pattern]
@@ -391,39 +392,17 @@
 (defmethod match-pattern :id
   [ds fuel-tracker solution pattern error-ch]
   (let [s-mch (pattern-data pattern)]
-    (if-let [active-graph (dataset/active ds)]
-      (if (sequential? active-graph)
-        (->> active-graph
-             (map (fn [graph]
-                    (-match-id graph fuel-tracker solution s-mch error-ch)))
-             async/merge)
-        (-match-id active-graph fuel-tracker solution s-mch error-ch))
-      nil-channel)))
+    (-match-id ds fuel-tracker solution s-mch error-ch)))
 
 (defmethod match-pattern :tuple
   [ds fuel-tracker solution pattern error-ch]
   (let [tuple (pattern-data pattern)]
-    (if-let [active-graph (dataset/active ds)]
-      (if (sequential? active-graph)
-        (->> active-graph
-             (map (fn [graph]
-                    (-match-triple graph fuel-tracker solution tuple error-ch)))
-             async/merge)
-        (-match-triple active-graph fuel-tracker solution tuple error-ch))
-      nil-channel)))
+    (-match-triple ds fuel-tracker solution tuple error-ch)))
 
 (defmethod match-pattern :class
   [ds fuel-tracker solution pattern error-ch]
-  (if-let [active-graph (dataset/active ds)]
-    (let [triple (pattern-data pattern)]
-      (log/debug "active graph:" active-graph)
-      (if (sequential? active-graph)
-        (->> active-graph
-             (map (fn [graph]
-                    (-match-class graph fuel-tracker solution triple error-ch)))
-             async/merge)
-        (-match-class active-graph fuel-tracker solution triple error-ch)))
-    nil-channel))
+  (let [triple (pattern-data pattern)]
+    (-match-class ds fuel-tracker solution triple error-ch)))
 
 (defmethod match-pattern :filter
   [_ds _fuel-tracker solution pattern error-ch]
@@ -462,7 +441,7 @@
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
   (-> ds
-      (dataset/activate alias)
+      (-activate-alias alias)
       (match-clause fuel-tracker solution clause error-ch)))
 
 (defmethod match-pattern :graph
@@ -470,18 +449,18 @@
   (let [[g clause] (pattern-data pattern)]
     (if-let [v (::var g)]
       (if-let [v-match (get solution v)]
-        (let [alias (or (::iri v-match)
+        (let [alias (or (get-iri v-match)
                         (get-value v-match))]
           (match-alias ds alias fuel-tracker solution clause error-ch))
-        (let [out-ch  (async/chan)
-              name-ch (-> ds dataset/names async/to-chan!)]
+        (let [out-ch   (async/chan)
+              alias-ch (-> ds -aliases async/to-chan!)]
           (async/pipeline-async 2
                                 out-ch
                                 (fn [alias ch]
                                   (let [solution* (update solution v match-iri alias)]
                                     (-> (match-alias ds alias fuel-tracker solution* clause error-ch)
                                         (async/pipe ch))))
-                                name-ch)
+                                alias-ch)
           out-ch))
       (match-alias ds g fuel-tracker solution clause error-ch))))
 
