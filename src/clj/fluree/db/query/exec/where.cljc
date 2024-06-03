@@ -543,21 +543,23 @@
 
 (defn search
   ([ds q fuel-tracker error-ch]
-   (search ds q fuel-tracker error-ch (-> q
-                                          :values
-                                          not-empty
-                                          (or [blank-solution])
-                                          async/to-chan!)))
+   (search ds q fuel-tracker error-ch nil))
   ([ds q fuel-tracker error-ch initial-solution-ch]
-   (let [out-ch (async/chan 2)]
+   (let [out-ch               (async/chan 2)
+         initial-solution-ch* (or initial-solution-ch
+                                  (-> q
+                                      :values
+                                      not-empty
+                                      (or [blank-solution])
+                                      async/to-chan!))]
      (if-let [where-clause (:where q)]
        (async/pipeline-async 2
                              out-ch
                              (fn [initial-solution ch]
                                (-> (match-clause ds fuel-tracker initial-solution where-clause error-ch)
                                    (async/pipe ch)))
-                             initial-solution-ch)
-       (async/pipe initial-solution-ch out-ch))
+                             initial-solution-ch*)
+       (async/pipe initial-solution-ch* out-ch))
      out-ch)))
 
 (defn bound-variables

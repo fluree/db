@@ -42,6 +42,47 @@
     (async/take 1 result-ch)
     (async/into [] result-ch)))
 
+(defn extract-subquery
+  [query-smt]
+  (when (and (sequential? query-smt)
+             (= :subquery (first query-smt)))
+    (second query-smt)))
+
+(defn execute
+  [ds fuel-tracker q error-ch initial-soln]
+  (->> (where/search ds q fuel-tracker error-ch)
+       (group/combine q)
+       (having/filter q error-ch)
+       (select/modify q)
+       (order/arrange q)
+       (select/format ds q fuel-tracker error-ch)
+       (drop-offset q)
+       (take-limit q)
+       (collect-results q)))
+
+(defn collect-subqueries
+  [ds fuel-tracker q error-ch subquery-chans]
+  (throw (ex-info "Subqueries not yet implemented" {}))
+  (let [initial-soln :TODO]
+    (execute ds fuel-tracker q error-ch initial-soln)))
+
+(defn query*
+  [ds fuel-tracker q error-ch]
+  (loop [[where-smt & r] (:where q)
+         result-chans []]
+    (if where-smt
+      (if-let [subquery (extract-subquery where-smt)]
+        (let [result-ch (query* ds fuel-tracker subquery error-ch)] ;; might be multiple nested subqueries
+          (recur r (conj result-chans result-ch)))
+        (recur r result-chans))
+      ;; end of subqueries search... if result-chans extract as initial soln to where, else execute where
+      (if (seq result-chans)
+        ;; found subqueries, collect them into initial values solution and the execute
+        (->> (collect-subqueries ds fuel-tracker q error-ch result-chans)
+             (execute ds fuel-tracker q error-ch))
+        ;; no sub-queries, just execute
+        (execute ds fuel-tracker q error-ch nil)))))
+
 (defn query
   "Execute the parsed query `q` against the database value `db`. Returns an async
   channel which will eventually contain a single vector of results, or an
@@ -49,15 +90,7 @@
   [ds fuel-tracker q]
   (go
     (let [error-ch  (async/chan)
-          result-ch (->> (where/search ds q fuel-tracker error-ch)
-                         (group/combine q)
-                         (having/filter q error-ch)
-                         (select/modify q)
-                         (order/arrange q)
-                         (select/format ds q fuel-tracker error-ch)
-                         (drop-offset q)
-                         (take-limit q)
-                         (collect-results q))]
+          result-ch (query* ds fuel-tracker q error-ch)]
       (async/alt!
-        error-ch  ([e] e)
-        result-ch ([result] result)))))
+       error-ch ([e] e)
+       result-ch ([result] result)))))
