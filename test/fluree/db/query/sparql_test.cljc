@@ -459,14 +459,14 @@
              groupBy))
       (is (= "(> (sum ?favNums) 1000)"
              having))))
-  (testing "mutiple GROUP BY"
+  (testing "multiple GROUP BY"
     (let [query "SELECT ?handle
                  WHERE {?person person:handle ?handle.}
                  GROUP BY ?person ?handle"
           {:keys [groupBy]} (sparql/->fql query)]
       (is (= ["?person" "?handle"]
              groupBy))))
-  (testing "mutiple HAVING constraints"
+  (testing "multiple HAVING constraints"
     (let [query "SELECT ?handle
                  WHERE {?person person:handle ?handle.}
                  GROUP BY ?person ?handle
