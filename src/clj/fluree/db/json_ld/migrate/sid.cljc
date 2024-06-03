@@ -1,7 +1,6 @@
 (ns fluree.db.json-ld.migrate.sid
   (:require [fluree.db.constants :as const]
             [fluree.db.query.exec.update :as update]
-            [fluree.db.json-ld.commit :as commit]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.reify :as reify]

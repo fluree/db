@@ -167,6 +167,22 @@
   [subj selection depth spec]
   (->SubgraphSelector subj selection depth spec))
 
+(defn modify
+  "Apply any modifying selectors to each solution in `solution-ch`."
+  [q solution-ch]
+  (let [selectors           (or (:select q)
+                                (:select-one q)
+                                (:select-distinct q))
+        modifying-selectors (filter #(satisfies? SolutionModifier %) selectors)
+        mods-xf             (map (fn [solution]
+                                   (reduce
+                                     (fn [sol sel]
+                                       (log/trace "Updating solution:" sol)
+                                       (update-solution sel sol))
+                                     solution modifying-selectors)))
+        modify-ch               (chan 1 mods-xf)]
+    (async/pipe solution-ch modify-ch)))
+
 (defn format-values
   "Formats the values from the specified where search solution `solution`
   according to the selector or collection of selectors specified by `selectors`"
@@ -195,18 +211,7 @@
         iri-cache           (volatile! {})
         format-ch           (if (contains? q :select-distinct)
                               (chan 1 (distinct))
-                              (chan))
-        modifying-selectors (filter #(satisfies? SolutionModifier %) selectors)
-        ;; TODO: Figure out the order of operations among parsing into a
-        ;;       selector, this, & format-value
-        mods-xf             (map (fn [solution]
-                                   (reduce
-                                    (fn [sol sel]
-                                      (log/trace "Updating solution:" sol)
-                                      (update-solution sel sol))
-                                    solution modifying-selectors)))
-        in-ch               (chan 1 mods-xf)]
-    (async/pipe solution-ch in-ch)
+                              (chan))]
     (async/pipeline-async 1
                           format-ch
                           (fn [solution ch]
@@ -214,5 +219,5 @@
                             (-> (format-values selectors db iri-cache context compact
                                                fuel-tracker error-ch solution)
                                 (async/pipe ch)))
-                          in-ch)
+                          solution-ch)
     format-ch))

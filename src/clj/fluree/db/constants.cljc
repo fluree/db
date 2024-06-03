@@ -13,7 +13,6 @@
 (def ^:const iri-DB (fluree-iri "DB"))
 (def ^:const iri-data (fluree-iri "data"))
 (def ^:const iri-t (fluree-iri "t"))
-
 (def ^:const iri-address (fluree-iri "address"))
 (def ^:const iri-v (fluree-iri "v"))
 (def ^:const iri-flakes (fluree-iri "flakes"))
@@ -24,6 +23,7 @@
 (def ^:const iri-alias (fluree-iri "alias"))
 (def ^:const iri-ledger (fluree-iri "ledger"))
 (def ^:const iri-branch (fluree-iri "branch"))
+(def ^:const iri-namespaces (fluree-iri "namespaces"))
 (def ^:const iri-issuer "https://www.w3.org/2018/credentials#issuer")
 (def ^:const iri-cred-subj "https://www.w3.org/2018/credentials#credentialSubject")
 (def ^:const iri-index (fluree-iri "index"))

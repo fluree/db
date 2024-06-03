@@ -1,6 +1,7 @@
 (ns fluree.db.query.subject-crawl.subject
   (:require [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.range :as query-range]
             [fluree.db.index :as index]
@@ -88,8 +89,8 @@
   [{:keys [db cache context compact-fn select-spec error-ch] :as _opts}]
   (fn [flakes port]
     (-> db
-        (json-ld-resp/format-subject-flakes cache context compact-fn select-spec
-                                            0 nil error-ch flakes)
+        (jld-format/format-subject-flakes cache context compact-fn select-spec
+                                      0 nil error-ch flakes)
         (async/pipe port))))
 
 (defn subj-crawl

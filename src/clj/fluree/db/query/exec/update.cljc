@@ -57,8 +57,7 @@
   [db-vol iri]
   (let [[ns nme] (iri/decompose iri)]
     (-> db-vol
-        (vswap! (fn [db]
-                  (ensure-namespace db ns)))
+        (vswap! ensure-namespace ns)
         (build-sid ns nme))))
 
 (defn create-iri-reference-flake

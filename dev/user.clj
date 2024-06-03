@@ -11,7 +11,6 @@
             [fluree.db.serde.json :as serdejson]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.range :as query-range]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
             [fluree.json-ld :as json-ld]
             [clojure.string :as str]

@@ -73,19 +73,20 @@
                 namespace-codes]}
         db
 
-        preds (vocab/serialize-schema-predicates schema)
-        data  {:ledger-alias    alias
-               :t               t
-               :preds           preds
-               :stats           (select-keys stats [:flakes :size])
-               :spot            (child-data spot)
-               :psot            (child-data psot)
-               :post            (child-data post)
-               :opst            (child-data opst)
-               :tspo            (child-data tspo)
-               :timestamp       (util/current-time-millis)
-               :namespace-codes namespace-codes}
-        ser   (serdeproto/-serialize-db-root (serde conn) data)]
+        data {:ledger-alias    alias
+              :t               t
+              :v               1 ;; version of db root file
+              :schema          (vocab/serialize-schema schema)
+              :stats           (select-keys stats [:flakes :size])
+              :spot            (child-data spot)
+              :psot            (child-data psot)
+              :post            (child-data post)
+              :opst            (child-data opst)
+              :tspo            (child-data tspo)
+              :timestamp       (util/current-time-millis)
+              :prevIndex       (or (:indexed stats) 0)
+              :namespace-codes namespace-codes}
+        ser  (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn alias :root ser)))
 
 
@@ -128,7 +129,6 @@
   (let [namespaces (-> root-map :namespace-codes map-invert)]
     (assoc root-map :namespaces namespaces)))
 
-
 (defn read-garbage
   "Returns garbage file data for a given index t."
   [conn ledger-alias t]
@@ -137,6 +137,13 @@
           data (<? (connection/-index-file-read conn key))]
       (when data
         (serdeproto/-deserialize-garbage (serde conn) data)))))
+
+(defn reify-schema
+  [{:keys [namespace-codes v] :as root-map}]
+  (if (not= 1 v)
+    (update root-map :schema vocab/deserialize-schema namespace-codes)
+    ;; legacy, for now only v0
+    (update root-map :preds deserialize-preds)))
 
 
 (defn read-db-root
@@ -149,8 +156,8 @@
          (-> root-data
              reify-index-roots
              reify-namespaces
-             (update :stats assoc :indexed t)
-             (update :preds deserialize-preds)))
+             reify-schema
+             (update :stats assoc :indexed t)))
        (throw (ex-info (str "Could not load index point at address: "
                             idx-address ".")
                        {:status 400

@@ -12,7 +12,6 @@
             [fluree.db.query.fql :as fql]
             [fluree.db.util.log :as log]
             [fluree.db.query.history :as history]
-            [fluree.db.query.range :as query-range]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
@@ -25,84 +24,20 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn- history*
-  [db query-map]
-  (go-try
-   (let [{:keys [opts]} query-map
-         {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map)
-
-         ctx (ctx-util/extract parsed)
-         db* (if-let [policy-identity (perm/parse-policy-identity opts ctx)]
-               (<? (perm/wrap-policy db policy-identity))
-               db)
-         ;; from and to are positive ints, need to convert to negative or fill in default values
-         {:keys [from to at]} t
-         [from-t to-t] (if at
-                         (let [t (cond (= :latest at) (:t db*)
-                                       (string? at) (<? (time-travel/datetime->t db* at))
-                                       (number? at) at)]
-                           [t t])
-                         ;; either (:from or :to)
-                         [(cond (= :latest from) (:t db*)
-                                (string? from) (<? (time-travel/datetime->t db* from))
-                                (number? from) from
-                                (nil? from) 1)
-                          (cond (= :latest to) (:t db*)
-                                (string? to) (<? (time-travel/datetime->t db* to))
-                                (number? to) to
-                                (nil? to) (:t db*))])
-
-         context        (ctx-util/extract parsed)
-         error-ch       (async/chan)]
-     (if history
-       ;; filter flakes for history pattern
-       (let [[pattern idx] (<? (history/history-pattern db* context history))
-             flake-slice-ch       (query-range/time-range db* idx = pattern {:from-t from-t :to-t to-t})
-             flake-ch             (async/chan 1 cat)
-
-             _                    (async/pipe flake-slice-ch flake-ch)
-
-             flakes               (async/<! (async/into [] flake-ch))
-
-             history-results-chan (history/history-flakes->json-ld db* context error-ch flakes)]
-
-         (if commit-details
-           ;; annotate with commit details
-           (async/alt! (async/into [] (history/add-commit-details db* context error-ch history-results-chan))
-                       ([result] result)
-                       error-ch ([e] e))
-
-           ;; we're already done
-           (async/alt! (async/into [] history-results-chan)
-                       ([result] result)
-                       error-ch ([e] e))))
-
-       ;; just commits over a range of time
-       (let [flake-slice-ch    (query-range/time-range db* :tspo = [] {:from-t from-t :to-t to-t})
-             commit-results-ch (history/commit-flakes->json-ld db* context error-ch flake-slice-ch)]
-         (async/alt! (async/into [] commit-results-ch)
-                     ([result] result)
-                     error-ch ([e] e)))))))
-
 (defn history
   "Return a summary of the changes over time, optionally with the full commit details included."
-  [db query-map]
+  [db query]
   (go-try
-   (let [{query-map :subject, did :did} (or (<? (cred/verify query-map))
-                                            {:subject query-map})
-         coerced-query (try*
-                         (history/coerce-history-query query-map)
-                         (catch* e
-                           (throw
-                             (ex-info
-                               (-> e
-                                   v/explain-error
-                                   (v/format-explained-errors nil))
-                               {:status  400
-                                :error   :db/invalid-query}))))
-         history-query (cond-> coerced-query
-                         did (assoc-in [:opts :did] did))]
-     (<? (history* db history-query)))))
+    (let [{query-map :subject, did :did} (or (<? (cred/verify query))
+                                             {:subject query})
+
+          context (ctx-util/extract query-map)
+          opts    (cond-> (:opts query-map)
+                    did (assoc :did did))
+          db*     (if-let [policy-identity (perm/parse-policy-identity opts context)]
+                    (<? (perm/wrap-policy db policy-identity))
+                    db)]
+      (<? (history/query db* context query-map)))))
 
 (defn sanitize-query-options
   [opts did]

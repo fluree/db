@@ -1,6 +1,8 @@
 (ns fluree.db.api.transact
   (:require [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
+            [fluree.db.json-ld.policy :as perm]
+            [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.json-ld.transact :as tx]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.nameservice.core :as nameservice]
@@ -26,20 +28,24 @@
           txn-context              (or (:context opts)
                                        (ctx-util/txn-context txn*))
 
-          expanded            (json-ld/expand (ctx-util/use-fluree-context txn*))
-          txn-opts            (util/get-first-value expanded const/iri-opts)
-          {:keys [maxFuel meta]
-           :as   parsed-opts} (cond-> opts
-                                (not raw-txn) (assoc :raw-txn txn)
-                                did           (assoc :did did)
-                                txn-context   (assoc :context txn-context)
-                                true          (parse-opts txn-opts))]
+          expanded   (json-ld/expand (ctx-util/use-fluree-context txn*))
+          txn-opts   (util/get-first-value expanded const/iri-opts)
+          parsed-txn (q-parse/parse-txn expanded txn-context)
+
+          {:keys [maxFuel meta], :as parsed-opts}
+          (cond-> opts
+            (not raw-txn) (assoc :raw-txn txn)
+            did           (assoc :did did)
+            txn-context   (assoc :context txn-context)
+            true          (parse-opts txn-opts))
+
+          identity (perm/parse-policy-identity parsed-opts txn-context)]
       (if (or maxFuel meta)
         (let [start-time   #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))
               fuel-tracker (fuel/tracker maxFuel)]
           (try*
-            (let [result (<? (tx/stage db fuel-tracker expanded parsed-opts))]
+            (let [result (<? (tx/stage db fuel-tracker identity parsed-txn parsed-opts))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start-time)
@@ -49,7 +55,7 @@
                               {:time (util/response-time-formatted start-time)
                                :fuel (fuel/tally fuel-tracker)}
                               e)))))
-        (<? (tx/stage db expanded parsed-opts))))))
+        (<? (tx/stage db identity parsed-txn parsed-opts))))))
 
 (defn transact!
   [conn txn]

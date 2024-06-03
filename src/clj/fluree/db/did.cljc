@@ -25,6 +25,11 @@
   [auth-id]
   (did-map (auth-id->did auth-id) nil nil))
 
+(defn private->did
+  [private-key]
+  (let [acct-id (crypto/account-id-from-private private-key)]
+    (str "did:fluree:" acct-id)))
+
 (defn private->did-map
   "Returns a complete did map from a private key."
   [private-key]

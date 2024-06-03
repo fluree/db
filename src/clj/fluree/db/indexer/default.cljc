@@ -1,6 +1,5 @@
 (ns fluree.db.indexer.default
-  (:require [fluree.db.indexer :as indexer]
-            [fluree.db.index :as index]
+  (:require [fluree.db.index :as index]
             [fluree.db.indexer.storage :as storage]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
@@ -29,116 +28,15 @@
 
 (defn novelty-min?
   "Returns true if ledger is beyond novelty-min threshold."
-  [{:keys [reindex-min-bytes]} db]
+  [db reindex-min-bytes]
   (let [novelty-size (get-in db [:novelty :size])]
     (> novelty-size reindex-min-bytes)))
 
 (defn novelty-max?
   "Returns true if ledger is beyond novelty-max threshold."
-  [reindex-max db]
+  [db reindex-max]
   (let [novelty-size (get-in db [:novelty :size])]
     (> novelty-size reindex-max)))
-
-(defn remove-watch-event
-  "Removes watch event id"
-  [state-atom watch-id]
-  (swap! state-atom update :watchers dissoc watch-id))
-
-(defn remove-all-watch-events
-  "Removes all watch events (useful when closing indexer)"
-  [state-atom]
-  (swap! state-atom assoc :watchers {}))
-
-(defn add-watch-event
-  "Add new watch event"
-  [state-atom watch-id callback]
-  (when-not watch-id
-    (throw (ex-info "Attempt to add index watch fn without a watch-id."
-                    {:status 500 :error :db/indexing})))
-  (when-not (fn? callback)
-    (throw (ex-info (str "Indexer watch event attempting to be added is not a callback fn. Id: " watch-id)
-                    {:status 500 :error :db/indexing})))
-  (swap! state-atom assoc-in [:watchers watch-id] callback))
-
-(defn send-watch-event
-  "Sends index watch event data which is assumed to always be a map."
-  [state-atom event-data]
-  (when-not (map? event-data)
-    (throw (ex-info (str "Index event data not a map as expected. Provided: " event-data)
-                    {:status 500 :error :db/indexing})))
-  (let [watchers (:watchers @state-atom)]
-    (doseq [[watch-id watch-fn] watchers]
-      (try*
-        (watch-fn (assoc event-data :watch-id watch-id))
-        (catch* e
-                (log/warn "Closing index watch function due to exception: " (ex-message e))
-                (remove-watch-event state-atom watch-id))))))
-
-(defn format-watch-event
-  "This ensures consistent formatting of watch events."
-  [event-type event-meta]
-  (assoc event-meta :event event-type))
-
-(defn close
-  "Closing indexer, sends events to all watchers and clears state atom."
-  [{:keys [state-atom] :as indexer}]
-  (indexer/-push-event indexer (format-watch-event :close nil))
-  ;; TODO - if currently indexing, should stop and garbage collect any in-progress written index files
-  (remove-all-watch-events state-atom))
-
-(defn lock-indexer
-  "Generates a new indexing state if indexing wasn't already in-process.
-
-  If indexing was in-process, updates the update-commit-fn so latest commit file
-  is used for updated indexing.
-
-  Returns two-tuple of lock status (true if successful, else false), and status
-  map containing the assigned tempid, promise chan, and others (see code)."
-  [state-atom branch t update-commit-fn]
-  (let [tempid         (util/current-time-millis)
-        state*         (swap! state-atom update-in [:branch branch]
-                              (fn [{:keys [indexing] :as branch-state}]
-                                (if (:tempid indexing)      ;; if id exists, already indexing
-                                  ;; Commits continue while indexing, update-commit-fn will always contain a closure of the latest committed db.
-                                  (assoc-in branch-state [:indexing :update-commit-fn] update-commit-fn)
-                                  ;; not indexing, establish
-                                  (let [indexing-state {:tempid           tempid
-                                                        :t                t
-                                                        :update-commit-fn update-commit-fn
-                                                        :branch           branch
-                                                        :port             (async/promise-chan)
-                                                        :status           {:start (util/current-time-iso)}}]
-                                    (assoc branch-state :indexing indexing-state)))))
-        ;; newly generated id value will be idential to what is in revised state if lock was successful.
-        indexing-state (get-in state* [:branch branch :indexing])
-        lock-success?  (= tempid (:tempid indexing-state))]
-    [lock-success? indexing-state]))
-
-(defn unlock-indexer
-  "Unlocks an indexing job and performs cleanup.
-  Returns two-tuple of update-commit-fn (or nil if doesn't exist) and final index-state"
-  [state-atom branch tempid indexed-db]
-  (let [commit-idx (get-in indexed-db [:commit :index])
-        state*     (swap! state-atom update-in [:branch branch]
-                          (fn [{:keys [indexing indexed] :as branch-state}]
-                            (if (= tempid (:tempid indexing))
-                              (let [indexed* (-> indexing
-                                                 (assoc :id (:id commit-idx)
-                                                        :address (:address commit-idx))
-                                                 (assoc-in [:status :stop] (util/current-time-iso)))]
-                                (assoc branch-state :indexed indexed*
-                                                    :indexing nil))
-                              (do
-                                (log/warn (str "Index unlocked request for tempid: " tempid
-                                               "unsuccessful because current indexing map is: " indexing
-                                               ". If helpful, last indexing map is: " indexed
-                                               " and db is: " indexed-db "."))
-                                branch-state))))]
-    ;; state* will have atomic lock on update-index-fn which can be important for full consistency
-    ;; however, we don't want it to not get garbage collected, nor have the port holding the indexed-db
-    ;; to not get garbage collected, so we do another swap to dissoc those keys.
-    (swap! state-atom update-in [:branch branch :indexed] dissoc :update-commit-fn :port)
-    (get-in state* [:branch branch :indexed])))
 
 (defn dirty?
   "Returns `true` if the index for `db` of type `idx` is out of date, or if `db`
@@ -242,30 +140,28 @@
     [leaf]))
 
 (defn update-leaf
-  [leaf t novelty remove-preds]
-  (let [new-flakes (index/novelty-subrange leaf t novelty)
-        to-remove  (filter-predicates remove-preds (:flakes leaf) new-flakes)]
-    (if (or (seq new-flakes) (seq to-remove))
-      (let [new-leaves (-> leaf
-                           (dissoc :id)
-                           (index/add-flakes new-flakes)
-                           (index/rem-flakes to-remove)
-                           rebalance-leaf)]
-        (map (fn [l]
-               (assoc l
-                 :id (random-uuid)
-                 :t t))
-             new-leaves))
-      [leaf])))
+  [leaf t novelty]
+  (if-let [new-flakes (-> leaf
+                          (index/novelty-subrange t novelty)
+                          not-empty)]
+    (let [new-leaves (-> leaf
+                         (dissoc :id)
+                         (index/add-flakes new-flakes)
+                         rebalance-leaf)]
+      (map (fn [l]
+             (assoc l
+                    :id (random-uuid)
+                    :t t))
+           new-leaves))
+    [leaf]))
 
 (defn integrate-novelty
   "Returns a transducer that transforms a stream of index nodes in depth first
-  order by incorporating the novelty flakes into the nodes, removing flakes with
-  predicates in remove-preds, rebalancing the leaves so that none is bigger than
-  *overflow-bytes*, and rebalancing the branches so that none have more children
-  than *overflow-children*. Maintains a 'lifo' stack to preserve the depth-first
-  order of the transformed stream."
-  [t novelty remove-preds]
+  order by incorporating the novelty flakes into the nodes, rebalancing the
+  leaves so that none is bigger than *overflow-bytes*, and rebalancing the
+  branches so that none have more children than *overflow-children*. Maintains a
+  'lifo' stack to preserve the depth-first order of the transformed stream."
+  [t novelty]
   (fn [xf]
     (let [stack (volatile! [])]
       (fn
@@ -282,7 +178,7 @@
         ;;   3. Iterate each resulting node with the nested transformer.
         ([result node]
          (if (index/leaf? node)
-           (let [leaves (update-leaf node t novelty remove-preds)]
+           (let [leaves (update-leaf node t novelty)]
              (vswap! stack into leaves)
              result)
 
@@ -406,24 +302,22 @@
 
 
 (defn refresh-index
-  [{:keys [conn] :as db} changes-ch error-ch {::keys [idx t novelty remove-preds root]}]
+  [{:keys [conn] :as db} changes-ch error-ch {::keys [idx t novelty root]}]
   (let [refresh-xf (comp (map preserve-id)
-                         (integrate-novelty t novelty remove-preds))
+                         (integrate-novelty t novelty))
         novel?     (fn [node]
-                     (or (seq remove-preds)
-                         (seq (index/novelty-subrange node t novelty))))]
+                     (seq (index/novelty-subrange node t novelty)))]
     (->> (index/tree-chan conn root novel? 1 refresh-xf error-ch)
          (write-resolved-nodes db idx changes-ch error-ch))))
 
 (defn extract-root
-  [{:keys [novelty t] :as db} remove-preds idx]
+  [{:keys [novelty t] :as db} idx]
   (let [index-root    (get db idx)
         index-novelty (get novelty idx)]
     {::idx          idx
      ::root         index-root
      ::novelty      index-novelty
-     ::t            t
-     ::remove-preds remove-preds}))
+     ::t            t}))
 
 
 (defn tally
@@ -436,18 +330,16 @@
 
 (defn refresh-all
   ([db error-ch]
-   (refresh-all db #{} nil error-ch))
-  ([db remove-preds changes-ch error-ch]
+   (refresh-all db nil error-ch))
+  ([db changes-ch error-ch]
    (->> index/types
-        (map (partial extract-root db remove-preds))
+        (map (partial extract-root db))
         (map (partial refresh-index db changes-ch error-ch))
         async/merge
         (async/reduce tally {:db db, :indexes [], :garbage #{}}))))
 
 (defn refresh
-  [indexer
-   {:keys [novelty t alias] :as db}
-   {:keys [remove-preds changes-ch]}]
+  [{:keys [novelty t alias] :as db} changes-ch]
   (go-try
     (let [start-time-ms (util/current-time-millis)
           novelty-size  (:size novelty)
@@ -455,11 +347,10 @@
                          :t            t
                          :novelty-size novelty-size
                          :start-time   (util/current-time-iso)}]
-      (if (or (dirty? db)
-              (seq remove-preds))
+      (if (dirty? db)
         (do (log/info "Refreshing Index:" init-stats)
             (let [error-ch   (async/chan)
-                  refresh-ch (refresh-all db remove-preds changes-ch error-ch)]
+                  refresh-ch (refresh-all db changes-ch error-ch)]
               (async/alt!
                 error-ch
                 ([e]
@@ -495,113 +386,3 @@
                    (log/info "Index refresh complete:" end-stats)
                    indexed-db)))))
         db))))
-
-(defn push-index-event
-  [indexer event-type event-meta]
-  (indexer/-push-event
-    indexer
-    (format-watch-event event-type event-meta)))
-
-(defn do-index
-  "Performs an index operation and returns a promise-channel of the latest db once complete"
-  [indexer {:keys [t branch] :as db} {:keys [update-commit changes-ch] :as opts}]
-  ;; note, lock-indexer will either acquire lock, or update `update-commit` fn to use latest commit
-  (let [[lock? index-state]   (lock-indexer (:state-atom indexer) branch t update-commit)
-        {:keys [tempid port]} index-state]
-    (if lock?
-      ;; when we have a lock, reindex and put updated db onto pc.
-      (go
-        (try*
-          (push-index-event indexer :index-start index-state)
-          (let [indexed-db   (<? (refresh indexer db opts))
-                index-state* (unlock-indexer (:state-atom indexer) branch tempid indexed-db)
-                {:keys [update-commit-fn port]} index-state*]
-            ;; in case event listener wanted final indexed db, put on established port
-            (when (fn? update-commit-fn)
-              (let [result (<! (update-commit-fn indexed-db))]
-                (when (util/exception? result)
-                  (log/error result "Exception updating commit with new index: " (ex-message result))
-                  (throw result))
-                (when changes-ch
-                  (>! changes-ch {:event :new-commit
-                                  :data  result}))))
-
-            (async/put! port indexed-db)
-            ;; push out event, retain :port for downstream to retrieve indexed db if needed, but
-            ;; remove update-commit-fn as we don't want downstream processes being able to do this
-            (push-index-event indexer :index-end (dissoc index-state* :update-commit-fn))
-
-            (when changes-ch
-              (async/close! changes-ch)))
-          (catch* e
-                  (log/error e "Error encountered creating index for db: " db ". "
-                             "Indexing stopped.")
-                  (when changes-ch
-                    (async/close! changes-ch)))))
-      (when changes-ch ;; if we don't have a lock, nothing to index so close changes-ch if it exists
-        (async/close! changes-ch)))
-    port))
-
-(defn index
-  [indexer db {:keys [changes-ch] :as opts}]
-  (if (novelty-min? indexer db)
-    (do-index indexer db opts)
-    (go
-      (when changes-ch
-        (async/close! changes-ch))
-      db)))
-
-
-(defn status
-  [{:keys [state-atom] :as _indexer}]
-  (let [{:keys [indexing indexed queued]} @state-atom]
-    {:indexing? (boolean (:id indexing))
-     :indexing  indexing
-     :indexed   indexed
-     :queued    queued}))
-
-(defrecord IndexerDefault [reindex-min-bytes reindex-max-bytes state-atom]
-  indexer/iIndex
-  (-index [indexer db] (index indexer db nil))
-  (-index [indexer db opts] (index indexer db opts))
-  (-add-watch [_ watch-id callback] (add-watch-event state-atom watch-id callback))
-  (-remove-watch [_ watch-id] (remove-watch-event state-atom watch-id))
-  (-push-event [_ event-data] (send-watch-event state-atom event-data))
-  (-close [indexer] (close indexer))
-  (-status [indexer] (status indexer))
-  (-reindex [indexer db] :TODO))
-
-
-(defn new-state-atom
-  []
-  (atom
-    {:watchers {}                                           ;; map of watcher ids to fns
-     ;; for each branch, can have separate indexing jobs
-     :branch   {:main {:indexing {:tempid nil               ;; running indexing job
-                                  :t      nil
-                                  :chan   nil
-                                  :status nil}
-                       ;; last completed indexing job
-                       :indexed  {:id      nil
-                                  :address nil
-                                  :t       nil
-                                  :garbage #{}}
-                       ;; queued indexing job, will be executed once current job completes
-                       :queued   {:db     nil               ;; holds ref to latest db asked to index
-                                  :id     nil
-                                  :t      nil
-                                  :chan   nil
-                                  :status nil}}}}))
-
-
-(defn create
-  "Creates a new indexer."
-  [{:keys [reindex-min-bytes reindex-max-bytes
-           state-atom]
-    :or   {reindex-min-bytes 100000                         ;; 100 kb
-           reindex-max-bytes 1000000                        ;; 1 mb
-           state-atom        (new-state-atom)}}]
-  (let [options {:reindex-min-bytes reindex-min-bytes
-                 :reindex-max-bytes reindex-max-bytes
-                 :state-atom        state-atom}]
-    (map->IndexerDefault options)))

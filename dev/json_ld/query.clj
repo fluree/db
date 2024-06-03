@@ -5,11 +5,8 @@
             [fluree.db.util.async :refer [<?? go-try channel?]]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.did :as did]
             [fluree.json-ld :as json-ld]
-            [fluree.db.indexer.default :as indexer]
-            [fluree.db.indexer :as indexer]
             [fluree.db.util.log :as log]
             [fluree.db.index :as index]
             [criterium.core :as criterium]
@@ -190,4 +187,3 @@
 
   @(fluree/query db {:select {'?s [:* {:ex/friend [:*]}]}
                      :where  [['?s :type :ex/User]]}))
-
