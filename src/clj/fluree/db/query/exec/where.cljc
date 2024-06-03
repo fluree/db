@@ -541,17 +541,21 @@
 
 (def blank-solution {})
 
+(defn values-initial-solution
+  [q]
+  (-> q
+      :values
+      not-empty
+      (or [blank-solution])
+      async/to-chan!))
+
 (defn search
   ([ds q fuel-tracker error-ch]
    (search ds q fuel-tracker error-ch nil))
   ([ds q fuel-tracker error-ch initial-solution-ch]
    (let [out-ch               (async/chan 2)
          initial-solution-ch* (or initial-solution-ch
-                                  (-> q
-                                      :values
-                                      not-empty
-                                      (or [blank-solution])
-                                      async/to-chan!))]
+                                  (values-initial-solution q))]
      (if-let [where-clause (:where q)]
        (async/pipeline-async 2
                              out-ch

@@ -50,7 +50,7 @@
 
 (defn execute
   [ds fuel-tracker q error-ch initial-soln]
-  (->> (where/search ds q fuel-tracker error-ch)
+  (->> (where/search ds q fuel-tracker error-ch initial-soln)
        (group/combine q)
        (having/filter q error-ch)
        (select/modify q)
@@ -60,28 +60,46 @@
        (take-limit q)
        (collect-results q)))
 
+(defn execute-subquery
+  [ds fuel-tracker q error-ch initial-soln]
+  (->> (where/search ds q fuel-tracker error-ch initial-soln)
+       (group/combine q)
+       (having/filter q error-ch)
+       (select/modify q)
+       (order/arrange q)))
+
 (defn collect-subqueries
   [ds fuel-tracker q error-ch subquery-chans]
-  (throw (ex-info "Subqueries not yet implemented" {}))
-  (let [initial-soln :TODO]
-    (execute ds fuel-tracker q error-ch initial-soln)))
+  (if (= 1 (count subquery-chans))
+    (first subquery-chans)
+    (throw (ex-info "Multiple subqueries not supported" {}))))
 
 (defn query*
-  [ds fuel-tracker q error-ch]
+  "Iterates over query :where to identify any subqueries,
+  and if they exist, executes them and collects them into initial-soln.
+
+  Recursive, in that subqueries can have subqueries.
+
+  Once subquery solution chans are identified, if any, the parent query is executed."
+  [ds fuel-tracker q error-ch subquery?]
   (loop [[where-smt & r] (:where q)
+         where*       [] ;; where clause with subqueries removed
          result-chans []]
     (if where-smt
       (if-let [subquery (extract-subquery where-smt)]
-        (let [result-ch (query* ds fuel-tracker subquery error-ch)] ;; might be multiple nested subqueries
-          (recur r (conj result-chans result-ch)))
-        (recur r result-chans))
+        (let [result-ch (query* ds fuel-tracker subquery error-ch true)] ;; might be multiple nested subqueries
+          (recur r where* (conj result-chans result-ch)))
+        (recur r (conj where* where-smt) result-chans))
       ;; end of subqueries search... if result-chans extract as initial soln to where, else execute where
       (if (seq result-chans)
         ;; found subqueries, collect them into initial values solution and the execute
         (->> (collect-subqueries ds fuel-tracker q error-ch result-chans)
-             (execute ds fuel-tracker q error-ch))
+             (execute ds fuel-tracker (assoc q :where (not-empty where*)) error-ch))
         ;; no sub-queries, just execute
-        (execute ds fuel-tracker q error-ch nil)))))
+        (let [q* (assoc q :where (not-empty where*))] ;; removed subqueries from where clause
+          (if subquery?
+            (execute-subquery ds fuel-tracker q* error-ch nil)
+            (execute ds fuel-tracker q* error-ch nil)))))))
 
 (defn query
   "Execute the parsed query `q` against the database value `db`. Returns an async
@@ -90,7 +108,7 @@
   [ds fuel-tracker q]
   (go
     (let [error-ch  (async/chan)
-          result-ch (query* ds fuel-tracker q error-ch)]
+          result-ch (query* ds fuel-tracker q error-ch false)]
       (async/alt!
        error-ch ([e] e)
        result-ch ([result] result)))))
