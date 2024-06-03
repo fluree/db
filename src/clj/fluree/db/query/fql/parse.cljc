@@ -567,21 +567,30 @@
     q))
 
 (defn parse-analytical-query
-  [q]
-  (let [context       (context/extract q)
-        [vars values] (parse-values q context)
-        where         (parse-where q vars context)
-        grouping      (parse-grouping q)
-        ordering      (parse-ordering q)]
-    (-> q
-        (assoc :context context
-          :where where)
-        (cond-> (seq values) (assoc :values values)
-                grouping (assoc :group-by grouping)
-                ordering (assoc :order-by ordering))
-        parse-having
-        (parse-select context)
-        parse-fuel)))
+  ([q] (parse-analytical-query q nil))
+  ([q parent-context]
+   (let [context   (cond->> (context/extract q)
+                            parent-context (merge parent-context))
+         [vars values] (parse-values q context)
+         where     (parse-where q vars context)
+         grouping  (parse-grouping q)
+         ordering  (parse-ordering q)]
+     (-> q
+         (assoc :context context
+                :where where)
+         (cond-> (seq values) (assoc :values values)
+                 grouping (assoc :group-by grouping)
+                 ordering (assoc :order-by ordering))
+         parse-having
+         (parse-select context)
+         parse-fuel))))
+
+(defmethod parse-pattern :subquery
+  [[_ sub-query] _vars context]
+  (let [sub-query* (-> sub-query
+                       syntax/coerce-query
+                       (parse-analytical-query context))]
+    [(where/->pattern :subquery sub-query*)]))
 
 (defn parse-query
   [q]
