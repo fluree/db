@@ -66,7 +66,10 @@
        (group/combine q)
        (having/filter q error-ch)
        (select/modify q)
-       (order/arrange q)))
+       (order/arrange q)
+       (select/subquery-format ds q fuel-tracker error-ch)
+       (drop-offset q)
+       (take-limit q)))
 
 (defn collect-subqueries
   [ds fuel-tracker q error-ch subquery-chans]
