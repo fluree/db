@@ -309,7 +309,7 @@
                         ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes
                         ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore
                         ?strDt ?strEnds ?strLang ?strLen ?strStarts ?struuid ?timezone ?tz ?ucase
-                        ?uri ?uuid ?year ?isBlank ?isIri ?isLiteral ?isNumeric ?isUri ?sameTerm ?in
+                        ?uri ?uuid ?year ?isBlank ?isIri ?isLiteral ?isNumeric ?isUri ?sameTerm ?in ?notIn
                  WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
                         BIND (BNODE(?foobar) AS ?bnode)
                         BIND (BOUND(?abs) AS ?bound)
@@ -324,6 +324,7 @@
                         BIND (HOURS(\"2024-4-1T14:45:13.815-05:00\") AS ?hours)
                         BIND (IF(\"true\", \"yes\", \"no\") AS ?if)
                         BIND (?age IN (1, 2, 3, \"foo\", ex:bar) AS ?in)
+                        BIND (?age NOT IN (1, 2, 3, \"foo\", ex:bar) AS ?notIn)
                         BIND (IRI(\"http://example.com\") AS ?iri)
                         BIND (LANG(\"Robert\"\"@en\") AS ?lang)
                         BIND (LANGMATCHES(?lang, \"FR\") AS ?langMatches)
@@ -375,6 +376,7 @@
                 [:bind "?hours" "(hours \"2024-4-1T14:45:13.815-05:00\")"]
                 [:bind "?if" "(if \"true\" \"yes\" \"no\")"]
                 [:bind "?in" "(in ?age [1 2 3 \"foo\" \"ex:bar\"])"]
+                [:bind "?notIn" "(not (in ?age [1 2 3 \"foo\" \"ex:bar\"]))"]
                 [:bind "?iri" "(iri \"http://example.com\")"]
                 [:bind "?lang" "(lang \"Robert\"\"@en\")"]
                 [:bind "?langMatches" "(langMatches ?lang \"FR\")"]

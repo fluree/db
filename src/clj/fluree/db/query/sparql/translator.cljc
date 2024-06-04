@@ -278,8 +278,7 @@
 
       (and (= "NOT" op)
            (= "IN" op-or-exp))
-      (throw (ex-info (str "Unsupported operator: " op)
-                      {:status 400 :error :db/invalid-query}))
+      (str "(not (in " expr " " (parse-term expr-list) "))")
 
       (nil? op)
       expr
