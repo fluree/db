@@ -229,6 +229,14 @@
   [[_ sign num-str]]
   (read-string (str sign num-str)))
 
+(defmethod parse-term :iriOrFunction
+  ;; iriOrFunction ::= iri ArgList?
+  [[_ iri arglist]]
+  (when arglist
+    (throw (ex-info "Unsupported syntax."
+                    {:status 400 :error :db/invalid-query :term arglist})))
+  (parse-term iri))
+
 (defmethod parse-term :MultiplicativeExpression
   ;; MultiplicativeExpression ::= UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
   ;; <UnaryExpression> ::= '!' PrimaryExpression
@@ -266,8 +274,8 @@
   (let [expr (parse-term n-exp)]
     (cond
       (= "IN" op)
-      (throw (ex-info (str "Unsupported operator: " op)
-                      {:status 400 :error :db/invalid-query}))
+      (str "(in " expr " " (parse-term op-or-exp) ")")
+
       (and (= "NOT" op)
            (= "IN" op-or-exp))
       (throw (ex-info (str "Unsupported operator: " op)
