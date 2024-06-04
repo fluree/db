@@ -312,7 +312,10 @@
   ;; <ConditionalAndExpression> ::= ValueLogical ( <'&&'> ValueLogical )*
   ;; <ValueLogical> ::= RelationalExpression
   [[_ & expression]]
-  (str/join " " (mapv parse-term expression)))
+  (let [expressions (mapv parse-term expression)]
+    (if (= 1 (count expressions))
+      (first expressions)
+      expressions)))
 
 (defmethod parse-term :IRIREF
   ;; #"<[^<>\"{}|^`\x00-\x20]*>" WS
@@ -435,6 +438,7 @@
       result)))
 
 (defmethod parse-term :Bind
+  ;; Bind ::= <'BIND' WS '(' WS>  Expression <WS 'AS' WS> Var <WS ')' WS>
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
