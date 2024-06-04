@@ -150,8 +150,7 @@
               {"@id" "?person", "person:favNums" "?num"}
               [:filter ["(> ?num 10)"]]]
              where)))
-    (let [query "PREFIX psm: <http://srv.ktbl.de/data/psm/>
-                 PREFIX schema: <http://schema.org/>
+    (let [query "PREFIX schema: <http://schema.org/>
                  SELECT ?s ?t ?name
                  FROM <cookbook/base>
                  WHERE {
@@ -163,7 +162,8 @@
       (is (= [{"@id" "?s", "@type" "?t"}
               {"@id" "?s", "schema:name" "?name"}
               [:filter ["(regex ?name \"^Jon\" \"i\")"]]]
-             where))))
+             where)
+          "filter by regex call")))
   (testing "OPTIONAL"
     (let [query "SELECT ?handle ?num
                  WHERE {?person person:handle ?handle.
