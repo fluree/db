@@ -118,7 +118,7 @@
                                  :select  [?name ?favNums]
                                  :where   {:schema/name ?name
                                            :ex/favNums  ?favNums}
-                                 :orderBy [(desc ?favNums)]})
+                                 :orderBy (desc ?favNums)})
              [["Alice" 76] ["Alice" 42] ["Cam" 10] ["Alice" 9] ["Brian" 7] ["Cam" 5]])
           "Ordering of favNums not in descending order.")
 
