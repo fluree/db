@@ -285,9 +285,13 @@
   [x]
   (str x))
 
+(defn sparql-in
+  [term expressions]
+  (contains? (set expressions) term))
+
 (def allowed-scalar-fns
   '#{&& || ! > < >= <= = + - * / quot and bound coalesce if lang nil? as
-     not not= or re-find re-pattern
+     not not= or re-find re-pattern in
      ;; string fns
      strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter concat regex replace
      ;; numeric fns
@@ -320,6 +324,7 @@
     count          clojure.core/count
     floor          fluree.db.query.exec.eval/floor
     groupconcat    fluree.db.query.exec.eval/groupconcat
+    in             fluree.db.query.exec.eval/sparql-in
     lang           fluree.db.query.exec.eval/lang
     lcase          fluree.db.query.exec.eval/lcase
     median         fluree.db.query.exec.eval/median
