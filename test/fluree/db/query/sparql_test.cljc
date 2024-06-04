@@ -183,7 +183,27 @@
               {"@id" "?s", "schema:name" "?name"}
               [:filter ["(regex ?name \"^Jon\" \"i\")"]]]
              where)
-          "filter by regex call")))
+          "filter by regex call"))
+    (let [query "SELECT ?s
+                 WHERE {
+                   ?s ?p ?o
+                   FILTER EXISTS { ?s ex:name \"Larry\" }
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s" "?p" "?o"}
+              ["exists" [{"@id" "?s" "ex:name" "Larry"}]]]
+             where)
+          "EXISTS expression parsing"))
+    (let [query "SELECT ?s
+                 WHERE {
+                   ?s ?p ?o
+                   FILTER NOT EXISTS { ?s ex:name \"Larry\" }
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s" "?p" "?o"}
+              ["not-exists" [{"@id" "?s" "ex:name" "Larry"}]]]
+             where)
+          "NOT EXISTS expression parsing")))
   (testing "OPTIONAL"
     (let [query "SELECT ?handle ?num
                  WHERE {?person person:handle ?handle.
@@ -402,7 +422,7 @@
                  }"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?g", "dc:publisher" "?who"}
-        [:graph "?g" [{"@id" "?x", "foaf:mbox" "?mbox"}]]]
+              [:graph "?g" [{"@id" "?x", "foaf:mbox" "?mbox"}]]]
              where)))))
 
 (deftest parse-prefixes

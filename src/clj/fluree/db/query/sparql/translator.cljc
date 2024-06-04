@@ -64,14 +64,12 @@
                     {:status 400 :error :db/invalid-query}))))
 
 (defmethod parse-term :ExistsFunc
-  [r]
-  (throw (ex-info "EXISTS is not a supported SPARQL clause"
-                  {:status 400 :error :db/invalid-query})))
+  [[_ & patterns]]
+  ["exists" (into [] (mapcat parse-term patterns))])
 
 (defmethod parse-term :NotExistsFunc
-  [r]
-  (throw (ex-info "NOT EXISTS is not a supported SPARQL clause"
-                  {:status 400 :error :db/invalid-query})))
+  [[_ & patterns]]
+  ["not-exists" (into [] (mapcat parse-term patterns))])
 
 (defmethod parse-term :RegexExpression
   ;; RegexExpression ::= <'REGEX'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
@@ -449,7 +447,10 @@
 (defmethod parse-term :Filter
   ;; Filter ::= <'FILTER'> WS Constraint
   [[_ constraint]]
-  [:filter [(parse-term constraint)]])
+  (let [parsed-constraint (parse-term constraint)]
+    (if (contains? #{"exists" "not-exists"} (first parsed-constraint))
+      parsed-constraint
+      [:filter [parsed-constraint]])))
 
 (defmethod parse-term :OptionalGraphPattern
   ;; OptionalGraphPattern ::= <'OPTIONAL'> GroupGraphPattern
