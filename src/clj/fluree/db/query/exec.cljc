@@ -6,6 +6,7 @@
             [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.order :as order]
             [fluree.db.query.exec.having :as having]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -75,7 +76,17 @@
   [ds fuel-tracker q error-ch subquery-chans]
   (if (= 1 (count subquery-chans))
     (first subquery-chans)
-    (throw (ex-info "Multiple subqueries not supported" {}))))
+    (let [out-ch (async/chan)]
+      (go
+        (let [all-solns (loop [chans subquery-chans
+                               acc   []]
+                          (if-let [next-chan (first chans)]
+                            (let [solns (async/<! (async/into [] next-chan))]
+                              (recur (rest chans) (conj acc solns)))
+                            acc))
+              results   (util/cartesian-merge all-solns)]
+          (async/onto-chan! out-ch results)))
+      out-ch)))
 
 (defn query*
   "Iterates over query :where to identify any subqueries,

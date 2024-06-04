@@ -76,3 +76,21 @@
           (is (= [[:ex/alice 42] [:ex/alice 76] [:ex/liam 42]]
                  @(fluree/query db qry))))))))
 
+(deftest ^:integration multiple-subqueries
+  (testing "More than one subquery"
+    (let [conn   (test-utils/create-conn)
+          people (test-utils/load-people conn)
+          db     (fluree/db people)]
+
+      (testing "in parallel gets all values"
+        (is (= [[13 5] [13 7] [13 9] [13 10] [13 11] [13 42] [13 42] [13 76] [34 5] [34 7] [34 9]
+                [34 10] [34 11] [34 42] [34 42] [34 76] [50 5] [50 5] [50 7] [50 7] [50 9] [50 9]
+                [50 10] [50 10] [50 11] [50 11] [50 42] [50 42] [50 42] [50 42] [50 76] [50 76]]
+               @(fluree/query db {"@context" {"schema" "http://schema.org/"
+                                              "ex"     "http://example.org/ns/"}
+                                  "select"   ["?age" "?favNums"]
+                                  "where"    [["subquery" {"select" ["?age"]
+                                                           "where"  {"schema:age" "?age"}}]
+                                              ["subquery" {"select" ["?favNums"]
+                                                           "where"  {"ex:favNums" "?favNums"}}]]
+                                  "orderBy"  ["?age" "?favNums"]})))))))
