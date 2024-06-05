@@ -17,9 +17,9 @@
                                   "select"   ["?name" "?age"]
                                   "where"    [{"@id"         "?s"
                                                "schema:name" "?name"}
-                                              ["subquery" {"select" ["?s" "?age"]
-                                                           "where"  {"@id"        "?s"
-                                                                     "schema:age" "?age"}}]]
+                                              ["query" {"select" ["?s" "?age"]
+                                                        "where"  {"@id"        "?s"
+                                                                  "schema:age" "?age"}}]]
                                   "orderBy"  "?name"}))))
 
       (testing "with unrelated vars in subquery expand to all parent vals"
@@ -30,8 +30,8 @@
                                               "ex"     "http://example.org/ns/"}
                                   "select"   ["?age" "?favNums"]
                                   "where"    [{"schema:age" "?age"}
-                                              ["subquery" {"select" ["?favNums"]
-                                                           "where"  {"ex:favNums" "?favNums"}}]]
+                                              ["query" {"select" ["?favNums"]
+                                                        "where"  {"ex:favNums" "?favNums"}}]]
                                   "orderBy"  ["?age" "?favNums"]})))
 
         (testing "and shorten results with subquery 'limit'"
@@ -40,9 +40,9 @@
                                                 "ex"     "http://example.org/ns/"}
                                     "select"   ["?age" "?favNums"]
                                     "where"    [{"schema:age" "?age"}
-                                                ["subquery" {"select" ["?favNums"]
-                                                             "where"  {"ex:favNums" "?favNums"}
-                                                             "limit"  2}]]
+                                                ["query" {"select" ["?favNums"]
+                                                          "where"  {"ex:favNums" "?favNums"}
+                                                          "limit"  2}]]
                                     "orderBy"  ["?age" "?favNums"]})))
 
           (testing "and obeys selectDistinct in subquery"
@@ -53,8 +53,8 @@
                                                   "ex"     "http://example.org/ns/"}
                                       "select"   ["?age" "?favNums"]
                                       "where"    [{"ex:favNums" "?favNums"}
-                                                  ["subquery" {"selectDistinct" ["?age"]
-                                                               "where"          {"schema:age" "?age"}}]]
+                                                  ["query" {"selectDistinct" ["?age"]
+                                                            "where"          {"schema:age" "?age"}}]]
                                       "orderBy"  ["?age" "?favNums"]})))))))))
 
 (deftest ^:integration subquery-aggregate-as
@@ -70,8 +70,8 @@
                    :where    ['{:id         ?iri
                                 :ex/favNums ?favNums}
                               [:filter "(> ?favNums ?avgFavNum)"]
-                              [:subquery {:where  '{:ex/favNums ?favN}
-                                          :select '[(as (avg ?favN) ?avgFavNum)]}]]
+                              [:query {:where  '{:ex/favNums ?favN}
+                                       :select '[(as (avg ?favN) ?avgFavNum)]}]]
                    :order-by '[?iri ?favNums]}]
           (is (= [[:ex/alice 42] [:ex/alice 76] [:ex/liam 42]]
                  @(fluree/query db qry))))))))
@@ -89,10 +89,10 @@
                @(fluree/query db {"@context" {"schema" "http://schema.org/"
                                               "ex"     "http://example.org/ns/"}
                                   "select"   ["?age" "?favNums"]
-                                  "where"    [["subquery" {"select" ["?age"]
-                                                           "where"  {"schema:age" "?age"}}]
-                                              ["subquery" {"select" ["?favNums"]
-                                                           "where"  {"ex:favNums" "?favNums"}}]]
+                                  "where"    [["query" {"select" ["?age"]
+                                                        "where"  {"schema:age" "?age"}}]
+                                              ["query" {"select" ["?favNums"]
+                                                        "where"  {"ex:favNums" "?favNums"}}]]
                                   "orderBy"  ["?age" "?favNums"]}))))
 
       (testing "with nested subqueries"
@@ -116,8 +116,8 @@
                                               "ex"     "http://example.org/ns/"}
                                   "select"   ["?name" "?email" "?age"]
                                   "where"    [{"schema:name" "?name"}
-                                              ["subquery" {"selectDistinct" ["?age" "?email"]
-                                                           "where"          [{"schema:age" "?age"}
-                                                                             ["subquery" {"select" ["?email"]
-                                                                                          "where"  {"schema:email" "?email"}}]]}]]
+                                              ["query" {"selectDistinct" ["?age" "?email"]
+                                                        "where"          [{"schema:age" "?age"}
+                                                                          ["query" {"select" ["?email"]
+                                                                                    "where"  {"schema:email" "?email"}}]]}]]
                                   "orderBy"  ["?name" "?email" "?age"]})))))))

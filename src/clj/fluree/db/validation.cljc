@@ -261,8 +261,8 @@
                              [:binding ::function]]]
     ::where-op             [:and
                             :keyword
-                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind, subquery"}
-                             :graph :filter :optional :union :bind :subquery]]
+                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind, query"}
+                             :graph :filter :optional :union :bind :query]]
     ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
@@ -283,7 +283,7 @@
                                      :min 1}
                             [:ref ::node-map-key] [:ref ::node-map-value]]
     ::where-pattern        [:multi {:dispatch where-pattern-type
-                                    :error/message "where clause patterns must be either a node map or a filter, optional, union, bind, subquery, or graph array."}
+                                    :error/message "where clause patterns must be either a node map or a filter, optional, union, bind, query, or graph array."}
                             [:node ::node-map]
                             [:filter [:catn
                                       [:op ::where-op]
@@ -298,9 +298,9 @@
                                     [:op ::where-op]
                                     [:bindings ::bind]]]
                             [:graph [:tuple ::where-op ::graph [:ref ::where]]]
-                            [:subquery [:catn
+                            [:query [:catn
                                      [:op ::where-op]
-                                     [:subquery [:map]]]]]
+                                     [:query [:map]]]]]
     ::where                [:orn {:error/message "where clause must be a single node map pattern or a sequence of where patterns"}
                             [:single ::node-map]
                             [:collection [:sequential ::where-pattern]]]

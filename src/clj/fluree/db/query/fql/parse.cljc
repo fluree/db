@@ -585,12 +585,12 @@
          (parse-select context)
          parse-fuel))))
 
-(defmethod parse-pattern :subquery
+(defmethod parse-pattern :query
   [[_ sub-query] _vars context]
   (let [sub-query* (-> sub-query
                        syntax/coerce-query
                        (parse-analytical-query context))]
-    [(where/->pattern :subquery sub-query*)]))
+    [(where/->pattern :query sub-query*)]))
 
 (defn parse-query
   [q]

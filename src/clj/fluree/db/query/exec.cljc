@@ -46,7 +46,7 @@
 (defn extract-subquery
   [query-smt]
   (when (and (sequential? query-smt)
-             (= :subquery (first query-smt)))
+             (= :query (first query-smt)))
     (second query-smt)))
 
 (defn execute
