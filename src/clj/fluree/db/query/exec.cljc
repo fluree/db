@@ -107,8 +107,11 @@
       ;; end of subqueries search... if result-chans extract as initial soln to where, else execute where
       (if (seq result-chans)
         ;; found subqueries, collect them into initial values solution and the execute
-        (->> (collect-subqueries ds fuel-tracker q error-ch result-chans)
-             (execute ds fuel-tracker (assoc q :where (not-empty where*)) error-ch))
+        (let [q* (assoc q :where (not-empty where*))
+              subquery-son (collect-subqueries ds fuel-tracker q error-ch result-chans)]
+          (if subquery?
+            (execute-subquery ds fuel-tracker q* error-ch subquery-son)
+            (execute ds fuel-tracker q* error-ch subquery-son)))
         ;; no sub-queries, just execute
         (let [q* (assoc q :where (not-empty where*))] ;; removed subqueries from where clause
           (if subquery?

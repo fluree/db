@@ -93,4 +93,31 @@
                                                            "where"  {"schema:age" "?age"}}]
                                               ["subquery" {"select" ["?favNums"]
                                                            "where"  {"ex:favNums" "?favNums"}}]]
-                                  "orderBy"  ["?age" "?favNums"]})))))))
+                                  "orderBy"  ["?age" "?favNums"]}))))
+
+      (testing "with nested subqueries"
+        (is (= [["Alice" "alice@example.org" 13] ["Alice" "alice@example.org" 34] ["Alice" "alice@example.org" 50]
+                ["Alice" "brian@example.org" 13] ["Alice" "brian@example.org" 34] ["Alice" "brian@example.org" 50]
+                ["Alice" "cam@example.org" 13] ["Alice" "cam@example.org" 34] ["Alice" "cam@example.org" 50]
+                ["Alice" "liam@example.org" 13] ["Alice" "liam@example.org" 34] ["Alice" "liam@example.org" 50]
+                ["Brian" "alice@example.org" 13] ["Brian" "alice@example.org" 34] ["Brian" "alice@example.org" 50]
+                ["Brian" "brian@example.org" 13] ["Brian" "brian@example.org" 34] ["Brian" "brian@example.org" 50]
+                ["Brian" "cam@example.org" 13] ["Brian" "cam@example.org" 34] ["Brian" "cam@example.org" 50]
+                ["Brian" "liam@example.org" 13] ["Brian" "liam@example.org" 34] ["Brian" "liam@example.org" 50]
+                ["Cam" "alice@example.org" 13] ["Cam" "alice@example.org" 34] ["Cam" "alice@example.org" 50]
+                ["Cam" "brian@example.org" 13] ["Cam" "brian@example.org" 34] ["Cam" "brian@example.org" 50]
+                ["Cam" "cam@example.org" 13] ["Cam" "cam@example.org" 34] ["Cam" "cam@example.org" 50]
+                ["Cam" "liam@example.org" 13] ["Cam" "liam@example.org" 34] ["Cam" "liam@example.org" 50]
+                ["Liam" "alice@example.org" 13] ["Liam" "alice@example.org" 34] ["Liam" "alice@example.org" 50]
+                ["Liam" "brian@example.org" 13] ["Liam" "brian@example.org" 34] ["Liam" "brian@example.org" 50]
+                ["Liam" "cam@example.org" 13] ["Liam" "cam@example.org" 34] ["Liam" "cam@example.org" 50]
+                ["Liam" "liam@example.org" 13] ["Liam" "liam@example.org" 34] ["Liam" "liam@example.org" 50]]
+               @(fluree/query db {"@context" {"schema" "http://schema.org/"
+                                              "ex"     "http://example.org/ns/"}
+                                  "select"   ["?name" "?email" "?age"]
+                                  "where"    [{"schema:name" "?name"}
+                                              ["subquery" {"selectDistinct" ["?age" "?email"]
+                                                           "where"          [{"schema:age" "?age"}
+                                                                             ["subquery" {"select" ["?email"]
+                                                                                          "where"  {"schema:email" "?email"}}]]}]]
+                                  "orderBy"  ["?name" "?email" "?age"]})))))))
