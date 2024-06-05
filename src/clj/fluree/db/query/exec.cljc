@@ -73,20 +73,23 @@
        (take-limit q)))
 
 (defn collect-subqueries
-  [ds fuel-tracker q error-ch subquery-chans]
-  (if (= 1 (count subquery-chans))
-    (first subquery-chans)
-    (let [out-ch (async/chan)]
-      (go
-        (let [all-solns (loop [chans subquery-chans
-                               acc   []]
-                          (if-let [next-chan (first chans)]
-                            (let [solns (async/<! (async/into [] next-chan))]
-                              (recur (rest chans) (conj acc solns)))
-                            acc))
-              results   (util/cartesian-merge all-solns)]
-          (async/onto-chan! out-ch results)))
-      out-ch)))
+  "With multiple subqueries each having its own solution channel,
+  merge them into a single solution."
+  [subquery-chans]
+  (when (seq subquery-chans)
+    (if (= 1 (count subquery-chans))
+      (first subquery-chans)
+      (let [out-ch (async/chan)]
+        (go
+          (let [all-solns (loop [chans subquery-chans
+                                 acc   []]
+                            (if-let [next-chan (first chans)]
+                              (let [solns (async/<! (async/into [] next-chan))]
+                                (recur (rest chans) (conj acc solns)))
+                              acc))
+                results   (util/cartesian-merge all-solns)]
+            (async/onto-chan! out-ch results)))
+        out-ch))))
 
 (defn query*
   "Iterates over query :where to identify any subqueries,
@@ -97,26 +100,19 @@
   Once subquery solution chans are identified, if any, the parent query is executed."
   [ds fuel-tracker q error-ch subquery?]
   (loop [[where-smt & r] (:where q)
-         where*       [] ;; where clause with subqueries removed
-         result-chans []]
+         where*           [] ;; where clause with subqueries removed
+         subquery-results []]
     (if where-smt
       (if-let [subquery (extract-subquery where-smt)]
         (let [result-ch (query* ds fuel-tracker subquery error-ch true)] ;; might be multiple nested subqueries
-          (recur r where* (conj result-chans result-ch)))
-        (recur r (conj where* where-smt) result-chans))
+          (recur r where* (conj subquery-results result-ch)))
+        (recur r (conj where* where-smt) subquery-results))
       ;; end of subqueries search... if result-chans extract as initial soln to where, else execute where
-      (if (seq result-chans)
-        ;; found subqueries, collect them into initial values solution and the execute
-        (let [q* (assoc q :where (not-empty where*))
-              subquery-son (collect-subqueries ds fuel-tracker q error-ch result-chans)]
-          (if subquery?
-            (execute-subquery ds fuel-tracker q* error-ch subquery-son)
-            (execute ds fuel-tracker q* error-ch subquery-son)))
-        ;; no sub-queries, just execute
-        (let [q* (assoc q :where (not-empty where*))] ;; removed subqueries from where clause
-          (if subquery?
-            (execute-subquery ds fuel-tracker q* error-ch nil)
-            (execute ds fuel-tracker q* error-ch nil)))))))
+      (let [q*            (assoc q :where (not-empty where*))
+            subquery-soln (collect-subqueries subquery-results)]
+        (if subquery?
+          (execute-subquery ds fuel-tracker q* error-ch subquery-soln)
+          (execute ds fuel-tracker q* error-ch subquery-soln))))))
 
 (defn query
   "Execute the parsed query `q` against the database value `db`. Returns an async
