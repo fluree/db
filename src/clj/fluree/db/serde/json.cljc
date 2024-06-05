@@ -13,7 +13,7 @@
 
 (defn deserialize-meta
   [serialized-meta]
-  (util/keywordize-keys serialized-meta))
+  (some-> serialized-meta util/keywordize-keys))
 
 (defn subject-reference?
   [dt]
