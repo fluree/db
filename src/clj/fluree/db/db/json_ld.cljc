@@ -363,6 +363,10 @@
           db        (assoc file-data "f:address" db-address)]
       (json-ld/expand db))))
 
+(defn get-max-ns-code
+  [ns-codes]
+  (->> ns-codes keys (apply max)))
+
 (defn with-namespaces
   [{:keys [namespaces max-namespace-code] :as db} new-namespaces]
   (let [new-ns-map          (into namespaces
@@ -372,7 +376,7 @@
                                                    [ns ns-code])))
                                   new-namespaces)
         new-ns-codes        (map-invert new-ns-map)
-        max-namespace-code* (apply max (vals new-ns-map))]
+        max-namespace-code* (get-max-ns-code new-ns-codes)]
     (assoc db
            :namespaces new-ns-map
            :namespace-codes new-ns-codes
@@ -615,8 +619,8 @@
           assert             (db-assert db-data)
           nses               (map :value
                                   (get db-data const/iri-namespaces))
-          _                  (log/debug "merge-commit new namespaces:" nses)
-          _                  (log/debug "db max-namespace-code:"
+          _                  (log/trace "merge-commit new namespaces:" nses)
+          _                  (log/trace "db max-namespace-code:"
                                         (:max-namespace-code db))
           db*                (with-namespaces db nses)
           asserted-flakes    (assert-flakes db* t-new assert)
@@ -812,10 +816,6 @@
      :namespaces      iri/default-namespaces
      :namespace-codes iri/default-namespace-codes
      :schema          (vocab/base-schema)}))
-
-(defn get-max-ns-code
-  [ns-codes]
-  (->> ns-codes keys (apply max)))
 
 (defn load-novelty
   [conn indexed-db index-t commit-jsonld]
