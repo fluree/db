@@ -314,6 +314,10 @@
           (recur r (assoc sid->s-flakes sid (into (set s-flakes) existing-flakes))))
         sid->s-flakes))))
 
+(defn get-max-ns-code
+  [ns-codes]
+  (->> ns-codes keys (apply max)))
+
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
@@ -322,16 +326,16 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-
-          mods     (<? (modified-subjects db add))
-
-          db-after (-> db
-                       (update :staged conj [txn author-did annotation])
-                       (assoc :policy policy) ;; re-apply policy to db-after
-                       (assoc :t t)
-                       (commit-data/update-novelty add remove)
-                       (commit-data/add-tt-id)
-                       (vocab/hydrate-schema add mods))]
+          mods         (<? (modified-subjects db add))
+          max-ns-code  (get-max-ns-code (:namespace-codes db))
+          db-after     (-> db
+                           (update :staged conj [txn author-did annotation])
+                           (assoc :t t
+                                  :max-namespace-code max-ns-code
+                                  :policy policy) ; re-apply policy to db-after
+                           (commit-data/update-novelty add remove)
+                           (commit-data/add-tt-id)
+                           (vocab/hydrate-schema add mods))]
       {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
 
 (defn validate-db-update
@@ -372,7 +376,7 @@
                                                    [ns ns-code])))
                                   new-namespaces)
         new-ns-codes        (map-invert new-ns-map)
-        max-namespace-code* (apply max (vals new-ns-map))]
+        max-namespace-code* (get-max-ns-code new-ns-codes)]
     (assoc db
            :namespaces new-ns-map
            :namespace-codes new-ns-codes
@@ -615,8 +619,8 @@
           assert             (db-assert db-data)
           nses               (map :value
                                   (get db-data const/iri-namespaces))
-          _                  (log/debug "merge-commit new namespaces:" nses)
-          _                  (log/debug "db max-namespace-code:"
+          _                  (log/trace "merge-commit new namespaces:" nses)
+          _                  (log/trace "db max-namespace-code:"
                                         (:max-namespace-code db))
           db*                (with-namespaces db nses)
           asserted-flakes    (assert-flakes db* t-new assert)
@@ -812,10 +816,6 @@
      :namespaces      iri/default-namespaces
      :namespace-codes iri/default-namespace-codes
      :schema          (vocab/base-schema)}))
-
-(defn get-max-ns-code
-  [ns-codes]
-  (->> ns-codes keys (apply max)))
 
 (defn load-novelty
   [conn indexed-db index-t commit-jsonld]
