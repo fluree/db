@@ -196,7 +196,7 @@
           new-commit      (commit-data/new-db-commit-map base-commit-map)
           keypair         (select-keys opts* [:did :private])
 
-          {:keys [commit-map commit-write-result] :as commit-write-map}
+          {:keys [commit-map write-result] :as commit-write-map}
           (<? (write-commit conn alias keypair new-commit))
 
           db  (formalize-commit staged-db commit-map)
@@ -206,7 +206,7 @@
 
       (if file-data?
         {:data-file-meta   data-write-result
-         :commit-file-meta commit-write-result
+         :commit-file-meta write-result
          :db               db*}
         db*))))
 
