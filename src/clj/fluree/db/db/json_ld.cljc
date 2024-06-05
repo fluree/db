@@ -314,6 +314,10 @@
           (recur r (assoc sid->s-flakes sid (into (set s-flakes) existing-flakes))))
         sid->s-flakes))))
 
+(defn get-max-ns-code
+  [ns-codes]
+  (->> ns-codes keys (apply max)))
+
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
@@ -322,16 +326,16 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-
-          mods     (<? (modified-subjects db add))
-
-          db-after (-> db
-                       (update :staged conj [txn author-did annotation])
-                       (assoc :policy policy) ;; re-apply policy to db-after
-                       (assoc :t t)
-                       (commit-data/update-novelty add remove)
-                       (commit-data/add-tt-id)
-                       (vocab/hydrate-schema add mods))]
+          mods         (<? (modified-subjects db add))
+          max-ns-code  (get-max-ns-code (:namespace-codes db))
+          db-after     (-> db
+                           (update :staged conj [txn author-did annotation])
+                           (assoc :t t
+                                  :max-namespace-code max-ns-code
+                                  :policy policy) ; re-apply policy to db-after
+                           (commit-data/update-novelty add remove)
+                           (commit-data/add-tt-id)
+                           (vocab/hydrate-schema add mods))]
       {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
 
 (defn validate-db-update
@@ -362,10 +366,6 @@
     (let [file-data (<? (connection/-c-read conn db-address))
           db        (assoc file-data "f:address" db-address)]
       (json-ld/expand db))))
-
-(defn get-max-ns-code
-  [ns-codes]
-  (->> ns-codes keys (apply max)))
 
 (defn with-namespaces
   [{:keys [namespaces max-namespace-code] :as db} new-namespaces]
