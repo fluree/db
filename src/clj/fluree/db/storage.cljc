@@ -34,6 +34,10 @@
      :method method
      :local  local}))
 
+(defn parse-local-path
+  [address]
+  (-> address parse-address :local))
+
 (defprotocol Store
   (write [store k v] "Writes `v` to Store associated with `k`. Returns value's address.")
   (exists? [store address] "Returns true when address exists in Store.")
