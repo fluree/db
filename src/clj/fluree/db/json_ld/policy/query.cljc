@@ -93,6 +93,7 @@
   [db flakes]
   (let [error-ch  (async/chan)
         result-ch (filter-flakes db error-ch flakes)]
-    (async/alt!
-     result-ch ([r] r)
-     error-ch ([e] e))))
+    (async/go
+     (async/alt!
+      result-ch ([r] r)
+      error-ch ([e] e)))))
