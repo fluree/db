@@ -1,7 +1,7 @@
 (ns fluree.db.json-ld.policy.query
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy.enforce :as enforce]
@@ -52,7 +52,7 @@
 (defn filter-flakes
   "Iterates over multiple flakes and returns the allowed flakes from policy, or
   an empty sequence if none are allowed."
-  [db flakes]
+  [db error-ch flakes]
   (go-try
    (let [parellelism 4
          from-ch     (async/chan parellelism) ;; keep to parallelism, so if exception occurs can close prematurely
@@ -62,31 +62,19 @@
                            to-ch
                            (fn [flake ch]
                              (async/go
-                               (let [allow? (async/<! (allow-flake? db flake))]
-                                 (cond
-                                   (util/exception? allow?)
-                                   (do
-                                     (async/close! from-ch) ;; close source chanel early to avoid processing more than needed
-                                     (log/error allow? "Exception in allow-flakes? checking permission for flake: " flake)
-                                     (async/put! ch allow?))
-
-                                   allow?
-                                   (async/put! ch flake)
-
-                                   :else
-                                   (async/put! ch ::restricted))
-
-                                 (async/close! ch))))
+                               (try*
+                                (let [allow? (<? (allow-flake? db flake))]
+                                  (if allow?
+                                    (async/>! ch flake)
+                                    (async/>! ch ::restricted))
+                                  (async/close! ch))
+                                (catch* e
+                                        (log/error e "Exception in allow-flakes? checking permission for flake: " flake)
+                                        (async/>! error-ch e)))))
                            from-ch)
      (async/reduce (fn [acc result]
-                     (cond
-                       (util/exception? result)
-                       (reduced result)
-
-                       (= ::restricted result)
+                     (if (= ::restricted result)
                        acc
-
-                       :else
                        (conj acc result)))
                    [] to-ch))))
 
@@ -103,4 +91,8 @@
   Leaving it here as some code leverages this function, and optimization
   work can be done here in the future."
   [db flakes]
-  (filter-flakes db flakes))
+  (let [error-ch  (async/chan)
+        result-ch (filter-flakes db error-ch flakes)]
+    (async/alt!
+     result-ch ([r] r)
+     error-ch ([e] e))))
