@@ -145,13 +145,15 @@
    {}
    policy-rules))
 
+;; TODO - For now, extracting a policy from a `select` clause does not retain the
+;  @value: 'x', @type: '@json' structure for the value of `f:query` which
+;  then creates an issue with JSON-LD parsing. This adds back the
+;  explicit @type declaration for the query itself. Once there is a way
+;  to have the query result come back as raw json-ld, then this step can
+;  be removed.
 (defn policy-from-query
-  "For now, extracting a policy from a `select` clause does not retain the
-  @value: 'x', @type: '@json' structure for the value of `f:query` which
-  then creates an issue with JSON-LD parsing. This adds back the
-  explicit @type declaration for the query itself. Once there is a way
-  to have the query result come back as raw json-ld, then this step can
-  be removed."
+  "Recasts @type: @json from a raw query result which
+  would looses the @type information."
   [query-results]
   (mapv
    #(if-let [query (get % const/iri-query)]
