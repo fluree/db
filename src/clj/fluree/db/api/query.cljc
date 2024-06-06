@@ -57,8 +57,11 @@
                            (if reasoners
                              ;; Currently we only support one rule source, so we take the first db or first
                              ;; reason graph that we find.
-                             (<? (reasoner/reason
-                                  time-travel-db reasoners (or (first reasoner-rules-db) (first reasoner-rules)) opts))
+                             (<? (reasoner/reason time-travel-db
+                                                  reasoners
+                                                  (or (first reasoner-rules-db)
+                                                      (first reasoner-rules))
+                                                  opts))
                              time-travel-db))]
       (assoc-in reasoned-db [:policy :cache] (atom {})))))
 
@@ -171,15 +174,15 @@
   (go-try
     (try*
       (let [[alias explicit-t] (extract-query-string-t alias)
-            address            (<? (nameservice/primary-address conn alias nil))
-            ledger             (<? (jld-ledger/load conn address))
-            db                 (ledger/-db ledger)
-            t*                 (or explicit-t t)
-            rules-db           (let [dbs-or-aliases (:reasoner-rules-db opts)]
-                                 (if (string? (first dbs-or-aliases))
-                                   [(ledger/-db (<? (jld-ledger/load conn (first dbs-or-aliases))))]
-                                   dbs-or-aliases))
-            opts*              (assoc opts :reasoner-rules-db rules-db)]
+            address  (<? (nameservice/primary-address conn alias nil))
+            ledger   (<? (jld-ledger/load conn address))
+            db       (ledger/-db ledger)
+            t*       (or explicit-t t)
+            rules-db (let [dbs-or-aliases (:reasoner-rules-db opts)]
+                     (if (string? (first dbs-or-aliases))
+                       [(ledger/-db (<? (jld-ledger/load conn (first dbs-or-aliases))))]
+                       dbs-or-aliases))
+            opts*    (assoc opts :reasoner-rules-db rules-db)]
         (<? (restrict-db db t* context opts*)))
       (catch* e
               (throw (contextualize-ledger-400-error
