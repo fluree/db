@@ -10,17 +10,19 @@
   "Returns all @id values that are not blank nodes
   from either an ordered list or a set of objects."
   [vals]
-  (->> (util/unwrap-list vals)
-       (into [] (comp
-                  (keep util/get-id)
-                  (remove iri/blank-node-id?)))))
+  (into []
+        (comp
+         (keep util/get-id)
+         (remove iri/blank-node-id?))
+        (util/unwrap-list vals)))
 
 (defn get-named-ids
   "Gets all @id values from property 'k' in json-ld node.
   Filters all scalar values and blank nodes."
   [json-ld k]
-  (->> (util/get-all-ids json-ld k)
-       (remove iri/blank-node-id?)))
+  (remove
+   iri/blank-node-id?
+   (util/get-all-ids json-ld k)))
 
 (defn equiv-class-type
   [equiv-class-statement]
@@ -411,9 +413,7 @@
                                                      "@type" {"@id" class}}))
                                         ["union"]
                                         union-classes)]
-            (-> acc
-                (conj with-property-q)
-                (conj of-classes-q)))
+            (conj acc with-property-q of-classes-q))
 
           :else
           (do (log/warn "Ignoring some rules from nested owl:someValuesFrom values."
