@@ -210,7 +210,9 @@
 (defn query-connection-fql
   [conn query {:keys [role did]}]
   (go-try
-    (let [{:keys [t opts] :as sanitized-query} (update query :opts sanitize-query-options did)
+(let [{verified-query :subject did :did} (or (<? (cred/verify query))
+                                             {:subject query})
+      {:keys [t opts] :as sanitized-query} (update verified-query :opts sanitize-query-options did)
 
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
