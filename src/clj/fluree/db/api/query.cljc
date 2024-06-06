@@ -217,7 +217,7 @@
 (defn query-connection-fql
   [conn query {:keys [role did]}]
   (go-try
-    (let [credentialed-opts-query     (update query :opts #(assoc % :role role :did did))
+    (let [credentialed-opts-query     (update query :opts #(merge {:role role :did did} %))
           {query :subject, did :did}  (or (<? (cred/verify credentialed-opts-query))
                                           {:subject credentialed-opts-query})
           {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
