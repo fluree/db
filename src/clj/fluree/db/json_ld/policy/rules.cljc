@@ -27,9 +27,12 @@
 
 (defn extract-query
   [restriction]
-  (-> restriction
-      (util/get-first-value const/iri-query)
-      (assoc "select" "?$this")))
+  (let [query (util/get-first-value restriction const/iri-query)]
+    (if (map? query)
+      (assoc query "select" "?$this")
+      (throw (ex-info (str "Invalid policy, unable to extract query from restriction: " restriction)
+                      {:status 400
+                       :error :db/invalid-policy})))))
 
 (defn policy-cids
   "Returns class subject ids for a given policy restriction map.
