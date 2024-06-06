@@ -9,11 +9,13 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn unrestricted?
-  [policy modify?]
-  (if modify?
-    (true? (get-in policy [const/iri-modify :root?]))
-    (true? (get-in policy [const/iri-view :root?]))))
+(defn unrestricted-modify?
+  [policy]
+  (true? (get-in policy [const/iri-modify :root?])))
+
+(defn unrestricted-view?
+  [policy]
+  (true? (get-in policy [const/iri-view :root?])))
 
 (defn class-policy-map
   "Returns class policy map"

@@ -19,7 +19,7 @@
 
 (defn unrestricted?
   [{:keys [policy] :as _db}]
-  (enforce/unrestricted? policy false))
+  (enforce/unrestricted-view? policy))
 
 (defn allow-flake?
   "Returns one of:
@@ -30,7 +30,7 @@
   (go-try
    (cond
 
-     (enforce/unrestricted? policy false)
+     (enforce/unrestricted-view? policy)
      true
 
      ;; currently property-restrictions override class restrictions if present

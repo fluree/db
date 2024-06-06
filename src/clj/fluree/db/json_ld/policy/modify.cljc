@@ -20,7 +20,7 @@
   [{:keys [db-after add mods]}]
   (go-try
    (let [{:keys [policy]} db-after]
-     (if (enforce/unrestricted? policy true)
+     (if (enforce/unrestricted-modify? policy)
        db-after
        (loop [[flake & r] add]
          (if flake
