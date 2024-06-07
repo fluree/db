@@ -1,6 +1,7 @@
 (ns fluree.db.query.exec.where
   (:require [fluree.db.query.range :as query-range]
             [clojure.core.async :as async :refer [>! go]]
+            [clojure.string :as str]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.index :as index]
@@ -404,16 +405,31 @@
   (let [triple (pattern-data pattern)]
     (-match-class ds fuel-tracker solution triple error-ch)))
 
+(defn filter-exception
+  "Reformats raw filter exception to try to provide more useful feedback."
+  [e solution f]
+  (let [fn-str (->> f meta :fns (str/join " "))
+        ex-msg (or (ex-message e)
+                   ;; note: NullPointerException is common but has no ex-message, create one
+                   (let [ex-type (str (type e))] ;; attempt to make JS compatible
+                     (if (= ex-type "class java.lang.NullPointerException")
+                       "Variable has null value, cannot apply filter"
+                       "Unknown error")))
+        e*     (ex-info (str "Exception in statement '[filter " fn-str "]': " ex-msg)
+                        {:status 400
+                         :error  :db/invalid-query}
+                        e)]
+    (log/warn (ex-message e*))
+    e*))
+
 (defmethod match-pattern :filter
   [_ds _fuel-tracker solution pattern error-ch]
   (go
-    (try*
-      (let [f (pattern-data pattern)]
-        (when (f solution)
-          solution))
-      (catch* e
-              (log/error e "Error applying filter")
-              (>! error-ch e)))))
+    (let [f (pattern-data pattern)]
+      (try*
+       (when (f solution)
+         solution)
+       (catch* e (>! error-ch (filter-exception e solution f)))))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the

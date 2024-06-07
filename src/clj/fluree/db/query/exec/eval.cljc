@@ -398,7 +398,7 @@
                       allowed-scalar-fns)]
     (if (contains? allowed-fns sym)
       (let [qsym (get qualified-symbols sym sym)]
-        (log/debug "qualified symbol" sym "as" qsym)
+        (log/trace "qualified symbol" sym "as" qsym)
         qsym)
       (let [err-msg (if (and (not allow-aggregates?)
                              (contains? allowed-aggregate-fns sym))
@@ -442,7 +442,7 @@
                            (log/trace "fn bindings:" (quote ~bdg))
                            (let ~bdg
                              ~qualified-code))]
-     (log/debug "compiled fn:" fn-code)
+     (log/trace "compiled fn:" fn-code)
      (eval fn-code))))
 
 (defn compile-filter
