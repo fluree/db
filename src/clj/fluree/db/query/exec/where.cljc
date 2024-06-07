@@ -436,12 +436,10 @@
                      (if (= ex-type "class java.lang.NullPointerException")
                        "Variable has null value, cannot apply filter"
                        "Unknown error")))
-        e* (ex-info (str "Exception in statement '[filter " fn-str "]': " ex-msg)
-                    {:status   400
-                     :error    :db/invalid-query
-                     :function  fn-str
-                     :solution solution}
-                    e)]
+        e*     (ex-info (str "Exception in statement '[filter " fn-str "]': " ex-msg)
+                        {:status 400
+                         :error  :db/invalid-query}
+                        e)]
     (log/warn (ex-message e*))
     e*))
 
