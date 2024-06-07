@@ -35,7 +35,8 @@
             [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-value
-                                                  get-first-id vswap!]]
+                                                  get-first-id vswap!
+                                                  try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
@@ -143,29 +144,36 @@
 
 (defn match-triple
   [db fuel-tracker solution tuple error-ch]
-  (let [matched-ch (async/chan 2 (comp cat
-                                       (map (fn [flake]
-                                              (where/match-flake solution tuple db flake)))))
-        db-alias   (:alias db)
-        triple     (where/assign-matched-values tuple solution)]
-    (if-let [[s p o] (where/compute-sids db triple)]
-      (let [pid (where/get-sid p db)]
-        (if-let [props (and pid (where/get-child-properties db pid))]
-          (let [prop-ch (-> props (conj pid) async/to-chan!)]
-            (async/pipeline-async 2
-                                  matched-ch
-                                  (fn [prop ch]
-                                    (let [p* (where/match-sid p db-alias prop)]
-                                      (-> db
-                                          (where/resolve-flake-range fuel-tracker error-ch [s p* o])
-                                          (async/pipe ch))))
-                                  prop-ch))
+  (try*
+   (let [matched-ch (async/chan 2 (comp cat
+                                        (map (fn [flake]
+                                               (where/match-flake solution tuple db flake)))))
+         db-alias   (:alias db)
+         triple     (where/assign-matched-values tuple solution)]
+     (if-let [[s p o] (where/compute-sids db triple)]
+       (let [pid (where/get-sid p db)]
+         (if-let [props (and pid (where/get-child-properties db pid))]
+           (let [prop-ch (-> props (conj pid) async/to-chan!)]
+             (async/pipeline-async 2
+                                   matched-ch
+                                   (fn [prop ch]
+                                     (let [p* (where/match-sid p db-alias prop)]
+                                       (-> db
+                                           (where/resolve-flake-range fuel-tracker error-ch [s p* o])
+                                           (async/pipe ch))))
+                                   prop-ch))
 
-          (-> db
-              (where/resolve-flake-range fuel-tracker error-ch [s p o])
-              (async/pipe matched-ch))))
-      (async/close! matched-ch))
-    matched-ch))
+           (-> db
+               (where/resolve-flake-range fuel-tracker error-ch [s p o])
+               (async/pipe matched-ch))))
+       (async/close! matched-ch))
+     matched-ch)
+   (catch* e
+           (async/put! error-ch (ex-info (str "Error matching triple: " (ex-message e))
+                                         {:status 500
+                                          :error  :db/invalid-query
+                                          :tuple  tuple}
+                                         e)))))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
