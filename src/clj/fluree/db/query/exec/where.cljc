@@ -428,8 +428,8 @@
 
 (defn filter-exception
   "Reformats raw filter exception to try to provide more useful feedback."
-  [e solution pattern]
-  (let [fn-str (->> (pattern-data pattern) meta :fns (str/join " "))
+  [e solution f]
+  (let [fn-str (->> f meta :fns (str/join " "))
         ex-msg (or (ex-message e)
                    ;; note: NullPointerException is common but has no ex-message, create one
                    (let [ex-type (str (type e))] ;; attempt to make JS compatible
@@ -448,12 +448,11 @@
 (defmethod match-pattern :filter
   [_ds _fuel-tracker solution pattern error-ch]
   (go
-    (try*
-      (let [f (pattern-data pattern)]
-        (when (f solution)
-          solution))
-      (catch* e
-              (>! error-ch (filter-exception e solution pattern))))))
+    (let [f (pattern-data pattern)]
+      (try*
+       (when (f solution)
+         solution)
+       (catch* e (>! error-ch (filter-exception e solution f)))))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
