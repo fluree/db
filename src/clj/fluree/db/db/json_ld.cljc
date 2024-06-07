@@ -8,23 +8,24 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.db.json-ld.history :as history]
-            [fluree.db.db.json-ld.policy :as db-policy]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.index :as index]
             [fluree.db.indexer :as indexer]
             [fluree.db.indexer.default :as idx-default]
+            [fluree.db.query.fql :as fql]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
+            [fluree.db.json-ld.policy.query :as qpolicy]
+            [fluree.db.json-ld.policy.rules :as policy-rules]
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.permissions-validate :as validate]
-            [fluree.db.policy.enforce-tx :as tx-policy]
+            [fluree.db.json-ld.policy.modify :as tx-policy]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :refer [AuditLog]]
@@ -45,15 +46,11 @@
 
 ;; ================ Jsonld record support fns ================================
 
-(defn root-db
-  [this]
-  (policy/root this))
-
 (defn class-ids
   "Returns list of class-ids for given subject-id"
   [db subject-id]
   (go-try
-    (let [root (root-db db)]
+    (let [root (policy/root db)]
       (<? (query-range/index-range root :spot = [subject-id const/$rdf:type]
                                    {:flake-xf (map flake/o)})))))
 
@@ -248,7 +245,7 @@
 
         commit-t  (-> db :commit commit-data/t)
         t         (flake/next-t commit-t)
-        db-before (root-db db)]
+        db-before (policy/root db)]
     {:db-before     db-before
      :context       context
      :txn           txn
@@ -326,7 +323,7 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-          mods         (<? (modified-subjects db add))
+          mods         (<? (modified-subjects (policy/root db) add))
           max-ns-code  (get-max-ns-code (:namespace-codes db))
           db-after     (-> db
                            (update :staged conj [txn author-did annotation])
@@ -341,17 +338,14 @@
 (defn validate-db-update
   [{:keys [db-after db-before mods context] :as staged-map}]
   (go-try
-    (<? (shacl/validate! db-before (root-db db-after) (vals mods) context))
+    (<? (shacl/validate! db-before (policy/root db-after) (vals mods) context))
     (let [allowed-db (<? (tx-policy/allowed? staged-map))]
-      (root-db allowed-db))))
+      allowed-db)))
 
 (defn stage
   [db fuel-tracker context identity annotation raw-txn parsed-txn]
   (go-try
-    (let [db*        (if identity
-                       (<? (policy/wrap-policy db identity))
-                       db)
-          tx-state   (->tx-state :db db*
+    (let [tx-state   (->tx-state :db db
                                  :context context
                                  :txn raw-txn
                                  :author-did (:did identity)
@@ -672,7 +666,7 @@
                      namespace-codes max-namespace-code reindex-min-bytes
                      reindex-max-bytes]
   dbproto/IFlureeDb
-  (-rootdb [this] (root-db this))
+  (-query [this query-map] (fql/query this query-map))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
   (-class-ids [this subject] (class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))
@@ -715,7 +709,7 @@
 
   (-iri-visible? [db iri]
     (let [sid (iri/encode-iri db iri)]
-      (validate/allow-iri? db sid)))
+      (qpolicy/allow-iri? db sid)))
 
   indexer/Indexable
   (index [db changes-ch]
@@ -733,7 +727,7 @@
                           [epoch-datetime current-time]
                           [current-time epoch-datetime])
             flakes         (-> db
-                               root-db
+                               policy/root
                                (query-range/index-range
                                 :post
                                 > [const/$_commit:time start]
@@ -761,10 +755,12 @@
     (history/query-commits db context from-t to-t error-ch))
 
   policy/Restrictable
-  (wrap-policy [db identity]
-    (db-policy/wrap-policy db identity))
+  (wrap-policy [db policy default-allow? values-map]
+    (policy-rules/wrap-policy db policy default-allow? values-map))
+  (wrap-identity-policy [db identity default-allow? values-map]
+    (policy-rules/wrap-identity-policy db identity default-allow? values-map))
   (root [db]
-    (db-policy/root db)))
+    (policy/root-db db)))
 
 (defn db?
   [x]

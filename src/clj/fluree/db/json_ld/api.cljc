@@ -12,18 +12,23 @@
             [fluree.db.api.query :as query-api]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.util.core :as util]
+            [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.connection :refer [notify-ledger]]
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.constants :as const]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.policy :as perm])
+            [fluree.db.json-ld.policy :as policy])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(declare query)
 
 (defn promise-wrap
   "Wraps an async channel that will contain a response in a promise."
@@ -270,21 +275,25 @@
                      {:status 500 :error :db/unexpected-error}))
      (ledger/-db ledger))))
 
-
 (defn wrap-policy
-  "Wraps a db object with specified permission attributes.
-  When requesting a db from a ledger, permission attributes can
-  be requested at that point, however if one has a db already, this
-  allows the permission attributes to be modified.
-
-  Returns promise"
-  ([db identity-map]
-   (wrap-policy db identity-map nil))
-  ([db identity-map context]
+  ([db policy default-allow?]
+   (wrap-policy db policy default-allow? nil))
+  ([db policy default-allow? values-map]
    (promise-wrap
-     (let [parsed-ctx (json-ld/parse-context context)
-           policy-id  (perm/parse-policy-identity identity-map parsed-ctx)]
-       (perm/wrap-policy db policy-id)))))
+    (policy/wrap-policy db policy default-allow? values-map))))
+
+(defn wrap-identity-policy
+  "For provided identity, locates specific property f:policyClass on
+  the identity containing a list of class IRIs that identity the policies
+  that should be applied to the identity.
+
+  With the policy classes, finds all policies containing that class
+  declaration."
+  ([db identity default-allow?]
+   (wrap-identity-policy db identity default-allow? nil))
+  ([db identity default-allow? values-map]
+   (promise-wrap
+    (policy/wrap-identity-policy db identity default-allow? values-map))))
 
 (defn dataset
   "Creates a composed dataset from multiple resolved graph databases.
@@ -318,6 +327,36 @@
   ([ds q opts]
    (promise-wrap (query-api/query ds q opts))))
 
+(defn credential-query
+  "Issues a policy-enforced query to the specified dataset/db as a verifiable
+  credential.
+
+  Extracts the query from the credential, and cryptographically verifies the
+  signing identity, which is then used by `wrap-identity-policy` to extract
+  the policy classes and apply the policies to the query."
+  ([ds cred-query] (credential-query ds cred-query {}))
+  ([ds cred-query {:keys [default-allow? values-map] :as opts}]
+   (promise-wrap
+    (go-try
+     (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
+       (log/debug "Credential query with identity: " identity " and query: " query)
+       (cond
+         (and query identity)
+         (let [policy-db (<? (policy/wrap-identity-policy ds
+                                                          identity
+                                                          (or (true? default-allow?)
+                                                              false)
+                                                          values-map))]
+           (<? (query-api/query policy-db query opts)))
+
+         identity
+         (throw (ex-info "Query not present in credential"
+                         {:status 400 :error :db/invalid-credential}))
+
+         :else
+         (throw (ex-info "Invalid credential"
+                         {:status 400 :error :db/invalid-credential}))))))))
+
 (defn query-connection
   "Queries the latest db in the ledger specified by the 'from' parameter in the
   query (what that actually looks like is format-specific). Returns a promise
@@ -329,10 +368,48 @@
 (defn history
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
-  [ledger query]
-  (let [latest-db (ledger/-db ledger)
-        res-chan  (query-api/history latest-db query)]
-    (promise-wrap res-chan)))
+  ([ledger query]
+   (let [latest-db (ledger/-db ledger)
+         res-chan  (query-api/history latest-db query)]
+     (promise-wrap res-chan)))
+  ([ledger query {:keys [policy identity default-allow? values-map] :as _opts}]
+   (promise-wrap
+    (let [latest-db (ledger/-db ledger)
+          policy-db (if identity
+                      (<? (policy/wrap-identity-policy latest-db identity default-allow? values-map))
+                      (<? (policy/wrap-policy latest-db policy default-allow? values-map)))]
+      (query-api/history policy-db query)))))
+
+(defn credential-history
+  "Issues a policy-enforced history query to the specified ledger as a
+  verifiable credential.
+
+  Extracts the query from the credential, and cryptographically verifies the
+  signing identity, which is then used by `wrap-identity-policy` to extract
+  the policy classes and apply the policies to the query."
+  ([ledger cred-query] (credential-history ledger cred-query {}))
+  ([ledger cred-query {:keys [default-allow? values-map] :as opts}]
+   (promise-wrap
+    (go-try
+     (let [latest-db (ledger/-db ledger)
+           {query :subject, identity :did} (<? (cred/verify cred-query))]
+       (log/debug "Credential history query with identity: " identity " and query: " query)
+       (cond
+         (and query identity)
+         (let [policy-db (<? (policy/wrap-identity-policy latest-db
+                                                          identity
+                                                          (or (true? default-allow?)
+                                                              false)
+                                                          values-map))]
+           (<? (query-api/history policy-db query)))
+
+         identity
+         (throw (ex-info "Query not present in credential"
+                         {:status 400 :error :db/invalid-credential}))
+
+         :else
+         (throw (ex-info "Invalid credential"
+                         {:status 400 :error :db/invalid-credential}))))))))
 
 (defn range
   "Performs a range scan against the specified index using test functions

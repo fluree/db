@@ -9,8 +9,7 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.common :refer [filter-subject]]
-            [fluree.db.permissions-validate :as validate :refer [filter-subject-flakes]]
-            [fluree.db.query.json-ld.response :as json-ld-resp]
+            [fluree.db.json-ld.policy.query :as policy :refer [filter-subject-flakes]]
             [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -40,10 +39,6 @@
         resolver    (index/conn->t-range-resolver conn novelty t t)]
     (index/tree-chan resolver idx-root first-flake last-flake any? 10 query-xf error-ch)))
 
-(defn permissioned-db?
-  [db]
-  (not (validate/unrestricted-view? db)))
-
 (defn flakes-xf
   [{:keys [db fuel-vol max-fuel error-ch vars filter-map] :as _opts}]
   (fn [sid port]
@@ -54,9 +49,9 @@
         ;; TODO: and if detected, could avoid index-range call entirely.
         (let [flake-range (cond->> (<? (query-range/index-range db :spot = [sid]))
                             filter-map (filter-subject vars filter-map))
-              flakes      (if (permissioned-db? db)
-                            (<? (filter-subject-flakes db flake-range))
-                            flake-range)]
+              flakes      (if (policy/unrestricted? db)
+                            flake-range
+                            (<? (filter-subject-flakes db flake-range)))]
           (when (seq flakes)
             (async/put! port flakes))
 
