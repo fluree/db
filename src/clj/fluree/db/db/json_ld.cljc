@@ -96,20 +96,6 @@
                          ", however provided db is only at t value: " (:t db))
                     {:status 500 :error :db/indexing}))))
 
-(defn force-index-update
-  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
-  (let [index-t (:t data-map)
-        commit* (assoc commit :index commit-index)]
-    (-> db
-        (empty-novelty index-t)
-        (assoc :commit commit*
-               :novelty* (empty-novelty db index-t)
-               :spot spot
-               :post post
-               :opst opst
-               :tspo tspo)
-        (assoc-in [:stats :indexed] index-t))))
-
 (defn newer-index?
   [commit {data-map :data, :as _commit-index}]
   (if data-map
@@ -122,9 +108,18 @@
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [commit] :as db} commit-index]
+  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
   (if (newer-index? commit commit-index)
-    (force-index-update db commit-index)
+    (let [index-t (:t data-map)
+          commit* (assoc commit :index commit-index)]
+      (-> db
+          (empty-novelty index-t)
+          (assoc :commit commit*
+                 :spot spot
+                 :post post
+                 :opst opst
+                 :tspo tspo)
+          (assoc-in [:stats :indexed] index-t)))
     db))
 
 (defn match-id
@@ -222,6 +217,7 @@
       (async/close! matched-ch))
     matched-ch))
 
+
 ;; TODO - can use transient! below
 (defn stage-update-novelty
   "If a db is staged more than once, any retractions in a previous stage will
@@ -315,6 +311,10 @@
           (recur r (assoc sid->s-flakes sid (into (set s-flakes) existing-flakes))))
         sid->s-flakes))))
 
+(defn get-max-ns-code
+  [ns-codes]
+  (->> ns-codes keys (apply max)))
+
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
@@ -323,16 +323,16 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-
-          mods     (<? (modified-subjects (policy/root db) add))
-
-          db-after (-> db
-                       (update :staged conj [txn author-did annotation])
-                       (assoc :policy policy) ;; re-apply policy to db-after
-                       (assoc :t t)
-                       (commit-data/update-novelty add remove)
-                       (commit-data/add-tt-id)
-                       (vocab/hydrate-schema add mods))]
+          mods         (<? (modified-subjects (policy/root db) add))
+          max-ns-code  (get-max-ns-code (:namespace-codes db))
+          db-after     (-> db
+                           (update :staged conj [txn author-did annotation])
+                           (assoc :t t
+                                  :max-namespace-code max-ns-code
+                                  :policy policy) ; re-apply policy to db-after
+                           (commit-data/update-novelty add remove)
+                           (commit-data/add-tt-id)
+                           (vocab/hydrate-schema add mods))]
       {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
 
 (defn validate-db-update
@@ -370,7 +370,7 @@
                                                    [ns ns-code])))
                                   new-namespaces)
         new-ns-codes        (map-invert new-ns-map)
-        max-namespace-code* (apply max (vals new-ns-map))]
+        max-namespace-code* (get-max-ns-code new-ns-codes)]
     (assoc db
            :namespaces new-ns-map
            :namespace-codes new-ns-codes
@@ -613,8 +613,8 @@
           assert             (db-assert db-data)
           nses               (map :value
                                   (get db-data const/iri-namespaces))
-          _                  (log/debug "merge-commit new namespaces:" nses)
-          _                  (log/debug "db max-namespace-code:"
+          _                  (log/trace "merge-commit new namespaces:" nses)
+          _                  (log/trace "db max-namespace-code:"
                                         (:max-namespace-code db))
           db*                (with-namespaces db nses)
           asserted-flakes    (assert-flakes db* t-new assert)
@@ -686,6 +686,13 @@
 
   (-match-class [db fuel-tracker solution s-mch error-ch]
     (match-class db fuel-tracker solution s-mch error-ch))
+
+  (-activate-alias [db alias']
+    (when (= alias alias')
+      db))
+
+  (-aliases [_]
+    [alias])
 
   jld-transact/Transactable
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
@@ -805,10 +812,6 @@
      :namespaces      iri/default-namespaces
      :namespace-codes iri/default-namespace-codes
      :schema          (vocab/base-schema)}))
-
-(defn get-max-ns-code
-  [ns-codes]
-  (->> ns-codes keys (apply max)))
 
 (defn load-novelty
   [conn indexed-db index-t commit-jsonld]

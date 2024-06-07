@@ -5,8 +5,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.iri :as iri]
-            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]])
-            [clojure.string :as str]))
+            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]])))
 
 (def default-context
   {:id     "@id"

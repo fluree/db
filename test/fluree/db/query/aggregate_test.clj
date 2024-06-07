@@ -25,4 +25,14 @@
                        :where   '{:schema/name ?name}}
               subject @(fluree/query db qry)]
           (is (= [[4]] subject)
-              "aggregates bindings for all results"))))))
+              "aggregates bindings for all results")))
+      (testing "with ordering"
+        (let [qry {:context  [test-utils/default-context
+                              {:ex "http://example.org/ns/"}]
+                   :where    '{:schema/name ?name
+                               :ex/favNums  ?favNums}
+                   :group-by '?name
+                   :order-by '?count
+                   :select   '[?name (as (count ?favNums) ?count)]}]
+          (is (= [["Brian" 1] ["Cam" 2] ["Liam" 2] ["Alice" 3]]
+                 @(fluree/query db qry))))))))
