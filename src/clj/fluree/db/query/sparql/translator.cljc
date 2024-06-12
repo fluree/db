@@ -545,5 +545,6 @@
 
 (defn translate
   [parsed]
-  (->> parsed
-       (reduce (fn [fql rule] (into fql (parse-rule rule))) {})))
+  (reduce (fn [fql rule] (into fql (parse-rule rule)))
+          {}
+          parsed))
