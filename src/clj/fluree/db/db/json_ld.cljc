@@ -311,10 +311,6 @@
           (recur r (assoc sid->s-flakes sid (into (set s-flakes) existing-flakes))))
         sid->s-flakes))))
 
-(defn get-max-ns-code
-  [ns-codes]
-  (->> ns-codes keys (apply max)))
-
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
@@ -324,11 +320,9 @@
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
           mods         (<? (modified-subjects (policy/root db) add))
-          max-ns-code  (get-max-ns-code (:namespace-codes db))
           db-after     (-> db
                            (update :staged conj [txn author-did annotation])
                            (assoc :t t
-                                  :max-namespace-code max-ns-code
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id)
@@ -370,7 +364,7 @@
                                                    [ns ns-code])))
                                   new-namespaces)
         new-ns-codes        (map-invert new-ns-map)
-        max-namespace-code* (get-max-ns-code new-ns-codes)]
+        max-namespace-code* (iri/get-max-namespace-code new-ns-codes)]
     (assoc db
            :namespaces new-ns-map
            :namespace-codes new-ns-codes
@@ -835,7 +829,7 @@
                          (<? (index-storage/read-db-root conn address))
                          (genesis-root-map ledger-alias))
            max-ns-code (max iri/last-default-code
-                            (-> root-map :namespace-codes get-max-ns-code))
+                            (-> root-map :namespace-codes iri/get-max-namespace-code))
            indexed-db  (-> root-map
                            (assoc :conn conn
                                   :alias ledger-alias
