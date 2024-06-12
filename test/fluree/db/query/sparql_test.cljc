@@ -342,7 +342,7 @@
                         BIND (sameTerm(?str, ?str) AS ?sameTerm)
                         ?person person:age ?age.}"
             {:keys [where]} (sparql/->fql query)]
-        (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
+        (is (= [[:bind "?abs" "(abs (* (/ (* (* 1 4) 3) -2) (/ -4 2)))"]
                 [:bind "?bnode" "(bnode ?foobar)"]
                 [:bind "?bound" "(bound ?abs)"]
                 [:bind "?ceil" "(ceil 1.8)"]

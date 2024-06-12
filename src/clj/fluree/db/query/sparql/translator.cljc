@@ -151,7 +151,7 @@
   [[_ func & args]]
   (let [f (get supported-scalar-functions func)]
     (case f
-      "abs"          (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
+      "abs"          (str "(" f " " (parse-term (first args)) ")")
       "bnode"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "bound"        (str "(" f " " (parse-term (first args)) ")")
       "ceil"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
