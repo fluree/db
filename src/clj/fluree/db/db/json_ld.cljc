@@ -828,8 +828,7 @@
      (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root conn address))
                          (genesis-root-map ledger-alias))
-           max-ns-code (max iri/last-default-code
-                            (-> root-map :namespace-codes iri/get-max-namespace-code))
+           max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
            indexed-db  (-> root-map
                            (assoc :conn conn
                                   :alias ledger-alias
