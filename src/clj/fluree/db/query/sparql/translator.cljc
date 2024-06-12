@@ -16,10 +16,13 @@
     (str "\"" x "\"")
     x))
 
-;; take a term rule and return a value
-(defmulti parse-term (fn [[tag & _]] tag))
-;; take a rule return a sequence of entry tuples [[k v]...]
-(defmulti parse-rule (fn [[tag & _]] tag))
+(defmulti parse-term
+  "Accepts a term rule and returns a value."
+  (fn [[tag & _]] tag))
+
+(defmulti parse-rule
+  "Accepts a rule and returns a sequence of entry tuples [[k v]...]."
+  (fn [[tag & _]] tag))
 
 (defmethod parse-term :Var
   ;; Var ::= VAR1 WS | VAR2 WS
