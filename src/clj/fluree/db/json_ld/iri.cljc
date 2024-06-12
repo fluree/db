@@ -194,12 +194,13 @@
      (when-let [ns-code (get namespaces ns)]
        (->sid ns-code nme)))))
 
+(defn get-max-namespace-code
+  [ns-codes]
+  (->> ns-codes keys (apply max last-default-code)))
+
 (defn next-namespace-code
-  [namespaces]
-  (->> namespaces
-       vals
-       (apply max last-default-code)
-       inc))
+  [ns-codes]
+  (-> ns-codes get-max-namespace-code inc))
 
 (def type-sid
   (iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))
