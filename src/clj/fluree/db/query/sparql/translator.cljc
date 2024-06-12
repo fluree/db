@@ -154,7 +154,7 @@
       "abs"          (str "(" f " " (parse-term (first args)) ")")
       "bnode"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "bound"        (str "(" f " " (parse-term (first args)) ")")
-      "ceil"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "ceil"         (str "(" f " " (parse-term (first args)) ")")
       "coalesce"     (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
       "concat"       (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
       "contains"     (str "(" f " " (literal-quote (parse-term (first args))) " "
@@ -162,7 +162,7 @@
       "datatype"     (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "day"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "encodeForUri" (str "(" f " " (literal-quote (parse-term (first args))) ")")
-      "floor"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "floor"        (str "(" f " " (parse-term (first args)) ")")
       "hours"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "if"           (str "(" f " " (literal-quote (parse-term (first args))) " "
                           (literal-quote (parse-term (first (next args)))) " "
@@ -177,7 +177,7 @@
       "month"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "now"          (str "(" f ")")
       "rand"         (str "(" f ")")
-      "round"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "round"        (str "(" f " " (parse-term (first args)) ")")
       "seconds"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha1"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha256"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
