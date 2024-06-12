@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async :refer [<!]]
             [fluree.db.ledger :as ledger]
             [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.json-ld.transact :as transact]
             [fluree.db.did :as did]
@@ -153,11 +154,13 @@
 
 (defn formalize-commit
   [{prev-commit :commit :as staged-db} new-commit]
-  (-> staged-db
-      (update :staged empty)
-      (assoc :commit new-commit
-             :prev-commit prev-commit)
-      (commit-data/add-commit-flakes prev-commit)))
+  (let [max-ns-code (-> staged-db :namespace-codes iri/get-max-namespace-code)]
+    (-> staged-db
+        (update :staged empty)
+        (assoc :commit new-commit
+               :prev-commit prev-commit
+               :max-namespace-code max-ns-code)
+        (commit-data/add-commit-flakes prev-commit))))
 
 (defn commit!
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject

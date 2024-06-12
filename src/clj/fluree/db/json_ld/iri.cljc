@@ -194,6 +194,10 @@
      (when-let [ns-code (get namespaces ns)]
        (->sid ns-code nme)))))
 
+(defn get-max-namespace-code
+  [ns-codes]
+  (->> ns-codes keys (apply max)))
+
 (defn next-namespace-code
   [namespaces]
   (->> namespaces
