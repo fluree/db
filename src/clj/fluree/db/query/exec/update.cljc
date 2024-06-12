@@ -45,10 +45,11 @@
 
 (defn ensure-namespace
   [db ns]
-  (let [nses (:namespaces db)]
+  (let [nses     (:namespaces db)
+        ns-codes (:namespace-codes db)]
     (if (contains? nses ns)
       db
-      (let [new-ns-code (iri/next-namespace-code nses)]
+      (let [new-ns-code (iri/next-namespace-code ns-codes)]
         (-> db
             (update :namespaces assoc ns new-ns-code)
             (update :namespace-codes assoc new-ns-code ns))))))
