@@ -285,7 +285,7 @@
   [x]
   (str x))
 
-(defn sparql-in
+(defn in
   [term expressions]
   (contains? (set expressions) term))
 
@@ -324,7 +324,7 @@
     count          clojure.core/count
     floor          fluree.db.query.exec.eval/floor
     groupconcat    fluree.db.query.exec.eval/groupconcat
-    in             fluree.db.query.exec.eval/sparql-in
+    in             fluree.db.query.exec.eval/in
     lang           fluree.db.query.exec.eval/lang
     lcase          fluree.db.query.exec.eval/lcase
     median         fluree.db.query.exec.eval/median
