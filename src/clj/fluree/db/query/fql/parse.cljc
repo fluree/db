@@ -60,7 +60,9 @@
           (json-ld/expand-iri context)
           (where/anonymous-value dt-iri))
       (where/anonymous-value v dt-iri))
-    (where/anonymous-value v)))
+    (if-let [lang (get attrs const/iri-language)]
+      (where/anonymous-value v const/iri-lang-string {:lang lang})
+      (where/anonymous-value v))))
 
 (defn parse-value-attributes
   [v attrs context]
@@ -80,7 +82,7 @@
           (where/match-iri var-match expanded))
         (where/match-value var-match val dt-iri))
       (if-let [lang (get attrs const/iri-language)]
-        (where/match-value var-match val const/iri-string {:lang lang})
+        (where/match-value var-match val const/iri-lang-string {:lang lang})
         (let [dt (datatype/infer-iri val)]
           (where/match-value var-match val dt))))))
 
