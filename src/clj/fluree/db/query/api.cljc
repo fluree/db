@@ -56,7 +56,7 @@
 
 =======
     (let [policy-db      (if-let [policy-identity (perm/parse-policy-identity opts context)]
-                           (<? (perm/wrap-policy db policy-identity))
+                           (<? (perm/wrap-identity-policy db policy-identity false nil))
                            db)
           time-travel-db (-> (if t
                                (<? (time-travel/as-of policy-db t))
