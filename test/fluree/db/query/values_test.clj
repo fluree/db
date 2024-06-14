@@ -20,7 +20,7 @@
                                                            "ex:birthday" {"@value" "2000-01-01"
                                                                           "@type" "xsd:datetime"}
                                                            "ex:cool" true}])})]
-    (testing "clause"
+    (testing "top-level clause"
       (testing "no where clause"
         (testing "multiple vars"
           (is (= [["foo1" "bar1"] ["foo2" "bar2"] ["foo3" "bar3"]]
@@ -28,12 +28,14 @@
                                      "values" [["?foo" "?bar"]
                                                [["foo1" "bar1"]
                                                 ["foo2" "bar2"]
-                                                ["foo3" "bar3"]]]}))))
+                                                ["foo3" "bar3"]]]}))
+              "syntactic form is parsed correctly"))
         (testing "single var"
           (is (= [["foo1"] ["foo2"] ["foo3"]]
                  @(fluree/query db1 {"select" ["?foo"]
-                                     "values" ["?foo" ["foo1" "foo2" "foo3" ]]}))))))
-    (testing "pattern"
+                                     "values" ["?foo" ["foo1" "foo2" "foo3" ]]}))
+              "syntactic form is parsed correctly"))))
+    (testing "where pattern"
       (testing "single var"
         (is (= [["Brian" "brian@example.org"]
                 ["Cam" "cam@example.org"]]
@@ -43,16 +45,30 @@
                                             {"@id" "?s" "schema:email" "?email"}
                                             ["values"
                                              ["?s" [{"@type" "xsd:anyURI" "@value" "ex:cam"}
-                                                    {"@type" "xsd:anyURI" "@value" "ex:brian"}]]]]}))))
-      (testing "nested scope"
+                                                    {"@type" "xsd:anyURI" "@value" "ex:brian"}]]]]}))
+            "syntactic form is parsed correctly"))
+      (testing "multiple vars"
+        (is (= [["Brian" "brian@example.org"]
+                ["Cam" "cam@example.org"]]
+               @(fluree/query db1 {"@context" context
+                                   "select" ["?name" "?email"]
+                                   "where" [{"@id" "?s" "schema:name" "?name"}
+                                            {"@id" "?s" "schema:email" "?email"}
+                                            ["values"
+                                             [["?s"] [[{"@type" "xsd:anyURI" "@value" "ex:cam"}]
+                                                      [{"@type" "xsd:anyURI" "@value" "ex:brian"}]]]]]}))
+            "syntactic form is parsed correctly"))
+      (testing "nested under optional clause"
         (is (= [["Nikola" nil true]]
                @(fluree/query db1 {"@context" context
                                    "select" ["?name" "?age" "?cool"]
                                    "where" [["optional"
-                                             [{"@id" "?s" "schema:name" "?name"
+                                             [{"@id" "?s"
+                                               "schema:name" "?name"
                                                "ex:cool" "?cool"}
                                               ["values"
-                                               ["?s" [{"@type" "xsd:anyURI" "@value" "ex:nikola"}]]]]]]}))))
+                                               ["?s" [{"@type" "xsd:anyURI" "@value" "ex:nikola"}]]]]]]}))
+            "syntactic form is parsed correctly"))
       (testing "federated"
         (let [db3 @(fluree/create-with-txn conn
                                            {"@context" context
@@ -70,7 +86,8 @@
                                                              {"@type" "xsd:anyURI" "@value" "ex:khris"}]]]]
                                             ;; federated queries async/merge solutions from different
                                             ;; graphs nondeterministically
-                                            "orderBy" "?name"})))))
+                                            "orderBy" "?name"}))
+              "constrains across multiple ledgers")))
       (testing "match meta"
         (is (= ["ex:nikola"]
                @(fluree/query db1 {"@context" context
