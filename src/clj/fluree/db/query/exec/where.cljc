@@ -1,6 +1,6 @@
 (ns fluree.db.query.exec.where
-  (:require [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async :refer [>! go]]
+  (:require [clojure.core.async :as async :refer [>! go]]
+            [clojure.set :as set]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.index :as index]
@@ -8,6 +8,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.datatype :as datatype]
             [fluree.db.query.dataset :as dataset]
+            [fluree.db.query.range :as query-range]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri])
@@ -576,7 +577,14 @@
     (->> inline-solutions
          (filterv (fn [inline-solution] (= (select-keys solution* (keys inline-solution))
                                            (update-vals inline-solution match-identity))))
-         (mapv (partial merge solution) inline-solutions)
+         (mapv (fn [inline-solution]
+                 (let [existing-vars (set (keys solution))
+                       inline-vars   (set (keys inline-solution))
+                       new-vars      (set/difference inline-vars existing-vars)]
+                   ;; don't clobber existing vars, only add new data
+                   (reduce (fn [solution new-var] (assoc solution new-var (get inline-solution new-var)))
+                           solution
+                           new-vars))))
          (async/to-chan!))))
 
 (defn with-default
