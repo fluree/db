@@ -69,7 +69,7 @@
 
 (defn write-db-root
   [db]
-  (let [{:keys [alias conn schema t stats spot psot post opst tspo
+  (let [{:keys [alias conn schema t stats spot post opst tspo
                 namespace-codes]}
         db
 
@@ -79,7 +79,6 @@
               :schema          (vocab/serialize-schema schema)
               :stats           (select-keys stats [:flakes :size])
               :spot            (child-data spot)
-              :psot            (child-data psot)
               :post            (child-data post)
               :opst            (child-data opst)
               :tspo            (child-data tspo)
