@@ -6,7 +6,7 @@
             [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go >!] :as async]
                :cljs [cljs.core.async :refer [chan  >!] :refer-macros [go] :as async])
-            [fluree.db.json-ld.policy.query :as policy]
+            [fluree.db.permissions-validate :as perm-validate]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.iri :as iri]))
 
@@ -112,7 +112,7 @@
   [db error-ch flake]
   (go
     (try* (if (or (schema-util/is-schema-flake? db flake)
-                  (<? (policy/allow-flake? db flake)))
+                  (<? (perm-validate/allow-flake? db flake)))
             flake
             ::unauthorized)
           (catch* e
@@ -131,14 +131,14 @@
 (defn filter-authorized
   "Returns a channel that will eventually return a stream of flake slices
   containing only the schema flakes and the flakes validated by
-  allow-flake? function for the database `db`
+  fluree.db.permissions-validate/allow-flake? function for the database `db`
   from the `flake-slices` channel"
   [db error-ch flake-slices]
   #?(:cljs
      flake-slices ; Note this bypasses all permissions in CLJS for now!
 
      :clj
-     (if (policy/unrestricted? db)
+     (if (perm-validate/unrestricted-view? db)
        flake-slices
        (let [auth-fn (fn [flakes ch]
                        (-> (authorize-flakes db error-ch flakes)

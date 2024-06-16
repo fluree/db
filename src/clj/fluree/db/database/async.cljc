@@ -160,14 +160,10 @@
       commit-ch))
 
   policy/Restrictable
-  (wrap-policy [_ policy default-allow? values-map]
-    (go-try
-     (let [db (<? db-chan)]
-       (<? (policy/wrap-policy db policy default-allow? values-map)))))
-  (wrap-identity-policy [_ identity default-allow? values-map]
+  (wrap-policy [_ identity]
     (go-try
       (let [db (<? db-chan)]
-        (<? (policy/wrap-identity-policy db identity default-allow? values-map)))))
+        (<? (policy/wrap-policy db identity)))))
   (root [_]
     (let [root-ch (async/promise-chan)
           root-db (->AsyncDB alias branch commit t root-ch)]

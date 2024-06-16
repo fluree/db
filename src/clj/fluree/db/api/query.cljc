@@ -24,8 +24,16 @@
   "Return a summary of the changes over time, optionally with the full commit details included."
   [db query]
   (go-try
-    (let [context (ctx-util/extract query)]
-      (<? (history/query db context query)))))
+    (let [{query-map :subject, did :did} (or (<? (cred/verify query))
+                                             {:subject query})
+
+          context (ctx-util/extract query-map)
+          opts    (cond-> (:opts query-map)
+                    did (assoc :did did))
+          db*     (if-let [policy-identity (perm/parse-policy-identity opts context)]
+                    (<? (perm/wrap-policy db policy-identity))
+                    db)]
+      (<? (history/query db* context query-map)))))
 
 (defn sanitize-query-options
   [opts did]
@@ -36,7 +44,7 @@
   [db t context opts]
   (go-try
     (let [db*  (if-let [policy-identity (perm/parse-policy-identity opts context)]
-                 (<? (perm/wrap-identity-policy db policy-identity false nil))
+                 (<? (perm/wrap-policy db policy-identity))
                  db)
           db** (-> (if t
                      (<? (time-travel/as-of db* t))

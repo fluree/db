@@ -44,9 +44,10 @@
      (cache-query ds query-map)
      (let [q   (try*
                  (parse/parse-query query-map)
-                 (catch* e e))]
+                 (catch* e e))
+           db* (assoc ds :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
        (if (util/exception? q)
          (async/to-chan! [q])
          (if (= :simple-subject-crawl (:strategy q))
-           (simple-subject-crawl ds q)
-           (exec/query ds fuel-tracker q)))))))
+           (simple-subject-crawl db* q)
+           (exec/query db* fuel-tracker q)))))))

@@ -910,7 +910,26 @@
                                                  "schema:email"     "john@flur.ee"
                                                  "schema:birthDate" "2022-08-17"
                                                  "schema:ssn"       "222-22-2222"
-                                                 "ex:address"       {"ex:state" "SC" "ex:country" "USA"}}]}})
+                                                 "ex:address"       {"ex:state" "SC" "ex:country" "USA"}}
+                                                {"@id"          "ex:rootPolicy"
+                                                 "@type"        "f:Policy"
+                                                 "f:targetNode" {"@id" "f:allNodes"}
+                                                 "f:allow"      {"@id"          "ex:rootAccessAllow"
+                                                                 "f:targetRole" {"@id" "ex:rootRole"}
+                                                                 "f:action"     [{"@id" "f:view"} {"@id" "f:modify"}]}}
+                                                {"@id"           "ex:userPolicy"
+                                                 "@type"         "f:Policy"
+                                                 "f:targetClass" {"@id" "ex:User"}
+                                                 "f:allow"       {"@id"          "ex:globalViewAllow"
+                                                                  "f:targetRole" {"@id" "ex:userRole"}
+                                                                  "f:action"     [{"@id" "f:view"}]}
+                                                 "f:property"    {"f:path"  {"@id" "schema:ssn"}
+                                                                  "f:allow" {"@id"          "ex:ssnViewRule"
+                                                                             "f:targetRole" {"@id" "ex:userRole"}
+                                                                             "f:action"     {"@id" "f:view"}
+                                                                             "f:equals"     {"@list"
+                                                                                             [{"@id" "f:$identity"}
+                                                                                              {"@id" "ex:user"}]}}}}]}})
 
            db6 @(fluree/stage db5 {"@context" ["https://ns.flur.ee"
                                                test-utils/default-str-context
@@ -960,6 +979,45 @@
        (is (= "Subject ex:mp path [\"ex:nickname\"] violates constraint sh:maxCount of shape _:fdb-5 - count 2 is greater than maximum count of 1."
               (ex-message db4)))
 
+       (is (= [{"id"               "ex:alice"
+                "type"             "ex:User"
+                "ex:address"       {"ex:state" "NC" "ex:country" "USA"}
+                "schema:birthDate" "2022-08-17"
+                "schema:name"      "Alice"
+                "schema:email"     "alice@flur.ee"
+                "schema:ssn"       "111-11-1111"}
+               {"id"               "ex:john"
+                "type"             "ex:User"
+                "ex:address"       {"ex:state" "SC" "ex:country" "USA"}
+                "schema:birthDate" "2022-08-17"
+                "schema:name"      "John"
+                "schema:email"     "john@flur.ee"
+                "schema:ssn"       "222-22-2222"}]
+              @(fluree/query db5 {:context [test-utils/default-str-context
+                                            {"ex" "ns:ex/"}]
+                                  :where   {"id" "?s", "@type" "ex:User"}
+                                  :select  {"?s" ["*" {"ex:address" ["ex:state" "ex:country"]}]}
+                                  :opts    {:did  root-did
+                                            :role "ex:rootRole"}}))
+           "rootRole user can see all ex:Users")
+
+       (is (= [{"id"               "ex:alice"
+                "type"             "ex:User"
+                "schema:email"     "alice@flur.ee"
+                "schema:birthDate" "2022-08-17"
+                "schema:name"      "Alice"
+                "schema:ssn"       "111-11-1111"}
+               {"id"               "ex:john"
+                "type"             "ex:User"
+                "schema:email"     "john@flur.ee"
+                "schema:birthDate" "2022-08-17"
+                "schema:name"      "John"}]
+              @(fluree/query db5 {:context [test-utils/default-str-context
+                                            {"ex" "ns:ex/"}]
+                                  :where   {"id" "?s", "@type" "ex:User"}
+                                  :select  {"?s" ["*" {"ex:address" ["*"]}]}
+                                  :opts    {:did alice-did :role "ex:userRole"}}))
+           "userRole user can see all ex:Users but only their own ssn")
 
        (is (= #{"Freddy" "Betty" "Leticia" "Andrew"}
               (set @(fluree/query db7 {"@context"       test-utils/default-str-context
@@ -968,7 +1026,7 @@
                                                          "schema:givenName" "?name"}})))
            "equivalentProperty annotations work")
 
-       (is (= 54
+       (is (= 72
               (-> @(fluree/history ledger {:context        test-utils/default-str-context
                                            :commit-details true
                                            :t              {:from :latest}})
@@ -976,7 +1034,7 @@
                   (get "f:commit")
                   (get "f:data")
                   (get "f:flakes"))))
-       (is (= 54
+       (is (= 72
               (-> @(fluree/history loaded {:context        test-utils/default-str-context
                                            :commit-details true
                                            :t              {:from :latest}})
