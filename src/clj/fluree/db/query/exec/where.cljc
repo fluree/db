@@ -534,6 +534,20 @@
       (dataset/activate alias)
       (match-clause fuel-tracker solution clause error-ch)))
 
+(defmethod match-pattern :exists
+  [ds fuel-tracker solution pattern error-ch]
+  (let [clause (pattern-data pattern)]
+    (go
+      (when (async/<! (match-clause ds fuel-tracker solution clause error-ch))
+        solution))))
+
+(defmethod match-pattern :not-exists
+  [ds fuel-tracker solution pattern error-ch]
+  (let [clause (pattern-data pattern)]
+    (go
+      (when-not (async/<! (match-clause ds fuel-tracker solution clause error-ch))
+        solution))))
+
 (defmethod match-pattern :graph
   [ds fuel-tracker solution pattern error-ch]
   (let [[g clause] (pattern-data pattern)]
