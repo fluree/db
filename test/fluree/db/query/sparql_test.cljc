@@ -107,7 +107,13 @@
                "person:birthday"
                {"@value" "2011-01-10T14:45:13.815-05:00", "@type" "xsd:dateTime"}}]
              where)
-          "datatype literal")))
+          "datatype literal"))
+    (let [query "SELECT ?person
+                 WHERE { ?person a schema:Person . }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?person", "@type" "schema:Person"}]
+             where)
+          "a as an alias for @type")))
   (testing "multi clause"
     (let [query "SELECT ?person ?nums
                  WHERE {?person person:handle \"jdoe\".
@@ -177,7 +183,27 @@
               {"@id" "?s", "schema:name" "?name"}
               [:filter ["(regex ?name \"^Jon\" \"i\")"]]]
              where)
-          "filter by regex call")))
+          "filter by regex call"))
+    (let [query "SELECT ?s
+                 WHERE {
+                   ?s ?p ?o
+                   FILTER EXISTS { ?s ex:name \"Larry\" }
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s" "?p" "?o"}
+              ["exists" [{"@id" "?s" "ex:name" "Larry"}]]]
+             where)
+          "EXISTS expression parsing"))
+    (let [query "SELECT ?s
+                 WHERE {
+                   ?s ?p ?o
+                   FILTER NOT EXISTS { ?s ex:name \"Larry\" }
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s" "?p" "?o"}
+              ["not-exists" [{"@id" "?s" "ex:name" "Larry"}]]]
+             where)
+          "NOT EXISTS expression parsing")))
   (testing "OPTIONAL"
     (let [query "SELECT ?handle ?num
                  WHERE {?person person:handle ?handle.
@@ -283,7 +309,7 @@
                         ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes
                         ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore
                         ?strDt ?strEnds ?strLang ?strLen ?strStarts ?struuid ?timezone ?tz ?ucase
-                        ?uri ?uuid ?year ?isBlank ?isIri ?isLiteral ?isNumeric ?isUri ?sameTerm
+                        ?uri ?uuid ?year ?isBlank ?isIri ?isLiteral ?isNumeric ?isUri ?sameTerm ?in ?notIn
                  WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
                         BIND (BNODE(?foobar) AS ?bnode)
                         BIND (BOUND(?abs) AS ?bound)
@@ -297,6 +323,8 @@
                         BIND (FLOOR(1.8) AS ?floor)
                         BIND (HOURS(\"2024-4-1T14:45:13.815-05:00\") AS ?hours)
                         BIND (IF(\"true\", \"yes\", \"no\") AS ?if)
+                        BIND (?age IN (1, 2, 3, \"foo\", ex:bar) AS ?in)
+                        BIND (?age NOT IN (1, 2, 3, \"foo\", ex:bar) AS ?notIn)
                         BIND (IRI(\"http://example.com\") AS ?iri)
                         BIND (LANG(\"Robert\"\"@en\") AS ?lang)
                         BIND (LANGMATCHES(?lang, \"FR\") AS ?langMatches)
@@ -334,19 +362,21 @@
                         BIND (sameTerm(?str, ?str) AS ?sameTerm)
                         ?person person:age ?age.}"
             {:keys [where]} (sparql/->fql query)]
-        (is (= [[:bind "?abs" "(abs \"(* (/ (* (* 1 4) 3) -2) (/ -4 2))\")"]
+        (is (= [[:bind "?abs" "(abs (* (/ (* (* 1 4) 3) -2) (/ -4 2)))"]
                 [:bind "?bnode" "(bnode ?foobar)"]
                 [:bind "?bound" "(bound ?abs)"]
-                [:bind "?ceil" "(ceil \"1.8\")"]
-                [:bind "?coalesce" "(coalesce ?num1 \"2\")"]
+                [:bind "?ceil" "(ceil 1.8)"]
+                [:bind "?coalesce" "(coalesce ?num1 2)"]
                 [:bind "?concat" "(concat \"foo\" \"bar\")"]
                 [:bind "?contains" "(contains \"foobar\" \"foo\")"]
                 [:bind "?datatype" "(datatype \"foobar\")"]
                 [:bind "?day" "(day \"2024-4-1T14:45:13.815-05:00\")"]
                 [:bind "?encodeForUri" "(encodeForUri \"Los Angeles\")"]
-                [:bind "?floor" "(floor \"1.8\")"]
+                [:bind "?floor" "(floor 1.8)"]
                 [:bind "?hours" "(hours \"2024-4-1T14:45:13.815-05:00\")"]
                 [:bind "?if" "(if \"true\" \"yes\" \"no\")"]
+                [:bind "?in" "(in ?age [1 2 3 \"foo\" \"ex:bar\"])"]
+                [:bind "?notIn" "(not (in ?age [1 2 3 \"foo\" \"ex:bar\"]))"]
                 [:bind "?iri" "(iri \"http://example.com\")"]
                 [:bind "?lang" "(lang \"Robert\"\"@en\")"]
                 [:bind "?langMatches" "(langMatches ?lang \"FR\")"]
@@ -356,7 +386,7 @@
                 [:bind "?month" "(month \"2024-4-1T14:45:13.815-05:00\")"]
                 [:bind "?now" "(now)"]
                 [:bind "?rand" "(rand)"]
-                [:bind "?round" "(round \"1.8\")"]
+                [:bind "?round" "(round 1.8)"]
                 [:bind "?seconds" "(seconds \"2024-4-1T14:45:13.815-05:00\")"]
                 [:bind "?sha1" "(sha1 \"abc\")"]
                 [:bind "?sha256" "(sha256 \"abc\")"]
@@ -379,11 +409,25 @@
                 [:bind "?isBlank" "(isBlank ?bnode)"]
                 [:bind "?isIri" "(isIri ?iri)"]
                 [:bind "?isLiteral" "(isLiteral \"foobar\")"]
-                [:bind "?isNumeric" "(isNumeric \"5\")"]
+                [:bind "?isNumeric" "(isNumeric 5)"]
                 [:bind "?isUri" "(isUri ?uri)"]
                 [:bind "?sameTerm" "(sameTerm ?str ?str)"]
                 {"@id" "?person", "person:age" "?age"}]
-               where))))))
+               where)))))
+  (testing "GRAPH"
+    (let [query "SELECT ?who ?g ?mbox
+                 FROM <http://example.org/dft.ttl>
+                 FROM NAMED <http://example.org/alice>
+                 FROM NAMED <http://example.org/bob>
+                 WHERE
+                 {
+                    ?g dc:publisher ?who .
+                    GRAPH ?g { ?x foaf:mbox ?mbox }
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?g", "dc:publisher" "?who"}
+              [:graph "?g" [{"@id" "?x", "foaf:mbox" "?mbox"}]]]
+             where)))))
 
 (deftest parse-prefixes
   (testing "PREFIX"
