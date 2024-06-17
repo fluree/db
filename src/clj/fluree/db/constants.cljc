@@ -63,6 +63,8 @@
 (def ^:const iri-exMessage (fluree-iri "exMessage"))
 (def ^:const iri-policyClass (fluree-iri "policyClass"))
 (def ^:const iri-context "@context")
+(def ^:const iri-base "@base")
+(def ^:const iri-vocab "@vocab")
 (def ^:const iri-id "@id")
 (def ^:const iri-value "@value")
 (def ^:const iri-language "@language")
@@ -73,6 +75,7 @@
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
 (def ^:const iri-lang-string "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
+(def ^:const iri-string "http://www.w3.org/2001/XMLSchema#string")
 
 ;; rdfs
 (def ^:const iri-rdfs:Class "http://www.w3.org/2000/01/rdf-schema#Class")

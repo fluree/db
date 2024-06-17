@@ -1,6 +1,6 @@
 (ns fluree.db.query.exec.where
-  (:require [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async :refer [>! go]]
+  (:require [clojure.core.async :as async :refer [>! go]]
+            [clojure.set :as set]
             [clojure.string :as str]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
@@ -8,6 +8,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.datatype :as datatype]
+            [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri])
   #?(:clj (:import (clojure.lang MapEntry))))
@@ -460,6 +461,20 @@
       (-activate-alias alias)
       (match-clause fuel-tracker solution clause error-ch)))
 
+(defmethod match-pattern :exists
+  [ds fuel-tracker solution pattern error-ch]
+  (let [clause (pattern-data pattern)]
+    (go
+      (when (async/<! (match-clause ds fuel-tracker solution clause error-ch))
+        solution))))
+
+(defmethod match-pattern :not-exists
+  [ds fuel-tracker solution pattern error-ch]
+  (let [clause (pattern-data pattern)]
+    (go
+      (when-not (async/<! (match-clause ds fuel-tracker solution clause error-ch))
+        solution))))
+
 (defmethod match-pattern :graph
   [ds fuel-tracker solution pattern error-ch]
   (let [[g clause] (pattern-data pattern)]
@@ -492,6 +507,26 @@
                                 (async/pipe ch)))
                           clause-ch)
     out-ch))
+
+(defmethod match-pattern :values
+  [db fuel-tracker solution pattern error-ch]
+  (let [inline-solutions (pattern-data pattern)
+        ;; transform a match into its identity for equality checks
+        match-identity   (juxt get-iri get-value get-datatype-iri (comp get-meta :lang))
+        solution*        (update-vals solution match-identity)]
+    ;; filter out any inline solutions whose matches don't match the solution's matches
+    (->> inline-solutions
+         (filterv (fn [inline-solution] (= (select-keys solution* (keys inline-solution))
+                                           (update-vals inline-solution match-identity))))
+         (mapv (fn [inline-solution]
+                 (let [existing-vars (set (keys solution))
+                       inline-vars   (set (keys inline-solution))
+                       new-vars      (set/difference inline-vars existing-vars)]
+                   ;; don't clobber existing vars, only add new data
+                   (reduce (fn [solution new-var] (assoc solution new-var (get inline-solution new-var)))
+                           solution
+                           new-vars))))
+         (async/to-chan!))))
 
 (defn with-default
   "Return a transducer that transforms an input stream of solutions to include the

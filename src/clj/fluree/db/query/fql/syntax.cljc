@@ -131,7 +131,7 @@
     ::select          [:orn {:error/message "Select must be a valid selector or vector of selectors"}
                        [:selector ::selector]
                        [:collection [:sequential ::selector]]]
-    ::direction       [:orn {:error/message "Direction must be ASC or DESC"}
+    ::direction       [:orn {:error/message "Direction must be \"asc\" or \"desc\""}
                        [:asc [:fn asc?]]
                        [:desc [:fn desc?]]]
     ::ordering        [:orn {:error/message "Ordering must be a var or two-tuple formatted ['ASC' or 'DESC', var]"}
