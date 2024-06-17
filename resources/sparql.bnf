@@ -79,7 +79,7 @@ ConstructTriples	  ::=  	TriplesSameSubject ( '.' ConstructTriples? )?
 TriplesSameSubject	  ::=  	VarOrTerm PropertyListNotEmpty | TriplesNode PropertyList
 PropertyList	  ::=  	PropertyListNotEmpty?
 PropertyListNotEmpty	  ::=  	Verb ObjectList ( <';'>  WS ( Verb ObjectList )? )*
-Verb	  ::=  	VarOrIri | 'a'
+Verb	  ::=  	VarOrIri | Type
 ObjectList	  ::=  	Object ( <','> WS Object )*
 Object	  ::=  	GraphNode
 TriplesSameSubjectPath	  ::=  	VarOrTerm PropertyListPathNotEmpty | TriplesNodePath PropertyListPath WS
@@ -95,9 +95,9 @@ PathSequence	  ::=  	PathEltOrInverse ( <'/'> PathEltOrInverse )*
 <PathElt>	  ::=  	PathPrimary PathMod?
 <PathEltOrInverse>	  ::=  	PathElt | <'^'> PathElt
 PathMod	  ::=  	'?' | '*' | ('+' INTEGER?) WS
-PathPrimary	  ::=  	iri | 'a' | '!' PathNegatedPropertySet | '(' Path ')'
+PathPrimary	  ::=  	iri | Type | '!' PathNegatedPropertySet | '(' Path ')'
 PathNegatedPropertySet	  ::=  	PathOneInPropertySet | '(' ( PathOneInPropertySet ( '|' PathOneInPropertySet )* )? ')'
-PathOneInPropertySet	  ::=  	iri | 'a' | '^' ( iri | 'a' )
+PathOneInPropertySet	  ::=  	iri | Type | '^' ( iri | Type )
 Integer	  ::=  	INTEGER
 TriplesNode	  ::=  	Collection | BlankNodePropertyList
 BlankNodePropertyList	  ::=  	'[' PropertyListNotEmpty ']'
@@ -110,12 +110,13 @@ CollectionPath	  ::=  	'(' GraphNodePath+ ')'
 <VarOrTerm>	  ::=  	Var | GraphTerm WS
 <VarOrIri>	  ::=  	Var | iri WS
 Var	  ::=  	VAR1 WS | VAR2 WS
+<Type> ::= (WS 'a' WS)
 <GraphTerm>	  ::=  	iri | RDFLiteral | NumericLiteral | BooleanLiteral | BlankNode | NIL
 Expression	  ::=  	WS ConditionalOrExpression WS
 ConditionalOrExpression ::= ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
 ConditionalAndExpression ::= ValueLogical ( <'&&'> ValueLogical )*
 <ValueLogical>	  ::=  	RelationalExpression
-RelationalExpression	  ::=  	NumericExpression WS ( '=' NumericExpression | '!=' NumericExpression | '<' NumericExpression | '>' NumericExpression | '<=' NumericExpression | '>=' NumericExpression | 'IN' ExpressionList | 'NOT' 'IN' ExpressionList )?
+RelationalExpression	  ::=  	NumericExpression WS ( '=' NumericExpression | '!=' NumericExpression | '<' NumericExpression | '>' NumericExpression | '<=' NumericExpression | '>=' NumericExpression | 'IN' WS ExpressionList | 'NOT' WS 'IN' WS ExpressionList )?
 NumericExpression	  ::=  	WS AdditiveExpression WS
 
 <AdditiveExpression>	  ::=  	MultiplicativeExpression ( '+' MultiplicativeExpression | '-' MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralNegative ) ( ( '*' UnaryExpression ) | ( '/' UnaryExpression ) )* )*
@@ -191,7 +192,7 @@ RegexExpression   ::=   <'REGEX'> <'('> Expression <','> Expression ( <','> Expr
 SubstringExpression   ::=   <'SUBSTR'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
 StrReplaceExpression    ::=   <'REPLACE'> <'('> Expression <','> Expression <','> Expression ( <','> Expression )? <')'>
 ExistsFunc    ::=   <'EXISTS'> GroupGraphPattern
-NotExistsFunc   ::=   <'NOT'> <'EXISTS'> GroupGraphPattern
+NotExistsFunc   ::=   <'NOT'> WS <'EXISTS'> GroupGraphPattern
 Aggregate   ::=     'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
 | 'SUM' WS <'('> WS 'DISTINCT'? Expression <')'>
 | 'MIN' <'('>  WS 'DISTINCT'? Expression <')'>
