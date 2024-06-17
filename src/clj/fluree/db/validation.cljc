@@ -256,13 +256,17 @@
                             [:schema [:ref ::where]]]
     ::union                [:+ {:error/message "union pattern must be a sequence of valid where clauses."}
                             [:schema [:ref ::where]]]
+    ::exists               [:+ {:error/message "exists pattern must be a sequence of valid where clauses."}
+                            [:schema [:ref ::where]]]
+    ::not-exists           [:+ {:error/message "not-exists pattern must be a sequence of valid where clauses."}
+                            [:schema [:ref ::where]]]
     ::bind                 [:+ {:error/message "bind values must be mappings from variables to functions"}
                             [:catn [:var ::var]
                              [:binding ::function]]]
     ::where-op             [:and
                             :keyword
-                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind"}
-                             :graph :filter :optional :union :bind]]
+                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind, values, exists, not-exists"}
+                             :graph :filter :optional :union :bind :values :exists :not-exists]]
     ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
@@ -294,6 +298,15 @@
                             [:union [:catn
                                      [:op ::where-op]
                                      [:clauses ::union]]]
+                            [:values [:catn
+                                      [:op ::where-op]
+                                      [:patterns ::values]]]
+                            [:exists [:catn
+                                      [:op ::where-op]
+                                      [:patterns ::exists]]]
+                            [:not-exists [:catn
+                                          [:op ::where-op]
+                                          [:patterns ::not-exists]]]
                             [:bind [:catn
                                     [:op ::where-op]
                                     [:bindings ::bind]]]

@@ -63,45 +63,179 @@
     (throw (ex-info (str "Unsupported aggregate function: " func)
                     {:status 400 :error :db/invalid-query}))))
 
+(defmethod parse-term :ExistsFunc
+  [[_ & patterns]]
+  ["exists" (into [] (mapcat parse-term patterns))])
+
+(defmethod parse-term :NotExistsFunc
+  [[_ & patterns]]
+  ["not-exists" (into [] (mapcat parse-term patterns))])
+
 (defmethod parse-term :RegexExpression
   ;; RegexExpression ::= <'REGEX'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
   [[_ text pattern flags]]
   (str "(regex " (literal-quote (parse-term text)) " " (literal-quote (parse-term pattern))
        (when flags (str " " (literal-quote (parse-term flags)))) ")"))
 
-(def supported-scalar-functions
-  {"COALESCE"  "coalesce"
-   "STR"       "str"
-   "RAND"      "rand"
-   "ABS"       "abs"
-   "CEIL"      "ceil"
-   "FLOOR"     "floor"
-   "CONCAT"    "concat"
-   "STRLEN"    "count"
-   "STRSTARTS" "strStarts"
-   "STRENDS"   "strEnds"
-   "IF"        "if"
-   "SHA256"    "sha256"
-   "SHA512"    "sha512"})
+(defmethod parse-term :SubstringExpression
+  ;; SubstringExpression ::= <'SUBSTR'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
+  [[_ source starting-loc length]]
+  (str "(subStr " (literal-quote (parse-term source)) " " (parse-term starting-loc)
+       (when length (str " " (parse-term length))) ")"))
+
+(defmethod parse-term :StrReplaceExpression
+  ;; StrReplaceExpression ::= <'REPLACE'> <'('> Expression <','> Expression <','> Expression ( <','> Expression )? <')'>
+  [[_ arg pattern replacement flags]]
+  (str "(replace " (literal-quote (parse-term arg)) " " (literal-quote (parse-term pattern))
+       " " (literal-quote (parse-term replacement))
+       (when flags (str " " (literal-quote (parse-term flags)))) ")"))
 
 (defmethod parse-term :ExpressionList
   ;; ExpressionList ::= NIL | <'('> Expression ( <','> Expression )* <')'>
   [[_ & expressions]]
   (mapv parse-term expressions))
 
+(def supported-scalar-functions
+  {"ABS"            "abs"
+   "BNODE"          "bnode"
+   "BOUND"          "bound"
+   "CEIL"           "ceil"
+   "COALESCE"       "coalesce"
+   "CONCAT"         "concat"
+   "CONTAINS"       "contains"
+   "DATATYPE"       "datatype"
+   "DAY"            "day"
+   "ENCODE_FOR_URI" "encodeForUri"
+   "FLOOR"          "floor"
+   "HOURS"          "hours"
+   "IF"             "if"
+   "IRI"            "iri"
+   "LANG"           "lang"
+   "LANGMATCHES"    "langMatches"
+   "LCASE"          "lcase"
+   "MD5"            "md5"
+   "MINUTES"        "minutes"
+   "MONTH"          "month"
+   "NOW"            "now"
+   "RAND"           "rand"
+   "ROUND"          "round"
+   "SECONDS"        "seconds"
+   "SHA1"           "sha1"
+   "SHA256"         "sha256"
+   "SHA512"         "sha512"
+   "STR"            "str"
+   "STRAFTER"       "strAfter"
+   "STRBEFORE"      "strBefore"
+   "STRDT"          "strDt"
+   "STRENDS"        "strEnds"
+   "STRLANG"        "strLang"
+   "STRLEN"         "strLen"
+   "STRSTARTS"      "strStarts"
+   "STRUUID"        "struuid"
+   "TIMEZONE"       "timezone"
+   "TZ"             "tz"
+   "UCASE"          "ucase"
+   "URI"            "uri"
+   "UUID"           "uuid"
+   "YEAR"           "year"
+   "isBLANK"        "isBlank"
+   "isIRI"          "isIri"
+   "isLITERAL"      "isLiteral"
+   "isNUMERIC"      "isNumeric"
+   "isURI"          "isUri"
+   "sameTerm"       "sameTerm"})
+
 (defmethod parse-term :Func
   [[_ func & args]]
-  (if-let [f (get supported-scalar-functions func)]
-    (str "(" f " " (str/join " " (->> (mapv parse-term args)
-                                      ;; clobber an :ExpressionList down to the same level as :Expressions
-                                      (flatten)
-                                      (map literal-quote))) ")")
-    (throw (ex-info (str "Unsupported function: " func)
-                    {:status 400 :error :db/invalid-query}))))
+  (let [f (get supported-scalar-functions func)]
+    (case f
+      "abs"          (str "(" f " " (parse-term (first args)) ")")
+      "bnode"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "bound"        (str "(" f " " (parse-term (first args)) ")")
+      "ceil"         (str "(" f " " (parse-term (first args)) ")")
+      "coalesce"     (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
+      "concat"       (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
+      "contains"     (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      "datatype"     (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "day"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "encodeForUri" (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "floor"        (str "(" f " " (parse-term (first args)) ")")
+      "hours"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "if"           (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) " "
+                          (literal-quote (parse-term (first (nnext args)))) ")")
+      "iri"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "lang"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "langMatches"  (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      "lcase"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "md5"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "minutes"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "month"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "now"          (str "(" f ")")
+      "rand"         (str "(" f ")")
+      "round"        (str "(" f " " (parse-term (first args)) ")")
+      "seconds"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "sha1"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "sha256"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "sha512"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "str"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "strAfter"     (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      "strBefore"    (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      "strDt"        (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      "strEnds"      (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      "strLang"      (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      "strLen"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "strStarts"    (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      "struuid"      (str "(" f ")")
+      "timezone"     (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "tz"           (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "ucase"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "uri"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "uuid"         (str "(" f ")")
+      "year"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "isBlank"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "isIri"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "isLiteral"    (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "isNumeric"    (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "isUri"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "sameTerm"     (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (first (next args)))) ")")
+      (throw (ex-info (str "Unsupported function: " func)
+                      {:status 400 :error :db/invalid-query})))))
 
 (defmethod parse-term :NumericLiteral
-  [[_ num-str]]
-  (read-string num-str))
+  ;; NumericLiteral   ::=   NumericLiteralUnsigned WS | NumericLiteralPositive WS | NumericLiteralNegative WS
+  ;; <NumericLiteralUnsigned>   ::=   INTEGER | DECIMAL | DOUBLE
+  ;; <NumericLiteralPositive>   ::=   INTEGER_POSITIVE | DECIMAL_POSITIVE | DOUBLE_POSITIVE
+  ;; <NumericLiteralNegative>   ::=   INTEGER_NEGATIVE | DECIMAL_NEGATIVE | DOUBLE_NEGATIVE
+  ;; <INTEGER_POSITIVE>   ::=   '+' INTEGER
+  ;; <DECIMAL_POSITIVE>   ::=   '+' DECIMAL
+  ;; <DOUBLE_POSITIVE>    ::=   '+' DOUBLE
+  ;; <INTEGER_NEGATIVE>   ::=   '-' INTEGER
+  ;; <DECIMAL_NEGATIVE>   ::=   '-' DECIMAL
+  ;; <DOUBLE_NEGATIVE>    ::=   '-' DOUBLE
+  ;; <INTEGER>    ::=   #"[0-9]+"
+  ;; <DECIMAL>    ::=  #"[0-9]*\.[0-9]*"
+  ;; <DOUBLE>   ::=   #"[0-9]+\.[0-9]*|(\.[0-9]+)|([0-9]+)" EXPONENT
+  ;; EXPONENT   ::=   #"[eE][+-]?[0-9]+"
+  [[_ sign num-str]]
+  (read-string (str sign num-str)))
+
+(defmethod parse-term :iriOrFunction
+  ;; iriOrFunction ::= iri ArgList?
+  [[_ iri arglist]]
+  (when arglist
+    (throw (ex-info "Unsupported syntax."
+                    {:status 400 :error :db/invalid-query :term arglist})))
+  (parse-term iri))
 
 (defmethod parse-term :MultiplicativeExpression
   ;; MultiplicativeExpression ::= UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
@@ -110,8 +244,16 @@
   ;; | '-' PrimaryExpression
   ;; | PrimaryExpression
   ;; <PrimaryExpression> ::= BrackettedExpression | BuiltInCall | iriOrFunction | RDFLiteral | NumericLiteral | BooleanLiteral | Var
-  [[_ & expression]]
-  (str/join " " (mapv parse-term expression)))
+  [[_ & [expr0 & [op1 expr1 & exprs]]]]
+  (if op1
+    ;; we need to recursively compose expressions
+    (loop [[op expr & r] exprs
+           result  (str "(" op1 " " (parse-term expr0) " " (parse-term expr1) ")")]
+      (if (and op expr)
+        (recur r (str "(" op " " result " " (parse-term expr) ")"))
+        result))
+    ;; A single UnaryExpression doesn't need to be composed with anything else
+    (parse-term expr0)))
 
 (defmethod parse-term :NumericExpression
   ;; NumericExpression ::= WS AdditiveExpression WS
@@ -132,12 +274,11 @@
   (let [expr (parse-term n-exp)]
     (cond
       (= "IN" op)
-      (throw (ex-info (str "Unsupported operator: " op)
-                      {:status 400 :error :db/invalid-query}))
+      (str "(in " expr " " (parse-term op-or-exp) ")")
+
       (and (= "NOT" op)
            (= "IN" op-or-exp))
-      (throw (ex-info (str "Unsupported operator: " op)
-                      {:status 400 :error :db/invalid-query}))
+      (str "(not (in " expr " " (parse-term expr-list) "))")
 
       (nil? op)
       expr
@@ -149,13 +290,31 @@
       ;; op: =, <, >, <=, >=
       (str "(" op " " expr " " (parse-term op-or-exp) ")"))))
 
+(defmethod parse-term :ConditionalOrExpression
+  ;; ConditionalOrExpression ::= ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
+  [[_ expr & exprs]]
+  (if (seq exprs)
+    (str "(or " (parse-term expr) " " (str/join " " (mapv parse-term exprs)) ")")
+    (parse-term expr)))
+
+(defmethod parse-term :ConditionalAndExpression
+  ;; ConditionalAndExpression ::= ValueLogical ( <'&&'> ValueLogical )*
+  ;; <ValueLogical> ::= RelationalExpression
+  [[_ expr & exprs]]
+  (if (seq exprs)
+    (str "(and " (parse-term expr) " " (str/join " " (mapv parse-term exprs)) ")")
+    (parse-term expr)))
+
 (defmethod parse-term :Expression
   ;; Expression ::= WS ConditionalOrExpression WS
   ;; <ConditionalOrExpression> ::= ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
   ;; <ConditionalAndExpression> ::= ValueLogical ( <'&&'> ValueLogical )*
   ;; <ValueLogical> ::= RelationalExpression
   [[_ & expression]]
-  (str/join " " (mapv parse-term expression)))
+  (let [expressions (mapv parse-term expression)]
+    (if (= 1 (count expressions))
+      (first expressions)
+      expressions)))
 
 (defmethod parse-term :IRIREF
   ;; #"<[^<>\"{}|^`\x00-\x20]*>" WS
@@ -231,23 +390,54 @@
   ;; NamedGraphClause ::= <'NAMED'> SourceSelector
   ;; <SourceSelector> ::= iri
   [[_ source]]
-  (throw (ex-info "FROM NAMED is not a supported SPARQL clause"
-                  {:status 400 :error :db/invalid-query}))
   (parse-term source))
 
+(defmethod parse-term :GraphGraphPattern
+  ;; GraphGraphPattern ::= <'GRAPH'> VarOrIri GroupGraphPattern
+  [[_ & [var-or-iri group-graph-pattern]]]
+  [:graph (parse-term var-or-iri) (into [] (parse-term group-graph-pattern))])
+
+(defmethod parse-term :VarOrIri
+  ;; <VarOrIri> ::= Var | iri WS
+  [[_ var-or-iri]]
+  (parse-term var-or-iri))
+
 (defmethod parse-rule :DatasetClause
-  ;; DatasetClause ::= <'FROM'> WS ( DefaultGraphClause | NamedGraphClause )
-  ;; DefaultGraphClause ::= SourceSelector
-  ;; NamedGraphClause ::= <'NAMED'> SourceSelector
-  ;; <SourceSelector> ::= iri
-  [[_ source]]
-  [[:from (parse-term source)]])
+  ;; DatasetClause ::= FromClause*
+  ;; <FromClause>  ::= <'FROM'> WS ( DefaultGraphClause | NamedGraphClause )
+  [[_ & clauses]]
+  (let [{from  :DefaultGraphClause
+         named :NamedGraphClause}
+        (group-by first clauses)]
+    (cond-> []
+      (seq from)  (conj [:from (mapv parse-term from)])
+      (seq named) (conj [:from-named (mapv parse-term named)]))))
+
+(defmethod parse-term :LANGTAG
+  ;; LANGTAG ::= #"@[a-zA-Z]+(-[a-zA-Z0-9]+)*" WS
+  [[_ langstr]]
+  ;; just drop the @ prefix
+  (subs langstr 1))
 
 (defmethod parse-term :RDFLiteral
+  ;; RDFLiteral ::= String WS ( LANGTAG | ( '^^' iri ) )? WS
+  ;; LANGTAG    ::=   #"@[a-zA-Z]+-[a-zA-Z0-9]*" WS
   [[_ & literal]]
-  (apply str literal))
+  (loop [[char & r] literal
+         result     ""]
+    (if char
+      (cond
+        ;; datatype :iri
+        (= "^^" char)             (recur nil {const/iri-value result const/iri-type (parse-term (first r))})
+        ;; LANGTAG
+        (= :LANGTAG (first char)) (recur nil {const/iri-value result const/iri-language (parse-term char)})
+        ;; String
+        :else
+        (recur r (str result char)))
+      result)))
 
 (defmethod parse-term :Bind
+  ;; Bind ::= <'BIND' WS '(' WS>  Expression <WS 'AS' WS> Var <WS ')' WS>
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
@@ -268,33 +458,49 @@
 (defmethod parse-term :Filter
   ;; Filter ::= <'FILTER'> WS Constraint
   [[_ constraint]]
-  [:filter [(parse-term constraint)]])
+  (let [parsed-constraint (parse-term constraint)]
+    (if (contains? #{"exists" "not-exists"} (first parsed-constraint))
+      parsed-constraint
+      [:filter [parsed-constraint]])))
 
 (defmethod parse-term :OptionalGraphPattern
   ;; OptionalGraphPattern ::= <'OPTIONAL'> GroupGraphPattern
   [[_ & optional]]
   (into [:optional] (mapv parse-term optional)))
 
+(defmethod parse-term :ServiceGraphPattern
+  [_]
+  (throw (ex-info "SERVICE is not a supported SPARQL pattern"
+                  {:status 400 :error :db/invalid-query})))
+
 (defmethod parse-term :DataBlockValue
   ;; DataBlockValue ::= iri | RDFLiteral | NumericLiteral | BooleanLiteral | 'UNDEF' WS
-  [[_ value]]
-  (if (= value "UNDEF")
-    nil
-    (parse-term value)))
+  [[_ [tag :as value]]]
+  (cond
+    ;; iri values need to be wrapped in a value-map
+    (= tag :iri) {const/iri-type const/iri-anyURI const/iri-value (parse-term value)}
+    (= value "UNDEF")      nil
+    :else                  (parse-term value)))
+
+(defmethod parse-term :VarList
+  ;; VarList ::= ( <'('> Var* <')'> )
+  [[_ & vars]]
+  (mapv parse-term vars))
+
+(defmethod parse-term :ValueList
+  ;; ValueList ::= ( <'('> WS DataBlockValue* <')'> )
+  [[_ & values]]
+  (mapv parse-term values))
 
 (defmethod parse-term :InlineDataFull
-  ;; InlineDataFull ::= ( NIL | '(' Var* ')' ) '{' ( '(' DataBlockValue* ')' | NIL )* '}'
-  [_ data]
-  (throw (ex-info "Multiple inline data values not supported"
-                  {:status 400 :error :db/invalid-query})))
+  ;; InlineDataFull ::= ( NIL | VarList ) WS <'{'> WS ( ValueList WS | NIL )* <'}'>
+  [[_ vars & data]]
+  [:values [(parse-term vars)] (mapv parse-term data)])
 
 (defmethod parse-term :InlineDataOneVar
   ;; InlineDataOneVar ::= Var <'{'> WS DataBlockValue* <'}'>
   [[_ var & data-block-values]]
-  (if (> (count data-block-values) 1)
-    (throw (ex-info "Multiple inline data values not supported"
-                    {:status 400 :error :db/invalid-query}))
-    [:bind (parse-term var) (parse-term (first data-block-values))]))
+  [:values [(parse-term var) (mapv parse-term data-block-values)]])
 
 (defmethod parse-term :InlineData
   ;; InlineData ::= <'VALUES'> WS DataBlock
@@ -305,7 +511,7 @@
 (defmethod parse-term :GraphPatternNotTriples
   ;; GraphPatternNotTriples ::= GroupOrUnionGraphPattern | OptionalGraphPattern | MinusGraphPattern | GraphGraphPattern | ServiceGraphPattern | Filter | Bind | InlineData
   [[_ & non-triples]]
-  (into [] (mapv parse-term non-triples)))
+  (mapv parse-term non-triples))
 
 (defmethod parse-term :PrefixedName
   [[_ & name]]
@@ -317,9 +523,10 @@
   (parse-term iri))
 
 (defmethod parse-term :PathPrimary
-  ;; PathPrimary ::= iri | 'a' | '!' PathNegatedPropertySet | '(' Path ')'
-  ;; PathNegatedPropertySet ::= PathOneInPropertySet | '(' ( PathOneInPropertySet ( '|' PathOneInPropertySet )* )? ')'
-  ;; PathOneInPropertySet ::= iri | 'a' | '^' ( iri | 'a' )
+  ;; PathPrimary    ::=   iri | Type | '!' PathNegatedPropertySet | '(' Path ')'
+  ;; PathNegatedPropertySet   ::=   PathOneInPropertySet | '(' ( PathOneInPropertySet ( '|' PathOneInPropertySet )* )? ')'
+  ;; PathOneInPropertySet   ::=   iri | Type | '^' ( iri | Type )
+  ;; <Type> ::= (WS 'a' WS)
   [[_ el]]
   (cond (rule? el) (parse-term el)
         (= el "a") const/iri-type
@@ -415,6 +622,11 @@
   ;; <GroupGraphPattern> ::= WS <'{'> WS ( SubSelect | GroupGraphPatternSub ) WS <'}'> WS
   [[_ & patterns]]
   [[:where (into [] (mapcat parse-term patterns))]])
+
+(defmethod parse-rule :ValuesClause
+  ;; ValuesClause ::= ( <'VALUES'> WS DataBlock )? WS
+  [[_ datablock]]
+  [(parse-term datablock)])
 
 (defmethod parse-rule :OffsetClause
   ;; OffsetClause ::= <'OFFSET'> WS INTEGER
