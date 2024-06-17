@@ -151,10 +151,10 @@
   [[_ func & args]]
   (let [f (get supported-scalar-functions func)]
     (case f
-      "abs"          (str "(" f " " (str/join " " (mapv (comp literal-quote parse-term) args)) ")")
+      "abs"          (str "(" f " " (parse-term (first args)) ")")
       "bnode"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "bound"        (str "(" f " " (parse-term (first args)) ")")
-      "ceil"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "ceil"         (str "(" f " " (parse-term (first args)) ")")
       "coalesce"     (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
       "concat"       (str "(" f " " (str/join " " (->> (parse-term (first args)) (mapv literal-quote))) ")")
       "contains"     (str "(" f " " (literal-quote (parse-term (first args))) " "
@@ -162,7 +162,7 @@
       "datatype"     (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "day"          (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "encodeForUri" (str "(" f " " (literal-quote (parse-term (first args))) ")")
-      "floor"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "floor"        (str "(" f " " (parse-term (first args)) ")")
       "hours"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "if"           (str "(" f " " (literal-quote (parse-term (first args))) " "
                           (literal-quote (parse-term (first (next args)))) " "
@@ -177,7 +177,7 @@
       "month"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "now"          (str "(" f ")")
       "rand"         (str "(" f ")")
-      "round"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
+      "round"        (str "(" f " " (parse-term (first args)) ")")
       "seconds"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha1"         (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "sha256"       (str "(" f " " (literal-quote (parse-term (first args))) ")")
@@ -231,6 +231,14 @@
   [[_ sign num-str]]
   (read-string (str sign num-str)))
 
+(defmethod parse-term :iriOrFunction
+  ;; iriOrFunction ::= iri ArgList?
+  [[_ iri arglist]]
+  (when arglist
+    (throw (ex-info "Unsupported syntax."
+                    {:status 400 :error :db/invalid-query :term arglist})))
+  (parse-term iri))
+
 (defmethod parse-term :MultiplicativeExpression
   ;; MultiplicativeExpression ::= UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
   ;; <UnaryExpression> ::= '!' PrimaryExpression
@@ -268,12 +276,11 @@
   (let [expr (parse-term n-exp)]
     (cond
       (= "IN" op)
-      (throw (ex-info (str "Unsupported operator: " op)
-                      {:status 400 :error :db/invalid-query}))
+      (str "(in " expr " " (parse-term op-or-exp) ")")
+
       (and (= "NOT" op)
            (= "IN" op-or-exp))
-      (throw (ex-info (str "Unsupported operator: " op)
-                      {:status 400 :error :db/invalid-query}))
+      (str "(not (in " expr " " (parse-term expr-list) "))")
 
       (nil? op)
       expr
@@ -306,7 +313,10 @@
   ;; <ConditionalAndExpression> ::= ValueLogical ( <'&&'> ValueLogical )*
   ;; <ValueLogical> ::= RelationalExpression
   [[_ & expression]]
-  (str/join " " (mapv parse-term expression)))
+  (let [expressions (mapv parse-term expression)]
+    (if (= 1 (count expressions))
+      (first expressions)
+      expressions)))
 
 (defmethod parse-term :IRIREF
   ;; #"<[^<>\"{}|^`\x00-\x20]*>" WS
@@ -429,6 +439,7 @@
       result)))
 
 (defmethod parse-term :Bind
+  ;; Bind ::= <'BIND' WS '(' WS>  Expression <WS 'AS' WS> Var <WS ')' WS>
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
