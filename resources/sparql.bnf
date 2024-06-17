@@ -116,7 +116,7 @@ Expression	  ::=  	WS ConditionalOrExpression WS
 ConditionalOrExpression ::= ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
 ConditionalAndExpression ::= ValueLogical ( <'&&'> ValueLogical )*
 <ValueLogical>	  ::=  	RelationalExpression
-RelationalExpression	  ::=  	NumericExpression WS ( '=' NumericExpression | '!=' NumericExpression | '<' NumericExpression | '>' NumericExpression | '<=' NumericExpression | '>=' NumericExpression | 'IN' ExpressionList | 'NOT' 'IN' ExpressionList )?
+RelationalExpression	  ::=  	NumericExpression WS ( '=' NumericExpression | '!=' NumericExpression | '<' NumericExpression | '>' NumericExpression | '<=' NumericExpression | '>=' NumericExpression | 'IN' WS ExpressionList | 'NOT' WS 'IN' WS ExpressionList )?
 NumericExpression	  ::=  	WS AdditiveExpression WS
 
 <AdditiveExpression>	  ::=  	MultiplicativeExpression ( '+' MultiplicativeExpression | '-' MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralNegative ) ( ( '*' UnaryExpression ) | ( '/' UnaryExpression ) )* )*
