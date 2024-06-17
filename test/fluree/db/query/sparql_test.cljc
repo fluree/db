@@ -93,7 +93,27 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "ex:andrew", "?p" "?o"}]
              where)
-          "iri in subject position")))
+          "iri in subject position"))
+    (let [query  "SELECT ?person WHERE {?person person:handle \"Los Angeles\"@en .}"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?person",
+               "person:handle" {"@value" "Los Angeles", "@language" "en"}}]
+             where)
+          "lang literal"))
+    (let [query "SELECT ?person
+                 WHERE {?person person:birthday \"2011-01-10T14:45:13.815-05:00\"^^xsd:dateTime .}"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?person",
+               "person:birthday"
+               {"@value" "2011-01-10T14:45:13.815-05:00", "@type" "xsd:dateTime"}}]
+             where)
+          "datatype literal"))
+    (let [query "SELECT ?person
+                 WHERE { ?person a schema:Person . }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?person", "@type" "schema:Person"}]
+             where)
+          "a as an alias for @type")))
   (testing "multi clause"
     (let [query "SELECT ?person ?nums
                  WHERE {?person person:handle \"jdoe\".
@@ -163,7 +183,27 @@
               {"@id" "?s", "schema:name" "?name"}
               [:filter ["(regex ?name \"^Jon\" \"i\")"]]]
              where)
-          "filter by regex call")))
+          "filter by regex call"))
+    (let [query "SELECT ?s
+                 WHERE {
+                   ?s ?p ?o
+                   FILTER EXISTS { ?s ex:name \"Larry\" }
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s" "?p" "?o"}
+              ["exists" [{"@id" "?s" "ex:name" "Larry"}]]]
+             where)
+          "EXISTS expression parsing"))
+    (let [query "SELECT ?s
+                 WHERE {
+                   ?s ?p ?o
+                   FILTER NOT EXISTS { ?s ex:name \"Larry\" }
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s" "?p" "?o"}
+              ["not-exists" [{"@id" "?s" "ex:name" "Larry"}]]]
+             where)
+          "NOT EXISTS expression parsing")))
   (testing "OPTIONAL"
     (let [query "SELECT ?handle ?num
                  WHERE {?person person:handle ?handle.
@@ -263,10 +303,131 @@
               [:bind "?num1" "(* (/ (* (* ?age 4) 3) -2) (/ -4 2))"]
               {"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:age" "?age"}]
+             where)))
+    (testing "function calls"
+      (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day
+                        ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes
+                        ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore
+                        ?strDt ?strEnds ?strLang ?strLen ?strStarts ?struuid ?timezone ?tz ?ucase
+                        ?uri ?uuid ?year ?isBlank ?isIri ?isLiteral ?isNumeric ?isUri ?sameTerm ?in ?notIn
+                 WHERE {BIND (ABS(1*4*3/-2*(-4/2)) AS ?abs)
+                        BIND (BNODE(?foobar) AS ?bnode)
+                        BIND (BOUND(?abs) AS ?bound)
+                        BIND (CEIL(1.8) AS ?ceil)
+                        BIND (COALESCE(?num1, 2) AS ?coalesce)
+                        BIND (CONCAT(\"foo\", \"bar\") AS ?concat)
+                        BIND (CONTAINS(\"foobar\", \"foo\") AS ?contains)
+                        BIND (DATATYPE(\"foobar\") AS ?datatype)
+                        BIND (DAY(\"2024-4-1T14:45:13.815-05:00\") AS ?day)
+                        BIND (ENCODE_FOR_URI(\"Los Angeles\") AS ?encodeForUri)
+                        BIND (FLOOR(1.8) AS ?floor)
+                        BIND (HOURS(\"2024-4-1T14:45:13.815-05:00\") AS ?hours)
+                        BIND (IF(\"true\", \"yes\", \"no\") AS ?if)
+                        BIND (?age IN (1, 2, 3, \"foo\", ex:bar) AS ?in)
+                        BIND (?age NOT IN (1, 2, 3, \"foo\", ex:bar) AS ?notIn)
+                        BIND (IRI(\"http://example.com\") AS ?iri)
+                        BIND (LANG(\"Robert\"\"@en\") AS ?lang)
+                        BIND (LANGMATCHES(?lang, \"FR\") AS ?langMatches)
+                        BIND (LCASE(\"FOO\") AS ?lcase)
+                        BIND (MD5(\"abc\") AS ?md5)
+                        BIND (MINUTES(\"2024-4-1T14:45:13.815-05:00\") AS ?minutes)
+                        BIND (MONTH(\"2024-4-1T14:45:13.815-05:00\") AS ?month)
+                        BIND (NOW() AS ?now)
+                        BIND (RAND() AS ?rand)
+                        BIND (ROUND(1.8) AS ?round)
+                        BIND (SECONDS(\"2024-4-1T14:45:13.815-05:00\") AS ?seconds)
+                        BIND (SHA1(\"abc\") AS ?sha1)
+                        BIND (SHA256(\"abc\") AS ?sha256)
+                        BIND (SHA512(\"abc\") AS ?sha512)
+                        BIND (STR(\"foobar\") AS ?str)
+                        BIND (STRAFTER(\"abc\", \"b\") AS ?strAfter)
+                        BIND (STRBEFORE(\"abc\", \"b\") AS ?strBefore)
+                        BIND (STRDT(\"iiii\", \"http://example.com/romanNumeral\") AS ?strDt)
+                        BIND (STRENDS(\"foobar\", \"bar\") AS ?strEnds)
+                        BIND (STRLANG(\"chat\", \"en\") AS ?strLang)
+                        BIND (STRLEN(\"chat\") AS ?strLen)
+                        BIND (STRSTARTS(\"foobar\", \"foo\") AS ?strStarts)
+                        BIND (STRUUID() AS ?struuid)
+                        BIND (TIMEZONE(\"2024-4-1T14:45:13.815-05:00\") AS ?timezone)
+                        BIND (TZ(\"2024-4-1T14:45:13.815-05:00\") AS ?tz)
+                        BIND (UCASE(\"foobar\") AS ?ucase)
+                        BIND (URI(\"http://example.com\") AS ?uri)
+                        BIND (UUID() AS ?uuid)
+                        BIND (YEAR(\"2024-4-1T14:45:13.815-05:00\") AS ?year)
+                        BIND (isBLANK(?bnode) AS ?isBlank)
+                        BIND (isIRI(?iri) AS ?isIri)
+                        BIND (isLITERAL(\"foobar\") AS ?isLiteral)
+                        BIND (isNUMERIC(5) AS ?isNumeric)
+                        BIND (isURI(?uri) AS ?isUri)
+                        BIND (sameTerm(?str, ?str) AS ?sameTerm)
+                        ?person person:age ?age.}"
+            {:keys [where]} (sparql/->fql query)]
+        (is (= [[:bind "?abs" "(abs (* (/ (* (* 1 4) 3) -2) (/ -4 2)))"]
+                [:bind "?bnode" "(bnode ?foobar)"]
+                [:bind "?bound" "(bound ?abs)"]
+                [:bind "?ceil" "(ceil 1.8)"]
+                [:bind "?coalesce" "(coalesce ?num1 2)"]
+                [:bind "?concat" "(concat \"foo\" \"bar\")"]
+                [:bind "?contains" "(contains \"foobar\" \"foo\")"]
+                [:bind "?datatype" "(datatype \"foobar\")"]
+                [:bind "?day" "(day \"2024-4-1T14:45:13.815-05:00\")"]
+                [:bind "?encodeForUri" "(encodeForUri \"Los Angeles\")"]
+                [:bind "?floor" "(floor 1.8)"]
+                [:bind "?hours" "(hours \"2024-4-1T14:45:13.815-05:00\")"]
+                [:bind "?if" "(if \"true\" \"yes\" \"no\")"]
+                [:bind "?in" "(in ?age [1 2 3 \"foo\" \"ex:bar\"])"]
+                [:bind "?notIn" "(not (in ?age [1 2 3 \"foo\" \"ex:bar\"]))"]
+                [:bind "?iri" "(iri \"http://example.com\")"]
+                [:bind "?lang" "(lang \"Robert\"\"@en\")"]
+                [:bind "?langMatches" "(langMatches ?lang \"FR\")"]
+                [:bind "?lcase" "(lcase \"FOO\")"]
+                [:bind "?md5" "(md5 \"abc\")"]
+                [:bind "?minutes" "(minutes \"2024-4-1T14:45:13.815-05:00\")"]
+                [:bind "?month" "(month \"2024-4-1T14:45:13.815-05:00\")"]
+                [:bind "?now" "(now)"]
+                [:bind "?rand" "(rand)"]
+                [:bind "?round" "(round 1.8)"]
+                [:bind "?seconds" "(seconds \"2024-4-1T14:45:13.815-05:00\")"]
+                [:bind "?sha1" "(sha1 \"abc\")"]
+                [:bind "?sha256" "(sha256 \"abc\")"]
+                [:bind "?sha512" "(sha512 \"abc\")"]
+                [:bind "?str" "(str \"foobar\")"]
+                [:bind "?strAfter" "(strAfter \"abc\" \"b\")"]
+                [:bind "?strBefore" "(strBefore \"abc\" \"b\")"]
+                [:bind "?strDt" "(strDt \"iiii\" \"http://example.com/romanNumeral\")"]
+                [:bind "?strEnds" "(strEnds \"foobar\" \"bar\")"]
+                [:bind "?strLang" "(strLang \"chat\" \"en\")"]
+                [:bind "?strLen" "(strLen \"chat\")"]
+                [:bind "?strStarts" "(strStarts \"foobar\" \"foo\")"]
+                [:bind "?struuid" "(struuid)"]
+                [:bind "?timezone" "(timezone \"2024-4-1T14:45:13.815-05:00\")"]
+                [:bind "?tz" "(tz \"2024-4-1T14:45:13.815-05:00\")"]
+                [:bind "?ucase" "(ucase \"foobar\")"]
+                [:bind "?uri" "(uri \"http://example.com\")"]
+                [:bind "?uuid" "(uuid)"]
+                [:bind "?year" "(year \"2024-4-1T14:45:13.815-05:00\")"]
+                [:bind "?isBlank" "(isBlank ?bnode)"]
+                [:bind "?isIri" "(isIri ?iri)"]
+                [:bind "?isLiteral" "(isLiteral \"foobar\")"]
+                [:bind "?isNumeric" "(isNumeric 5)"]
+                [:bind "?isUri" "(isUri ?uri)"]
+                [:bind "?sameTerm" "(sameTerm ?str ?str)"]
+                {"@id" "?person", "person:age" "?age"}]
+               where)))))
+  (testing "GRAPH"
+    (let [query "SELECT ?who ?g ?mbox
+                 FROM <http://example.org/dft.ttl>
+                 FROM NAMED <http://example.org/alice>
+                 FROM NAMED <http://example.org/bob>
+                 WHERE
+                 {
+                    ?g dc:publisher ?who .
+                    GRAPH ?g { ?x foaf:mbox ?mbox }
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?g", "dc:publisher" "?who"}
+              [:graph "?g" [{"@id" "?x", "foaf:mbox" "?mbox"}]]]
              where)))))
-
-;;TODO: not yet supported
-#_(testing "language labels")
 
 (deftest parse-prefixes
   (testing "PREFIX"
@@ -289,7 +450,19 @@
           {:keys [context]} (sparql/->fql query)]
       (is (= {"foaf" "http://xmlns.com/foaf/0.1/"
               "ex"   "http://example.org/ns/"}
-             context)))))
+             context))))
+  (testing "comments"
+    (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+                 PREFIX ex: <http://example.org/ns/>
+                 # THIS IS IGNORED
+                 SELECT ?name ?mbox # THIS TOO
+                 WHERE {?x foaf:name ?name.
+                        # DEFINITELY IGNORED
+                        ?x foaf:mbox ?mbox}"]
+      (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/", "ex" "http://example.org/ns/"},
+              :select ["?name" "?mbox"],
+              :where [{"@id" "?x", "foaf:name" "?name"} {"@id" "?x", "foaf:mbox" "?mbox"}]}
+             (sparql/->fql query))))))
 
 (deftest parse-modifiers
   (testing "LIMIT"
@@ -335,13 +508,21 @@
              groupBy))
       (is (= "(> (sum ?favNums) 1000)"
              having))))
-  (testing "mutiple GROUP BY"
+  (testing "multiple GROUP BY"
     (let [query "SELECT ?handle
                  WHERE {?person person:handle ?handle.}
                  GROUP BY ?person ?handle"
           {:keys [groupBy]} (sparql/->fql query)]
       (is (= ["?person" "?handle"]
              groupBy))))
+  (testing "multiple HAVING constraints"
+    (let [query "SELECT ?handle
+                 WHERE {?person person:handle ?handle.}
+                 GROUP BY ?person ?handle
+                 HAVING(STRLEN(?handle) < 5 && (STRSTARTS(?handle, \"foo\") || STRSTARTS(?handle, \"bar\")))"
+          {:keys [having]} (sparql/->fql query)]
+      (is (= "(and (< (strLen ?handle) 5) (or (strStarts ?handle \"foo\") (strStarts ?handle \"bar\")))"
+             having))))
   (testing "DISTINCT"
     (let [query "SELECT DISTINCT ?person ?fullName
                  WHERE {?person person:fullName ?fullName}"
