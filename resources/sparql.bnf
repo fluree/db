@@ -192,7 +192,7 @@ RegexExpression   ::=   <'REGEX'> <'('> Expression <','> Expression ( <','> Expr
 SubstringExpression   ::=   <'SUBSTR'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
 StrReplaceExpression    ::=   <'REPLACE'> <'('> Expression <','> Expression <','> Expression ( <','> Expression )? <')'>
 ExistsFunc    ::=   <'EXISTS'> GroupGraphPattern
-NotExistsFunc   ::=   <'NOT'> <'EXISTS'> GroupGraphPattern
+NotExistsFunc   ::=   <'NOT'> WS <'EXISTS'> GroupGraphPattern
 Aggregate   ::=     'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
 | 'SUM' WS <'('> WS 'DISTINCT'? Expression <')'>
 | 'MIN' <'('>  WS 'DISTINCT'? Expression <')'>
