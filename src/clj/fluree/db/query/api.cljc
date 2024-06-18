@@ -18,14 +18,10 @@
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
-<<<<<<< HEAD:src/clj/fluree/db/query/api.cljc
-            [fluree.db.nameservice.core :as nameservice]))
-=======
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.validation :as v]))
->>>>>>> 97da69f1 (Include reasoning logic when restricting db):src/clj/fluree/db/api/query.cljc
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -45,18 +41,8 @@
 (defn restrict-db
   [db t {:keys [did default-allow?] :as opts}]
   (go-try
-<<<<<<< HEAD:src/clj/fluree/db/query/api.cljc
-    (let [db*  (if did
-                 (<? (perm/wrap-identity-policy db did default-allow? nil))
-                 db)
-          db** (-> (if t
-                     (<? (time-travel/as-of db* t))
-                     db*))]
-      (assoc-in db** [:policy :cache] (atom {})))))
-
-=======
-    (let [policy-db      (if-let [policy-identity (perm/parse-policy-identity opts context)]
-                           (<? (perm/wrap-identity-policy db policy-identity false nil))
+    (let [policy-db      (if did
+                           (<? (perm/wrap-identity-policy db did default-allow? nil))
                            db)
           time-travel-db (-> (if t
                                (<? (time-travel/as-of policy-db t))
@@ -67,13 +53,12 @@
                              ;; reason graph that we find.
                              (<? (reasoner/reason time-travel-db
                                                   reasoners
-                                                  (or (first reasoner-rules-db)
-                                                      (first reasoner-rules))
+                                                  reasoner-rules
+                                                  reasoner-rules-db
                                                   opts))
                              time-travel-db))]
       (assoc-in reasoned-db [:policy :cache] (atom {})))))
     
->>>>>>> 97da69f1 (Include reasoning logic when restricting db):src/clj/fluree/db/api/query.cljc
 (defn track-query
   [ds max-fuel query]
   (go-try
