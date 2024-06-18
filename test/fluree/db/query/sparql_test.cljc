@@ -85,15 +85,29 @@
       (is (= [{"@id"           "?person"
                "person:handle" "jdoe"}]
              where)))
-    (let [query "PREFIX psm: <http://srv.ktbl.de/data/psm/>
-         PREFIX ex: <http://example.org/>
-         SELECT ?p ?o
-         FROM <cookbook/base>
-         WHERE { ex:andrew ?p ?o. }"
+    (let [query "PREFIX ex: <http://example.org/>
+                 SELECT ?p ?o
+                 WHERE { ex:andrew ?p ?o. }"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "ex:andrew", "?p" "?o"}]
              where)
           "iri in subject position"))
+    (let [query "PREFIX ex: <http://example.org/>
+                 SELECT ?s
+                 WHERE { ?s ex:friend <urn:12345>. }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s", "ex:friend" {"@id" "urn:12345"}}]
+             where)
+          "iri in object position"))
+    (let [query "PREFIX ex: <http://example.org/>
+                 SELECT ?s
+                 WHERE { ?s a <urn:12345>;
+                            ex:friend ex:brad. }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s", "@type" {"@id" "urn:12345"}}
+              {"@id" "?s", "ex:friend" {"@id" "ex:brad"}}]
+             where)
+          "iri in object position in an object list"))
     (let [query  "SELECT ?person WHERE {?person person:handle \"Los Angeles\"@en .}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?person",
@@ -111,7 +125,7 @@
     (let [query "SELECT ?person
                  WHERE { ?person a schema:Person . }"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [{"@id" "?person", "@type" "schema:Person"}]
+      (is (= [{"@id" "?person", "@type" {"@id" "schema:Person"}}]
              where)
           "a as an alias for @type")))
   (testing "multi clause"

@@ -549,8 +549,12 @@
   (apply str (mapv parse-term elements)))
 
 (defmethod parse-term :Object
-  [[_ obj]]
-  (parse-term obj))
+  ;; Object   ::=   GraphNode
+  ;; <GraphNode>    ::=   VarOrTerm | TriplesNode
+  [[_ [tag :as obj]]]
+  (if (= tag :iri)
+    {const/iri-id (parse-term obj)}
+    (parse-term obj)))
 
 (defmethod parse-term :ObjectList
   ;; ObjectList ::= Object ( <','> WS Object )*
@@ -560,8 +564,8 @@
   ;; TriplesNode ::= Collection | BlankNodePropertyList
   ;; Collection ::=  '(' GraphNode+ ')'
   ;; BlankNodePropertyList ::= '[' PropertyListNotEmpty ']'
-  [[_ path :as obj-path]]
-  (parse-term path))
+  [[_ & path :as obj-path]]
+  (mapv parse-term path))
 
 (defmethod parse-term :ObjectPath
   ;; ObjectPath ::= GraphNodePath
@@ -570,7 +574,11 @@
   ;; CollectionPath ::= '(' GraphNodePath+ ')'
   ;; BlankNodePropertyListPath ::= '[' PropertyListPathNotEmpty ']'
   [[_ & objs]]
-  (mapv parse-term objs))
+  (mapv (fn [[tag :as obj]]
+          (if (= tag :iri)
+            {const/iri-id (parse-term obj)}
+            (parse-term obj)))
+        objs))
 
 (defmethod parse-term :PropertyListPathNotEmpty
   ;; PropertyListPathNotEmpty ::= ( VerbPath | VerbSimple ) ObjectListPath ( <';'> WS ( ( VerbPath | VerbSimple ) ObjectList )? )* WS
