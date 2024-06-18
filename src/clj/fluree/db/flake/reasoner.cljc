@@ -163,28 +163,36 @@
     (log/debug "Reasoner - source OWL rules: " graph)
     (owl-datalog/owl->datalog inserts graph)))
 
+(defn rules-from-dbs
+  [methods inserts dbs]
+  (for [method methods]
+    (mapcat (fn [db]
+              (as-> db $
+                (clojure.core.async/<!! (resolve/rules-from-db $ method))
+                (rules-from-graph method inserts $)))
+            dbs)))
+
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
   supplied rules graph or from the db if no graph is supplied."
-  [methods db inserts graph-or-db]
+  [methods db inserts rules-graphs rules-dbs]
   (go-try
-    (let [rules-db        (cond
-                            (nil? graph-or-db) db
-                            (queryable? graph-or-db) graph-or-db)
-          supplied-rules* (when-not rules-db
-                            (try*
-                              (parse-rules-graph graph-or-db)
-                              (catch* e
-                                      (log/error "Error parsing supplied rules graph:" e)
-                                      (throw e))))]
-      (loop [[method & r] methods
-             rules []]
-        (if method
-          (let [rules-graph* (or supplied-rules*
-                                 (<? (resolve/rules-from-db rules-db method)))
-                rules*       (rules-from-graph method inserts rules-graph*)]
-            (recur r (into rules rules*)))
-          rules)))))
+    (let [parsed-rules-graphs (try*
+                                (map parse-rules-graph rules-graphs)
+                                (catch* e
+                                        (log/error "Error parsing supplied rules graph:" e)
+                                        (throw e)))
+          all-rules-from-graphs (apply concat
+                                       (for [method methods]
+                                         (mapcat (fn [parsed-rules-graph]
+                                                   (rules-from-graph method inserts parsed-rules-graph))
+                                                 parsed-rules-graphs)))
+          all-rules-dbs       (if (or (nil? rules-dbs) (empty? rules-dbs))
+                                [db]
+                                (conj rules-dbs db))
+          all-rules-from-dbs (apply concat (rules-from-dbs methods inserts all-rules-dbs))
+          all-rules (concat all-rules-from-graphs all-rules-from-dbs)]
+      all-rules)))
 
 (defn triples->map
   "Turns triples from same subject (@id) originating from
@@ -236,13 +244,14 @@
           db*)))))
 
 (defn reason
-  [db methods rules-graph fuel-tracker reasoner-max]
+  [db methods rules-graphs rules-dbs {:keys [fuel-tracker reasoner-max]
+                                      :or {reasoner-max 10} :as _opts}]
   (go-try
     (let [db*             (update db :reasoner #(into methods %))
           tx-state        (flake.transact/->tx-state :db db*)
           inserts         (atom nil)
           ;; TODO - rules can be processed in parallel
-          raw-rules       (<? (all-rules methods db* inserts rules-graph))
+          raw-rules       (<? (all-rules methods db* inserts rules-graphs rules-dbs))
           _               (log/debug "Reasoner - extracted rules: " raw-rules)
           reasoning-rules (-> raw-rules
                               resolve/rules->graph

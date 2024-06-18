@@ -53,8 +53,8 @@
                              ;; reason graph that we find.
                              (<? (reasoner/reason time-travel-db
                                                   reasoners
-                                                  (or (first reasoner-rules-db)
-                                                      (first reasoner-rules))
+                                                  reasoner-rules
+                                                  reasoner-rules-db
                                                   opts))
                              time-travel-db))]
       (assoc-in reasoned-db [:policy :cache] (atom {})))))
