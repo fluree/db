@@ -126,15 +126,17 @@
           db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
 
       (testing "A recursive relationship"
-        (let [grandparents-db @(fluree/reason db0 :datalog {"@context" {"f"  "https://ns.flur.ee/ledger#"
-                                                                        "ex" "http://example.org/"},
-                                                            "@id"      "ex:grandParentRule"
-                                                            "f:rule"   {"@type"  "@json"
-                                                                        "@value" {"@context" {"ex" "http://example.org/"}
-                                                                                  "where"    {"ex:children" "?children"
-                                                                                              "ex:parents"  "?parents"}
-                                                                                  "insert"   {"@id"            "?children",
-                                                                                              "ex:grandParent" {"@id" "?parents"}}}}})
+        (let [grandparents-db @(fluree/reason db0 :datalog
+                                              {:rule-graphs
+                                               [{"@context" {"f"  "https://ns.flur.ee/ledger#"
+                                                             "ex" "http://example.org/"},
+                                                 "@id"      "ex:grandParentRule"
+                                                 "f:rule"   {"@type"  "@json"
+                                                             "@value" {"@context" {"ex" "http://example.org/"}
+                                                                       "where"    {"ex:children" "?children"
+                                                                                   "ex:parents"  "?parents"}
+                                                                       "insert"   {"@id"            "?children",
+                                                                                   "ex:grandParent" {"@id" "?parents"}}}}}]})
               grandparents-of @(fluree/query grandparents-db
                                              {:context {"ex" "http://example.org/"}
                                               :select  ["?grandParent" "?person"]
