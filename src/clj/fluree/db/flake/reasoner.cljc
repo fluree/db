@@ -244,8 +244,10 @@
           db*)))))
 
 (defn reason
-  [db methods rules-graphs rules-dbs {:keys [fuel-tracker reasoner-max]
-                                      :or {reasoner-max 10} :as _opts}]
+  [db methods
+   {:keys [rule-graphs rule-dbs]}
+   {:keys [max-fuel reasoner-max]
+    :or   {reasoner-max 10} :as _opts}]
   (go-try
     (let [db*             (update db :reasoner #(into methods %))
           tx-state        (flake.transact/->tx-state :db db*)
