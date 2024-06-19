@@ -161,12 +161,20 @@
 
 (defn parse-rule-dbs
   [conn dbs-or-aliases]
-  (map (fn [db-or-alias]
-         (cond
-           (db/db? db-or-alias) db-or-alias
-           (string? db-or-alias) (ledger/-db (clojure.core.async/<!! (jld-ledger/load conn db-or-alias)))
-           :else (throw "Invalid rule db provided. Must be a db object or a string of the ledger name.")))
-       dbs-or-aliases))
+  (let [clause-chan (async/to-chan! dbs-or-aliases)
+        out-chan (async/chan)]
+    (async/pipeline-async
+     1
+     out-chan
+     (fn [db-or-alias out-ch]
+       (async/pipe (go-try
+                     (cond
+                       (db/db? db-or-alias) db-or-alias
+                       (string? db-or-alias) (ledger/-db (<? (jld-ledger/load conn db-or-alias)))
+                       :else (throw "Invalid rule db provided. Must be a db object or a string of the ledger name.")))
+                   out-ch))
+     clause-chan)
+    (async/into [] out-chan)))
 
 (defn load-alias
   [conn alias t opts]
@@ -177,7 +185,7 @@
             ledger   (<? (jld-ledger/load conn address))
             db       (ledger/-db ledger)
             t*       (or explicit-t t)
-            rule-dbs (parse-rule-dbs conn (:rule-dbs opts))
+            rule-dbs (<? (parse-rule-dbs conn (:rule-dbs opts)))
             opts*    (assoc opts :rule-dbs rule-dbs)]
         (<? (restrict-db db t* context opts*))) 
       (catch* e
