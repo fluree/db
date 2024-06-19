@@ -34,7 +34,18 @@
           (is (= [["foo1"] ["foo2"] ["foo3"]]
                  @(fluree/query db1 {"select" ["?foo"]
                                      "values" ["?foo" ["foo1" "foo2" "foo3" ]]}))
-              "syntactic form is parsed correctly"))))
+              "syntactic form is parsed correctly")))
+      (testing "iri values"
+        (is (= [["Brian" "brian@example.org"]
+                ["Cam" "cam@example.org"]]
+               @(fluree/query db1 {"@context" context
+                                   "select" ["?name" "?email"]
+                                   "where" [{"@id" "?s" "schema:name" "?name"}
+                                            {"@id" "?s" "schema:email" "?email"}
+                                            ["values"
+                                             ["?s" [{"@id" "ex:cam"}
+                                                    {"@id" "ex:brian"}]]]]}))
+            "id-maps can be used to distinguish iris")))
     (testing "where pattern"
       (testing "single var"
         (is (= [["Brian" "brian@example.org"]
@@ -56,7 +67,7 @@
                                             {"@id" "?s" "schema:email" "?email"}
                                             ["values"
                                              [["?s"] [[{"@type" "xsd:anyURI" "@value" "ex:cam"}]
-                                                      [{"@type" "xsd:anyURI" "@value" "ex:brian"}]]]]]}))
+                                                      [{"@id" "ex:brian"}]]]]]}))
             "syntactic form is parsed correctly"))
       (testing "nested under optional clause"
         (is (= [["Nikola" nil true]]
