@@ -1,5 +1,6 @@
 (ns fluree.db.reasoner
   (:require [clojure.string :as str]
+            [clojure.core.async :as async]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -148,12 +149,22 @@
 
 (defn rules-from-dbs
   [methods inserts dbs]
-  (for [method methods]
-    (mapcat (fn [db]
-              (as-> db $
-                (clojure.core.async/<!! (resolve/rules-from-db $ method))
-                (rules-from-graph method inserts $)))
-            dbs)))
+  (let [clause-chan (async/to-chan! dbs)
+        out-chan (async/chan)]
+    (doall
+     (for [method methods]
+       (async/pipeline-async
+        1
+        out-chan
+        (fn [db out-ch]
+          (async/pipe (go-try
+                        (as-> db $
+                          (<? (resolve/rules-from-db $ method))
+                          (rules-from-graph method inserts $)))
+                      out-ch)
+          out-ch)
+        clause-chan)))
+    (async/into [] out-chan)))
 
 (defn all-rules
   [methods db inserts rule-graphs rule-dbs]
@@ -171,7 +182,7 @@
           all-rule-dbs       (if (or (nil? rule-dbs) (empty? rule-dbs))
                                 [db]
                                 (conj rule-dbs db))
-          all-rules-from-dbs (apply concat (rules-from-dbs methods inserts all-rule-dbs))
+          all-rules-from-dbs (apply concat (<? (rules-from-dbs methods inserts all-rule-dbs)))
           all-rules (concat all-rules-from-graphs all-rules-from-dbs)]
       all-rules)))
 
