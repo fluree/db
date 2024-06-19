@@ -156,10 +156,10 @@
             dbs)))
 
 (defn all-rules
-  [methods db inserts rules-graphs rules-dbs]
+  [methods db inserts rule-graphs rule-dbs]
   (go-try
-    (let [parsed-rules-graphs (try*
-                                (map parse-rules-graph rules-graphs)
+    (let [parsed-rule-graphs (try*
+                                (map parse-rules-graph rule-graphs)
                                 (catch* e
                                         (log/error "Error parsing supplied rules graph:" e)
                                         (throw e)))
@@ -167,11 +167,11 @@
                                        (for [method methods]
                                          (mapcat (fn [parsed-rules-graph]
                                                    (rules-from-graph method inserts parsed-rules-graph))
-                                                 parsed-rules-graphs)))
-          all-rules-dbs       (if (or (nil? rules-dbs) (empty? rules-dbs))
+                                                 parsed-rule-graphs)))
+          all-rule-dbs       (if (or (nil? rule-dbs) (empty? rule-dbs))
                                 [db]
-                                (conj rules-dbs db))
-          all-rules-from-dbs (apply concat (rules-from-dbs methods inserts all-rules-dbs))
+                                (conj rule-dbs db))
+          all-rules-from-dbs (apply concat (rules-from-dbs methods inserts all-rule-dbs))
           all-rules (concat all-rules-from-graphs all-rules-from-dbs)]
       all-rules)))
 
@@ -225,8 +225,10 @@
           db*)))))
 
 (defn reason
-  [db methods rules-graphs rules-dbs {:keys [max-fuel reasoner-max]
-                              :or   {reasoner-max 10} :as _opts}]
+  [db methods
+   {:keys [rule-graphs rule-dbs]}
+   {:keys [max-fuel reasoner-max]
+    :or   {reasoner-max 10} :as _opts}]
   (go-try
     (let [methods*        (set (util/sequential methods))
           fuel-tracker    (fuel/tracker max-fuel)
@@ -234,7 +236,7 @@
           tx-state        (db/->tx-state :db db*)
           inserts         (atom nil)
           ;; TODO - rules can be processed in parallel
-          raw-rules       (<? (all-rules methods* db* inserts rules-graphs rules-dbs))
+          raw-rules       (<? (all-rules methods* db* inserts rule-graphs rule-dbs))
           _               (log/debug "Reasoner - extracted rules: " raw-rules)
           reasoning-rules (->> raw-rules
                                (resolve/rules->graph db*)

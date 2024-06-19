@@ -4,6 +4,7 @@
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
+            [fluree.db.db.json-ld :as db]
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
@@ -45,14 +46,11 @@
           time-travel-db (-> (if t
                                (<? (time-travel/as-of policy-db t))
                                policy-db))
-          reasoned-db    (let [{:keys [reasoners reasoner-rules reasoner-rules-db]} opts]
-                           (if reasoners
-                             ;; Currently we only support one rule source, so we take the first db or first
-                             ;; reason graph that we find.
+          reasoned-db    (let [{:keys [reasoner-methods rule-graphs rule-dbs] :as reasoning} opts]
+                           (if reasoner-methods
                              (<? (reasoner/reason time-travel-db
-                                                  reasoners
-                                                  reasoner-rules
-                                                  reasoner-rules-db
+                                                  reasoner-methods
+                                                  reasoning
                                                   opts))
                              time-travel-db))]
       (assoc-in reasoned-db [:policy :cache] (atom {})))))
@@ -161,6 +159,15 @@
                  parse-t-val)]
       [alias nil])))
 
+(defn parse-rule-dbs
+  [conn dbs-or-aliases]
+  (map (fn [db-or-alias]
+         (cond
+           (db/db? db-or-alias) db-or-alias
+           (string? db-or-alias) (ledger/-db (clojure.core.async/<!! (jld-ledger/load conn db-or-alias)))
+           :else (throw "Invalid rule db provided. Must be a db object or a string of the ledger name.")))
+       dbs-or-aliases))
+
 (defn load-alias
   [conn alias t context opts]
   (go-try
@@ -170,11 +177,8 @@
             ledger   (<? (jld-ledger/load conn address))
             db       (ledger/-db ledger)
             t*       (or explicit-t t)
-            rules-db (let [dbs-or-aliases (:reasoner-rules-db opts)]
-                       (if (string? (first dbs-or-aliases))
-                         [(ledger/-db (<? (jld-ledger/load conn (first dbs-or-aliases))))]
-                         dbs-or-aliases))
-            opts*    (assoc opts :reasoner-rules-db rules-db)]
+            rule-dbs (parse-rule-dbs conn (:rule-dbs opts))
+            opts*    (assoc opts :rule-dbs rule-dbs)]
         (<? (restrict-db db t* context opts*))) 
       (catch* e
               (throw (contextualize-ledger-400-error
