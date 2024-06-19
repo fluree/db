@@ -473,7 +473,7 @@
   ([db methods rules-graph] (reason db methods rules-graph nil))
   ([db methods rules-graph opts]
    (promise-wrap
-     (reasoner/reason db methods rules-graph opts))))
+     (reasoner/reason db methods {:rule-graphs [rules-graph]} opts))))
 
 (defn reasoned-count
   "Returns a count of reasoned facts in the provided db."
