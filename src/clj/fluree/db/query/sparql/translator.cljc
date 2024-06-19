@@ -370,7 +370,7 @@
                   ;; :Expression
                   (let [[next next-next & r*] r
                         expr (parse-term term)
-                        as?  (= "AS" next)
+                        as?  (= [:As] next)
                         expr (if as?
                                (str "(as " expr " " (parse-term next-next) ")")
                                expr)]
@@ -665,7 +665,7 @@
 (defmethod parse-term :GroupCondition
   ;; GroupCondition ::= BuiltInCall | FunctionCall | <'('> Expression ( WS 'AS' WS Var )? <')'> | Var
   [[_ expr as var :as condition]]
-  (if (= as "AS")
+  (if (= as [:As])
     (str "(as " (parse-term expr) " " (parse-term var) ")")
     (parse-term expr)))
 
