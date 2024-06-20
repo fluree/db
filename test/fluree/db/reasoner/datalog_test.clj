@@ -204,35 +204,58 @@
 
 
       (testing "multiple graphs as rule sources"
-        (let [reasoned-db @(fluree/reason db0 :datalog {:rule-graphs [uncle-rule aunt-rule]})]
+        (let [half-reasoned-db @(fluree/reason db0 :datalog {:rule-graphs [aunt-rule]})
+              full-reasoned-db @(fluree/reason db0 :datalog {:rule-graphs [uncle-rule aunt-rule]})]
+
+          (is (= [["ex:brian" "ex:janine"]]
+                 @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
+                                                  :select  ["?s" "?aunt"]
+                                                  :where   {"@id"     "?s",
+                                                            "ex:aunt" "?aunt"}}))
+              "Without only the aunt-rule included, only one result is returned.")
 
           (is (= [["ex:brian" "ex:holly"] ["ex:brian" "ex:janine"]]
-                 @(fluree/query reasoned-db {:context {"ex" "http://example.org/"}
-                                             :select  ["?s" "?aunt"]
-                                             :where   {"@id"     "?s",
-                                                       "ex:aunt" "?aunt"}}))
-              "Multiple rule graphs can be used to reason about data.")))
+                 @(fluree/query full-reasoned-db {:context {"ex" "http://example.org/"}
+                                                  :select  ["?s" "?aunt"]
+                                                  :where   {"@id"     "?s",
+                                                            "ex:aunt" "?aunt"}}))
+              "With both graphs included, two results are returned.")))
 
       (testing "multiple dbs as rule sources"
-        (let [reasoned-db @(fluree/reason db0 :datalog {:rule-dbs [rule-db-1 rule-db-2]})]
+        (let [half-reasoned-db @(fluree/reason db0 :datalog {:rule-dbs [rule-db-1]})
+              full-reasoned-db @(fluree/reason db0 :datalog {:rule-dbs [rule-db-1 rule-db-2]})]
 
+          (is (= []
+                 @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
+                                                  :select  ["?s" "?aunt"]
+                                                  :where   {"@id"     "?s",
+                                                            "ex:aunt" "?aunt"}}))
+              "With only the uncle-rule, no results are returned.")
+          
           (is (= [["ex:brian" "ex:holly"] ["ex:brian" "ex:janine"]]
-                 @(fluree/query reasoned-db {:context {"ex" "http://example.org/"}
-                                             :select  ["?s" "?aunt"]
-                                             :where   {"@id"     "?s",
-                                                       "ex:aunt" "?aunt"}}))
-              "Multiple rule dbs can be used to reason about data.")))
+                 @(fluree/query full-reasoned-db {:context {"ex" "http://example.org/"}
+                                                  :select  ["?s" "?aunt"]
+                                                  :where   {"@id"     "?s",
+                                                            "ex:aunt" "?aunt"}}))
+              "With both rule dbs included, two results are returned.")))
 
       (testing "a mixture of graphs and dbs as rule sources"
-        (let [reasoned-db @(fluree/reason db0 :datalog {:rule-dbs [rule-db-1]
-                                                        :rule-graphs [aunt-rule]})]
+        (let [half-reasoned-db @(fluree/reason db0 :datalog {:rule-dbs [rule-db-1]})
+              full-reasoned-db @(fluree/reason db0 :datalog {:rule-dbs    [rule-db-1]
+                                                             :rule-graphs [aunt-rule]})]
 
+          (is (= []
+                 @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
+                                                  :select  ["?s" "?aunt"]
+                                                  :where   {"@id"     "?s",
+                                                            "ex:aunt" "?aunt"}}))
+              "With only the uncle-rule, no results are returned.")
           (is (= [["ex:brian" "ex:holly"] ["ex:brian" "ex:janine"]]
-                 @(fluree/query reasoned-db {:context {"ex" "http://example.org/"}
-                                             :select  ["?s" "?aunt"]
-                                             :where   {"@id"     "?s",
-                                                       "ex:aunt" "?aunt"}}))
-              "Multiple rule dbs can be used to reason about data."))))))
+                 @(fluree/query full-reasoned-db {:context {"ex" "http://example.org/"}
+                                                  :select  ["?s" "?aunt"]
+                                                  :where   {"@id"     "?s",
+                                                            "ex:aunt" "?aunt"}}))
+              "With both sources included, two results are returned."))))))
 
 
 (def has-subtask-rule
