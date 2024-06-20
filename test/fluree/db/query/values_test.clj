@@ -40,11 +40,10 @@
                 ["Cam" "cam@example.org"]]
                @(fluree/query db1 {"@context" context
                                    "select" ["?name" "?email"]
+                                   "values" ["?s" [{"@id" "ex:brian"}
+                                                   {"@id" "ex:cam"}]]
                                    "where" [{"@id" "?s" "schema:name" "?name"}
-                                            {"@id" "?s" "schema:email" "?email"}
-                                            ["values"
-                                             ["?s" [{"@id" "ex:cam"}
-                                                    {"@id" "ex:brian"}]]]]}))
+                                            {"@id" "?s" "schema:email" "?email"}]}))
             "id-maps can be used to distinguish iris")
         (testing "equivalent syntactic forms"
           (is (= [["ex:cam"] ["ex:liam"]]
