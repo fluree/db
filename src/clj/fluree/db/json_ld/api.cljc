@@ -573,11 +573,11 @@
   or if no rules graph is supplied, the rules will be looked for within
   the db itself."
   ([db methods] (reason db methods nil nil))
-  ([db methods rules-graph] (reason db methods rules-graph nil))
-  ([db methods rules-graph opts]
+  ([db methods rule-sources] (reason db methods rule-sources nil))
+  ([db methods rule-sources opts]
    (log/warn "DEPRECATED function `reason` superseded by `fluree.db.api/reason`")
    (promise-wrap
-     (reasoner/reason db methods {:rule-graphs [rules-graph]} opts))))
+    (reasoner/reason db methods rule-sources opts))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/reasoned-count"}
