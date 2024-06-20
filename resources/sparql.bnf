@@ -5,7 +5,7 @@ BaseDecl ::= <'BASE'> WS IRIREF
 PrefixDecl ::= <'PREFIX'> WS PNAME_NS WS IRIREF
 SelectQuery ::= WS SelectClause WS DatasetClause WS WhereClause WS SolutionModifier WS
 SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause
-SelectClause ::= WS <'SELECT'> WS ( 'DISTINCT' | 'REDUCED')? ( ( WS ( Var | ( <'('> Expression WS 'AS' WS Var <')'> ) ) )+ | ( WS '*' ) )
+SelectClause ::= WS <'SELECT'> WS ( 'DISTINCT' | 'REDUCED')? ( ( WS ( Var | ( <'('> Expression As Var <')'> ) ) )+ | ( WS '*' ) )
 ConstructQuery	  ::=  	'CONSTRUCT' ( ConstructTemplate DatasetClause WhereClause SolutionModifier | DatasetClause 'WHERE' '{' TriplesTemplate? '}' SolutionModifier )
 DescribeQuery	  ::=  	'DESCRIBE' ( VarOrIri+ | '*' ) DatasetClause WhereClause? SolutionModifier
 AskQuery	  ::=  	'ASK' DatasetClause WhereClause SolutionModifier
@@ -18,7 +18,7 @@ NamedGraphClause	  ::=  	<'NAMED'> WS SourceSelector
 WhereClause	  ::=  	<'WHERE'?> WS GroupGraphPattern WS
 SolutionModifier	  ::=  	GroupClause? HavingClause? OrderClause? LimitOffsetClauses?
 GroupClause	  ::=  	<'GROUP' WS 'BY' WS> GroupCondition+
-GroupCondition	  ::=  	BuiltInCall | FunctionCall | <'('> Expression ( WS 'AS' WS Var )? <')'> | Var
+GroupCondition	  ::=  	BuiltInCall | FunctionCall | <'('> Expression ( As Var )? <')'> | Var
 HavingClause	  ::=  	<'HAVING'> HavingCondition+
 HavingCondition	  ::=  	Constraint
 OrderClause	  ::=  	<'ORDER' WS 'BY'> WS OrderCondition+ WS
@@ -59,7 +59,7 @@ GraphPatternNotTriples	  ::=  	GroupOrUnionGraphPattern | OptionalGraphPattern |
 OptionalGraphPattern	  ::=  	<'OPTIONAL'> GroupGraphPattern
 GraphGraphPattern	  ::=  	<'GRAPH'> WS VarOrIri WS GroupGraphPattern
 ServiceGraphPattern	  ::=  	<'SERVICE'> WS 'SILENT'? WS VarOrIri GroupGraphPattern
-Bind	  ::=  	<'BIND' WS '(' WS>  Expression <WS 'AS' WS> Var <WS ')' WS>
+Bind	  ::=  	<'BIND' WS '(' WS>  Expression <As> Var <WS ')' WS>
 InlineData	  ::=  	<'VALUES'> WS DataBlock
 <DataBlock>	  ::=  	InlineDataOneVar | InlineDataFull
 InlineDataOneVar	  ::=  	Var <'{'> WS DataBlockValue* <'}'>
@@ -118,6 +118,7 @@ ConditionalAndExpression ::= ValueLogical ( <'&&'> ValueLogical )*
 <ValueLogical>	  ::=  	RelationalExpression
 RelationalExpression	  ::=  	NumericExpression WS ( '=' NumericExpression | '!=' NumericExpression | '<' NumericExpression | '>' NumericExpression | '<=' NumericExpression | '>=' NumericExpression | 'IN' WS ExpressionList | 'NOT' WS 'IN' WS ExpressionList )?
 NumericExpression	  ::=  	WS AdditiveExpression WS
+As ::= WS <('AS' | 'as')> WS
 
 <AdditiveExpression>	  ::=  	MultiplicativeExpression ( '+' MultiplicativeExpression | '-' MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralNegative ) ( ( '*' UnaryExpression ) | ( '/' UnaryExpression ) )* )*
 
