@@ -470,10 +470,10 @@
   or if no rules graph is supplied, the rules will be looked for within
   the db itself."
   ([db methods] (reason db methods nil nil))
-  ([db methods rules-graph] (reason db methods rules-graph nil))
-  ([db methods rules-graph opts]
+  ([db methods rule-sources] (reason db methods rule-sources nil))
+  ([db methods rule-sources opts]
    (promise-wrap
-     (reasoner/reason db methods {:rule-graphs [rules-graph]} opts))))
+     (reasoner/reason db methods rule-sources opts))))
 
 (defn reasoned-count
   "Returns a count of reasoned facts in the provided db."
