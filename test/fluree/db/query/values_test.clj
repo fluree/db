@@ -45,7 +45,25 @@
                                             ["values"
                                              ["?s" [{"@id" "ex:cam"}
                                                     {"@id" "ex:brian"}]]]]}))
-            "id-maps can be used to distinguish iris")))
+            "id-maps can be used to distinguish iris")
+        (testing "equivalent syntactic forms"
+          (is (= [["ex:cam"] ["ex:liam"]]
+                 @(fluree/query db1 {"@context" context
+                                     "where" [{"@id" "?s" "ex:friend" {"@id" "ex:alice"}}]
+                                     "select" ["?s"]}))
+              "iri literal")
+          (is (= [["ex:cam"] ["ex:liam"]]
+                 @(fluree/query db1 {"@context" context
+                                     "values" ["?friend" [{"@id" "ex:alice"}]]
+                                     "where" [{"@id" "?s" "ex:friend" "?friend"}]
+                                     "select" ["?s"]}))
+              "variable")
+          (is (= [["ex:cam"] ["ex:liam"]]
+                 @(fluree/query db1 {"@context" context
+                                     "values" ["?friend" [{"@id" "ex:alice"}]]
+                                     "where" [{"@id" "?s" "ex:friend" {"@id" "?friend"}}]
+                                     "select" ["?s"]}))
+              "variable in id-map"))))
     (testing "where pattern"
       (testing "single var"
         (is (= [["Brian" "brian@example.org"]
