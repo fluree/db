@@ -8,6 +8,21 @@
   (-reason [reasoner methods rules-graph fuel-tracker reasoner-max])
   (-reasoned-facts [reasoner]))
 
+(defn deduplicate-raw-rules
+  [raw-rules]
+  (let [rule-ids (map first raw-rules)
+        duplicate-ids (filter #(< 1 (last %)) (frequencies rule-ids))]
+    (reduce (fn [rules [duplicate-id occurances]]
+              (let [grouped-rules (group-by #(= duplicate-id (first %)) rules)]
+                (loop [suffix occurances
+                       rules-to-update (get grouped-rules true)
+                       updated-rules-list (get grouped-rules false)]
+                  (if (empty? rules-to-update)
+                    updated-rules-list
+                    (let [updated-rule [(str duplicate-id suffix) (last (first rules-to-update))]]
+                      (recur (dec suffix) (rest rules-to-update) (conj updated-rules-list updated-rule)))))))
+            raw-rules duplicate-ids)))
+
 (defn reason
   [db methods rules-graph {:keys [max-fuel reasoner-max]
                            :or   {reasoner-max 10} :as _opts}]
