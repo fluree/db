@@ -75,21 +75,17 @@
 (defn match-value-binding-map
   [var-match binding-map context]
   (let [attrs (expand-keys binding-map context)
-
-        {id const/iri-id val const/iri-value} attrs]
-    (if id
-      (let [expanded (json-ld/expand-iri id context)]
-        (where/match-iri var-match expanded))
-      (if-let [dt-iri (get-expanded-datatype attrs context)]
-        (if (or (= const/iri-anyURI dt-iri)
-                (= const/iri-id dt-iri))
-          (let [expanded (json-ld/expand-iri val context)]
-            (where/match-iri var-match expanded))
-          (where/match-value var-match val dt-iri))
-        (if-let [lang (get attrs const/iri-language)]
-          (where/match-value var-match val const/iri-lang-string {:lang lang})
-          (let [dt (datatype/infer-iri val)]
-            (where/match-value var-match val dt)))))))
+        {val const/iri-value} attrs]
+    (if-let [dt-iri (get-expanded-datatype attrs context)]
+      (if (or (= const/iri-anyURI dt-iri)
+              (= const/iri-id dt-iri))
+        (let [expanded (json-ld/expand-iri val context)]
+          (where/match-iri var-match expanded))
+        (where/match-value var-match val dt-iri))
+      (if-let [lang (get attrs const/iri-language)]
+        (where/match-value var-match val const/iri-lang-string {:lang lang})
+        (let [dt (datatype/infer-iri val)]
+          (where/match-value var-match val dt))))))
 
 (defn match-value-binding
   [var-match value context]
