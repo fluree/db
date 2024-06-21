@@ -32,7 +32,7 @@
   "Given a child, unresolved node, extracts just the data that will go into
   storage."
   [child]
-  (select-keys child [:id :leaf :first :rhs :size]))
+  (select-keys child [:id :leaf :first :rhs :size :leftmost?]))
 
 (defn write-leaf
   "Serializes and writes the index leaf node `leaf` to storage."
