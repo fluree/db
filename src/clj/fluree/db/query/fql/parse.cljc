@@ -81,7 +81,8 @@
       (let [expanded (json-ld/expand-iri id context)]
         (where/match-iri var-match expanded))
       (if-let [dt-iri (get-expanded-datatype attrs context)]
-        (if (= const/iri-anyURI dt-iri)
+        (if (or (= const/iri-anyURI dt-iri)
+                (= const/iri-id dt-iri))
           (let [expanded (json-ld/expand-iri val context)]
             (where/match-iri var-match expanded))
           (where/match-value var-match val dt-iri))
