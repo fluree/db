@@ -12,11 +12,13 @@
                 "ex:children" [{"@id" "ex:alice"}]
                 "ex:address"  {"ex:country" {"@id" "ex:Canada"}}
                 "ex:age"      42
-                "ex:parents"   [{"@id"        "ex:carol"
-                                 "ex:name"    "Carol"
-                                 "ex:age"     72
-                                 "ex:address" {"ex:country" {"@id" "ex:Singapore"}}
-                                 "ex:brother" {"@id" "ex:mike"}}]}
+                "ex:parents"  [{"@id"        "ex:carol"
+                                "ex:name"    "Carol"
+                                "ex:age"     72
+                                "ex:address" {"ex:country" {"@id" "ex:Singapore"}}
+                                "ex:brother" {"@id" "ex:mike"}
+                                "ex:parents" [{"@id"     "ex:cheryl"
+                                               "ex:name" "Cheryl"}]}]}
                {"@id"     "ex:laura"
                 "ex:name" "Laura"}
                {"@id"       "ex:bob"
@@ -92,6 +94,18 @@
                                    "ex:parents"  "?parents"}
                        "insert"   {"@id"            "?children",
                                    "ex:grandParent" {"@id" "?parents"}}}}})
+
+(def alt-grandparent-rule
+  {"@context" {"f"  "https://ns.flur.ee/ledger#"
+               "ex" "http://example.org/"}
+   "@id"    "ex:grandParentRule"
+   "f:rule" {"@type"  "@json"
+             "@value" {"@context" {"ex" "http://example.org/"}
+                       "where"    {"@id" "?person"
+                                   "ex:parents" {"@id" "?parent"
+                                                 "ex:parents" {"@id" "?grandParent"}}}
+                       "insert"   {"@id"            "?person",
+                                   "ex:grandParent" {"@id" "?grandParent"}}}}})
 
 (def senior-rule
   {"@context" {"f"  "https://ns.flur.ee/ledger#"
@@ -255,7 +269,17 @@
                                                   :select  ["?s" "?aunt"]
                                                   :where   {"@id"     "?s",
                                                             "ex:aunt" "?aunt"}}))
-              "With both sources included, two results are returned."))))))
+              "With both sources included, two results are returned.")))
+
+      (testing "multiple sources targeting identical nodes"
+        (let [identical-node-reasoned-db @(fluree/reason db0 :datalog
+                                                         {:rule-graphs [alt-grandparent-rule grandparent-rule]})]
+          (is (= [["ex:alice" "ex:carol"] ["ex:brian" "ex:cheryl"]]
+                 @(fluree/query identical-node-reasoned-db {:context {"ex" "http://example.org/"}
+                                                            :select  ["?s" "?grandParent"]
+                                                            :where   {"@id"            "?s",
+                                                                      "ex:grandParent" "?grandParent"}}))
+              "Rules are deduplicated and used in reasoning"))))))
 
 
 (def has-subtask-rule

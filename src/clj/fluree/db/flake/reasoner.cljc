@@ -253,6 +253,21 @@
             (recur r db**))
           db*)))))
 
+(defn deduplicate-raw-rules
+  [raw-rules]
+  (let [rule-ids (map first raw-rules)
+        duplicate-ids (filter #(< 1 (last %)) (frequencies rule-ids))]
+    (reduce (fn [rules [duplicate-id occurances]]
+              (let [grouped-rules (group-by #(= duplicate-id (first %)) rules)]
+                (loop [suffix occurances
+                       rules-to-update (get grouped-rules true)
+                       updated-rules-list (get grouped-rules false)]
+                  (if (empty? rules-to-update)
+                    updated-rules-list
+                    (let [updated-rule [(str duplicate-id suffix) (last (first rules-to-update))]]
+                      (recur (dec suffix) (rest rules-to-update) (conj updated-rules-list updated-rule)))))))
+            raw-rules duplicate-ids)))
+
 (defn reason
   [db methods
    {:keys [rule-graphs rule-dbs]}
@@ -265,7 +280,8 @@
           ;; TODO - rules can be processed in parallel
           raw-rules       (<? (all-rules methods db* inserts rules-graphs rules-dbs))
           _               (log/debug "Reasoner - extracted rules: " raw-rules)
-          reasoning-rules (-> raw-rules
+          deduplicated-rules (deduplicate-raw-rules raw-rules)
+          reasoning-rules (-> deduplicated-rules
                               resolve/rules->graph
                               add-rule-dependencies)
           db**            (if-let [inserts* @inserts]
