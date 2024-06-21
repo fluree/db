@@ -20,11 +20,12 @@
 (def ^:const f-ipfs-ns "fluree:ipfs://")
 (def ^:const f-s3-ns "fluree:s3://")
 
-(def type-iri "@type")
+(def ^:const type-iri "@type")
+(def ^:const json-iri "@json")
 
 (def json-iri-keywords
   {type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-   "@json"  "http://www.w3.org/2001/XMLSchema#json"})
+   json-iri "http://www.w3.org/2001/XMLSchema#json"})
 
 (defn normalize
   [iri]
