@@ -40,8 +40,8 @@
                 ["Cam" "cam@example.org"]]
                @(fluree/query db1 {"@context" context
                                    "select" ["?name" "?email"]
-                                   "values" ["?s" [{"@id" "ex:brian"}
-                                                   {"@id" "ex:cam"}]]
+                                   "values" ["?s" [{"@type" "@id" "@value" "ex:brian"}
+                                                   {"@type" "@id" "@value" "ex:cam"}]]
                                    "where" [{"@id" "?s" "schema:name" "?name"}
                                             {"@id" "?s" "schema:email" "?email"}]}))
             "id-maps can be used to distinguish iris")
@@ -64,13 +64,13 @@
               "iri literal")
           (is (= [["ex:cam"] ["ex:liam"]]
                  @(fluree/query db1 {"@context" context
-                                     "values" ["?friend" [{"@id" "ex:alice"}]]
+                                     "values" ["?friend" [{"@value" "ex:alice" "@type" "@id"}]]
                                      "where" [{"@id" "?s" "ex:friend" "?friend"}]
                                      "select" ["?s"]}))
               "variable")
           (is (= [["ex:cam"] ["ex:liam"]]
                  @(fluree/query db1 {"@context" context
-                                     "values" ["?friend" [{"@id" "ex:alice"}]]
+                                     "values" ["?friend" [{"@value" "ex:alice" "@type" "@id"}]]
                                      "where" [{"@id" "?s" "ex:friend" {"@id" "?friend"}}]
                                      "select" ["?s"]}))
               "variable in id-map"))))
@@ -95,7 +95,7 @@
                                             {"@id" "?s" "schema:email" "?email"}
                                             ["values"
                                              [["?s"] [[{"@type" "xsd:anyURI" "@value" "ex:cam"}]
-                                                      [{"@id" "ex:brian"}]]]]]}))
+                                                      [{"@type" "@id" "@value" "ex:brian"}]]]]]}))
             "syntactic form is parsed correctly"))
       (testing "nested under optional clause"
         (is (= [["Nikola" nil true]]
