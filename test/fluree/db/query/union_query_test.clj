@@ -1,7 +1,7 @@
 (ns fluree.db.query.union-query-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]))
+            [fluree.db :as fluree]))
 
 (deftest ^:integration union-queries
   (testing "Testing various 'union' query clauses."

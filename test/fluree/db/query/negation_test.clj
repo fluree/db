@@ -1,6 +1,6 @@
 (ns fluree.db.query.negation-test
   (:require  [clojure.test :as t :refer [deftest testing is]]
-             [fluree.db.json-ld.api :as fluree]
+             [fluree.db :as fluree]
              [fluree.db.test-utils :as test-utils]))
 
 (deftest negation

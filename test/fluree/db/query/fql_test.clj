@@ -1,7 +1,7 @@
 (ns fluree.db.query.fql-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
-            [fluree.db.json-ld.api :as fluree]))
+            [fluree.db :as fluree]))
 
 (deftest ^:integration grouping-test
   (testing "grouped queries"

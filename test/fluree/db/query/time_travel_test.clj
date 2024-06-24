@@ -1,7 +1,7 @@
 (ns fluree.db.query.time-travel-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]))
 
