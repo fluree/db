@@ -20,7 +20,6 @@
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.connection :refer [notify-ledger]]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.constants :as const]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy :as policy])
