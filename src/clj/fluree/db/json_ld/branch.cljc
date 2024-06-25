@@ -2,7 +2,7 @@
   (:require [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.indexer :as indexer]
             [fluree.json-ld :as json-ld]
-            [fluree.db.database.async :as async-db]
+            [fluree.db.async-db :as async-db]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log :include-macros true]

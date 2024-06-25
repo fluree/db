@@ -1,4 +1,4 @@
-(ns fluree.db.database.async
+(ns fluree.db.async-db
   (:refer-clojure :exclude [load])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [<! >! go]]
