@@ -10,15 +10,13 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn same-commit?
+(defn same-t?
   [current-commit indexed-commit]
   (let [current-t (commit-data/t current-commit)
         indexed-t (commit-data/t indexed-commit)]
-    (and (= current-t indexed-t)
-         (= (:id current-t)
-            (:id indexed-t)))))
+    (= current-t indexed-t)))
 
-(defn older-commit?
+(defn newer-commit?
   [current-commit indexed-commit]
   (let [current-t (commit-data/t current-commit)
         indexed-t (commit-data/t indexed-commit)]
@@ -44,13 +42,13 @@
 (defn update-index
   [{current-commit :commit, :as current-state}
    {:keys [conn alias branch], indexed-commit :commit, :as indexed-db}]
-  (if (same-commit? current-commit indexed-commit)
+  (if (same-t? current-commit indexed-commit)
     (if (newer-index? indexed-commit current-commit)
       (assoc current-state
              :commit     indexed-commit
              :current-db indexed-db)
       current-state)
-    (if (older-commit? current-commit indexed-commit)
+    (if (newer-commit? current-commit indexed-commit)
       (if (newer-index? indexed-commit current-commit)
         (let [latest-index  (:index indexed-commit)
               latest-commit (assoc current-commit :index latest-index)
