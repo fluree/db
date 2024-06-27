@@ -10,7 +10,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (def grammar #?(:clj  (io/resource "sparql.bnf")
-                :cljs (inline-resource "sparql.bnf")))
+                :cljs (inline-resource "sparql.js.bnf")))
 
 (defparser parser grammar)
 
