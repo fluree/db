@@ -142,7 +142,7 @@
                                                    "ex:parent" ?parent}}))))
             "returns all sub properties of ex:parent property")))))
 
-(deftest ^:integration ^:kaocha/pending subjects-as-predicates
+(deftest ^:integration subjects-as-predicates
   (testing "predicate iri-cache loookups"
     (let [conn    @(fluree/connect {:method :memory})
           ledger  @(fluree/create conn "propertypathstest")
@@ -207,7 +207,7 @@
                                  "select"   {"ex:nested" ["id" {"ex:reversed-pred" ["*"]}]}}))
           "via reverse crawl")
       (is (= [{"id" "ex:nested", "ex:reversed-pred" "ex:subject-as-predicate"}]
-             @(fluree/query db2 {"@context" [context {"ex:reversed-pred" {"@reverse" "ex:unlabeled-pred"}}]
+             @(fluree/query db3 {"@context" [context {"ex:reversed-pred" {"@reverse" "ex:unlabeled-pred"}}]
                                  "select"   {"ex:nested" ["id" "ex:reversed-pred"]}}))
           "via reverse no subgraph"))))
 
