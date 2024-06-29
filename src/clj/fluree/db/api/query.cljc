@@ -207,36 +207,36 @@
         (dataset db-map defaults)))))
 
 (defn query-connection-fql
-  [conn query]
+  [conn query {:keys [role did]}]
   (go-try
-    (let [{query :subject, did :did} (or (<? (cred/verify query))
-                                         {:subject query})
-          {:keys [t opts] :as query*}  (update query :opts sanitize-query-options did)
+    (let [credentialed-opts-query     (update query :opts #(merge {:role role :did did} %))
+          {query :subject, did :did}  (or (<? (cred/verify credentialed-opts-query))
+                                          {:subject query})
+          {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
 
           default-aliases (some-> query* :from util/sequential)
           named-aliases   (some-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [s-ctx       (ctx-util/extract query)
-              ds          (<? (load-dataset conn default-aliases named-aliases t
+        (let [s-ctx    (ctx-util/extract query)
+              ds       (<? (load-dataset conn default-aliases named-aliases t
                                             s-ctx opts))
-              query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
-              max-fuel    (:max-fuel opts)]
+              query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
+              max-fuel (:max-fuel opts)]
           (if (::util/track-fuel? opts)
             (<? (track-query ds max-fuel query**))
             (<? (fql/query ds query**))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))
 
-
 (defn query-connection-sparql
-  [conn query]
+  [conn query request-opts]
   (go-try
     (let [fql (sparql/->fql query)]
-      (<? (query-connection-fql conn fql)))))
+      (<? (query-connection-fql conn fql request-opts)))))
 
 (defn query-connection
-  [conn query {:keys [format] :as _opts :or {format :fql}}]
-  (case format
-    :fql (query-connection-fql conn query)
-    :sparql (query-connection-sparql conn query)))
+  [conn query {:keys [format] :as request-opts}]
+  (case (or format :fql)
+    :fql (query-connection-fql conn query request-opts)
+    :sparql (query-connection-sparql conn query request-opts)))
