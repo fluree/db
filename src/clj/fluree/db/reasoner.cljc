@@ -3,7 +3,6 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.log :as log]
             [fluree.db.db.json-ld :as db :refer [db?]]
             [fluree.db.util.async :refer [go-try <?]]
@@ -145,6 +144,12 @@
   (let []
     (log/debug "Reasoner - source OWL rules: " graph)
     (owl-datalog/owl->datalog inserts graph)))
+
+(defn parse-rules-graph
+  [rules-graph]
+  (-> rules-graph
+      json-ld/expand
+      util/sequential))
 
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
