@@ -990,78 +990,97 @@
                               (select-keys ["f:author" "f:txn" "f:data"]))))))))))
 
 (deftest ^:integration txn-annotation
-  (let [bnode-counter (atom 0)]
-    (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")
-                  fluree.db.json-ld.iri/new-blank-node-id (fn [] (str "_:fdb-" (swap! bnode-counter inc)))]
-      (let [conn         @(fluree/connect {:method :memory})
-            ledger-name  "annotationtest"
-            ledger       @(fluree/create conn ledger-name)
-            context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
+  (let [bnode-counter (atom 0)
 
-            db0 (fluree/db ledger)
-            db1 (->> @(fluree/stage db0 {"@context" context
-                                         "insert" [{"@id" "ex:betty"
-                                                    "@type" "ex:Yeti"
-                                                    "schema:name" "Betty"
-                                                    "schema:age" 55}]})
-                     (fluree/commit! ledger)
-                     (deref))
+        conn        @(fluree/connect {:method :memory})
+        ledger-name "annotationtest"
+        ledger      @(fluree/create conn ledger-name)
+        context     [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
 
-
-
-
-
-            db2 (->> @(fluree/stage db1 {"@context" context
-                                         "insert" [{"@id" "ex:freddy"
-                                                    "@type" "ex:Yeti"
-                                                    "schema:name" "Freddy"
-                                                    "schema:age" 1002}]}
-                                    {:annotation {"ex:originator" "opts" "ex:data" "ok"}})
-                     (fluree/commit! ledger)
-                     (deref))
-
-            db3 (->> @(fluree/stage db2 {"@context" context
-                                         "insert"   [{"@id"         "ex:letty"
-                                                      "@type"       "ex:Yeti"
-                                                      "schema:name" "Leticia"
-                                                      "schema:age"  38}]
-                                         "opts" {"annotation" {"ex:originator" "txn" "ex:data" "ok"}}})
-                     (fluree/commit! ledger)
-                     (deref))]
-        (testing "annotations in commit-details"
-          (is (= [{"f:txn" "fluree:memory://2c28ed0d4102ff436641911c90f47f0681a9ae251640823f7f361f7e22a57fef"}
-                  {"f:txn" "fluree:memory://cd26d7c28c0a5368694a6b8fbd11c573f0623313c06ae96c15ff016572972568"
-                   "f:annotation" {"id" "_:fdb-3" "ex:data" "ok" "ex:originator" "opts"}}
-
-                  {"f:txn" "fluree:memory://40ce18ee7469c565297e9b9e348788a891ab1bca8fdfda2116d7a2b6c2c82a86"
-                   "f:annotation" {"id" "_:fdb-5" "ex:data" "ok" "ex:originator" "txn"}}]
-                 (->> @(fluree/history ledger {:context        context
-                                               :commit-details true
-                                               :t              {:from 1 :to :latest}})
-                      (mapv (fn [c] (-> c (get "f:commit") (select-keys ["f:txn" "f:annotation"]))))))))
-
-        (testing "only single annotation subject permitted"
-          (let [invalid1 @(fluree/stage db0 {"@context" context
-                                             "insert" [{"@id" "ex:betty"
-                                                        "@type" "ex:Yeti"
+        db0 (fluree/db ledger)]
+    (testing "valid annotations"
+      (with-redefs [fluree.db.util.core/current-time-iso    (fn [] "1970-01-01T00:12:00.00000Z")
+                    fluree.db.json-ld.iri/new-blank-node-id (fn [] (str "_:fdb-" (swap! bnode-counter inc)))]
+        (let [db1 (->> @(fluree/stage db0 {"@context" context
+                                           "insert"   [{"@id"         "ex:betty"
+                                                        "@type"       "ex:Yeti"
                                                         "schema:name" "Betty"
-                                                        "schema:age" 55}]}
-                                        {:annotation {"ex:originator" "opts" "ex:nested" {"invalid" "true"}}})
-                invalid2 @(fluree/stage db0 {"@context" context
-                                             "insert" [{"@id" "ex:betty"
-                                                        "@type" "ex:Yeti"
-                                                        "schema:name" "Betty"
-                                                        "schema:age" 55}]}
-                                        {:annotation [{"ex:originator" "opts" "ex:multiple" true}
-                                                      {"ex:originator" "opts" "ex:invalid" true}]})]
-            (is (= "Commit annotation must only have a single subject." (ex-message invalid1)))
-            (is (= "Commit annotation must only have a single subject." (ex-message invalid2)))))
+                                                        "schema:age"  55}]})
+                       (fluree/commit! ledger)
+                       (deref))
 
-        (testing "annotation has no references"
-          (let [invalid3 @(fluree/stage db0 {"@context" context
-                                             "insert" [{"@id" "ex:betty"
-                                                        "@type" "ex:Yeti"
-                                                        "schema:name" "Betty"
-                                                        "schema:age" 55}]}
-                                        {:annotation [{"ex:originator" "opts" "@id" "invalid:subj"}]})]
-            (is (= "Commit annotation cannot specify a subject identifier." (ex-message invalid3)))))))))
+              db2 (->> @(fluree/stage db1 {"@context" context
+                                           "insert"   [{"@id"         "ex:freddy"
+                                                        "@type"       "ex:Yeti"
+                                                        "schema:name" "Freddy"
+                                                        "schema:age"  1002}]}
+                                      {:annotation {"ex:originator" "opts" "ex:data" false}})
+                       (fluree/commit! ledger)
+                       (deref))
+
+              db3 (->> @(fluree/stage db2 {"@context" context
+                                           "insert"   [{"@id"         "ex:letty"
+                                                        "@type"       "ex:Yeti"
+                                                        "schema:name" "Leticia"
+                                                        "schema:age"  38}]
+                                           "opts"     {"annotation" {"ex:originator" "txn" "ex:data" "ok"}}})
+                       (fluree/commit! ledger)
+                       (deref))]
+          (testing "annotations in commit-details"
+            (is (= [{"f:txn" "fluree:memory://2c28ed0d4102ff436641911c90f47f0681a9ae251640823f7f361f7e22a57fef"}
+                    {"f:txn"        "fluree:memory://cd26d7c28c0a5368694a6b8fbd11c573f0623313c06ae96c15ff016572972568"
+                     "f:annotation" {"id" "_:fdb-3" "ex:data" false "ex:originator" "opts"}}
+
+                    {"f:txn"        "fluree:memory://40ce18ee7469c565297e9b9e348788a891ab1bca8fdfda2116d7a2b6c2c82a86"
+                     "f:annotation" {"id" "_:fdb-5" "ex:data" "ok" "ex:originator" "txn"}}]
+                   (->> @(fluree/history ledger {:context        context
+                                                 :commit-details true
+                                                 :t              {:from 1 :to :latest}})
+                        (mapv (fn [c] (-> c (get "f:commit") (select-keys ["f:txn" "f:annotation"]))))))))))
+
+      (testing "invalid annotations"
+          (testing "only single annotation subject permitted"
+            (let [invalid2 @(fluree/stage db0 {"@context" context
+                                               "insert" [{"@id" "ex:betty"
+                                                          "@type" "ex:Yeti"
+                                                          "schema:name" "Betty"
+                                                          "schema:age" 55}]}
+                                          {:annotation [{"ex:originator" "opts" "ex:multiple" true}
+                                                        {"ex:originator" "opts" "ex:invalid" true}]})]
+              (is (= "Commit annotation must only have a single subject." (ex-message invalid2)))))
+
+          (testing "cannot specify id"
+            (let [invalid3 @(fluree/stage db0 {"@context" context
+                                               "insert" [{"@id" "ex:betty"
+                                                          "@type" "ex:Yeti"
+                                                          "schema:name" "Betty"
+                                                          "schema:age" 55}]}
+                                          {:annotation [{"ex:originator" "opts" "@id" "invalid:subj"}]})]
+              (is (= "Commit annotation cannot specify a subject identifier." (ex-message invalid3)))))
+
+          (testing "annotation has no references"
+            (let [invalid4 @(fluree/stage db0 {"@context" context
+                                               "insert" [{"@id" "ex:betty"
+                                                          "@type" "ex:Yeti"
+                                                          "schema:name" "Betty"
+                                                          "schema:age" 55}]}
+                                          {:annotation [{"ex:originator" "opts" "ex:friend" {"@id" "ex:betty"}}]})]
+              (is (= "Commit annotation cannot reference other subjects." (ex-message invalid4))
+                  "using id-map"))
+            (let [invalid4 @(fluree/stage db0 {"@context" context
+                                               "insert" [{"@id" "ex:betty"
+                                                          "@type" "ex:Yeti"
+                                                          "schema:name" "Betty"
+                                                          "schema:age" 55}]}
+                                          {:annotation [{"ex:originator" "opts" "ex:friend"
+                                                         {"@type" "xsd:anyURI" "@value" "ex:betty"}}]})]
+              (is (= "Commit annotation cannot reference other subjects." (ex-message invalid4))
+                  "using value-map with type xsd:anyURI"))
+            (let [invalid1 @(fluree/stage db0 {"@context" context
+                                               "insert" [{"@id" "ex:betty"
+                                                          "@type" "ex:Yeti"
+                                                          "schema:name" "Betty"
+                                                          "schema:age" 55}]}
+                                          {:annotation {"ex:originator" "opts" "ex:nested" {"valid" false}}})]
+              (is (= "Commit annotation cannot reference other subjects." (ex-message invalid1))
+                  "using implicit blank node identifier")))))))

@@ -608,16 +608,18 @@
 (declare parse-subj-cmp)
 
 (defn parse-object-value
-  [v datatype metadata]
+  [v datatype context metadata]
   (let [datatype* (iri/normalize datatype)]
-    (where/anonymous-value v datatype* metadata)))
+    (if (= datatype* const/iri-anyURI)
+      (where/match-iri (json-ld/expand-iri v context))
+      (where/anonymous-value v datatype* metadata))))
 
 (defn parse-obj-cmp
-  [allowed-vars subj-cmp pred-cmp m triples
+  [allowed-vars context subj-cmp pred-cmp m triples
    {:keys [list id value type language] :as v-map}]
   (cond list
         (reduce (fn [triples [i list-item]]
-                  (parse-obj-cmp allowed-vars subj-cmp pred-cmp {:i i} triples list-item))
+                  (parse-obj-cmp allowed-vars context subj-cmp pred-cmp {:i i} triples list-item))
                 triples
                 (map vector (range) list))
 
@@ -627,7 +629,7 @@
                     language (assoc :lang language))
           obj-cmp (if (v/variable? value)
                     (parse-variable-if-allowed allowed-vars value)
-                    (parse-object-value value type m*))]
+                    (parse-object-value value type context m*))]
       (conj triples [subj-cmp pred-cmp obj-cmp]))
 
     ;; ref object
@@ -645,15 +647,15 @@
                     ;; project newly created bnode-id into v-map
                     (assoc v-map :id (where/get-iri ref-cmp))
                     v-map)]
-      (conj (parse-subj-cmp allowed-vars triples v-map*)
+      (conj (parse-subj-cmp allowed-vars context triples v-map*)
             [subj-cmp pred-cmp ref-cmp]))))
 
 (defn parse-pred-cmp
-  [allowed-vars subj-cmp triples [pred values]]
+  [allowed-vars context subj-cmp triples [pred values]]
   (cond
     (v/variable? pred)
     (let [pred-cmp (parse-variable-if-allowed allowed-vars pred)]
-      (reduce (partial parse-obj-cmp allowed-vars subj-cmp pred-cmp nil)
+      (reduce (partial parse-obj-cmp allowed-vars context subj-cmp pred-cmp nil)
               triples
               values))
 
@@ -666,30 +668,30 @@
     (let [values*  (map (fn [typ] {:id typ})
                         values)
           pred-cmp (where/match-iri const/iri-rdf-type)]
-      (reduce (partial parse-obj-cmp allowed-vars subj-cmp pred-cmp nil)
+      (reduce (partial parse-obj-cmp allowed-vars context subj-cmp pred-cmp nil)
               triples
               values*))
 
     :else
     (let [pred-cmp (where/match-iri pred)]
-      (reduce (partial parse-obj-cmp allowed-vars subj-cmp pred-cmp nil)
+      (reduce (partial parse-obj-cmp allowed-vars context subj-cmp pred-cmp nil)
               triples
               values))))
 
 (defn parse-subj-cmp
-  [allowed-vars triples {:keys [id] :as node}]
+  [allowed-vars context triples {:keys [id] :as node}]
   (let [subj-cmp (cond (v/variable? id) (parse-variable-if-allowed allowed-vars id)
                        (nil? id)        (where/match-iri (iri/new-blank-node-id))
                        :else            (where/match-iri id))]
-    (reduce (partial parse-pred-cmp allowed-vars subj-cmp)
+    (reduce (partial parse-pred-cmp allowed-vars context subj-cmp)
             triples
             (dissoc node :id :idx))))
 
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
-  [allowed-vars expanded]
+  [allowed-vars context expanded]
   (try*
-    (reduce (partial parse-subj-cmp allowed-vars)
+    (reduce (partial parse-subj-cmp allowed-vars context)
             []
             expanded)
     (catch* e
@@ -708,11 +710,11 @@
         delete-clause (-> txn
                           (util/get-first-value const/iri-delete)
                           (json-ld/expand context))
-        delete        (->> delete-clause util/sequential (parse-triples bound-vars))
+        delete        (->> delete-clause util/sequential (parse-triples bound-vars context))
         insert-clause (-> txn
                           (util/get-first-value const/iri-insert)
                           (json-ld/expand context))
-        insert        (->> insert-clause util/sequential (parse-triples bound-vars))
+        insert        (->> insert-clause util/sequential (parse-triples bound-vars context))
         annotation    (util/get-first-value txn const/iri-annotation)]
     (when (and (empty? insert) (empty? delete))
       (throw (ex-info (str "Invalid transaction, insert or delete clause must contain nodes with objects.")
