@@ -623,7 +623,7 @@
    {:keys [list id value type language] :as v-map}]
   (cond list
         (reduce (fn [triples [i list-item]]
-                  (parse-obj-cmp allowed-vars subj-cmp pred-cmp {:i i} triples list-item))
+                  (parse-obj-cmp allowed-vars context subj-cmp pred-cmp {:i i} triples list-item))
                 triples
                 (map vector (range) list))
 
@@ -651,7 +651,7 @@
                     ;; project newly created bnode-id into v-map
                     (assoc v-map :id (where/get-iri ref-cmp))
                     v-map)]
-      (conj (parse-subj-cmp allowed-vars triples v-map*)
+      (conj (parse-subj-cmp allowed-vars context triples v-map*)
             [subj-cmp pred-cmp ref-cmp]))))
 
 (defn parse-pred-cmp
