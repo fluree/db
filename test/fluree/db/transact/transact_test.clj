@@ -156,7 +156,21 @@
                   :select  {:ex/wes [:*]}}]
       (is (= [{:id                        :ex/wes
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
-             @(fluree/query db query))))))
+             @(fluree/query db query)))))
+  (testing "iri value maps are handled correctly"
+    (let [conn @(fluree/connect {:method :memory})
+          ledger @(fluree/create conn "any-iri")
+          db0 (fluree/db ledger)
+
+          db1 @(fluree/stage db0 {"@context" {"ex" "http://example.com/"}
+                                  "insert" [{"@id" "ex:foo"
+                                             "ex:bar" {"@type" "http://www.w3.org/2001/XMLSchema#anyURI"
+                                                       "@value" "ex:baz"}}]})]
+      (is (= [{"@id" "http://example.com/foo"
+               "http://example.com/bar" {"@id" "http://example.com/baz"}}]
+             @(fluree/query db1 {"@context" nil
+                                 "select" {"http://example.com/foo" ["*"]}}))
+          "ex:baz is properly expanded and wrapped in an id-map"))))
 
 (deftest object-var-test
   (testing "var in object position works"
