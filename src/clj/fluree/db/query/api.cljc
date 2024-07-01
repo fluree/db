@@ -35,27 +35,43 @@
       (<? (history/query db context query)))))
 
 (defn sanitize-query-options
-  [opts did]
+  [opts {:keys [did] :as _opts}]
   (cond-> (util/parse-opts opts)
     did (assoc :did did :issuer did)))
+
+(defn db->policy-db
+  [db context {:keys [did default-allow?] :as _opts}]
+  (go-try
+    (if did
+      (<? (perm/wrap-identity-policy db did default-allow? nil))
+      db)))
+
+(defn db->time-travel-db
+  [db {:keys [t] :as _opts}]
+  (go-try
+    (if t
+      (<? (time-travel/as-of db t))
+      db)))
+
+(defn db->reasoned-db
+  [db opts]
+  (go-try
+    (let [{:keys [reasoner-methods rule-graphs rule-dbs] :as reasoning} opts]
+      (if reasoner-methods
+        (<? (reasoner/reason db
+                             reasoner-methods
+                             reasoning
+                             opts))
+        time-travel-db))))
 
 (defn restrict-db
   [db t {:keys [did default-allow?] :as opts}]
   (go-try
-    (let [policy-db      (if did
-                           (<? (perm/wrap-identity-policy db did default-allow? nil))
-                           db)
-          time-travel-db (-> (if t
-                               (<? (time-travel/as-of policy-db t))
-                               policy-db))
-          reasoned-db    (let [{:keys [reasoner-methods rule-graphs rule-dbs] :as reasoning} opts]
-                           (if reasoner-methods
-                             (<? (reasoner/reason time-travel-db
-                                                  reasoner-methods
-                                                  reasoning
-                                                  opts))
-                             time-travel-db))]
-      (assoc-in reasoned-db [:policy :cache] (atom {})))))
+    (let [restricted-db (-> db
+                            (db->policy-db context opts)
+                            (db->time-travel-db t)
+                            (db->reasoned-db opts))]
+      (assoc-in restricted-db [:policy :cache] (atom {})))))
     
 (defn track-query
   [ds max-fuel query]
@@ -81,10 +97,9 @@
   ([ds query] (query-fql ds query nil))
   ([ds query {:keys [did issuer] :as _opts}]
    (go-try
-    ;; TODO - verify if both 'did' and 'issuer' opts are still needed upstream
-    (let [{:keys [t opts] :as query*} (update query :opts sanitize-query-options (or did issuer))
-
-          ;; TODO - remove restrict-db from here, restriction should happen
+     ;; TODO - verify if both 'did' and 'issuer' opts are still needed upstream
+     (let [{:keys [t opts] :as query*} (update query :opts sanitize-query-options (or did issuer))
+           ;; TODO - remove restrict-db from here, restriction should happen
           ;;      - upstream if needed
           ds*      (if (dataset? ds)
                      ds
@@ -96,16 +111,16 @@
         (<? (fql/query ds* query**)))))))
 
 (defn query-sparql
-  [db query]
+  [db query & [request-opts]]
   (go-try
     (let [fql (sparql/->fql query)]
-      (<? (query-fql db fql)))))
+      (<? (query-fql db fql request-opts)))))
 
 (defn query
-  [db query {:keys [format] :as _opts :or {format :fql}}]
+  [db query {:keys [format] :as request-opts :or {format :fql}}]
   (case format
-    :fql (query-fql db query)
-    :sparql (query-sparql db query)))
+    :fql (query-fql db query request-opts)
+    :sparql (query-sparql db query request-opts)))
 
 (defn contextualize-ledger-400-error
   [info-str e]
