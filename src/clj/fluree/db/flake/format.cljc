@@ -1,4 +1,4 @@
-(ns fluree.db.db.json-ld.format
+(ns fluree.db.flake.format
   (:require [fluree.db.query.json-ld.response :as jld-response]
             [clojure.core.async :as async :refer [go]]
             [fluree.db.query.range :as query-range]

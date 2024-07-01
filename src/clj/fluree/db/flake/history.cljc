@@ -1,9 +1,9 @@
-(ns fluree.db.db.json-ld.history
+(ns fluree.db.flake.history
   (:require [clojure.core.async :as async :refer [go >! <!]]
             [fluree.db.query.history.parse :as parse]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
-            [fluree.db.db.json-ld.format :as jld-format]
+            [fluree.db.flake.format :as jld-format]
             [fluree.db.flake :as flake]
             [fluree.db.index :as index]
             [fluree.db.time-travel :as time-travel]

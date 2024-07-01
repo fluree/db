@@ -6,7 +6,7 @@
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.indexer.default :as indexer]
-            [fluree.db.db.json-ld :as db]
+            [fluree.db.flake.flake-db :as db]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]

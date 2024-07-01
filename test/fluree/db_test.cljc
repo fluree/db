@@ -7,7 +7,7 @@
             [fluree.db :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
-            #?@(:clj ([fluree.db.database.async :as async-db]
+            #?@(:clj ([fluree.db.async-db :as async-db]
                       [clojure.core.async :as async]))
             #?(:clj  [test-with-files.tools :refer [with-tmp-dir]
                       :as twf]

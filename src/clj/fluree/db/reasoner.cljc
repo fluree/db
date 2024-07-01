@@ -5,7 +5,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.log :as log]
-            [fluree.db.db.json-ld :as db :refer [db?]]
+            [fluree.db.flake.flake-db :as db :refer [db?]]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
             [fluree.db.fuel :as fuel]
