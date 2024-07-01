@@ -2,7 +2,7 @@
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.did :as did]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
             [jsonista.core :as json]

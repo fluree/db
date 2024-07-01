@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.crypto :as crypto]
             [fluree.db.did :as did]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db :as fluree]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]

@@ -1,7 +1,7 @@
 (ns fluree.sdk.node
   (:require [cljs.nodejs :as node-js]
             [clojure.string :as str]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db :as fluree]
             [fluree.db.util.log :as log]
             ["@peculiar/webcrypto" :refer [Crypto]]))
 

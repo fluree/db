@@ -1,7 +1,7 @@
 (ns fluree.db.query.misc-queries-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db :as fluree]
             [fluree.db.util.core :as util]
             [test-with-files.tools :refer [with-tmp-dir]]))
 

@@ -1,6 +1,4 @@
-(ns fluree.db.json-ld.api
-  {:deprecated "3.0"
-   :superseded-by "fluree.db"}
+(ns fluree.db
   (:require [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
@@ -31,9 +29,7 @@
 
 (declare query)
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/promise-wrap"}
-  promise-wrap
+(defn promise-wrap
   "Wraps an async channel that will contain a response in a promise."
   [port]
   #?(:clj
@@ -55,9 +51,7 @@
 
 ;; ledger operations
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/connect"}
-  connect
+(defn connect
   "Forms connection to ledger, enabling automatic pulls of new updates, event
   services, index service.
 
@@ -92,15 +86,11 @@
                    :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
                                          {:status 400, :error :db/unsupported-operation})))))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/connect-file"}
-  connect-file
+(defn connect-file
   [opts]
   (connect (assoc opts :method :file)))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/connect-ipfs"}
-  connect-ipfs
+(defn connect-ipfs
   "Forms an ipfs connection using default settings.
   - server - (optional) IPFS http api server endpoint, defaults to http://127.0.0.1:5001/
   - profile - (optional) IPFS stored profile to use.
@@ -108,25 +98,19 @@
   [opts]
   (connect (assoc opts :method :ipfs)))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/connect-memory"}
-  connect-memory
+(defn connect-memory
   "Forms an in-memory connection using default settings.
   - did - (optional) DId information to use, if storing blocks as verifiable credentials"
   [opts]
   (connect (assoc opts :method :memory)))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/address?"}
-  address?
+(defn address?
   "Returns true if the argument is a full ledger address, false if it is just an
   alias."
   [ledger-alias-or-address]
   (jld-ledger/fluree-address? ledger-alias-or-address))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/create"}
-  create
+(defn create
   "Creates a new json-ld ledger. A connection (conn)
   must always be supplied.
 
@@ -152,27 +136,21 @@
       (log/info "Creating ledger" ledger-alias)
       (jld-ledger/create conn ledger-alias opts)))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/alias->address"}
-  alias->address
+(defn alias->address
   "Returns a core.async channel with the connection-specific address of the
   given ledger-alias."
   [conn ledger-alias]
   (log/debug "Looking up address for ledger alias" ledger-alias)
   (nameservice/primary-address conn ledger-alias nil))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/load"}
-  load
+(defn load
   "Loads an existing ledger by its alias (which will be converted to a
   connection-specific address first)."
   [conn alias-or-address]
   (promise-wrap
     (jld-ledger/load conn alias-or-address)))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/exists?"}
-  exists?
+(defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
   otherwise."
   [conn ledger-alias-or-address]
@@ -184,9 +162,7 @@
         (log/debug "exists? - ledger address:" address)
         (<! (nameservice/exists? conn address))))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/notify"}
-  notify
+(defn notify
   "Notifies the connection with a new commit map (parsed JSON commit with string keys).
 
   If the connection knows of the ledger, and is currently maintaining
@@ -202,38 +178,28 @@
                  {:status 400 :error :db/invalid-commit-map})))))
 
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/index"}
-  index
+(defn index
   "Performs indexing operation on the specified ledger"
   [ledger])
 
 
 ;; MAYBE CHALLENGE?
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/validate"}
-  validate
+(defn validate
   "Validates a ledger, checks block integrity along with signatures."
   [])
 
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/pull"}
-  pull
+(defn pull
   "Checks name service for ledger and pulls latest version locally."
   [])
 
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/combine"}
-  combine
+(defn combine
   "Combines multiple ledgers into a new, read-only ledger."
   [])
 
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/stage"}
-  stage
+(defn stage
   "Performs a transaction and queues change if valid (does not commit)"
   ([db json-ld] (stage db json-ld nil))
   ([db json-ld opts]
@@ -241,9 +207,7 @@
      (promise-wrap result-ch))))
 
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/commit!"}
-  commit!
+(defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
   aggregated together.
 
@@ -257,65 +221,49 @@
    (promise-wrap
      (ledger/-commit! ledger db opts))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/transact!"}
-  transact!
+(defn transact!
   [conn txn]
   (promise-wrap
     (transact-api/transact! conn txn)))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/create-with-txn"}
-  create-with-txn
+(defn create-with-txn
   [conn txn]
   (promise-wrap
     (transact-api/create-with-txn conn txn)))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/status"}
-  status
+(defn status
   "Returns current status of ledger branch."
   ([ledger] (ledger/-status ledger))
   ([ledger branch] (ledger/-status ledger branch)))
 
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/push"}
-  push
+(defn push
   "Pushes all commits since last push to a name service, e.g. a Fluree Network, IPNS, DNS, Fluree Nexus.
   Depending on consensus requirements for a Fluree Network, will accept or reject push as newest update."
   [])
 
 
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/squash"}
-  squash
+(defn squash
   "Squashes multiple unpublished commits into a single unpublished commit"
   [])
 
 
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/merge"}
-  merge
+(defn merge
   "Merges changes from one branch into another branch."
   [])
 
 
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/branch"}
-  branch
+(defn branch
   "Creates a new branch of a given ledger"
   [])
 
 
 ;; db operations
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/db"}
-  db
+(defn db
   "Retrieves latest db, or optionally a db at a moment in time
   and/or permissioned to a specific identity."
   ([ledger]
@@ -326,18 +274,14 @@
                      {:status 500 :error :db/unexpected-error}))
      (ledger/-db ledger))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/wrap-policy"}
-  wrap-policy
+(defn wrap-policy
   ([db policy default-allow?]
    (wrap-policy db policy default-allow? nil))
   ([db policy default-allow? values-map]
    (promise-wrap
     (policy/wrap-policy db policy default-allow? values-map))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/wrap-identity-policy"}
-  wrap-identity-policy
+(defn wrap-identity-policy
   "For provided identity, locates specific property f:policyClass on
   the identity containing a list of class IRIs that identity the policies
   that should be applied to the identity.
@@ -350,9 +294,7 @@
    (promise-wrap
     (policy/wrap-identity-policy db identity default-allow? values-map))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/dataset"}
-  dataset
+(defn dataset
   "Creates a composed dataset from multiple resolved graph databases.
 
   The databases to be composed are supplied as a map with a string alias
@@ -378,17 +320,13 @@
   ([named-graphs default-graphs]
    (query-api/dataset named-graphs default-graphs)))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/query"}
-  query
+(defn query
   "Queries a dataset or single db and returns a promise with the results."
   ([ds q] (query ds q {}))
   ([ds q opts]
    (promise-wrap (query-api/query ds q opts))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/credential-query"}
-  credential-query
+(defn credential-query
   "Issues a policy-enforced query to the specified dataset/db as a verifiable
   credential.
 
@@ -399,7 +337,7 @@
   ([ds cred-query {:keys [default-allow? values-map] :as opts}]
    (promise-wrap
     (go-try
-      (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
+     (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
        (log/debug "Credential query with identity: " identity " and query: " query)
        (cond
          (and query identity)
@@ -418,9 +356,7 @@
          (throw (ex-info "Invalid credential"
                          {:status 400 :error :db/invalid-credential}))))))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/query-connection"}
-  query-connection
+(defn query-connection
   "Queries the latest db in the ledger specified by the 'from' parameter in the
   query (what that actually looks like is format-specific). Returns a promise
   with the results."
@@ -428,9 +364,7 @@
   ([conn q opts]
    (promise-wrap (query-api/query-connection conn q opts))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/history"}
-  history
+(defn history
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   ([ledger query]
@@ -439,15 +373,13 @@
      (promise-wrap res-chan)))
   ([ledger query {:keys [policy identity default-allow? values-map] :as _opts}]
    (promise-wrap
-     (let [latest-db (ledger/-db ledger)
-           policy-db (if identity
-                       (<? (policy/wrap-identity-policy latest-db identity default-allow? values-map))
-                       (<? (policy/wrap-policy latest-db policy default-allow? values-map)))]
+    (let [latest-db (ledger/-db ledger)
+          policy-db (if identity
+                      (<? (policy/wrap-identity-policy latest-db identity default-allow? values-map))
+                      (<? (policy/wrap-policy latest-db policy default-allow? values-map)))]
       (query-api/history policy-db query)))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/credential-history"}
-  credential-history
+(defn credential-history
   "Issues a policy-enforced history query to the specified ledger as a
   verifiable credential.
 
@@ -458,8 +390,8 @@
   ([ledger cred-query {:keys [default-allow? values-map] :as opts}]
    (promise-wrap
     (go-try
-      (let [latest-db                       (ledger/-db ledger)
-            {query :subject, identity :did} (<? (cred/verify cred-query))]
+     (let [latest-db (ledger/-db ledger)
+           {query :subject, identity :did} (<? (cred/verify cred-query))]
        (log/debug "Credential history query with identity: " identity " and query: " query)
        (cond
          (and query identity)
@@ -478,9 +410,7 @@
          (throw (ex-info "Invalid credential"
                          {:status 400 :error :db/invalid-credential}))))))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/range"}
-  range
+(defn range
   "Performs a range scan against the specified index using test functions
   of >=, <=, >, <"
   ;; TODO - assert index is valid index type
@@ -491,34 +421,26 @@
    (promise-wrap
      (query-range/index-range db index start-test start-match end-test end-match))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/slice"}
-  slice
+(defn slice
   "Like range, but returns all flakes that match the supplied flake parts."
   [db index match]
   (promise-wrap
     (query-range/index-range db index = match)))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/expand-iri"}
-  expand-iri
+(defn expand-iri
   "Expands given IRI with the default database context, or provided context."
   ([context compact-iri]
    (json-ld/expand-iri compact-iri
                        (json-ld/parse-context context))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/encode-iri"}
-  encode-iri
+(defn encode-iri
   "Returns the internal Fluree IRI identifier (a compact form).
   This can be used for doing range scans, slices and for other
   more advanced needs."
   [db iri]
   (iri/encode-iri db iri))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/internal-id"}
-  internal-id
+(defn internal-id
   "Deprecated, use encode-iri instead."
   {:deprecated true}
   [db iri]
@@ -526,9 +448,7 @@
     (println "WARNING: (internal-id db iri) is deprecated, use (encode-iri db iri).")
     (encode-iri db iri)))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/decode-iri"}
-  decode-iri
+(defn decode-iri
   "Opposite of encode-iri. When doing more advanced features
   like direct range-scans of indexes, IRIs are returned in their
   internal compact format. This allows the IRI to be returned
@@ -538,9 +458,7 @@
 
 ;; reasoning APIs
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/reason"}
-  reason
+(defn reason
   "Sets the reasoner methods(s) to perform on a db.
   Supported methods are :datalog and :owl2rl.
   One or more methods can be supplied as a sequential list/vector.
@@ -556,9 +474,7 @@
    (promise-wrap
      (reasoner/reason db methods rules-graph opts))))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/reasoned-count"}
-  reasoned-count
+(defn reasoned-count
   "Returns a count of reasoned facts in the provided db."
   [db]
   (let [spot (-> db :novelty :spot)]
@@ -568,9 +484,7 @@
                 n))
             0 spot)))
 
-(defn ^{:deprecated    "3.0"
-        :superseded-by "fluree.db/reasoned-facts"}
-  reasoned-facts
+(defn reasoned-facts
   "Returns all reasoned facts in the provided db as  4-tuples of:
   [subject property object rule-iri]
   where the rule-iri is the @id of the rule that generated the fact
@@ -588,16 +502,16 @@
   ([db] (reasoned-facts db nil))
   ([db opts]
    (let [group-fn (case (:group-by opts)
-                    nil       nil
-                    :subject  (fn [p] (nth p 0))
+                    nil nil
+                    :subject (fn [p] (nth p 0))
                     :property (fn [p] (nth p 1))
-                    :rule     (fn [p] (nth p 3)))
+                    :rule (fn [p] (nth p 3)))
          triples+ (juxt #(decode-iri db (flake/s %))
                         #(decode-iri db (flake/p %))
                         #(as-> (flake/o %) o
-                           (if (iri/sid? o)
-                             (decode-iri db o)
-                             o))
+                               (if (iri/sid? o)
+                                 (decode-iri db o)
+                                 o))
                         #(jld-db/reasoned-rule? %))
          result   (->> db :novelty :spot
                        jld-db/reasoned-flakes

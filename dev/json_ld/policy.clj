@@ -1,5 +1,5 @@
 (ns json-ld.policy
-  (:require [fluree.db.json-ld.api :as fluree]
+  (:require [fluree.db :as fluree]
             [fluree.db.util.async :refer [<?? go-try channel?]]
             [fluree.db.did :as did]))
 
