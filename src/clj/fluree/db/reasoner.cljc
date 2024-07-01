@@ -198,7 +198,7 @@
                          by-subj)
             parsed     (->> statements
                             json-ld/expand
-                            (q-parse/parse-triples nil))]
+                            (q-parse/parse-triples nil nil))]
         (assoc acc rule-id {:insert parsed})))
     {}
     inserts))
