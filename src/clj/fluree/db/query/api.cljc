@@ -40,10 +40,17 @@
     did (assoc :did did :issuer did)))
 
 (defn db->policy-db
+<<<<<<< HEAD:src/clj/fluree/db/query/api.cljc
   [db context {:keys [did default-allow?] :as _opts}]
   (go-try
     (if did
       (<? (perm/wrap-identity-policy db did default-allow? nil))
+=======
+  [db context request-opts]
+  (go-try
+    (if-let [policy-identity (perm/parse-policy-identity request-opts context)]
+      (<? (perm/wrap-identity-policy db policy-identity false nil))
+>>>>>>> 6a46027f (Move condense sparql-query and fql-query into query):src/clj/fluree/db/api/query.cljc
       db)))
 
 (defn db->time-travel-db
@@ -54,14 +61,14 @@
       db)))
 
 (defn db->reasoned-db
-  [db opts]
+  [db request-opts]
   (go-try
-    (let [{:keys [reasoner-methods rule-graphs rule-dbs] :as reasoning} opts]
+    (let [{:keys [reasoner-methods rule-graphs rule-dbs] :as reasoning} request-opts]
       (if reasoner-methods
         (<? (reasoner/reason db
                              reasoner-methods
                              reasoning
-                             opts))
+                             request-opts))
         time-travel-db))))
 
 (defn restrict-db
@@ -91,36 +98,29 @@
                                      :fuel   (fuel/tally fuel-tracker)}
                                     e)))))))
 
-(defn query-fql
-  "Execute a query against a database source. Returns core async channel
-  containing result or exception."
-  ([ds query] (query-fql ds query nil))
-  ([ds query {:keys [did issuer] :as _opts}]
-   (go-try
-     ;; TODO - verify if both 'did' and 'issuer' opts are still needed upstream
-     (let [{:keys [t opts] :as query*} (update query :opts sanitize-query-options (or did issuer))
-           ;; TODO - remove restrict-db from here, restriction should happen
-          ;;      - upstream if needed
-          ds*      (if (dataset? ds)
-                     ds
-                     (<? (restrict-db ds t opts)))
-          query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
-          max-fuel (:max-fuel opts)]
-      (if (::util/track-fuel? opts)
-        (<? (track-query ds* max-fuel query**))
-        (<? (fql/query ds* query**)))))))
-
-(defn query-sparql
-  [db query & [request-opts]]
-  (go-try
-    (let [fql (sparql/->fql query)]
-      (<? (query-fql db fql request-opts)))))
-
 (defn query
-  [db query {:keys [format] :as request-opts :or {format :fql}}]
-  (case format
-    :fql (query-fql db query request-opts)
-    :sparql (query-sparql db query request-opts)))
+  ([db query*]
+   (query db query* nil))
+  ([db query {:keys [format] :as opts}]
+   (go-try
+     (let [fql-query   (if (= :sparql format)
+                         (sparql/->fql query)
+                         query)          
+           
+           {:keys [t opts] :as sanitized-query}
+           (update fql-query :opts sanitize-query-options did)
+           
+           final-query (update sanitized-query :opts dissoc :meta :max-fuel ::util/track-fuel?)
+           
+           dataset     (if (dataset? ds)
+                         ds
+                         (as-> ds $
+                           (<? (db->policy-db $ (ctx-util/extract verified-query) opts))
+                           (<? (db->time-travel-db $ t))
+                           (<? (db->reasoned-db $ opts))]
+       (if (::util/track-fuel? opts)
+         (<? (track-query dataset (:max-fuel opts) final-query))
+         (<? (fql/query dataset final-query)))))))
 
 (defn contextualize-ledger-400-error
   [info-str e]
