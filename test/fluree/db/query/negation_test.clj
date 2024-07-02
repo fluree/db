@@ -94,4 +94,23 @@
                                  "select"   ["?s" "?p" "?o"]
                                  "where"    [{"@id" "?s" "?p" "?o"}
                                              ["minus" [{"@id" "ex:alice" "ex:familyName" "Smith"}]]]}))
-          "no match of bindings so nothing is removed"))))
+          "no match of bindings so nothing is removed"))
+
+    (testing "inner filters"
+      (let [db1 @(fluree/stage db0 {"insert" [{"@id" "ex:a"
+                                               "ex:p" 1
+                                               "ex:q" [1 2]}
+                                              {"@id" "ex:b"
+                                               "ex:p" 3.0
+                                               "ex:q" [4.0 5.0]}]})]
+        (is (= [["ex:b" 3.0M]]
+               @(fluree/query db1 {"where" [{"@id" "?x" "ex:p" "?p"}
+                                            ["not-exists" [{"@id" "?x" "ex:q" "?q"}
+                                                           ["filter" "(= ?p ?q)"]]]]
+                                   "select" ["?x" "?p"]})))
+        (is (= [["ex:a" 1]
+                ["ex:b" 3.0M]]
+               @(fluree/query db1 {"where" [{"@id" "?x" "ex:p" "?p"}
+                                            ["minus" [{"@id" "?x" "ex:q" "?q"}
+                                                      ["filter" "(= ?p ?q)"]]]]
+                                   "select" ["?x" "?p"]})))))))
