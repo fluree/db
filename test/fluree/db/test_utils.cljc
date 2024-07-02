@@ -130,14 +130,14 @@
     "schema:email" "cam@example.org"
     "schema:age"   34
     "ex:favNums"   [5, 10]
-    "ex:friend"    ["ex:brian" "ex:alice"]}
+    "ex:friend"    [{"@id" "ex:brian"} {"@id" "ex:alice"}]}
    {"id"           "ex:liam"
     "type"         "ex:User"
     "schema:name"  "Liam"
     "schema:email" "liam@example.org"
     "schema:age"   13
     "ex:favNums"   [42, 11]
-    "ex:friend"    ["ex:brian" "ex:alice" "ex:cam"]}])
+    "ex:friend"    [{"@id" "ex:brian"} {"@id" "ex:alice"} {"@id" "ex:cam"}]}])
 
 (defn create-conn
   ([]

@@ -34,7 +34,46 @@
           (is (= [["foo1"] ["foo2"] ["foo3"]]
                  @(fluree/query db1 {"select" ["?foo"]
                                      "values" ["?foo" ["foo1" "foo2" "foo3" ]]}))
-              "syntactic form is parsed correctly"))))
+              "syntactic form is parsed correctly")))
+      (testing "iri values"
+        (is (= [["Brian" "brian@example.org"]
+                ["Cam" "cam@example.org"]]
+               @(fluree/query db1 {"@context" context
+                                   "select" ["?name" "?email"]
+                                   "values" ["?s" [{"@type" "@id" "@value" "ex:brian"}
+                                                   {"@type" "@id" "@value" "ex:cam"}]]
+                                   "where" [{"@id" "?s" "schema:name" "?name"}
+                                            {"@id" "?s" "schema:email" "?email"}]}))
+            "id-maps can be used to distinguish iris")
+        (is (= [["Brian" "brian@example.org"]
+                ["Cam" "cam@example.org"]]
+               @(fluree/query db1 {"@context" context
+                                   "select" ["?name" "?email"]
+                                   "values" ["?s" [{"@value" "ex:brian"
+                                                    "@type" "@id"}
+                                                   {"@value" "ex:cam"
+                                                    "@type" "@id"}]]
+                                   "where" [{"@id" "?s" "schema:name" "?name"}
+                                            {"@id" "?s" "schema:email" "?email"}]}))
+            "id-maps can be used to distinguish iris")
+        (testing "equivalent syntactic forms"
+          (is (= [["ex:cam"] ["ex:liam"]]
+                 @(fluree/query db1 {"@context" context
+                                     "where" [{"@id" "?s" "ex:friend" {"@id" "ex:alice"}}]
+                                     "select" ["?s"]}))
+              "iri literal")
+          (is (= [["ex:cam"] ["ex:liam"]]
+                 @(fluree/query db1 {"@context" context
+                                     "values" ["?friend" [{"@value" "ex:alice" "@type" "@id"}]]
+                                     "where" [{"@id" "?s" "ex:friend" "?friend"}]
+                                     "select" ["?s"]}))
+              "variable")
+          (is (= [["ex:cam"] ["ex:liam"]]
+                 @(fluree/query db1 {"@context" context
+                                     "values" ["?friend" [{"@value" "ex:alice" "@type" "@id"}]]
+                                     "where" [{"@id" "?s" "ex:friend" {"@id" "?friend"}}]
+                                     "select" ["?s"]}))
+              "variable in id-map"))))
     (testing "where pattern"
       (testing "single var"
         (is (= [["Brian" "brian@example.org"]
@@ -56,7 +95,7 @@
                                             {"@id" "?s" "schema:email" "?email"}
                                             ["values"
                                              [["?s"] [[{"@type" "xsd:anyURI" "@value" "ex:cam"}]
-                                                      [{"@type" "xsd:anyURI" "@value" "ex:brian"}]]]]]}))
+                                                      [{"@type" "@id" "@value" "ex:brian"}]]]]]}))
             "syntactic form is parsed correctly"))
       (testing "nested under optional clause"
         (is (= [["Nikola" nil true]]
