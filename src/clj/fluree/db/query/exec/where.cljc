@@ -1,5 +1,6 @@
 (ns fluree.db.query.exec.where
   (:require [clojure.core.async :as async :refer [>! go]]
+            [clojure.set :as set]
             [clojure.string :as str]
             [clojure.set :as set]
             [fluree.db.flake :as flake]
