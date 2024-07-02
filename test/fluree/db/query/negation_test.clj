@@ -54,18 +54,21 @@
              @(fluree/query db1 {"@context" context
                                  "select"   ["?s" "?p" "?o"]
                                  "where"    [{"@id" "?s" "?p" "?o"}
-                                             ["not-exists" [{"@id" "?x" "?y" "?z"}]]]})))
+                                             ["not-exists" [{"@id" "?x" "?y" "?z"}]]]}))
+          "two patterns match the same data, everything is filtered out")
       (is (= []
              @(fluree/query db1 {"@context" context
                                  "select"   ["?s" "?p" "?o"]
                                  "where"    [{"@id" "?s" "?p" "?o"}
-                                             ["not-exists" [{"@id" "ex:alice" "type" "ex:Person"}]]]}))))
+                                             ["not-exists" [{"@id" "ex:alice" "type" "ex:Person"}]]]}))
+          "[ex:alice type ex:Person] does exist, so all [?s ?p ?o] are filtered out"))
     (testing "minus"
       (is (= ["ex:alice" "ex:carol"]
              @(fluree/query db1 {"@context"       context
                                  "selectDistinct" "?s"
                                  "where"          [{"@id" "?s" "?p" "?o"}
-                                                   ["minus" [{"@id" "?s" "ex:givenName" "Bob"}]]]})))
+                                                   ["minus" [{"@id" "?s" "ex:givenName" "Bob"}]]]}))
+          "ex:bob is removed from the solution set")
       (is (= [["ex:alice" "type" "ex:Person"]
               ["ex:alice" "ex:familyName" "Smith"]
               ["ex:alice" "ex:givenName" "Alice"]
@@ -77,13 +80,10 @@
              @(fluree/query db1 {"@context" context
                                  "select"   ["?s" "?p" "?o"]
                                  "where"    [{"@id" "?s" "?p" "?o"}
-                                             ["minus" [{"@id" "?x" "?y" "?z"}]]]})))
-      (is (= []
-             @(fluree/query db1 {"@context" context
-                                 "select"   ["?s" "?p" "?o"]
-                                 "where"    [{"@id" "?s" "?p" "?o"}
-                                             ["minus" [{"@id" "ex:alice" "ex:familyName" "Smith"}]]]})))
+                                             ["minus" [{"@id" "?x" "?y" "?z"}]]]}))
+          "nothing is removed from the solution set because there are no variables in common")
       (is (= [["ex:alice" "type" "ex:Person"]
+              ["ex:alice" "ex:familyName" "Smith"]
               ["ex:alice" "ex:givenName" "Alice"]
               ["ex:alice" "ex:nickname" "Ali"]
               ["ex:bob" "ex:familyName" "Jones"]
@@ -93,4 +93,5 @@
              @(fluree/query db1 {"@context" context
                                  "select"   ["?s" "?p" "?o"]
                                  "where"    [{"@id" "?s" "?p" "?o"}
-                                             ["minus" [{"@id" "ex:alice" "ex:familyName" "Smith"}]]]}))))))
+                                             ["minus" [{"@id" "ex:alice" "ex:familyName" "Smith"}]]]}))
+          "no match of bindings so nothing is removed"))))

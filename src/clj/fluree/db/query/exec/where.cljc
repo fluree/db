@@ -480,10 +480,12 @@
   (let [clause (pattern-data pattern)
         out-ch (async/chan 2 (filter (fn [minus-solution]
                                        (let [vars (keys minus-solution)]
-                                         (= minus-solution (select-keys solution vars))))))]
+                                         ;; only retain minus solutions that match the provided solution
+                                         ;; empty solutions will always match everything, so remove those as well
+                                         (and (not-empty minus-solution)
+                                              (= minus-solution (select-keys solution vars)))))))]
     (go
-      ;; if there are any matches, remove the solution
-      (when-not (-> (match-clause ds fuel-tracker solution clause error-ch)
+      (when-not (-> (match-clause ds fuel-tracker {} clause error-ch)
                     (async/pipe out-ch)
                     (async/<!))
         solution))))
