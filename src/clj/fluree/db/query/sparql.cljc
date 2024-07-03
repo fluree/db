@@ -9,8 +9,19 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def grammar #?(:clj  (io/resource "sparql.bnf")
-                :cljs (inline-resource "sparql.bnf")))
+(def PN_CHARS_BASE
+  "CLJ and CLJS use different (and incompatible) unicode character syntax, so in the regex
+  for PN_CHARS_BASE needs to be platform specific."
+  #?(:clj
+     (slurp (io/resource "sparql.pn_chars_base.jvm.bnf"))
+     :cljs
+     (inline-resource "sparql.pn_chars_base.js.bnf")))
+
+(def grammar
+  (str
+    #?(:clj  (slurp (io/resource "sparql.bnf"))
+       :cljs (inline-resource "sparql.bnf"))
+    PN_CHARS_BASE))
 
 (defparser parser grammar)
 
