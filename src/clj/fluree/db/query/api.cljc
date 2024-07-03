@@ -26,6 +26,12 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn q
+  ([ds-or-db query]
+   (fql/query ds-or-db query))
+  ([ds-or-db fuel-tracker query]
+   (fql/query ds-or-db fuel-tracker query)))
+
 (defn history
   "Return a summary of the changes over time, optionally with the full commit
   details included."
@@ -40,17 +46,10 @@
     did (assoc :did did :issuer did)))
 
 (defn db->policy-db
-<<<<<<< HEAD:src/clj/fluree/db/query/api.cljc
   [db context {:keys [did default-allow?] :as _opts}]
   (go-try
     (if did
       (<? (perm/wrap-identity-policy db did default-allow? nil))
-=======
-  [db context request-opts]
-  (go-try
-    (if-let [policy-identity (perm/parse-policy-identity request-opts context)]
-      (<? (perm/wrap-identity-policy db policy-identity false nil))
->>>>>>> 6a46027f (Move condense sparql-query and fql-query into query):src/clj/fluree/db/api/query.cljc
       db)))
 
 (defn db->time-travel-db
@@ -86,7 +85,7 @@
     (let [start #?(:clj (System/nanoTime)
                    :cljs (util/current-time-millis))
           fuel-tracker  (fuel/tracker max-fuel)]
-      (try* (let [result (<? (fql/query ds fuel-tracker query))]
+      (try* (let [result (<? (q ds fuel-tracker query))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start)
@@ -120,7 +119,7 @@
                            (<? (db->reasoned-db $ opts))]
        (if (::util/track-fuel? opts)
          (<? (track-query dataset (:max-fuel opts) final-query))
-         (<? (fql/query dataset final-query)))))))
+         (<? (q dataset final-query)))))))
 
 (defn contextualize-ledger-400-error
   [info-str e]
@@ -264,8 +263,8 @@
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel ::util/track-fuel?)
               max-fuel      (:max-fuel opts)]
           (if (::util/track-fuel? opts)
-            (<? (track-query ds max-fuel trimmed-query))
-            (<? (fql/query ds trimmed-query))))
+            (<? (track-query ds max-fuel query**))
+            (<? (q ds query**))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))
 
