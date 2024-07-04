@@ -1,6 +1,6 @@
 (ns fluree.sdk.webworker
   (:require [cljs.core.async :as async]
-            [fluree.db.api.query :as q]
+            [fluree.db.query.api :as q]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
