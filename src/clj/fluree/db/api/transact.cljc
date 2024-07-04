@@ -3,7 +3,7 @@
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.json-ld.transact :as tx]
+            [fluree.db.transact :as tx]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
