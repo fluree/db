@@ -1,7 +1,7 @@
 (ns json-ld.query
   (:require [clojure.core.async :as async]
             [fluree.db.flake :as flake]
-            [fluree.db :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.util.async :refer [<?? go-try channel?]]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]

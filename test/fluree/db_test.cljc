@@ -4,7 +4,7 @@
             #?@(:cljs [[clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]])
             [fluree.db.did :as did]
-            [fluree.db :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
             #?@(:clj ([fluree.db.database.async :as async-db]

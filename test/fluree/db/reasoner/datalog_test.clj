@@ -1,6 +1,6 @@
 (ns fluree.db.reasoner.datalog-test
   (:require [clojure.test :refer :all]
-            [fluree.db :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
 (def reasoning-db-data

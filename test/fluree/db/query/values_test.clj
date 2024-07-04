@@ -1,6 +1,6 @@
 (ns fluree.db.query.values-test
   (:require  [clojure.test :as t :refer [deftest testing is]]
-             [fluree.db :as fluree]
+             [fluree.db.api :as fluree]
              [fluree.db.test-utils :as test-utils]))
 
 (deftest values

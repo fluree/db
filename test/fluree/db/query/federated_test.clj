@@ -1,7 +1,7 @@
 (ns fluree.db.query.federated-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db :as fluree]))
+            [fluree.db.api :as fluree]))
 
 (deftest ^:integration federated-query-connection-test
   (testing "Federated queries using query-connection"
