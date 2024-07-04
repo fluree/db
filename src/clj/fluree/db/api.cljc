@@ -1,4 +1,4 @@
-(ns fluree.db
+(ns fluree.db.api
   (:require [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]

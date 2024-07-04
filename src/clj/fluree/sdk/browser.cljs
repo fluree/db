@@ -1,5 +1,5 @@
 (ns fluree.sdk.browser
-  (:require [fluree.db :as fluree]
+  (:require [fluree.db.api :as fluree]
             [fluree.db.util.log :as log]
             [fluree.sdk.version :refer [version]]))
 

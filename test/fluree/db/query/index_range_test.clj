@@ -1,7 +1,7 @@
 (ns fluree.db.query.index-range-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]))

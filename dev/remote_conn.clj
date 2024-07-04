@@ -1,6 +1,6 @@
 (ns remote-conn
   (:require [clojure.core.async :as async]
-            [fluree.db :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.util.xhttp :as xhttp]))
 
 (comment

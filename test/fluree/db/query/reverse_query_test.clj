@@ -2,7 +2,7 @@
   (:require
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
-    [fluree.db :as fluree]))
+    [fluree.db.api :as fluree]))
 
 (deftest ^:integration context-reverse-test
   (testing "Test that the @reverse context values pulls select values back correctly."

@@ -1,5 +1,5 @@
 (ns json-ld.crud
-  (:require [fluree.db :as fluree]
+  (:require [fluree.db.api :as fluree]
             [fluree.db.util.async :refer [<?? go-try channel?]]))
 
 

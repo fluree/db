@@ -1,5 +1,5 @@
 (ns ledger-merge
-  (:require [fluree.db :as fluree]
+  (:require [fluree.db.api :as fluree]
             [fluree.db.did :as did]))
 
 (def sample-order
