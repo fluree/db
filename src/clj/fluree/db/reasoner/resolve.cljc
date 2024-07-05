@@ -1,6 +1,6 @@
 (ns fluree.db.reasoner.resolve
+  "Functions for finding reasoning rules that should be enforced"
   (:require [clojure.core.async :as async]
-            [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.query.fql.parse :as q-parse]
@@ -13,7 +13,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-;; namespace to find all rules that should be enforced
+
 
 
 (defn result-summary
@@ -124,4 +124,3 @@
                          :where  {"@id"          "?s",
                                   const/iri-rule "?rule"}})
     :owl2rl (extract-owl2rl-from-db db)))
-
