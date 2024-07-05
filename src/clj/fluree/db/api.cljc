@@ -178,27 +178,6 @@
                  {:status 400 :error :db/invalid-commit-map})))))
 
 
-(defn index
-  "Performs indexing operation on the specified ledger"
-  [ledger])
-
-
-;; MAYBE CHALLENGE?
-(defn validate
-  "Validates a ledger, checks block integrity along with signatures."
-  [])
-
-
-(defn pull
-  "Checks name service for ledger and pulls latest version locally."
-  [])
-
-
-(defn combine
-  "Combines multiple ledgers into a new, read-only ledger."
-  [])
-
-
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
   ([db json-ld] (stage db json-ld nil))
@@ -235,30 +214,6 @@
   "Returns current status of ledger branch."
   ([ledger] (ledger/-status ledger))
   ([ledger branch] (ledger/-status ledger branch)))
-
-
-(defn push
-  "Pushes all commits since last push to a name service, e.g. a Fluree Network, IPNS, DNS, Fluree Nexus.
-  Depending on consensus requirements for a Fluree Network, will accept or reject push as newest update."
-  [])
-
-
-
-(defn squash
-  "Squashes multiple unpublished commits into a single unpublished commit"
-  [])
-
-
-
-(defn merge
-  "Merges changes from one branch into another branch."
-  [])
-
-
-
-(defn branch
-  "Creates a new branch of a given ledger"
-  [])
 
 
 ;; db operations
