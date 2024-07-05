@@ -3,7 +3,7 @@
             [fluree.db.ledger :as ledger]
             [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.json-ld.transact :as transact]
+            [fluree.db.transact :as transact]
             [fluree.db.did :as did]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.context :as context]

@@ -28,7 +28,7 @@
             [fluree.db.json-ld.policy.rules :as policy-rules]
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.json-ld.shacl :as shacl]
-            [fluree.db.json-ld.transact :as jld-transact]
+            [fluree.db.transact :as transact]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.policy.modify :as tx-policy]
             [fluree.db.query.exec.update :as update]
@@ -687,7 +687,7 @@
   (-aliases [_]
     [alias])
 
-  jld-transact/Transactable
+  transact/Transactable
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
     (stage db fuel-tracker context identity annotation raw-txn parsed-txn))
   (-merge-commit [db new-commit proof] (merge-commit conn db [new-commit proof]))

@@ -231,7 +231,7 @@
           raw-rules       (<? (all-rules methods* db* inserts graph-or-db))
           _               (log/debug "Reasoner - extracted rules: " raw-rules)
           reasoning-rules (->> raw-rules
-                               (resolve/rules->graph db*)
+                               resolve/rules->graph
                                add-rule-dependencies)
           db**            (if-let [inserts* @inserts]
                             (<? (process-inserts db* fuel-tracker inserts*))

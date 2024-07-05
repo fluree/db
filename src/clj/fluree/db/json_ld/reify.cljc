@@ -1,7 +1,6 @@
 (ns fluree.db.json-ld.reify
   (:require [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
