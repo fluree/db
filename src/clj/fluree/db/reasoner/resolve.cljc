@@ -87,7 +87,7 @@
   and a list of 'test' flakes (:flake-tests) which will be used to
   test inferred flakes against the post index
   to determine if any of the patterns used by this rule had a match."
-  [db rules]
+  [rules]
   (reduce
     (fn [acc [rule-id rule]]
       (assoc acc rule-id (rule-graph rule)))
