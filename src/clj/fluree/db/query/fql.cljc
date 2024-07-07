@@ -1,7 +1,6 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.exec :as exec])
   (:refer-clojure :exclude [var? vswap!])
@@ -47,6 +46,4 @@
                  (catch* e e))]
        (if (util/exception? q)
          (async/to-chan! [q])
-         (if (= :simple-subject-crawl (:strategy q))
-           (simple-subject-crawl ds q)
-           (exec/query ds fuel-tracker q)))))))
+         (exec/query ds fuel-tracker q))))))
