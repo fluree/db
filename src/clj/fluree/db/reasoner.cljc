@@ -5,7 +5,8 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.log :as log]
-            [fluree.db.flake.flake-db :as db :refer [db?]]
+            [fluree.db.flake.flake-db :as flake-db  :refer [db?]]
+            [fluree.db.flake.transact :as flake.transact]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
             [fluree.db.fuel :as fuel]
@@ -37,20 +38,20 @@
   "When triples from rules require explicit inserts, returns flakes."
   [db fuel-tracker rule-id insert-smt]
   (go-try
-    (let [tx-state (-> (db/->tx-state :db db, :reasoned-from-iri rule-id)
+    (let [tx-state (-> (flake.transact/->tx-state :db db, :reasoned-from-iri rule-id)
                        (assoc :stage-update? true))
-          [db* new-flakes] (<? (db/generate-flakes db fuel-tracker insert-smt tx-state))]
-      (<? (db/final-db db* new-flakes tx-state)))))
+          [db* new-flakes] (<? (flake.transact/generate-flakes db fuel-tracker insert-smt tx-state))]
+      (<? (flake.transact/final-db db* new-flakes tx-state)))))
 
 (defn reasoner-stage
   [db fuel-tracker rule-id full-rule]
   (go-try
-    (let [tx-state   (db/->tx-state :db db, :reasoned-from-iri rule-id)
+    (let [tx-state   (flake.transact/->tx-state :db db, :reasoned-from-iri rule-id)
           parsed-txn (:rule-parsed full-rule)]
       (when-not (:where parsed-txn)
         (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
                         {:status 400 :error :db/invalid-transaction})))
-      (<? (db/generate-flakes db fuel-tracker parsed-txn tx-state)))))
+      (<? (flake.transact/generate-flakes db fuel-tracker parsed-txn tx-state)))))
 
 (defn filter-same-as-trans
   "Note - this remove 'self' from sameAs transitive
@@ -76,7 +77,7 @@
           reasoner-flakes* (filter-same-as-trans rule-id reasoner-flakes)]
       (log/debug "reasoner flakes: " rule-id reasoner-flakes*)
       ;; returns map of :db-after, :add, :remove - but for reasoning we only support adds, so remove should be empty
-      (<? (db/final-db db reasoner-flakes* tx-state*)))))
+      (<? (flake.transact/final-db db reasoner-flakes* tx-state*)))))
 
 (defn execute-reasoner
   "Executes the reasoner on the staged db-after and returns the updated db-after."
@@ -225,7 +226,7 @@
     (let [methods*        (set (util/sequential methods))
           fuel-tracker    (fuel/tracker max-fuel)
           db*             (update db :reasoner #(into methods* %))
-          tx-state        (db/->tx-state :db db*)
+          tx-state        (flake.transact/->tx-state :db db*)
           inserts         (atom nil)
           ;; TODO - rules can be processed in parallel
           raw-rules       (<? (all-rules methods* db* inserts graph-or-db))
