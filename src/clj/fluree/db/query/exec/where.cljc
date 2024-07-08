@@ -1,6 +1,5 @@
 (ns fluree.db.query.exec.where
   (:require [clojure.core.async :as async :refer [>! go]]
-            [clojure.set :as set]
             [clojure.string :as str]
             [clojure.set :as set]
             [fluree.db.flake :as flake]
@@ -9,7 +8,6 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.datatype :as datatype]
-            [fluree.db.query.dataset :as dataset]
             [fluree.db.query.range :as query-range]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
