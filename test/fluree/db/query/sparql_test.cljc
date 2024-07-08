@@ -252,6 +252,7 @@
     (testing "pattern"
       (let [query "SELECT ?handle
                  WHERE {VALUES ?handle { \"dsanchez\" }
+<<<<<<< HEAD
                         ?person person:handle ?handle.}"]
         (is (= [[:values ["?handle" ["dsanchez"]]]
                 {"@id" "?person", "person:handle" "?handle"}]
@@ -297,6 +298,13 @@
                    "@value" ":personB"}]]}
                (select-keys (sparql/->fql query) [:where :values]))
             "where pattern: single var, multiple values"))))
+=======
+                        ?person person:handle ?handle.}"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [[:bind "?handle" "dsanchez"]
+              {"@id" "?person", "person:handle" "?handle"}]
+             where))))
+>>>>>>> 28aaa46d (rewrite sparql translator)
   (testing "BIND"
     (let [query "SELECT ?person ?handle
                  WHERE {BIND (\"dsanchez\" AS ?handle)

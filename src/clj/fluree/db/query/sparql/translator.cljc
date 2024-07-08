@@ -1,13 +1,21 @@
 (ns fluree.db.query.sparql.translator
   (:require [fluree.db.constants :as const]
             [clojure.string :as str]
+<<<<<<< HEAD
             #?(:cljs [cljs.tools.reader :refer [read-string]])))
+=======
+            #?(:clj [clojure.java.io :as io])
+            #?(:clj  [instaparse.core :as insta :refer [defparser]]
+               :cljs [instaparse.core :as insta :refer-macros [defparser]])
+            #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defn rule?
   [x]
   (and (sequential? x)
        (keyword? (first x))))
 
+<<<<<<< HEAD
 (defn literal-quote
   "Quote a non-variable string literal for use in an expression."
   [x]
@@ -23,6 +31,12 @@
 (defmulti parse-rule
   "Accepts a rule and returns a sequence of entry tuples [[k v]...]."
   (fn [[tag & _]] tag))
+=======
+;; take a term rule and return a value
+(defmulti parse-term (fn [[tag & _]] tag))
+;; take a rule return a sequence of entry tuples [[k v]...]
+(defmulti parse-rule (fn [[tag & _]] tag))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :Var
   ;; Var ::= VAR1 WS | VAR2 WS
@@ -63,6 +77,7 @@
     (throw (ex-info (str "Unsupported aggregate function: " func)
                     {:status 400 :error :db/invalid-query}))))
 
+<<<<<<< HEAD
 (defmethod parse-term :ExistsFunc
   [[_ & patterns]]
   ["exists" (into [] (mapcat parse-term patterns))])
@@ -89,12 +104,29 @@
   (str "(replace " (literal-quote (parse-term arg)) " " (literal-quote (parse-term pattern))
        " " (literal-quote (parse-term replacement))
        (when flags (str " " (literal-quote (parse-term flags)))) ")"))
+=======
+(def supported-scalar-functions
+  {"COALESCE"  "coalesce"
+   "STR"       "str"
+   "RAND"      "rand"
+   "ABS"       "abs"
+   "CEIL"      "ceil"
+   "FLOOR"     "floor"
+   "CONCAT"    "concat"
+   "STRLEN"    "count"
+   "STRSTARTS" "strStarts"
+   "STRENDS"   "strEnds"
+   "IF"        "if"
+   "SHA256"    "sha256"
+   "SHA512"    "sha512"})
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :ExpressionList
   ;; ExpressionList ::= NIL | <'('> Expression ( <','> Expression )* <')'>
   [[_ & expressions]]
   (mapv parse-term expressions))
 
+<<<<<<< HEAD
 (def supported-scalar-functions
   {"ABS"            "abs"
    "BNODE"          "bnode"
@@ -236,6 +268,38 @@
     (throw (ex-info "Unsupported syntax."
                     {:status 400 :error :db/invalid-query :term arglist})))
   (parse-term iri))
+=======
+(defmethod parse-term :Func
+  [[_ func & args]]
+  (if-let [f (get supported-scalar-functions func)]
+    (str "(" f " " (str/join " "
+                             (->> (mapv parse-term args)
+                                  (flatten)
+                                  (map (fn [arg]
+                                         (if (and (string? arg)
+                                                  (not (str/starts-with? arg "?")))
+                                           (str \" arg \")
+                                           arg))))
+                             #_(reduce
+                               (fn [parsed-args expr]
+                                 (let [parsed (parse-term expr)]
+                                   (cond
+                                     ;; We need to quote literals to embed in the func string.
+                                     ;; (contains? (set (flatten expr)) :RDFLiteral)
+                                     ;; (conj parsed-args (str \" parsed \"))
+                                     ;; handle the nesting from :ExpressionList
+                                     (vector? parsed)    (into parsed-args parsed)
+                                     ;; no special handling necessary
+                                     :else               (conj parsed-args parsed ))))
+                               []
+                               args)) ")")
+    (throw (ex-info (str "Unsupported function: " func)
+                    {:status 400 :error :db/invalid-query}))))
+
+(defmethod parse-term :NumericLiteral
+  [[_ num-str]]
+  (read-string num-str))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :MultiplicativeExpression
   ;; MultiplicativeExpression ::= UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
@@ -244,6 +308,7 @@
   ;; | '-' PrimaryExpression
   ;; | PrimaryExpression
   ;; <PrimaryExpression> ::= BrackettedExpression | BuiltInCall | iriOrFunction | RDFLiteral | NumericLiteral | BooleanLiteral | Var
+<<<<<<< HEAD
   [[_ & [expr0 & [op1 expr1 & exprs]]]]
   (if op1
     ;; we need to recursively compose expressions
@@ -254,6 +319,10 @@
         result))
     ;; A single UnaryExpression doesn't need to be composed with anything else
     (parse-term expr0)))
+=======
+  [[_ & expression]]
+  (str/join " " (mapv parse-term expression)))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :NumericExpression
   ;; NumericExpression ::= WS AdditiveExpression WS
@@ -274,11 +343,20 @@
   (let [expr (parse-term n-exp)]
     (cond
       (= "IN" op)
+<<<<<<< HEAD
       (str "(in " expr " " (parse-term op-or-exp) ")")
 
       (and (= "NOT" op)
            (= "IN" op-or-exp))
       (str "(not (in " expr " " (parse-term expr-list) "))")
+=======
+      (throw (ex-info (str "Unsupported operator: " op)
+                      {:status 400 :error :db/invalid-query}))
+      (and (= "NOT" op)
+           (= "IN" op-or-exp))
+      (throw (ex-info (str "Unsupported operator: " op)
+                      {:status 400 :error :db/invalid-query}))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
       (nil? op)
       expr
@@ -290,6 +368,7 @@
       ;; op: =, <, >, <=, >=
       (str "(" op " " expr " " (parse-term op-or-exp) ")"))))
 
+<<<<<<< HEAD
 (defmethod parse-term :ConditionalOrExpression
   ;; ConditionalOrExpression ::= ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
   [[_ expr & exprs]]
@@ -305,16 +384,22 @@
     (str "(and " (parse-term expr) " " (str/join " " (mapv parse-term exprs)) ")")
     (parse-term expr)))
 
+=======
+>>>>>>> 28aaa46d (rewrite sparql translator)
 (defmethod parse-term :Expression
   ;; Expression ::= WS ConditionalOrExpression WS
   ;; <ConditionalOrExpression> ::= ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
   ;; <ConditionalAndExpression> ::= ValueLogical ( <'&&'> ValueLogical )*
   ;; <ValueLogical> ::= RelationalExpression
   [[_ & expression]]
+<<<<<<< HEAD
   (let [expressions (mapv parse-term expression)]
     (if (= 1 (count expressions))
       (first expressions)
       expressions)))
+=======
+  (str/join " " (mapv parse-term expression)))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :IRIREF
   ;; #"<[^<>\"{}|^`\x00-\x20]*>" WS
@@ -370,7 +455,11 @@
                   ;; :Expression
                   (let [[next next-next & r*] r
                         expr (parse-term term)
+<<<<<<< HEAD
                         as?  (= [:As] next)
+=======
+                        as?  (= "AS" next)
+>>>>>>> 28aaa46d (rewrite sparql translator)
                         expr (if as?
                                (str "(as " expr " " (parse-term next-next) ")")
                                expr)]
@@ -390,6 +479,7 @@
   ;; NamedGraphClause ::= <'NAMED'> SourceSelector
   ;; <SourceSelector> ::= iri
   [[_ source]]
+<<<<<<< HEAD
   (parse-term source))
 
 (defmethod parse-term :GraphGraphPattern
@@ -438,6 +528,25 @@
 
 (defmethod parse-term :Bind
   ;; Bind ::= <'BIND' WS '(' WS>  Expression <WS 'AS' WS> Var <WS ')' WS>
+=======
+  (throw (ex-info "FROM NAMED is not a supported SPARQL clause"
+                  {:status 400 :error :db/invalid-query}))
+  (parse-term source))
+
+(defmethod parse-rule :DatasetClause
+  ;; DatasetClause ::= <'FROM'> WS ( DefaultGraphClause | NamedGraphClause )
+  ;; DefaultGraphClause ::= SourceSelector
+  ;; NamedGraphClause ::= <'NAMED'> SourceSelector
+  ;; <SourceSelector> ::= iri
+  [[_ source]]
+  [[:from (parse-term source)]])
+
+(defmethod parse-term :RDFLiteral
+  [[_ & literal]]
+  (apply str literal))
+
+(defmethod parse-term :Bind
+>>>>>>> 28aaa46d (rewrite sparql translator)
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
@@ -458,16 +567,21 @@
 (defmethod parse-term :Filter
   ;; Filter ::= <'FILTER'> WS Constraint
   [[_ constraint]]
+<<<<<<< HEAD
   (let [parsed-constraint (parse-term constraint)]
     (if (contains? #{"exists" "not-exists"} (first parsed-constraint))
       parsed-constraint
       [:filter [parsed-constraint]])))
+=======
+  [:filter [(parse-term constraint)]])
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :OptionalGraphPattern
   ;; OptionalGraphPattern ::= <'OPTIONAL'> GroupGraphPattern
   [[_ & optional]]
   (into [:optional] (mapv parse-term optional)))
 
+<<<<<<< HEAD
 (defmethod parse-term :ServiceGraphPattern
   [_]
   (throw (ex-info "SERVICE is not a supported SPARQL pattern"
@@ -496,11 +610,32 @@
   ;; InlineDataFull ::= ( NIL | VarList ) WS <'{'> WS ( ValueList WS | NIL )* <'}'>
   [[_ vars & data]]
   [:values [(parse-term vars)] (mapv parse-term data)])
+=======
+(defmethod parse-term :DataBlockValue
+  ;; DataBlockValue ::= iri | RDFLiteral | NumericLiteral | BooleanLiteral | 'UNDEF' WS
+  [[_ value]]
+  (if (= value "UNDEF")
+    nil
+    (parse-term value)))
+
+(defmethod parse-term :InlineDataFull
+  ;; InlineDataFull ::= ( NIL | '(' Var* ')' ) '{' ( '(' DataBlockValue* ')' | NIL )* '}'
+  [_ data]
+  (throw (ex-info "Multiple inline data values not supported"
+                  {:status 400 :error :db/invalid-query})))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :InlineDataOneVar
   ;; InlineDataOneVar ::= Var <'{'> WS DataBlockValue* <'}'>
   [[_ var & data-block-values]]
+<<<<<<< HEAD
   [:values [(parse-term var) (mapv parse-term data-block-values)]])
+=======
+  (if (> (count data-block-values) 1)
+    (throw (ex-info "Multiple inline data values not supported"
+                    {:status 400 :error :db/invalid-query}))
+    [:bind (parse-term var) (parse-term (first data-block-values))]))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :InlineData
   ;; InlineData ::= <'VALUES'> WS DataBlock
@@ -511,7 +646,11 @@
 (defmethod parse-term :GraphPatternNotTriples
   ;; GraphPatternNotTriples ::= GroupOrUnionGraphPattern | OptionalGraphPattern | MinusGraphPattern | GraphGraphPattern | ServiceGraphPattern | Filter | Bind | InlineData
   [[_ & non-triples]]
+<<<<<<< HEAD
   (mapv parse-term non-triples))
+=======
+  (into [] (mapv parse-term non-triples)))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :PrefixedName
   [[_ & name]]
@@ -523,10 +662,16 @@
   (parse-term iri))
 
 (defmethod parse-term :PathPrimary
+<<<<<<< HEAD
   ;; PathPrimary    ::=   iri | Type | '!' PathNegatedPropertySet | '(' Path ')'
   ;; PathNegatedPropertySet   ::=   PathOneInPropertySet | '(' ( PathOneInPropertySet ( '|' PathOneInPropertySet )* )? ')'
   ;; PathOneInPropertySet   ::=   iri | Type | '^' ( iri | Type )
   ;; <Type> ::= (WS 'a' WS)
+=======
+  ;; PathPrimary ::= iri | 'a' | '!' PathNegatedPropertySet | '(' Path ')'
+  ;; PathNegatedPropertySet ::= PathOneInPropertySet | '(' ( PathOneInPropertySet ( '|' PathOneInPropertySet )* )? ')'
+  ;; PathOneInPropertySet ::= iri | 'a' | '^' ( iri | 'a' )
+>>>>>>> 28aaa46d (rewrite sparql translator)
   [[_ el]]
   (cond (rule? el) (parse-term el)
         (= el "a") const/iri-type
@@ -537,7 +682,10 @@
 (defmethod parse-term :PathMod
   ;; PathMod ::= '?' | '*' | ('+' INTEGER?) WS
   [[_ mod degree]]
+<<<<<<< HEAD
   ;; TODO: this does nothing in FQL
+=======
+>>>>>>> 28aaa46d (rewrite sparql translator)
   (str mod degree))
 
 (defmethod parse-term :PathSequence
@@ -549,12 +697,17 @@
   (apply str (mapv parse-term elements)))
 
 (defmethod parse-term :Object
+<<<<<<< HEAD
   ;; Object   ::=   GraphNode
   ;; <GraphNode>    ::=   VarOrTerm | TriplesNode
   [[_ [tag :as obj]]]
   (if (= tag :iri)
     {const/iri-id (parse-term obj)}
     (parse-term obj)))
+=======
+  [[_ obj]]
+  (parse-term obj))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :ObjectList
   ;; ObjectList ::= Object ( <','> WS Object )*
@@ -564,8 +717,13 @@
   ;; TriplesNode ::= Collection | BlankNodePropertyList
   ;; Collection ::=  '(' GraphNode+ ')'
   ;; BlankNodePropertyList ::= '[' PropertyListNotEmpty ']'
+<<<<<<< HEAD
   [[_ & path :as obj-path]]
   (mapv parse-term path))
+=======
+  [[_ path :as obj-path]]
+  (parse-term path))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :ObjectPath
   ;; ObjectPath ::= GraphNodePath
@@ -574,11 +732,15 @@
   ;; CollectionPath ::= '(' GraphNodePath+ ')'
   ;; BlankNodePropertyListPath ::= '[' PropertyListPathNotEmpty ']'
   [[_ & objs]]
+<<<<<<< HEAD
   (mapv (fn [[tag :as obj]]
           (if (= tag :iri)
             {const/iri-id (parse-term obj)}
             (parse-term obj)))
         objs))
+=======
+  (mapv parse-term objs))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :PropertyListPathNotEmpty
   ;; PropertyListPathNotEmpty ::= ( VerbPath | VerbSimple ) ObjectListPath ( <';'> WS ( ( VerbPath | VerbSimple ) ObjectList )? )* WS
@@ -631,11 +793,14 @@
   [[_ & patterns]]
   [[:where (into [] (mapcat parse-term patterns))]])
 
+<<<<<<< HEAD
 (defmethod parse-rule :ValuesClause
   ;; ValuesClause ::= ( <'VALUES'> WS DataBlock )? WS
   [[_ datablock]]
   [(parse-term datablock)])
 
+=======
+>>>>>>> 28aaa46d (rewrite sparql translator)
 (defmethod parse-rule :OffsetClause
   ;; OffsetClause ::= <'OFFSET'> WS INTEGER
   [[_ offset]]
@@ -649,23 +814,44 @@
 (defmethod parse-term :ExplicitOrderCondition
   ;; ExplicitOrderCondition ::= ( 'ASC' | 'DESC' ) WS BrackettedExpression
   [[_ order expr]]
+<<<<<<< HEAD
   (list (str/lower-case order) (parse-term expr)))
+=======
+  [(str/lower-case order) (parse-term expr)])
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-rule :OrderClause
   ;; OrderClause ::= <'ORDER' WS 'BY'> WS OrderCondition+ WS
   ;; <OrderCondition> ::= ExplicitOrderCondition | Constraint | Var
   [[_ & conditions]]
+<<<<<<< HEAD
   [[:orderBy (mapv (fn [condition]
                      (cond (= "ASC" (first condition)) (list "asc" (parse-term (second condition)))
                            (= "DESC" (first condition)) (list "desc" (parse-term (second condition)))
                            :else
                            (parse-term condition)))
                    conditions)]])
+=======
+  (if (> (count conditions) 1)
+    (throw (ex-info "Multiple ORDER BY conditions are not supported"
+                    {:status 400 :error :db/invalid-query}))
+    [[:orderBy (first
+                 (mapv (fn [condition]
+                         (cond (= "ASC" (first condition)) ["asc" (parse-term (second condition))]
+                               (= "DESC" (first condition)) ["desc" (parse-term (second condition))]
+                               :else
+                               (parse-term condition)))
+                       conditions))]]))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defmethod parse-term :GroupCondition
   ;; GroupCondition ::= BuiltInCall | FunctionCall | <'('> Expression ( WS 'AS' WS Var )? <')'> | Var
   [[_ expr as var :as condition]]
+<<<<<<< HEAD
   (if (= as [:As])
+=======
+  (if (= as "AS")
+>>>>>>> 28aaa46d (rewrite sparql translator)
     (str "(as " (parse-term expr) " " (parse-term var) ")")
     (parse-term expr)))
 
@@ -705,8 +891,53 @@
   [[_ & modifiers]]
   (mapcat parse-rule modifiers))
 
+<<<<<<< HEAD
 (defn translate
   [parsed]
   (reduce (fn [fql rule] (into fql (parse-rule rule)))
           {}
           parsed))
+=======
+(defn parse-stage-2
+  [parsed]
+  (def parsed parsed)
+  (reduce (fn [fql rule]
+            (let [entries (parse-rule rule)]
+              (println "DEP parsed" (pr-str entries))
+              (into fql entries)))
+          {}
+          parsed))
+
+(def grammar #?(:clj  (io/resource "sparql2.bnf")
+                :cljs (inline-resource "sparql2.bnf")))
+
+(defparser parser grammar)
+
+(defn parse-stage-1
+  [sparql]
+  (let [parsed (parser sparql)]
+    (if (insta/failure? parsed)
+      (throw (ex-info (str "Improperly formatted SPARQL query: " sparql)
+                      {:status   400 :error    :db/invalid-query}))
+      parsed)))
+
+(comment
+  (def parsed
+    (parse-stage-1
+      "PREFIX person: <http://example.org/Person#>
+                          SELECT (CONCAT(?handle, '-', ?fullName) AS ?hfn)
+                          WHERE {?person person:handle ?handle.
+                                 ?person person:fullName ?fullName.}"))
+
+  (-> (parse-stage-1 "PREFIX person: <http://example.org/Person#>
+                          SELECT ?handle
+                          WHERE {?person person:handle ?handle.}
+                          ORDER BY DESC(?handle)")
+
+      (parse-stage-2))
+
+  parsed
+
+
+  ,)
+>>>>>>> 28aaa46d (rewrite sparql translator)

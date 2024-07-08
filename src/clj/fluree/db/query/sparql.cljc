@@ -5,7 +5,12 @@
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
             [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.util.docs :as docs]
+<<<<<<< HEAD
             [fluree.db.util.log :as log]))
+=======
+            [fluree.db.util.log :as log]
+            #_[fluree.db.query.sparql2fql :refer [parsed->fql]]))
+>>>>>>> 28aaa46d (rewrite sparql translator)
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -32,5 +37,10 @@
 
 (defn ->fql
   [sparql]
+<<<<<<< HEAD
   (let [parsed (parse sparql)]
     (sparql.translator/translate parsed)))
+=======
+  (let [parsed (sparql.translator/parse-stage-1 sparql)]
+    (sparql.translator/parse-stage-2 parsed)))
+>>>>>>> 28aaa46d (rewrite sparql translator)
