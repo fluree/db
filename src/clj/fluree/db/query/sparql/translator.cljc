@@ -255,7 +255,6 @@
 
 (defmethod parse-term :Bind
   ;; Bind ::= <'BIND' WS '(' WS>  Expression <WS 'AS' WS> Var <WS ')' WS>
-=======
   (throw (ex-info "FROM NAMED is not a supported SPARQL clause"
                   {:status 400 :error :db/invalid-query}))
   (parse-term source))
@@ -273,7 +272,6 @@
   (apply str literal))
 
 (defmethod parse-term :Bind
->>>>>>> 28aaa46d (rewrite sparql translator)
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
