@@ -1,7 +1,7 @@
 (ns fluree.db.query.sparql.translator
   (:require [fluree.db.constants :as const]
             [clojure.string :as str]
-            #?(:cljs [cljs.tools.reader :refer [read-string]])))
+            #?(:cljs [cljs.tools.reader :refer [read-string]])
             #?(:clj [clojure.java.io :as io])
             #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
