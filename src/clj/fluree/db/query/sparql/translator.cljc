@@ -1,14 +1,11 @@
 (ns fluree.db.query.sparql.translator
   (:require [fluree.db.constants :as const]
             [clojure.string :as str]
-<<<<<<< HEAD
             #?(:cljs [cljs.tools.reader :refer [read-string]])))
-=======
             #?(:clj [clojure.java.io :as io])
             #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])))
->>>>>>> 28aaa46d (rewrite sparql translator)
 
 (defn rule?
   [x]
