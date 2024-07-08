@@ -1,4 +1,4 @@
-(ns fluree.db.query.dataset
+(ns fluree.db.dataset
   (:require [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.exec.where :as where]
