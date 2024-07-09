@@ -6,7 +6,7 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.query.dataset :as dataset :refer [dataset?]]
+            [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.log :as log]
             [fluree.db.query.history :as history]
