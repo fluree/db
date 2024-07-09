@@ -4,7 +4,7 @@
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.json-ld.transact :as transact]
+            [fluree.db.transact :as transact]
             [fluree.db.did :as did]
             [fluree.db.util.context :as context]
             [fluree.db.util.async :refer [<? go-try]]

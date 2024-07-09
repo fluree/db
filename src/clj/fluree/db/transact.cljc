@@ -1,4 +1,4 @@
-(ns fluree.db.json-ld.transact
+(ns fluree.db.transact
   (:require [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]))

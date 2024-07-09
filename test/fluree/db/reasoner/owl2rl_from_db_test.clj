@@ -1,6 +1,6 @@
 (ns fluree.db.reasoner.owl2rl-from-db-test
   (:require [clojure.test :refer :all]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 (deftest ^:integration owl-stored-in-host-db
   (testing "Testing nested owl restrictions coming from same db as data"

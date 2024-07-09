@@ -1,7 +1,7 @@
 (ns fluree.db.transact.retraction-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]))
+            [fluree.db.api :as fluree]))
 
 (deftest ^:integration retracting-data
   (testing "Retractions of individual properties and entire subjects."

@@ -1,7 +1,7 @@
 (ns fluree.db.policy.tx-test
   (:require [clojure.test :refer :all]
             [fluree.db.did :as did]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))

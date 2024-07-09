@@ -6,7 +6,7 @@
               [clojure.core.async.interop :refer [<p!]]])
    [fluree.db.query.sparql :as sparql]
    [fluree.db.test-utils :as test-utils]
-   [fluree.db.json-ld.api :as fluree])
+   [fluree.db.api :as fluree])
   #?(:clj (:import (clojure.lang ExceptionInfo))))
 
 (deftest parse-select

@@ -6,7 +6,7 @@
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.json-ld.transact :as transact]
+            [fluree.db.transact :as transact]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :as history]
             [fluree.db.query.json-ld.response :as jld-response]

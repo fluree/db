@@ -1,7 +1,7 @@
 (ns fluree.db.policy.identity-based-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.did :as did]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration property-policy-query-identity
