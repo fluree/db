@@ -222,12 +222,7 @@
   "Retrieves latest db, or optionally a db at a moment in time
   and/or permissioned to a specific identity."
   ([ledger]
-   (db ledger nil))
-  ([ledger opts]
-   (if opts
-     (throw (ex-info "DB opts not yet implemented"
-                     {:status 500 :error :db/unexpected-error}))
-     (ledger/-db ledger))))
+   (ledger/-db ledger)))
 
 (defn wrap-policy
   ([db policy default-allow?]
@@ -277,7 +272,8 @@
 
 (defn query
   "Queries a dataset or single db and returns a promise with the results."
-  ([ds q] (query ds q {}))
+  ([ds q]
+   (query ds q {}))
   ([ds q opts]
    (promise-wrap (query-api/query ds q opts))))
 
@@ -394,14 +390,6 @@
   more advanced needs."
   [db iri]
   (iri/encode-iri db iri))
-
-(defn internal-id
-  "Deprecated, use encode-iri instead."
-  {:deprecated true}
-  [db iri]
-  (do
-    (println "WARNING: (internal-id db iri) is deprecated, use (encode-iri db iri).")
-    (encode-iri db iri)))
 
 (defn decode-iri
   "Opposite of encode-iri. When doing more advanced features
