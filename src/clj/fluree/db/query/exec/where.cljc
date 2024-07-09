@@ -482,17 +482,16 @@
   [ds fuel-tracker solution pattern error-ch]
   ;; minus performs a set difference, removing a provided solution if the same solution
   ;; produced by the minus pattern
-  (let [clause (pattern-data pattern)
-        out-ch (async/chan 2 (filter (fn [minus-solution]
-                                       ;; only keep minus-solutions that match the provided solution
-                                       (let [vars (keys minus-solution)]
+  (let [clause   (pattern-data pattern)
+        minus-ch (async/chan 2 (filter (fn [minus-solution]
+                                         ;; only keep minus-solutions that match the provided solution
                                          (and (not-empty minus-solution)
-                                              (= minus-solution (select-keys solution vars)))))))]
+                                              (= minus-solution (select-keys solution (keys minus-solution)))))))]
     (go
       ;; minus does not use existing bindings
       ;; if a minus solutions equals the provided solution, remove the provided solution
       (when-not (-> (match-clause ds fuel-tracker {} clause error-ch)
-                    (async/pipe out-ch)
+                    (async/pipe minus-ch)
                     (async/<!))
         solution))))
 
