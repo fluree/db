@@ -465,14 +465,34 @@
   [ds fuel-tracker solution pattern error-ch]
   (let [clause (pattern-data pattern)]
     (go
+      ;; exists uses existing bindings
       (when (async/<! (match-clause ds fuel-tracker solution clause error-ch))
         solution))))
 
 (defmethod match-pattern :not-exists
   [ds fuel-tracker solution pattern error-ch]
+  ;; not exists removes a pattern
   (let [clause (pattern-data pattern)]
     (go
+      ;; not-exists uses existing bindings
       (when-not (async/<! (match-clause ds fuel-tracker solution clause error-ch))
+        solution))))
+
+(defmethod match-pattern :minus
+  [ds fuel-tracker solution pattern error-ch]
+  ;; minus performs a set difference, removing a provided solution if the same solution
+  ;; produced by the minus pattern
+  (let [clause   (pattern-data pattern)
+        minus-ch (async/chan 2 (filter (fn [minus-solution]
+                                         ;; only keep minus-solutions that match the provided solution
+                                         (and (not-empty minus-solution)
+                                              (= minus-solution (select-keys solution (keys minus-solution)))))))]
+    (go
+      ;; minus does not use existing bindings
+      ;; if a minus solutions equals the provided solution, remove the provided solution
+      (when-not (-> (match-clause ds fuel-tracker {} clause error-ch)
+                    (async/pipe minus-ch)
+                    (async/<!))
         solution))))
 
 (defmethod match-pattern :graph

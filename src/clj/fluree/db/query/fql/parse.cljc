@@ -423,6 +423,10 @@
   [[_ patterns] vars context]
   [(where/->pattern :not-exists (parse-where-clause patterns vars context))])
 
+(defmethod parse-pattern :minus
+  [[_ patterns] vars context]
+  [(where/->pattern :minus (parse-where-clause patterns vars context))])
+
 (defmethod parse-pattern :graph
   [[_ graph where] vars context]
   (let [graph* (or (parse-variable graph)
