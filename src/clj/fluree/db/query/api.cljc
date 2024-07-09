@@ -230,12 +230,13 @@
                         {:status 400, :error :db/invalid-query}))))))
 
 (defn query-connection-sparql
-  [conn query request-opts]
+  [conn query {:keys [role did] :as request-opts}]
   (go-try
     (let [{sparql :subject did :did} (or (<? (cred/verify query))
                                          {:subject query})
-          fql (sparql/->fql sparql)]
-      (<? (query-connection-fql conn fql request-opts)))))
+          fql (sparql/->fql sparql)
+          credentialed-fql (update fql :opts #(merge {:role role :did did} %))]
+      (<? (query-connection-fql conn credentialed-fql request-opts)))))
 
 (defn query-connection
   [conn query {:keys [format] :as request-opts}]
