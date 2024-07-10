@@ -34,8 +34,11 @@
             [fluree.db.serde.json :as serde-json]
             [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-value
-                                                  get-first-id vswap!]]
+            [fluree.db.util.core :as util
+             #?@(:clj  [:refer [get-first get-first-value get-first-id vswap!
+                                try* catch*]]
+                 :cljs [:refer [get-first get-first-value get-first-id vswap!]
+                        :refer-macros [try* catch*]])]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
@@ -474,60 +477,75 @@
     :else
     true))
 
-(defn assert-value-map
-  [db sid pid t v-map]
+(defn value-map->flake
+  [assert? db sid pid t v-map]
   (let [ref-id (:id v-map)
         meta   (::meta v-map)]
     (if (and ref-id (node? v-map))
       (let [ref-sid (iri/encode-iri db ref-id)]
-        (flake/create sid pid ref-sid const/$xsd:anyURI t true meta))
+        (flake/create sid pid ref-sid const/$xsd:anyURI t assert? meta))
       (let [[value dt] (datatype/from-expanded v-map nil)]
-        (flake/create sid pid value dt t true meta)))))
+        (flake/create sid pid value dt t assert? meta)))))
 
-(defn assert-property
-  [db sid pid t value]
+
+(defn property->flake
+  [assert? db sid pid t value]
   (let [v-maps (util/sequential value)]
     (mapcat (fn [v-map]
               (if (list-value? v-map)
                 (let [list-vals (:list v-map)]
                   (into []
                         (comp (map add-list-meta)
-                              (map (partial assert-value-map db sid pid t)))
+                              (map (partial value-map->flake assert? db sid pid t)))
                         list-vals))
-                [(assert-value-map db sid pid t v-map)]))
+                [(value-map->flake assert? db sid pid t v-map)]))
             v-maps)))
 
-(defn- get-type-assertions
-  [db t sid type]
-  (if type
-    (loop [[type-item & r] type
-           acc []]
-      (if type-item
-        (let [type-id (iri/encode-iri db type-item)]
-          (recur r (conj acc (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t true nil))))
-        acc))
-    []))
+(defn- get-type-flakes
+  [assert? db t sid type]
+  (into []
+        (map (fn [type-item]
+               (let [type-sid (iri/encode-iri db type-item)]
+                 (flake/create sid const/$rdf:type type-sid
+                               const/$xsd:anyURI t assert? nil))))
+        type))
 
-(defn assert-node
-  [db t node]
-  (log/trace "assert-node:" node)
+(defn node->flakes
+  [assert? db t node]
+  (log/trace "node->flakes:" node "assert?" assert?)
   (let [{:keys [id type]} node
-        sid             (iri/encode-iri db id)
+        sid             (if assert?
+                          (iri/encode-iri db id)
+                          (or (iri/encode-iri db id)
+                              (throw
+                               (ex-info
+                                "Cannot retract subject IRI with unknown namespace."
+                                {:status 400
+                                 :error  :db/invalid-retraction
+                                 :iri    id}))))
         type-assertions (if (seq type)
-                          (get-type-assertions db t sid type)
+                          (get-type-flakes assert? db t sid type)
                           [])]
     (into type-assertions
-          (comp (filter (fn [node-entry]
-                          (not (-> node-entry key keyword?))))
-                (mapcat (fn [[prop value]]
-                          (let [pid (iri/encode-iri db prop)]
-                            (assert-property db sid pid t value)))))
+          (comp (remove #(-> % key keyword?))
+                (mapcat
+                 (fn [[prop value]]
+                   (let [pid (if assert?
+                               (iri/encode-iri db prop)
+                               (or (iri/encode-iri db prop)
+                                   (throw
+                                    (ex-info
+                                     "Cannot retract property IRI with unknown namespace."
+                                     {:status 400
+                                      :error  :db/invalid-retraction
+                                      :iri    prop}))))]
+                     (property->flake assert? db sid pid t value)))))
           node)))
 
-(defn assert-flakes
-  [db t assertions]
+(defn create-flakes
+  [assert? db t assertions]
   (into []
-        (mapcat (partial assert-node db t))
+        (mapcat (partial node->flakes assert? db t))
         assertions))
 
 (defn merge-flakes
@@ -537,62 +555,6 @@
       (assoc :t t)
       (commit-data/update-novelty flakes)
       (vocab/hydrate-schema flakes)))
-
-(defn retract-value-map
-  [db sid pid t v-map]
-  (let [ref-id (:id v-map)]
-    (if (and ref-id (node? v-map))
-      (let [ref-sid (iri/encode-iri db ref-id)]
-        (flake/create sid pid ref-sid const/$xsd:anyURI t false nil))
-      (let [[value dt] (datatype/from-expanded v-map nil)]
-        (flake/create sid pid value dt t false nil)))))
-
-(defn- get-type-retractions
-  [db t sid type]
-  (into []
-        (map (fn [type-item]
-               (let [type-sid (iri/encode-iri db type-item)]
-                 (flake/create sid const/$rdf:type type-sid
-                               const/$xsd:anyURI t false nil))))
-        type))
-
-(defn- retract-node*
-  [db t {:keys [sid type-retractions] :as _retract-state} node]
-  (loop [[[k v-maps] & r] node
-         acc type-retractions]
-    (if k
-      (if (keyword? k)
-        (recur r acc)
-        (let [pid  (or (iri/encode-iri db k)
-                       (throw (ex-info (str "Retraction on a property that does not exist: " k)
-                                       {:status 400
-                                        :error  :db/invalid-commit})))
-              acc* (into acc
-                         (map (partial retract-value-map db sid pid t))
-                         (util/sequential v-maps))]
-          (recur r acc*)))
-      acc)))
-
-(defn retract-node
-  [db t node]
-  (let [{:keys [id type]} node
-        sid              (or (iri/encode-iri db id)
-                             (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
-                                                  " at db t value: " t ".")
-                                             {:status 400 :error
-                                              :db/invalid-commit})))
-        retract-state    {:sid sid}
-        type-retractions (if (seq type)
-                           (get-type-retractions db t sid type)
-                           [])
-        retract-state*   (assoc retract-state :type-retractions type-retractions)]
-    (retract-node* db t retract-state* node)))
-
-(defn retract-flakes
-  [db t retractions]
-  (into []
-        (mapcat (partial retract-node db t))
-        retractions))
 
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
@@ -611,9 +573,9 @@
           _                  (log/trace "db max-namespace-code:"
                                         (:max-namespace-code db))
           db*                (with-namespaces db nses)
-          asserted-flakes    (assert-flakes db* t-new assert)
+          asserted-flakes    (create-flakes true db* t-new assert)
           retract            (db-retract db-data)
-          retracted-flakes   (retract-flakes db* t-new retract)
+          retracted-flakes   (create-flakes false db* t-new retract)
 
           {:keys [previous issuer message data] :as commit-metadata}
           (commit-data/json-ld->map commit db*)
