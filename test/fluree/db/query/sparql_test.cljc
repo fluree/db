@@ -441,7 +441,38 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?g", "dc:publisher" "?who"}
               [:graph "?g" [{"@id" "?x", "foaf:mbox" "?mbox"}]]]
-             where)))))
+             where))))
+  (testing "MINUS"
+    (let [query "SELECT ?handle ?num
+                 WHERE {?person person:handle ?handle.
+                        MINUS {?person person:favNums ?num.}}"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?person", "person:handle" "?handle"}
+              [:minus [{"@id" "?person", "person:favNums" "?num"}]]]
+             where)))
+    (testing "multi-clause"
+      (let [query "SELECT ?person ?name ?handle ?favNums
+                   WHERE {?person person:fullName ?name.
+                          MINUS {?person person:handle ?handle.
+                                 ?person person:favNums ?favNums.}}"
+            {:keys [where]} (sparql/->fql query)]
+        (is (= [{"@id" "?person", "person:fullName" "?name"}
+                [:minus
+                 [{"@id" "?person", "person:handle" "?handle"}
+                  {"@id" "?person", "person:favNums" "?favNums"}]]]
+               where))))
+    (testing "MINUS + FILTER"
+      (let [query "SELECT *
+                 WHERE {
+                   ?x :p ?n
+                   MINUS {
+                    ?x :q ?m .
+                    FILTER(?n = ?m) } }"
+            {:keys [where]} (sparql/->fql query)]
+        (is (= [{"@id" "?x", ":p" "?n"}
+                [:minus [{"@id" "?x", ":q" "?m"}
+                         [:filter ["(= ?n ?m)"]]]]]
+               where))))))
 
 (deftest parse-prefixes
   (testing "PREFIX"

@@ -468,6 +468,10 @@
   [[_ & optional]]
   (into [:optional] (mapv parse-term optional)))
 
+(defmethod parse-term :MinusGraphPattern
+  [[_ & patterns]]
+  (into [:minus] (mapv parse-term patterns)))
+
 (defmethod parse-term :ServiceGraphPattern
   [_]
   (throw (ex-info "SERVICE is not a supported SPARQL pattern"
