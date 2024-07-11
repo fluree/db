@@ -109,7 +109,7 @@
        (async/go
         (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                      (let [non-cred example-cred-subject]
-                       (is (nil? (async/<! (cred/verify non-cred))))
+                       (is (util/exception? (async/<! (cred/verify non-cred))))
                        (done)))))))
 
 #?(:clj
