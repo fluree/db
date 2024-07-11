@@ -69,7 +69,7 @@
 
        (testing "verify not a credential"
          (let [non-cred example-cred-subject]
-           (is (nil? (async/<!! (cred/verify non-cred)))))))))
+           (is (util/exception? (async/<!! (cred/verify non-cred)))))))))
 
 #?(:cljs
    (deftest generate
