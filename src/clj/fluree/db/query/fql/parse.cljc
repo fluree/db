@@ -687,7 +687,9 @@
                        :else            (where/match-iri id))]
     (reduce (partial parse-pred-cmp allowed-vars subj-cmp)
             triples
-            (dissoc node :id :idx))))
+            (->> (dissoc node :id :idx)
+                 ;; deterministic patterns for each pred
+                 (sort-by (comp str first))))))
 
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
