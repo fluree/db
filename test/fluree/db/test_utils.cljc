@@ -174,13 +174,6 @@
       #?(:clj @commit-p, :cljs (<p! commit-p))
       ledger)))
 
-(defn transact
-  ([ledger data]
-   (transact ledger data {}))
-  ([ledger data commit-opts]
-   (let [staged @(fluree/stage (fluree/db ledger) data)]
-     (fluree/commit! ledger staged commit-opts))))
-
 (defn retry-promise-wrapped
   "Retries a fn that when deref'd might return a Throwable. Intended for
   retrying promise-wrapped API fns. Do not deref the return value, this will
