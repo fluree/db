@@ -115,8 +115,22 @@
         auth-did                 (did/auth-id->did id)]
     {:subject (json/parse payload false) :did auth-did}))
 
+(defn is-JWS?
+  [signed-transaction]
+  (string? signed-transaction))
+
 (defn verify
-  [auth-claim]
-  (if (string? auth-claim)
-    (go-try (verify-jws auth-claim))
-    (verify-credential auth-claim)))
+  "Verifies a signed query/transaction. Returns keys:
+  {:subject <original tx/cmd> :did <did>}
+
+  Will throw if no :did is detected."
+  [signed-command]
+  (go-try
+   (let [result (if (is-JWS? signed-command)
+                  (verify-jws signed-command)
+                  (<? (verify-credential signed-command)))]
+     (if (:did result)
+       result
+       (throw (ex-info "Signed message could not be verified to an identity"
+                       {:status 401
+                        :error  :db/invalid-credential}))))))
