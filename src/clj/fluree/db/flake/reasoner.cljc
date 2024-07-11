@@ -185,23 +185,25 @@
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
   supplied rules graph or from the db if no graph is supplied."
-  [methods db inserts rules-graphs rules-dbs]
+  [methods db inserts rule-sources]
   (go-try
-    (let [parsed-rules-graphs (try*
-                                (map parse-rules-graph rules-graphs)
-                                (catch* e
-                                        (log/error "Error parsing supplied rules graph:" e)
-                                        (throw e)))
+    (let [rule-graphs           (filter #(not (or (= string? %) (db? %))) rule-sources)
+          parsed-rule-graphs    (try*
+                                  (map parse-rules-graph rule-graphs)
+                                  (catch* e
+                                          (log/error "Error parsing supplied rules graph:" e)
+                                          (throw e)))
           all-rules-from-graphs (apply concat
                                        (for [method methods]
                                          (mapcat (fn [parsed-rules-graph]
                                                    (rules-from-graph method inserts parsed-rules-graph))
-                                                 parsed-rules-graphs)))
-          all-rules-dbs       (if (or (nil? rules-dbs) (empty? rules-dbs))
-                                [db]
-                                (conj rules-dbs db))
-          all-rules-from-dbs (apply concat (<? (rules-from-dbs methods inserts all-rule-dbs)))
-          all-rules (concat all-rules-from-graphs all-rules-from-dbs)]
+                                                 parsed-rule-graphs)))
+          rule-dbs              (filter #(or (= string? %) (db? %)) rule-sources)
+          all-rule-dbs          (if (or (nil? rule-dbs) (empty? rule-dbs))
+                                  [db]
+                                  (conj rule-dbs db))
+          all-rules-from-dbs    (apply concat (<? (rules-from-dbs methods inserts all-rule-dbs)))
+          all-rules             (concat all-rules-from-graphs all-rules-from-dbs)]
       all-rules)))
 
 (defn triples->map
@@ -269,24 +271,23 @@
             raw-rules duplicate-ids)))
 
 (defn reason
-  [db methods
-   {:keys [rule-graphs rule-dbs]}
+  [db methods rule-sources
    {:keys [max-fuel reasoner-max]
     :or   {reasoner-max 10} :as _opts}]
   (go-try
-    (let [db*             (update db :reasoner #(into methods %))
-          tx-state        (flake.transact/->tx-state :db db*)
-          inserts         (atom nil)
+    (let [db*                (update db :reasoner #(into methods %))
+          tx-state           (flake.transact/->tx-state :db db*)
+          inserts            (atom nil)
           ;; TODO - rules can be processed in parallel
-          raw-rules       (<? (all-rules methods db* inserts rules-graphs rules-dbs))
-          _               (log/debug "Reasoner - extracted rules: " raw-rules)
+          raw-rules          (<? (all-rules methods db* inserts rule-sources))
+          _                  (log/debug "Reasoner - extracted rules: " raw-rules)
           deduplicated-rules (deduplicate-raw-rules raw-rules)
-          reasoning-rules (-> deduplicated-rules
-                              resolve/rules->graph
-                              add-rule-dependencies)
-          db**            (if-let [inserts* @inserts]
-                            (<? (process-inserts db* fuel-tracker inserts*))
-                            db*)]
+          reasoning-rules    (-> deduplicated-rules
+                                 resolve/rules->graph
+                                 add-rule-dependencies)
+          db**               (if-let [inserts* @inserts]
+                               (<? (process-inserts db* fuel-tracker inserts*))
+                               db*)]
       (log/trace "Reasoner - parsed rules: " reasoning-rules)
       (if (empty? reasoning-rules)
         db**

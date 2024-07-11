@@ -48,11 +48,11 @@
           time-travel-db (-> (if t
                                (<? (time-travel/as-of policy-db t))
                                policy-db))
-          reasoned-db    (let [{:keys [reasoner-methods rule-graphs rule-dbs] :as reasoning} opts]
+          reasoned-db    (let [{:keys [reasoner-methods rule-sources]} opts]
                            (if reasoner-methods
                              (<? (reasoner/reason time-travel-db
                                                   reasoner-methods
-                                                  reasoning
+                                                  rule-sources
                                                   opts))
                              time-travel-db))]
       (assoc-in reasoned-db [:policy :cache] (atom {})))))
@@ -159,19 +159,18 @@
                  parse-t-val)]
       [alias nil])))
 
-(defn parse-rule-dbs
-  [conn dbs-or-aliases]
-  (let [clause-chan (async/to-chan! dbs-or-aliases)
+(defn load-aliased-rule-dbs
+  [conn rule-sources]
+  (let [clause-chan (async/to-chan! rule-sources)
         out-chan (async/chan)]
     (async/pipeline-async
      1
      out-chan
-     (fn [db-or-alias out-ch]
+     (fn [rule-source out-ch]
        (async/pipe (go-try
-                     (cond
-                       (db/db? db-or-alias) db-or-alias
-                       (string? db-or-alias) (ledger/-db (<? (jld-ledger/load conn db-or-alias)))
-                       :else (throw "Invalid rule db provided. Must be a db object or a string of the ledger name.")))
+                     (if (string? rule-source)
+                       (ledger/-db (<? (jld-ledger/load conn rule-source)))
+                       rule-source))
                    out-ch))
      clause-chan)
     (async/into [] out-chan)))
@@ -181,12 +180,12 @@
   (go-try
     (try*
       (let [[alias explicit-t] (extract-query-string-t alias)
-            address  (<? (nameservice/primary-address conn alias nil))
-            ledger   (<? (jld-ledger/load conn address))
-            db       (ledger/-db ledger)
-            t*       (or explicit-t t)
-            rule-dbs (<? (parse-rule-dbs conn (:rule-dbs opts)))
-            opts*    (assoc opts :rule-dbs rule-dbs)]
+            address      (<? (nameservice/primary-address conn alias nil))
+            ledger       (<? (jld-ledger/load conn address))
+            db           (ledger/-db ledger)
+            t*           (or explicit-t t)
+            rule-sources (<? (parse-rule-dbs conn (:rule-sources opts)))
+            opts*        (assoc opts :rule-sources rule-sources)]
         (<? (restrict-db db t* context opts*))) 
       (catch* e
               (throw (contextualize-ledger-400-error

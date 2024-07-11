@@ -191,7 +191,7 @@
           db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
 
       (testing "A recursive relationship"
-        (let [grandparents-db @(fluree/reason db0 :datalog {:rule-graphs [grandparent-rule]})
+        (let [grandparents-db @(fluree/reason db0 :datalog [grandparent-rule])
               grandparents-of @(fluree/query grandparents-db
                                              {:context {"ex" "http://example.org/"}
                                               :select  ["?grandParent" "?person"]
@@ -218,8 +218,8 @@
 
 
       (testing "multiple graphs as rule sources"
-        (let [half-reasoned-db @(fluree/reason db0 :datalog {:rule-graphs [aunt-rule]})
-              full-reasoned-db @(fluree/reason db0 :datalog {:rule-graphs [uncle-rule aunt-rule]})]
+        (let [half-reasoned-db @(fluree/reason db0 :datalog [aunt-rule])
+              full-reasoned-db @(fluree/reason db0 :datalog [uncle-rule aunt-rule])]
 
           (is (= [["ex:brian" "ex:janine"]]
                  @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
@@ -236,8 +236,8 @@
               "With both graphs included, two results are returned.")))
 
       (testing "multiple dbs as rule sources"
-        (let [half-reasoned-db @(fluree/reason db0 :datalog {:rule-dbs [rule-db-1]})
-              full-reasoned-db @(fluree/reason db0 :datalog {:rule-dbs [rule-db-1 rule-db-2]})]
+        (let [half-reasoned-db @(fluree/reason db0 :datalog [rule-db-1])
+              full-reasoned-db @(fluree/reason db0 :datalog [rule-db-1 rule-db-2])]
 
           (is (= []
                  @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
@@ -254,9 +254,8 @@
               "With both rule dbs included, two results are returned.")))
 
       (testing "a mixture of graphs and dbs as rule sources"
-        (let [half-reasoned-db @(fluree/reason db0 :datalog {:rule-dbs [rule-db-1]})
-              full-reasoned-db @(fluree/reason db0 :datalog {:rule-dbs    [rule-db-1]
-                                                             :rule-graphs [aunt-rule]})]
+        (let [half-reasoned-db @(fluree/reason db0 :datalog [rule-db-1])
+              full-reasoned-db @(fluree/reason db0 :datalog [rule-db-1 aunt-rule])]
 
           (is (= []
                  @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
@@ -272,8 +271,7 @@
               "With both sources included, two results are returned.")))
 
       (testing "multiple sources targeting identical nodes"
-        (let [identical-node-reasoned-db @(fluree/reason db0 :datalog
-                                                         {:rule-graphs [alt-grandparent-rule grandparent-rule]})]
+        (let [identical-node-reasoned-db @(fluree/reason db0 :datalog [alt-grandparent-rule grandparent-rule])]
           (is (= [["ex:alice" "ex:carol"] ["ex:brian" "ex:cheryl"]]
                  @(fluree/query identical-node-reasoned-db {:context {"ex" "http://example.org/"}
                                                             :select  ["?s" "?grandParent"]
