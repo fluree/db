@@ -122,6 +122,8 @@
      :type-key       (json-ld/compact "@type" compact-fn)
      :index-files-ch index-files-ch})) ;; optional async chan passed in which will stream out all new index files created (for consensus)
 
+;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
+;; TODO - however this is really a concern of "commit", not staging and I don' think the db should be handling any of it
 (defn write-transactions!
   [conn {:keys [alias] :as _ledger} staged]
   (go-try
@@ -178,6 +180,7 @@
           {:keys [dbid db-jsonld staged-txns]}
           (jld-db/db->jsonld staged-db opts*)
 
+          ;; TODO - we do not support multiple "transactions" in a single commit (although other code assumes we do which needs cleaning)
           [[txn-id author annotation] :as txns]
           (<? (write-transactions! conn ledger staged-txns))
 
@@ -197,7 +200,7 @@
                            :db-address db-address
                            :author     (or author "")
                            :annotation annotation
-                           :txn-id     (if (= 1 (count txns)) txn-id "")
+                           :txn-id     txn-id
                            :flakes     (:flakes stats)
                            :size       (:size stats)}
           new-commit      (commit-data/new-db-commit-map base-commit-map)
