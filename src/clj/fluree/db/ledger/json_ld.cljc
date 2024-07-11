@@ -125,12 +125,16 @@
 (defn write-transactions!
   [conn {:keys [alias] :as _ledger} staged]
   (go-try
-    (loop [[[txn author-did annotation] & r] staged
-           results                []]
-      (if txn
-        (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
-          (recur r (conj results [txn-id author-did annotation])))
-        results))))
+   (loop [[next-staged & r] staged
+          results []]
+     (if next-staged
+       (let [[txn author-did annotation] next-staged
+             results* (if txn
+                        (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
+                          (conj results [txn-id author-did annotation]))
+                        (conj results next-staged))]
+         (recur r results*))
+       results))))
 
 (defn write-commit
   [conn alias {:keys [did private]} commit]
