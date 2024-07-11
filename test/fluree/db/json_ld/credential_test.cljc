@@ -5,7 +5,8 @@
                :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.did :as did]))
+            [fluree.db.did :as did]
+            [fluree.db.util.core :as util]))
 
 
 (def kp
@@ -114,11 +115,13 @@
 #?(:clj
    (deftest ^:integration cred-wrapped-transactions-and-queries
      (let [conn      @(fluree/connect {:method :memory})
-           ledger    @(fluree/create conn "credentialtest")
+           ledger-id "credentialtest"
            context   (merge test-utils/default-str-context
                             {"ct" "ledger:credentialtest/"})
-           db0       @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
-                                                   "insert"   {"@id" "ct:open" "ct:foo" "bar"}})
+           db0       @(fluree/create-with-txn conn {"@context" ["https://ns.flur.ee" context]
+                                                    "ledger"   ledger-id
+                                                    "insert"   {"@id" "ct:open" "ct:foo" "bar"}})
+
            root-user {"id"            (:id auth)
                       "type"          "ct:User"
                       "ct:name"       "Daniel"
@@ -141,10 +144,12 @@
                                      "@value" {"where" [["filter" "(= ?$this ?$identity)"]]}}}
            tx        [root-user pleb-user policy]
            ;; can't use credentials until after an identity with a role has been created
-           db1       @(test-utils/transact ledger {"@context" ["https://ns.flur.ee" context]
-                                                   "insert"   tx})
+           db1       @(fluree/transact! conn {"@context" ["https://ns.flur.ee" context]
+                                              "ledger"   ledger-id
+                                              "insert"   tx})
 
            mdfn      {"@context" ["https://ns.flur.ee" context]
+                      "ledger"   ledger-id
                       "delete"   {"@id"        (:id auth)
                                   "ct:name"    "Daniel"
                                   "ct:favnums" 1}
@@ -152,7 +157,9 @@
                                   "ct:name"    "D"
                                   "ct:favnums" [4 5 6]}}
 
-           db2       @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
+           db2       @(fluree/credential-transact! conn (async/<!! (cred/generate mdfn (:private auth))))
+
+           ledger    @(fluree/load conn ledger-id)
 
            query     {"@context" context
                       "select"   {(:id auth) ["*"]}}]
