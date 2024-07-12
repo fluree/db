@@ -1128,4 +1128,24 @@
     (is (= ["foo-1"]
            @(fluree/query db5 {"@context" context
                                "where"    [{"@id" "ex:dan" "ex:x" "?x" "f:range" {"at" 1}}]
-                               "select"   "?x"})))))
+                               "select"   "?x"})))
+    (testing "subject history"
+      ;; this is only the asserted data at each t - like an as-of query
+      (is (= [["ex:dan" "ex:x" "foo-1" 1]
+              ["ex:dan" "ex:x" "foo-1" 1]
+              ["ex:dan" "ex:x" "foo-2" 2]
+              ["ex:dan" "ex:x" "foo-2" 2]
+              ["ex:dan" "ex:x" "foo-3" 3]
+              ["ex:dan" "ex:x" "foo-3" 3]
+              ["ex:dan" "ex:x" "foo-cat" 5]
+              ["ex:dan" "ex:y" "bar-1" 1]
+              ["ex:dan" "ex:y" "bar-1" 1]
+              ["ex:dan" "ex:y" "bar-2" 2]
+              ["ex:dan" "ex:y" "bar-2" 2]
+              ["ex:dan" "ex:y" "bar-3" 3]
+              ["ex:dan" "ex:y" "bar-3" 3]
+              ["ex:dan" "ex:y" "bar-cat" 5]]
+             @(fluree/query db5 {"@context" context
+                                 "values" ["?s" [{"@value" "ex:dan" "@type" "xsd:anyURI"}]]
+                                 "where" [{"@id" "?s" "?p" "?o" "f:range" {"from" 1 "to" 5}}]
+                                 "select" ["?s" "?p" "?o" ]}))))))

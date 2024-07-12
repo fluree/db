@@ -234,6 +234,8 @@
         sid   (flake/s flake)
         s-iri (iri/decode-sid db sid)]
     (-> s-match
+        (assoc ::t (flake/t flake))
+        (assoc ::op (flake/op flake))
         (match-sid alias sid)
         (match-iri s-iri))))
 
@@ -246,6 +248,8 @@
         pid      (flake/p flake)
         p-iri    (iri/decode-sid db pid)]
     (-> p-match
+        (assoc ::t (flake/t flake))
+        (assoc ::op (flake/op flake))
         (match-sid alias pid)
         (match-iri p-iri))))
 
@@ -253,16 +257,23 @@
   "Matches the object, data type, and metadata of the supplied `flake` to the
   triple object pattern component `o-match`."
   [o-match db flake]
-  (let [dt (flake/dt flake)]
+  (let [op (flake/op flake)
+        t  (flake/t flake)
+        dt (flake/dt flake)]
     (if (= const/$xsd:anyURI dt)
       (let [alias (:alias db)
             oid   (flake/o flake)
             o-iri (iri/decode-sid db oid)]
         (-> o-match
             (match-sid alias oid)
-            (match-iri o-iri)))
+            (match-iri o-iri)
+            (assoc ::t t)
+            (assoc ::op op)))
       (let [dt-iri (iri/decode-sid db dt)]
-        (match-value o-match (flake/o flake) dt-iri (flake/m flake))))))
+        (-> o-match
+            (assoc ::t t)
+            (assoc ::op op)
+            (match-value (flake/o flake) dt-iri (flake/m flake)))))))
 
 (defn match-flake
   "Assigns the unmatched variables within the supplied `triple-pattern` to their
