@@ -116,8 +116,9 @@
     {:subject (json/parse payload false) :did auth-did}))
 
 (defn jws?
-  [signed-transaction]
-  (string? signed-transaction))
+  [x]
+  (and (string? x)
+       (re-matches #"(^[A-Za-z0-9-_]*\.[A-Za-z0-9-_]*\.[A-Za-z0-9-_]*$)" x)))
 
 (defn verify
   "Verifies a signed query/transaction. Returns keys:
