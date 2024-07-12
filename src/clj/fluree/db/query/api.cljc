@@ -87,7 +87,9 @@
 (defn query-sparql
   [db query]
   (go-try
-    (let [fql (sparql/->fql query)]
+    (let [verified-query (or (:subject (<? (cred/verify query)))
+                             query)
+          fql (sparql/->fql verified-query)]
       (<? (query-fql db fql)))))
 
 (defn query
@@ -208,11 +210,11 @@
         (dataset db-map defaults)))))
 
 (defn query-connection-fql
-  [conn query {:keys [role did]}]
+  [conn query request-opts]
   (go-try
     (let [{verified-query :subject did :did} (or (<? (cred/verify query))
                                                  {:subject query})
-          {:keys [t opts] :as sanitized-query} (update verified-query :opts sanitize-query-options did)
+          {:keys [t opts] :as sanitized-query} (update verified-query :opts sanitize-query-options (or did (:did request-opts)))
           
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
@@ -232,9 +234,9 @@
 (defn query-connection-sparql
   [conn query {:keys [role did] :as request-opts}]
   (go-try
-    (let [{sparql :subject did :did} (or (<? (cred/verify query))
-                                         {:subject query})
-          fql (sparql/->fql sparql)
+    (let [verified-query   (or (:subject (<? (cred/verify query)))
+                               query)
+          fql              (sparql/->fql verified-query)
           credentialed-fql (update fql :opts #(merge {:role role :did did} %))]
       (<? (query-connection-fql conn credentialed-fql request-opts)))))
 
