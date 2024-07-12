@@ -256,6 +256,8 @@
           db*)))))
 
 (defn deduplicate-raw-rules
+  "Given a list of reasoning rules, identifies rules with duplicate ids and renames them using
+  indexes."
   [raw-rules]
   (let [rule-ids (map first raw-rules)
         duplicate-ids (filter #(< 1 (last %)) (frequencies rule-ids))]
