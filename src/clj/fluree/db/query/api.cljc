@@ -184,7 +184,7 @@
             ledger       (<? (jld-ledger/load conn address))
             db           (ledger/-db ledger)
             t*           (or explicit-t t)
-            rule-sources (<? (parse-rule-dbs conn (:rule-sources opts)))
+            rule-sources (<? (load-aliased-rule-dbs conn (:rule-sources opts)))
             opts*        (assoc opts :rule-sources rule-sources)]
         (<? (restrict-db db t* context opts*))) 
       (catch* e
