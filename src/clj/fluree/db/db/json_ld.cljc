@@ -126,7 +126,7 @@
     db))
 
 (defn match-id
-  [db fuel-tracker solution s-mch error-ch]
+  [db fuel-tracker solution [s-mch t-mch] error-ch]
   (let [matched-ch (async/chan 2 (comp cat
                                        (partition-by flake/s)
                                        (map first)
@@ -151,7 +151,7 @@
                                               (where/match-flake solution tuple db flake)))))
         db-alias   (:alias db)
         triple     (where/assign-matched-values tuple solution)]
-    (if-let [[s p o] (where/compute-sids db triple)]
+    (if-let [[s p o t] (where/compute-sids db triple)]
       (let [pid (where/get-sid p db)]
         (if-let [props (and pid (where/get-child-properties db pid))]
           (let [prop-ch (-> props (conj pid) async/to-chan!)]
@@ -160,12 +160,12 @@
                                   (fn [prop ch]
                                     (let [p* (where/match-sid p db-alias prop)]
                                       (-> db
-                                          (where/resolve-flake-range fuel-tracker error-ch [s p* o])
+                                          (where/resolve-flake-range fuel-tracker error-ch [s p* o t])
                                           (async/pipe ch))))
                                   prop-ch))
 
           (-> db
-              (where/resolve-flake-range fuel-tracker error-ch [s p o])
+              (where/resolve-flake-range fuel-tracker error-ch [s p o t])
               (async/pipe matched-ch))))
       (async/close! matched-ch))
     matched-ch))
@@ -202,7 +202,7 @@
                                               (where/match-flake solution triple db flake)))))
         db-alias   (:alias db)
         triple     (where/assign-matched-values triple solution)]
-    (if-let [[s p o] (where/compute-sids db triple)]
+    (if-let [[s p o t] (where/compute-sids db triple)]
       (let [cls        (where/get-sid o db)
             sub-obj    (dissoc o ::sids ::iri)
             class-objs (into [o]
@@ -214,7 +214,7 @@
         (async/pipeline-async 2
                               matched-ch
                               (fn [class-obj ch]
-                                (-> (where/resolve-flake-range db fuel-tracker error-ch [s p class-obj])
+                                (-> (where/resolve-flake-range db fuel-tracker error-ch [s p class-obj t])
                                     (async/pipe ch)))
                               class-ch))
       (async/close! matched-ch))
@@ -634,11 +634,11 @@
     (iri/sid->iri sid namespace-codes))
 
   where/Matcher
-  (-match-id [db fuel-tracker solution s-mch error-ch]
-    (match-id db fuel-tracker solution s-mch error-ch))
+  (-match-id [db fuel-tracker solution [s-mch t-mch] error-ch]
+    (match-id db fuel-tracker solution [s-mch t-mch] error-ch))
 
-  (-match-triple [db fuel-tracker solution s-mch error-ch]
-    (match-triple db fuel-tracker solution s-mch error-ch))
+  (-match-triple [db fuel-tracker solution triple error-ch]
+    (match-triple db fuel-tracker solution triple error-ch))
 
   (-match-class [db fuel-tracker solution s-mch error-ch]
     (match-class db fuel-tracker solution s-mch error-ch))

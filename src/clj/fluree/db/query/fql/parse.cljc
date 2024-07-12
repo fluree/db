@@ -279,6 +279,21 @@
         (assoc const/iri-id id)
         (update const/iri-id id-or-variable))))
 
+;; TODO: merge this with with-id
+(defn with-temporal-range
+  [m context]
+  (let [[range-key t-range]
+        (reduce-kv (fn [_res p o]
+                     (let [expanded (if (v/variable? p)
+                                      p
+                                      (json-ld/expand-iri p context))]
+                       (when (= const/iri-range expanded)
+                         (reduced [p o]))))
+                   nil m)]
+    (-> m
+        (dissoc range-key)
+        (assoc const/iri-range t-range))))
+
 (defn parse-subject
   [id context]
   (if (v/variable? id)
@@ -294,89 +309,109 @@
         (where/->predicate const/iri-rdf-type reverse)
         (where/->predicate expanded reverse)))))
 
+(defn parse-temporal-range
+  [{:strs [at from to]}]
+  (if at
+    [at at]
+    [from to]))
+
 (def id-predicate-match
   (parse-predicate const/iri-id nil))
 
 (declare parse-statement parse-statements)
 
 (defn flip-reverse-pattern
-  [[s-mch p-mch o-mch :as pattern]]
+  [[s-mch p-mch o-mch t-mch :as pattern]]
   (if (::where/reverse p-mch)
-    [o-mch p-mch s-mch]
+    [o-mch p-mch s-mch t-mch]
     pattern))
 
 (defn parse-object-map
-  [s-mch p-mch o vars context]
+  [s-mch p-mch t-mch o vars context]
   (let [o* (expand-keys o context)]
     (if-let [v (get o* const/iri-value)]
       (let [attrs (dissoc o* const/iri-value)
             o-mch (if-let [var (parse-var-name v)]
                     (parse-variable-attributes var attrs vars)
                     (parse-value-attributes v attrs context))]
-        [(flip-reverse-pattern [s-mch p-mch o-mch])])
+        [(flip-reverse-pattern [s-mch p-mch o-mch t-mch])])
       ;; ref
-      (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
-            o-mch   (-> id-map
+      (let [;; not o*, we can't use expanded or we'll lose @reverse
+            o-map (-> o
+                      (with-id context)
+                      (with-temporal-range context))
+
+            o-mch   (-> o-map
                         (get const/iri-id)
                         (parse-subject context))
-            o-attrs (dissoc id-map const/iri-id)]
+
+            nested-t-mch (-> o-map
+                             (get const/iri-range)
+                             (parse-temporal-range))
+
+            o-attrs (dissoc o-map const/iri-id const/iri-range)]
         ;; return a thunk wrapping the recursive call to preserve stack
         ;; space by delaying execution
-        #(into [(flip-reverse-pattern [s-mch p-mch o-mch])]
-               (parse-statements o-mch o-attrs vars context))))))
+        #(into [(flip-reverse-pattern [s-mch p-mch o-mch t-mch])]
+               (parse-statements o-mch nested-t-mch o-attrs vars context))))))
 
 (defn parse-statement*
-  [s-mch p-mch o vars context]
+  [s-mch p-mch t-mch o vars context]
   (cond
     (v/variable? o)
     (let [o-mch (parse-variable o)]
-      [(flip-reverse-pattern [s-mch p-mch o-mch])])
+      [(flip-reverse-pattern [s-mch p-mch o-mch t-mch])])
 
     (map? o)
-    (parse-object-map s-mch p-mch o vars context)
+    (parse-object-map s-mch p-mch t-mch o vars context)
 
     (sequential? o)
     #(mapcat (fn [o*]
-               (parse-statement s-mch p-mch o* vars context))
+               (parse-statement s-mch p-mch t-mch o* vars context))
              o)
 
     (type-pred-match? p-mch)
     (let [class-ref (parse-class o context)]
-      [(where/->pattern :class (flip-reverse-pattern [s-mch p-mch class-ref]))])
+      [(where/->pattern :class (flip-reverse-pattern [s-mch p-mch class-ref t-mch]))])
 
     :else
     (let [o-mch (where/anonymous-value o)]
-      [(flip-reverse-pattern [s-mch p-mch o-mch])])))
+      [(flip-reverse-pattern [s-mch p-mch o-mch t-mch])])))
 
 (defn parse-statement
-  [s-mch p-mch o vars context]
-  (trampoline parse-statement* s-mch p-mch o vars context))
+  [s-mch p-mch t-mch o vars context]
+  (trampoline parse-statement* s-mch p-mch t-mch o vars context))
 
 (defn parse-statements*
-  [s-mch attrs vars context]
+  [s-mch t-mch attrs vars context]
   #(mapcat (fn [[p o]]
+             ;; special handling for range
              (let [p-mch (parse-predicate p context)]
-               (parse-statement s-mch p-mch o vars context)))
+               (parse-statement s-mch p-mch t-mch o vars context)))
            attrs))
 
 (defn parse-statements
-  [s-mch attrs vars context]
-  (trampoline parse-statements* s-mch attrs vars context))
+  [s-mch t-mch attrs vars context]
+  (trampoline parse-statements* s-mch t-mch attrs vars context))
 
 (defn parse-id-map-pattern
   [m vars context]
   (let [s-mch (-> m
                   (get const/iri-id)
                   (parse-subject context))
-        attrs (dissoc m const/iri-id)]
+        t-mch (-> m
+                  (get const/iri-range)
+                  (parse-temporal-range))
+        attrs (dissoc m const/iri-id const/iri-range)]
     (if (empty? attrs)
-      [(where/->pattern :id s-mch)]
-      (parse-statements s-mch attrs vars context))))
+      [(where/->pattern :id [s-mch t-mch])]
+      (parse-statements s-mch t-mch attrs vars context))))
 
 (defn parse-node-map
   [m vars context]
   (-> m
       (with-id context)
+      (with-temporal-range context)
       (parse-id-map-pattern vars context)))
 
 (defmethod parse-pattern :node

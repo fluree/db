@@ -13,6 +13,7 @@
 (def ^:const iri-DB (fluree-iri "DB"))
 (def ^:const iri-data (fluree-iri "data"))
 (def ^:const iri-t (fluree-iri "t"))
+(def ^:const iri-range (fluree-iri "range"))
 (def ^:const iri-address (fluree-iri "address"))
 (def ^:const iri-v (fluree-iri "v"))
 (def ^:const iri-flakes (fluree-iri "flakes"))

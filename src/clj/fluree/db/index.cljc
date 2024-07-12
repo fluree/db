@@ -316,6 +316,10 @@
                          :to-t   to-t
                          :flakes  flakes)))))))))
 
+(defn conn->history-range-resolver
+  [{:keys [lru-cache-atom] :as conn} novelty from-t to-t]
+  (->CachedHistoryRangeResolver conn novelty from-t to-t lru-cache-atom))
+
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from
   `idx-novelty` to `leaf` if `t` is newer than `leaf`, or removing flakes later

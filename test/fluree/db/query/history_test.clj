@@ -1065,3 +1065,67 @@
                                                         "schema:age" 55}]}
                                         {:annotation [{"ex:originator" "opts" "@id" "invalid:subj"}]})]
             (is (= "Commit annotation cannot specify a subject identifier." (ex-message invalid3)))))))))
+
+(deftest temporal-tests
+  (let [conn      @(fluree/connect {:method :memory})
+        ledger-id "temporaltest"
+        context   [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        db1       @(fluree/create-with-txn conn {"@context" context
+                                                 "ledger"   ledger-id
+                                                 "insert"   [{"id"   "ex:dan"
+                                                              "ex:x" "foo-1"
+                                                              "ex:y" "bar-1"}
+                                                             {"id"   "ex:cat"
+                                                              "ex:x" "foo-1"
+                                                              "ex:y" "bar-1"}
+                                                             {"id"   "ex:dog"
+                                                              "ex:x" "foo-1"
+                                                              "ex:y" "bar-1"}]})
+
+        db2 @(fluree/transact! conn {"@context" context
+                                     "ledger"   ledger-id
+                                     "delete"   {"id"   "ex:dan"
+                                                 "ex:x" "foo-1"
+                                                 "ex:y" "bar-1"}
+                                     "insert"   {"id"   "ex:dan"
+                                                 "ex:x" "foo-2"
+                                                 "ex:y" "bar-2"}})
+        db3 @(fluree/transact! conn {"@context" context
+                                     "ledger"   ledger-id
+                                     "delete"   {"id"   "ex:dan"
+                                                 "ex:x" "foo-2"
+                                                 "ex:y" "bar-2"}
+                                     "insert"   {"id"   "ex:dan"
+                                                 "ex:x" "foo-3"
+                                                 "ex:y" "bar-3"}})
+
+        db4 @(fluree/transact! conn {"@context" context
+                                     "ledger"   ledger-id
+                                     "delete"   [{"id"   "ex:cat"
+                                                  "ex:x" "foo-1"
+                                                  "ex:y" "bar-1"}
+                                                 {"id"   "ex:dog"
+                                                  "ex:x" "foo-1"
+                                                  "ex:y" "bar-1"}]
+                                     "insert"   [{"id"   "ex:cat"
+                                                  "ex:x" "foo-cat"
+                                                  "ex:y" "bar-cat"}
+                                                 {"id"   "ex:dog"
+                                                  "ex:x" "foo-dog"
+                                                  "ex:y" "bar-dog"}]})
+        db5 @(fluree/transact! conn {"@context" context
+                                     "ledger"   ledger-id
+                                     "delete"   {"id"   "ex:dan"
+                                                 "ex:x" "foo-3"
+                                                 "ex:y" "bar-3"}
+                                     "insert"   {"id"   "ex:dan"
+                                                 "ex:x" "foo-cat"
+                                                 "ex:y" "bar-cat"}})]
+    (is (= ["foo-cat"]
+           @(fluree/query db5 {"@context" context
+                               "where"    [{"@id" "ex:dan" "ex:x" "?x" }]
+                               "select"   "?x"})))
+    (is (= ["foo-1"]
+           @(fluree/query db5 {"@context" context
+                               "where"    [{"@id" "ex:dan" "ex:x" "?x" "f:range" {"at" 1}}]
+                               "select"   "?x"})))))

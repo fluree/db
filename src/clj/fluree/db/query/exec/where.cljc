@@ -268,7 +268,7 @@
   "Assigns the unmatched variables within the supplied `triple-pattern` to their
   corresponding values from `flake` in the supplied match `solution`."
   [solution triple-pattern db flake]
-  (let [[s p o] triple-pattern]
+  (let [[s p o t] triple-pattern]
     (cond-> solution
       (unmatched-var? s) (assoc (::var s) (match-subject s db flake))
       (unmatched-var? p) (assoc (::var p) (match-predicate p db flake))
@@ -304,7 +304,7 @@
   ([db fuel-tracker error-ch components]
    (resolve-flake-range db fuel-tracker nil error-ch components))
 
-  ([{:keys [t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
+  ([{:keys [t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch [from-t to-t]]]
    (let [s    (get-sid s-mch db)
          s-fn (::fn s-mch)
          p    (get-sid p-mch db)
@@ -343,8 +343,8 @@
                           (remove nil?)
                           (apply comp))
          opts        {:idx         idx
-                      :from-t      t
-                      :to-t        t
+                      :from-t      (or from-t t)
+                      :to-t        (or to-t t)
                       :start-flake start-flake
                       :end-flake   end-flake
                       :flake-xf    flake-xf*}]
@@ -370,7 +370,7 @@
       o-mch)))
 
 (defn compute-sids
-  [db [s p o]]
+  [db [s p o t]]
   (let [s* (compute-sid s db)
         p* (compute-sid p db)
         o* (if (unmatched-var? o)
@@ -379,7 +379,7 @@
                (compute-sid o db)
                (compute-datatype-sid o db)))]
     (when (and (some? s*) (some? p*) (some? o*))
-      [s* p* o*])))
+      [s* p* o* t])))
 
 (defn get-child-properties
   [db prop]

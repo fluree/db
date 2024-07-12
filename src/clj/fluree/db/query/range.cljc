@@ -155,9 +155,16 @@
    {:keys [from-t to-t start-flake end-flake] :as opts}]
   (let [root      (get db idx)
         novelty   (get-in db [:novelty idx])
-        resolver  (index/conn->t-range-resolver conn novelty from-t to-t)
+        resolver  (if (= from-t to-t)
+                    (index/conn->t-range-resolver conn novelty from-t to-t)
+                    (index/conn->history-range-resolver conn novelty from-t to-t))
+        resolve?  (if (= from-t to-t)
+                    any?
+                    (let [idx-cmp   (get-in db [:comparators idx])
+                          range-set (flake/sorted-set-by idx-cmp start-flake end-flake)]
+                      (fn [node] (intersects-range? node range-set))))
         query-xf  (extract-query-flakes opts)]
-    (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
+    (->> (index/tree-chan resolver root start-flake end-flake resolve? 1 query-xf error-ch)
          (filter-authorized db error-ch))))
 
 (defn filter-subject-page
