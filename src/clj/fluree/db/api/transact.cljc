@@ -15,10 +15,11 @@
             [fluree.db.ledger :as ledger]))
 
 (defn parse-opts
-  [parsed-opts opts]
-  (reduce (fn [opts* [k v]] (assoc opts* (keyword k) v))
-          parsed-opts
-          opts))
+  [expanded-txn opts txn-context]
+  (-> (util/get-first-value expanded-txn const/iri-opts)
+      (merge opts) ;; override opts 'did', 'raw-txn' with credential's if present
+      (util/keywordize-keys)
+      (assoc :context txn-context)))
 
 (defn stage
   [db txn opts]
@@ -26,10 +27,7 @@
    (let [txn-context (or (ctx-util/txn-context txn)
                          (:context opts))
          expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
-         parsed-opts (-> (util/get-first-value expanded const/iri-opts) ;; get opts out of transaction
-                         (merge opts) ;; merge with upstream supplied opts (e.g. did, raw-txn
-                         (assoc :context txn-context)
-                         (util/keywordize-keys))
+         parsed-opts (parse-opts expanded opts txn-context)
          track-fuel? (or (:maxFuel parsed-opts)
                          (:meta parsed-opts))
          parsed-txn  (q-parse/parse-txn expanded txn-context)
@@ -65,10 +63,7 @@
                                         {:status 400 :error :db/invalid-transaction})))
           address     (<? (nameservice/primary-address conn ledger-id* nil))
 
-          parsed-opts (-> (util/get-first-value expanded const/iri-opts)
-                          (merge opts)
-                          (util/keywordize-keys)
-                          (assoc :context txn-context))]
+          parsed-opts (parse-opts expanded opts txn-context)]
       (if-not (<? (nameservice/exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))
         (let [ledger   (<? (jld-ledger/load conn address))
@@ -104,10 +99,7 @@
                         (throw (ex-info "Invalid transaction, missing required key: ledger."
                                         {:status 400 :error :db/invalid-transaction})))
           address     (<? (nameservice/primary-address conn ledger-id nil))
-          parsed-opts (-> (util/get-first-value expanded const/iri-opts)
-                          (merge opts) ;; override opts 'did', 'raw-txn' with credential's if present
-                          (util/keywordize-keys)
-                          (assoc :context txn-context))]
+          parsed-opts (parse-opts expanded opts txn-context)]
       (if (<? (nameservice/exists? conn address))
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
