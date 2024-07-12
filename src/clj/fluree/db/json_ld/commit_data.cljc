@@ -524,9 +524,7 @@
 
 ;; TODO - txn should really be an IRI, not a string
 (defn txn-flake
-  "Builds and returns the commit txn flakes for the given t and transaction id.
-  Used when committing to an in-memory ledger value and when reifying a ledger
-  from storage on load."
+  "Builds and returns the commit txn flake for the given t and transaction id."
   [t commit-sid txn]
   (flake/create commit-sid const/$_commit:txn txn const/$xsd:string t true nil))
 
@@ -563,8 +561,6 @@
                              (issuer-flakes db t commit-sid issuer-iri))
         message-flakes     (when message
                              (message-flakes t commit-sid message))
-        txn-flake          (when txn
-                             (txn-flake t commit-sid txn))
 
         [db* annotation-flakes] (annotation-flakes db t commit-sid annotation)
 
@@ -574,7 +570,7 @@
                                    issuer-flakes (into issuer-flakes)
                                    annotation-flakes (into annotation-flakes)
                                    message-flakes (into message-flakes)
-                                   txn-flake (conj txn-flake))]
+                                   txn (conj (txn-flake t commit-sid txn)))]
     (-> db*
         (update-novelty commit-flakes)
         add-tt-id)))
