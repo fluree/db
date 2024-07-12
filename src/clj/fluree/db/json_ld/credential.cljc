@@ -115,7 +115,7 @@
         auth-did                 (did/auth-id->did id)]
     {:subject (json/parse payload false) :did auth-did}))
 
-(defn is-JWS?
+(defn jws?
   [signed-transaction]
   (string? signed-transaction))
 
@@ -126,7 +126,7 @@
   Will throw if no :did is detected."
   [signed-command]
   (go-try
-   (let [result (if (is-JWS? signed-command)
+   (let [result (if (jws? signed-command)
                   (verify-jws signed-command)
                   (<? (verify-credential signed-command)))]
      (if (:did result)
