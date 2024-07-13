@@ -35,8 +35,8 @@
 (defn restrict-db
   [db t context opts]
   (go-try
-    (let [db*  (if-let [policy-identity (perm/parse-policy-identity opts context)]
-                 (<? (perm/wrap-identity-policy db policy-identity false nil))
+    (let [db*  (if-let [did (:did opts)]
+                 (<? (perm/wrap-identity-policy db did true nil))
                  db)
           db** (-> (if t
                      (<? (time-travel/as-of db* t))

@@ -342,7 +342,7 @@
     (let [tx-state   (->tx-state :db db
                                  :context context
                                  :txn raw-txn
-                                 :author-did (:did identity)
+                                 :author-did identity
                                  :annotation annotation)
           [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
           updated-db (<? (final-db db** new-flakes tx-state))]

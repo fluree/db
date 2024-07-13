@@ -32,9 +32,8 @@
                                     "schema:name"          "Widget"
                                     "schema:price"         99.99
                                     "schema:priceCurrency" "USD"}
-                                   ;; assign root-did to "ex:rootRole"
                                    {"@id" root-did}
-                                   ;; assign alice-did to "ex:userRole" and also link the did to "ex:alice" via "ex:user"
+                                   ;; assign alice-did to "ex:EmployeePolicy" and also link the did to "ex:alice" via "ex:user"
                                    {"@id"           alice-did
                                     "f:policyClass" [{"@id" "ex:EmployeePolicy"}]
                                     "ex:user"       {"@id" "ex:alice"}}
