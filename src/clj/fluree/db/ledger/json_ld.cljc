@@ -352,16 +352,18 @@
 (defn create
   [conn ledger-alias opts]
   (go-try
-    (let [[not-cached? ledger-chan] (register-ledger conn ledger-alias)] ;; holds final cached ledger in a promise-chan avoid race conditions
-      (if not-cached?
+    (let [[cached? ledger-chan] (register-ledger conn ledger-alias)] ;; holds final cached ledger in a promise-chan avoid race conditions
+      (if cached?
+        (throw (ex-info
+                (str "Unable to create new ledger, one already exists for: "
+                     ledger-alias)
+                {:status 400
+                 :error  :db/ledger-exists}))
         (let [ledger (<! (create* conn ledger-alias opts))]
           (when (util/exception? ledger)
             (release-ledger conn ledger-alias))
           (async/put! ledger-chan ledger)
-          ledger)
-        (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
-                        {:status 400
-                         :error  :db/ledger-exists}))))))
+          ledger)))))
 
 (defn commit->ledger-alias
   "Returns ledger alias from commit map, if present. If not present
@@ -424,26 +426,37 @@
 
 (defn load-address
   [conn address]
+  (log/trace "load-address:" address)
   (let [alias (address->alias address)
-        [not-cached? ledger-chan] (register-ledger conn alias)]
-    (if not-cached?
-      (load* conn ledger-chan address)
-      ledger-chan)))
+        [cached? ledger-chan] (register-ledger conn alias)]
+    (log/trace "load-address ledger registered")
+    (if cached?
+      (do
+        (log/trace "load-address cached")
+        ledger-chan)
+      (do
+        (log/trace "load-address not cached")
+        (load* conn ledger-chan address)))))
 
 (defn load-alias
   [conn alias]
   (go-try
-    (let [[not-cached? ledger-chan] (register-ledger conn alias)]
-      (if not-cached?
+    (log/trace "load-alias:" alias)
+    (let [[cached? ledger-chan] (register-ledger conn alias)]
+      (log/trace "ledger registered")
+      (if cached?
+        (<? ledger-chan)
         (let [address (<! (nameservice/primary-address conn alias nil))]
+          (log/trace "got address:" address)
           (if (util/exception? address)
             (do (release-ledger conn alias)
                 (async/put! ledger-chan
                             (ex-info (str "Load for " alias " failed due to failed address lookup.")
                                      {:status 400 :error :db/invalid-address}
                                      address)))
-            (<? (load* conn ledger-chan address))))
-        (<? ledger-chan)))))
+            (do
+              (log/trace "loading ledger")
+              (<? (load* conn ledger-chan address)))))))))
 
 (defn load
   [conn alias-or-address]

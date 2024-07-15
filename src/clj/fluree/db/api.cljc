@@ -18,7 +18,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.connection :refer [notify-ledger]]
+            [fluree.db.connection :as conn]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.flake :as flake]
@@ -172,11 +172,28 @@
   [conn commit-map]
   (promise-wrap
     (if (map? commit-map)
-      (notify-ledger conn commit-map)
+      (conn/notify-ledger conn commit-map)
       (go
         (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
                  {:status 400 :error :db/invalid-commit-map})))))
 
+(defn load-or-notify
+  "Loads the ledger specified by alias if it isn't already, or notifies it of
+  the new commit in commit-map if it is already loaded. Returns a promise with
+  the loaded / updated ledger."
+  [conn alias commit-map]
+  (promise-wrap
+   (go
+     (log/trace "load-or-notify:" alias)
+     (<! (let [[cached? ledger-chan] (conn/register-ledger conn alias)]
+           (if cached?
+             (do
+               (log/trace "load-or-notify notifying cached ledger"
+                          (async/poll! ledger-chan))
+               (conn/notify-ledger conn commit-map))
+             (let [ledger-addr (<! (alias->address conn alias))]
+               (log/trace "load-or-notify loading ledger" alias)
+               (jld-ledger/load* conn ledger-chan ledger-addr))))))))
 
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"

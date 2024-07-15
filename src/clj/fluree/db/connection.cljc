@@ -52,23 +52,26 @@
   in-memory on the conn.
 
   Returns a two-tuple of
-  [not-cached? promise-chan]
+  [cached? promise-chan]
 
-  where not-cached? is true if a new promise-chan was created, false if an
-  existing promise-chan was found.
+  where cached? is true if a ledger is available on the channel or false if one
+  is not.
 
-  promise-chan is the new promise channel that must have the final ledger `put!` into it
-  assuming success? is true, otherwise it will return the existing found promise-chan when
-  success? is false"
+  promise-chan is the new promise channel that must have the final ledger `put!`
+  into it (assuming cached? is false), otherwise it will return the existing
+  found promise-chan when cached? is true"
   [{:keys [state] :as _conn} ledger-alias]
-  (let [new-p-chan  (async/promise-chan)
-        new-state   (swap! state update-in [:ledger ledger-alias]
-                           (fn [existing]
-                             (or existing new-p-chan)))
-        p-chan      (get-in new-state [:ledger ledger-alias])
-        not-cached? (= p-chan new-p-chan)]
-    (log/debug "Registering ledger: " ledger-alias " not-cached? " not-cached?)
-    [not-cached? p-chan]))
+  (letfn [(make-new-ledger-chan []
+            (let [new-p-chan (async/promise-chan)
+                  new-state  (swap! state update-in [:ledger ledger-alias]
+                                    (fn [existing]
+                                      (or existing new-p-chan)))]
+              [false (get-in new-state [:ledger ledger-alias])]))]
+    (if-let [ledger-chan (some-> state deref :ledger (get ledger-alias))]
+      (if (async/poll! ledger-chan)
+        [true ledger-chan]
+        (make-new-ledger-chan))
+      (make-new-ledger-chan))))
 
 (defn release-ledger
   "Opposite of register-ledger. Removes reference to a ledger from conn"
