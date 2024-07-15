@@ -454,8 +454,8 @@
     (assoc db :t t))
 
   AuditLog
-  (-history [db context from-t to-t commit-details? error-ch history-q]
-    (history/query-history db context from-t to-t commit-details? error-ch history-q))
+  (-history [db context from-t to-t commit-details? include error-ch history-q]
+    (history/query-history db context from-t to-t commit-details? include error-ch history-q))
   (-commits [db context from-t to-t include error-ch]
     (history/query-commits db context from-t to-t include error-ch))
 

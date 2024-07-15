@@ -23,7 +23,7 @@
              (nil? to)      (:t db))])))
 
 (defprotocol AuditLog
-  (-history [db context from-t to-t commit-details? error-ch history-q])
+  (-history [db context from-t to-t commit-details? include error-ch history-q])
   (-commits [db context from-t to-t include error-ch]))
 
 (defn query
@@ -36,7 +36,7 @@
           error-ch      (async/chan)
           include       (not-empty (select-keys parsed-query [:commit :data :txn]))
           result-ch     (if history
-                          (-history db context from-t to-t commit-details error-ch history)
+                          (-history db context from-t to-t commit-details include error-ch history)
                           (-commits db context from-t to-t include error-ch))]
       (async/alt! result-ch ([result] result)
                   error-ch  ([e] e)))))

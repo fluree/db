@@ -997,9 +997,9 @@
         (is (= [{"f:txn" nil}
                 {"f:txn" jws1}
                 {"f:txn" jws2}]
-               (->> @(fluree/history ledger {:context context
-                                             :txn     true
-                                             :t       {:from 1 :to :latest}})))))
+               @(fluree/history ledger {:context context
+                                        :txn     true
+                                        :t       {:from 1 :to :latest}}))))
       (testing ":commit returns just the commit wrapper"
         (is (= [{"f:commit"
                  {"f:alias"  "authortest",
@@ -1058,9 +1058,9 @@
                    "f:size"   8520,
                    "f:t"      3,
                    "id" "fluree:db:sha256:bsfjn7tehnhojgltwopo7ml3boncyq2ebnhvwqmev4uq5hgg3l2x"}}}]
-               (->> @(fluree/history ledger {:context context
-                                             :commit  true
-                                             :t       {:from 1 :to :latest}})))))
+               @(fluree/history ledger {:context context
+                                        :commit  true
+                                        :t       {:from 1 :to :latest}}))))
       (testing ":data returns just the asserts and retracts"
         (is (= [{"f:data"
                  {"f:assert"
@@ -1088,9 +1088,9 @@
                   "f:retract" []}}
                 {"f:data" {"f:assert" [{"ex:foo" 3, "id" "_:fdb-4"}], "f:retract" []}}
                 {"f:data" {"f:assert" [{"ex:foo" 5, "id" "_:fdb-6"}], "f:retract" []}}]
-               (->> @(fluree/history ledger {:context context
-                                             :data    true
-                                             :t       {:from 1 :to :latest}})))))
+               @(fluree/history ledger {:context context
+                                        :data    true
+                                        :t       {:from 1 :to :latest}}))))
       (testing ":commit :data :and txn can be composed together"
         (is (= [{"f:txn" nil
                  "f:commit"
@@ -1180,11 +1180,68 @@
                    "f:t"      3,
                    "id" "fluree:db:sha256:bsfjn7tehnhojgltwopo7ml3boncyq2ebnhvwqmev4uq5hgg3l2x"}},
                  "f:data" {"f:assert" [{"ex:foo" 5, "id" "_:fdb-6"}], "f:retract" []}}]
-               (->> @(fluree/history ledger {:context context
-                                             :txn     true
-                                             :data    true
-                                             :commit  true
-                                             :t       {:from 1 :to :latest}}))))))))
+               @(fluree/history ledger {:context context
+                                        :txn     true
+                                        :data    true
+                                        :commit  true
+                                        :t       {:from 1 :to :latest}}))))
+      (testing ":commit :data :and txn can be composed together with history"
+        (is (= [{"f:t" 1,
+                 "f:assert" [{"type" "ex:Yeti",
+                              "schema:age" 1002,
+                              "schema:name" "Freddy",
+                              "id" "ex:freddy"}],
+                 "f:retract" [],
+                 "f:txn" nil,
+                 "f:commit" {"f:alias" "authortest",
+                             "f:time" 720000,
+                             "f:previous"
+                             {"id"
+                              "fluree:commit:sha256:bku3fg5vpmre72rxdeklap5ckbxidyne7zz6ncurg2niwy5264ih"},
+                             "id" "fluree:commit:sha256:bbqny7mff6byds77crqwbpq7bukzrki6sdzbiwro2c24xpc36gv2a"
+                             "f:v" 0,
+                             "f:branch" "main",
+                             "f:address" "fluree:memory://7a209c60839afefae379863296b698aa5bf38eea9a23537806b637d749899196"
+                             "f:data"
+                             {"f:address"
+                              "fluree:memory://06b103176ccba03d7615b63a1dc0e1efad45cf4804f37d18f9d4151558f38a60",
+                              "f:flakes" 16,
+                              "f:previous"
+                              {"id"
+                               "fluree:db:sha256:beuoec4c6zqxfjglld3evwjdtavsdktncoh6bbxiz677cc4zz3qr"},
+                              "f:size" 1902,
+                              "f:t" 1,
+                              "id"
+                              "fluree:db:sha256:bbozj3rqh62e2chzynu575hbxcsmxdpsl2s5c3jxl3iqbtssawoq5"}},
+                 "f:data" {"f:assert"
+                           [{"f:role" {"id" "ex:rootRole"},
+                             "id" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
+                            {"type" "ex:Yeti",
+                             "schema:age" 55,
+                             "schema:name" "Betty",
+                             "id" "ex:betty"}
+                            {"type" "ex:Yeti",
+                             "schema:age" 1002,
+                             "schema:name" "Freddy",
+                             "id" "ex:freddy"}
+                            {"type" "ex:Yeti",
+                             "schema:age" 38,
+                             "schema:name" "Leticia",
+                             "id" "ex:letty"}
+                            {"f:action" [{"id" "f:modify"} {"id" "f:view"}],
+                             "f:targetRole" {"id" "ex:rootRole"},
+                             "id" "ex:rootAccessAllow"}
+                            {"type" "f:Policy",
+                             "f:allow" {"id" "ex:rootAccessAllow"},
+                             "f:targetNode" {"id" "f:allNodes"},
+                             "id" "ex:rootPolicy"}],
+                           "f:retract" []}}]
+               @(fluree/history ledger {:context context
+                                        :history "ex:freddy"
+                                        :txn     true
+                                        :data    true
+                                        :commit  true
+                                        :t       {:from 1 :to :latest}})))))))
 
 (deftest ^:integration txn-annotation
   (let [bnode-counter (atom 0)

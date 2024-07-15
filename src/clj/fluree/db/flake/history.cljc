@@ -276,7 +276,7 @@
   "Adds commit-details to history results from the history-results-ch.
   Chunks together history results with consecutive `t`s to reduce `time-range`
   calls. "
-  [db context error-ch history-results-ch]
+  [db context include error-ch history-results-ch]
   (let [t-key      (json-ld/compact const/iri-t context)
         out-ch     (async/chan 2 cat)
         chunked-ch (async/chan 2 (with-consecutive-ts t-key))]
@@ -294,7 +294,7 @@
                                             {:from-t from-t, :to-t to-t})
                 consecutive-commit-details (<! (->> flake-slices-ch
                                                     (commit-flakes->json-ld
-                                                      db context nil error-ch)
+                                                      db context include error-ch)
                                                     (async/into [])))]
             (map into chunk consecutive-commit-details)))
         ch))
@@ -302,13 +302,13 @@
     out-ch))
 
 (defn query-history
-  [db context from-t to-t commit-details? error-ch history-q]
+  [db context from-t to-t commit-details? include error-ch history-q]
   (go-try
     (let [[pattern idx]  (<? (history-pattern db context history-q))
           flake-slice-ch (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t})
           flakes         (async/<! (async/reduce into [] flake-slice-ch))
           result-ch      (cond->> (history-flakes->json-ld db context error-ch flakes)
-                           commit-details? (add-commit-details db context error-ch)
+                           (or commit-details? include) (add-commit-details db context include error-ch)
                            true            (async/into []))]
       (<! result-ch))))
 
