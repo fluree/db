@@ -220,7 +220,7 @@
    (let [[start-test start-match end-test end-match]
          (expand-range-interval idx test match)]
      (time-range db idx start-test start-match end-test end-match opts)))
-  ([{:keys [t conn ] :as db} idx start-test start-match end-test end-match opts]
+  ([{:keys [t conn] :as db} idx start-test start-match end-test end-match opts]
    (let [{:keys [limit offset flake-limit from-t to-t]
           :or   {from-t t, to-t t}}
          opts
