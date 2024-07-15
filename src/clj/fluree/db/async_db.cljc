@@ -146,13 +146,13 @@
       (let [db (<? db-chan)]
         (<? (history/-history db context from-t to-t commit-details? error-ch history-q)))))
 
-  (-commits [_ context from-t to-t error-ch]
+  (-commits [_ context from-t to-t include error-ch]
     (let [commit-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (history/-commits context from-t to-t error-ch)
+                (history/-commits context from-t to-t include error-ch)
                 (async/pipe commit-ch)))
           (catch* e
             (log/error e "Error loading database for commit range")

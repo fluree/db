@@ -24,18 +24,19 @@
 
 (defprotocol AuditLog
   (-history [db context from-t to-t commit-details? error-ch history-q])
-  (-commits [db context from-t to-t error-ch]))
+  (-commits [db context from-t to-t include error-ch]))
 
 (defn query
   [db context q]
   (go-try
-    (let [{:keys [history t commit-details] :as _parsed-query}
+    (let [{:keys [history t commit-details] :as parsed-query}
           (parse/parse-history-query q)
           ;; from and to are positive ints, need to convert to negative or fill in default values
           [from-t to-t] (<? (find-t-endpoints db t))
           error-ch      (async/chan)
+          include       (not-empty (select-keys parsed-query [:commit :data :txn]))
           result-ch     (if history
                           (-history db context from-t to-t commit-details error-ch history)
-                          (-commits db context from-t to-t error-ch))]
+                          (-commits db context from-t to-t include error-ch))]
       (async/alt! result-ch ([result] result)
                   error-ch  ([e] e)))))
