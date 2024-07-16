@@ -1,19 +1,7 @@
 (ns fluree.db.json-ld.policy
-  (:require [fluree.json-ld :as json-ld]
-            [fluree.db.constants :as const]))
+  (:require [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn parse-policy-identity
-  ([opts]
-   (parse-policy-identity opts nil))
-  ([opts context]
-   (when-let [{:keys [role] :as identity} (-> opts
-                                              (select-keys [:did :role :credential])
-                                              not-empty)]
-     (if (and role context)
-       (update identity :role json-ld/expand-iri context)
-       identity))))
 
 (def root-policy-map
   "Base policy (permissions) map that will give access to all flakes."

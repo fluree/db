@@ -32,7 +32,7 @@
                          (:meta parsed-opts))
          parsed-txn  (q-parse/parse-txn expanded txn-context)
 
-         identity    (perm/parse-policy-identity parsed-opts txn-context)]
+         identity    (:did parsed-opts)]
      (if track-fuel?
        (let [start-time #?(:clj (System/nanoTime)
                            :cljs (util/current-time-millis))
