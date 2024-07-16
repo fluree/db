@@ -63,7 +63,7 @@
 
        (testing "verify incorrect signature"
          (let [wrong-cred (assoc example-credential "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
-           (is (= "Verification failed."
+           (is (= "Verification failed, invalid credential."
                   (-> (async/<!! (cred/verify wrong-cred))
                       (Throwable->map)
                       (:cause))))))
