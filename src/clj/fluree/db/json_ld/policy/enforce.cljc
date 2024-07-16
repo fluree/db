@@ -60,7 +60,7 @@
   [policies]
   (ex-info (or (some :ex-message policies)
                "Policy enforcement prevents modification.")
-           {:status 400 :error :db/policy-exception}))
+           {:status 403 :error :db/policy-exception}))
 
 (defn default-val
   "Returns the default policy value if no policies are found.
