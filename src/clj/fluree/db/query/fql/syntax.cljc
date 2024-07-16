@@ -142,19 +142,19 @@
     ::select-map        [:map-of {:max           1
                                   :error/message "Only one key/val for select-map"}
                          ::select-map-key ::subselection]
-    ::selector          [:orn {:error/message "selector must be either a variable, wildcard symbol (`*`), iri, function application, or select map"}
-                         [:wildcard ::wildcard]
+    ::selector          [:orn {:error/message "selector must be either a variable, iri, function application, or select map"}
                          [:var ::var]
                          [:aggregate ::function]
                          [:select-map ::select-map]]
-    ::select            [:orn {:error/message "Select must be a valid selector or vector of selectors"}
+    ::select            [:orn {:error/message "Select must be a valid selector, a wildcard symbol (`*`), or a vector of selectors"}
+                         [:wildcard ::wildcard]
                          [:selector ::selector]
                          [:collection [:sequential ::selector]]]
-    ::subquery-selector [:orn {:error/message "selector must be either a variable, wildcard symbol (`*`), iri, function application, or select map"}
-                         [:wildcard ::wildcard]
+    ::subquery-selector [:orn {:error/message "selector must be either a variable iri, function application, or select map"}
                          [:var ::var]
                          [:aggregate ::as-function]]
-    ::subquery-select   [:orn {:error/message "Select must be a valid selector or vector of selectors. Subqueries do not allow graph crawl syntax (e.g. {?x [*]})."}
+    ::subquery-select   [:orn {:error/message "Select must be a valid selector, a wildcard symbol (`*`), or a vector of selectors. Subqueries do not allow graph crawl syntax (e.g. {?x [*]})."}
+                         [:wildcard ::wildcard]
                          [:selector ::subquery-selector]
                          [:collection [:sequential ::subquery-selector]]]
     ::direction         [:orn {:error/message "Direction must be \"asc\" or \"desc\""}

@@ -506,18 +506,19 @@
 
 (defn parse-selector
   [context depth s]
-  (let [[selector-type selector-val] (syntax/parse-selector s)]
-    (case selector-type
-      :wildcard select/wildcard-selector
-      :var (-> selector-val symbol select/variable-selector)
-      :aggregate (case (first selector-val)
-                   :string-fn (if (re-find #"^\(as " s)
+  (if (syntax/wildcard? s)
+    select/wildcard-selector
+    (let [[selector-type selector-val] (syntax/parse-selector s)]
+      (case selector-type
+        :var (-> selector-val symbol select/variable-selector)
+        :aggregate (case (first selector-val)
+                     :string-fn (if (re-find #"^\(as " s)
+                                  (parse-as-fn s)
+                                  (parse-fn s))
+                     :list-fn (if (= 'as (first s))
                                 (parse-as-fn s)
-                                (parse-fn s))
-                   :list-fn (if (= 'as (first s))
-                              (parse-as-fn s)
-                              (parse-fn s)))
-      :select-map (parse-select-map s depth context))))
+                                (parse-fn s)))
+        :select-map (parse-select-map s depth context)))))
 
 (defn parse-select-clause
   [clause context depth]
