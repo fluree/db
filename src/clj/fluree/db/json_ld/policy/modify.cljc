@@ -17,6 +17,11 @@
        seq))
 
 (defn allowed?
+  "Checks if all 'adds' are allowed by the policy. If so
+  returns final db.
+
+  If encounters a policy error, will throw with policy error
+  message (if available)."
   [{:keys [db-after add mods]}]
   (go-try
    (let [{:keys [policy]} db-after]
