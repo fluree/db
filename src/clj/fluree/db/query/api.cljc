@@ -208,35 +208,35 @@
         (dataset db-map defaults)))))
 
 (defn query-connection-fql
-  [conn query did]
+  [conn query {:keys [role did]}]
   (go-try
-   (let [{:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
+    (let [{:keys [t opts] :as sanitized-query} (update query :opts sanitize-query-options did)
 
-         default-aliases (some-> query* :from util/sequential)
-         named-aliases   (some-> query* :from-named util/sequential)]
-     (if (or (seq default-aliases)
-             (seq named-aliases))
-       (let [s-ctx    (ctx-util/extract query)
-             ds       (<? (load-dataset conn default-aliases named-aliases t
-                                        s-ctx opts))
-             query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
-             max-fuel (:max-fuel opts)]
-         (if (::util/track-fuel? opts)
-           (<? (track-query ds max-fuel query**))
-           (<? (fql/query ds query**))))
-       (throw (ex-info "Missing ledger specification in connection query"
-                       {:status 400, :error :db/invalid-query}))))))
-
+          default-aliases (some-> sanitized-query :from util/sequential)
+          named-aliases   (some-> sanitized-query :from-named util/sequential)]
+      (if (or (seq default-aliases)
+              (seq named-aliases))
+        (let [s-ctx    (ctx-util/extract query)
+              ds       (<? (load-dataset conn default-aliases named-aliases t
+                                            s-ctx opts))
+              trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel ::util/track-fuel?)
+              max-fuel (:max-fuel opts)]
+          (if (::util/track-fuel? opts)
+            (<? (track-query ds max-fuel trimmed-query))
+            (<? (fql/query ds trimmed-query))))
+        (throw (ex-info "Missing ledger specification in connection query"
+                        {:status 400, :error :db/invalid-query}))))))
 
 (defn query-connection-sparql
-  [conn query did]
+  [conn query request-opts]
   (go-try
-   (let [fql (sparql/->fql query)]
-     (<? (query-connection-fql conn fql did)))))
+    (let [{sparql :subject did :did} (or (<? (cred/verify query))
+                                         {:subject query})
+          fql (sparql/->fql sparql)]
+      (<? (query-connection-fql conn fql request-opts)))))
 
 (defn query-connection
-  [conn query {:keys [format did] :as opts :or {format :fql}}]
-  (case format
-    :fql (query-connection-fql conn query did)
-    :sparql (query-connection-sparql conn query did)))
-
+  [conn query {:keys [format] :as request-opts}]
+  (case (or format :fql)
+    :fql (query-connection-fql conn query request-opts)
+    :sparql (query-connection-sparql conn query request-opts)))
