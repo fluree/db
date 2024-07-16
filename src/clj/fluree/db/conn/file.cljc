@@ -98,12 +98,6 @@
      (binding [*out* w]
        (pr (connection/printer-map conn)))))
 
-(defn trim-last-slash
-  [s]
-  (if (str/ends-with? s "/")
-    (subs s 0 (dec (count s)))
-    s))
-
 (defn ledger-defaults
   [{:keys [did]}]
   {:did did})
