@@ -614,7 +614,7 @@
 (defn parse-object-value
   [v datatype context metadata]
   (let [datatype* (iri/normalize datatype)]
-    (if (= datatype* const/iri-anyURI)
+    (if (= datatype* const/iri-id)
       (where/match-iri (json-ld/expand-iri v context))
       (where/anonymous-value v datatype* metadata))))
 

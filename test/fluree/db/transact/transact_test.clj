@@ -164,7 +164,7 @@
 
           db1 @(fluree/stage db0 {"@context" {"ex" "http://example.com/"}
                                   "insert" [{"@id" "ex:foo"
-                                             "ex:bar" {"@type" "http://www.w3.org/2001/XMLSchema#anyURI"
+                                             "ex:bar" {"@type" "@id"
                                                        "@value" "ex:baz"}}]})]
       (is (= [{"@id" "http://example.com/foo"
                "http://example.com/bar" {"@id" "http://example.com/baz"}}]

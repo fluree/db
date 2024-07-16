@@ -19,10 +19,10 @@
                    (mapcat rest)                      ; discard keys
                    (mapcat (partial remove
                                     (fn [v]
-                                      ;; remove value objects unless they have type xsd:anyURI
+                                      ;; remove value objects unless they have type @id
                                       (and
                                         (some? (:value v))
-                                        (not= (:type v) const/iri-anyURI)))))))
+                                        (not= (:type v) const/iri-id)))))))
        not-empty))
 
 (defn extract-annotation

@@ -1087,7 +1087,7 @@
                                                           "schema:name" "Betty"
                                                           "schema:age"  55}]}
                                         {:annotation [{"ex:originator" "opts" "ex:friend"
-                                                       {"@type" "xsd:anyURI" "@value" "ex:betty"}}]})]
+                                                       {"@type" "id" "@value" "ex:betty"}}]})]
             (is (= "Commit annotation cannot reference other subjects." (ex-message invalid4))
                 "using value-map with type xsd:anyURI"))
           (let [invalid1 @(fluree/stage db0 {"@context" context
