@@ -15,7 +15,6 @@
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice.core :as nameservice]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -87,9 +86,7 @@
 (defn query-sparql
   [db query]
   (go-try
-    (let [verified-query (or (:subject (<? (cred/verify query)))
-                             query)
-          fql (sparql/->fql verified-query)]
+    (let [fql (sparql/->fql query)]
       (<? (query-fql db fql)))))
 
 (defn query
@@ -212,9 +209,7 @@
 (defn query-connection-fql
   [conn query request-opts]
   (go-try
-    (let [{verified-query :subject did :did} (or (<? (cred/verify query))
-                                                 {:subject query})
-          {:keys [t opts] :as sanitized-query} (update verified-query :opts sanitize-query-options (or did (:did request-opts)))
+    (let [{:keys [t opts] :as sanitized-query} (update query :opts sanitize-query-options (:did request-opts))
           
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
@@ -234,9 +229,7 @@
 (defn query-connection-sparql
   [conn query {:keys [role did] :as request-opts}]
   (go-try
-    (let [verified-query   (or (:subject (<? (cred/verify query)))
-                               query)
-          fql              (sparql/->fql verified-query)
+    (let [fql              (sparql/->fql query)
           credentialed-fql (update fql :opts #(merge {:role role :did did} %))]
       (<? (query-connection-fql conn credentialed-fql request-opts)))))
 

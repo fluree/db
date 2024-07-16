@@ -295,7 +295,7 @@
   ([ds cred-query {:keys [default-allow? values-map] :as opts}]
    (promise-wrap
     (go-try
-     (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
+     (let [{query :subject, identity :did} (<? (cred/verify cred-query opts))]
        (log/debug "Credential query with identity: " identity " and query: " query)
        (let [policy-db (<? (policy/wrap-identity-policy ds
                                                         identity

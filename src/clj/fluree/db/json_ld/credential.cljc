@@ -109,11 +109,14 @@
        {:subject subject :did auth-did}))))
 
 (defn verify-jws
-  [jws]
+  [jws format]
   (let [{:keys [payload pubkey]} (crypto/verify-jws jws)
         id                       (crypto/account-id-from-public pubkey)
-        auth-did                 (did/auth-id->did id)]
-    {:subject (json/parse payload false) :did auth-did}))
+        auth-did                 (did/auth-id->did id)
+        processed-payload        (if (= :sparql format)
+                                   payload
+                                   (json/parse payload false))]
+    {:subject processed-payload :did auth-did}))
 
 (defn jws?
   [x]
@@ -125,13 +128,17 @@
   {:subject <original tx/cmd> :did <did>}
 
   Will throw if no :did is detected."
-  [signed-command]
-  (go-try
-   (let [result (if (jws? signed-command)
-                  (verify-jws signed-command)
-                  (<? (verify-credential signed-command)))]
-     (if (:did result)
-       result
-       (throw (ex-info "Signed message could not be verified to an identity"
-                       {:status 401
-                        :error  :db/invalid-credential}))))))
+  ([signed-command]
+   (verify signed-command nil))
+  ([signed-command {format :format}]
+   (go-try
+     (let [result (if (jws? signed-command)
+                    (verify-jws signed-command format)
+                    (<? (verify-credential signed-command)))]
+       (println signed-command)
+       (println result)
+       (if (:did result)
+         result
+         (throw (ex-info "Signed message could not be verified to an identity"
+                         {:status 401
+                          :error  :db/invalid-credential})))))))
