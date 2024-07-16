@@ -178,21 +178,21 @@
 (defn wrap-identity-policy
   [db identity default-allow? values-map]
   (go-try
-    (let [policies  (<? (dbproto/-query db {"select" {"?policy" ["*"]}
-                                            "where"  [{"@id"                 identity
-                                                       const/iri-policyClass "?classes"}
-                                                      {"@id"   "?policy"
-                                                       "@type" "?classes"}]}))
-          policies* (if (util/exception? policies)
-                      policies
-                      (policy-from-query policies))
-          val-map   (assoc values-map "?$identity" {"@value" identity
-                                                    "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"})]
-      (log/trace "wrap-identity-policy - extracted policy from identity: " identity
-                 " policy: " policies*)
-      (if (util/exception? policies*)
-        (throw (ex-info (str "Unable to extract policies for identity: " identity
-                             " with error: " (ex-message policies*))
-                        {:status 400 :error :db/policy-exception}
-                        policies*))
-        (<? (wrap-policy db policies* default-allow? val-map))))))
+   (let [policies  (<? (dbproto/-query db {"select" {"?policy" ["*"]}
+                                           "where"  [{"@id"                 identity
+                                                      const/iri-policyClass "?classes"}
+                                                     {"@id"   "?policy"
+                                                      "@type" "?classes"}]}))
+         policies* (if (util/exception? policies)
+                     policies
+                     (policy-from-query policies))
+         val-map   (assoc values-map "?$identity" {"@value" identity
+                                                   "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"})]
+     (log/trace "wrap-identity-policy - extracted policy from identity: " identity
+                " policy: " policies*)
+     (if (util/exception? policies*)
+       (throw (ex-info (str "Unable to extract policies for identity: " identity
+                            " with error: " (ex-message policies*))
+                       {:status 400 :error :db/policy-exception}
+                       policies*))
+       (<? (wrap-policy db policies* default-allow? val-map))))))
