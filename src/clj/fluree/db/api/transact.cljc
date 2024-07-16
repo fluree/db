@@ -15,95 +15,101 @@
             [fluree.db.ledger :as ledger]))
 
 (defn parse-opts
-  [parsed-opts opts]
-  (reduce (fn [opts* [k v]] (assoc opts* (keyword k) v))
-          parsed-opts
-          opts))
+  [expanded-txn opts txn-context]
+  (-> (util/get-first-value expanded-txn const/iri-opts)
+      (merge opts) ;; override opts 'did', 'raw-txn' with credential's if present
+      (util/keywordize-keys)
+      (assoc :context txn-context)))
 
 (defn stage
-  [db txn {:keys [raw-txn] :as opts}]
+  [db txn opts]
   (go-try
-    (let [{txn* :subject did :did} (or (<? (cred/verify txn))
-                                       {:subject txn})
-          txn-context              (or (:context opts)
-                                       (ctx-util/txn-context txn*))
+   (let [txn-context (or (ctx-util/txn-context txn)
+                         (:context opts))
+         expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
+         parsed-opts (parse-opts expanded opts txn-context)
+         track-fuel? (or (:maxFuel parsed-opts)
+                         (:meta parsed-opts))
+         parsed-txn  (q-parse/parse-txn expanded txn-context)
 
-          expanded   (json-ld/expand (ctx-util/use-fluree-context txn*))
-          txn-opts   (util/get-first-value expanded const/iri-opts)
-          parsed-txn (q-parse/parse-txn expanded txn-context)
-
-          {:keys [maxFuel meta], :as parsed-opts}
-          (cond-> opts
-            (not raw-txn) (assoc :raw-txn txn)
-            did           (assoc :did did)
-            txn-context   (assoc :context txn-context)
-            true          (parse-opts txn-opts))
-
-          identity (perm/parse-policy-identity parsed-opts txn-context)]
-      (if (or maxFuel meta)
-        (let [start-time   #?(:clj  (System/nanoTime)
-                              :cljs (util/current-time-millis))
-              fuel-tracker (fuel/tracker maxFuel)]
-          (try*
-            (let [result (<? (tx/stage db fuel-tracker identity parsed-txn parsed-opts))]
-              {:status 200
-               :result result
-               :time   (util/response-time-formatted start-time)
-               :fuel   (fuel/tally fuel-tracker)})
-            (catch* e
-              (throw (ex-info "Error staging database"
-                              {:time (util/response-time-formatted start-time)
-                               :fuel (fuel/tally fuel-tracker)}
-                              e)))))
-        (<? (tx/stage db identity parsed-txn parsed-opts))))))
+         identity    (perm/parse-policy-identity parsed-opts txn-context)]
+     (if track-fuel?
+       (let [start-time #?(:clj (System/nanoTime)
+                           :cljs (util/current-time-millis))
+             fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
+         (try*
+          (let [result (<? (tx/stage db fuel-tracker identity parsed-txn parsed-opts))]
+            {:status 200
+             :result result
+             :time   (util/response-time-formatted start-time)
+             :fuel   (fuel/tally fuel-tracker)})
+          (catch* e
+                  (throw (ex-info "Error staging database"
+                                  {:time (util/response-time-formatted start-time)
+                                   :fuel (fuel/tally fuel-tracker)}
+                                  e)))))
+       (<? (tx/stage db identity parsed-txn parsed-opts))))))
 
 (defn transact!
-  [conn txn]
-  (go-try
-    (let [{txn* :subject did :did} (or (<? (cred/verify txn))
-                                       {:subject txn})
+  ([conn txn] (transact! conn txn {:raw-txn txn}))
+  ([conn txn {:keys [context] :as opts}]
+   (go-try
+    (let [txn-context (or (ctx-util/txn-context txn)
+                          context) ;; parent context might come from a Verifiable Credential's context
+          expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
+          ledger-id*  (util/get-first-value expanded const/iri-ledger)
+          _           (when-not ledger-id*
+                        (throw (ex-info "Invalid transaction, missing required key: ledger."
+                                        {:status 400 :error :db/invalid-transaction})))
+          address     (<? (nameservice/primary-address conn ledger-id* nil))
 
-          txn-context (ctx-util/txn-context txn*)
-          expanded    (json-ld/expand (ctx-util/use-fluree-context txn*))
-          ledger-id   (util/get-first-value expanded const/iri-ledger)
-          _ (when-not ledger-id
-              (throw (ex-info "Invalid transaction, missing required key: ledger."
-                              {:status 400 :error :db/invalid-transaction})))
-          address     (<? (nameservice/primary-address conn ledger-id nil))
-
-          opts (cond-> (util/get-first-value expanded const/iri-opts)
-                 did         (assoc :did did)
-                 txn-context (assoc :context txn-context))
-
-          parsed-opts (parse-opts {:raw-txn txn} opts)]
+          parsed-opts (parse-opts expanded opts txn-context)]
       (if-not (<? (nameservice/exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))
-        (let [ledger (<? (jld-ledger/load conn address))
-              db     (<? (stage (ledger/-db ledger) txn* parsed-opts))]
-          (<? (ledger/-commit! ledger db)))))))
+        (let [ledger   (<? (jld-ledger/load conn address))
+              db       (<? (stage (ledger/-db ledger) txn parsed-opts))
+              ;; commit API takes a did-map and parsed context as opts
+              ;; whereas stage API takes a did IRI and unparsed context.
+              ;; Dissoc them until deciding at a later point if they can carry through.
+              cmt-opts (dissoc parsed-opts :context :did)] ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
+          (<? (ledger/-commit! ledger db cmt-opts))))))))
+
+(defn credential-transact!
+  "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.
+
+  Will throw if signature cannot be extracted."
+  [conn txn opts]
+  (go-try
+   (let [{txn* :subject did :did} (<? (cred/verify txn))
+         parent-context (when (map? txn) ;; parent-context only relevant for verifiable credential
+                          (ctx-util/txn-context txn))]
+     (<? (transact! conn txn* (assoc opts :raw-txn txn
+                                          :did did
+                                          :context parent-context))))))
 
 (defn create-with-txn
-  [conn txn]
-  (go-try
-    (let [{txn* :subject did :did} (or (<? (cred/verify txn))
-                                       {:subject txn})
-
-          txn-context (ctx-util/txn-context txn*)
-          expanded    (json-ld/expand (ctx-util/use-fluree-context txn*))
+  ([conn txn] (create-with-txn conn txn nil))
+  ([conn txn {:keys [context] :as opts}]
+   (go-try
+    (let [expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
+          txn-context (or (ctx-util/txn-context txn)
+                          context) ;; parent context from credential if present
           ledger-id   (util/get-first-value expanded const/iri-ledger)
-          _ (when-not ledger-id
-              (throw (ex-info "Invalid transaction, missing required key: ledger."
-                              {:status 400 :error :db/invalid-transaction})))
+          _           (when-not ledger-id
+                        (throw (ex-info "Invalid transaction, missing required key: ledger."
+                                        {:status 400 :error :db/invalid-transaction})))
           address     (<? (nameservice/primary-address conn ledger-id nil))
-
-          opts (cond-> (util/get-first-value expanded const/iri-opts)
-                 did         (assoc :did did)
-                 txn-context (assoc :context txn-context))
-
-          parsed-opts (parse-opts {:raw-txn txn} opts)]
+          parsed-opts (parse-opts expanded opts txn-context)]
       (if (<? (nameservice/exists? conn address))
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
         (let [ledger (<? (jld-ledger/create conn ledger-id parsed-opts))
-              db     (<? (stage (ledger/-db ledger) txn* parsed-opts))]
-          (<? (ledger/-commit! ledger db)))))))
+              db     (<? (stage (ledger/-db ledger) txn parsed-opts))]
+          (<? (ledger/-commit! ledger db))))))))
+
+(defn credential-create-with-txn!
+  [conn txn]
+  (let [{txn* :subject did :did} (<? (cred/verify txn))
+        parent-context (when (map? txn) ;; parent-context only relevant for verifiable credential
+                         (ctx-util/txn-context txn))]
+    (create-with-txn conn txn* {:raw-txn txn, :did did :context parent-context})))

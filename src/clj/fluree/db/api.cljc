@@ -201,9 +201,16 @@
      (ledger/-commit! ledger db opts))))
 
 (defn transact!
-  [conn txn]
-  (promise-wrap
-    (transact-api/transact! conn txn)))
+  ([conn txn] (transact! conn txn nil))
+  ([conn txn opts]
+   (promise-wrap
+    (transact-api/transact! conn txn opts))))
+
+(defn credential-transact!
+  ([conn txn] (credential-transact! conn txn nil))
+  ([conn txn opts]
+   (promise-wrap
+    (transact-api/credential-transact! conn txn opts))))
 
 (defn create-with-txn
   [conn txn]
@@ -290,22 +297,12 @@
     (go-try
      (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
        (log/debug "Credential query with identity: " identity " and query: " query)
-       (cond
-         (and query identity)
-         (let [policy-db (<? (policy/wrap-identity-policy ds
-                                                          identity
-                                                          (or (true? default-allow?)
-                                                              false)
-                                                          values-map))]
-           (<? (query-api/query policy-db query opts)))
-
-         identity
-         (throw (ex-info "Query not present in credential"
-                         {:status 400 :error :db/invalid-credential}))
-
-         :else
-         (throw (ex-info "Invalid credential"
-                         {:status 400 :error :db/invalid-credential}))))))))
+       (let [policy-db (<? (policy/wrap-identity-policy ds
+                                                        identity
+                                                        (or (true? default-allow?)
+                                                            false)
+                                                        values-map))]
+         (<? (query-api/query policy-db query opts))))))))
 
 (defn query-connection
   "Queries the latest db in the ledger specified by the 'from' parameter in the
@@ -314,6 +311,14 @@
   ([conn q] (query-connection conn q {}))
   ([conn q opts]
    (promise-wrap (query-api/query-connection conn q opts))))
+
+(defn credential-query-connection
+  ([conn cred-query] (credential-query-connection conn cred-query {}))
+  ([conn cred-query opts]
+   (promise-wrap
+    (go-try
+     (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
+       (<? (query-connection conn query (assoc opts :did identity))))))))
 
 (defn history
   "Return the change history over a specified time range. Optionally include the commit

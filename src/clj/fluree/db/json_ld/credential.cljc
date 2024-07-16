@@ -4,7 +4,7 @@
             #?(:cljs [cljs.core.async.interop :refer-macros [<p!]])
             [fluree.crypto :as crypto]
             [fluree.db.did :as did]
-            [fluree.db.util.async :refer [go-try]]
+            [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
@@ -115,8 +115,23 @@
         auth-did                 (did/auth-id->did id)]
     {:subject (json/parse payload false) :did auth-did}))
 
+(defn jws?
+  [x]
+  (and (string? x)
+       (re-matches #"(^[A-Za-z0-9-_]*\.[A-Za-z0-9-_]*\.[A-Za-z0-9-_]*$)" x)))
+
 (defn verify
-  [auth-claim]
-  (if (string? auth-claim)
-    (go-try (verify-jws auth-claim))
-    (verify-credential auth-claim)))
+  "Verifies a signed query/transaction. Returns keys:
+  {:subject <original tx/cmd> :did <did>}
+
+  Will throw if no :did is detected."
+  [signed-command]
+  (go-try
+   (let [result (if (jws? signed-command)
+                  (verify-jws signed-command)
+                  (<? (verify-credential signed-command)))]
+     (if (:did result)
+       result
+       (throw (ex-info "Signed message could not be verified to an identity"
+                       {:status 401
+                        :error  :db/invalid-credential}))))))
