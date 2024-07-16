@@ -27,25 +27,25 @@
   (-index-file-read [conn file-address] "Reads an index item from storage"))
 
 (comment
-  ;; state machine looks like this:
-  {:ledger {"ledger-a" {:event-fn :main-system-event-fn ;; returns async-chan response once complete
-                        :subs     {:sub-id :sub-fn} ;; active subscriptions
-                        ;; map of branches, along with current/default branch
-                        :branches {}
-                        :branch   {}}}
+ ;; state machine looks like this:
+ {:ledger {"ledger-a" {:event-fn :main-system-event-fn ;; returns async-chan response once complete
+                       :subs     {:sub-id :sub-fn} ;; active subscriptions
+                       ;; map of branches, along with current/default branch
+                       :branches {}
+                       :branch   {}}}
 
 
-   :await  {:msg-id :async-res-ch} ;; map of msg-ids to response chans for messages awaiting responses
-   :stats  {}}) ;; any stats about the connection itself
+  :await  {:msg-id :async-res-ch} ;; map of msg-ids to response chans for messages awaiting responses
+  :stats  {}}) ;; any stats about the connection itself
 
 
 (defn blank-state
   "Returns top-level state for connection"
   []
   (atom
-    {:ledger {}
-     :await  {}
-     :stats  {}}))
+   {:ledger {}
+    :await  {}
+    :stats  {}}))
 
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held
