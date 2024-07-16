@@ -1,7 +1,7 @@
 (ns fluree.db.api.transact
   (:require [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
-            [fluree.db.json-ld.policy :as perm]
+            [fluree.db.json-ld.policy :as policy]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.transact :as tx]
             [fluree.db.ledger.json-ld :as jld-ledger]
@@ -31,14 +31,16 @@
          track-fuel? (or (:maxFuel parsed-opts)
                          (:meta parsed-opts))
          parsed-txn  (q-parse/parse-txn expanded txn-context)
-
-         identity    (:did parsed-opts)]
+         identity    (:did parsed-opts)
+         policy-db   (if identity
+                       (<? (policy/wrap-identity-policy db identity true nil))
+                       db)]
      (if track-fuel?
        (let [start-time #?(:clj (System/nanoTime)
                            :cljs (util/current-time-millis))
              fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
          (try*
-          (let [result (<? (tx/stage db fuel-tracker identity parsed-txn parsed-opts))]
+          (let [result (<? (tx/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
             {:status 200
              :result result
              :time   (util/response-time-formatted start-time)
@@ -48,7 +50,7 @@
                                   {:time (util/response-time-formatted start-time)
                                    :fuel (fuel/tally fuel-tracker)}
                                   e)))))
-       (<? (tx/stage db identity parsed-txn parsed-opts))))))
+       (<? (tx/stage policy-db identity parsed-txn parsed-opts))))))
 
 (defn transact!
   ([conn txn] (transact! conn txn {:raw-txn txn}))
