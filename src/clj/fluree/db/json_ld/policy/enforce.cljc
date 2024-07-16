@@ -39,6 +39,8 @@
     (seq (apply concat (keep #(get class-policies %) classes)))))
 
 (defn policies-for-property
+  "Returns policy properties if they exist for the provided property
+  else nil"
   [policy-map modify? property]
   (let [prop-policies (property-policy-map policy-map modify?)]
     (get prop-policies property)))
@@ -60,12 +62,11 @@
   [policies]
   (ex-info (or (some :ex-message policies)
                "Policy enforcement prevents modification.")
-           {:status 400 :error :db/policy-exception}))
+           {:status 403 :error :db/policy-exception}))
 
 (defn default-val
-  "Returns the default policy value if no policies are found.
-  For transactions/modifications, this is an exception. For queries/view
-  it is just a boolean true/false."
+  "Returns the default policy value if no policies are found. (true/false)
+  If false and a transactions/modification, an exception is thrown."
   [{:keys [default-allow?] :as _policy} modify? policies]
   (if (true? default-allow?)
     true
@@ -86,6 +87,7 @@
          (if (seq result)
            true
            (recur r)))
+       ;; no more policies left to evaluate - all returned false
        (if modify?
          (modify-exception policies-to-eval)
          false)))))

@@ -11,6 +11,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.history :as history]
             [fluree.db.query.sparql :as sparql]
+            [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
@@ -210,8 +211,9 @@
 (defn query-connection-fql
   [conn query did]
   (go-try
-   (let [{:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
-
+   (let [{:keys [t opts] :as query*} (-> query
+                                         syntax/coerce-query
+                                         (update :opts sanitize-query-options did))
          default-aliases (some-> query* :from util/sequential)
          named-aliases   (some-> query* :from-named util/sequential)]
      (if (or (seq default-aliases)
