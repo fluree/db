@@ -7,6 +7,7 @@
             [fluree.db.query.exec.eval :as-alias eval]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.json-ld.response :as json-ld-resp]
+            [fluree.db.util.core :as util]
             [fluree.db.util.core :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
@@ -52,9 +53,11 @@
 
 (defprotocol ValueSelector
   (implicit-grouping? [this]
-   "Returns true if this selector should have its values grouped together.")
+    "Returns true if this selector should have its values grouped together.")
   (format-value [fmt db iri-cache context compact fuel-tracker error-ch solution]
-   "Formats a where search solution (map of pattern matches) by extracting and displaying relevant pattern matches."))
+    "Async format a search solution (map of pattern matches) by extracting relevant match.")
+  (solution-value [fmt error-ch solution]
+    "Formats value for subquery select statement as k-v tuple - synchronous."))
 
 ;; This exists because many different types of data structures in :select
 ;; clauses get implicit-grouping? called on them. So this defaults them to false.
@@ -74,7 +77,10 @@
     (log/trace "VariableSelector format-value var:" var "solution:" solution)
     (-> solution
         (get var)
-        (display db iri-cache compact error-ch))))
+        (display db iri-cache compact error-ch)))
+  (solution-value
+    [_ _ solution]
+    [var (get solution var)]))
 
 (defn variable-selector
   "Returns a selector that extracts and formats a value bound to the specified
@@ -86,19 +92,22 @@
   ValueSelector
   (implicit-grouping? [_] false)
   (format-value
-   [_ db iri-cache _context compact _fuel-tracker error-ch solution]
-   (go-loop [ks        (keys solution)
-             formatted {}]
-     (let [k          (first ks)
-           fv         (-> solution
-                          (get k)
-                          (display db iri-cache compact error-ch)
-                          <!)
-           formatted' (assoc formatted k fv)
-           next-ks    (rest ks)]
-         (if (seq next-ks)
-           (recur next-ks formatted')
-           formatted')))))
+    [_ db iri-cache _context compact _fuel-tracker error-ch solution]
+    (go-loop [ks (keys solution)
+              formatted {}]
+      (let [k          (first ks)
+            fv         (-> solution
+                           (get k)
+                           (display db iri-cache compact error-ch)
+                           <!)
+            formatted' (assoc formatted k fv)
+            next-ks    (rest ks)]
+        (if (seq next-ks)
+          (recur next-ks formatted')
+          formatted'))))
+  (solution-value
+    [_ _ solution]
+    solution))
 
 (def wildcard-selector
   "Returns a selector that extracts and formats every bound value bound in the
@@ -112,8 +121,8 @@
     [_ _ _ _ _ _ error-ch solution]
     (go (try* (agg-fn solution)
               (catch* e
-                (log/error e "Error applying aggregate selector")
-                (>! error-ch e))))))
+                      (log/error e "Error applying aggregate selector")
+                      (>! error-ch e))))))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
@@ -140,7 +149,10 @@
     [_ _ _ _ _ _ _ solution]
     (log/trace "AsSelector format-value solution:" solution)
     (go (let [match (get solution bind-var)]
-          (where/get-value match)))))
+          (where/get-value match))))
+  (solution-value
+    [_ _ solution]
+    [bind-var (get solution bind-var)]))
 
 (defn as-selector
   [as-fn bind-var aggregate?]
@@ -220,4 +232,31 @@
                                                fuel-tracker error-ch solution)
                                 (async/pipe ch)))
                           solution-ch)
+    format-ch))
+
+(defn format-subquery-values
+  [selectors error-ch solution]
+  (reduce
+   (fn [acc selector]
+     (if-let [soln-val (solution-value selector error-ch solution)]
+       (if (map? soln-val)
+         (reduced soln-val) ;; wilcard selector returns map of all solutions, can stop.
+         (assoc acc (first soln-val) (second soln-val)))
+       acc))
+   {}
+   (util/sequential selectors)))
+
+(defn subquery-format
+  "Formats each solution within the stream of solutions in `solution-ch` according
+  to the selectors within the select clause of the supplied parsed query `q`."
+  [db q fuel-tracker error-ch solution-ch]
+  (let [selectors (or (:select q)
+                      (:select-one q)
+                      (:select-distinct q))
+        format-ch (if (contains? q :select-distinct)
+                    (chan 1 (comp
+                             (map (partial format-subquery-values selectors error-ch))
+                             (distinct)))
+                    (chan 1 (map (partial format-subquery-values selectors error-ch))))]
+    (async/pipe solution-ch format-ch)
     format-ch))
