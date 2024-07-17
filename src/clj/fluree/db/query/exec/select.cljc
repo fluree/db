@@ -64,8 +64,7 @@
 (extend-type #?(:clj Object :cljs object) ; https://cljs.github.io/api/cljs.core/extend-type
   ValueSelector
   (implicit-grouping? [_] false)
-  (format-value [_ _ _ _ _ _ _ _] nil)
-  (solution-value [_ _ _] nil))
+  (format-value [_ _ _ _ _ _ _ _] nil))
 
 (defprotocol SolutionModifier
   (update-solution [this solution]))
