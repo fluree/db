@@ -79,8 +79,8 @@
 
 (defn verify-credential
   "Takes a credential and returns the credential subject and signing did if it
-  verifies. If credential does not have a jws returns nil. If the credential is invalid
-  an exception will be thrown."
+  verifies. If credential does not have a jws returns nil. If the credential is
+  invalid an exception will be thrown."
   [credential]
   (go-try
    (when-let [jws (get-in credential ["proof" "jws"])]
@@ -126,6 +126,14 @@
   [x]
   (and (string? x)
        (re-matches #"(^[A-Za-z0-9-_]*\.[A-Za-z0-9-_]*\.[A-Za-z0-9-_]*$)" x)))
+
+(defn verifiable-credential?
+  [x]
+  (and (map? x) (contains? x "proof")))
+
+(defn credential?
+  [x]
+  (or (jws? x) (verifiable-credential? x)))
 
 (defn verify
   "Verifies a signed query/transaction. Returns keys:
