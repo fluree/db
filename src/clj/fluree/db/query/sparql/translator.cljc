@@ -624,10 +624,10 @@
   [[_ & patterns]]
   (mapcat parse-term patterns))
 
+(declare translate)
 (defmethod parse-term :SubSelect
-  [r]
-  (throw (ex-info "SubSelect patterns are not supported"
-                  {:status 400 :error :db/invalid-query})))
+  [[_ & subquery-clauses]]
+  [:query (translate subquery-clauses)])
 
 (defmethod parse-rule :WhereClause
   ;; WhereClause ::= <'WHERE'?> WS GroupGraphPattern WS
@@ -638,7 +638,9 @@
 (defmethod parse-rule :ValuesClause
   ;; ValuesClause ::= ( <'VALUES'> WS DataBlock )? WS
   [[_ datablock]]
-  [(parse-term datablock)])
+  (if datablock
+    [(parse-term datablock)]
+    []))
 
 (defmethod parse-rule :OffsetClause
   ;; OffsetClause ::= <'OFFSET'> WS INTEGER

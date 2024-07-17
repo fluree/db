@@ -472,7 +472,28 @@
         (is (= [{"@id" "?x", ":p" "?n"}
                 [:minus [{"@id" "?x", ":q" "?m"}
                          [:filter ["(= ?n ?m)"]]]]]
-               where))))))
+               where)))))
+  (testing "subquery"
+      (let [query "PREFIX : <http://people.example/>
+                 SELECT ?y ?minName
+                 WHERE {
+                  :alice :knows ?y .
+                  {
+                    SELECT ?y (MIN(?name) AS ?minName)
+                    WHERE {
+                      ?y :name ?name .
+                    } GROUP BY ?y
+                  }
+                }"]
+        (is (= {:context {"" "http://people.example/"},
+                :select ["?y" "?minName"],
+                :where
+                [{"@id" ":alice", ":knows" "?y"}
+                 [:query
+                  {:select ["?y" "(as (min ?name) ?minName)"],
+                   :where [{"@id" "?y", ":name" "?name"}],
+                   :groupBy ["?y"]}]]}
+               (sparql/->fql query))))))
 
 (deftest parse-prefixes
   (testing "PREFIX"
