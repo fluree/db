@@ -588,7 +588,7 @@
 (defmethod parse-pattern :query
   [[_ sub-query] _vars context]
   (let [sub-query* (-> sub-query
-                       syntax/coerce-query
+                       syntax/coerce-subquery
                        (parse-analytical-query context))]
     [(where/->pattern :query sub-query*)]))
 

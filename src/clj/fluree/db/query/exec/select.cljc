@@ -177,14 +177,7 @@
                          where/get-iri)
                      subj)]
       (json-ld-resp/format-node ds iri context compact spec iri-cache
-                                fuel-tracker error-ch)))
-  (solution-value
-    [_ error-ch _]
-    (async/put!
-     error-ch
-     (ex-info "Graph crawl select statements cannot be used in subqueries."
-              {:status 400
-               :error  :db/invalid-query}))))
+                                fuel-tracker error-ch))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied
