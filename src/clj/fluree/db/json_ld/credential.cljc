@@ -98,19 +98,26 @@
            auth-did      (did/auth-id->did id)]
        (when (not= jws-header-json header)
          (throw (ex-info "Unsupported jws header in credential."
-                         {:error :credential/unknown-signing-algorithm
+                         {:status 400
+                          :error :credential/unknown-signing-algorithm
                           :supported-header jws-header-json
                           :header header
                           :credential credential})))
 
        (when (not (crypto/verify-signature pubkey signing-input signature))
-         (throw (ex-info "Verification failed." {:error :credential/invalid-signature :credential credential})))
+         (throw (ex-info "Verification failed, invalid credential."
+                         {:status 400
+                          :error :credential/invalid-signature
+                          :credential credential})))
         ;; everything is good
        {:subject subject :did auth-did}))))
 
 (defn verify-jws
   [jws format]
-  (let [{:keys [payload pubkey]} (crypto/verify-jws jws)
+  (let [{:keys [payload pubkey]} (or (crypto/verify-jws jws)
+                                     (throw (ex-info (str "Invalid JWS: " jws)
+                                                     {:status 400
+                                                      :error  :db/invalid-credential})))
         id                       (crypto/account-id-from-public pubkey)
         auth-did                 (did/auth-id->did id)
         processed-payload        (if (= :sparql format)

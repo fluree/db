@@ -252,6 +252,9 @@
     ::function             [:orn
                             [:string-fn [:and :string [:re #"^\(.+\)$"]]]
                             [:list-fn [:and list? [:cat :symbol [:* any?]]]]]
+    ::as-function          [:orn {:error/message "subquery aggregates must be bound to a variable with 'as' e.g. '(as (sum ?x) ?x-sum)"}
+                            [:string-fn [:and :string [:re #"^\(as .+\)$"]]]
+                            [:list-fn [:and list? [:cat :symbol [:* any?]]]]]
     ::optional             [:+ {:error/message "optional pattern must be a sequence of valid where clauses."}
                             [:schema [:ref ::where]]]
     ::union                [:+ {:error/message "union pattern must be a sequence of valid where clauses."}
@@ -268,7 +271,7 @@
     ::where-op             [:and
                             :keyword
                             [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind, values, exists, not-exists, minus"}
-                             :graph :filter :optional :union :bind :values :exists :not-exists :minus]]
+                             :graph :filter :optional :union :bind :query :values :exists :not-exists :minus]]
     ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
@@ -289,7 +292,7 @@
                                      :min 1}
                             [:ref ::node-map-key] [:ref ::node-map-value]]
     ::where-pattern        [:multi {:dispatch where-pattern-type
-                                    :error/message "where clause patterns must be either a node map or a filter, optional, union, bind, or graph array."}
+                                    :error/message "where clause patterns must be either a node map or a filter, optional, union, bind, query, or graph array."}
                             [:node ::node-map]
                             [:filter [:catn
                                       [:op ::where-op]
@@ -315,7 +318,11 @@
                             [:bind [:catn
                                     [:op ::where-op]
                                     [:bindings ::bind]]]
-                            [:graph [:tuple ::where-op ::graph [:ref ::where]]]]
+                            [:graph [:tuple ::where-op ::graph [:ref ::where]]]
+                            ;; TODO - because ::subquery is a separate registry it cannot be called here, validated in f.d.q.fql.syntax/coerce-subquery until resolved
+                            [:query [:catn
+                                     [:op ::where-op]
+                                     [:query [:map]]]]]
     ::where                [:orn {:error/message "where clause must be a single node map pattern or a sequence of where patterns"}
                             [:single ::node-map]
                             [:collection [:sequential ::where-pattern]]]

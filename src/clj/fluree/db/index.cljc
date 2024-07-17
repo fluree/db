@@ -287,16 +287,16 @@
 
 (defn history-t-range
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
-  ([{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
-   (let [latest       (if (> to-t leaf-t)
-                        (flake/conj-all flakes (novelty-subrange leaf to-t novelty))
-                        flakes)
-         ;; flakes that happen after to-t
-         subsequent   (filter-after to-t latest)
-         ;; flakes that happen before from-t
-         previous     (filter (partial before-t? from-t) latest)
-         out-of-range (concat subsequent previous)]
-     (flake/disj-all latest out-of-range))))
+  [{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
+  (let [latest       (if (> to-t leaf-t)
+                       (flake/conj-all flakes (novelty-subrange leaf to-t novelty))
+                       flakes)
+        ;; flakes that happen after to-t
+        subsequent   (filter-after to-t latest)
+        ;; flakes that happen before from-t
+        previous     (filter (partial before-t? from-t) latest)
+        out-of-range (concat subsequent previous)]
+    (flake/disj-all latest out-of-range)))
 
 (defrecord CachedHistoryRangeResolver [node-resolver novelty from-t to-t lru-cache-atom]
   Resolver
