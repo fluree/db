@@ -1,7 +1,8 @@
 (ns fluree.db.transact
   (:require [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
-            [fluree.json-ld :as json-ld]))
+            [fluree.json-ld :as json-ld]
+            [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -16,7 +17,12 @@
        (into []
              (comp (remove (fn [[k _]] (keyword? k)))  ; remove :id :idx :type
                    (mapcat rest)                      ; discard keys
-                   (mapcat (partial remove :value)))) ; remove value objects
+                   (mapcat (partial remove
+                                    (fn [v]
+                                      ;; remove value objects unless they have type @id
+                                      (and
+                                        (some? (:value v))
+                                        (not= (:type v) const/iri-id)))))))
        not-empty))
 
 (defn extract-annotation
@@ -28,9 +34,11 @@
     (when-let [specified-id (:id annotation)]
       (throw (ex-info "Commit annotation cannot specify a subject identifier."
                       {:status 400, :error :db/invalid-annotation :id specified-id})))
-    (when (or (> (count expanded) 1)
-              (nested-nodes? annotation))
+    (when (> (count expanded) 1)
       (throw (ex-info "Commit annotation must only have a single subject."
+                      {:status 400, :error :db/invalid-annotation})))
+    (when (nested-nodes? annotation)
+      (throw (ex-info "Commit annotation cannot reference other subjects."
                       {:status 400, :error :db/invalid-annotation})))
     ;; everything is good
     expanded))
