@@ -32,7 +32,7 @@
   "Given a child, unresolved node, extracts just the data that will go into
   storage."
   [child]
-  (select-keys child [:id :leaf :first :rhs :size]))
+  (select-keys child [:id :leaf :first :rhs :size :leftmost?]))
 
 (defn write-leaf
   "Serializes and writes the index leaf node `leaf` to storage."
@@ -69,7 +69,7 @@
 
 (defn write-db-root
   [db]
-  (let [{:keys [alias conn schema t stats spot psot post opst tspo
+  (let [{:keys [alias conn schema t stats spot post opst tspo
                 namespace-codes]}
         db
 
@@ -79,7 +79,6 @@
               :schema          (vocab/serialize-schema schema)
               :stats           (select-keys stats [:flakes :size])
               :spot            (child-data spot)
-              :psot            (child-data psot)
               :post            (child-data post)
               :opst            (child-data opst)
               :tspo            (child-data tspo)
@@ -88,7 +87,6 @@
               :namespace-codes namespace-codes}
         ser  (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn alias :root ser)))
-
 
 (defn read-branch
   [{:keys [serializer] :as conn} key]
@@ -144,7 +142,6 @@
     (update root-map :schema vocab/deserialize-schema namespace-codes)
     ;; legacy, for now only v0
     (update root-map :preds deserialize-preds)))
-
 
 (defn read-db-root
   "Returns all data for a db index root of a given t."
@@ -205,13 +202,14 @@
            (async/put! return-ch
                        (assoc node k data)))
          (catch* e
-                 (log/error e "Error resolving index node")
-                 (when error-fn
-                   (try*
-                     (error-fn)
-                     (catch* e (log/error e "Error executing error-fn in resolve-index-node!"))))
-                 (async/put! return-ch e)
-                 (async/close! return-ch))))
+           (log/error e "Error resolving index node")
+           (when error-fn
+             (try*
+               (error-fn)
+               (catch* e
+                 (log/error e "Error executing error-fn in resolve-index-node!"))))
+           (async/put! return-ch e)
+           (async/close! return-ch))))
      return-ch)))
 
 (defn resolve-empty-leaf

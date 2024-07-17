@@ -3,6 +3,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.log :as log]
             [fluree.db.db.json-ld :as db :refer [db?]]
             [fluree.db.util.async :refer [go-try <?]]
@@ -145,12 +146,6 @@
     (log/debug "Reasoner - source OWL rules: " graph)
     (owl-datalog/owl->datalog inserts graph)))
 
-(defn parse-rules-graph
-  [rules-graph]
-  (-> rules-graph
-      json-ld/expand
-      util/sequential))
-
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
   supplied rules graph or from the db if no graph is supplied."
@@ -235,9 +230,9 @@
           ;; TODO - rules can be processed in parallel
           raw-rules       (<? (all-rules methods* db* inserts graph-or-db))
           _               (log/debug "Reasoner - extracted rules: " raw-rules)
-          reasoning-rules (->> raw-rules
-                               (resolve/rules->graph db*)
-                               add-rule-dependencies)
+          reasoning-rules (-> raw-rules
+                              resolve/rules->graph
+                              add-rule-dependencies)
           db**            (if-let [inserts* @inserts]
                             (<? (process-inserts db* fuel-tracker inserts*))
                             db*)]

@@ -1,7 +1,7 @@
 (ns fluree.db.query.filter-query-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]))
+            [fluree.db.api :as fluree]))
 
 (deftest ^:integration filter-test
   (let [conn   (test-utils/create-conn)

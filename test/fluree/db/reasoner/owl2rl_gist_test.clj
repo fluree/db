@@ -1,7 +1,7 @@
 (ns fluree.db.reasoner.owl2rl-gist-test
   (:require [clojure.java.io :as io]
             [clojure.test :refer :all]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]))

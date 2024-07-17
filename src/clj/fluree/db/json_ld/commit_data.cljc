@@ -175,15 +175,15 @@
 
 (defn jsonld->clj
   [jsonld]
-  (let [id      (:id jsonld)
-        v       (get-first-value jsonld const/iri-v)
-        alias   (get-first-value jsonld const/iri-alias)
-        branch  (get-first-value jsonld const/iri-branch)
-        address (-> jsonld
-                    (get-first-value const/iri-address)
-                    not-empty)
-        author  (get-first-value jsonld const/iri-author)
-        txn     (get-first-value jsonld const/iri-txn)
+  (let [id          (:id jsonld)
+        v           (get-first-value jsonld const/iri-v)
+        alias       (get-first-value jsonld const/iri-alias)
+        branch      (get-first-value jsonld const/iri-branch)
+        address     (-> jsonld
+                        (get-first-value const/iri-address)
+                        not-empty)
+        author      (get-first-value jsonld const/iri-author)
+        txn         (get-first-value jsonld const/iri-txn)
 
         time        (get-first-value jsonld const/iri-time)
         message     (get-first-value jsonld const/iri-message)
@@ -194,27 +194,27 @@
         ns          (get-first jsonld const/iri-ns)
         index       (get-first jsonld const/iri-index)]
 
-    (cond-> {:id      id
-             :v       v
-             :alias   alias
-             :branch  branch
-             :time    time
-             :tag     (mapv :value tags)
-             :data    (parse-db-data data)
-             :author  author
-             :txn     txn}
-      address     (assoc :address address)
-      prev-commit (assoc :previous       {:id      (:id prev-commit)
+    (cond-> {:id     id
+             :v      v
+             :alias  alias
+             :branch branch
+             :time   time
+             :tag    (mapv :value tags)
+             :data   (parse-db-data data)
+             :author author}
+            txn (assoc :txn txn)
+            address (assoc :address address)
+            prev-commit (assoc :previous {:id      (:id prev-commit)
                                           :address (get-first-value prev-commit const/iri-address)})
-      message     (assoc :message message)
-      ns          (assoc :ns (->> ns
-                                  util/sequential
-                                  (mapv (fn [namespace]
-                                          (select-keys namespace [:id])))))
-      index       (assoc :index {:id      (:id index)
+            message (assoc :message message)
+            ns (assoc :ns (->> ns
+                               util/sequential
+                               (mapv (fn [namespace]
+                                       (select-keys namespace [:id])))))
+            index (assoc :index {:id      (:id index)
                                  :address (get-first-value index const/iri-address)
                                  :data    (parse-db-data (get-first index const/iri-data))})
-      issuer      (assoc :issuer (select-keys issuer [:id])))))
+            issuer (assoc :issuer (select-keys issuer [:id])))))
 
 (defn update-index-roots
   [commit-map {:keys [spot post opst tspo]}]
@@ -377,15 +377,15 @@
                                 :prev-commit)
                         (assoc :address ""
                                :author author
-                               :txn  txn-id
                                :data data-commit
                                :time (util/current-time-iso)))]
     (cond-> commit
-      issuer (assoc :issuer {:id issuer})
-      prev-commit (assoc :previous prev-commit)
-      message (assoc :message message)
-      annotation (assoc :annotation annotation)
-      tag (assoc :tag tag))))
+            txn-id (assoc :txn txn-id)
+            issuer (assoc :issuer {:id issuer})
+            prev-commit (assoc :previous prev-commit)
+            message (assoc :message message)
+            annotation (assoc :annotation annotation)
+            tag (assoc :tag tag))))
 
 (defn ref?
   [f]
@@ -451,7 +451,7 @@
   "Builds and returns the commit metadata flakes for the given commit, t, and
   db-sid. Used when committing to an in-memory ledger value and when reifying
   a ledger from storage on load."
-  [{:keys [address alias branch data time v author txn] :as _commit} t commit-sid db-sid]
+  [{:keys [address alias branch data time v author] :as _commit} t commit-sid db-sid]
   (let [{db-t :t db-address :address :keys [flakes size]} data]
     [;; commit flakes
      ;; address
@@ -468,8 +468,6 @@
      (flake/create commit-sid const/$_commit:data db-sid const/$xsd:anyURI t true nil)
      ;; author
      (flake/create commit-sid const/$_commit:author author const/$xsd:string t true nil)
-     ;; txn
-     (flake/create commit-sid const/$_commit:txn txn const/$xsd:string t true nil)
 
      ;; db flakes
      ;; t
@@ -524,6 +522,12 @@
   [t commit-sid message]
   [(flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil)])
 
+;; TODO - txn should really be an IRI, not a string
+(defn txn-flake
+  "Builds and returns the commit txn flake for the given t and transaction id."
+  [t commit-sid txn]
+  (flake/create commit-sid const/$_commit:txn txn const/$xsd:string t true nil))
+
 (defn annotation-flakes
   [db t commit-sid annotation]
   (if annotation
@@ -540,10 +544,10 @@
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
   [{:keys [commit] :as db} prev-commit]
-  (let [{:keys [data id issuer message annotation]} commit
-        {db-t :t, db-id :id}                        data
-        {previous-id :id prev-data :data}           prev-commit
-        prev-data-id                                (:id prev-data)
+  (let [{:keys [data id issuer message annotation txn]} commit
+        {db-t :t, db-id :id} data
+        {previous-id :id prev-data :data} prev-commit
+        prev-data-id       (:id prev-data)
 
         t                  db-t
         commit-sid         (iri/encode-iri db id)
@@ -560,12 +564,13 @@
 
         [db* annotation-flakes] (annotation-flakes db t commit-sid annotation)
 
-        commit-flakes (cond-> base-flakes
-                        prev-commit-flakes (into prev-commit-flakes)
-                        prev-db-flakes     (into prev-db-flakes)
-                        issuer-flakes      (into issuer-flakes)
-                        annotation-flakes  (into annotation-flakes)
-                        message-flakes     (into message-flakes))]
+        commit-flakes      (cond-> base-flakes
+                                   prev-commit-flakes (into prev-commit-flakes)
+                                   prev-db-flakes (into prev-db-flakes)
+                                   issuer-flakes (into issuer-flakes)
+                                   annotation-flakes (into annotation-flakes)
+                                   message-flakes (into message-flakes)
+                                   txn (conj (txn-flake t commit-sid txn)))]
     (-> db*
         (update-novelty commit-flakes)
         add-tt-id)))

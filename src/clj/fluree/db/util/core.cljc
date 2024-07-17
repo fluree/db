@@ -419,6 +419,18 @@
       (first v)
       v)))
 
+(defn get-types
+  [json-ld]
+  (or (:type json-ld)
+      (get json-ld "@type")))
+
+(defn of-type?
+  "Returns true if the provided json-ld node is of the provided type."
+  [json-ld rdf-type]
+  (->> json-ld
+       get-types
+       (some #(= % rdf-type))))
+
 (defn get-value
   [val]
   (if (map? val)
@@ -453,6 +465,35 @@
    (if (#{:list :set} (-> context (get iri) :container))
      coll
      (unwrap-singleton coll))))
+
+(defn unwrap-list
+  "If values are contained in a @list, unwraps them.
+  @list can look like:
+  {ex:someProperty [{@list [ex:val1 ex:val2]}]}
+  or in single-cardinality form:
+  {ex:someProperty {@list [ex:val1 ex:val2]}}
+
+  If @list is not present, return original 'vals' argument."
+  [vals]
+  (let [first-val (if (sequential? vals)
+                    (first vals)
+                    vals)
+        list-vals (when (map? first-val)
+                    (or (:list first-val)
+                        (get first-val "@list")))]
+    (or list-vals
+        vals)))
+
+(defn get-all-ids
+  "Returns all @id values for a given key in a json-ld node.
+
+  If values are contained in a @list, unwraps them.
+
+  Elides any scalar values (those without an @id key)."
+  [json-ld k]
+  (some->> (get json-ld k)
+           unwrap-list
+           (keep get-id)))
 
 (defn parse-opts
   [opts]

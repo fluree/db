@@ -1,6 +1,6 @@
 (ns fluree.db.reasoner.owl2rl-class-test
   (:require [clojure.test :refer :all]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
 ;; tests for OWL class reasoning rules

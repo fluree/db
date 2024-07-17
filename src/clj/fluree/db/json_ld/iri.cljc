@@ -20,11 +20,12 @@
 (def ^:const f-ipfs-ns "fluree:ipfs://")
 (def ^:const f-s3-ns "fluree:s3://")
 
-(def type-iri "@type")
+(def ^:const type-iri "@type")
+(def ^:const json-iri "@json")
 
 (def json-iri-keywords
   {type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-   "@json"  "http://www.w3.org/2001/XMLSchema#json"})
+   json-iri "http://www.w3.org/2001/XMLSchema#json"})
 
 (defn normalize
   [iri]
@@ -191,19 +192,16 @@
    (iri->sid iri default-namespaces))
   ([iri namespaces]
    (let [[ns nme] (decompose iri)]
-     (if-let [ns-code (get namespaces ns)]
-       (->sid ns-code nme)
-       (throw (ex-info (str "Unexpected error: Namespace not registered in the database "
-                            "for iri: " iri ".")
-                       {:status 500
-                        :error :db/unexpected-error}))))))
+     (when-let [ns-code (get namespaces ns)]
+       (->sid ns-code nme)))))
+
+(defn get-max-namespace-code
+  [ns-codes]
+  (->> ns-codes keys (apply max last-default-code)))
 
 (defn next-namespace-code
-  [namespaces]
-  (->> namespaces
-       vals
-       (apply max last-default-code)
-       inc))
+  [ns-codes]
+  (-> ns-codes get-max-namespace-code inc))
 
 (def type-sid
   (iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))

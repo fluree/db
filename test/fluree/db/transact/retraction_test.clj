@@ -1,7 +1,7 @@
 (ns fluree.db.transact.retraction-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]))
+            [fluree.db.api :as fluree]))
 
 (deftest ^:integration retracting-data
   (testing "Retractions of individual properties and entire subjects."
@@ -41,4 +41,36 @@
                             {:context [test-utils/default-context
                                        {:ex "http://example.org/ns/"}],
                              :select {:ex/alice [:*]}}))
-          "Alice should no longer have an age property"))))
+          "Alice should no longer have an age property")))
+  (testing "retracting ordered lists"
+    (let [conn             (test-utils/create-conn)
+          ledger           @(fluree/create conn "tx/retract")
+          context          [test-utils/default-str-context
+                            {"ex"        "http://example.org/ns/"
+                             "ex:items2" {"@container" "@list"}}]
+          q1               {:context context
+                            :select  {"ex:list-test" ["*"]}}
+          db               @(fluree/stage
+                             (fluree/db ledger)
+                             {"@context" context
+                              "insert"
+                              [{"id"        "ex:list-test"
+                                "ex:items1" {"@list" ["zero" "one" "two"
+                                                      "three"]}
+                                "ex:items2" ["four" "five" "six" "seven"]}]})
+          before-retract   @(fluree/query db q1)
+          db-after-retract @(fluree/stage
+                             db
+                             {"@context" context
+                              "delete"   {"id"        "ex:list-test"
+                                          "ex:items1" "?items1"
+                                          "ex:items2" "?items2"}
+                              "where"    {"id"        "ex:list-test"
+                                          "ex:items1" "?items1"
+                                          "ex:items2" "?items2"}})
+          after-retract    @(fluree/query db-after-retract q1)]
+      (is (= [{"id"        "ex:list-test"
+               "ex:items1" ["zero" "one" "two" "three"]
+               "ex:items2" ["four" "five" "six" "seven"]}]
+             before-retract))
+      (is (= [{"id" "ex:list-test"}] after-retract)))))

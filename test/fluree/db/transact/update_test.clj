@@ -1,7 +1,7 @@
 (ns fluree.db.transact.update-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]))
+            [fluree.db.api :as fluree]))
 
 (deftest ^:integration deleting-data
   (testing "Deletions of entire subjects."
@@ -440,10 +440,18 @@
                                                    test-utils/default-str-context
                                                    {"ex" "http://example.com/"}]
                                        "where"    [{"id" "?s", "ex:text" "?text"}
-                                                   ["bind" "?bound" "(bound ?text)"]]
-                                       "insert"   {"id" "?s", "ex:bound" "?bound"}
+                                                   ["bind"
+                                                    "?bound" "(bound ?text)"
+                                                    "?in" "(in (strLen ?text) [(+ 6 1) 8 9])"
+                                                    "?not-in" "(not (in (strLen ?text) [(+ 6 1) 8 9]))"]]
+                                       "insert"   {"id"        "?s",
+                                                   "ex:bound"  "?bound"
+                                                   "ex:in"     "?in"
+                                                   "ex:not-in" "?not-in"}
                                        "values"   ["?s" ["ex:functional-fns"]]}))]
-        (is (= {"ex:bound" true}
+        (is (= {"ex:bound"  true
+                "ex:in"     true
+                "ex:not-in" false}
                @(fluree/query @updated {"@context"  [test-utils/default-str-context
                                                      {"ex" "http://example.com/"}]
                                         "selectOne" {"ex:functional-fns" ["ex:bound"

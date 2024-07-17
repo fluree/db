@@ -1,4 +1,4 @@
-(ns fluree.db.api.query
+(ns fluree.db.query.api
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.string :as str]
@@ -6,11 +6,12 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.query.dataset :as dataset :refer [dataset?]]
+            [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.log :as log]
             [fluree.db.query.history :as history]
             [fluree.db.query.sparql :as sparql]
+            [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
@@ -24,16 +25,8 @@
   "Return a summary of the changes over time, optionally with the full commit details included."
   [db query]
   (go-try
-    (let [{query-map :subject, did :did} (or (<? (cred/verify query))
-                                             {:subject query})
-
-          context (ctx-util/extract query-map)
-          opts    (cond-> (:opts query-map)
-                    did (assoc :did did))
-          db*     (if-let [policy-identity (perm/parse-policy-identity opts context)]
-                    (<? (perm/wrap-policy db policy-identity))
-                    db)]
-      (<? (history/query db* context query-map)))))
+    (let [context (ctx-util/extract query)]
+      (<? (history/query db context query)))))
 
 (defn sanitize-query-options
   [opts did]
@@ -43,8 +36,8 @@
 (defn restrict-db
   [db t context opts]
   (go-try
-    (let [db*  (if-let [policy-identity (perm/parse-policy-identity opts context)]
-                 (<? (perm/wrap-policy db policy-identity))
+    (let [db*  (if-let [did (:did opts)]
+                 (<? (perm/wrap-identity-policy db did true nil))
                  db)
           db** (-> (if t
                      (<? (time-travel/as-of db* t))
@@ -72,16 +65,17 @@
 (defn query-fql
   "Execute a query against a database source. Returns core async channel
   containing result or exception."
-  [ds query]
-  (go-try
-    (let [{query :subject, did :did} (or (<? (cred/verify query))
-                                         {:subject query})
-          {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
+  ([ds query] (query-fql ds query nil))
+  ([ds query {:keys [did issuer] :as _opts}]
+   (go-try
+    ;; TODO - verify if both 'did' and 'issuer' opts are still needed upstream
+    (let [{:keys [t opts] :as query*} (update query :opts sanitize-query-options (or did issuer))
 
           ;; TODO: extracting query context here for policy only to do it later
           ;; while parsing the query. We need to consolidate both policy and
           ;; query parsing while cleaning up the query api call stack.
           q-ctx    (ctx-util/extract query*)
+          ;; TODO - remove restrict-db from here, restriction should happen upstream if needed
           ds*      (if (dataset? ds)
                      ds
                      (<? (restrict-db ds t q-ctx opts)))
@@ -89,7 +83,7 @@
           max-fuel (:max-fuel opts)]
       (if (::util/track-fuel? opts)
         (<? (track-query ds* max-fuel query**))
-        (<? (fql/query ds* query**))))))
+        (<? (fql/query ds* query**)))))))
 
 (defn query-sparql
   [db query]
@@ -215,36 +209,36 @@
         (dataset db-map defaults)))))
 
 (defn query-connection-fql
-  [conn query]
+  [conn query did]
   (go-try
-    (let [{query :subject, did :did} (or (<? (cred/verify query))
-                                         {:subject query})
-          {:keys [t opts] :as query*}  (update query :opts sanitize-query-options did)
-
-          default-aliases (some-> query* :from util/sequential)
-          named-aliases   (some-> query* :from-named util/sequential)]
-      (if (or (seq default-aliases)
-              (seq named-aliases))
-        (let [s-ctx       (ctx-util/extract query)
-              ds          (<? (load-dataset conn default-aliases named-aliases t
-                                            s-ctx opts))
-              query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
-              max-fuel    (:max-fuel opts)]
-          (if (::util/track-fuel? opts)
-            (<? (track-query ds max-fuel query**))
-            (<? (fql/query ds query**))))
-        (throw (ex-info "Missing ledger specification in connection query"
-                        {:status 400, :error :db/invalid-query}))))))
+   (let [{:keys [t opts] :as query*} (-> query
+                                         syntax/coerce-query
+                                         (update :opts sanitize-query-options did))
+         default-aliases (some-> query* :from util/sequential)
+         named-aliases   (some-> query* :from-named util/sequential)]
+     (if (or (seq default-aliases)
+             (seq named-aliases))
+       (let [s-ctx    (ctx-util/extract query)
+             ds       (<? (load-dataset conn default-aliases named-aliases t
+                                        s-ctx opts))
+             query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
+             max-fuel (:max-fuel opts)]
+         (if (::util/track-fuel? opts)
+           (<? (track-query ds max-fuel query**))
+           (<? (fql/query ds query**))))
+       (throw (ex-info "Missing ledger specification in connection query"
+                       {:status 400, :error :db/invalid-query}))))))
 
 
 (defn query-connection-sparql
-  [conn query]
+  [conn query did]
   (go-try
-    (let [fql (sparql/->fql query)]
-      (<? (query-connection-fql conn fql)))))
+   (let [fql (sparql/->fql query)]
+     (<? (query-connection-fql conn fql did)))))
 
 (defn query-connection
-  [conn query {:keys [format] :as _opts :or {format :fql}}]
+  [conn query {:keys [format did] :as opts :or {format :fql}}]
   (case format
-    :fql (query-connection-fql conn query)
-    :sparql (query-connection-sparql conn query)))
+    :fql (query-connection-fql conn query did)
+    :sparql (query-connection-sparql conn query did)))
+

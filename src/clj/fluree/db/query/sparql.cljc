@@ -3,14 +3,25 @@
             #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
+            [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.util.docs :as docs]
-            [fluree.db.util.log :as log]
-            [fluree.db.query.sparql2fql :refer [parsed->fql]]))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def grammar #?(:clj  (io/resource "sparql.bnf")
-                :cljs (inline-resource "sparql.bnf")))
+(def PN_CHARS_BASE
+  "CLJ and CLJS use different (and incompatible) unicode character syntax, so in the regex
+  for PN_CHARS_BASE needs to be platform specific."
+  #?(:clj
+     (slurp (io/resource "sparql.pn_chars_base.jvm.bnf"))
+     :cljs
+     (inline-resource "sparql.pn_chars_base.js.bnf")))
+
+(def grammar
+  (str
+    #?(:clj  (slurp (io/resource "sparql.bnf"))
+       :cljs (inline-resource "sparql.bnf"))
+    PN_CHARS_BASE))
 
 (defparser parser grammar)
 
@@ -30,4 +41,7 @@
         (log/trace "Parsed SPARQL query:" parsed)
         parsed))))
 
-(def ->fql (comp parsed->fql parse))
+(defn ->fql
+  [sparql]
+  (let [parsed (parse sparql)]
+    (sparql.translator/translate parsed)))

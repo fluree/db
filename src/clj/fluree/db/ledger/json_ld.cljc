@@ -2,8 +2,9 @@
   (:require [clojure.core.async :as async :refer [<!]]
             [fluree.db.ledger :as ledger]
             [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.json-ld.transact :as transact]
+            [fluree.db.transact :as transact]
             [fluree.db.did :as did]
             [fluree.db.util.context :as context]
             [fluree.db.util.async :refer [<? go-try]]
@@ -121,15 +122,21 @@
      :type-key       (json-ld/compact "@type" compact-fn)
      :index-files-ch index-files-ch})) ;; optional async chan passed in which will stream out all new index files created (for consensus)
 
+;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
+;; TODO - however this is really a concern of "commit", not staging and I don' think the db should be handling any of it
 (defn write-transactions!
   [conn {:keys [alias] :as _ledger} staged]
   (go-try
-    (loop [[[txn author-did annotation] & r] staged
-           results                []]
-      (if txn
-        (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
-          (recur r (conj results [txn-id author-did annotation])))
-        results))))
+   (loop [[next-staged & r] staged
+          results []]
+     (if next-staged
+       (let [[txn author-did annotation] next-staged
+             results* (if txn
+                        (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
+                          (conj results [txn-id author-did annotation]))
+                        (conj results next-staged))]
+         (recur r results*))
+       results))))
 
 (defn write-commit
   [conn alias {:keys [did private]} commit]
@@ -153,11 +160,13 @@
 
 (defn formalize-commit
   [{prev-commit :commit :as staged-db} new-commit]
-  (-> staged-db
-      (update :staged empty)
-      (assoc :commit new-commit
-             :prev-commit prev-commit)
-      (commit-data/add-commit-flakes prev-commit)))
+  (let [max-ns-code (-> staged-db :namespace-codes iri/get-max-namespace-code)]
+    (-> staged-db
+        (update :staged empty)
+        (assoc :commit new-commit
+               :prev-commit prev-commit
+               :max-namespace-code max-ns-code)
+        (commit-data/add-commit-flakes prev-commit))))
 
 (defn commit!
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
@@ -171,6 +180,7 @@
           {:keys [dbid db-jsonld staged-txns]}
           (jld-db/db->jsonld staged-db opts*)
 
+          ;; TODO - we do not support multiple "transactions" in a single commit (although other code assumes we do which needs cleaning)
           [[txn-id author annotation] :as txns]
           (<? (write-transactions! conn ledger staged-txns))
 
@@ -190,7 +200,7 @@
                            :db-address db-address
                            :author     (or author "")
                            :annotation annotation
-                           :txn-id     (if (= 1 (count txns)) txn-id "")
+                           :txn-id     txn-id
                            :flakes     (:flakes stats)
                            :size       (:size stats)}
           new-commit      (commit-data/new-db-commit-map base-commit-map)

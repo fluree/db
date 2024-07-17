@@ -1,7 +1,7 @@
 (ns fluree.db.query.json-ld-basic-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]))
+            [fluree.db.api :as fluree]))
 
 (deftest ^:integration json-ld-basic-query
   (testing "json-ld"

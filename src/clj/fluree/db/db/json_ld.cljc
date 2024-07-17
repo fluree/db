@@ -8,23 +8,24 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.db.json-ld.format :as jld-format]
             [fluree.db.db.json-ld.history :as history]
-            [fluree.db.db.json-ld.policy :as db-policy]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.index :as index]
             [fluree.db.indexer :as indexer]
             [fluree.db.indexer.default :as idx-default]
+            [fluree.db.query.fql :as fql]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
+            [fluree.db.json-ld.policy.query :as qpolicy]
+            [fluree.db.json-ld.policy.rules :as policy-rules]
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.json-ld.shacl :as shacl]
-            [fluree.db.json-ld.transact :as jld-transact]
+            [fluree.db.transact :as transact]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.permissions-validate :as validate]
-            [fluree.db.policy.enforce-tx :as tx-policy]
+            [fluree.db.json-ld.policy.modify :as tx-policy]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :refer [AuditLog]]
@@ -33,8 +34,11 @@
             [fluree.db.serde.json :as serde-json]
             [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-value
-                                                  get-first-id vswap!]]
+            [fluree.db.util.core :as util
+             #?@(:clj  [:refer [get-first get-first-value get-first-id vswap!
+                                try* catch*]]
+                 :cljs [:refer [get-first get-first-value get-first-id vswap!]
+                        :refer-macros [try* catch*]])]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
@@ -45,15 +49,11 @@
 
 ;; ================ Jsonld record support fns ================================
 
-(defn root-db
-  [this]
-  (policy/root this))
-
 (defn class-ids
   "Returns list of class-ids for given subject-id"
   [db subject-id]
   (go-try
-    (let [root (root-db db)]
+    (let [root (policy/root db)]
       (<? (query-range/index-range root :spot = [subject-id const/$rdf:type]
                                    {:flake-xf (map flake/o)})))))
 
@@ -248,7 +248,7 @@
 
         commit-t  (-> db :commit commit-data/t)
         t         (flake/next-t commit-t)
-        db-before (root-db db)]
+        db-before (policy/root db)]
     {:db-before     db-before
      :context       context
      :txn           txn
@@ -322,35 +322,30 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-
-          mods     (<? (modified-subjects db add))
-
-          db-after (-> db
-                       (update :staged conj [txn author-did annotation])
-                       (assoc :policy policy) ;; re-apply policy to db-after
-                       (assoc :t t)
-                       (commit-data/update-novelty add remove)
-                       (commit-data/add-tt-id)
-                       (vocab/hydrate-schema add mods))]
+          mods         (<? (modified-subjects (policy/root db) add))
+          db-after     (-> db
+                           (update :staged conj [txn author-did annotation])
+                           (assoc :t t
+                                  :policy policy) ; re-apply policy to db-after
+                           (commit-data/update-novelty add remove)
+                           (commit-data/add-tt-id)
+                           (vocab/hydrate-schema add mods))]
       {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
 
 (defn validate-db-update
   [{:keys [db-after db-before mods context] :as staged-map}]
   (go-try
-    (<? (shacl/validate! db-before (root-db db-after) (vals mods) context))
+    (<? (shacl/validate! db-before (policy/root db-after) (vals mods) context))
     (let [allowed-db (<? (tx-policy/allowed? staged-map))]
-      (root-db allowed-db))))
+      allowed-db)))
 
 (defn stage
   [db fuel-tracker context identity annotation raw-txn parsed-txn]
   (go-try
-    (let [db*        (if identity
-                       (<? (policy/wrap-policy db identity))
-                       db)
-          tx-state   (->tx-state :db db*
+    (let [tx-state   (->tx-state :db db
                                  :context context
                                  :txn raw-txn
-                                 :author-did (:did identity)
+                                 :author-did identity
                                  :annotation annotation)
           [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
           updated-db (<? (final-db db** new-flakes tx-state))]
@@ -372,7 +367,7 @@
                                                    [ns ns-code])))
                                   new-namespaces)
         new-ns-codes        (map-invert new-ns-map)
-        max-namespace-code* (apply max (vals new-ns-map))]
+        max-namespace-code* (iri/get-max-namespace-code new-ns-codes)]
     (assoc db
            :namespaces new-ns-map
            :namespace-codes new-ns-codes
@@ -482,60 +477,75 @@
     :else
     true))
 
-(defn assert-value-map
-  [db sid pid t v-map]
+(defn value-map->flake
+  [assert? db sid pid t v-map]
   (let [ref-id (:id v-map)
         meta   (::meta v-map)]
     (if (and ref-id (node? v-map))
       (let [ref-sid (iri/encode-iri db ref-id)]
-        (flake/create sid pid ref-sid const/$xsd:anyURI t true meta))
+        (flake/create sid pid ref-sid const/$xsd:anyURI t assert? meta))
       (let [[value dt] (datatype/from-expanded v-map nil)]
-        (flake/create sid pid value dt t true meta)))))
+        (flake/create sid pid value dt t assert? meta)))))
 
-(defn assert-property
-  [db sid pid t value]
+
+(defn property->flake
+  [assert? db sid pid t value]
   (let [v-maps (util/sequential value)]
     (mapcat (fn [v-map]
               (if (list-value? v-map)
                 (let [list-vals (:list v-map)]
                   (into []
                         (comp (map add-list-meta)
-                              (map (partial assert-value-map db sid pid t)))
+                              (map (partial value-map->flake assert? db sid pid t)))
                         list-vals))
-                [(assert-value-map db sid pid t v-map)]))
+                [(value-map->flake assert? db sid pid t v-map)]))
             v-maps)))
 
-(defn- get-type-assertions
-  [db t sid type]
-  (if type
-    (loop [[type-item & r] type
-           acc []]
-      (if type-item
-        (let [type-id (iri/encode-iri db type-item)]
-          (recur r (conj acc (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t true nil))))
-        acc))
-    []))
+(defn- get-type-flakes
+  [assert? db t sid type]
+  (into []
+        (map (fn [type-item]
+               (let [type-sid (iri/encode-iri db type-item)]
+                 (flake/create sid const/$rdf:type type-sid
+                               const/$xsd:anyURI t assert? nil))))
+        type))
 
-(defn assert-node
-  [db t node]
-  (log/trace "assert-node:" node)
+(defn node->flakes
+  [assert? db t node]
+  (log/trace "node->flakes:" node "assert?" assert?)
   (let [{:keys [id type]} node
-        sid             (iri/encode-iri db id)
+        sid             (if assert?
+                          (iri/encode-iri db id)
+                          (or (iri/encode-iri db id)
+                              (throw
+                               (ex-info
+                                "Cannot retract subject IRI with unknown namespace."
+                                {:status 400
+                                 :error  :db/invalid-retraction
+                                 :iri    id}))))
         type-assertions (if (seq type)
-                          (get-type-assertions db t sid type)
+                          (get-type-flakes assert? db t sid type)
                           [])]
     (into type-assertions
-          (comp (filter (fn [node-entry]
-                          (not (-> node-entry key keyword?))))
-                (mapcat (fn [[prop value]]
-                          (let [pid (iri/encode-iri db prop)]
-                            (assert-property db sid pid t value)))))
+          (comp (remove #(-> % key keyword?))
+                (mapcat
+                 (fn [[prop value]]
+                   (let [pid (if assert?
+                               (iri/encode-iri db prop)
+                               (or (iri/encode-iri db prop)
+                                   (throw
+                                    (ex-info
+                                     "Cannot retract property IRI with unknown namespace."
+                                     {:status 400
+                                      :error  :db/invalid-retraction
+                                      :iri    prop}))))]
+                     (property->flake assert? db sid pid t value)))))
           node)))
 
-(defn assert-flakes
-  [db t assertions]
+(defn create-flakes
+  [assert? db t assertions]
   (into []
-        (mapcat (partial assert-node db t))
+        (mapcat (partial node->flakes assert? db t))
         assertions))
 
 (defn merge-flakes
@@ -545,62 +555,6 @@
       (assoc :t t)
       (commit-data/update-novelty flakes)
       (vocab/hydrate-schema flakes)))
-
-(defn retract-value-map
-  [db sid pid t v-map]
-  (let [ref-id (:id v-map)]
-    (if (and ref-id (node? v-map))
-      (let [ref-sid (iri/encode-iri db ref-id)]
-        (flake/create sid pid ref-sid const/$xsd:anyURI t false nil))
-      (let [[value dt] (datatype/from-expanded v-map nil)]
-        (flake/create sid pid value dt t false nil)))))
-
-(defn- get-type-retractions
-  [db t sid type]
-  (into []
-        (map (fn [type-item]
-               (let [type-sid (iri/encode-iri db type-item)]
-                 (flake/create sid const/$rdf:type type-sid
-                               const/$xsd:anyURI t false nil))))
-        type))
-
-(defn- retract-node*
-  [db t {:keys [sid type-retractions] :as _retract-state} node]
-  (loop [[[k v-maps] & r] node
-         acc type-retractions]
-    (if k
-      (if (keyword? k)
-        (recur r acc)
-        (let [pid  (or (iri/encode-iri db k)
-                       (throw (ex-info (str "Retraction on a property that does not exist: " k)
-                                       {:status 400
-                                        :error  :db/invalid-commit})))
-              acc* (into acc
-                         (map (partial retract-value-map db sid pid t))
-                         (util/sequential v-maps))]
-          (recur r acc*)))
-      acc)))
-
-(defn retract-node
-  [db t node]
-  (let [{:keys [id type]} node
-        sid              (or (iri/encode-iri db id)
-                             (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
-                                                  " at db t value: " t ".")
-                                             {:status 400 :error
-                                              :db/invalid-commit})))
-        retract-state    {:sid sid}
-        type-retractions (if (seq type)
-                           (get-type-retractions db t sid type)
-                           [])
-        retract-state*   (assoc retract-state :type-retractions type-retractions)]
-    (retract-node* db t retract-state* node)))
-
-(defn retract-flakes
-  [db t retractions]
-  (into []
-        (mapcat (partial retract-node db t))
-        retractions))
 
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
@@ -615,13 +569,13 @@
           assert             (db-assert db-data)
           nses               (map :value
                                   (get db-data const/iri-namespaces))
-          _                  (log/debug "merge-commit new namespaces:" nses)
-          _                  (log/debug "db max-namespace-code:"
+          _                  (log/trace "merge-commit new namespaces:" nses)
+          _                  (log/trace "db max-namespace-code:"
                                         (:max-namespace-code db))
           db*                (with-namespaces db nses)
-          asserted-flakes    (assert-flakes db* t-new assert)
+          asserted-flakes    (create-flakes true db* t-new assert)
           retract            (db-retract db-data)
-          retracted-flakes   (retract-flakes db* t-new retract)
+          retracted-flakes   (create-flakes false db* t-new retract)
 
           {:keys [previous issuer message data] :as commit-metadata}
           (commit-data/json-ld->map commit db*)
@@ -668,7 +622,7 @@
                      namespace-codes max-namespace-code reindex-min-bytes
                      reindex-max-bytes]
   dbproto/IFlureeDb
-  (-rootdb [this] (root-db this))
+  (-query [this query-map] (fql/query this query-map))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
   (-class-ids [this subject] (class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))
@@ -696,7 +650,7 @@
   (-aliases [_]
     [alias])
 
-  jld-transact/Transactable
+  transact/Transactable
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
     (stage db fuel-tracker context identity annotation raw-txn parsed-txn))
   (-merge-commit [db new-commit proof] (merge-commit conn db [new-commit proof]))
@@ -711,7 +665,7 @@
 
   (-iri-visible? [db iri]
     (let [sid (iri/encode-iri db iri)]
-      (validate/allow-iri? db sid)))
+      (qpolicy/allow-iri? db sid)))
 
   indexer/Indexable
   (index [db changes-ch]
@@ -729,7 +683,7 @@
                           [epoch-datetime current-time]
                           [current-time epoch-datetime])
             flakes         (-> db
-                               root-db
+                               policy/root
                                (query-range/index-range
                                 :post
                                 > [const/$_commit:time start]
@@ -757,10 +711,12 @@
     (history/query-commits db context from-t to-t error-ch))
 
   policy/Restrictable
-  (wrap-policy [db identity]
-    (db-policy/wrap-policy db identity))
+  (wrap-policy [db policy default-allow? values-map]
+    (policy-rules/wrap-policy db policy default-allow? values-map))
+  (wrap-identity-policy [db identity default-allow? values-map]
+    (policy-rules/wrap-identity-policy db identity default-allow? values-map))
   (root [db]
-    (db-policy/root db)))
+    (policy/root-db db)))
 
 (defn db?
   [x]
@@ -813,10 +769,6 @@
      :namespace-codes iri/default-namespace-codes
      :schema          (vocab/base-schema)}))
 
-(defn get-max-ns-code
-  [ns-codes]
-  (->> ns-codes keys (apply max)))
-
 (defn load-novelty
   [conn indexed-db index-t commit-jsonld]
   (go-try
@@ -838,8 +790,7 @@
      (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root conn address))
                          (genesis-root-map ledger-alias))
-           max-ns-code (max iri/last-default-code
-                            (-> root-map :namespace-codes get-max-ns-code))
+           max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
            indexed-db  (-> root-map
                            (assoc :conn conn
                                   :alias ledger-alias

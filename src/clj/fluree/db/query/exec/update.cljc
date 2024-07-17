@@ -45,10 +45,11 @@
 
 (defn ensure-namespace
   [db ns]
-  (let [nses (:namespaces db)]
+  (let [nses     (:namespaces db)
+        ns-codes (:namespace-codes db)]
     (if (contains? nses ns)
       db
-      (let [new-ns-code (iri/next-namespace-code nses)]
+      (let [new-ns-code (iri/next-namespace-code ns-codes)]
         (-> db
             (update :namespaces assoc ns new-ns-code)
             (update :namespace-codes assoc new-ns-code ns))))))
@@ -74,7 +75,7 @@
                        where/get-datatype-iri
                        (->> (generate-sid! db-vol)))
                (dbproto/-p-prop @db-vol :datatype p-iri)
-               (datatype/infer v))
+               (datatype/infer v (:lang m)))
         v* (datatype/coerce-value v dt)]
     (flake/create sid pid v* dt t true m)))
 

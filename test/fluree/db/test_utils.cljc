@@ -1,12 +1,11 @@
 (ns fluree.db.test-utils
   (:require [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]
             [fluree.db.did :as did]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.iri :as iri]
-            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]])
-            [clojure.string :as str]))
+            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]])))
 
 (def default-context
   {:id     "@id"
@@ -112,6 +111,34 @@
     :ex/favNums   [42, 11]
     :ex/friend    [:ex/brian :ex/alice :ex/cam]}])
 
+(def people-strings
+  [{"@id"           "ex:brian",
+    "type"         "ex:User",
+    "schema:name"  "Brian"
+    "schema:email" "brian@example.org"
+    "schema:age"   50
+    "ex:favNums"   7}
+   {"id"           "ex:alice",
+    "type"         "ex:User",
+    "schema:name"  "Alice"
+    "schema:email" "alice@example.org"
+    "schema:age"   50
+    "ex:favNums"   [42, 76, 9]}
+   {"id"           "ex:cam",
+    "type"         "ex:User",
+    "schema:name"  "Cam"
+    "schema:email" "cam@example.org"
+    "schema:age"   34
+    "ex:favNums"   [5, 10]
+    "ex:friend"    ["ex:brian" "ex:alice"]}
+   {"id"           "ex:liam"
+    "type"         "ex:User"
+    "schema:name"  "Liam"
+    "schema:email" "liam@example.org"
+    "schema:age"   13
+    "ex:favNums"   [42, 11]
+    "ex:friend"    ["ex:brian" "ex:alice" "ex:cam"]}])
+
 (defn create-conn
   ([]
    (create-conn {}))
@@ -146,13 +173,6 @@
                                                   :push? true})]
       #?(:clj @commit-p, :cljs (<p! commit-p))
       ledger)))
-
-(defn transact
-  ([ledger data]
-   (transact ledger data {}))
-  ([ledger data commit-opts]
-   (let [staged @(fluree/stage (fluree/db ledger) data)]
-     (fluree/commit! ledger staged commit-opts))))
 
 (defn retry-promise-wrapped
   "Retries a fn that when deref'd might return a Throwable. Intended for

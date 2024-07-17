@@ -6,7 +6,7 @@
             [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go >!] :as async]
                :cljs [cljs.core.async :refer [chan  >!] :refer-macros [go] :as async])
-            [fluree.db.permissions-validate :as perm-validate]
+            [fluree.db.json-ld.policy.query :as policy]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.iri :as iri]))
 
@@ -95,18 +95,28 @@
   [f]
   (= f ::unauthorized))
 
+(defn authorize-flake-exception
+  "Wraps upstream exception and logs out a warning message"
+  [e db flake]
+  (let [e* (ex-info (str "Policy exception authorizing Flake in "
+                         (:alias db) "?t=" (:t db)
+                         ". " (ex-message e))
+                    {:error  :db/policy-exception
+                     :status 400
+                     :flake  flake}
+                    e)]
+    (log/warn (ex-message e*))
+    e*))
+
 (defn authorize-flake
   [db error-ch flake]
   (go
     (try* (if (or (schema-util/is-schema-flake? db flake)
-                  (<? (perm-validate/allow-flake? db flake)))
+                  (<? (policy/allow-flake? db flake)))
             flake
             ::unauthorized)
           (catch* e
-                  (log/error e
-                             "Error authorizing flake in ledger"
-                             (select-keys db [:network :ledger-id :t]))
-                  (>! error-ch e)))))
+                  (>! error-ch (authorize-flake-exception e db flake))))))
 
 (defn authorize-flakes
   "Authorize each flake in the supplied `flakes` collection asynchronously,
@@ -121,14 +131,14 @@
 (defn filter-authorized
   "Returns a channel that will eventually return a stream of flake slices
   containing only the schema flakes and the flakes validated by
-  fluree.db.permissions-validate/allow-flake? function for the database `db`
+  allow-flake? function for the database `db`
   from the `flake-slices` channel"
   [db error-ch flake-slices]
   #?(:cljs
      flake-slices ; Note this bypasses all permissions in CLJS for now!
 
      :clj
-     (if (perm-validate/unrestricted-view? db)
+     (if (policy/unrestricted? db)
        flake-slices
        (let [auth-fn (fn [flakes ch]
                        (-> (authorize-flakes db error-ch flakes)
@@ -210,7 +220,7 @@
    (let [[start-test start-match end-test end-match]
          (expand-range-interval idx test match)]
      (time-range db idx start-test start-match end-test end-match opts)))
-  ([{:keys [t conn ] :as db} idx start-test start-match end-test end-match opts]
+  ([{:keys [t conn] :as db} idx start-test start-match end-test end-match opts]
    (let [{:keys [limit offset flake-limit from-t to-t]
           :or   {from-t t, to-t t}}
          opts

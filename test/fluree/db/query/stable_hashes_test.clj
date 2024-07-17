@@ -1,6 +1,6 @@
 (ns fluree.db.query.stable-hashes-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
 (deftest stable-hashes-test
@@ -28,10 +28,10 @@
                        :schema/age   30}]})
           db1    @(fluree/commit! ledger db0)]
       (testing "stable commit id"
-        (is (= "fluree:commit:sha256:bc4pgf733mfhelp4ueeciwbfftthr4juvh2btondbmzjbvf6zpf5"
+        (is (= "fluree:commit:sha256:bbmpvuetgbce2qs5q7dwlbjgj5zcxknvaun2gutewa5pgg5seks5e"
                (get-in db1 [:commit :id]))))
       (testing "stable commit address"
-        (is (= "fluree:memory://10e1db9dc617a4d4b01a3fbdea6eb97a52f4173a8b01c2cdbb66ec05f90a41c7"
+        (is (= "fluree:memory://e5417a11d9ead4187d63a3e29f14ff79069dd47bcb3f664771d25f1b518fa021"
                (get-in db1 [:commit :address]))))
       (testing "stable db id"
         (is (= "fluree:db:sha256:bbsfu5hq2mkalfpirabumzsohpwwz3legce6hie6tpb6nlqwvzigc"

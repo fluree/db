@@ -1,6 +1,6 @@
 (ns fluree.db.indexer.default-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [test-with-files.tools :refer [with-tmp-dir]]))
 

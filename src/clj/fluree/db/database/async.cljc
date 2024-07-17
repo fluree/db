@@ -6,7 +6,7 @@
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.json-ld.transact :as transact]
+            [fluree.db.transact :as transact]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :as history]
             [fluree.db.query.json-ld.response :as jld-response]
@@ -160,10 +160,14 @@
       commit-ch))
 
   policy/Restrictable
-  (wrap-policy [_ identity]
+  (wrap-policy [_ policy default-allow? values-map]
+    (go-try
+     (let [db (<? db-chan)]
+       (<? (policy/wrap-policy db policy default-allow? values-map)))))
+  (wrap-identity-policy [_ identity default-allow? values-map]
     (go-try
       (let [db (<? db-chan)]
-        (<? (policy/wrap-policy db identity)))))
+        (<? (policy/wrap-identity-policy db identity default-allow? values-map)))))
   (root [_]
     (let [root-ch (async/promise-chan)
           root-db (->AsyncDB alias branch commit t root-ch)]

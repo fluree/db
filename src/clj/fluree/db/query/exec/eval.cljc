@@ -285,9 +285,13 @@
   [x]
   (str x))
 
+(defn in
+  [term expressions]
+  (contains? (set expressions) term))
+
 (def allowed-scalar-fns
   '#{&& || ! > < >= <= = + - * / quot and bound coalesce if lang nil? as
-     not not= or re-find re-pattern
+     not not= or re-find re-pattern in
      ;; string fns
      strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter concat regex replace
      ;; numeric fns
@@ -320,6 +324,7 @@
     count          clojure.core/count
     floor          fluree.db.query.exec.eval/floor
     groupconcat    fluree.db.query.exec.eval/groupconcat
+    in             fluree.db.query.exec.eval/in
     lang           fluree.db.query.exec.eval/lang
     lcase          fluree.db.query.exec.eval/lcase
     median         fluree.db.query.exec.eval/median
@@ -398,7 +403,7 @@
                       allowed-scalar-fns)]
     (if (contains? allowed-fns sym)
       (let [qsym (get qualified-symbols sym sym)]
-        (log/debug "qualified symbol" sym "as" qsym)
+        (log/trace "qualified symbol" sym "as" qsym)
         qsym)
       (let [err-msg (if (and (not allow-aggregates?)
                              (contains? allowed-aggregate-fns sym))
@@ -442,7 +447,7 @@
                            (log/trace "fn bindings:" (quote ~bdg))
                            (let ~bdg
                              ~qualified-code))]
-     (log/debug "compiled fn:" fn-code)
+     (log/trace "compiled fn:" fn-code)
      (eval fn-code))))
 
 (defn compile-filter

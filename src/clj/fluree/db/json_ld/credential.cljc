@@ -4,7 +4,7 @@
             #?(:cljs [cljs.core.async.interop :refer-macros [<p!]])
             [fluree.crypto :as crypto]
             [fluree.db.did :as did]
-            [fluree.db.util.async :refer [go-try]]
+            [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
@@ -98,25 +98,47 @@
            auth-did      (did/auth-id->did id)]
        (when (not= jws-header-json header)
          (throw (ex-info "Unsupported jws header in credential."
-                         {:error :credential/unknown-signing-algorithm
+                         {:status 400
+                          :error :credential/unknown-signing-algorithm
                           :supported-header jws-header-json
                           :header header
                           :credential credential})))
 
        (when (not (crypto/verify-signature pubkey signing-input signature))
-         (throw (ex-info "Verification failed." {:error :credential/invalid-signature :credential credential})))
+         (throw (ex-info "Verification failed, invalid credential."
+                         {:status 400
+                          :error :credential/invalid-signature
+                          :credential credential})))
         ;; everything is good
        {:subject subject :did auth-did}))))
 
 (defn verify-jws
   [jws]
-  (let [{:keys [payload pubkey]} (crypto/verify-jws jws)
+  (let [{:keys [payload pubkey]} (or (crypto/verify-jws jws)
+                                     (throw (ex-info (str "Invalid JWS: " jws)
+                                                     {:status 400
+                                                      :error  :db/invalid-credential})))
         id                       (crypto/account-id-from-public pubkey)
         auth-did                 (did/auth-id->did id)]
     {:subject (json/parse payload false) :did auth-did}))
 
+(defn jws?
+  [x]
+  (and (string? x)
+       (re-matches #"(^[A-Za-z0-9-_]*\.[A-Za-z0-9-_]*\.[A-Za-z0-9-_]*$)" x)))
+
 (defn verify
-  [auth-claim]
-  (if (string? auth-claim)
-    (go-try (verify-jws auth-claim))
-    (verify-credential auth-claim)))
+  "Verifies a signed query/transaction. Returns keys:
+  {:subject <original tx/cmd> :did <did>}
+
+  Will throw if no :did is detected."
+  [signed-command]
+  (go-try
+   (let [result (if (jws? signed-command)
+                  (verify-jws signed-command)
+                  (<? (verify-credential signed-command)))]
+     (if (:did result)
+       result
+       (throw (ex-info "Signed message could not be verified to an identity"
+                       {:status 401
+                        :error  :db/invalid-credential}))))))
