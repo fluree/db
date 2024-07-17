@@ -142,8 +142,6 @@
      (let [result (if (jws? signed-command)
                     (verify-jws signed-command format)
                     (<? (verify-credential signed-command)))]
-       (println signed-command)
-       (println result)
        (if (:did result)
          result
          (throw (ex-info "Signed message could not be verified to an identity"

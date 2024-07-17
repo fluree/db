@@ -317,8 +317,8 @@
   ([conn cred-query opts]
    (promise-wrap
     (go-try
-     (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
-       (<? (query-connection conn query (assoc opts :did identity))))))))
+      (let [{query :subject, identity :did} (<? (cred/verify cred-query opts))]
+        @(query-connection conn query (assoc opts :did identity)))))))
 
 (defn history
   "Return the change history over a specified time range. Optionally include the commit
