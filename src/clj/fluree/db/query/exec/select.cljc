@@ -123,14 +123,7 @@
     (go (try* (agg-fn solution)
               (catch* e
                       (log/error e "Error applying aggregate selector")
-                      (>! error-ch e)))))
-  (solution-value
-    [_ error-ch _]
-    (async/put!
-     error-ch
-     (ex-info "Aggregate selectors cannot be used in subqueries without 'as' syntax."
-              {:status 400
-               :error  :db/invalid-query}))))
+                      (>! error-ch e))))))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
