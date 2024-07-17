@@ -301,6 +301,7 @@
                                     [:op ::where-op]
                                     [:bindings ::bind]]]
                             [:graph [:tuple ::where-op ::graph [:ref ::where]]]
+                            ;; TODO - because ::subquery is a separate registry it cannot be called here, validated in f.d.q.fql.syntax/coerce-subquery until resolved
                             [:query [:catn
                                      [:op ::where-op]
                                      [:query [:map]]]]]

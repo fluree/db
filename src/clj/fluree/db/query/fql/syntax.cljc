@@ -214,6 +214,9 @@
 (def coerce-subquery*
   (m/coercer ::subquery fql-transformer {:registry registry}))
 
+;; TODO - because ::subquery not defined in the f.d.validation registrity it cannot be called from
+;; there and parsed as part of the parent query. For now we have a separate coerce-subquery
+;; function - once malli is refactored to be part of the same registry this coudl be avoided
 (defn coerce-subquery
   [qry]
   (try*
