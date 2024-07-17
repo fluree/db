@@ -515,7 +515,12 @@
 (defmethod parse-term :GraphPatternNotTriples
   ;; GraphPatternNotTriples ::= GroupOrUnionGraphPattern | OptionalGraphPattern | MinusGraphPattern | GraphGraphPattern | ServiceGraphPattern | Filter | Bind | InlineData
   [[_ & non-triples]]
-  (mapv parse-term non-triples))
+  (reduce (fn [results non-triple]
+            (if (= :GroupOrUnionGraphPattern (first non-triple))
+              (into results (parse-term non-triple))
+              (conj results (parse-term non-triple))))
+          []
+          non-triples))
 
 (defmethod parse-term :PrefixedName
   [[_ & name]]
@@ -616,8 +621,15 @@
 
 (defmethod parse-term :GroupOrUnionGraphPattern
   ;; GroupOrUnionGraphPattern ::= GroupGraphPattern ( <'UNION'> GroupGraphPattern )*
-  [[_ & union-patterns]]
-  (into [:union] (mapcat parse-term union-patterns)))
+  [[_ group-pattern & union-patterns]]
+  (if union-patterns
+    (->> (mapv parse-term union-patterns)
+         (reduce (fn [result patterns]
+                   (let [lhs (last result)
+                         rhs (first patterns)]
+                     (conj (vec (butlast result)) [:union lhs rhs])))
+                 (parse-term group-pattern)))
+    (parse-term group-pattern)))
 
 (defmethod parse-term :GroupGraphPatternSub
   ;; GroupGraphPatternSub ::= WS TriplesBlock? ( GraphPatternNotTriples WS <'.'?> TriplesBlock? WS )* WS
@@ -626,8 +638,11 @@
 
 (declare translate)
 (defmethod parse-term :SubSelect
+  ;; SubSelect ::= SelectClause WS WhereClause WS SolutionModifier WS ValuesClause
   [[_ & subquery-clauses]]
-  [:query (translate subquery-clauses)])
+  ;; SubSelect is always nested under GroupOrUnionGraphPattern, which returns a sequence of results
+  ;; so we need to wrap it in an extra vector
+  [[:query (translate subquery-clauses)]])
 
 (defmethod parse-rule :WhereClause
   ;; WhereClause ::= <'WHERE'?> WS GroupGraphPattern WS
