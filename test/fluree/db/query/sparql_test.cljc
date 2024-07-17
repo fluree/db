@@ -163,9 +163,10 @@
              where))))
   (testing "UNION"
     (let [query "SELECT ?person ?age
-                 WHERE {{?person person:age 70.
-                         ?person person:handle \"dsanchez\".}
-                        UNION {?person person:handle \"anguyen\".}
+                 WHERE {?person person:age 70 .
+                        { ?person person:handle \"dsanchez\".}
+                        UNION
+                        { ?person person:handle \"anguyen\".}
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?person", "person:age" 70}
@@ -173,6 +174,18 @@
                {"@id" "?person", "person:handle" "dsanchez"}
                {"@id" "?person", "person:handle" "anguyen"}]
               {"@id" "?person", "person:age" "?age"}]
+             where)))
+    (let [query "SELECT ?title ?author
+                 WHERE  { { ?book dc10:title ?title .  ?book dc10:creator ?author }
+                          UNION
+                          { ?book dc11:title ?title .  ?book dc11:creator ?author } }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [[:union
+               {"@id" "?book" "dc10:title" "?title"}
+               {"@id" "?book" "dc11:title" "?title"}]
+              [:union
+               {"@id" "?book" "dc10:creator" "?author"}
+               {"@id" "?book" "dc11:creator" "?author"}]]
              where))))
   (testing "FILTER"
     (let [query "SELECT ?handle ?num

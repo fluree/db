@@ -621,14 +621,11 @@
 
 (defmethod parse-term :GroupOrUnionGraphPattern
   ;; GroupOrUnionGraphPattern ::= GroupGraphPattern ( <'UNION'> GroupGraphPattern )*
-  [[_ group-pattern & union-patterns]]
+  [[_ group-pattern & union-patterns :as term]]
   (if union-patterns
-    (->> (mapv parse-term union-patterns)
-         (reduce (fn [result patterns]
-                   (let [lhs (last result)
-                         rhs (first patterns)]
-                     (conj (vec (butlast result)) [:union lhs rhs])))
-                 (parse-term group-pattern)))
+    (->> (mapv parse-term (rest term))
+         ;; this presumes that each GroupGraphPattern has the same number of patterns per group
+         (apply map (fn [& patterns] (into [:union] patterns))))
     (parse-term group-pattern)))
 
 (defmethod parse-term :GroupGraphPatternSub
