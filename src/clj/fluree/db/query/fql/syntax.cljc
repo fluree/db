@@ -124,6 +124,7 @@
                           [:role {:optional true} ::role]
                           [:did {:optional true} ::did]]]
     ::function          ::v/function
+    ::as-function       ::v/as-function
     ::wildcard          [:fn wildcard?]
     ::var               ::v/var
     ::iri               ::v/iri
@@ -152,7 +153,7 @@
     ::subquery-selector [:orn {:error/message "selector must be either a variable, wildcard symbol (`*`), iri, function application, or select map"}
                          [:wildcard ::wildcard]
                          [:var ::var]
-                         [:aggregate ::function]]
+                         [:aggregate ::as-function]]
     ::subquery-select   [:orn {:error/message "Select must be a valid selector or vector of selectors. Subqueries do not allow graph crawl syntax (e.g. {?x [*]})."}
                          [:selector ::subquery-selector]
                          [:collection [:sequential ::subquery-selector]]]

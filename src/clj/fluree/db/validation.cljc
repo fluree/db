@@ -252,6 +252,9 @@
     ::function             [:orn
                             [:string-fn [:and :string [:re #"^\(.+\)$"]]]
                             [:list-fn [:and list? [:cat :symbol [:* any?]]]]]
+    ::as-function          [:orn {:error/message "subquery aggregates must be bound to a variable with 'as' e.g. '(as (sum ?x) ?x-sum)"}
+                            [:string-fn [:and :string [:re #"^\(as .+\)$"]]]
+                            [:list-fn [:and list? [:cat :symbol [:* any?]]]]]
     ::optional             [:+ {:error/message "optional pattern must be a sequence of valid where clauses."}
                             [:schema [:ref ::where]]]
     ::union                [:+ {:error/message "union pattern must be a sequence of valid where clauses."}
