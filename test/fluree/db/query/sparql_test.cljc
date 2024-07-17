@@ -163,16 +163,29 @@
              where))))
   (testing "UNION"
     (let [query "SELECT ?person ?age
-                 WHERE {{?person person:age 70.
-                         ?person person:handle \"dsanchez\".}
-                        UNION {?person person:handle \"anguyen\".}
+                 WHERE {?person person:age 70 .
+                        { ?person person:handle \"dsanchez\".}
+                        UNION
+                        { ?person person:handle \"anguyen\".}
                         ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [[:union
-               {"@id" "?person", "person:age" 70}
+      (is (= [{"@id" "?person", "person:age" 70}
+              [:union
                {"@id" "?person", "person:handle" "dsanchez"}
                {"@id" "?person", "person:handle" "anguyen"}]
               {"@id" "?person", "person:age" "?age"}]
+             where)))
+    (let [query "SELECT ?title ?author
+                 WHERE  { { ?book dc10:title ?title .  ?book dc10:creator ?author }
+                          UNION
+                          { ?book dc11:title ?title .  ?book dc11:creator ?author } }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [[:union
+               {"@id" "?book" "dc10:title" "?title"}
+               {"@id" "?book" "dc11:title" "?title"}]
+              [:union
+               {"@id" "?book" "dc10:creator" "?author"}
+               {"@id" "?book" "dc11:creator" "?author"}]]
              where))))
   (testing "FILTER"
     (let [query "SELECT ?handle ?num
@@ -472,7 +485,28 @@
         (is (= [{"@id" "?x", ":p" "?n"}
                 [:minus [{"@id" "?x", ":q" "?m"}
                          [:filter ["(= ?n ?m)"]]]]]
-               where))))))
+               where)))))
+  (testing "subquery"
+      (let [query "PREFIX : <http://people.example/>
+                 SELECT ?y ?minName
+                 WHERE {
+                  :alice :knows ?y .
+                  {
+                    SELECT ?y (MIN(?name) AS ?minName)
+                    WHERE {
+                      ?y :name ?name .
+                    } GROUP BY ?y
+                  }
+                }"]
+        (is (= {:context {"" "http://people.example/"},
+                :select ["?y" "?minName"],
+                :where
+                [{"@id" ":alice", ":knows" "?y"}
+                 [:query
+                  {:select ["?y" "(as (min ?name) ?minName)"],
+                   :where [{"@id" "?y", ":name" "?name"}],
+                   :groupBy ["?y"]}]]}
+               (sparql/->fql query))))))
 
 (deftest parse-prefixes
   (testing "PREFIX"
