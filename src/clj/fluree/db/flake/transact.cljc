@@ -13,6 +13,8 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.vocab :as vocab]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; TODO - can use transient! below
 (defn stage-update-novelty
   "If a db is staged more than once, any retractions in a previous stage will

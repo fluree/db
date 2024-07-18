@@ -9,6 +9,8 @@
             [fluree.db.fuel :as fuel]
             [fluree.db.util.json :as json]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn cache-sid->iri
   [db cache compact-fn sid]
   (let [cache-key [(:alias db) sid]]

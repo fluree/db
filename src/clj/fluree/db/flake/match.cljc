@@ -9,6 +9,8 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn class-ids
   "Returns list of class-ids for given subject-id"
   [db subject-id]
