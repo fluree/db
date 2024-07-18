@@ -1,11 +1,11 @@
 (ns fluree.db.ledger.json-ld
   (:require [clojure.core.async :as async :refer [<!]]
             [fluree.db.ledger :as ledger]
-            [fluree.db.db.json-ld :as jld-db]
-            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.transact :as transact]
             [fluree.db.did :as did]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.context :as context]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.branch :as branch]
@@ -178,7 +178,7 @@
           (->> opts normalize-opts (enrich-commit-opts ledger))
 
           {:keys [dbid db-jsonld staged-txns]}
-          (jld-db/db->jsonld staged-db opts*)
+          (flake-db/db->jsonld staged-db opts*)
 
           ;; TODO - we do not support multiple "transactions" in a single commit (although other code assumes we do which needs cleaning)
           [[txn-id author annotation] :as txns]

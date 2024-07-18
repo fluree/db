@@ -1,8 +1,8 @@
-(ns fluree.db.database.async
+(ns fluree.db.async-db
   (:refer-clojure :exclude [load])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [<! >! go]]
-            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
@@ -220,6 +220,6 @@
         t          (-> commit-map :data :t)
         async-db   (->AsyncDB ledger-alias branch commit-map t (async/promise-chan))]
     (go
-      (let [db (<! (jld-db/load conn ledger-alias branch [commit-jsonld commit-map]))]
+      (let [db (<! (flake-db/load conn ledger-alias branch [commit-jsonld commit-map]))]
         (deliver! async-db db)))
     async-db))

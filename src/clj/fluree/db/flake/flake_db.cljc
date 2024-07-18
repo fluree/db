@@ -1,23 +1,28 @@
-(ns fluree.db.db.json-ld
+(ns fluree.db.flake.flake-db
   (:refer-clojure :exclude [load vswap!])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [go]]
             [clojure.set :refer [map-invert]]
             [fluree.db.connection :as connection]
-            [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
-            [fluree.db.db.json-ld.format :as jld-format]
-            [fluree.db.db.json-ld.history :as history]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.time-travel :refer [TimeTravel]]
+            [fluree.db.query.history :refer [AuditLog]]
+            [fluree.db.flake.history :as history]
+            [fluree.db.flake.format :as jld-format]
+            [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
+            [fluree.db.util.core :as util :refer [get-first get-first-value
+                                                  get-first-id vswap!]]
             [fluree.db.index :as index]
             [fluree.db.indexer :as indexer]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.query.fql :as fql]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
             [fluree.db.json-ld.policy.rules :as policy-rules]
@@ -27,18 +32,10 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.policy.modify :as tx-policy]
             [fluree.db.query.exec.update :as update]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.query.history :refer [AuditLog]]
             [fluree.db.query.json-ld.response :as jld-response]
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serde-json]
-            [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util
-             #?@(:clj  [:refer [get-first get-first-value get-first-id vswap!
-                                try* catch*]]
-                 :cljs [:refer [get-first get-first-value get-first-id vswap!]
-                        :refer-macros [try* catch*]])]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
@@ -617,10 +614,9 @@
 
 ;; ================ end Jsonld record support fns ============================
 
-(defrecord JsonLdDb [conn alias branch commit t tt-id stats spot post opst tspo
-                     schema comparators staged novelty policy namespaces
-                     namespace-codes max-namespace-code reindex-min-bytes
-                     reindex-max-bytes]
+(defrecord FlakeDB [conn alias branch commit t tt-id stats spot post opst tspo
+                    schema comparators staged novelty policy namespaces namespace-codes
+                    max-namespace-code reindex-min-bytes reindex-max-bytes]
   dbproto/IFlureeDb
   (-query [this query-map] (fql/query this query-map))
   (-p-prop [_ meta-key property] (p-prop schema meta-key property))
@@ -720,28 +716,28 @@
 
 (defn db?
   [x]
-  (instance? JsonLdDb x))
+  (instance? FlakeDB x))
 
-(def ^String label "#fluree/JsonLdDb ")
+(def ^String label "#fluree/FlakeDB ")
 
 (defn display
   [db]
   (select-keys db [:alias :branch :t :stats :policy]))
 
 #?(:cljs
-   (extend-type JsonLdDb
+   (extend-type FlakeDB
      IPrintWithWriter
      (-pr-writer [db w _opts]
        (-write w label)
        (-write w (-> db display pr)))))
 
 #?(:clj
-   (defmethod print-method JsonLdDb [^JsonLdDb db, ^Writer w]
+   (defmethod print-method FlakeDB [^FlakeDB db, ^Writer w]
      (.write w label)
      (binding [*out* w]
        (-> db display pr))))
 
-(defmethod pprint/simple-dispatch JsonLdDb
+(defmethod pprint/simple-dispatch FlakeDB
   [db]
   (print label)
   (-> db display pprint))
@@ -803,7 +799,7 @@
                                   :max-namespace-code max-ns-code
                                   :reindex-min-bytes reindex-min-bytes
                                   :reindex-max-bytes reindex-max-bytes)
-                           map->JsonLdDb
+                           map->FlakeDB
                            policy/root)
            indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
                          (<? (vocab/load-schema indexed-db (:preds root-map)))
@@ -942,7 +938,7 @@
 
 (defn db->jsonld
   "Creates the JSON-LD map containing a new ledger update"
-  [{:keys [t commit stats staged max-namespace-code] :as db}
+  [{:keys [t commit stats staged] :as db}
    {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
   (let [prev-dbid   (commit-data/data-id commit)
 
