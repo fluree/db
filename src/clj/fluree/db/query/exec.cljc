@@ -7,7 +7,7 @@
             [fluree.db.query.exec.order :as order]
             [fluree.db.query.exec.having :as having]
             [fluree.db.util.core :as util]
-            [fluree.db.query.json-ld.response :as response]
+            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -15,7 +15,7 @@
 (defn queryable?
   [x]
   (and (where/matcher? x)
-       (response/node-formatter? x)))
+       (subject/subject-formatter? x)))
 
 (defn drop-offset
   "Returns a channel containing the stream of solutions from `solution-ch` after

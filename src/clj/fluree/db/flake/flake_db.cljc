@@ -32,7 +32,7 @@
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.transact :as transact]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.query.json-ld.response :as jld-response]
+            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serde-json]
             [fluree.db.util.async :refer [<? go-try]]
@@ -405,7 +405,7 @@
   (-merge-commit [db new-commit proof] (merge-commit conn db [new-commit proof]))
   (-merge-commit [db new-commit] (merge-commit conn db [new-commit]))
 
-  jld-response/NodeFormatter
+  subject/SubjectFormatter
   (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
     (jld-format/forward-properties db iri spec context compact-fn cache fuel-tracker error-ch))
 

@@ -1,5 +1,5 @@
 (ns fluree.db.flake.format
-  (:require [fluree.db.query.json-ld.response :as jld-response]
+  (:require [fluree.db.query.exec.select.subject :as subject]
             [clojure.core.async :as async :refer [go]]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
@@ -52,7 +52,7 @@
 (defn format-reference
   [db spec sid]
   (let [iri (iri/decode-sid db sid)]
-    (jld-response/encode-reference iri spec)))
+    (subject/encode-reference iri spec)))
 
 (defn format-object
   [db spec f]
@@ -152,10 +152,10 @@
                               (format-subject-xf db cache context compact-fn select-spec)
                               s-flakes)
           subject-ch    (if reverse
-                          (let [reverse-ch (jld-response/format-reverse-properties db s-iri reverse compact-fn cache fuel-tracker error-ch)]
+                          (let [reverse-ch (subject/format-reverse-properties db s-iri reverse compact-fn cache fuel-tracker error-ch)]
                             (async/reduce conj subject-attrs reverse-ch))
                           (go subject-attrs))]
       (->> subject-ch
-           (jld-response/resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-           (jld-response/append-id db s-iri select-spec compact-fn error-ch)))
+           (subject/resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
+           (subject/append-id db s-iri select-spec compact-fn error-ch)))
     (go)))

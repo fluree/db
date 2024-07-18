@@ -9,7 +9,7 @@
             [fluree.db.transact :as transact]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :as history]
-            [fluree.db.query.json-ld.response :as jld-response]
+            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :refer [try* catch*]]
@@ -66,14 +66,14 @@
   (-aliases [_]
     [alias])
 
-  jld-response/NodeFormatter
+  subject/SubjectFormatter
   (-forward-properties [_ iri select-spec context compact-fn cache fuel-tracker error-ch]
     (let [prop-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (jld-response/-forward-properties iri select-spec context compact-fn cache fuel-tracker error-ch)
+                (subject/-forward-properties iri select-spec context compact-fn cache fuel-tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
             (log/error e "Error loading database")
@@ -86,7 +86,7 @@
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (jld-response/-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
+                (subject/-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
             (log/error e "Error loading database")
@@ -96,7 +96,7 @@
   (-iri-visible? [_ iri]
     (go-try
       (let [db (<? db-chan)]
-        (<? (jld-response/-iri-visible? db iri)))))
+        (<? (subject/-iri-visible? db iri)))))
 
   transact/Transactable
   (-stage-txn [_ fuel-tracker context identity annotation raw-txn parsed-txn]

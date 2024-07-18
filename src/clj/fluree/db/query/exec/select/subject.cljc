@@ -1,4 +1,4 @@
-(ns fluree.db.query.json-ld.response
+(ns fluree.db.query.exec.select.subject
   (:require [fluree.db.util.async :refer [<?]]
             [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -7,16 +7,16 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defprotocol NodeFormatter
+(defprotocol SubjectFormatter
   (-forward-properties [db iri select-spec context compact-fn cache fuel-tracker error-ch])
   (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch])
   (-iri-visible? [db iri]))
 
-(defn node-formatter?
+(defn subject-formatter?
   [x]
-  (satisfies? NodeFormatter x))
+  (satisfies? SubjectFormatter x))
 
-(declare format-node)
+(declare format-subject)
 
 (defn append-id
   ([ds iri compact-fn error-ch]
@@ -60,13 +60,13 @@
     (cond
       ;; have a specified sub-selection (graph crawl)
       subselect
-      (format-node ds o-iri context compact-fn subselect cache (inc current-depth)
-                   fuel-tracker error-ch)
+      (format-subject ds o-iri context compact-fn subselect cache (inc current-depth)
+                      fuel-tracker error-ch)
 
       ;; requested graph crawl depth has not yet been reached
       (< current-depth max-depth)
-      (format-node ds o-iri context compact-fn select-spec cache (inc current-depth)
-                   fuel-tracker error-ch)
+      (format-subject ds o-iri context compact-fn select-spec cache (inc current-depth)
+                      fuel-tracker error-ch)
 
       :else
       (append-id ds o-iri compact-fn error-ch))))
@@ -114,9 +114,9 @@
 
     (async/reduce conj {} out-ch)))
 
-(defn format-node
+(defn format-subject
   ([ds iri context compact-fn select-spec cache fuel-tracker error-ch]
-   (format-node ds iri context compact-fn select-spec cache 0 fuel-tracker error-ch))
+   (format-subject ds iri context compact-fn select-spec cache 0 fuel-tracker error-ch))
   ([ds iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
    (let [forward-ch (-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
          subject-ch (if reverse
