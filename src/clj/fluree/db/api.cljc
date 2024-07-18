@@ -295,8 +295,9 @@
   ([ds cred-query {:keys [default-allow? values-map format] :as opts}]
    (promise-wrap
     (go-try
-     (let [json? (not= :sparql format)
-           {query :subject, identity :did} (<? (cred/verify cred-query json?))]
+     (let [{query :subject, identity :did} (if (= :sparql format)
+                                             (cred/verify-jws cred-query)
+                                             (<? (cred/verify cred-query)))]
        (log/debug "Credential query with identity: " identity " and query: " query)
        (let [policy-db (<? (policy/wrap-identity-policy ds
                                                         identity
@@ -318,8 +319,9 @@
   ([conn cred-query {:keys [format] :as opts}]
    (promise-wrap
     (go-try
-     (let [json? (not= :sparql format)
-           {query :subject, identity :did} (<? (cred/verify cred-query json?))]
+     (let [{query :subject, identity :did} (if (= :sparql format)
+                                             (cred/verify-jws cred-query)
+                                             (<? (cred/verify cred-query)))]
        (log/debug "Credential query connection with identity: " identity " and query: " query)
        (<? (query-api/query-connection conn query (assoc opts :did identity))))))))
 
