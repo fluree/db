@@ -113,18 +113,15 @@
        {:subject subject :did auth-did}))))
 
 (defn verify-jws
-  ([jws] (verify-jws jws true))
-  ([jws json?]
-   (let [{:keys [payload pubkey]} (or (crypto/verify-jws jws)
-                                      (throw (ex-info (str "Invalid JWS: " jws)
-                                                      {:status 400
-                                                       :error  :db/invalid-credential})))
-         id       (crypto/account-id-from-public pubkey)
-         auth-did (did/auth-id->did id)]
-     {:subject (if json?
-                 (json/parse payload false)
-                 payload)
-      :did     auth-did})))
+  [jws]
+  (let [{:keys [payload pubkey]} (or (crypto/verify-jws jws)
+                                     (throw (ex-info (str "Invalid JWS: " jws)
+                                                     {:status 400
+                                                      :error  :db/invalid-credential})))
+        id       (crypto/account-id-from-public pubkey)
+        auth-did (did/auth-id->did id)]
+    {:subject payload
+     :did     auth-did}))
 
 (defn jws?
   [x]
