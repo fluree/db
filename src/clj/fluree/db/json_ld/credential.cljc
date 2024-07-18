@@ -113,14 +113,18 @@
        {:subject subject :did auth-did}))))
 
 (defn verify-jws
-  [jws]
-  (let [{:keys [payload pubkey]} (or (crypto/verify-jws jws)
-                                     (throw (ex-info (str "Invalid JWS: " jws)
-                                                     {:status 400
-                                                      :error  :db/invalid-credential})))
-        id                       (crypto/account-id-from-public pubkey)
-        auth-did                 (did/auth-id->did id)]
-    {:subject (json/parse payload false) :did auth-did}))
+  ([jws] (verify-jws jws true))
+  ([jws json?]
+   (let [{:keys [payload pubkey]} (or (crypto/verify-jws jws)
+                                      (throw (ex-info (str "Invalid JWS: " jws)
+                                                      {:status 400
+                                                       :error  :db/invalid-credential})))
+         id       (crypto/account-id-from-public pubkey)
+         auth-did (did/auth-id->did id)]
+     {:subject (if json?
+                 (json/parse payload false)
+                 payload)
+      :did     auth-did})))
 
 (defn jws?
   [x]
@@ -132,13 +136,14 @@
   {:subject <original tx/cmd> :did <did>}
 
   Will throw if no :did is detected."
-  [signed-command]
-  (go-try
-   (let [result (if (jws? signed-command)
-                  (verify-jws signed-command)
-                  (<? (verify-credential signed-command)))]
-     (if (:did result)
-       result
-       (throw (ex-info "Signed message could not be verified to an identity"
-                       {:status 401
-                        :error  :db/invalid-credential}))))))
+  ([signed-command] (verify signed-command true))
+  ([signed-command json?]
+   (go-try
+    (let [result (if (jws? signed-command)
+                   (verify-jws signed-command json?) ;; JWS can be SPARQL
+                   (<? (verify-credential signed-command)))] ;; VC is always JSON
+      (if (:did result)
+        result
+        (throw (ex-info "Signed message could not be verified to an identity"
+                        {:status 401
+                         :error  :db/invalid-credential})))))))

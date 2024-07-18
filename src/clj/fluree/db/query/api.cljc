@@ -34,15 +34,19 @@
     did (assoc :did did :issuer did)))
 
 (defn restrict-db
-  [db t context opts]
+  [db t context {:keys [did default-allow?] :as opts}]
   (go-try
-    (let [db*  (if-let [did (:did opts)]
-                 (<? (perm/wrap-identity-policy db did true nil))
-                 db)
-          db** (-> (if t
-                     (<? (time-travel/as-of db* t))
-                     db*))]
-      (assoc-in db** [:policy :cache] (atom {})))))
+   (let [db*  (if did
+                (<? (perm/wrap-identity-policy db
+                                               did
+                                               (or (true? default-allow?)
+                                                   false)
+                                               nil))
+                db)
+         db** (-> (if t
+                    (<? (time-travel/as-of db* t))
+                    db*))]
+     (assoc-in db** [:policy :cache] (atom {})))))
 
 (defn track-query
   [ds max-fuel query]
@@ -234,6 +238,7 @@
   [conn query did]
   (go-try
    (let [fql (sparql/->fql query)]
+     (log/debug "query-connection SPARQL fql: " fql "did:" did)
      (<? (query-connection-fql conn fql did)))))
 
 (defn query-connection
