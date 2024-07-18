@@ -16,13 +16,13 @@
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice.core :as nameservice]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn history
-  "Return a summary of the changes over time, optionally with the full commit details included."
+  "Return a summary of the changes over time, optionally with the full commit
+  details included."
   [db query]
   (go-try
     (let [context (ctx-util/extract query)]
@@ -34,7 +34,7 @@
     did (assoc :did did :issuer did)))
 
 (defn restrict-db
-  [db t context opts]
+  [db t opts]
   (go-try
     (let [db*  (if-let [did (:did opts)]
                  (<? (perm/wrap-identity-policy db did true nil))
@@ -71,14 +71,11 @@
     ;; TODO - verify if both 'did' and 'issuer' opts are still needed upstream
     (let [{:keys [t opts] :as query*} (update query :opts sanitize-query-options (or did issuer))
 
-          ;; TODO: extracting query context here for policy only to do it later
-          ;; while parsing the query. We need to consolidate both policy and
-          ;; query parsing while cleaning up the query api call stack.
-          q-ctx    (ctx-util/extract query*)
-          ;; TODO - remove restrict-db from here, restriction should happen upstream if needed
+          ;; TODO - remove restrict-db from here, restriction should happen
+          ;;      - upstream if needed
           ds*      (if (dataset? ds)
                      ds
-                     (<? (restrict-db ds t q-ctx opts)))
+                     (<? (restrict-db ds t opts)))
           query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
           max-fuel (:max-fuel opts)]
       (if (::util/track-fuel? opts)
@@ -150,7 +147,7 @@
       [alias nil])))
 
 (defn load-alias
-  [conn alias t context opts]
+  [conn alias t opts]
   (go-try
     (try*
       (let [[alias explicit-t] (extract-query-string-t alias)
@@ -158,14 +155,14 @@
             ledger  (<? (jld-ledger/load conn address))
             db      (ledger/-db ledger)
             t*      (or explicit-t t)]
-        (<? (restrict-db db t* context opts)))
+        (<? (restrict-db db t* opts)))
       (catch* e
               (throw (contextualize-ledger-400-error
                        (str "Error loading ledger " alias ": ")
                        e))))))
 
 (defn load-aliases
-  [conn aliases global-t context opts]
+  [conn aliases global-t opts]
   (when (some? global-t)
     (try*
       (util/str->epoch-ms global-t)
@@ -180,7 +177,7 @@
           db-map      {}]
      (if alias
        ;; TODO: allow restricting federated dataset components individually by t
-       (let [db      (<? (load-alias conn alias global-t context opts))
+       (let [db      (<? (load-alias conn alias global-t opts))
              db-map* (assoc db-map alias db)]
          (recur r db-map*))
        db-map))))
@@ -194,18 +191,16 @@
     (dataset/combine named-graphs default-coll)))
 
 (defn load-dataset
-  [conn defaults named global-t context opts]
+  [conn defaults named global-t opts]
   (go-try
     (if (and (= (count defaults) 1)
              (empty? named))
       (let [alias (first defaults)]
-        (<? (load-alias conn alias global-t context opts))) ; return an
-                                                            ; unwrapped db if
-                                                            ; the data set
-                                                            ; consists of one
-                                                            ; ledger
+        (<? (load-alias conn alias global-t opts))) ; return an unwrapped db if
+                                                    ; the data set consists of
+                                                    ; one ledger
       (let [all-aliases (->> defaults (concat named) distinct)
-            db-map      (<? (load-aliases conn all-aliases global-t context opts))]
+            db-map      (<? (load-aliases conn all-aliases global-t opts))]
         (dataset db-map defaults)))))
 
 (defn query-connection-fql
@@ -218,9 +213,7 @@
          named-aliases   (some-> query* :from-named util/sequential)]
      (if (or (seq default-aliases)
              (seq named-aliases))
-       (let [s-ctx    (ctx-util/extract query)
-             ds       (<? (load-dataset conn default-aliases named-aliases t
-                                        s-ctx opts))
+       (let [ds       (<? (load-dataset conn default-aliases named-aliases t opts))
              query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
              max-fuel (:max-fuel opts)]
          (if (::util/track-fuel? opts)
@@ -237,8 +230,7 @@
      (<? (query-connection-fql conn fql did)))))
 
 (defn query-connection
-  [conn query {:keys [format did] :as opts :or {format :fql}}]
+  [conn query {:keys [format did] :as _opts :or {format :fql}}]
   (case format
     :fql (query-connection-fql conn query did)
     :sparql (query-connection-sparql conn query did)))
-
