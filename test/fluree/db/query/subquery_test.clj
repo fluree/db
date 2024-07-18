@@ -1,6 +1,6 @@
 (ns fluree.db.query.subquery-test
   (:require [clojure.test :refer :all]
-            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.log :as log]))
 
