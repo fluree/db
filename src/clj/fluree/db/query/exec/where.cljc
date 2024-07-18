@@ -184,10 +184,6 @@
   (-activate-alias [s alias])
   (-aliases [s]))
 
-(defn matcher?
-  [x]
-  (satisfies? Matcher x))
-
 (defn pattern-type
   [pattern]
   (if (map-entry? pattern)

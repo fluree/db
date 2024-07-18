@@ -163,14 +163,19 @@
     (log/debug "Reasoner - source OWL rules: " graph)
     (owl-datalog/owl->datalog inserts graph)))
 
+(defn rules-graph?
+  [x]
+  (or (map? x)
+      (sequential? x)))
+
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
   supplied rules graph or from the db if no graph is supplied."
   [methods db inserts graph-or-db]
   (go-try
     (let [rules-db        (cond
-                            (nil? graph-or-db) db
-                            (queryable? graph-or-db) graph-or-db)
+                            (nil? graph-or-db)               db
+                            (not (rules-graph? graph-or-db)) graph-or-db)
           supplied-rules* (when-not rules-db
                             (try*
                               (parse-rules-graph graph-or-db)
@@ -178,7 +183,7 @@
                                       (log/error "Error parsing supplied rules graph:" e)
                                       (throw e))))]
       (loop [[method & r] methods
-             rules []]
+             rules        []]
         (if method
           (let [rules-graph* (or supplied-rules*
                                  (<? (resolve/rules-from-db rules-db method)))
