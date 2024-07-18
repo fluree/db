@@ -208,11 +208,11 @@
         (dataset db-map defaults)))))
 
 (defn query-connection-fql
-  [conn query request-opts]
+  [conn query opts]
   (go-try
     (let [{:keys [t opts] :as sanitized-query} (-> query
                                                    syntax/coerce-query
-                                                   (update :opts sanitize-query-options (:did request-opts)))
+                                                   (update :opts sanitize-query-options (:did opts)))
           
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
@@ -230,14 +230,14 @@
                         {:status 400, :error :db/invalid-query}))))))
 
 (defn query-connection-sparql
-  [conn query {:keys [role did] :as request-opts}]
+  [conn query {:keys [role did] :as opts}]
   (go-try
     (let [fql              (sparql/->fql query)
           credentialed-fql (update fql :opts #(merge {:role role :did did} %))]
-      (<? (query-connection-fql conn credentialed-fql request-opts)))))
+      (<? (query-connection-fql conn credentialed-fql opts)))))
 
 (defn query-connection
-  [conn query {:keys [format] :as request-opts}]
+  [conn query {:keys [format] :as opts}]
   (case (or format :fql)
-    :fql (query-connection-fql conn query request-opts)
-    :sparql (query-connection-sparql conn query request-opts)))
+    :fql (query-connection-fql conn query opts)
+    :sparql (query-connection-sparql conn query opts)))

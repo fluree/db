@@ -166,9 +166,9 @@
                   "select"   {(:id auth) ["*"]}}
 
            sparql (str "PREFIX ct: <ledger:credentialtest/>
-                           SELECT ?name
-                           FROM <" ledger-id ">
-                           WHERE { \"" (:id auth) "\" ct:name ?name }")]
+                        SELECT ?name
+                        FROM <" ledger-id ">
+                        WHERE { \"" (:id auth) "\" ct:name ?name }")]
        (is (= [{"id" "ct:open", "ct:foo" "bar"}]
               @(fluree/query db0 {"@context" context
                                   "select"   {"ct:open" ["*"]}}))
