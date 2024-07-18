@@ -12,6 +12,10 @@
   (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch])
   (-iri-visible? [db iri]))
 
+(defn subject-formatter?
+  [x]
+  (satisfies? SubjectFormatter x))
+
 (declare format-subject)
 
 (defn append-id
