@@ -12,6 +12,10 @@
   (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch])
   (-iri-visible? [db iri]))
 
+(defn node-formatter?
+  [x]
+  (satisfies? NodeFormatter x))
+
 (declare format-node)
 
 (defn append-id

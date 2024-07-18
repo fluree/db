@@ -14,8 +14,8 @@
 
 (defn queryable?
   [x]
-  (and (satisfies? where/Matcher x)
-       (satisfies? response/NodeFormatter x)))
+  (and (where/matcher? x)
+       (response/node-formatter? x)))
 
 (defn drop-offset
   "Returns a channel containing the stream of solutions from `solution-ch` after
