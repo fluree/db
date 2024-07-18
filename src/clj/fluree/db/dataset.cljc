@@ -2,7 +2,7 @@
   (:require [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.query.json-ld.response :as resp]
+            [fluree.db.query.exec.select.subject :as subject]
             [clojure.core.async :as async]))
 
 (defrecord DataSet [named default active])
@@ -86,14 +86,14 @@
     (names ds))
 
 
-  resp/NodeFormatter
+  subject/SubjectFormatter
   (-forward-properties [ds iri select-spec context compact-fn cache fuel-tracker error-ch]
     (let [db-ch   (->> ds all async/to-chan!)
           prop-ch (async/chan)]
       (async/pipeline-async 4
                             prop-ch
                             (fn [db ch]
-                              (-> (resp/-forward-properties db iri select-spec context compact-fn cache fuel-tracker error-ch)
+                              (-> (subject/-forward-properties db iri select-spec context compact-fn cache fuel-tracker error-ch)
                                   (async/pipe ch)))
                             db-ch)
       (async/reduce merge-subgraphs {} prop-ch)))
@@ -104,7 +104,7 @@
       (async/pipeline-async 2
                             prop-ch
                             (fn [db ch]
-                              (-> (resp/-reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch)
+                              (-> (subject/-reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch)
                                   (async/pipe ch)))
                             db-ch)
       (async/reduce (fn [combined-prop db-prop]
@@ -120,7 +120,7 @@
     (go-try
       (some? (loop [[db & r] (all ds)]
                (if db
-                 (if (<? (resp/-iri-visible? db iri))
+                 (if (<? (subject/-iri-visible? db iri))
                    db
                    (recur r))
                  nil))))))

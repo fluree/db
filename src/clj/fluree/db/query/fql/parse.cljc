@@ -1,7 +1,6 @@
 (ns fluree.db.query.fql.parse
   (:require #?(:cljs [cljs.reader :refer [read-string]])
             [clojure.set :as set]
-            [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]

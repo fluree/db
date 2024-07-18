@@ -5,7 +5,6 @@
             [clojure.set :refer [map-invert]]
             [fluree.db.connection :as connection]
             [fluree.db.datatype :as datatype]
-            [fluree.db.fuel :as fuel]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
@@ -13,8 +12,12 @@
             [fluree.db.query.history :refer [AuditLog]]
             [fluree.db.flake.history :as history]
             [fluree.db.flake.format :as jld-format]
+            [fluree.db.flake.match :as match]
             [fluree.db.constants :as const]
+            [fluree.db.reasoner :as reasoner]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.reasoner :as flake.reasoner]
+            [fluree.db.flake.transact :as flake.transact]
             [fluree.db.util.core :as util :refer [get-first get-first-value
                                                   get-first-id vswap!]]
             [fluree.db.index :as index]
@@ -27,12 +30,9 @@
             [fluree.db.json-ld.policy.query :as qpolicy]
             [fluree.db.json-ld.policy.rules :as policy-rules]
             [fluree.db.json-ld.reify :as reify]
-            [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.transact :as transact]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.json-ld.policy.modify :as tx-policy]
-            [fluree.db.query.exec.update :as update]
-            [fluree.db.query.json-ld.response :as jld-response]
+            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serde-json]
             [fluree.db.util.async :refer [<? go-try]]
@@ -45,27 +45,6 @@
 (def data-version 0)
 
 ;; ================ Jsonld record support fns ================================
-
-(defn class-ids
-  "Returns list of class-ids for given subject-id"
-  [db subject-id]
-  (go-try
-    (let [root (policy/root db)]
-      (<? (query-range/index-range root :spot = [subject-id const/$rdf:type]
-                                   {:flake-xf (map flake/o)})))))
-
-(defn p-prop
-  [schema property predicate]
-  (assert (#{:id :iri :subclassOf :parentProps :childProps :datatype}
-           property)
-          (str "Invalid predicate property: " (pr-str property)))
-  (get-in schema [:pred predicate property]))
-
-(defn class-prop
-  [{:keys [schema] :as _db} meta-key class]
-  (if (= :subclasses meta-key)
-    (get @(:subclasses schema) class)
-    (p-prop schema meta-key class)))
 
 (defn empty-all-novelty
   [db]
@@ -121,232 +100,6 @@
                  :tspo tspo)
           (assoc-in [:stats :indexed] index-t)))
     db))
-
-(defn match-id
-  [db fuel-tracker solution s-mch error-ch]
-  (let [matched-ch (async/chan 2 (comp cat
-                                       (partition-by flake/s)
-                                       (map first)
-                                       (map (fn [f]
-                                              (if (where/unmatched-var? s-mch)
-                                                (let [var     (where/get-variable s-mch)
-                                                      matched (where/match-subject s-mch db f)]
-                                                  (assoc solution var matched))
-                                                solution)))))
-        s-mch*     (where/assign-matched-component s-mch solution)]
-    (if-let [s (where/compute-sid db s-mch*)]
-      (-> db
-          (where/resolve-flake-range fuel-tracker error-ch [s])
-          (async/pipe matched-ch))
-      (async/close! matched-ch))
-    matched-ch))
-
-(defn match-triple
-  [db fuel-tracker solution tuple error-ch]
-  (let [matched-ch (async/chan 2 (comp cat
-                                       (map (fn [flake]
-                                              (where/match-flake solution tuple db flake)))))
-        db-alias   (:alias db)
-        triple     (where/assign-matched-values tuple solution)]
-    (if-let [[s p o] (where/compute-sids db triple)]
-      (let [pid (where/get-sid p db)]
-        (if-let [props (and pid (where/get-child-properties db pid))]
-          (let [prop-ch (-> props (conj pid) async/to-chan!)]
-            (async/pipeline-async 2
-                                  matched-ch
-                                  (fn [prop ch]
-                                    (let [p* (where/match-sid p db-alias prop)]
-                                      (-> db
-                                          (where/resolve-flake-range fuel-tracker error-ch [s p* o])
-                                          (async/pipe ch))))
-                                  prop-ch))
-
-          (-> db
-              (where/resolve-flake-range fuel-tracker error-ch [s p o])
-              (async/pipe matched-ch))))
-      (async/close! matched-ch))
-    matched-ch))
-
-(defn with-distinct-subjects
-  "Return a transducer that filters a stream of flakes by removing any flakes with
-  subject ids repeated from previously processed flakes."
-  []
-  (fn [rf]
-    (let [seen-sids (volatile! #{})]
-      (fn
-        ;; Initialization: do nothing but initialize the supplied reducing fn
-        ([]
-         (rf))
-
-        ;; Iteration: keep track of subject ids seen; only pass flakes with new
-        ;; subject ids through to the supplied reducing fn.
-        ([result f]
-         (let [sid (flake/s f)]
-           (if (contains? @seen-sids sid)
-             result
-             (do (vswap! seen-sids conj sid)
-                 (rf result f)))))
-
-        ;; Termination: do nothing but terminate the supplied reducing fn
-        ([result]
-         (rf result))))))
-
-(defn match-class
-  [db fuel-tracker solution triple error-ch]
-  (let [matched-ch (async/chan 2 (comp cat
-                                       (with-distinct-subjects)
-                                       (map (fn [flake]
-                                              (where/match-flake solution triple db flake)))))
-        db-alias   (:alias db)
-        triple     (where/assign-matched-values triple solution)]
-    (if-let [[s p o] (where/compute-sids db triple)]
-      (let [cls        (where/get-sid o db)
-            sub-obj    (dissoc o ::sids ::iri)
-            class-objs (into [o]
-                             (comp (map (fn [cls]
-                                          (where/match-sid sub-obj db-alias cls)))
-                                   (remove nil?))
-                             (class-prop db :subclasses cls))
-            class-ch   (async/to-chan! class-objs)]
-        (async/pipeline-async 2
-                              matched-ch
-                              (fn [class-obj ch]
-                                (-> (where/resolve-flake-range db fuel-tracker error-ch [s p class-obj])
-                                    (async/pipe ch)))
-                              class-ch))
-      (async/close! matched-ch))
-    matched-ch))
-
-
-;; TODO - can use transient! below
-(defn stage-update-novelty
-  "If a db is staged more than once, any retractions in a previous stage will
-  get completely removed from novelty. This returns flakes that must be added and removed
-  from novelty."
-  [novelty-flakes new-flakes]
-  (loop [[f & r] new-flakes
-         adds    new-flakes
-         removes (empty new-flakes)]
-    (if f
-      (if (true? (flake/op f))
-        (recur r adds removes)
-        (let [flipped (flake/flip-flake f)]
-          (if (contains? novelty-flakes flipped)
-            (recur r (disj adds f) (conj removes flipped))
-            (recur r adds removes))))
-      [(not-empty adds) (not-empty removes)])))
-
-(defn ->tx-state
-  "Generates a state map for transaction processing. When optional
-  reasoned-from-IRI is provided, will mark any new flakes as reasoned from the
-  provided value in the flake's metadata (.-m) as :reasoned key."
-  [& {:keys [db context txn author-did annotation reasoned-from-iri]}]
-  (let [{:keys [policy], db-t :t} db
-
-        commit-t  (-> db :commit commit-data/t)
-        t         (flake/next-t commit-t)
-        db-before (policy/root db)]
-    {:db-before     db-before
-     :context       context
-     :txn           txn
-     :annotation    annotation
-     :author-did    author-did
-     :policy        policy
-     :stage-update? (= t db-t) ; if a previously staged db is getting updated again before committed
-     :t             t
-     :reasoner-max  10 ; maximum number of reasoner iterations before exception
-     :reasoned      reasoned-from-iri}))
-
-(defn into-flakeset
-  [fuel-tracker error-ch flake-ch]
-  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)
-        error-xf (halt-when util/exception?)
-        flake-xf (if fuel-tracker
-                   (let [track-fuel (fuel/track fuel-tracker error-ch)]
-                     (comp error-xf track-fuel))
-                   error-xf)]
-    (async/transduce flake-xf (completing conj) flakeset flake-ch)))
-
-(defn reasoned-rule?
-  "Returns truthy if the flake has been generated by reasoner"
-  [flake]
-  (-> flake meta :reasoned))
-
-(defn non-reasoned-flakes
-  "Takes a sequence of flakes and removes any flakes which are reasoned.
-
-  This is primarily used to remove reasoned flakes from commits."
-  [flakes]
-  (remove reasoned-rule? flakes))
-
-(defn reasoned-flakes
-  "Takes a sequence of flakes and keeps only reasoned flakes"
-  [flakes]
-  (filter reasoned-rule? flakes))
-
-(defn generate-flakes
-  [db fuel-tracker parsed-txn tx-state]
-  (go
-    (let [error-ch  (async/chan)
-          db-vol    (volatile! db)
-          update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
-                         (update/modify db-vol parsed-txn tx-state fuel-tracker error-ch)
-                         (into-flakeset fuel-tracker error-ch))]
-      (async/alt!
-        error-ch ([e] e)
-        update-ch ([result]
-                   (if (util/exception? result)
-                     result
-                     [@db-vol result]))))))
-
-(defn modified-subjects
-  "Returns a map of sid to s-flakes for each modified subject."
-  [db flakes]
-  (go-try
-    (loop [[s-flakes & r] (partition-by flake/s flakes)
-           sid->s-flakes {}]
-      (if s-flakes
-        (let [sid             (some-> s-flakes first flake/s)
-              existing-flakes (<? (query-range/index-range db :spot = [sid]))]
-          (recur r (assoc sid->s-flakes sid (into (set s-flakes) existing-flakes))))
-        sid->s-flakes))))
-
-(defn final-db
-  "Returns map of all elements for a stage transaction required to create an
-  updated db."
-  [db new-flakes {:keys [stage-update? policy t txn author-did annotation db-before context] :as _tx-state}]
-  (go-try
-    (let [[add remove] (if stage-update?
-                         (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
-                         [new-flakes nil])
-          mods         (<? (modified-subjects (policy/root db) add))
-          db-after     (-> db
-                           (update :staged conj [txn author-did annotation])
-                           (assoc :t t
-                                  :policy policy) ; re-apply policy to db-after
-                           (commit-data/update-novelty add remove)
-                           (commit-data/add-tt-id)
-                           (vocab/hydrate-schema add mods))]
-      {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
-
-(defn validate-db-update
-  [{:keys [db-after db-before mods context] :as staged-map}]
-  (go-try
-    (<? (shacl/validate! db-before (policy/root db-after) (vals mods) context))
-    (let [allowed-db (<? (tx-policy/allowed? staged-map))]
-      allowed-db)))
-
-(defn stage
-  [db fuel-tracker context identity annotation raw-txn parsed-txn]
-  (go-try
-    (let [tx-state   (->tx-state :db db
-                                 :context context
-                                 :txn raw-txn
-                                 :author-did identity
-                                 :annotation annotation)
-          [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
-          updated-db (<? (final-db db** new-flakes tx-state))]
-      (<? (validate-db-update updated-db)))))
 
 (defn read-db
   [conn db-address]
@@ -619,8 +372,8 @@
                     max-namespace-code reindex-min-bytes reindex-max-bytes]
   dbproto/IFlureeDb
   (-query [this query-map] (fql/query this query-map))
-  (-p-prop [_ meta-key property] (p-prop schema meta-key property))
-  (-class-ids [this subject] (class-ids this subject))
+  (-p-prop [_ meta-key property] (match/p-prop schema meta-key property))
+  (-class-ids [this subject] (match/class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))
 
   iri/IRICodec
@@ -631,13 +384,13 @@
 
   where/Matcher
   (-match-id [db fuel-tracker solution s-mch error-ch]
-    (match-id db fuel-tracker solution s-mch error-ch))
+    (match/match-id db fuel-tracker solution s-mch error-ch))
 
   (-match-triple [db fuel-tracker solution s-mch error-ch]
-    (match-triple db fuel-tracker solution s-mch error-ch))
+    (match/match-triple db fuel-tracker solution s-mch error-ch))
 
   (-match-class [db fuel-tracker solution s-mch error-ch]
-    (match-class db fuel-tracker solution s-mch error-ch))
+    (match/match-class db fuel-tracker solution s-mch error-ch))
 
   (-activate-alias [db alias']
     (when (= alias alias')
@@ -648,11 +401,11 @@
 
   transact/Transactable
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
-    (stage db fuel-tracker context identity annotation raw-txn parsed-txn))
+    (flake.transact/stage db fuel-tracker context identity annotation raw-txn parsed-txn))
   (-merge-commit [db new-commit proof] (merge-commit conn db [new-commit proof]))
   (-merge-commit [db new-commit] (merge-commit conn db [new-commit]))
 
-  jld-response/NodeFormatter
+  subject/SubjectFormatter
   (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
     (jld-format/forward-properties db iri spec context compact-fn cache fuel-tracker error-ch))
 
@@ -712,7 +465,13 @@
   (wrap-identity-policy [db identity default-allow? values-map]
     (policy-rules/wrap-identity-policy db identity default-allow? values-map))
   (root [db]
-    (policy/root-db db)))
+    (policy/root-db db))
+
+  reasoner/Reasoner
+  (-reason [db methods rules-graph fuel-tracker reasoner-max]
+    (flake.reasoner/reason db methods rules-graph fuel-tracker reasoner-max))
+  (-reasoned-facts [db]
+    (flake.reasoner/reasoned-facts db)))
 
 (defn db?
   [x]
@@ -892,7 +651,7 @@
   :flakes - all considered flakes, for any downstream processes that need it"
   [{:keys [reasoner] :as db} {:keys [compact-fn id-key type-key] :as _opts}]
   (when-let [flakes (cond-> (commit-flakes db)
-                      reasoner non-reasoned-flakes)]
+                      reasoner flake.reasoner/non-reasoned-flakes)]
     (log/trace "generate-commit flakes:" flakes)
     (let [ctx (volatile! {})]
       (loop [[s-flakes & r] (partition-by flake/s flakes)
