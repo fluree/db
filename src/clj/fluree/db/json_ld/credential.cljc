@@ -133,14 +133,13 @@
   {:subject <original tx/cmd> :did <did>}
 
   Will throw if no :did is detected."
-  ([signed-command] (verify signed-command true))
-  ([signed-command json?]
-   (go-try
-    (let [result (if (jws? signed-command)
-                   (verify-jws signed-command json?) ;; JWS can be SPARQL
-                   (<? (verify-credential signed-command)))] ;; VC is always JSON
-      (if (:did result)
-        result
-        (throw (ex-info "Signed message could not be verified to an identity"
-                        {:status 401
-                         :error  :db/invalid-credential})))))))
+  [signed-command]
+  (go-try
+   (let [result (if (jws? signed-command)
+                  (verify-jws signed-command) ;; JWS can be SPARQL
+                  (<? (verify-credential signed-command)))] ;; VC is always JSON
+     (if (:did result)
+       (update result :subject (json/parse false))
+       (throw (ex-info "Signed message could not be verified to an identity"
+                       {:status 401
+                        :error  :db/invalid-credential}))))))
