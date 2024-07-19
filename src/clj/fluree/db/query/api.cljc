@@ -227,7 +227,7 @@
   [conn query opts]
   (go-try
     (let [fql (sparql/->fql query)]
-      (<? (query-connection-fql conn credentialed-fql opts)))))
+      (<? (query-connection-fql conn fql opts)))))
 
 (defn query-connection
   [conn query {:keys [format] :as opts}]
