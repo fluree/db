@@ -136,10 +136,11 @@
   [signed-command]
   (go-try
    (let [result (if (jws? signed-command)
-                  (verify-jws signed-command) ;; JWS can be SPARQL
+                  (-> (verify-jws signed-command)
+                      (update :subject json/parse false))
                   (<? (verify-credential signed-command)))] ;; VC is always JSON
      (if (:did result)
-       (update result :subject (json/parse false))
+       result
        (throw (ex-info "Signed message could not be verified to an identity"
                        {:status 401
                         :error  :db/invalid-credential}))))))
