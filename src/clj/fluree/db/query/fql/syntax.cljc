@@ -107,6 +107,7 @@
     ::max-fuel          pos-int?
     ::depth             nat-int?
     ::pretty-print      boolean?
+    ::default-allow?    boolean?
     ::parse-json        boolean?
     ::issuer            [:maybe string?]
     ::role              :any
@@ -120,6 +121,8 @@
                           [:parse-json {:optional true} ::parse-json]
                           [:prettyPrint {:optional true} ::pretty-print]
                           [:pretty-print {:optional true} ::pretty-print]
+                          [:default-allow? {:optional true} ::default-allow?]
+                          [:defaultAllow {:optional true} ::default-allow?]
                           [:issuer {:optional true} ::issuer]
                           [:role {:optional true} ::role]
                           [:did {:optional true} ::did]]]

@@ -34,7 +34,7 @@
     did (assoc :did did :issuer did)))
 
 (defn restrict-db
-  [db t {:keys [did default-allow?]}]
+  [db t {:keys [did default-allow?] :as opts}]
   (go-try
     (let [db*  (if did
                  (<? (perm/wrap-identity-policy db did default-allow? nil))
@@ -227,6 +227,7 @@
   [conn query opts]
   (go-try
     (let [fql (sparql/->fql query)]
+      (log/debug "query-connection SPARQL fql: " fql "did:" did)
       (<? (query-connection-fql conn fql opts)))))
 
 (defn query-connection

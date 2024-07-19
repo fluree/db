@@ -163,12 +163,7 @@
            ledger @(fluree/load conn ledger-id)
 
            query {"@context" context
-                  "select"   {(:id auth) ["*"]}}
-
-           sparql (str "PREFIX ct: <ledger:credentialtest/>
-                        SELECT ?name
-                        FROM <" ledger-id ">
-                        WHERE { \"" (:id auth) "\" ct:name ?name }")]
+                  "select"   {(:id auth) ["*"]}}]
        (is (= [{"id" "ct:open", "ct:foo" "bar"}]
               @(fluree/query db0 {"@context" context
                                   "select"   {"ct:open" ["*"]}}))
@@ -231,33 +226,37 @@
                                           (:private pleb-auth)))))
            "history query credential - forbidding access")
 
-       (is (= [["D"]]
-              @(fluree/credential-query
-                db2
-                (crypto/create-jws sparql (:private auth))
-                {:format :sparql}))
-           "SPARQL query credential - allowing access")
-
-       (is (= []
-              @(fluree/credential-query
-                (fluree/db ledger)
-                (crypto/create-jws sparql (:private pleb-auth))
-                {:format :sparql}))
-           "SPARQL query credential - forbidding access")
-
-       (is (= [["D"]]
-             @(fluree/credential-query-connection
-               conn
-               (crypto/create-jws sparql (:private auth))
-               {:format :sparql}))
-           "SPARQL query connection credential - allowing access")
-
-       (is (= []
-              @(fluree/credential-query-connection
-                conn
-                (crypto/create-jws sparql (:private pleb-auth))
-                {:format :sparql}))
-           "SPARQL query connection credential - forbidding access"))))
+       (let [sparql (str "PREFIX ct: <ledger:credentialtest/>
+                        SELECT ?name
+                        FROM <" ledger-id ">
+                        WHERE { \"" (:id auth) "\" ct:name ?name }")]
+         (is (= [["D"]]
+                @(fluree/credential-query
+                  db2
+                  (crypto/create-jws sparql (:private auth))
+                  {:format :sparql}))
+             "SPARQL query credential - allowing access")
+         
+         (is (= []
+                @(fluree/credential-query
+                  (fluree/db ledger)
+                  (crypto/create-jws sparql (:private pleb-auth))
+                  {:format :sparql}))
+             "SPARQL query credential - forbidding access")
+         
+         (is (= [["D"]]
+                @(fluree/credential-query-connection
+                  conn
+                  (crypto/create-jws sparql (:private auth))
+                  {:format :sparql}))
+             "SPARQL query connection credential - allowing access")
+         
+         (is (= []
+                @(fluree/credential-query-connection
+                  conn
+                  (crypto/create-jws sparql (:private pleb-auth))
+                  {:format :sparql}))
+             "SPARQL query connection credential - forbidding access")))))
 
 (comment
  #?(:cljs
