@@ -34,10 +34,10 @@
     did (assoc :did did :issuer did)))
 
 (defn restrict-db
-  [db t opts]
+  [db t {:keys [did default-allow?]}]
   (go-try
-    (let [db*  (if-let [did (:did opts)]
-                 (<? (perm/wrap-identity-policy db did true nil))
+    (let [db*  (if did
+                 (<? (perm/wrap-identity-policy db did default-allow? nil))
                  db)
           db** (-> (if t
                      (<? (time-travel/as-of db* t))
