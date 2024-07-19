@@ -204,11 +204,11 @@
         (dataset db-map defaults)))))
 
 (defn query-connection-fql
-  [conn query opts]
+  [conn query did]
   (go-try
     (let [{:keys [t opts] :as sanitized-query} (-> query
                                                    syntax/coerce-query
-                                                   (update :opts sanitize-query-options (:did opts)))
+                                                   (update :opts sanitize-query-options did))
           
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
@@ -224,14 +224,14 @@
                         {:status 400, :error :db/invalid-query}))))))
 
 (defn query-connection-sparql
-  [conn query opts]
+  [conn query did]
   (go-try
     (let [fql (sparql/->fql query)]
       (log/debug "query-connection SPARQL fql: " fql "did:" did)
-      (<? (query-connection-fql conn fql opts)))))
+      (<? (query-connection-fql conn fql did)))))
 
 (defn query-connection
-  [conn query {:keys [format] :as opts :or {format :fql}}]
+  [conn query {:keys [format did] :as opts :or {format :fql}}]
   (case format
-    :fql (query-connection-fql conn query opts)
-    :sparql (query-connection-sparql conn query opts)))
+    :fql (query-connection-fql conn query did)
+    :sparql (query-connection-sparql conn query did)))
