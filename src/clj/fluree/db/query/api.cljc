@@ -231,7 +231,7 @@
       (<? (query-connection-fql conn fql opts)))))
 
 (defn query-connection
-  [conn query {:keys [format] :as opts}]
-  (case (or format :fql)
+  [conn query {:keys [format] :as opts :or {format :fql}}]
+  (case format
     :fql (query-connection-fql conn query opts)
     :sparql (query-connection-sparql conn query opts)))
