@@ -1,15 +1,15 @@
-(ns fluree.db.database.async
+(ns fluree.db.async-db
   (:refer-clojure :exclude [load])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [<! >! go]]
-            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.transact :as transact]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :as history]
-            [fluree.db.query.json-ld.response :as jld-response]
+            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :refer [try* catch*]]
@@ -66,14 +66,14 @@
   (-aliases [_]
     [alias])
 
-  jld-response/NodeFormatter
+  subject/SubjectFormatter
   (-forward-properties [_ iri select-spec context compact-fn cache fuel-tracker error-ch]
     (let [prop-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (jld-response/-forward-properties iri select-spec context compact-fn cache fuel-tracker error-ch)
+                (subject/-forward-properties iri select-spec context compact-fn cache fuel-tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
             (log/error e "Error loading database")
@@ -86,7 +86,7 @@
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (jld-response/-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
+                (subject/-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
             (log/error e "Error loading database")
@@ -96,7 +96,7 @@
   (-iri-visible? [_ iri]
     (go-try
       (let [db (<? db-chan)]
-        (<? (jld-response/-iri-visible? db iri)))))
+        (<? (subject/-iri-visible? db iri)))))
 
   transact/Transactable
   (-stage-txn [_ fuel-tracker context identity annotation raw-txn parsed-txn]
@@ -220,6 +220,6 @@
         t          (-> commit-map :data :t)
         async-db   (->AsyncDB ledger-alias branch commit-map t (async/promise-chan))]
     (go
-      (let [db (<! (jld-db/load conn ledger-alias branch [commit-jsonld commit-map]))]
+      (let [db (<! (flake-db/load conn ledger-alias branch [commit-jsonld commit-map]))]
         (deliver! async-db db)))
     async-db))

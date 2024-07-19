@@ -515,7 +515,12 @@
 (defmethod parse-term :GraphPatternNotTriples
   ;; GraphPatternNotTriples ::= GroupOrUnionGraphPattern | OptionalGraphPattern | MinusGraphPattern | GraphGraphPattern | ServiceGraphPattern | Filter | Bind | InlineData
   [[_ & non-triples]]
-  (mapv parse-term non-triples))
+  (reduce (fn [results non-triple]
+            (if (= :GroupOrUnionGraphPattern (first non-triple))
+              (into results (parse-term non-triple))
+              (conj results (parse-term non-triple))))
+          []
+          non-triples))
 
 (defmethod parse-term :PrefixedName
   [[_ & name]]
@@ -616,18 +621,25 @@
 
 (defmethod parse-term :GroupOrUnionGraphPattern
   ;; GroupOrUnionGraphPattern ::= GroupGraphPattern ( <'UNION'> GroupGraphPattern )*
-  [[_ & union-patterns]]
-  (into [:union] (mapcat parse-term union-patterns)))
+  [[_ group-pattern & union-patterns :as term]]
+  (if union-patterns
+    (->> (mapv parse-term (rest term))
+         ;; this presumes that each GroupGraphPattern has the same number of patterns per group
+         (apply map (fn [& patterns] (into [:union] patterns))))
+    (parse-term group-pattern)))
 
 (defmethod parse-term :GroupGraphPatternSub
   ;; GroupGraphPatternSub ::= WS TriplesBlock? ( GraphPatternNotTriples WS <'.'?> TriplesBlock? WS )* WS
   [[_ & patterns]]
   (mapcat parse-term patterns))
 
+(declare translate)
 (defmethod parse-term :SubSelect
-  [r]
-  (throw (ex-info "SubSelect patterns are not supported"
-                  {:status 400 :error :db/invalid-query})))
+  ;; SubSelect ::= SelectClause WS WhereClause WS SolutionModifier WS ValuesClause
+  [[_ & subquery-clauses]]
+  ;; SubSelect is always nested under GroupOrUnionGraphPattern, which returns a sequence of results
+  ;; so we need to wrap it in an extra vector
+  [[:query (translate subquery-clauses)]])
 
 (defmethod parse-rule :WhereClause
   ;; WhereClause ::= <'WHERE'?> WS GroupGraphPattern WS
@@ -638,7 +650,9 @@
 (defmethod parse-rule :ValuesClause
   ;; ValuesClause ::= ( <'VALUES'> WS DataBlock )? WS
   [[_ datablock]]
-  [(parse-term datablock)])
+  (if datablock
+    [(parse-term datablock)]
+    []))
 
 (defmethod parse-rule :OffsetClause
   ;; OffsetClause ::= <'OFFSET'> WS INTEGER

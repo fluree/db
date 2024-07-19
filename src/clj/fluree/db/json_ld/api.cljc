@@ -6,7 +6,7 @@
             [fluree.db.conn.memory :as memory-conn]
             [fluree.db.conn.remote :as remote-conn]
             [fluree.json-ld :as json-ld]
-            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.flake.flake-db :as flake-db]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.platform :as platform]
@@ -593,12 +593,7 @@
   "Returns a count of reasoned facts in the provided db."
   [db]
   (log/warn "DEPRECATED function `reasoned-count` superseded by `fluree.db.api/reasoned-count`")
-  (let [spot (-> db :novelty :spot)]
-    (reduce (fn [n flake]
-              (if (jld-db/reasoned-rule? flake)
-                (inc n)
-                n))
-            0 spot)))
+  (reasoner/reasoned-count db))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/reasoned-facts"}
@@ -620,21 +615,4 @@
   ([db] (reasoned-facts db nil))
   ([db opts]
    (log/warn "DEPRECATED function `reasoned-facts` superseded by `fluree.db.api/reasoned-facts`")
-   (let [group-fn (case (:group-by opts)
-                    nil       nil
-                    :subject  (fn [p] (nth p 0))
-                    :property (fn [p] (nth p 1))
-                    :rule     (fn [p] (nth p 3)))
-         triples+ (juxt #(decode-iri db (flake/s %))
-                        #(decode-iri db (flake/p %))
-                        #(as-> (flake/o %) o
-                           (if (iri/sid? o)
-                             (decode-iri db o)
-                             o))
-                        #(jld-db/reasoned-rule? %))
-         result   (->> db :novelty :spot
-                       jld-db/reasoned-flakes
-                       (mapv triples+))]
-     (if group-fn
-       (group-by group-fn result)
-       result))))
+   (reasoner/reasoned-facts (:group-by opts))))

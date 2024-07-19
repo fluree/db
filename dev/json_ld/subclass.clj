@@ -1,7 +1,7 @@
 (ns json-ld.subclass
   (:require [fluree.db.method.ipfs.core :as ipfs]
-            [fluree.db.db.json-ld :as jld-db]
             [fluree.db.transact :as jld-tx]
+            [fluree.db.flake.flake-db :as flake-db]
             [clojure.core.async :as async]
             [fluree.db.flake :as flake]
             [fluree.db.api :as fluree]
