@@ -37,11 +37,7 @@
   [db t {:keys [did default-allow?] :as opts}]
   (go-try
    (let [db*  (if did
-                (<? (perm/wrap-identity-policy db
-                                               did
-                                               (or (true? default-allow?)
-                                                   false)
-                                               nil))
+                (<? (perm/wrap-identity-policy db did default-allow? nil))
                 db)
          db** (-> (if t
                     (<? (time-travel/as-of db* t))

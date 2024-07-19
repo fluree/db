@@ -354,11 +354,7 @@
        (log/debug "Credential history query with identity: " identity " and query: " query)
        (cond
          (and query identity)
-         (let [policy-db (<? (policy/wrap-identity-policy latest-db
-                                                          identity
-                                                          (or (true? default-allow?)
-                                                              false)
-                                                          values-map))]
+         (let [policy-db (<? (policy/wrap-identity-policy latest-db identity default-allow? values-map))]
            (<? (query-api/history policy-db query)))
 
          identity
