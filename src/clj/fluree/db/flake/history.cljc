@@ -209,6 +209,7 @@
 
            assert-key          (json-ld/compact const/iri-assert compact)
            retract-key         (json-ld/compact const/iri-retract compact)
+           t-key               (json-ld/compact const/iri-t compact)
            data-key            (json-ld/compact const/iri-data compact)
            commit-key          (json-ld/compact const/iri-commit compact)
            annotation-key      (json-ld/compact const/iri-annotation compact)]
@@ -224,7 +225,8 @@
                       (assoc-in [commit-key data-key] commit-meta)
                       (cond-> annotation (assoc-in [commit-key annotation-key] annotation)))
            data   (-> (assoc-in [data-key assert-key] asserts)
-                      (assoc-in [data-key retract-key] retracts)))
+                      (assoc-in [data-key retract-key] retracts)
+                      (assoc-in [data-key t-key] (get commit-meta t-key))))
          (-> {commit-key commit-wrapper}
              (assoc-in [commit-key data-key] commit-meta)
              (assoc-in [commit-key data-key assert-key] asserts)

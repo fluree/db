@@ -1110,7 +1110,8 @@
                                         :t       {:from 1 :to :latest}}))))
       (testing ":data returns just the asserts and retracts"
         (is (= [{"f:data"
-                 {"f:assert"
+                 {"f:t" 1
+                  "f:assert"
                   [{"f:role" {"id" "ex:rootRole"},
                     "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
                    {"type"        "ex:Yeti",
@@ -1133,8 +1134,12 @@
                     "f:targetNode" {"id" "f:allNodes"},
                     "id"           "ex:rootPolicy"}],
                   "f:retract" []}}
-                {"f:data" {"f:assert" [{"ex:foo" 3, "id" "_:fdb-4"}], "f:retract" []}}
-                {"f:data" {"f:assert" [{"ex:foo" 5, "id" "_:fdb-6"}], "f:retract" []}}]
+                {"f:data" {"f:t" 2
+                           "f:assert" [{"ex:foo" 3, "id" "_:fdb-4"}],
+                           "f:retract" []}}
+                {"f:data" {"f:t" 3
+                           "f:assert" [{"ex:foo" 5, "id" "_:fdb-6"}],
+                           "f:retract" []}}]
                @(fluree/history ledger {:context context
                                         :data    true
                                         :t       {:from 1 :to :latest}}))))
@@ -1160,7 +1165,8 @@
                    "id"
                    "fluree:db:sha256:bbozj3rqh62e2chzynu575hbxcsmxdpsl2s5c3jxl3iqbtssawoq5"}},
                  "f:data"
-                 {"f:assert"
+                 {"f:t" 1,
+                  "f:assert"
                   [{"f:role" {"id" "ex:rootRole"},
                     "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
                    {"type"        "ex:Yeti",
@@ -1205,7 +1211,9 @@
                    "f:size"   4906,
                    "f:t"      2,
                    "id" "fluree:db:sha256:b7fcqtfrabf73raflq3ydyag6vjlxwzzdk7umr4l5pdu5pbtnjis"}},
-                 "f:data" {"f:assert" [{"ex:foo" 3, "id" "_:fdb-4"}], "f:retract" []}}
+                 "f:data" {"f:t" 2
+                           "f:assert" [{"ex:foo" 3, "id" "_:fdb-4"}],
+                           "f:retract" []}}
                 {"f:txn"  jws2
                  "f:commit"
                  {"f:alias"  "authortest",
@@ -1226,7 +1234,9 @@
                    "f:size"   8520,
                    "f:t"      3,
                    "id" "fluree:db:sha256:bsfjn7tehnhojgltwopo7ml3boncyq2ebnhvwqmev4uq5hgg3l2x"}},
-                 "f:data" {"f:assert" [{"ex:foo" 5, "id" "_:fdb-6"}], "f:retract" []}}]
+                 "f:data" {"f:t" 3
+                           "f:assert" [{"ex:foo" 5, "id" "_:fdb-6"}],
+                           "f:retract" []}}]
                @(fluree/history ledger {:context context
                                         :txn     true
                                         :data    true
@@ -1260,7 +1270,8 @@
                               "f:t" 1,
                               "id"
                               "fluree:db:sha256:bbozj3rqh62e2chzynu575hbxcsmxdpsl2s5c3jxl3iqbtssawoq5"}},
-                 "f:data" {"f:assert"
+                 "f:data" {"f:t" 1,
+                           "f:assert"
                            [{"f:role" {"id" "ex:rootRole"},
                              "id" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
                             {"type" "ex:Yeti",
@@ -1320,7 +1331,8 @@
                               "f:t" 1,
                               "id"
                               "fluree:db:sha256:bbozj3rqh62e2chzynu575hbxcsmxdpsl2s5c3jxl3iqbtssawoq5"}}
-                 "f:data" {"f:assert"
+                 "f:data" {"f:t" 1,
+                           "f:assert"
                            [{"f:role" {"id" "ex:rootRole"},
                              "id" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
                             {"type" "ex:Yeti",
