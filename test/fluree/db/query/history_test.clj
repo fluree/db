@@ -1048,69 +1048,62 @@
                                         :txn     true
                                         :t       {:from 1 :to :latest}}))))
       (testing ":commit returns just the commit wrapper"
-        (is (= [{"f:commit"
-                 {"f:alias"  "authortest",
-                  "f:time"   720000,
-                  "f:previous" {"id" "fluree:commit:sha256:bku3fg5vpmre72rxdeklap5ckbxidyne7zz6ncurg2niwy5264ih"},
-                  "id" "fluree:commit:sha256:bbqny7mff6byds77crqwbpq7bukzrki6sdzbiwro2c24xpc36gv2a"
-                  "f:v"      0,
-                  "f:branch" "main",
-                  "f:address" "fluree:memory://7a209c60839afefae379863296b698aa5bf38eea9a23537806b637d749899196"
-                  "f:data"
-                  {"f:address"
-                   "fluree:memory://06b103176ccba03d7615b63a1dc0e1efad45cf4804f37d18f9d4151558f38a60",
-                   "f:flakes" 16,
-                   "f:previous"
-                   {"id"
-                    "fluree:db:sha256:beuoec4c6zqxfjglld3evwjdtavsdktncoh6bbxiz677cc4zz3qr"},
-                   "f:size"   1902,
-                   "f:t"      1,
-                   "id"
-                   "fluree:db:sha256:bbozj3rqh62e2chzynu575hbxcsmxdpsl2s5c3jxl3iqbtssawoq5"}}}
-                {"f:commit"
-                 {"f:alias"  "authortest",
-                  "f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-                  "f:time"   720000,
-                  "f:txn"
-                  "fluree:memory://cba3a98584459b25115f12e11b30f504f6f985d82979f1f16fb1e2d3158ff659",
-                  "f:previous" {"id" "fluree:commit:sha256:bbqny7mff6byds77crqwbpq7bukzrki6sdzbiwro2c24xpc36gv2a"},
-                  "id" "fluree:commit:sha256:bbx2zcis3nuxi4xyyshvg45wrjz2istdocnd2eawjzw2tz4ekwmaq"
-                  "f:v"      0,
-                  "f:branch" "main",
-                  "f:address" "fluree:memory://308b1fecb30f0151230a314c681db46f23b44c7a17dd4cef79ffa4bff20c4cb1"
-                  "f:data"
-                  {"f:address" "fluree:memory://9083d154b0235031424ef66d9bce5c3ce3c02b6f2acc595541afe0f5cf49efee"
-                   "f:flakes" 29,
-                   "f:previous"
-                   {"id"
-                    "fluree:db:sha256:bbozj3rqh62e2chzynu575hbxcsmxdpsl2s5c3jxl3iqbtssawoq5"},
-                   "f:size"   4906,
-                   "f:t"      2,
-                   "id" "fluree:db:sha256:b7fcqtfrabf73raflq3ydyag6vjlxwzzdk7umr4l5pdu5pbtnjis"}}}
-                {"f:commit"
-                 {"f:alias"  "authortest",
-                  "f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-                  "f:time"   720000,
-                  "f:txn"
-                  "fluree:memory://69063190b0a67fc6352ce405a28a76617bacfdd976a6d98eccd6dd0b78cf6f37",
-                  "f:previous" {"id" "fluree:commit:sha256:bbx2zcis3nuxi4xyyshvg45wrjz2istdocnd2eawjzw2tz4ekwmaq"},
-                  "id" "fluree:commit:sha256:bbncvid2dq2abcl4h23mnwixs7wg65of4gnowub5plg7r5xmwugbw"
-                  "f:v"      0,
-                  "f:branch" "main",
-                  "f:address" "fluree:memory://b50638cebc79c904766e9527f46891e7d06c376b058fbf7ab008e9cc54f8861e"
-                  "f:data"
-                  {"f:address" "fluree:memory://6c1de9ab6995e04f16ada3712d43bc14f54ec469dcb63022ea85d0c05d64cb13"
-                   "f:flakes" 44,
-                   "f:previous" {"id" "fluree:db:sha256:b7fcqtfrabf73raflq3ydyag6vjlxwzzdk7umr4l5pdu5pbtnjis"},
-                   "f:size"   8520,
-                   "f:t"      3,
-                   "id" "fluree:db:sha256:bsfjn7tehnhojgltwopo7ml3boncyq2ebnhvwqmev4uq5hgg3l2x"}}}]
-               @(fluree/history ledger {:context context
-                                        :commit  true
-                                        :t       {:from 1 :to :latest}}))))
+        (is (pred-match?
+              [{"f:commit"
+                {"f:alias"    "authortest",
+                 "f:time"     720000,
+                 "f:previous" {"id" test-utils/commit-id?},
+                 "id"         test-utils/commit-id?
+                 "f:v"        0,
+                 "f:branch"   "main",
+                 "f:address"  test-utils/address?
+                 "f:data"
+                 {"f:address"  test-utils/address?
+                  "f:flakes"   16,
+                  "f:previous" {"id" test-utils/db-id?},
+                  "f:size"     pos-int?,
+                  "f:t"        1,
+                  "id"         test-utils/db-id?}}}
+               {"f:commit"
+                {"f:alias"    "authortest",
+                 "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                 "f:time"     720000,
+                 "f:txn"      test-utils/address?
+                 "f:previous" {"id" test-utils/commit-id?}
+                 "id"         test-utils/commit-id?
+                 "f:v"        0,
+                 "f:branch"   "main",
+                 "f:address"  test-utils/address?
+                 "f:data"
+                 {"f:address"  test-utils/address?
+                  "f:flakes"   29,
+                  "f:previous" {"id" test-utils/db-id?},
+                  "f:size"     pos-int?
+                  "f:t"        2,
+                  "id"         test-utils/db-id?}}}
+               {"f:commit"
+                {"f:alias"    "authortest",
+                 "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                 "f:time"     720000,
+                 "f:txn"      test-utils/address?
+                 "f:previous" {"id" test-utils/commit-id?},
+                 "id"         test-utils/commit-id?
+                 "f:v"        0,
+                 "f:branch"   "main",
+                 "f:address"  test-utils/address?
+                 "f:data"
+                 {"f:address"  test-utils/address?
+                  "f:flakes"   44,
+                  "f:previous" {"id" test-utils/db-id?},
+                  "f:size"     pos-int?,
+                  "f:t"        3,
+                  "id"         test-utils/db-id?}}}]
+              @(fluree/history ledger {:context context
+                                       :commit  true
+                                       :t       {:from 1 :to :latest}}))))
       (testing ":data returns just the asserts and retracts"
         (is (= [{"f:data"
-                 {"f:t" 1
+                 {"f:t"       1
                   "f:assert"
                   [{"f:role" {"id" "ex:rootRole"},
                     "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
@@ -1134,234 +1127,212 @@
                     "f:targetNode" {"id" "f:allNodes"},
                     "id"           "ex:rootPolicy"}],
                   "f:retract" []}}
-                {"f:data" {"f:t" 2
-                           "f:assert" [{"ex:foo" 3, "id" "_:fdb-4"}],
+                {"f:data" {"f:t"       2
+                           "f:assert"  [{"ex:foo" 3, "id" "_:fdb-4"}],
                            "f:retract" []}}
-                {"f:data" {"f:t" 3
-                           "f:assert" [{"ex:foo" 5, "id" "_:fdb-6"}],
+                {"f:data" {"f:t"       3
+                           "f:assert"  [{"ex:foo" 5, "id" "_:fdb-6"}],
                            "f:retract" []}}]
                @(fluree/history ledger {:context context
                                         :data    true
                                         :t       {:from 1 :to :latest}}))))
       (testing ":commit :data :and txn can be composed together"
-        (is (= [{"f:txn" nil
-                 "f:commit"
-                 {"f:alias"  "authortest",
-                  "f:time"   720000,
-                  "f:previous" {"id" "fluree:commit:sha256:bku3fg5vpmre72rxdeklap5ckbxidyne7zz6ncurg2niwy5264ih"},
-                  "id" "fluree:commit:sha256:bbqny7mff6byds77crqwbpq7bukzrki6sdzbiwro2c24xpc36gv2a"
-                  "f:v"      0,
-                  "f:branch" "main",
-                  "f:address" "fluree:memory://7a209c60839afefae379863296b698aa5bf38eea9a23537806b637d749899196"
-                  "f:data"
-                  {"f:address"
-                   "fluree:memory://06b103176ccba03d7615b63a1dc0e1efad45cf4804f37d18f9d4151558f38a60",
-                   "f:flakes" 16,
-                   "f:previous"
-                   {"id"
-                    "fluree:db:sha256:beuoec4c6zqxfjglld3evwjdtavsdktncoh6bbxiz677cc4zz3qr"},
-                   "f:size"   1902,
-                   "f:t"      1,
-                   "id"
-                   "fluree:db:sha256:bbozj3rqh62e2chzynu575hbxcsmxdpsl2s5c3jxl3iqbtssawoq5"}},
+        (is (pred-match?
+              [{"f:txn" nil
+                "f:commit"
+                {"f:alias"    "authortest",
+                 "f:time"     720000,
+                 "f:previous" {"id" test-utils/commit-id?},
+                 "id"         test-utils/commit-id?
+                 "f:v"        0,
+                 "f:branch"   "main",
+                 "f:address"  test-utils/address?
                  "f:data"
-                 {"f:t" 1,
-                  "f:assert"
-                  [{"f:role" {"id" "ex:rootRole"},
-                    "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
-                   {"type"        "ex:Yeti",
-                    "schema:age"  55,
-                    "schema:name" "Betty",
-                    "id"          "ex:betty"}
-                   {"type"        "ex:Yeti",
-                    "schema:age"  1002,
-                    "schema:name" "Freddy",
-                    "id"          "ex:freddy"}
-                   {"type"        "ex:Yeti",
-                    "schema:age"  38,
-                    "schema:name" "Leticia",
-                    "id"          "ex:letty"}
-                   {"f:action"     [{"id" "f:modify"} {"id" "f:view"}],
-                    "f:targetRole" {"id" "ex:rootRole"},
-                    "id"           "ex:rootAccessAllow"}
-                   {"type"         "f:Policy",
-                    "f:allow"      {"id" "ex:rootAccessAllow"},
-                    "f:targetNode" {"id" "f:allNodes"},
-                    "id"           "ex:rootPolicy"}],
-                  "f:retract" []}}
-                {"f:txn"  jws1
-                 "f:commit"
-                 {"f:alias"  "authortest",
-                  "f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-                  "f:time"   720000,
-                  "f:txn"
-                  "fluree:memory://cba3a98584459b25115f12e11b30f504f6f985d82979f1f16fb1e2d3158ff659",
-                  "f:previous"
-                  {"id" "fluree:commit:sha256:bbqny7mff6byds77crqwbpq7bukzrki6sdzbiwro2c24xpc36gv2a"},
-                  "id" "fluree:commit:sha256:bbx2zcis3nuxi4xyyshvg45wrjz2istdocnd2eawjzw2tz4ekwmaq"
-                  "f:v"      0,
-                  "f:branch" "main",
-                  "f:address" "fluree:memory://308b1fecb30f0151230a314c681db46f23b44c7a17dd4cef79ffa4bff20c4cb1"
-                  "f:data"
-                  {"f:address" "fluree:memory://9083d154b0235031424ef66d9bce5c3ce3c02b6f2acc595541afe0f5cf49efee"
-                   "f:flakes" 29
-                   "f:previous"
-                   {"id"
-                    "fluree:db:sha256:bbozj3rqh62e2chzynu575hbxcsmxdpsl2s5c3jxl3iqbtssawoq5"},
-                   "f:size"   4906,
-                   "f:t"      2,
-                   "id" "fluree:db:sha256:b7fcqtfrabf73raflq3ydyag6vjlxwzzdk7umr4l5pdu5pbtnjis"}},
-                 "f:data" {"f:t" 2
-                           "f:assert" [{"ex:foo" 3, "id" "_:fdb-4"}],
-                           "f:retract" []}}
-                {"f:txn"  jws2
-                 "f:commit"
-                 {"f:alias"  "authortest",
-                  "f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-                  "f:time"   720000,
-                  "f:txn"
-                  "fluree:memory://69063190b0a67fc6352ce405a28a76617bacfdd976a6d98eccd6dd0b78cf6f37",
-                  "f:previous" {"id" "fluree:commit:sha256:bbx2zcis3nuxi4xyyshvg45wrjz2istdocnd2eawjzw2tz4ekwmaq"},
-                  "id" "fluree:commit:sha256:bbncvid2dq2abcl4h23mnwixs7wg65of4gnowub5plg7r5xmwugbw"
-                  "f:v"      0,
-                  "f:branch" "main",
-                  "f:address" "fluree:memory://b50638cebc79c904766e9527f46891e7d06c376b058fbf7ab008e9cc54f8861e"
-                  "f:data"
-                  {"f:address" "fluree:memory://6c1de9ab6995e04f16ada3712d43bc14f54ec469dcb63022ea85d0c05d64cb13"
-                   "f:flakes" 44,
-                   "f:previous"
-                   {"id" "fluree:db:sha256:b7fcqtfrabf73raflq3ydyag6vjlxwzzdk7umr4l5pdu5pbtnjis"},
-                   "f:size"   8520,
-                   "f:t"      3,
-                   "id" "fluree:db:sha256:bsfjn7tehnhojgltwopo7ml3boncyq2ebnhvwqmev4uq5hgg3l2x"}},
-                 "f:data" {"f:t" 3
-                           "f:assert" [{"ex:foo" 5, "id" "_:fdb-6"}],
-                           "f:retract" []}}]
-               @(fluree/history ledger {:context context
-                                        :txn     true
-                                        :data    true
-                                        :commit  true
-                                        :t       {:from 1 :to :latest}}))))
+                 {"f:address"  test-utils/address?
+                  "f:flakes"   16,
+                  "f:previous" {"id" test-utils/db-id?},
+                  "f:size"     pos-int?
+                  "f:t"        1,
+                  "id"         test-utils/db-id?}},
+                "f:data"
+                {"f:t"       1,
+                 "f:assert"
+                 [{"f:role" {"id" "ex:rootRole"},
+                   "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
+                  {"type"        "ex:Yeti",
+                   "schema:age"  55,
+                   "schema:name" "Betty",
+                   "id"          "ex:betty"}
+                  {"type"        "ex:Yeti",
+                   "schema:age"  1002,
+                   "schema:name" "Freddy",
+                   "id"          "ex:freddy"}
+                  {"type"        "ex:Yeti",
+                   "schema:age"  38,
+                   "schema:name" "Leticia",
+                   "id"          "ex:letty"}
+                  {"f:action"     [{"id" "f:modify"} {"id" "f:view"}],
+                   "f:targetRole" {"id" "ex:rootRole"},
+                   "id"           "ex:rootAccessAllow"}
+                  {"type"         "f:Policy",
+                   "f:allow"      {"id" "ex:rootAccessAllow"},
+                   "f:targetNode" {"id" "f:allNodes"},
+                   "id"           "ex:rootPolicy"}],
+                 "f:retract" []}}
+               {"f:txn"  jws1
+                "f:commit"
+                {"f:alias"    "authortest",
+                 "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                 "f:time"     720000,
+                 "f:txn"      test-utils/address?
+                 "f:previous" {"id" test-utils/commit-id?},
+                 "id"         test-utils/commit-id?
+                 "f:v"        0,
+                 "f:branch"   "main",
+                 "f:address"  test-utils/address?
+                 "f:data"
+                 {"f:address"  test-utils/address?
+                  "f:flakes"   29,
+                  "f:previous" {"id" test-utils/db-id?},
+                  "f:size"     pos-int?
+                  "f:t"        2,
+                  "id"         test-utils/db-id?}},
+                "f:data" {"f:t"       2
+                          "f:assert"  [{"ex:foo" 3, "id" "_:fdb-4"}],
+                          "f:retract" []}}
+               {"f:txn"  jws2
+                "f:commit"
+                {"f:alias"    "authortest",
+                 "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                 "f:time"     720000,
+                 "f:txn"      test-utils/address?
+                 "f:previous" {"id" test-utils/commit-id?},
+                 "id"         test-utils/commit-id?
+                 "f:v"        0,
+                 "f:branch"   "main",
+                 "f:address"  test-utils/address?
+                 "f:data"
+                 {"f:address"  test-utils/address?
+                  "f:flakes"   44,
+                  "f:previous" {"id" test-utils/db-id?},
+                  "f:size"     pos-int?
+                  "f:t"        3,
+                  "id"         test-utils/db-id?}},
+                "f:data" {"f:t"       3
+                          "f:assert"  [{"ex:foo" 5, "id" "_:fdb-6"}],
+                          "f:retract" []}}]
+              @(fluree/history ledger {:context context
+                                       :txn     true
+                                       :data    true
+                                       :commit  true
+                                       :t       {:from 1 :to :latest}}))))
       (testing ":commit :data :and txn can be composed together with history"
-        (is (= [{"f:t" 1,
-                 "f:assert" [{"type" "ex:Yeti",
-                              "schema:age" 1002,
+        (is (pred-match?
+              [{"f:t"       1,
+                "f:assert"  [{"type"        "ex:Yeti",
+                              "schema:age"  1002,
                               "schema:name" "Freddy",
-                              "id" "ex:freddy"}],
-                 "f:retract" [],
-                 "f:txn" nil,
-                 "f:commit" {"f:alias" "authortest",
-                             "f:time" 720000,
-                             "f:previous"
-                             {"id"
-                              "fluree:commit:sha256:bku3fg5vpmre72rxdeklap5ckbxidyne7zz6ncurg2niwy5264ih"},
-                             "id" "fluree:commit:sha256:bbqny7mff6byds77crqwbpq7bukzrki6sdzbiwro2c24xpc36gv2a"
-                             "f:v" 0,
-                             "f:branch" "main",
-                             "f:address" "fluree:memory://7a209c60839afefae379863296b698aa5bf38eea9a23537806b637d749899196"
+                              "id"          "ex:freddy"}],
+                "f:retract" [],
+                "f:txn"     nil,
+                "f:commit"  {"f:alias"    "authortest",
+                             "f:time"     720000,
+                             "f:previous" {"id" test-utils/commit-id?},
+                             "id"         test-utils/commit-id?
+                             "f:v"        0,
+                             "f:branch"   "main",
+                             "f:address"  test-utils/address?
                              "f:data"
-                             {"f:address"
-                              "fluree:memory://06b103176ccba03d7615b63a1dc0e1efad45cf4804f37d18f9d4151558f38a60",
-                              "f:flakes" 16,
-                              "f:previous"
-                              {"id"
-                               "fluree:db:sha256:beuoec4c6zqxfjglld3evwjdtavsdktncoh6bbxiz677cc4zz3qr"},
-                              "f:size" 1902,
-                              "f:t" 1,
-                              "id"
-                              "fluree:db:sha256:bbozj3rqh62e2chzynu575hbxcsmxdpsl2s5c3jxl3iqbtssawoq5"}},
-                 "f:data" {"f:t" 1,
-                           "f:assert"
-                           [{"f:role" {"id" "ex:rootRole"},
-                             "id" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
-                            {"type" "ex:Yeti",
-                             "schema:age" 55,
-                             "schema:name" "Betty",
-                             "id" "ex:betty"}
-                            {"type" "ex:Yeti",
-                             "schema:age" 1002,
-                             "schema:name" "Freddy",
-                             "id" "ex:freddy"}
-                            {"type" "ex:Yeti",
-                             "schema:age" 38,
-                             "schema:name" "Leticia",
-                             "id" "ex:letty"}
-                            {"f:action" [{"id" "f:modify"} {"id" "f:view"}],
-                             "f:targetRole" {"id" "ex:rootRole"},
-                             "id" "ex:rootAccessAllow"}
-                            {"type" "f:Policy",
-                             "f:allow" {"id" "ex:rootAccessAllow"},
-                             "f:targetNode" {"id" "f:allNodes"},
-                             "id" "ex:rootPolicy"}],
-                           "f:retract" []}}]
-               @(fluree/history ledger {:context context
-                                        :history "ex:freddy"
-                                        :txn     true
-                                        :data    true
-                                        :commit  true
-                                        :t       {:from 1 :to :latest}}))))
+                             {"f:address"  test-utils/address?
+                              "f:flakes"   16,
+                              "f:previous" {"id" test-utils/db-id?},
+                              "f:size"     pos-int?,
+                              "f:t"        1,
+                              "id"         test-utils/db-id?}},
+                "f:data"    {"f:t"       1,
+                             "f:assert"
+                             [{"f:role" {"id" "ex:rootRole"},
+                               "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
+                              {"type"        "ex:Yeti",
+                               "schema:age"  55,
+                               "schema:name" "Betty",
+                               "id"          "ex:betty"}
+                              {"type"        "ex:Yeti",
+                               "schema:age"  1002,
+                               "schema:name" "Freddy",
+                               "id"          "ex:freddy"}
+                              {"type"        "ex:Yeti",
+                               "schema:age"  38,
+                               "schema:name" "Leticia",
+                               "id"          "ex:letty"}
+                              {"f:action"     [{"id" "f:modify"} {"id" "f:view"}],
+                               "f:targetRole" {"id" "ex:rootRole"},
+                               "id"           "ex:rootAccessAllow"}
+                              {"type"         "f:Policy",
+                               "f:allow"      {"id" "ex:rootAccessAllow"},
+                               "f:targetNode" {"id" "f:allNodes"},
+                               "id"           "ex:rootPolicy"}],
+                             "f:retract" []}}]
+              @(fluree/history ledger {:context context
+                                       :history "ex:freddy"
+                                       :txn     true
+                                       :data    true
+                                       :commit  true
+                                       :t       {:from 1 :to :latest}}))))
       (testing ":commit :data :and txn can be composed together with commit-details"
-        (is (= [{"f:t" 1,
-                 "f:assert" [{"type" "ex:Yeti",
-                              "schema:age" 1002,
+        (is (pred-match?
+              [{"f:t"       1,
+                "f:assert"  [{"type"        "ex:Yeti",
+                              "schema:age"  1002,
                               "schema:name" "Freddy",
-                              "id" "ex:freddy"}],
-                 "f:retract" [],
-                 "f:txn" nil,
-                 "f:commit" {"f:alias" "authortest",
-                             "f:author" "",
-                             "f:time" 720000,
-                             "f:previous"
-                             {"id"
-                              "fluree:commit:sha256:bku3fg5vpmre72rxdeklap5ckbxidyne7zz6ncurg2niwy5264ih"},
-                             "id"
-                             "fluree:commit:sha256:bb25t37mxaum2u7nfxccasdbsqevbeco74p2dt3is2w66cxah5m52",
-                             "f:v" 0,
-                             "f:branch" "main",
-                             "f:address"
-                             "fluree:memory://3c501c97724a2366bd16540dd16818aad934728294446fba35667bd663f710e3",
+                              "id"          "ex:freddy"}],
+                "f:retract" [],
+                "f:txn"     nil,
+                "f:commit"  {"f:alias"    "authortest",
+                             "f:time"     720000,
+                             "f:previous" {"id" test-utils/commit-id?},
+                             "id"         test-utils/commit-id?
+                             "f:v"        0,
+                             "f:branch"   "main",
+                             "f:address"  test-utils/address?
                              "f:data"
-                             {"f:address"
-                              "fluree:memory://06b103176ccba03d7615b63a1dc0e1efad45cf4804f37d18f9d4151558f38a60",
-                              "f:flakes" 16,
-                              "f:previous"
-                              {"id"
-                               "fluree:db:sha256:beuoec4c6zqxfjglld3evwjdtavsdktncoh6bbxiz677cc4zz3qr"},
-                              "f:size" 1902,
-                              "f:t" 1,
-                              "id"
-                              "fluree:db:sha256:bbozj3rqh62e2chzynu575hbxcsmxdpsl2s5c3jxl3iqbtssawoq5"}}
-                 "f:data" {"f:t" 1,
-                           "f:assert"
-                           [{"f:role" {"id" "ex:rootRole"},
-                             "id" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
-                            {"type" "ex:Yeti",
-                             "schema:age" 55,
-                             "schema:name" "Betty",
-                             "id" "ex:betty"}
-                            {"type" "ex:Yeti",
-                             "schema:age" 1002,
-                             "schema:name" "Freddy",
-                             "id" "ex:freddy"}
-                            {"type" "ex:Yeti",
-                             "schema:age" 38,
-                             "schema:name" "Leticia",
-                             "id" "ex:letty"}
-                            {"f:action" [{"id" "f:modify"} {"id" "f:view"}],
-                             "f:targetRole" {"id" "ex:rootRole"},
-                             "id" "ex:rootAccessAllow"}
-                            {"type" "f:Policy",
-                             "f:allow" {"id" "ex:rootAccessAllow"},
-                             "f:targetNode" {"id" "f:allNodes"},
-                             "id" "ex:rootPolicy"}],
-                           "f:retract" []}}]
-               @(fluree/history ledger {:context context
-                                        :history "ex:freddy"
-                                        :commit-details true
-                                        :txn     true
-                                        :data    true
-                                        :commit  true
-                                        :t       {:from 1 :to :latest}})))))))
+                             {"f:address"  test-utils/address?
+                              "f:flakes"   16,
+                              "f:previous" {"id" test-utils/db-id?},
+                              "f:size"     pos-int?
+                              "f:t"        1,
+                              "id"         test-utils/db-id?}}
+                "f:data"    {"f:t"       1,
+                             "f:assert"
+                             [{"f:role" {"id" "ex:rootRole"},
+                               "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
+                              {"type"        "ex:Yeti",
+                               "schema:age"  55,
+                               "schema:name" "Betty",
+                               "id"          "ex:betty"}
+                              {"type"        "ex:Yeti",
+                               "schema:age"  1002,
+                               "schema:name" "Freddy",
+                               "id"          "ex:freddy"}
+                              {"type"        "ex:Yeti",
+                               "schema:age"  38,
+                               "schema:name" "Leticia",
+                               "id"          "ex:letty"}
+                              {"f:action"     [{"id" "f:modify"} {"id" "f:view"}],
+                               "f:targetRole" {"id" "ex:rootRole"},
+                               "id"           "ex:rootAccessAllow"}
+                              {"type"         "f:Policy",
+                               "f:allow"      {"id" "ex:rootAccessAllow"},
+                               "f:targetNode" {"id" "f:allNodes"},
+                               "id"           "ex:rootPolicy"}],
+                             "f:retract" []}}]
+              @(fluree/history ledger {:context        context
+                                       :history        "ex:freddy"
+                                       :commit-details true
+                                       :txn            true
+                                       :data           true
+                                       :commit         true
+                                       :t              {:from 1 :to :latest}})))))))
 
 (deftest ^:integration txn-annotation
   (let [bnode-counter (atom 0)
