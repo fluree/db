@@ -232,8 +232,7 @@
 (defn query-connection-sparql
   [conn query {:keys [role did] :as opts}]
   (go-try
-    (let [fql              (sparql/->fql query)
-          credentialed-fql (update fql :opts #(merge {:role role :did did} %))]
+    (let [fql (sparql/->fql query)]
       (<? (query-connection-fql conn credentialed-fql opts)))))
 
 (defn query-connection
