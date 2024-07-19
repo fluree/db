@@ -351,8 +351,7 @@
          (and query identity)
          (let [policy-db (<? (policy/wrap-identity-policy latest-db
                                                           identity
-                                                          (or (true? default-allow?)
-                                                              false)
+                                                          default-allow?
                                                           values-map))]
            (<? (query-api/history policy-db query)))
 
