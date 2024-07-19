@@ -6,9 +6,8 @@
             [fluree.db.constants :as const]
             [fluree.db.query.exec.eval :as-alias eval]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.query.json-ld.response :as json-ld-resp]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.core :refer [catch* try*]]
+            [fluree.db.query.exec.select.subject :as subject]
+            [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
             [fluree.db.datatype :as datatype]
@@ -168,8 +167,8 @@
                          (get subj)
                          where/get-iri)
                      subj)]
-      (json-ld-resp/format-node ds iri context compact spec iri-cache
-                                fuel-tracker error-ch))))
+      (subject/format-subject ds iri context compact spec iri-cache
+                              fuel-tracker error-ch))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied

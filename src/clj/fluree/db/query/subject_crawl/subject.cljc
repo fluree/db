@@ -1,7 +1,7 @@
 (ns fluree.db.query.subject-crawl.subject
   (:require [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.db.json-ld.format :as jld-format]
+            [fluree.db.flake.format :as jld-format]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.range :as query-range]
             [fluree.db.index :as index]

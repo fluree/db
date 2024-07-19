@@ -1,17 +1,17 @@
-(ns fluree.db.db.json-ld.history
+(ns fluree.db.flake.history
   (:require [clojure.core.async :as async :refer [go >! <!]]
-            [fluree.db.query.history.parse :as parse]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
-            [fluree.db.db.json-ld.format :as jld-format]
+            [fluree.db.flake.format :as jld-format]
             [fluree.db.flake :as flake]
             [fluree.db.index :as index]
-            [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.iri :as iri]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn s-flakes->json-ld
   "Build a subject map out a set of flakes with the same subject.
