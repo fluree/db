@@ -326,17 +326,18 @@
     (connection/-did conn)))
 
 (defn parse-ledger-options
-  [conn {:keys [did branch]
+  [conn {:keys [did branch indexing]
          :or   {branch :main}}]
-  (let [did*    (parse-did conn did)]
-    {:did     did*
-     :branch  branch}))
+  (let [did* (parse-did conn did)]
+    {:did      did*
+     :branch   branch
+     :indexing indexing}))
 
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [did branch]}
+    (let [{:keys [did branch indexing]}
           (parse-ledger-options conn opts)
 
           ledger-alias*  (normalize-alias ledger-alias)
@@ -345,7 +346,7 @@
           genesis-commit (json-ld/expand
                            (<? (write-genesis-commit conn ledger-alias branch ns-addresses)))
           ;; map of all branches and where they are branched from
-          branches       {branch (branch/state-map conn ledger-alias* branch genesis-commit)}]
+          branches       {branch (branch/state-map conn ledger-alias* branch genesis-commit indexing)}]
       (map->JsonLDLedger
         {:id       (random-uuid)
          :did      did

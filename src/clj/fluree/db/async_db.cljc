@@ -215,11 +215,11 @@
   (:db-chan async-db))
 
 (defn load
-  [conn ledger-alias branch commit-jsonld]
+  [conn ledger-alias branch commit-jsonld indexing-opts]
   (let [commit-map (commit-data/jsonld->clj commit-jsonld)
         t          (-> commit-map :data :t)
         async-db   (->AsyncDB ledger-alias branch commit-map t (async/promise-chan))]
     (go
-      (let [db (<! (flake-db/load conn ledger-alias branch [commit-jsonld commit-map]))]
+      (let [db (<! (flake-db/load conn ledger-alias branch [commit-jsonld commit-map] indexing-opts))]
         (deliver! async-db db)))
     async-db))
