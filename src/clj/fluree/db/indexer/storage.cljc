@@ -68,26 +68,30 @@
     (connection/-index-file-write conn alias :garbage ser)))
 
 (defn write-db-root
-  [db]
-  (let [{:keys [alias conn schema t stats spot post opst tspo
+  [db garbage-addr]
+  (let [{:keys [alias conn schema t stats spot post opst tspo commit
                 namespace-codes reindex-min-bytes reindex-max-bytes]}
         db
-
-        data {:ledger-alias    alias
-              :t               t
-              :v               1 ;; version of db root file
-              :schema          (vocab/serialize-schema schema)
-              :stats           (select-keys stats [:flakes :size])
-              :spot            (child-data spot)
-              :post            (child-data post)
-              :opst            (child-data opst)
-              :tspo            (child-data tspo)
-              :timestamp       (util/current-time-millis)
-              :prevIndex       (or (:indexed stats) 0)
-              :namespace-codes namespace-codes
-              :config {:reindex-min-bytes reindex-min-bytes
-                       :reindex-max-bytes reindex-max-bytes}}
-        ser  (serdeproto/-serialize-db-root (serde conn) data)]
+        prev-idx-t    (-> commit :index :data :t)
+        prev-idx-addr (-> commit :index :address)
+        data          (cond->
+                       {:ledger-alias    alias
+                        :t               t
+                        :v               1 ;; version of db root file
+                        :schema          (vocab/serialize-schema schema)
+                        :stats           (select-keys stats [:flakes :size])
+                        :spot            (child-data spot)
+                        :post            (child-data post)
+                        :opst            (child-data opst)
+                        :tspo            (child-data tspo)
+                        :timestamp       (util/current-time-millis)
+                        :namespace-codes namespace-codes
+                        :config          {:reindex-min-bytes reindex-min-bytes
+                                          :reindex-max-bytes reindex-max-bytes}}
+                       prev-idx-t (assoc :prev-index {:t       prev-idx-t
+                                                      :address prev-idx-addr})
+                       garbage-addr (assoc :garbage garbage-addr))
+        ser           (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn alias :root ser)))
 
 (defn read-branch

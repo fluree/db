@@ -366,8 +366,7 @@
                                        (let [write-res (<? (storage/write-garbage refreshed-db* garbage))]
                                          (<! (notify-new-index-file write-res :garbage t changes-ch))
                                          write-res))
-                       ;; TODO - WRITE GARBAGE INTO INDEX ROOT!!!
-                       db-root-res   (<? (storage/write-db-root refreshed-db*))
+                       db-root-res   (<? (storage/write-db-root refreshed-db* (:address garbage-res)))
                        _             (<! (notify-new-index-file db-root-res :root t changes-ch))
 
                        index-address (:address db-root-res)
