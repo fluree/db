@@ -91,7 +91,7 @@
                                           :reindex-max-bytes reindex-max-bytes}}
                        prev-idx-t (assoc :prev-index {:t       prev-idx-t
                                                       :address prev-idx-addr})
-                       garbage-addr (assoc :garbage garbage-addr))
+                       garbage-addr (assoc-in [:garbage :address] garbage-addr))
         ser           (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn alias :root ser)))
 
