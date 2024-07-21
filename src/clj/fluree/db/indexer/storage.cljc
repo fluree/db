@@ -59,9 +59,10 @@
 (defn write-garbage
   "Writes garbage record out for latest index."
   [db garbage]
-  (let [{:keys [alias conn t]} db
+  (let [{:keys [alias branch conn t]} db
 
-        data {:ledger-alias alias
+        data {:alias        alias
+              :branch       branch
               :t            t
               :garbage      garbage}
         ser  (serdeproto/-serialize-garbage (serde conn) data)]
