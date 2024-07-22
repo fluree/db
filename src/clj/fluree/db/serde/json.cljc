@@ -143,6 +143,12 @@
                             v)))
     {} m))
 
+(defn serialize-garbage
+  [{:keys [alias branch t garbage]}]
+  {"alias"   alias
+   "branch"  (name branch)
+   "t"       t
+   "garbage" (vec garbage)})
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
@@ -151,7 +157,7 @@
       (fn [acc k v]
         (assoc acc (name k)
                    (case k
-                     (:stats :config)
+                     (:stats :config :garbage :prev-index)
                      (util/stringify-keys v)
 
                      (:spot :post :opst :tspo)
@@ -169,8 +175,8 @@
     {"flakes" (map serialize-flake (:flakes leaf))})
   (-deserialize-leaf [_ leaf]
     (deserialize-leaf-node leaf))
-  (-serialize-garbage [_ garbage]
-    (util/stringify-keys garbage))
+  (-serialize-garbage [_ garbage-map]
+    (serialize-garbage garbage-map))
   (-deserialize-garbage [_ garbage]
     (deserialize-garbage garbage)))
 
