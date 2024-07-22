@@ -2,7 +2,8 @@
   (:require [clojure.core.async :as async]
             [fluree.db.query.history.parse :as parse]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.log :as log]))
 
 (defn find-t-endpoints
   [db {:keys [from to at] :as _t}]
@@ -38,5 +39,7 @@
           result-ch     (if history
                           (-history db context from-t to-t commit-details include error-ch history)
                           (-commits db context from-t to-t include error-ch))]
+      (when commit-details
+        (log/warn "DEPRECATED history option `commit-details` superseded by options `commit`, `data`, and `txn`."))
       (async/alt! result-ch ([result] result)
                   error-ch  ([e] e)))))
