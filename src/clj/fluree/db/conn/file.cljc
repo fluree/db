@@ -36,10 +36,11 @@
        :size    (count json)
        :address address})))
 
-(defn read-data [conn address keywordize?]
+(defn read-data
+  [conn address keywordize?]
   (go-try
-    (-> (<? (storage/read (:store conn) address))
-        (json/parse keywordize?))))
+   (some-> (<? (storage/read (:store conn) address))
+           (json/parse keywordize?))))
 
 (defn delete-data
   "Will throw if not deleted."
