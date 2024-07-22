@@ -75,22 +75,24 @@
   dependent on the frequency and size of updates that is ledger-specific
   against the ledger's 'reindex-min-bytes' setting."
   [{:keys [conn commit] :as _db} max-indexes]
-  (go-try
-   (assert (and (int? max-indexes)
-                (>= max-indexes 0)))
-   (let [all-garbage (<? (trace-idx-roots conn commit))
-         to-clean    (->> all-garbage
-                          (drop max-indexes)
-                          (sort-by :t)) ;; clean oldest 't' value first
-         start-time  (util/current-time-millis)]
-     (if (empty? to-clean)
-       (log/debug "Clean-garbage called, but no garbage to clean.")
-       (do
-         (log/info "Starting garbage collection of oldest"
-                   (count to-clean) "indexes.")
-         (doseq [next-garbage to-clean]
-           (<! (clean-garbage-record conn next-garbage)))
-         (log/info "Finished garbage collection of oldest"
-                   (count to-clean) "indexes in"
-                   (- (util/current-time-millis) start-time) "ms.")
-         :done)))))
+  (go
+    (if (and (int? max-indexes) (>= max-indexes 0))
+      (let [all-garbage (<? (trace-idx-roots conn commit))
+            to-clean    (->> all-garbage
+                             (drop max-indexes)
+                             (sort-by :t)) ;; clean oldest 't' value first
+            start-time  (util/current-time-millis)]
+        (if (empty? to-clean)
+          (log/debug "Clean-garbage called, but no garbage to clean.")
+          (do
+            (log/info "Starting garbage collection of oldest"
+                      (count to-clean) "indexes.")
+            (doseq [next-garbage to-clean]
+              (<! (clean-garbage-record conn next-garbage)))
+            (log/info "Finished garbage collection of oldest"
+                      (count to-clean) "indexes in"
+                      (- (util/current-time-millis) start-time) "ms.")
+            :done)))
+      ;; Unexpected setting. In async chan, don't throw.
+      (ex-info (str "Setting for max-old-indexes should be >=0, instead received: " max-indexes)
+               {:status 500 :error :db/unexpected-error}))))
