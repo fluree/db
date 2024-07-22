@@ -151,7 +151,7 @@
       (fn [acc k v]
         (assoc acc (name k)
                    (case k
-                     :stats
+                     (:stats :config)
                      (util/stringify-keys v)
 
                      (:spot :post :opst :tspo)

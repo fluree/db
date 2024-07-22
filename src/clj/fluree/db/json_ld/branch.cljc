@@ -37,7 +37,7 @@
 (defn load-db
   [conn alias branch commit]
   (let [commit-jsonld (commit-map->commit-jsonld commit)]
-    (async-db/load conn alias branch commit-jsonld)))
+    (async-db/load conn alias branch commit-jsonld nil)))
 
 (defn update-index
   [{current-commit :commit, :as current-state}
@@ -96,17 +96,19 @@
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
-  [conn ledger-alias branch-name commit-jsonld]
-  (let [initial-db (async-db/load conn ledger-alias branch-name commit-jsonld)
-        commit-map (commit-data/jsonld->clj commit-jsonld)
-        state      (atom {:commit     commit-map
-                          :current-db initial-db})
-        idx-q      (index-queue conn ledger-alias branch-name state)]
-    {:name        branch-name
-     :conn        conn
-     :alias       ledger-alias
-     :state       state
-     :index-queue idx-q}))
+  ([conn ledger-alias branch-name commit-jsonld]
+   (state-map conn ledger-alias branch-name commit-jsonld nil))
+  ([conn ledger-alias branch-name commit-jsonld indexing-opts]
+   (let [initial-db (async-db/load conn ledger-alias branch-name commit-jsonld indexing-opts)
+         commit-map (commit-data/jsonld->clj commit-jsonld)
+         state      (atom {:commit     commit-map
+                           :current-db initial-db})
+         idx-q      (index-queue conn ledger-alias branch-name state)]
+     {:name        branch-name
+      :conn        conn
+      :alias       ledger-alias
+      :state       state
+      :index-queue idx-q})))
 
 (defn next-commit?
   [current-commit new-commit]

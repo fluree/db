@@ -534,19 +534,37 @@
           (recur r new-db))
         db))))
 
+(defn add-reindex-thresholds
+  "Adds reindexing thresholds to the root map.
+
+  Gives preference to indexing-opts param, which is passed in
+  when creating a new ledger.
+
+  If no indexing opts are present, looks for latest setting
+  written at latest index root and uses that.
+
+  Else, uses default values."
+  [{:keys [config] :as root-map} indexing-opts]
+  (let [reindex-min-bytes (or (:reindex-min-bytes indexing-opts)
+                              (:reindex-min-bytes config)
+                              100000) ; 100 kb
+        reindex-max-bytes (or (:reindex-max-bytes indexing-opts)
+                              (:reindex-max-bytes config)
+                              1000000)] ; 1mb
+    (assoc root-map :reindex-min-bytes reindex-min-bytes
+                    :reindex-max-bytes reindex-max-bytes)))
+
 (defn load
   ([conn ledger-alias branch commit-pair]
    (load conn ledger-alias branch commit-pair {}))
-  ([conn ledger-alias branch [commit-jsonld commit-map]
-    {:keys [reindex-min-bytes reindex-max-bytes]
-     :or   {reindex-min-bytes 100000 ; 100 kb
-            reindex-max-bytes 1000000}}] ; 1 mb
+  ([conn ledger-alias branch [commit-jsonld commit-map] indexing-opts]
    (go-try
      (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root conn address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
            indexed-db  (-> root-map
+                           (add-reindex-thresholds indexing-opts)
                            (assoc :conn conn
                                   :alias ledger-alias
                                   :branch branch
@@ -555,9 +573,7 @@
                                   :comparators index/comparators
                                   :staged []
                                   :novelty (new-novelty-map index/comparators)
-                                  :max-namespace-code max-ns-code
-                                  :reindex-min-bytes reindex-min-bytes
-                                  :reindex-max-bytes reindex-max-bytes)
+                                  :max-namespace-code max-ns-code)
                            map->FlakeDB
                            policy/root)
            indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map

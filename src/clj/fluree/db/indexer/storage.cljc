@@ -70,7 +70,7 @@
 (defn write-db-root
   [db]
   (let [{:keys [alias conn schema t stats spot post opst tspo
-                namespace-codes]}
+                namespace-codes reindex-min-bytes reindex-max-bytes]}
         db
 
         data {:ledger-alias    alias
@@ -84,7 +84,9 @@
               :tspo            (child-data tspo)
               :timestamp       (util/current-time-millis)
               :prevIndex       (or (:indexed stats) 0)
-              :namespace-codes namespace-codes}
+              :namespace-codes namespace-codes
+              :config {:reindex-min-bytes reindex-min-bytes
+                       :reindex-max-bytes reindex-max-bytes}}
         ser  (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn alias :root ser)))
 
