@@ -419,7 +419,7 @@
   indexer/Indexable
   (index [db changes-ch]
     (if (idx-default/novelty-min? db reindex-min-bytes)
-      (idx-default/refresh db changes-ch)
+      (idx-default/refresh db changes-ch max-old-indexes)
       (go)))
 
   TimeTravel

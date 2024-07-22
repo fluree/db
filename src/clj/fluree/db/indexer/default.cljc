@@ -1,6 +1,7 @@
 (ns fluree.db.indexer.default
   (:require [fluree.db.index :as index]
             [fluree.db.indexer.storage :as storage]
+            [fluree.db.indexer.garbage :as garbage]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [clojure.core.async :as async :refer [<! >! go go-loop]]
@@ -339,7 +340,7 @@
         (async/reduce tally {:db db, :indexes [], :garbage #{}}))))
 
 (defn refresh
-  [{:keys [novelty t alias] :as db} changes-ch]
+  [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
   (go-try
     (let [start-time-ms (util/current-time-millis)
           novelty-size  (:size novelty)
@@ -383,5 +384,8 @@
                                             :address (:address db-root-res)
                                             :garbage (:address garbage-res))]
                    (log/info "Index refresh complete:" end-stats)
+                   ;; kick off automatic garbage collection
+                   (async/thread
+                    (garbage/clean-garbage indexed-db max-old-indexes))
                    indexed-db)))))
         db))))
