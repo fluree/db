@@ -65,10 +65,15 @@
 
 (defn clean-garbage
   "Cleans up garbage data for old indexes, but retains
-  the last `max-indexes` indexes. Note that if not retaining
-  at least one prior index, current queries or handles on the latest
-  db might fail, therefore `max-indexes` is recommended to typically
-  be 1 or more."
+  the most recent `max-indexes` indexes.
+
+  Note that any db's held as a variable will rely on the index-root
+  from when they were pulled from the ledger via (fluree/db <ledger>).
+  If these db vars are held over time, you might want to adjust this
+  setting such that old index-roots are not garbage collected during that
+  expected timeframe. The frequency of new indexes being created is
+  dependent on the frequency and size of updates that is ledger-specific
+  against the ledger's 'reindex-min-bytes' setting."
   [{:keys [conn commit] :as _db} max-indexes]
   (go-try
    (assert (and (int? max-indexes)
