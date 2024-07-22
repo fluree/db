@@ -143,6 +143,12 @@
    (when-let [data (<? (connection/-index-file-read conn garbage-address))]
      (serdeproto/-deserialize-garbage (serde conn) data))))
 
+(defn delete-garbage-item
+  "Deletes an index segment during garbage collection.
+  Returns async chan"
+  [conn idx-segment-address]
+  (connection/-index-file-delete conn idx-segment-address))
+
 (defn reify-schema
   [{:keys [namespace-codes v] :as root-map}]
   (if (not= 1 v)
