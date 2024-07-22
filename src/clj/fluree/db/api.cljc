@@ -290,16 +290,14 @@
   signing identity, which is then used by `wrap-identity-policy` to extract
   the policy classes and apply the policies to the query."
   ([ds cred-query] (credential-query ds cred-query {}))
-  ([ds cred-query {:keys [default-allow? values-map] :as opts}]
+  ([ds cred-query {:keys [default-allow? values-map format] :as opts}]
    (promise-wrap
     (go-try
-     (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
+      (let [{query :subject, identity :did} (if (= :sparql format)
+                                              (cred/verify-jws cred-query)
+                                              (<? (cred/verify cred-query)))]
        (log/debug "Credential query with identity: " identity " and query: " query)
-       (let [policy-db (<? (policy/wrap-identity-policy ds
-                                                        identity
-                                                        (or (true? default-allow?)
-                                                            false)
-                                                        values-map))]
+       (let [policy-db (<? (policy/wrap-identity-policy ds identity default-allow? values-map))]
          (<? (query-api/query policy-db query opts))))))))
 
 (defn query-connection
@@ -312,11 +310,14 @@
 
 (defn credential-query-connection
   ([conn cred-query] (credential-query-connection conn cred-query {}))
-  ([conn cred-query opts]
+  ([conn cred-query {:keys [format] :as opts}]
    (promise-wrap
     (go-try
-     (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
-       (<? (query-connection conn query (assoc opts :did identity))))))))
+      (let [{query :subject, identity :did} (if (= :sparql format)
+                                              (cred/verify-jws cred-query)
+                                              (<? (cred/verify cred-query)))]
+        (log/debug "Credential query connection with identity: " identity " and query: " query)
+        @(query-connection conn query (assoc opts :did identity)))))))
 
 (defn history
   "Return the change history over a specified time range. Optionally include the commit
@@ -349,11 +350,7 @@
        (log/debug "Credential history query with identity: " identity " and query: " query)
        (cond
          (and query identity)
-         (let [policy-db (<? (policy/wrap-identity-policy latest-db
-                                                          identity
-                                                          (or (true? default-allow?)
-                                                              false)
-                                                          values-map))]
+         (let [policy-db (<? (policy/wrap-identity-policy latest-db identity default-allow? values-map))]
            (<? (query-api/history policy-db query)))
 
          identity

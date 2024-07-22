@@ -189,5 +189,3 @@
                   "select"   {"?s" ["*"]}
                   "where"    {"@id"   "?s"
                               "@type" "ex:Product"}})))))))
-
-

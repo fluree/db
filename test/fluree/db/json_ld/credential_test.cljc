@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.credential-test
-  (:require [fluree.db.json-ld.credential :as cred]
+  (:require [fluree.crypto :as crypto]
+            [fluree.db.json-ld.credential :as cred]
             [clojure.core.async :as async]
             #?(:clj  [clojure.test :as t :refer [deftest testing is]]
                :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])
@@ -148,22 +149,21 @@
                                               "ledger"   ledger-id
                                               "insert"   tx})
 
-           mdfn      {"@context" ["https://ns.flur.ee" context]
-                      "ledger"   ledger-id
-                      "delete"   {"@id"        (:id auth)
-                                  "ct:name"    "Daniel"
-                                  "ct:favnums" 1}
-                      "insert"   {"@id"        (:id auth)
-                                  "ct:name"    "D"
-                                  "ct:favnums" [4 5 6]}}
+           mdfn {"@context" ["https://ns.flur.ee" context]
+                 "ledger"   ledger-id
+                 "delete"   {"@id"        (:id auth)
+                             "ct:name"    "Daniel"
+                             "ct:favnums" 1}
+                 "insert"   {"@id"        (:id auth)
+                             "ct:name"    "D"
+                             "ct:favnums" [4 5 6]}}
 
-           db2       @(fluree/credential-transact! conn (async/<!! (cred/generate mdfn (:private auth))))
+           db2 @(fluree/credential-transact! conn (async/<!! (cred/generate mdfn (:private auth))))
 
-           ledger    @(fluree/load conn ledger-id)
+           ledger @(fluree/load conn ledger-id)
 
-           query     {"@context" context
-                      "select"   {(:id auth) ["*"]}}]
-
+           query {"@context" context
+                  "select"   {(:id auth) ["*"]}}]
        (is (= [{"id" "ct:open", "ct:foo" "bar"}]
               @(fluree/query db0 {"@context" context
                                   "select"   {"ct:open" ["*"]}}))
@@ -224,7 +224,39 @@
                 (async/<!! (cred/generate {:history (:id auth)
                                            :t       {:from 1}}
                                           (:private pleb-auth)))))
-           "history query credential - forbidding access"))))
+           "history query credential - forbidding access")
+
+       (let [sparql (str "PREFIX ct: <ledger:credentialtest/>
+                        SELECT ?name
+                        FROM <" ledger-id ">
+                        WHERE { \"" (:id auth) "\" ct:name ?name }")]
+         (is (= [["D"]]
+                @(fluree/credential-query
+                  db2
+                  (crypto/create-jws sparql (:private auth))
+                  {:format :sparql}))
+             "SPARQL query credential - allowing access")
+         
+         (is (= []
+                @(fluree/credential-query
+                  (fluree/db ledger)
+                  (crypto/create-jws sparql (:private pleb-auth))
+                  {:format :sparql}))
+             "SPARQL query credential - forbidding access")
+         
+         (is (= [["D"]]
+                @(fluree/credential-query-connection
+                  conn
+                  (crypto/create-jws sparql (:private auth))
+                  {:format :sparql}))
+             "SPARQL query connection credential - allowing access")
+         
+         (is (= []
+                @(fluree/credential-query-connection
+                  conn
+                  (crypto/create-jws sparql (:private pleb-auth))
+                  {:format :sparql}))
+             "SPARQL query connection credential - forbidding access")))))
 
 (comment
  #?(:cljs

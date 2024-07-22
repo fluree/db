@@ -120,7 +120,7 @@
                                                       :error  :db/invalid-credential})))
         id                       (crypto/account-id-from-public pubkey)
         auth-did                 (did/auth-id->did id)]
-    {:subject (json/parse payload false) :did auth-did}))
+    {:subject payload :did auth-did}))
 
 (defn jws?
   [x]
@@ -142,11 +142,13 @@
   Will throw if no :did is detected."
   [signed-command]
   (go-try
-   (let [result (if (jws? signed-command)
-                  (verify-jws signed-command)
-                  (<? (verify-credential signed-command)))]
-     (if (:did result)
-       result
-       (throw (ex-info "Signed message could not be verified to an identity"
-                       {:status 401
-                        :error  :db/invalid-credential}))))))
+    (let [result (if (jws? signed-command)
+                   (-> signed-command
+                       verify-jws
+                       (update :subject json/parse false))
+                   (<? (verify-credential signed-command)))]
+      (if (:did result)
+        result
+        (throw (ex-info "Signed message could not be verified to an identity"
+                        {:status 401
+                         :error  :db/invalid-credential}))))))

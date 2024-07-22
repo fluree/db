@@ -34,10 +34,10 @@
     did (assoc :did did :issuer did)))
 
 (defn restrict-db
-  [db t opts]
+  [db t {:keys [did default-allow?] :as opts}]
   (go-try
-    (let [db*  (if-let [did (:did opts)]
-                 (<? (perm/wrap-identity-policy db did true nil))
+    (let [db*  (if did
+                 (<? (perm/wrap-identity-policy db did default-allow? nil))
                  db)
           db** (-> (if t
                      (<? (time-travel/as-of db* t))
@@ -206,31 +206,32 @@
 (defn query-connection-fql
   [conn query did]
   (go-try
-   (let [{:keys [t opts] :as query*} (-> query
-                                         syntax/coerce-query
-                                         (update :opts sanitize-query-options did))
-         default-aliases (some-> query* :from util/sequential)
-         named-aliases   (some-> query* :from-named util/sequential)]
-     (if (or (seq default-aliases)
-             (seq named-aliases))
-       (let [ds       (<? (load-dataset conn default-aliases named-aliases t opts))
-             query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
-             max-fuel (:max-fuel opts)]
-         (if (::util/track-fuel? opts)
-           (<? (track-query ds max-fuel query**))
-           (<? (fql/query ds query**))))
-       (throw (ex-info "Missing ledger specification in connection query"
-                       {:status 400, :error :db/invalid-query}))))))
-
+    (let [{:keys [t opts] :as sanitized-query} (-> query
+                                                   syntax/coerce-query
+                                                   (update :opts sanitize-query-options did))
+          
+          default-aliases (some-> sanitized-query :from util/sequential)
+          named-aliases   (some-> sanitized-query :from-named util/sequential)]
+      (if (or (seq default-aliases)
+              (seq named-aliases))
+        (let [ds            (<? (load-dataset conn default-aliases named-aliases t opts))
+              trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel ::util/track-fuel?)
+              max-fuel      (:max-fuel opts)]
+          (if (::util/track-fuel? opts)
+            (<? (track-query ds max-fuel trimmed-query))
+            (<? (fql/query ds trimmed-query))))
+        (throw (ex-info "Missing ledger specification in connection query"
+                        {:status 400, :error :db/invalid-query}))))))
 
 (defn query-connection-sparql
   [conn query did]
   (go-try
-   (let [fql (sparql/->fql query)]
-     (<? (query-connection-fql conn fql did)))))
+    (let [fql (sparql/->fql query)]
+      (log/debug "query-connection SPARQL fql: " fql "did:" did)
+      (<? (query-connection-fql conn fql did)))))
 
 (defn query-connection
-  [conn query {:keys [format did] :as _opts :or {format :fql}}]
+  [conn query {:keys [format did] :as opts :or {format :fql}}]
   (case format
     :fql (query-connection-fql conn query did)
     :sparql (query-connection-sparql conn query did)))
