@@ -138,12 +138,10 @@
 
 (defn read-garbage
   "Returns garbage file data for a given index t."
-  [conn ledger-alias t]
+  [conn garbage-address]
   (go-try
-    (let [key  (ledger-garbage-key ledger-alias t)
-          data (<? (connection/-index-file-read conn key))]
-      (when data
-        (serdeproto/-deserialize-garbage (serde conn) data)))))
+   (when-let [data (<? (connection/-index-file-read conn garbage-address))]
+     (serdeproto/-deserialize-garbage (serde conn) data))))
 
 (defn reify-schema
   [{:keys [namespace-codes v] :as root-map}]
