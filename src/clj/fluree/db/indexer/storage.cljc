@@ -71,7 +71,8 @@
 (defn write-db-root
   [db garbage-addr]
   (let [{:keys [alias conn schema t stats spot post opst tspo commit
-                namespace-codes reindex-min-bytes reindex-max-bytes]}
+                namespace-codes reindex-min-bytes reindex-max-bytes
+                max-old-indexes]}
         db
         prev-idx-t    (-> commit :index :data :t)
         prev-idx-addr (-> commit :index :address)
@@ -88,7 +89,8 @@
                         :timestamp       (util/current-time-millis)
                         :namespace-codes namespace-codes
                         :config          {:reindex-min-bytes reindex-min-bytes
-                                          :reindex-max-bytes reindex-max-bytes}}
+                                          :reindex-max-bytes reindex-max-bytes
+                                          :max-old-indexes   max-old-indexes}}
                        prev-idx-t (assoc :prev-index {:t       prev-idx-t
                                                       :address prev-idx-addr})
                        garbage-addr (assoc-in [:garbage :address] garbage-addr))

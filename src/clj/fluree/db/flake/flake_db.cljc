@@ -369,7 +369,7 @@
 
 (defrecord FlakeDB [conn alias branch commit t tt-id stats spot post opst tspo
                     schema comparators staged novelty policy namespaces namespace-codes
-                    max-namespace-code reindex-min-bytes reindex-max-bytes]
+                    max-namespace-code reindex-min-bytes reindex-max-bytes max-old-indexes]
   dbproto/IFlureeDb
   (-query [this query-map] (fql/query this query-map))
   (-p-prop [_ meta-key property] (match/p-prop schema meta-key property))
@@ -550,9 +550,17 @@
                               100000) ; 100 kb
         reindex-max-bytes (or (:reindex-max-bytes indexing-opts)
                               (:reindex-max-bytes config)
-                              1000000)] ; 1mb
+                              1000000) ; 1mb
+        max-old-indexes (or (:max-old-indexes indexing-opts)
+                            (:max-old-indexes config)
+                            3)] ;; default of 3 maximum old indexes not garbage collected
+    (when-not (and (int? max-old-indexes)
+                   (>= max-old-indexes 0))
+      (throw (ex-info (str "Invalid max-old-indexes value. Must be a non-negative integer.")
+                      {:status 400, :error :db/invalid-config})))
     (assoc root-map :reindex-min-bytes reindex-min-bytes
-                    :reindex-max-bytes reindex-max-bytes)))
+                    :reindex-max-bytes reindex-max-bytes
+                    :max-old-indexes max-old-indexes)))
 
 (defn load
   ([conn ledger-alias branch commit-pair]
