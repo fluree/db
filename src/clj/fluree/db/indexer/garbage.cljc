@@ -76,7 +76,7 @@
   against the ledger's 'reindex-min-bytes' setting."
   [{:keys [conn commit] :as _db} max-indexes]
   (go
-    (if (and (int? max-indexes) (>= max-indexes 0))
+    (if (nat-int? max-indexes)
       (let [all-garbage (<? (trace-idx-roots conn commit))
             to-clean    (->> all-garbage
                              (drop max-indexes)
