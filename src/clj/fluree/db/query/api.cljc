@@ -4,7 +4,6 @@
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
-            [fluree.db.db.json-ld :as db]
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
@@ -175,6 +174,62 @@
      clause-chan)
     (async/into [] out-chan)))
 
+(defn query-str->map
+  "Converts the string query parameters of
+  k=v&k2=v2&k3=v3 into a map of {k v, k2 v2, k3 v3}"
+  [query-str]
+  (->> (str/split query-str #"&")
+       (map str/trim)
+       (map (fn [s]
+              (str/split s #"=")))
+       (reduce
+         (fn [acc [k v]]
+           (assoc acc k v))
+         {})))
+
+(defn parse-t-val
+  "If t-val is an integer in string form, coerces
+  it to an integer, otherwise assumes it is an
+  ISO-8601 datetime string and returns it as is."
+  [t-val]
+  (if (re-matches #"^\d+$" t-val)
+    (util/str->long t-val)
+    t-val))
+
+(defn extract-query-string-t
+  "This uses the http query string format to as a generic way to
+  select a specific 'db' that can be used in queries. For now there
+  is only one parameter/key we look for, and that is `t` which can
+  be used to specify the moment in time.
+
+  e.g.:
+   - my/db?t=42
+   - my/db?t=2020-01-01T00:00:00Z"
+  [alias]
+  (let [[alias query-str] (str/split alias #"\?")]
+    (if query-str
+      [alias (-> query-str
+                 query-str->map
+                 (get "t")
+                 parse-t-val)]
+      [alias nil])))
+
+(defn load-aliased-rule-dbs
+  [conn rule-sources]
+  (let [clause-chan (async/to-chan! rule-sources)
+        out-chan (async/chan)]
+    (async/pipeline-async
+     1
+     out-chan
+     (fn [rule-source out-ch]
+       (async/pipe (go-try 
+                     (if (string? rule-source)
+                       (ledger/-db (<? (jld-ledger/load conn rule-source)))
+                       rule-source))
+                   out-ch))
+     clause-chan)
+    (async/into [] out-chan)))
+                     
 (defn load-alias
   [conn alias t opts]
   (go-try
@@ -186,7 +241,7 @@
             t*           (or explicit-t t)
             rule-sources (<? (load-aliased-rule-dbs conn (:rule-sources opts)))
             opts*        (assoc opts :rule-sources rule-sources)]
-        (<? (restrict-db db t* context opts*))) 
+        (<? (restrict-db db t* opts*))) 
       (catch* e
               (throw (contextualize-ledger-400-error
                        (str "Error loading ledger " alias ": ")

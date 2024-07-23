@@ -1,5 +1,6 @@
 (ns fluree.db.flake.reasoner
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -7,6 +8,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.exec :refer [queryable?]]
             [fluree.db.flake.transact :as flake.transact]
+            [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
             [fluree.db.constants :as const]
@@ -182,12 +184,16 @@
         clause-chan)))
     (async/into [] out-chan)))
 
+(defn db?
+  [x]
+  (:conn x))
+
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
   supplied rules graph or from the db if no graph is supplied."
   [methods db inserts rule-sources]
   (go-try
-    (let [rule-graphs           (filter #(not (or (= string? %) (db? %))) rule-sources)
+    (let [rule-graphs           (filter #(and (map? %) (not (db? %))) rule-sources)
           parsed-rule-graphs    (try*
                                   (map parse-rules-graph rule-graphs)
                                   (catch* e
@@ -198,7 +204,7 @@
                                          (mapcat (fn [parsed-rules-graph]
                                                    (rules-from-graph method inserts parsed-rules-graph))
                                                  parsed-rule-graphs)))
-          rule-dbs              (filter #(or (= string? %) (db? %)) rule-sources)
+          rule-dbs              (filter #(or (string? %) (db? %)) rule-sources)
           all-rule-dbs          (if (or (nil? rule-dbs) (empty? rule-dbs))
                                   [db]
                                   (conj rule-dbs db))
@@ -273,9 +279,7 @@
             raw-rules duplicate-ids)))
 
 (defn reason
-  [db methods rule-sources
-   {:keys [max-fuel reasoner-max]
-    :or   {reasoner-max 10} :as _opts}]
+  [db methods rule-sources fuel-tracker reasoner-max]
   (go-try
     (let [db*                (update db :reasoner #(into methods %))
           tx-state           (flake.transact/->tx-state :db db*)
