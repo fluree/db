@@ -262,12 +262,18 @@
             (recur r db**))
           db*)))))
 
+(defn find-duplicate-ids
+  [raw-rules]
+  (let [rule-ids (map first raw-rules)]
+    (->> rule-ids
+         frequencies
+         (filter #(< 1 (last %))))))
+
 (defn deduplicate-raw-rules
   "Given a list of reasoning rules, identifies rules with duplicate ids and renames them using
   indexes."
   [raw-rules]
-  (let [rule-ids (map first raw-rules)
-        duplicate-ids (filter #(< 1 (last %)) (frequencies rule-ids))]
+  (let [duplicate-ids (find-duplicate-ids raw-rules)]
     (reduce (fn [rules [duplicate-id occurances]]
               (let [grouped-rules (group-by #(= duplicate-id (first %)) rules)]
                 (loop [suffix occurances
@@ -288,8 +294,10 @@
           ;; TODO - rules can be processed in parallel
           raw-rules          (<? (all-rules methods db* inserts rule-sources))
           _                  (log/debug "Reasoner - extracted rules: " raw-rules)
-          deduplicated-rules (deduplicate-raw-rules raw-rules)
-          reasoning-rules    (-> deduplicated-rules
+          duplicate-ids      (find-duplicate-ids raw-rules)
+          deduplicated-rules (when (not (empty? duplicate-ids))
+                               (log/error "Duplicate ids detected. Rules will be overwritten:" (apply str (map first duplicate-ids))))
+          reasoning-rules    (-> raw-rules 
                                  resolve/rules->graph
                                  add-rule-dependencies)
           db**               (if-let [inserts* @inserts]
