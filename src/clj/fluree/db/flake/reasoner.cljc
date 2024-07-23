@@ -15,7 +15,8 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql.parse :as fql.parse]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
-            [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
+            [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]
+            [fluree.db.query.exec.where :as where]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -186,7 +187,7 @@
 
 (defn db?
   [x]
-  (:conn x))
+  (satisfies? where/Matcher x))
 
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
