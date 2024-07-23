@@ -8,7 +8,6 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.exec :refer [queryable?]]
             [fluree.db.flake.transact :as flake.transact]
-            [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
             [fluree.db.constants :as const]
@@ -296,7 +295,7 @@
           _                  (log/debug "Reasoner - extracted rules: " raw-rules)
           duplicate-ids      (find-duplicate-ids raw-rules)
           deduplicated-rules (when (not (empty? duplicate-ids))
-                               (log/error "Duplicate ids detected. Rules will be overwritten:" (apply str (map first duplicate-ids))))
+                               (log/error "Duplicate ids detected. Some rules will be overwritten:" (apply str (map first duplicate-ids))))
           reasoning-rules    (-> raw-rules 
                                  resolve/rules->graph
                                  add-rule-dependencies)
