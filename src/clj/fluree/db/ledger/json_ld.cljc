@@ -198,7 +198,7 @@
                            :t          t
                            :time       commit-time
                            :db-address db-address
-                           :author     (or author "")
+                           :author     author
                            :annotation annotation
                            :txn-id     txn-id
                            :flakes     (:flakes stats)

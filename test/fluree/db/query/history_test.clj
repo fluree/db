@@ -306,7 +306,6 @@
                           {:id test-utils/did?}
                           :f/address test-utils/address?
                           :f/alias   "committest"
-                          :f/author  ""
                           :f/branch  "main"
                           :f/previous
                           {:id test-utils/commit-id?}
@@ -329,13 +328,12 @@
         (let [commit-5 {:f/commit {"https://www.w3.org/2018/credentials#issuer" {:id test-utils/did?}
                                    :f/address                                   test-utils/address?
                                    :f/alias                                     "committest"
-                                   :f/author                                    ""
                                    :f/branch                                    "main"
                                    :f/data                                      {:f/address  test-utils/address?
                                                                                  :f/assert   [{:ex/x "foo-cat"
                                                                                                :ex/y "bar-cat"
                                                                                                :id   :ex/alice}]
-                                                                                 :f/flakes   66
+                                                                                 :f/flakes   62
                                                                                  :f/previous {:id test-utils/db-id?}
                                                                                  :f/retract  [#_{:ex/x "foo-3"
                                                                                                  :ex/y "bar-3"
@@ -352,13 +350,12 @@
                                    {:id test-utils/did?}
                                    :f/address  test-utils/address?
                                    :f/alias    "committest"
-                                   :f/author   ""
                                    :f/branch   "main"
                                    :f/data     {:f/address  test-utils/address?
                                                 :f/assert   [{:ex/x "foo-cat"
                                                               :ex/y "bar-cat"
                                                               :id   :ex/cat}]
-                                                :f/flakes   50
+                                                :f/flakes   47
                                                 :f/previous {:id test-utils/db-id?}
                                                 :f/retract  []
                                                 :f/size     pos-int?
@@ -392,13 +389,12 @@
                              {:id test-utils/did?}
                              :f/address  test-utils/address?
                              :f/alias    "committest"
-                             :f/author   ""
                              :f/branch   "main"
                              :f/data     {:f/address  test-utils/address?
                                           :f/assert   [{:ex/x "foo-cat"
                                                         :ex/y "bar-cat"
                                                         :id   :ex/cat}]
-                                          :f/flakes   50
+                                          :f/flakes   47
                                           :f/previous {:id test-utils/db-id?}
                                           :f/retract  []
                                           :f/size     pos-int?
@@ -414,13 +410,12 @@
                            {:id test-utils/did?}
                            :f/address  test-utils/address?
                            :f/alias    "committest"
-                           :f/author   ""
                            :f/branch   "main"
                            :f/data     {:f/address  test-utils/address?
                                         :f/assert   [{:ex/x "foo-3"
                                                       :ex/y "bar-3"
                                                       :id   :ex/alice}]
-                                        :f/flakes   34
+                                        :f/flakes   32
                                         :f/previous {:id test-utils/db-id?}
                                         :f/retract  [{:ex/x "foo-2"
                                                       :ex/y "bar-2"
@@ -438,13 +433,12 @@
                            {:id test-utils/did?}
                            :f/address  test-utils/address?
                            :f/alias    "committest"
-                           :f/author   ""
                            :f/branch   "main"
                            :f/data     {:f/address  test-utils/address?
                                         :f/assert   [{:ex/x "foo-2"
                                                       :ex/y "bar-2"
                                                       :id   :ex/alice}]
-                                        :f/flakes   18
+                                        :f/flakes   17
                                         :f/previous {:id test-utils/db-id?}
                                         :f/retract  [{:ex/x "foo-1"
                                                       :ex/y "bar-1"
@@ -464,13 +458,12 @@
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
                           :f/alias    "committest"
-                          :f/author   ""
                           :f/branch   "main"
                           :f/data     {:f/address  test-utils/address?
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
                                                      :id   :ex/cat}]
-                                       :f/flakes   50
+                                       :f/flakes   47
                                        :f/previous {:id test-utils/db-id?}
                                        :f/retract  []
                                        :f/size     pos-int?
@@ -484,13 +477,12 @@
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
                           :f/alias    "committest"
-                          :f/author   ""
                           :f/branch   "main"
                           :f/data     {:f/address  test-utils/address?
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
                                                      :id   :ex/alice}]
-                                       :f/flakes   66
+                                       :f/flakes   62
                                        :f/previous {:id test-utils/db-id?}
                                        :f/retract  [{:ex/x "foo-3"
                                                      :ex/y "bar-3"
@@ -513,7 +505,6 @@
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
                           :f/alias    "committest"
-                          :f/author   ""
                           :f/branch   "main"
                           :f/previous {:id test-utils/commit-id?}
                           :f/data     {:f/address  test-utils/address?
@@ -542,13 +533,12 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
                             :f/alias    "committest"
-                            :f/author   ""
                             :f/branch   "main"
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
                                                        :id   :ex/alice}]
-                                         :f/flakes   34
+                                         :f/flakes   32
                                          :f/previous {:id test-utils/db-id?}
                                          :f/retract  [{:ex/x "foo-2"
                                                        :ex/y "bar-2"
@@ -571,13 +561,12 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
                             :f/alias    "committest"
-                            :f/author   ""
                             :f/branch   "main"
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
                                                        :id   :ex/alice}]
-                                         :f/flakes   66
+                                         :f/flakes   62
                                          :f/previous {:id test-utils/db-id?}
                                          :f/retract  [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
@@ -668,13 +657,12 @@
                              :id   :ex/alice}]
                   :commit  {:f/address  test-utils/address?
                             :f/alias    ledger-name
-                            :f/author   ""
                             :f/branch   "main"
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
                                                        :id   :ex/alice}]
-                                         :f/flakes   36
+                                         :f/flakes   34
                                          :f/previous {:id test-utils/db-id?}
                                          :f/retract  [{:ex/x "foo-2"
                                                        :ex/y "bar-2"
@@ -695,13 +683,12 @@
                              :id   :ex/alice}]
                   :commit  {:f/address  test-utils/address?
                             :f/alias    ledger-name
-                            :f/author   ""
                             :f/branch   "main"
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
                                                        :id   :ex/alice}]
-                                         :f/flakes   68
+                                         :f/flakes   64
                                          :f/previous {:id test-utils/db-id?}
                                          :f/retract  [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
@@ -770,13 +757,12 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
                             :f/alias    ledger-name
-                            :f/author   ""
                             :f/branch   "main"
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
                                                        :id   :ex/alice}]
-                                         :f/flakes   34
+                                         :f/flakes   32
                                          :f/previous {:id test-utils/db-id?}
                                          :f/retract  [{:ex/x "foo-2"
                                                        :ex/y "bar-2"
@@ -799,13 +785,12 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
                             :f/alias    ledger-name
-                            :f/author   ""
                             :f/branch   "main"
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
                                                        :id   :ex/alice}]
-                                         :f/flakes   66
+                                         :f/flakes   62
                                          :f/previous {:id test-utils/db-id?}
                                          :f/retract  [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
@@ -887,13 +872,12 @@
                                           {:id test-utils/did?}
                                           :f/address  test-utils/address?
                                           :f/alias    ledger-name
-                                          :f/author   ""
                                           :f/branch   "main"
                                           :f/data     {:f/address  test-utils/address?
                                                        :f/assert   [{:ex/x "foo-3"
                                                                      :ex/y "bar-3"
                                                                      :id   :ex/alice}]
-                                                       :f/flakes   38
+                                                       :f/flakes   36
                                                        :f/previous {:id test-utils/db-id?}
                                                        :f/retract  [{:ex/x "foo-2"
                                                                      :ex/y "bar-2"
@@ -916,13 +900,12 @@
                                           {:id test-utils/did?}
                                           :f/address  test-utils/address?
                                           :f/alias    ledger-name
-                                          :f/author   ""
                                           :f/branch   "main"
                                           :f/data     {:f/address  test-utils/address?
                                                        :f/assert   [{:ex/x "foo-cat"
                                                                      :ex/y "bar-cat"
                                                                      :id   :ex/alice}]
-                                                       :f/flakes   72
+                                                       :f/flakes   68
                                                        :f/previous {:id test-utils/db-id?}
                                                        :f/retract  [{:ex/x "foo-3"
                                                                      :ex/y "bar-3"
@@ -991,7 +974,7 @@
                                                                             "ledger"   ledger-name
                                                                             "insert"   {"ex:foo" 5}})
                                                            root-privkey))]
-      (is (= [{"f:author" "", "f:data" {"f:t" 1}}
+      (is (= [{"f:data" {"f:t" 1}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
                "f:txn"    "fluree:memory://cba3a98584459b25115f12e11b30f504f6f985d82979f1f16fb1e2d3158ff659",
                "f:data"   {"f:t" 2}}
