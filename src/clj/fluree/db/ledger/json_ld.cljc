@@ -311,11 +311,7 @@
   {:closed?  false
    :branches branches
    :branch   current-branch
-   :graphs   {}
-   :push     {:complete {:t   0
-                         :dag nil}
-              :pending  {:t   0
-                         :dag nil}}})
+   :graphs   {}})
 
 (defn parse-did
   [conn did]
