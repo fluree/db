@@ -53,6 +53,27 @@
     {:ipns-address     ipns-address
      :relative-address relative-address}))
 
+(def ipns-queue-atom {})
+
+(defn ipns-queue-pending
+  [ipns-addr t dag-map]
+  (swap! ipns-queue-atom update-in [ipns-addr :push :pending] assoc :t t :dag dag-map))
+
+(defn ipns-queue-complete
+  [ipns-addr t dag-map]
+  (swap! ipns-queue-atom update-in [ipns-addr :push]
+         (fn [{:keys [pending complete] :as m}]
+           (let [pending*  (if (= t (:t pending))
+                             {:t nil :dag nil}
+                             (do
+                               (log/info "IPNS publishing is slower than your commits and will have delays.")
+                               pending))
+                 complete* (if (> t (:t complete))
+                             {:t t :dag dag-map}
+                             complete)]
+             (assoc m :pending pending*
+                      :complete complete*)))))
+
 
 (defn push!
   "Publishes ledger metadata document (ledger root) to IPFS and recursively updates any
