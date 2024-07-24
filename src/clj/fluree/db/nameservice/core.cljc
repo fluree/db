@@ -55,15 +55,15 @@
 
 (defn push!
   "Executes a push operation to all nameservices registered on the connection."
-  [conn commit-data]
+  [conn json-ld-commit]
   (let [nameservices (nameservices conn)]
     (go-try
       (loop [nameservices* nameservices]
         (when-let [ns (first nameservices*)]
           (let [sync? (ns-proto/-sync? ns)]
             (if sync?
-              (<? (ns-proto/-push ns commit-data))
-              (ns-proto/-push ns commit-data))
+              (<? (ns-proto/-push ns json-ld-commit))
+              (ns-proto/-push ns json-ld-commit))
             (recur (rest nameservices*))))))))
 
 (defn lookup-commit

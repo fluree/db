@@ -7,10 +7,11 @@
 (set! *warn-on-reflection* true)
 
 (defn push
-  [s3-client s3-bucket s3-prefix {commit-address :address
-                                  nameservices   :ns}]
+  [s3-client s3-bucket s3-prefix {commit-address "address"
+                                  nameservices   "ns"}]
   (go
-    (let [my-ns-iri   (some #(when (re-matches #"^fluree:s3:.+" (:id %)) (:id %)) nameservices)
+    (let [my-ns-iri   (->> (map #(get % "id") nameservices)
+                           (some #(when (re-matches #"^fluree:s3:.+" %) %)))
           commit-path (s3/address-path s3-bucket s3-prefix commit-address false)
           head-path   (s3/address-path s3-bucket s3-prefix my-ns-iri)]
       (->> (.getBytes ^String commit-path)
