@@ -14,8 +14,12 @@
   [:and
    [:map-of ::json-ld-keyword :any]
    [:fn {:error/message "Must supply a value for either \"history\" or \"commit-details\""}
-    (fn [{:keys [history commit-details]}]
-      (or (string? history) (keyword? history) (seq history) commit-details))]
+    (fn [{:keys [history commit-details commit data txn]}]
+      (or (string? history) (keyword? history) (seq history)
+          commit-details
+          commit
+          data
+          txn))]
    (into
     [:map
      [:history {:optional true}
@@ -35,6 +39,12 @@
           [:o [:not :nil]]]]]]]
      [:commit-details {:optional      true
                        :error/message "Invalid value of \"commit-details\" key"} :boolean]
+     [:commit {:optional true
+               :error/message "Invalid value of \"commit\" key"} :boolean]
+     [:data {:optional true
+             :error/message "Invalid value of \"commit\" key"} :boolean]
+     [:txn {:optional true
+            :error/message "Invalid value of \"txn\" key"} :boolean]
      [:context {:optional true} ::context]
      [:opts {:optional true} [:map-of :keyword :any]]
      [:t
@@ -70,7 +80,6 @@
                                   (<= from to)
                                   true))]]]]
     extra-kvs)])
-
 
 (def registry
   (merge
