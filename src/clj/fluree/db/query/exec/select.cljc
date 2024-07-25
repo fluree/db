@@ -92,18 +92,13 @@
   (implicit-grouping? [_] false)
   (format-value
     [_ db iri-cache _context compact _fuel-tracker error-ch solution]
-    (go-loop [ks (keys solution)
-              formatted {}]
-      (let [k          (first ks)
-            fv         (-> solution
-                           (get k)
-                           (display db iri-cache compact error-ch)
-                           <!)
-            formatted' (assoc formatted k fv)
-            next-ks    (rest ks)]
-        (if (seq next-ks)
-          (recur next-ks formatted')
-          formatted'))))
+    (go-loop [[var & vars] (sort (keys solution))
+              result {}]
+      (if var
+        (recur vars (assoc result var (-> (get solution var)
+                                          (display db iri-cache compact error-ch)
+                                          <!)))
+        result)))
   (solution-value
     [_ _ solution]
     solution))

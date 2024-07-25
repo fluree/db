@@ -26,7 +26,7 @@
                  WHERE {?person person:handle ?handle;
                                 person:favNums ?favNums.}"
           {:keys [select]} (sparql/->fql query)]
-      (is (= ["*"] select))))
+      (is (= "*" select))))
   (testing "aggregates"
     (testing "AVG"
       (let [query "SELECT (AVG(?favNums) AS ?nums)
@@ -707,18 +707,18 @@
                           WHERE {?person person:handle ?handle;
                                          person:favNums ?favNums.}"
                  results @(fluree/query db query {:format :sparql})]
-             (is (= '[[{?favNums 23, ?handle "bbob", ?person "ex:bbob"}]
-                      [{?favNums 0, ?handle "jbob", ?person "ex:jbob"}]
-                      [{?favNums 3, ?handle "jbob", ?person "ex:jbob"}]
-                      [{?favNums 5, ?handle "jbob", ?person "ex:jbob"}]
-                      [{?favNums 6, ?handle "jbob", ?person "ex:jbob"}]
-                      [{?favNums 7, ?handle "jbob", ?person "ex:jbob"}]
-                      [{?favNums 8, ?handle "jbob", ?person "ex:jbob"}]
-                      [{?favNums 9, ?handle "jbob", ?person "ex:jbob"}]
-                      [{?favNums 3, ?handle "jdoe", ?person "ex:jdoe"}]
-                      [{?favNums 7, ?handle "jdoe", ?person "ex:jdoe"}]
-                      [{?favNums 42, ?handle "jdoe", ?person "ex:jdoe"}]
-                      [{?favNums 99, ?handle "jdoe", ?person "ex:jdoe"}]]
+             (is (= '[{?favNums 23, ?handle "bbob", ?person "ex:bbob"}
+                      {?favNums 0, ?handle "jbob", ?person "ex:jbob"}
+                      {?favNums 3, ?handle "jbob", ?person "ex:jbob"}
+                      {?favNums 5, ?handle "jbob", ?person "ex:jbob"}
+                      {?favNums 6, ?handle "jbob", ?person "ex:jbob"}
+                      {?favNums 7, ?handle "jbob", ?person "ex:jbob"}
+                      {?favNums 8, ?handle "jbob", ?person "ex:jbob"}
+                      {?favNums 9, ?handle "jbob", ?person "ex:jbob"}
+                      {?favNums 3, ?handle "jdoe", ?person "ex:jdoe"}
+                      {?favNums 7, ?handle "jdoe", ?person "ex:jdoe"}
+                      {?favNums 42, ?handle "jdoe", ?person "ex:jdoe"}
+                      {?favNums 99, ?handle "jdoe", ?person "ex:jdoe"}]
                     results))))
          (testing "basic wildcard query w/ grouping works"
            (let [query   "PREFIX person: <http://example.org/Person#>
@@ -727,9 +727,9 @@
                                          person:favNums ?favNums.}
                           GROUP BY ?person ?handle"
                  results @(fluree/query db query {:format :sparql})]
-             (is (= '[[{?favNums [23], ?handle "bbob", ?person "ex:bbob"}]
-                      [{?favNums [0 3 5 6 7 8 9], ?handle "jbob", ?person "ex:jbob"}]
-                      [{?favNums [3 7 42 99], ?handle "jdoe", ?person "ex:jdoe"}]]
+             (is (= '[{?favNums [23], ?handle "bbob", ?person "ex:bbob"}
+                      {?favNums [0 3 5 6 7 8 9], ?handle "jbob", ?person "ex:jbob"}
+                      {?favNums [3 7 42 99], ?handle "jdoe", ?person "ex:jdoe"}]
                     results))))
          (testing "basic query w/ OPTIONAL works"
            (let [query   "PREFIX person: <http://example.org/Person#>
