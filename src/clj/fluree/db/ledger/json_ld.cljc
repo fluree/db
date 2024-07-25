@@ -152,11 +152,9 @@
        :write-result  commit-res})))
 
 (defn push-commit
-  [conn {:keys [state] :as _ledger} {:keys [commit-map commit-jsonld write-result]}]
-  (nameservice/push! conn (assoc commit-map
-                                 :meta write-result
-                                 :json-ld commit-jsonld
-                                 :ledger-state state)))
+  [conn {:keys [commit-map commit-jsonld]}]
+  (let [commit-jsonld* (assoc commit-jsonld "address" (:address commit-map))]
+    (nameservice/push! conn commit-jsonld*)))
 
 (defn formalize-commit
   [{prev-commit :commit :as staged-db} new-commit]
@@ -212,7 +210,7 @@
           db  (formalize-commit staged-db commit-map)
           db* (update-commit! ledger branch db index-files-ch)]
 
-      (<? (push-commit conn ledger commit-write-map))
+      (<? (push-commit conn commit-write-map))
 
       (if file-data?
         {:data-file-meta   data-write-result
@@ -311,11 +309,7 @@
   {:closed?  false
    :branches branches
    :branch   current-branch
-   :graphs   {}
-   :push     {:complete {:t   0
-                         :dag nil}
-              :pending  {:t   0
-                         :dag nil}}})
+   :graphs   {}})
 
 (defn parse-did
   [conn did]

@@ -49,7 +49,7 @@
           (boolean resp)))))
 
   (read [_ address]
-    (let [{:keys [ns local method]} (storage/parse-address address)
+    (let [{:keys [ns method local]} (storage/parse-address address)
           path                      (build-ipfs-path method local)]
       (when-not (and (= "fluree" ns)
                      (#{"ipfs" "ipns"} method))

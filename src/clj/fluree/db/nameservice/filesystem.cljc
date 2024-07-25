@@ -17,8 +17,9 @@
 For now, since we only have a single branch possible,
 always sets default-branch. Eventually will need to merge
 changes from different branches into existing metadata map"
-[ns-address commit-address
- {alias  "alias"
+[ns-address
+ {address "address"
+  alias  "alias"
   branch "branch"
   :as    json-ld-commit}]
 (let [branch-iri (str ns-address "(" branch ")")]
@@ -27,7 +28,7 @@ changes from different branches into existing metadata map"
    "defaultBranch" branch-iri
    "ledgerAlias"   alias
    "branches"      [{"@id"     branch-iri
-                     "address" commit-address
+                     "address" address
                      "commit"  json-ld-commit}]}))
 
 (defn address-path
@@ -92,13 +93,10 @@ changes from different branches into existing metadata map"
 
 (defn push!
   "Pushes updated commit to internal format stored on file system"
-  [local-path base-address {commit-address :address
-                            alias          :alias
-                            meta           :meta
-                            commit-json-ld :json-ld}]
+  [local-path base-address {alias          "alias"
+                            :as commit-json-ld}]
   (let [ns-address     (address base-address alias nil)
-        commit-address (:address meta)
-        record         (ns-record ns-address commit-address commit-json-ld)]
+        record         (ns-record ns-address commit-json-ld)]
     ;; write-ns-record returns a promise chan, with path of file if successful or exception
     (write-ns-record record local-path alias)))
 
@@ -155,7 +153,7 @@ changes from different branches into existing metadata map"
   [alias commit-address local-path legacy-path]
   (async/go
     (let [ns-address (str "fluree:file://" alias)
-          ns-record  (ns-record ns-address commit-address {"alias" alias, "branch" "main"})]
+          ns-record  (ns-record ns-address {"address" commit-address "alias" alias, "branch" "main"})]
       (let [successful? (async/<! (write-ns-record ns-record local-path alias))]
         (if (util/exception? successful?)
           (log/error successful?
