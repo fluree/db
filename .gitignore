@@ -35,3 +35,4 @@ package-lock.json
 **cljs-runtime
 **report.html
 test/nodejs/store
+/dev/data/*
