@@ -76,8 +76,10 @@
   (-unsubscribe [nameservice ledger-alias] (unsubscribe conn-state ledger-alias))
   (-sync? [_] sync?)
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported RemoteNameService op: ledgers" {})))
-  (-address [_ ledger-alias {:keys [branch] :or {branch :main} :as _opts}]
-    (go (str ledger-alias "/" (name branch) "/head")))
+  (-address [_ ledger-alias {:keys [branch]:as _opts}]
+    (go (if (and branch (not= "main" branch))
+          (str ledger-alias "(" branch ")")
+          ledger-alias)))
   (-alias [_ ledger-address]
     ledger-address)
   (-close [nameservice]
