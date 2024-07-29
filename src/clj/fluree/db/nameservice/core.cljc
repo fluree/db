@@ -95,7 +95,7 @@
 
 (defn read-resource
   [conn resource-address]
-  (if file-read?
+  (if (file-read? resource-address)
     (connection/-c-read conn resource-address)
     (read-latest-commit conn resource-address)))
 
