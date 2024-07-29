@@ -26,7 +26,7 @@
   (write [_ dir data]
     (go-try
       (when (not (storage/hashable? data))
-        (throw (ex-info "Must serialize v before writing to FileStore."
+        (throw (ex-info "Must serialize data before writing to FileStore."
                         {:root root
                          :path dir
                          :data data})))
