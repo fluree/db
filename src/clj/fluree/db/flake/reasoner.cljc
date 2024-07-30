@@ -1,5 +1,6 @@
 (ns fluree.db.flake.reasoner
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -13,7 +14,8 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql.parse :as fql.parse]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
-            [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
+            [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]
+            [fluree.db.query.exec.where :as where]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -163,28 +165,52 @@
     (log/debug "Reasoner - source OWL rules: " graph)
     (owl-datalog/owl->datalog inserts graph)))
 
+(defn rules-from-dbs
+  [methods inserts dbs]
+  (let [clause-chan (async/to-chan! dbs)
+        out-chan (async/chan)]
+    (doall
+     (for [method methods]
+       (async/pipeline-async
+        1
+        out-chan
+        (fn [db out-ch]
+          (async/pipe (go-try
+                        (as-> db $
+                          (<? (resolve/rules-from-db $ method))
+                          (rules-from-graph method inserts $)))
+                      out-ch)
+          out-ch)
+        clause-chan)))
+    (async/into [] out-chan)))
+
+(defn db?
+  [x]
+  (satisfies? where/Matcher x))
+
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
   supplied rules graph or from the db if no graph is supplied."
-  [methods db inserts graph-or-db]
+  [methods db inserts rule-sources]
   (go-try
-    (let [rules-db        (cond
-                            (nil? graph-or-db) db
-                            (queryable? graph-or-db) graph-or-db)
-          supplied-rules* (when-not rules-db
-                            (try*
-                              (parse-rules-graph graph-or-db)
-                              (catch* e
-                                      (log/error "Error parsing supplied rules graph:" e)
-                                      (throw e))))]
-      (loop [[method & r] methods
-             rules []]
-        (if method
-          (let [rules-graph* (or supplied-rules*
-                                 (<? (resolve/rules-from-db rules-db method)))
-                rules*       (rules-from-graph method inserts rules-graph*)]
-            (recur r (into rules rules*)))
-          rules)))))
+    (let [rule-graphs           (filter #(and (map? %) (not (db? %))) rule-sources)
+          parsed-rule-graphs    (try*
+                                  (map parse-rules-graph rule-graphs)
+                                  (catch* e
+                                          (log/error "Error parsing supplied rules graph:" e)
+                                          (throw e)))
+          all-rules-from-graphs (apply concat
+                                       (for [method methods]
+                                         (mapcat (fn [parsed-rules-graph]
+                                                   (rules-from-graph method inserts parsed-rules-graph))
+                                                 parsed-rule-graphs)))
+          rule-dbs              (filter #(or (string? %) (db? %)) rule-sources)
+          all-rule-dbs          (if (or (nil? rule-dbs) (empty? rule-dbs))
+                                  [db]
+                                  (conj rule-dbs db))
+          all-rules-from-dbs    (apply concat (<? (rules-from-dbs methods inserts all-rule-dbs)))
+          all-rules             (concat all-rules-from-graphs all-rules-from-dbs)]
+      all-rules)))
 
 (defn triples->map
   "Turns triples from same subject (@id) originating from
@@ -236,13 +262,13 @@
           db*)))))
 
 (defn reason
-  [db methods rules-graph fuel-tracker reasoner-max]
+  [db methods rule-sources fuel-tracker reasoner-max]
   (go-try
     (let [db*             (update db :reasoner #(into methods %))
           tx-state        (flake.transact/->tx-state :db db*)
           inserts         (atom nil)
           ;; TODO - rules can be processed in parallel
-          raw-rules       (<? (all-rules methods db* inserts rules-graph))
+          raw-rules       (<? (all-rules methods db* inserts rule-sources))
           _               (log/debug "Reasoner - extracted rules: " raw-rules)
           reasoning-rules (-> raw-rules
                               resolve/rules->graph

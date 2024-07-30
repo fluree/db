@@ -316,7 +316,7 @@
       (let [{query :subject, identity :did} (if (= :sparql format)
                                               (cred/verify-jws cred-query)
                                               (<? (cred/verify cred-query)))]
-        (log/debug "Credential query connection with identity: " identity " and query: " query)
+        (log/error "Credential query connection with identity: " identity " and query: " query)
         @(query-connection conn query (assoc opts :did identity)))))))
 
 (defn history
@@ -412,10 +412,10 @@
   or if no rules graph is supplied, the rules will be looked for within
   the db itself."
   ([db methods] (reason db methods nil nil))
-  ([db methods rules-graph] (reason db methods rules-graph nil))
-  ([db methods rules-graph opts]
+  ([db methods rule-sources] (reason db methods rule-sources nil))
+  ([db methods rule-sources opts]
    (promise-wrap
-     (reasoner/reason db methods rules-graph opts))))
+     (reasoner/reason db methods rule-sources opts))))
 
 (defn reasoned-count
   "Returns a count of reasoned facts in the provided db."

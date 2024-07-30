@@ -70,11 +70,10 @@
 
       (testing "Testing owl:sameAs passed along as a reasoned rule"
         (let [db-reasoned @(fluree/reason db-base :owl2rl
-                                          {:rule-graphs
-                                           [{"@context"   {"ex"  "http://example.org/"
-                                                           "owl" "http://www.w3.org/2002/07/owl#"}
-                                             "@id"        "ex:carol"
-                                             "owl:sameAs" {"@id" "ex:carol-lynn"}}]})]
+                                          [{"@context"   {"ex"  "http://example.org/"
+                                                          "owl" "http://www.w3.org/2002/07/owl#"}
+                                            "@id"        "ex:carol"
+                                            "owl:sameAs" {"@id" "ex:carol-lynn"}}])]
           
           (is (= (list "ex:carol" "ex:carol-lynn")
                  (sort
@@ -198,13 +197,12 @@
       (testing "Testing rdfs:domain - rule: prp-dom"
         (let [db-prp-dom @(fluree/reason
                            db-base :owl2rl
-                           {:rule-graphs
-                            [{"@context"    {"ex"   "http://example.org/"
-                                             "owl"  "http://www.w3.org/2002/07/owl#"
-                                             "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                              "@id"         "ex:parents"
-                              "@type"       ["owl:ObjectProperty"]
-                              "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]}]})]
+                           [{"@context"    {"ex"   "http://example.org/"
+                                            "owl"  "http://www.w3.org/2002/07/owl#"
+                                            "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                             "@id"         "ex:parents"
+                             "@type"       ["owl:ObjectProperty"]
+                             "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]}])]
 
           (is (= (list "ex:Child" "ex:Person")
                  (sort
@@ -226,13 +224,12 @@
       (testing "Testing rdfs:range - rule: prp-rng"
         (let [db-prp-rng @(fluree/reason
                            db-base :owl2rl
-                           {:rule-graphs
-                            [{"@context"   {"ex"   "http://example.org/"
-                                            "owl"  "http://www.w3.org/2002/07/owl#"
-                                            "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                              "@id"        "ex:parents"
-                              "@type"      ["owl:ObjectProperty"]
-                              "rdfs:range" [{"@id" "ex:Person"} {"@id" "ex:parents"}]}]})]
+                           [{"@context"   {"ex"   "http://example.org/"
+                                           "owl"  "http://www.w3.org/2002/07/owl#"
+                                           "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                             "@id"        "ex:parents"
+                             "@type"      ["owl:ObjectProperty"]
+                             "rdfs:range" [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
 
           (is (= (list "ex:Person" "ex:parents")
                  (sort
@@ -255,14 +252,13 @@
       (testing "Testing multiple rules rdfs:domain + rdfs:range - rules: prp-dom & prp-rng"
         (let [db-prp-dom+rng @(fluree/reason
                                db-base :owl2rl
-                               {:rule-graphs
-                                [{"@context"    {"ex"   "http://example.org/"
-                                                 "owl"  "http://www.w3.org/2002/07/owl#"
-                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                  "@id"         "ex:parents"
-                                  "@type"       ["owl:ObjectProperty"]
-                                  "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]
-                                  "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:parents"}]}]})]
+                               [{"@context"    {"ex"   "http://example.org/"
+                                                "owl"  "http://www.w3.org/2002/07/owl#"
+                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                 "@id"         "ex:parents"
+                                 "@type"       ["owl:ObjectProperty"]
+                                 "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]
+                                 "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
 
           (is (= ["ex:brian" "ex:carol"]
                  @(fluree/query db-prp-dom+rng
@@ -311,7 +307,7 @@
               
               db-prp-dom+rng @(fluree/reason
                                db-base :owl2rl
-                               {:rule-dbs [domain-rule-db range-rule-db]})]
+                               [domain-rule-db range-rule-db])]
 
           (is (= ["ex:brian" "ex:carol"]
                  @(fluree/query db-prp-dom+rng
@@ -354,7 +350,7 @@
 
               db-prp-dom+rng @(fluree/reason
                                db-base :owl2rl
-                               {:rule-graphs [domain-rule range-rule]})]
+                               [domain-rule range-rule])]
 
           (is (= ["ex:brian" "ex:carol"]
                  @(fluree/query db-prp-dom+rng
@@ -400,8 +396,7 @@
 
               db-prp-dom+rng @(fluree/reason
                                db-base :owl2rl
-                               {:rule-dbs [domain-rule-db]
-                                :rule-graphs [range-rule]})]
+                               [domain-rule-db range-rule])]
 
           (is (= ["ex:brian" "ex:carol"]
                  @(fluree/query db-prp-dom+rng
@@ -440,11 +435,10 @@
                                                    "ex:mother" [{"@id" "ex:anne"} {"@id" "ex:anne2"}]}]})
           db-reasoned @(fluree/reason
                          db-base :owl2rl
-                         {:rule-graphs
-                          [{"@context" {"ex"  "http://example.org/"
-                                        "owl" "http://www.w3.org/2002/07/owl#"}
-                            "@id"      "ex:mother"
-                            "@type"    ["owl:ObjectProperty" "owl:FunctionalProperty"]}]})]
+                         [{"@context" {"ex"  "http://example.org/"
+                                       "owl" "http://www.w3.org/2002/07/owl#"}
+                           "@id"      "ex:mother"
+                           "@type"    ["owl:ObjectProperty" "owl:FunctionalProperty"]}])]
       
       (is (= (list "ex:carol" "ex:carol2")
              (sort
@@ -502,11 +496,10 @@
                                                    "ex:email" "ralph@example.org"}]})
           db-reasoned @(fluree/reason
                          db-base :owl2rl
-                         {:rule-graphs
-                          [{"@context" {"ex"  "http://example.org/"
-                                        "owl" "http://www.w3.org/2002/07/owl#"}
-                            "@id"      "ex:email"
-                            "@type"    ["owl:ObjectProperty" "owl:InverseFunctionalProperty"]}]})]
+                         [{"@context" {"ex"  "http://example.org/"
+                                       "owl" "http://www.w3.org/2002/07/owl#"}
+                           "@id"      "ex:email"
+                           "@type"    ["owl:ObjectProperty" "owl:InverseFunctionalProperty"]}])]
       
       (is (= (list "ex:brian" "ex:brian2")
              (sort
@@ -544,12 +537,11 @@
 
               db-prp-symp  @(fluree/reason
                               db-livesWith :owl2rl
-                              {:rule-graphs
-                               [{"@context" {"ex"   "http://example.org/"
-                                             "owl"  "http://www.w3.org/2002/07/owl#"
-                                             "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                 "@id"      "ex:livesWith"
-                                 "@type"    ["owl:ObjectProperty" "owl:SymetricProperty"]}]})]
+                              [{"@context" {"ex"   "http://example.org/"
+                                            "owl"  "http://www.w3.org/2002/07/owl#"
+                                            "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                "@id"      "ex:livesWith"
+                                "@type"    ["owl:ObjectProperty" "owl:SymetricProperty"]}])]
           
           (is (= ["ex:person-a"]
                  @(fluree/query db-prp-symp
@@ -577,12 +569,11 @@
 
           db-prp-trp   @(fluree/reason
                           db-livesWith :owl2rl
-                          {:rule-graphs
-                           [{"@context" {"ex"   "http://example.org/"
-                                         "owl"  "http://www.w3.org/2002/07/owl#"
-                                         "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                             "@id"      "ex:livesWith"
-                             "@type"    ["owl:ObjectProperty" "owl:TransitiveProperty"]}]})]
+                          [{"@context" {"ex"   "http://example.org/"
+                                        "owl"  "http://www.w3.org/2002/07/owl#"
+                                        "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                            "@id"      "ex:livesWith"
+                            "@type"    ["owl:ObjectProperty" "owl:TransitiveProperty"]}])]
       
       (is (= (list "ex:person-b" "ex:person-c" "ex:person-d")
              (sort
@@ -604,19 +595,18 @@
                                                    "ex:father" {"@id" "ex:greg-dad"}}]})
           db-reasoned @(fluree/reason
                          db-base :owl2rl
-                         {:rule-graphs
-                          [{"@context"           {"ex"   "http://example.org/"
-                                                  "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
-                                                  "owl"  "http://www.w3.org/2002/07/owl#"}
-                            "@id"                "ex:mother"
-                            "@type"              ["owl:ObjectProperty"]
-                            "rdfs:subPropertyOf" {"@id" "ex:parents"}}
-                           {"@context"           {"ex"   "http://example.org/"
-                                                  "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
-                                                  "owl"  "http://www.w3.org/2002/07/owl#"}
-                            "@id"                "ex:father"
-                            "@type"              ["owl:ObjectProperty"]
-                            "rdfs:subPropertyOf" {"@id" "ex:parents"}}]})]
+                         [{"@context"           {"ex"   "http://example.org/"
+                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+                                                 "owl"  "http://www.w3.org/2002/07/owl#"}
+                           "@id"                "ex:mother"
+                           "@type"              ["owl:ObjectProperty"]
+                           "rdfs:subPropertyOf" {"@id" "ex:parents"}}
+                          {"@context"           {"ex"   "http://example.org/"
+                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+                                                 "owl"  "http://www.w3.org/2002/07/owl#"}
+                           "@id"                "ex:father"
+                           "@type"              ["owl:ObjectProperty"]
+                           "rdfs:subPropertyOf" {"@id" "ex:parents"}}])]
 
       (is (= (list "ex:alice-mom" "ex:greg-dad")
              (sort
@@ -643,17 +633,16 @@
                                                    "ex:parents" [{"@id" "ex:mom-mom-mom"} {"@id" "ex:mom-mom-dad"}]}]})
           db-reasoned @(fluree/reason
                          db-base :owl2rl
-                         {:rule-graphs
-                          [{"@context"               {"ex"  "http://example.org/"
-                                                      "owl" "http://www.w3.org/2002/07/owl#"}
-                            "@id"                    "ex:grandparent"
-                            "@type"                  ["owl:ObjectProperty"]
-                            "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parents"} {"@id" "ex:parents"}]}}
-                           {"@context"               {"ex"  "http://example.org/"
-                                                      "owl" "http://www.w3.org/2002/07/owl#"}
-                            "@id"                    "ex:greatGrandparent"
-                            "@type"                  ["owl:ObjectProperty"]
-                            "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parents"} {"@id" "ex:parents"} {"@id" "ex:parents"}]}}]})]
+                         [{"@context"               {"ex"  "http://example.org/"
+                                                     "owl" "http://www.w3.org/2002/07/owl#"}
+                           "@id"                    "ex:grandparent"
+                           "@type"                  ["owl:ObjectProperty"]
+                           "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parents"} {"@id" "ex:parents"}]}}
+                          {"@context"               {"ex"  "http://example.org/"
+                                                     "owl" "http://www.w3.org/2002/07/owl#"}
+                           "@id"                    "ex:greatGrandparent"
+                           "@type"                  ["owl:ObjectProperty"]
+                           "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parents"} {"@id" "ex:parents"} {"@id" "ex:parents"}]}}])]
       
       (is (= (list "ex:dad-dad" "ex:dad-mom" "ex:mom-dad" "ex:mom-mom")
              (sort
@@ -695,13 +684,12 @@
                                                    "ex:child" {"@id" "ex:bob"}}]})
 
           db-reasoned @(fluree/reason db-base :owl2rl
-                                      {:rule-graphs
-                                       [{"@context"      {"ex"   "http://example.org/"
-                                                          "owl"  "http://www.w3.org/2002/07/owl#"
-                                                          "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                         "@id"           "ex:child"
-                                         "@type"         ["owl:ObjectProperty"]
-                                         "owl:inverseOf" {"@id" "ex:parents"}}]})]
+                                      [{"@context"      {"ex"   "http://example.org/"
+                                                         "owl"  "http://www.w3.org/2002/07/owl#"
+                                                         "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                        "@id"           "ex:child"
+                                        "@type"         ["owl:ObjectProperty"]
+                                        "owl:inverseOf" {"@id" "ex:parents"}}])]
 
       (is (= ["ex:son"]
              @(fluree/query db-reasoned
@@ -765,19 +753,18 @@
                                                    "ex:ofOrgan"     "liver"}]})
 
           db-reasoned @(fluree/reason db-base :owl2rl
-                                      {:rule-graphs
-                                       [{"@context"   {"ex"  "http://example.org/"
-                                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                                         "@id"        "ex:RegisteredPatient"
-                                         "@type"      ["owl:ObjectProperty"]
-                                         "owl:hasKey" {"@id" "ex:hasWaitingListN"}} ;; single value
-                                        {"@context"   {"ex"  "http://example.org/"
-                                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                                         "@id"        "ex:Transplantation"
-                                         "@type"      ["owl:ObjectProperty"]
-                                         "owl:hasKey" [{"@list" [{"@id" "ex:donorId"} ;; multi as @list
-                                                                 {"@id" "ex:recipientId"}
-                                                                 {"@id" "ex:ofOrgan"}]}]}]})]
+                                      [{"@context"   {"ex"  "http://example.org/"
+                                                      "owl" "http://www.w3.org/2002/07/owl#"}
+                                        "@id"        "ex:RegisteredPatient"
+                                        "@type"      ["owl:ObjectProperty"]
+                                        "owl:hasKey" {"@id" "ex:hasWaitingListN"}} ;; single value
+                                       {"@context"   {"ex"  "http://example.org/"
+                                                      "owl" "http://www.w3.org/2002/07/owl#"}
+                                        "@id"        "ex:Transplantation"
+                                        "@type"      ["owl:ObjectProperty"]
+                                        "owl:hasKey" [{"@list" [{"@id" "ex:donorId"} ;; multi as @list
+                                                                {"@id" "ex:recipientId"}
+                                                                {"@id" "ex:ofOrgan"}]}]}])]
 
       (is (= (list "ex:brian" "ex:brian2")
              (sort

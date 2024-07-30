@@ -4,7 +4,7 @@
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
-            [fluree.db.db.json-ld :as db]
+            [fluree.db.flake.flake-db :as db]
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
@@ -68,15 +68,18 @@
                              reasoner-methods
                              reasoning
                              request-opts))
-        time-travel-db))))
+        db))))
 
 (defn restrict-db
-  [db t {:keys [did default-allow?] :as opts}]
+  [db t {:keys [did default-allow? context] :as opts}]
   (go-try
     (let [restricted-db (-> db
                             (db->policy-db context opts)
+                            <?
                             (db->time-travel-db t)
-                            (db->reasoned-db opts))]
+                            <?
+                            (db->reasoned-db opts)
+                            <?)]
       (assoc-in restricted-db [:policy :cache] (atom {})))))
     
 (defn track-query
@@ -100,7 +103,7 @@
 (defn query
   ([db query*]
    (query db query* nil))
-  ([db query {:keys [format] :as opts}]
+  ([db query {:keys [format did] :as opts}]
    (go-try
      (let [fql-query   (if (= :sparql format)
                          (sparql/->fql query)
@@ -111,12 +114,12 @@
            
            final-query (update sanitized-query :opts dissoc :meta :max-fuel ::util/track-fuel?)
            
-           dataset     (if (dataset? ds)
-                         ds
-                         (as-> ds $
-                           (<? (db->policy-db $ (ctx-util/extract verified-query) opts))
+           dataset     (if (dataset? db)
+                         db
+                         (as-> db $
+                           (<? (db->policy-db $ (ctx-util/extract final-query) opts))
                            (<? (db->time-travel-db $ t))
-                           (<? (db->reasoned-db $ opts))]
+                           (<? (db->reasoned-db $ opts))))]
        (if (::util/track-fuel? opts)
          (<? (track-query dataset (:max-fuel opts) final-query))
          (<? (q dataset final-query)))))))
@@ -200,7 +203,7 @@
             t*       (or explicit-t t)
             rule-dbs (<? (parse-rule-dbs conn (:rule-dbs opts)))
             opts*    (assoc opts :rule-dbs rule-dbs)]
-        (<? (restrict-db db t* context opts*))) 
+        (<? (restrict-db db t* opts*))) 
       (catch* e
               (throw (contextualize-ledger-400-error
                        (str "Error loading ledger " alias ": ")
@@ -263,8 +266,8 @@
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel ::util/track-fuel?)
               max-fuel      (:max-fuel opts)]
           (if (::util/track-fuel? opts)
-            (<? (track-query ds max-fuel query**))
-            (<? (q ds query**))))
+            (<? (track-query ds max-fuel trimmed-query))
+            (<? (q ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))
 

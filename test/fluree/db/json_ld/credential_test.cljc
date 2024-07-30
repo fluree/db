@@ -227,9 +227,9 @@
            "history query credential - forbidding access")
 
        (let [sparql (str "PREFIX ct: <ledger:credentialtest/>
-                        SELECT ?name
-                        FROM <" ledger-id ">
-                        WHERE { \"" (:id auth) "\" ct:name ?name }")]
+                          SELECT ?name
+                          FROM <" ledger-id ">
+                          WHERE { \"" (:id auth) "\" ct:name ?name }")]
          (is (= [["D"]]
                 @(fluree/credential-query
                   db2
@@ -250,7 +250,7 @@
                   (crypto/create-jws sparql (:private auth))
                   {:format :sparql}))
              "SPARQL query connection credential - allowing access")
-         
+
          (is (= []
                 @(fluree/credential-query-connection
                   conn
