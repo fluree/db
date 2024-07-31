@@ -2,6 +2,7 @@
   "A simple default connection-level cache."
   (:require [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.core.async :as async]
+            [fluree.db.util.log :as log]
             [fluree.db.util.core :as util :refer [exception?]]))
 
 (defn create-lru-cache
