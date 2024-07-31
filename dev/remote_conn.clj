@@ -13,8 +13,12 @@
 
   (def db (fluree/db ledger))
 
-  @(fluree/query db {:select {"?s" ["*"]}
-                     :where  [["?s" "ex:name" nil]]})
+
+
+  @(fluree/query db {"@context" {"ex" "http://example.org/"}
+                     "select"   {"?s" ["*"]}
+                     "where"    {"@id"     "?s"
+                                 "ex:name" nil}})
 
 
   )
