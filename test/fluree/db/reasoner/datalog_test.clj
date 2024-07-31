@@ -273,18 +273,17 @@
       (testing "multiple sources targeting identical nodes"
         (let [alt-rule-first-reasoned-db @(fluree/reason db0 :datalog [alt-grandparent-rule grandparent-rule])
               alt-rule-last-reasoned-db @(fluree/reason db0 :datalog [grandparent-rule alt-grandparent-rule])]
-          (is (= [["ex:alice" "ex:carol"]]
-                 @(fluree/query alt-rule-first-reasoned-db {:context {"ex" "http://example.org/"}
-                                                            :select  ["?s" "?grandParent"]
-                                                            :where   {"@id"            "?s",
-                                                                      "ex:grandParent" "?grandParent"}}))
-              "Normal rule is overwritten and not used in reasoning")
-          (is (= [["ex:brian" "ex:cheryl"]]
-                 @(fluree/query alt-rule-last-reasoned-db {:context {"ex" "http://example.org/"}
-                                                           :select  ["?s" "?grandParent"]
-                                                           :where   {"@id"            "?s",
-                                                                     "ex:grandParent" "?grandParent"}}))
-              "Alternative rule is overwritten and not used in reasoning"))))))
+          (is (and (= [["ex:alice" "ex:carol"]]
+                      @(fluree/query alt-rule-first-reasoned-db {:context {"ex" "http://example.org/"}
+                                                                 :select  ["?s" "?grandParent"]
+                                                                 :where   {"@id"            "?s",
+                                                                           "ex:grandParent" "?grandParent"}}))
+                   (= [["ex:brian" "ex:cheryl"]]
+                      @(fluree/query alt-rule-last-reasoned-db {:context {"ex" "http://example.org/"}
+                                                                 :select  ["?s" "?grandParent"]
+                                                                 :where   {"@id"            "?s",
+                                                                           "ex:grandParent" "?grandParent"}})))
+              "Rules are deduplicated and used in reasoning"))))))
 
 
 (def has-subtask-rule

@@ -691,6 +691,11 @@
                                         "@type"         ["owl:ObjectProperty"]
                                         "owl:inverseOf" {"@id" "ex:parents"}}])]
 
+     (println "JMR" (fluree/query db-reasoned
+                            {:context {"ex" "http://example.org/"}
+                             :select  "?x"
+                             :where   {"@id"      "ex:mom"
+                                       "ex:child" "?x"}})) 
       (is (= ["ex:son"]
              @(fluree/query db-reasoned
                             {:context {"ex" "http://example.org/"}

@@ -10,6 +10,7 @@
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.query.api :as query-api]
             [fluree.db.api.transact :as transact-api]
+            [fluree.db.flake.flake-db :refer [db?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.ledger.json-ld :as jld-ledger]

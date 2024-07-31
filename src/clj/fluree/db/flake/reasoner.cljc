@@ -261,12 +261,35 @@
             (recur r db**))
           db*)))))
 
+(defn find-duplicate-ids
+  [raw-rules]
+  (let [rule-ids (map first raw-rules)]
+    (->> rule-ids
+         frequencies
+         (filter #(< 1 (last %))))))
+
+(defn deduplicate-raw-rules
+  "Given a list of reasoning rules, identifies rules with duplicate ids and renames them using
+  indexes."
+  [raw-rules]
+  (let [duplicate-ids (find-duplicate-ids raw-rules)]
+    (reduce (fn [rules [duplicate-id occurances]]
+              (let [grouped-rules (group-by #(= duplicate-id (first %)) rules)]
+                (loop [suffix occurances
+                       rules-to-update (get grouped-rules true)
+                       updated-rules-list (get grouped-rules false)]
+                  (if (empty? rules-to-update)
+                    updated-rules-list
+                    (let [updated-rule [(str duplicate-id suffix) (last (first rules-to-update))]]
+                      (recur (dec suffix) (rest rules-to-update) (conj updated-rules-list updated-rule)))))))
+            raw-rules duplicate-ids)))
+
 (defn reason
   [db methods rule-sources fuel-tracker reasoner-max]
   (go-try
-    (let [db*             (update db :reasoner #(into methods %))
-          tx-state        (flake.transact/->tx-state :db db*)
-          inserts         (atom nil)
+    (let [db*                (update db :reasoner #(into methods %))
+          tx-state           (flake.transact/->tx-state :db db*)
+          inserts            (atom nil)
           ;; TODO - rules can be processed in parallel
           raw-rules       (<? (all-rules methods db* inserts rule-sources))
           _               (log/debug "Reasoner - extracted rules: " raw-rules)
