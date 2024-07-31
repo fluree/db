@@ -41,7 +41,7 @@
       (<? (history/query db context query)))))
 
 (defn sanitize-query-options
-  [opts {:keys [did] :as _opts}]
+  [opts did]
   (cond-> (util/parse-opts opts)
     did (assoc :did did :issuer did)))
 

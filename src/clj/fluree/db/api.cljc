@@ -296,9 +296,9 @@
       (let [{query :subject, identity :did} (if (= :sparql format)
                                               (cred/verify-jws cred-query)
                                               (<? (cred/verify cred-query)))]
-       (log/debug "Credential query with identity: " identity " and query: " query)
-       (let [policy-db (<? (policy/wrap-identity-policy ds identity default-allow? values-map))]
-         (<? (query-api/query policy-db query opts))))))))
+        (log/debug "Credential query with identity: " identity " and query: " query)
+        (let [policy-db (<? (policy/wrap-identity-policy ds identity default-allow? values-map))]
+          (<? (query-api/query policy-db query (dissoc opts :did)))))))))
 
 (defn query-connection
   "Queries the latest db in the ledger specified by the 'from' parameter in the
@@ -316,7 +316,7 @@
       (let [{query :subject, identity :did} (if (= :sparql format)
                                               (cred/verify-jws cred-query)
                                               (<? (cred/verify cred-query)))]
-        (log/error "Credential query connection with identity: " identity " and query: " query)
+        (log/debug "Credential query connection with identity: " identity " and query: " query)
         @(query-connection conn query (assoc opts :did identity)))))))
 
 (defn history
