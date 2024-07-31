@@ -111,7 +111,7 @@
 (defn connect
   "Create a new S3 connection."
   [{:keys [defaults parallelism s3-endpoint s3-bucket s3-prefix lru-cache-atom
-           memory serializer nameservices]
+           cache-max-mb serializer nameservices]
     :or   {serializer (json-serde)} :as _opts}]
   (go
     (let [aws-opts       (cond-> {:api :s3}
@@ -121,13 +121,12 @@
           state          (connection/blank-state)
           nameservices*  (util/sequential
                            (or nameservices (default-S3-nameservice client s3-bucket s3-prefix)))
-          cache-size     (conn-cache/memory->cache-size memory)
+          cache-size     (conn-cache/memory->cache-size cache-max-mb)
           lru-cache-atom (or lru-cache-atom
                              (atom (conn-cache/create-lru-cache cache-size)))
           s3-store       (s3-storage/open s3-bucket s3-prefix s3-endpoint)]
       (map->S3Connection {:id              conn-id
                           :store           s3-store
-                          :memory          memory
                           :state           state
                           :ledger-defaults (ledger-defaults defaults)
                           :serializer      serializer

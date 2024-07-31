@@ -116,7 +116,7 @@
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism storage-path lru-cache-atom memory serializer nameservices]
+  [{:keys [defaults parallelism storage-path lru-cache-atom cache-max-mb serializer nameservices]
     :or   {serializer (json-serde)} :as _opts}]
   (log/debug "Initialized file connection with options: " _opts)
   (go
@@ -124,7 +124,7 @@
           state          (connection/blank-state)
           nameservices*  (util/sequential
                            (or nameservices (default-file-nameservice storage-path)))
-          cache-size     (conn-cache/memory->cache-size memory)
+          cache-size     (conn-cache/memory->cache-size cache-max-mb)
           lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))
           file-store     (file-storage/open storage-path)]
       ;; TODO - need to set up monitor loops for async chans

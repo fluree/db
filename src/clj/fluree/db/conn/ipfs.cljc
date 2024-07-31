@@ -125,7 +125,7 @@
            enabled and commits will not succeed until the ns file is written to
            disk. It should be used as the primary nameservice whenever used for
            a ledger receiving frequent updates or timeliness is important."
-  [{:keys [server parallelism lru-cache-atom memory defaults serializer
+  [{:keys [server parallelism lru-cache-atom cache-max-mb defaults serializer
            ;; only include if you want to configure custom nameservice(s)
            nameservices
            ;; if not providing preconfigured 'nameservices', ipns + file nameservices used
@@ -141,7 +141,6 @@
   (go-try
     (let [ipfs-endpoint   (validate-http-url server)
           ledger-defaults (ledger-defaults defaults)
-          memory          (or memory 1000000) ; default 1MB memory
           conn-id         (str (random-uuid))
           state           (connection/blank-state)
           nameservices*   (if nameservices ;; provided pre-configured nameservices to connection
@@ -149,7 +148,7 @@
                             (cond-> [] ;; utilize default nameservices with provided config options
                                     ipns-nameservice (conj (<? (default-ipns-nameservice ipns-nameservice ipfs-endpoint)))
                                     file-nameservice (conj (default-file-nameservice file-nameservice))))
-          cache-size      (conn-cache/memory->cache-size memory)
+          cache-size      (conn-cache/memory->cache-size cache-max-mb)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))
           ipfs-store      (ipfs-storage/open ipfs-endpoint)]
       (when (empty? nameservices*)
