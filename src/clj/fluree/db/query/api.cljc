@@ -53,7 +53,7 @@
       db)))
 
 (defn db->time-travel-db
-  [db {:keys [t] :as _opts}]
+  [db t]
   (go-try
     (if t
       (<? (time-travel/as-of db t))
