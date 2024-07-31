@@ -62,9 +62,9 @@
        (having/filter q error-ch)
        (select/modify q)
        (order/arrange q)
-       (select/format ds q fuel-tracker error-ch)
        (drop-offset q)
        (take-limit q)
+       (select/format ds q fuel-tracker error-ch)
        (collect-results q)))
 
 (defn execute-subquery
@@ -74,9 +74,9 @@
        (having/filter q error-ch)
        (select/modify q)
        (order/arrange q)
-       (select/subquery-format ds q fuel-tracker error-ch)
        (drop-offset q)
-       (take-limit q)))
+       (take-limit q)
+       (select/subquery-format ds q fuel-tracker error-ch)))
 
 (defn collect-subqueries
   "With multiple subqueries each having its own solution channel,
