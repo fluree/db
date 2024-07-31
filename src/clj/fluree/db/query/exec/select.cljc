@@ -218,7 +218,7 @@
         format-ch           (if (contains? q :select-distinct)
                               (chan 1 (distinct))
                               (chan))]
-    (async/pipeline-async 1
+    (async/pipeline-async 3
                           format-ch
                           (fn [solution ch]
                             (log/trace "select/format solution:" solution)
