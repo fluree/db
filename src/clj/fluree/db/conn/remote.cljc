@@ -81,7 +81,7 @@
 
 (defn connect
   "Creates a new memory connection."
-  [{:keys [parallelism lru-cache-atom memory defaults servers serializer nameservices]
+  [{:keys [parallelism lru-cache-atom cache-max-mb defaults servers serializer nameservices]
     :or   {serializer (json-serde)}}]
   (go-try
     (let [ledger-defaults (<? (ledger-defaults defaults))
@@ -96,7 +96,7 @@
                                 ;; if default ns, and returns exception, throw - connection fails
                                 ;; (likely due to unreachable server with websocket request)
                                 (<? (default-remote-nameservice server-state state))))
-          cache-size      (conn-cache/memory->cache-size memory)
+          cache-size      (conn-cache/memory->cache-size cache-max-mb)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]
       (map->RemoteConnection {:id              conn-id

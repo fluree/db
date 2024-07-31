@@ -12,10 +12,10 @@
 
 (defn memory->cache-size
   "Validate system memory is enough to build a usable cache, then derive cache size."
-  [memory]
-  (let [memory      (or memory 1000000)        ; default 1MB memory
-        object-size 100000                     ; estimate 100kb index node size
-        cache-size  (quot memory object-size)] ; number of objects to keep in cache
+  [cache-max-mb]
+  (let [memory      (or cache-max-mb 100) ; default 100MB memory
+        object-size 0.1 ; estimate 100kb index node size
+        cache-size  (int (quot memory object-size))] ; number of objects to keep in cache
     (when (< cache-size 10)
       (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.")
                       {:status 400 :error :db/invalid-configuration})))
