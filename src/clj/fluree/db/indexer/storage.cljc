@@ -203,28 +203,15 @@
                       {:status 500, :error :db/storage-error})))))
 
 (defn resolve-index-node
-  ([conn node]
-   (resolve-index-node conn node nil))
-  ([conn {:keys [comparator leaf] :as node} error-fn]
-   (assert comparator "Cannot resolve index node; configuration does not have a comparator.")
-   (let [return-ch (async/chan)]
-     (go
-       (try*
-         (let [[k data] (if leaf
-                          [:flakes (<? (fetch-leaf-flakes conn node))]
-                          [:children (<? (fetch-child-attributes conn node))])]
-           (async/put! return-ch
-                       (assoc node k data)))
-         (catch* e
-           (log/error e "Error resolving index node")
-           (when error-fn
-             (try*
-               (error-fn)
-               (catch* e
-                 (log/error e "Error executing error-fn in resolve-index-node!"))))
-           (async/put! return-ch e)
-           (async/close! return-ch))))
-     return-ch)))
+  [conn {:keys [leaf] :as node}]
+  (go-try
+   (let [data (if leaf
+                  (<? (fetch-leaf-flakes conn node))
+                  (<? (fetch-child-attributes conn node)))
+         node* (if leaf
+                 (assoc node :flakes data)
+                 (assoc node :children data))]
+     node*)))
 
 (defn resolve-empty-leaf
   [{:keys [comparator] :as node}]
@@ -264,6 +251,4 @@
        lru-cache-atom
        cache-key
        (fn [_]
-         (resolve-index-node conn node
-                             (fn []
-                               (conn-cache/lru-evict lru-cache-atom cache-key))))))))
+         (resolve-index-node conn node))))))
