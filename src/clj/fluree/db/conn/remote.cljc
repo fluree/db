@@ -1,6 +1,6 @@
 (ns fluree.db.conn.remote
   (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.indexer.storage :as storage]
+            [fluree.db.indexer.storage :as index-storage]
             [fluree.db.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
@@ -43,16 +43,8 @@
 
   index/Resolver
   (resolve
-    [conn {:keys [id leaf tempid] :as node}]
-    (let [cache-key [::resolve id tempid]]
-      (if (= :empty id)
-        (storage/resolve-empty-node node)
-        (conn-cache/lru-lookup
-          lru-cache-atom
-          cache-key
-          (fn [_]
-            (storage/resolve-index-node conn node
-                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
+    [conn node]
+    (index-storage/index-resolver conn lru-cache-atom node)))
 
 #?(:cljs
    (extend-type RemoteConnection

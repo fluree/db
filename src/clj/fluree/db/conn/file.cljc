@@ -81,16 +81,8 @@
 
   index/Resolver
   (resolve
-    [conn {:keys [id leaf tempid] :as node}]
-    (let [cache-key [::resolve id tempid]]
-      (if (= :empty id)
-        (index-storage/resolve-empty-node node)
-        (conn-cache/lru-lookup
-          lru-cache-atom
-          cache-key
-          (fn [_]
-            (index-storage/resolve-index-node conn node
-                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
+    [conn node]
+    (index-storage/index-resolver conn lru-cache-atom node)))
 
 #?(:cljs
    (extend-type FileConnection

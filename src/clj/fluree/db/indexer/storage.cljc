@@ -10,6 +10,7 @@
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.conn.cache :as conn-cache]
             [fluree.db.connection :as connection]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -250,3 +251,19 @@
     (if (index/leaf? node)
       (resolve-empty-leaf node)
       (resolve-empty-branch node))))
+
+(defn index-resolver
+  "Attempts to resolve index-node from cache, and if cache miss
+  resolves from storage and caches. If resolution has an exception, removes
+  the cache entry."
+  [conn lru-cache-atom {:keys [id tempid] :as node}]
+  (let [cache-key [::resolve id tempid]]
+    (if (= :empty id)
+      (resolve-empty-node node)
+      (conn-cache/lru-lookup
+       lru-cache-atom
+       cache-key
+       (fn [_]
+         (resolve-index-node conn node
+                             (fn []
+                               (conn-cache/lru-evict lru-cache-atom cache-key))))))))
