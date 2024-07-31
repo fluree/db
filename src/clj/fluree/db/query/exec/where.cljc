@@ -440,8 +440,8 @@
   "Return a channel of all solutions from the data set `ds` that extend from the
   solutions in `solution-ch` and also match the where-clause pattern `pattern`."
   [ds fuel-tracker pattern error-ch solution-ch]
-  (let [out-ch (async/chan 2)]
-    (async/pipeline-async 2
+  (let [out-ch (async/chan)]
+    (async/pipeline-async 1
                           out-ch
                           (fn [solution ch]
                             (-> (match-pattern ds fuel-tracker solution pattern error-ch)
@@ -523,8 +523,8 @@
   [db fuel-tracker solution pattern error-ch]
   (let [clauses   (pattern-data pattern)
         clause-ch (async/to-chan! clauses)
-        out-ch    (async/chan 2)]
-    (async/pipeline-async 2
+        out-ch    (async/chan)]
+    (async/pipeline-async 1
                           out-ch
                           (fn [clause ch]
                             (-> (match-clause db fuel-tracker solution clause error-ch)
@@ -585,7 +585,7 @@
 (defmethod match-pattern :optional
   [db fuel-tracker solution pattern error-ch]
   (let [clause (pattern-data pattern)
-        opt-ch (async/chan 2 (with-default solution))]
+        opt-ch (async/chan 1 (with-default solution))]
     (-> (match-clause db fuel-tracker solution clause error-ch)
         (async/pipe opt-ch))))
 
@@ -628,11 +628,11 @@
   ([ds q fuel-tracker error-ch]
    (search ds q fuel-tracker error-ch nil))
   ([ds q fuel-tracker error-ch initial-solution-ch]
-   (let [out-ch               (async/chan 2)
+   (let [out-ch               (async/chan)
          initial-solution-ch* (or initial-solution-ch
                                   (values-initial-solution q))]
      (if-let [where-clause (:where q)]
-       (async/pipeline-async 2
+       (async/pipeline-async 1
                              out-ch
                              (fn [initial-solution ch]
                                (-> (match-clause ds fuel-tracker initial-solution where-clause error-ch)

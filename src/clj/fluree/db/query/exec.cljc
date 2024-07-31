@@ -24,7 +24,7 @@
   [{:keys [offset]} solution-ch]
   (if offset
     (async/pipe solution-ch
-                (async/chan 2 (drop offset)))
+                (async/chan 1 (drop offset)))
     solution-ch))
 
 (defn take-limit

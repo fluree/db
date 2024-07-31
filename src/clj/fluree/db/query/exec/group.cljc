@@ -71,5 +71,5 @@
                                      (partial unwind-groups grouping))
                          {}
                          solution-ch)
-        (async/pipe (async/chan 2 cat)))
+        (async/pipe (async/chan 1 cat)))
     solution-ch))

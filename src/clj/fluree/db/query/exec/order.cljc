@@ -43,7 +43,7 @@
   (if order-by
     (let [comparator (partial compare-solutions order-by)
           coll-ch    (async/into [] solution-ch)
-          ordered-ch (async/chan 2 (comp (map (partial sort comparator))
+          ordered-ch (async/chan 1 (comp (map (partial sort comparator))
                                          cat))]
       (async/pipe coll-ch ordered-ch))
     solution-ch))

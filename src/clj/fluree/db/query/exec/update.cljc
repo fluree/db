@@ -16,10 +16,10 @@
 
 (defn retract-triple-matches
   [db t fuel-tracker error-ch matched-ch]
-  (let [retract-ch (async/chan 2 (comp cat
+  (let [retract-ch (async/chan 1 (comp cat
                                        (map (fn [f]
                                               (flake/flip-flake f t)))))]
-    (async/pipeline-async 2
+    (async/pipeline-async 1
                           retract-ch
                           (fn [matched-triple ch]
                             (-> db
@@ -32,7 +32,7 @@
   [db txn {:keys [t] :as _tx-state} fuel-tracker error-ch solution-ch]
   (let [clause     (:delete txn)
         matched-ch (async/pipe solution-ch
-                               (async/chan 2 (comp (mapcat (partial assign-clause clause))
+                               (async/chan 1 (comp (mapcat (partial assign-clause clause))
                                                    (filter where/all-matched?)
                                                    (map (partial where/compute-sids db))
                                                    (remove nil?))))]
@@ -99,19 +99,19 @@
         insert-xf (comp (mapcat (partial assign-clause clause))
                         (filter where/all-matched?)
                         (map (partial build-flake db-vol t reasoned)))
-        insert-ch (async/chan 2 insert-xf identity)]
+        insert-ch (async/chan 1 insert-xf identity)]
     (async/pipe solution-ch insert-ch)))
 
 (defn insert-retract
   [db-vol mdfn tx-state fuel-tracker error-ch solution-ch]
-  (let [solution-ch*    (async/chan 2)  ; create an extra channel to multiply so
-                                        ; solutions don't get dropped before we
-                                        ; can add taps to process them.
+  (let [solution-ch*    (async/chan)  ; create an extra channel to multiply so
+                                      ; solutions don't get dropped before we
+                                      ; can add taps to process them.
         solution-mult   (async/mult solution-ch*)
-        insert-soln-ch  (->> (async/chan 2)
+        insert-soln-ch  (->> (async/chan)
                              (async/tap solution-mult))
         insert-ch       (insert db-vol mdfn tx-state insert-soln-ch)
-        retract-soln-ch (->> (async/chan 2)
+        retract-soln-ch (->> (async/chan)
                              (async/tap solution-mult))
         retract-ch      (retract @db-vol mdfn tx-state fuel-tracker error-ch retract-soln-ch)]
     (async/pipe solution-ch solution-ch*) ; now hook up the solution input
@@ -129,7 +129,7 @@
 (defn modify
   [db-vol parsed-txn tx-state fuel-tracker error-ch solution-ch]
   (let [solution-ch* (async/pipe solution-ch
-                                 (async/chan 2 (comp (where/with-default where/blank-solution))))]
+                                 (async/chan 1 (comp (where/with-default where/blank-solution))))]
     (cond
       (and (insert? parsed-txn)
            (retract? parsed-txn))

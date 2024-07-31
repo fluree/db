@@ -8,7 +8,7 @@
   [q error-ch solution-ch]
   (if-let [filter-fn (:having q)]
     (let [filtered-ch (async/chan)]
-      (async/pipeline-async 2
+      (async/pipeline-async 1
                             filtered-ch
                             (fn [solution ch]
                               (go (try* (when (filter-fn solution)
