@@ -26,16 +26,18 @@
   function that accepts `k` as its only argument and returns an async channel) to
   produce the value and add it to the cache."
   [cache-atom k value-fn]
-  (let [out (async/chan)]
-    (if-let [v (get @cache-atom k)]
-      (do (swap! cache-atom cache/hit k)
-          (async/put! out v))
+  (if-let [v (get @cache-atom k)]
+    (do (swap! cache-atom cache/hit k)
+        v)
+    (let [c (async/promise-chan)]
+      (swap! cache-atom cache/miss k c)
       (async/go
         (let [v (async/<! (value-fn k))]
-          (when-not (exception? v)
-            (swap! cache-atom cache/miss k v))
-          (async/put! out v))))
-    out))
+          (async/put! c v)
+          (when (exception? v)
+            (log/error v "Error resolving cache value for key: " k "with exception:" (ex-message v))
+            (swap! cache-atom cache/evict k))))
+      c)))
 
 (defn lru-evict
   "Evict the key `k` from the cache."
