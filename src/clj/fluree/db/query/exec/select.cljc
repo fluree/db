@@ -52,7 +52,9 @@
 
 (defprotocol ValueSelector
   (format-value [fmt db iri-cache context compact fuel-tracker error-ch solution]
-    "Async format a search solution (map of pattern matches) by extracting relevant match.")
+    "Async format a search solution (map of pattern matches) by extracting relevant match."))
+
+(defprotocol ValueAdapter
   (solution-value [fmt error-ch solution]
     "Formats value for subquery select statement as k-v tuple - synchronous."))
 
@@ -67,6 +69,7 @@
     (-> solution
         (get var)
         (display db iri-cache compact error-ch)))
+  ValueAdapter
   (solution-value
     [_ _ solution]
     [var (get solution var)]))
@@ -88,6 +91,7 @@
                                           (display db iri-cache compact error-ch)
                                           <!)))
         result)))
+  ValueAdapter
   (solution-value
     [_ _ solution]
     solution))
@@ -131,6 +135,7 @@
     (log/trace "AsSelector format-value solution:" solution)
     (go (let [match (get solution bind-var)]
           (where/get-value match))))
+  ValueAdapter
   (solution-value
     [_ _ solution]
     [bind-var (get solution bind-var)]))
