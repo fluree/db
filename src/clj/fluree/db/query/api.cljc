@@ -39,7 +39,7 @@
     did (assoc :did did :issuer did)))
 
 (defn restrict-db
-  [db t {:keys [did default-allow?] :as opts}]
+  [db t {:keys [did default-allow? reasoner-methods rule-sources] :as opts}]
   (go-try
     (let [policy-db      (if did
                            (<? (perm/wrap-identity-policy db did default-allow? nil))
@@ -47,13 +47,12 @@
           time-travel-db (-> (if t
                                (<? (time-travel/as-of policy-db t))
                                policy-db))
-          reasoned-db    (let [{:keys [reasoner-methods rule-sources]} opts]
-                           (if reasoner-methods
-                             (<? (reasoner/reason time-travel-db
-                                                  reasoner-methods
-                                                  rule-sources
-                                                  opts))
-                             time-travel-db))]
+          reasoned-db    (if reasoner-methods
+                           (<? (reasoner/reason time-travel-db
+                                                reasoner-methods
+                                                rule-sources
+                                                opts))
+                           time-travel-db)]
       (assoc-in reasoned-db [:policy :cache] (atom {})))))
     
 (defn track-query

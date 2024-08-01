@@ -15,7 +15,7 @@
             [fluree.db.query.fql.parse :as fql.parse]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
             [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]
-            [fluree.db.query.exec.where :as where]))
+            [fluree.db.query.exec :refer [queryable?]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -184,27 +184,23 @@
         clause-chan)))
     (async/into [] out-chan)))
 
-(defn db?
-  [x]
-  (satisfies? where/Matcher x))
-
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
   supplied rules graph or from the db if no graph is supplied."
   [methods db inserts rule-sources]
   (go-try
-    (let [rule-graphs           (filter #(and (map? %) (not (db? %))) rule-sources)
+    (let [rule-graphs           (filter #(and (map? %) (not (queryable? %))) rule-sources)
           parsed-rule-graphs    (try*
                                   (map parse-rules-graph rule-graphs)
                                   (catch* e
                                           (log/error "Error parsing supplied rules graph:" e)
                                           (throw e)))
-          all-rules-from-graphs (apply concat
-                                       (for [method methods]
-                                         (mapcat (fn [parsed-rules-graph]
-                                                   (rules-from-graph method inserts parsed-rules-graph))
-                                                 parsed-rule-graphs)))
-          rule-dbs              (filter #(or (string? %) (db? %)) rule-sources)
+          all-rules-from-graphs (mapcat (fn [method]
+                                          (mapcat (fn [parsed-rules-graph]
+                                                    (rules-from-graph method inserts parsed-rules-graph))
+                                                  parsed-rule-graphs))
+                                        methods)
+          rule-dbs              (filter #(or (string? %) (queryable? %)) rule-sources)
           all-rule-dbs          (if (or (nil? rule-dbs) (empty? rule-dbs))
                                   [db]
                                   (conj rule-dbs db))
@@ -266,7 +262,7 @@
   (let [rule-ids (map first raw-rules)]
     (->> rule-ids
          frequencies
-         (filter #(< 1 (last %))))))
+         (filter #(< 1 (val %))))))
 
 (defn deduplicate-raw-rules
   "Given a list of reasoning rules, identifies rules with duplicate ids and renames them using
