@@ -56,7 +56,12 @@
 
   (exists? [_ address]
     (let [path (storage-path root address)]
-      (fs/exists? path))))
+      (fs/exists? path)))
+
+  storage/ByteStore
+  (write-bytes [_ address bytes]
+   (let [path (storage-path root address)]
+     (fs/write-file path bytes))))
 
 (defn open
   [root-path]

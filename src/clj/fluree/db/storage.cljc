@@ -44,3 +44,7 @@
   (delete [store address] "Remove value associated with `address` from the Store.")
   (read [store address] "Returns value associated with `address`.")
   (list [store prefix] "Returns sequence of keys that match prefix."))
+
+(defprotocol ByteStore
+  "ByteStore is used by consensus to replicate files across servers"
+  (write-bytes [store address bytes] "Async writes bytes to Store based on address."))
