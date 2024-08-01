@@ -106,22 +106,29 @@
   [path]
   (ns-filesystem/initialize path))
 
+(defn default-lru-cache
+  [cache-max-mb]
+  (let [cache-size (conn-cache/memory->cache-size cache-max-mb)]
+    (atom (conn-cache/create-lru-cache cache-size))))
+
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism storage-path lru-cache-atom cache-max-mb serializer nameservices]
+  [{:keys [defaults parallelism storage-path store
+           lru-cache-atom cache-max-mb serializer nameservices]
     :or   {serializer (json-serde)} :as _opts}]
   (log/debug "Initialized file connection with options: " _opts)
   (go
-    (let [conn-id        (str (random-uuid))
-          state          (connection/blank-state)
-          nameservices*  (util/sequential
+    (let [conn-id         (str (random-uuid))
+          state           (connection/blank-state)
+          nameservices*   (util/sequential
                            (or nameservices (default-file-nameservice storage-path)))
-          cache-size     (conn-cache/memory->cache-size cache-max-mb)
-          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))
-          file-store     (file-storage/open storage-path)]
+          lru-cache-atom* (or lru-cache-atom
+                              (default-lru-cache cache-max-mb))
+          store*          (or store
+                              (file-storage/open storage-path))]
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id              conn-id
-                            :store           file-store
+                            :store           store*
                             :ledger-defaults (ledger-defaults defaults)
                             :serializer      serializer
                             :parallelism     parallelism
@@ -129,4 +136,4 @@
                             :msg-out-ch      (async/chan)
                             :nameservices    nameservices*
                             :state           state
-                            :lru-cache-atom  lru-cache-atom}))))
+                            :lru-cache-atom  lru-cache-atom*}))))
