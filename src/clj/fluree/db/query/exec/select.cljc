@@ -51,32 +51,25 @@
                           (>! error-ch e))))))))
 
 (defprotocol ValueSelector
-  (implicit-grouping? [this]
-    "Returns true if this selector should have its values grouped together.")
   (format-value [fmt db iri-cache context compact fuel-tracker error-ch solution]
-    "Async format a search solution (map of pattern matches) by extracting relevant match.")
+    "Async format a search solution (map of pattern matches) by extracting relevant match."))
+
+(defprotocol ValueAdapter
   (solution-value [fmt error-ch solution]
     "Formats value for subquery select statement as k-v tuple - synchronous."))
-
-;; This exists because many different types of data structures in :select
-;; clauses get implicit-grouping? called on them. So this defaults them to false.
-(extend-type #?(:clj Object :cljs object) ; https://cljs.github.io/api/cljs.core/extend-type
-  ValueSelector
-  (implicit-grouping? [_] false)
-  (format-value [_ _ _ _ _ _ _ _] nil))
 
 (defprotocol SolutionModifier
   (update-solution [this solution]))
 
 (defrecord VariableSelector [var]
   ValueSelector
-  (implicit-grouping? [_] false)
   (format-value
     [_ db iri-cache _context compact _fuel-tracker error-ch solution]
     (log/trace "VariableSelector format-value var:" var "solution:" solution)
     (-> solution
         (get var)
         (display db iri-cache compact error-ch)))
+  ValueAdapter
   (solution-value
     [_ _ solution]
     [var (get solution var)]))
@@ -89,7 +82,6 @@
 
 (defrecord WildcardSelector []
   ValueSelector
-  (implicit-grouping? [_] false)
   (format-value
     [_ db iri-cache _context compact _fuel-tracker error-ch solution]
     (go-loop [[var & vars] (sort (keys solution))
@@ -99,6 +91,7 @@
                                           (display db iri-cache compact error-ch)
                                           <!)))
         result)))
+  ValueAdapter
   (solution-value
     [_ _ solution]
     solution))
@@ -110,7 +103,6 @@
 
 (defrecord AggregateSelector [agg-fn]
   ValueSelector
-  (implicit-grouping? [_] true)
   (format-value
     [_ _ _ _ _ _ error-ch solution]
     (go (try* (agg-fn solution)
@@ -138,12 +130,12 @@
                                    where/unmatched-var
                                    (where/match-value result dt)))))
   ValueSelector
-  (implicit-grouping? [_] aggregate?)
   (format-value
     [_ _ _ _ _ _ _ solution]
     (log/trace "AsSelector format-value solution:" solution)
     (go (let [match (get solution bind-var)]
           (where/get-value match))))
+  ValueAdapter
   (solution-value
     [_ _ solution]
     [bind-var (get solution bind-var)]))
@@ -154,7 +146,6 @@
 
 (defrecord SubgraphSelector [subj selection depth spec]
   ValueSelector
-  (implicit-grouping? [_] false)
   (format-value
     [_ ds iri-cache context compact fuel-tracker error-ch solution]
     (when-let [iri (if (where/variable? subj)
@@ -254,3 +245,9 @@
                     (chan 1 (map (partial format-subquery-values selectors error-ch))))]
     (async/pipe solution-ch format-ch)
     format-ch))
+
+(defn implicit-grouping?
+  [selector]
+  (or (instance? AggregateSelector selector)
+      (and (instance? AsSelector selector)
+           (:aggregate? selector))))
