@@ -22,7 +22,7 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord FileStore [root]
-  storage/Store
+  storage/ContentAddressedStore
   (write [_ dir data]
     (go-try
       (when (not (storage/hashable? data))

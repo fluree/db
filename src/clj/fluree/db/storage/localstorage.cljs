@@ -13,7 +13,7 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord LocalStorageStore []
-  storage/Store
+  storage/ContentAddressedStore
   (write [_ k v]
     (go
       (let [hashable (if (storage/hashable? v)
