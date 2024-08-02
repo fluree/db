@@ -202,6 +202,10 @@
   [var]
   (var->lang-var var))
 
+(defmacro datatype
+  [var]
+  (var->dt-var var))
+
 (defn regex
   [text pattern]
   (boolean (re-find (re-pattern pattern) text)))
@@ -290,16 +294,22 @@
   (contains? (set expressions) term))
 
 (def allowed-scalar-fns
-  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if lang nil? as
-     not not= or re-find re-pattern in
+  '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if lang nil?
+     as not not= or re-find re-pattern in
+
      ;; string fns
-     strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter concat regex replace
+     strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter
+     concat regex replace
+
      ;; numeric fns
      abs round ceil floor rand
+
      ;; datetime fns
      now year month day hours minutes seconds tz
+
      ;; hash fns
      sha256 sha512
+
      ;; rdf term fns
      uuid struuid isNumeric isBlank str})
 
@@ -322,6 +332,7 @@
     contains       fluree.db.query.exec.eval/contains
     count-distinct fluree.db.query.exec.eval/count-distinct
     count          clojure.core/count
+    datatype       fluree.db.query.exec.eval/datatype
     floor          fluree.db.query.exec.eval/floor
     groupconcat    fluree.db.query.exec.eval/groupconcat
     in             fluree.db.query.exec.eval/in
