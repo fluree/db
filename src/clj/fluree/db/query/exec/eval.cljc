@@ -293,6 +293,9 @@
   [term expressions]
   (contains? (set expressions) term))
 
+(def context-var
+  (symbol "$-CONTEXT"))
+
 (def allowed-scalar-fns
   '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if lang nil?
      as not not= or re-find re-pattern in
@@ -433,26 +436,26 @@
             code))
 
 (defn bind-variables
-  [soln-sym var-syms]
-  (into []
+  [soln-sym var-syms ctx]
+  (into `[~context-var ~ctx]
         (mapcat (fn [var]
                   (let [dt-var   (var->dt-var var)
                         lang-var (var->lang-var var)]
-                    `[mch#      (get ~soln-sym (quote ~var))
-                      ~dt-var   (where/get-datatype-iri mch#)
-                      ~lang-var (-> mch# ::where/meta :lang (or ""))
-                      ~var      (cond->> (where/get-binding mch#)
-                                  (= ~dt-var ::group/grouping)
-                                  (mapv where/get-value))])))
+                    `[mch#         (get ~soln-sym (quote ~var))
+                      ~dt-var      (where/get-datatype-iri mch#)
+                      ~lang-var    (-> mch# ::where/meta :lang (or ""))
+                      ~var         (cond->> (where/get-binding mch#)
+                                     (= ~dt-var ::group/grouping)
+                                     (mapv where/get-value))])))
         var-syms))
 
 (defn compile
-  ([code] (compile code true))
-  ([code allow-aggregates?]
+  ([code ctx] (compile code ctx true))
+  ([code ctx allow-aggregates?]
    (let [qualified-code (coerce code allow-aggregates?)
          vars           (variables qualified-code)
          soln-sym       'solution
-         bdg            (bind-variables soln-sym vars)
+         bdg            (bind-variables soln-sym vars ctx)
          fn-code        `(fn [~soln-sym]
                            (log/trace "fn solution:" ~soln-sym)
                            (log/trace "fn bindings:" (quote ~bdg))
@@ -462,8 +465,8 @@
      (eval fn-code))))
 
 (defn compile-filter
-  [code var]
-  (let [f        (compile code)
+  [code var ctx]
+  (let [f        (compile code ctx)
         soln-sym 'solution]
     (eval `(fn [~soln-sym ~var]
              (-> ~soln-sym
