@@ -319,7 +319,7 @@
             (is (= [["ex:bob"]] sut)
                 "returns correctly filtered results")))))))
 
-(deftest ^:integration ^:pending datatype-test
+(deftest ^:integration datatype-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "people")
         db     @(fluree/stage
@@ -341,7 +341,7 @@
                      :where   '[{:ex/age ?age}
                                 [:bind ?dt (datatype ?age)]]}
             results @(fluree/query db query)]
-        (is (= [["forever 10" "xsd:string"] [36 "xsd:long"]]
+        (is (= [[36 :xsd/long] ["forever 10" :xsd/string]]
                results))))
     (testing "filtering query results with datatype fn")
     (testing "filtering query results with @type value map")))

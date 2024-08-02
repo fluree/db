@@ -204,7 +204,7 @@
 
 (defmacro datatype
   [var]
-  (var->dt-var var))
+  (-> var var->dt-var where/match-iri))
 
 (defn regex
   [text pattern]

@@ -56,7 +56,8 @@
 
 (defn matched-sid?
   [mch]
-  (contains? mch ::sids))
+  (and (map? mch)
+       (contains? mch ::sids)))
 
 (defn get-sid
   [iri-mch db]
@@ -591,11 +592,14 @@
 
 (defn bind-function-result
   [solution var-name result]
-  (let [dt  (datatype/infer-iri result)
-        mch (-> var-name
-                unmatched-var
-                (match-value result dt))]
-    (assoc solution var-name mch)))
+  (if (matched? result)
+    (let [mch (assoc result ::var var-name)]
+      (assoc solution var-name mch))
+    (let [dt  (datatype/infer-iri result)
+          mch (-> var-name
+                  unmatched-var
+                  (match-value result dt))]
+      (assoc solution var-name mch))))
 
 (defmethod match-pattern :bind
   [_db _fuel-tracker solution pattern error-ch]
