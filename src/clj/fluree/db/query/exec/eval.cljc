@@ -4,6 +4,7 @@
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
@@ -296,9 +297,15 @@
 (def context-var
   (symbol "$-CONTEXT"))
 
+(defmacro iri
+  [s]
+  `(-> ~s
+       (json-ld/expand-iri ~context-var)
+       where/match-iri))
+
 (def allowed-scalar-fns
-  '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if lang nil?
-     as not not= or re-find re-pattern in
+  '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if iri lang
+     nil? as not not= or re-find re-pattern in
 
      ;; string fns
      strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter
@@ -315,7 +322,6 @@
 
      ;; rdf term fns
      uuid struuid isNumeric isBlank str})
-
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
@@ -339,6 +345,7 @@
     floor          fluree.db.query.exec.eval/floor
     groupconcat    fluree.db.query.exec.eval/groupconcat
     in             fluree.db.query.exec.eval/in
+    iri            fluree.db.query.exec.eval/iri
     lang           fluree.db.query.exec.eval/lang
     lcase          fluree.db.query.exec.eval/lcase
     median         fluree.db.query.exec.eval/median
