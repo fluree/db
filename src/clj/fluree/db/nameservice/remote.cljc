@@ -78,13 +78,13 @@
           ledger-alias)))
   (-alias [_ ledger-address]
     ledger-address)
-  (-close [nameservice]
+  (-close [_]
     (async/close! msg-in)
     (async/close! msg-out))
 
   ns-proto/Publication
-  (-subscribe [nameservice ledger-alias callback] (subscribe conn-state ledger-alias callback))
-  (-unsubscribe [nameservice ledger-alias] (unsubscribe conn-state ledger-alias)))
+  (-subscribe [_ ledger-alias callback] (subscribe conn-state ledger-alias callback))
+  (-unsubscribe [_ ledger-alias] (unsubscribe conn-state ledger-alias)))
 
 (defn initialize
   [server-state conn-state]

@@ -29,7 +29,7 @@
 
   ns-proto/iNameService
   (-lookup [_ ledger-alias] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
-  (-lookup [_ ledger-alias opts] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
+  (-lookup [_ ledger-alias _opts] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
   (-sync? [_] sync?)
   (-address [_ ledger-alias {:keys [branch] :as _opts}]
     (let [branch (if branch (name branch) "main")]
@@ -37,7 +37,7 @@
   (-alias [_ ledger-address]
     (-> ledger-address (->> (s3/address-path s3-bucket s3-prefix)) (str/split #"/")
         (->> (drop-last 2) (str/join #"/"))))
-  (-close [nameservice] true))
+  (-close [_] true))
 
 
 (defn initialize

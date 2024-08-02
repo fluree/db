@@ -69,7 +69,7 @@
   (-alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
       alias))
-  (-close [nameservice] true))
+  (-close [_] true))
 
 (defn initialize
   [ipfs-endpoint ipns-key]
