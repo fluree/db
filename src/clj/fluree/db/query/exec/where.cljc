@@ -589,7 +589,7 @@
     (-> (match-clause db fuel-tracker solution clause error-ch)
         (async/pipe opt-ch))))
 
-(defn add-fn-result-to-solution
+(defn bind-function-result
   [solution var-name result]
   (let [dt  (datatype/infer-iri result)
         mch (-> var-name
@@ -606,8 +606,8 @@
                       (let [f        (::fn b)
                             var-name (::var b)]
                         (try*
-                          (->> (f solution)
-                               (add-fn-result-to-solution solution* var-name))
+                          (let [result (f solution)]
+                            (bind-function-result solution* var-name result))
                           (catch* e (update solution* ::errors conj e)))))
                     solution (vals bind))]
         (when-let [errors (::errors result)]
