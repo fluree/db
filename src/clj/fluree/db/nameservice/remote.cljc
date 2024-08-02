@@ -71,7 +71,6 @@
   ns-proto/iNameService
   (-lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
   (-lookup [_ ledger-address opts] (remote-lookup conn-state server-state ledger-address)) ;; TODO - doesn't support branch yet
-  (-push [_ commit-data] (throw (ex-info "Unsupported RemoteNameService op: push" {})))
   (-sync? [_] sync?)
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported RemoteNameService op: ledgers" {})))
   (-address [_ ledger-alias {:keys [branch]:as _opts}]

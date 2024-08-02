@@ -72,10 +72,12 @@
 
 (defrecord MemoryNameService
   [state-atom sync?]
+  ns-proto/Publisher
+  (-push [_ commit-data] (push! state-atom commit-data))
+
   ns-proto/iNameService
   (-lookup [_ ledger-alias] (lookup state-atom ledger-alias))
   (-lookup [_ ledger-alias opts] (lookup state-atom ledger-alias)) ;; TODO - doesn't support branches yet
-  (-push [_ commit-data] (push! state-atom commit-data))
   (-sync? [_] sync?)
   (-ledgers [_ opts] (ledger-list state-atom opts))
   (-address [_ ledger-alias opts]

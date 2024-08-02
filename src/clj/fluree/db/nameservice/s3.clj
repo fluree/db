@@ -24,10 +24,12 @@
 
 (defrecord S3NameService
   [s3-client s3-bucket s3-prefix sync?]
+  ns-proto/Publisher
+  (-push [_ commit-data] (push s3-client s3-bucket s3-prefix commit-data))
+
   ns-proto/iNameService
   (-lookup [_ ledger-alias] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
   (-lookup [_ ledger-alias opts] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
-  (-push [_ commit-data] (push s3-client s3-bucket s3-prefix commit-data))
   (-sync? [_] sync?)
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported S3NameService op: ledgers" {})))
   (-address [_ ledger-alias {:keys [branch] :as _opts}]

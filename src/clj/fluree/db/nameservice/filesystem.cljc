@@ -211,10 +211,12 @@ changes from different branches into existing metadata map"
 
 (defrecord FileNameService
   [local-path sync? base-address]
+  ns-proto/Publisher
+  (-push [_ commit-data] (push! local-path base-address commit-data))
+
   ns-proto/iNameService
   (-lookup [_ ledger-alias] (lookup ledger-alias local-path base-address nil))
   (-lookup [_ ledger-alias opts] (lookup ledger-alias local-path base-address opts))
-  (-push [_ commit-data] (push! local-path base-address commit-data))
   (-sync? [_] sync?)
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]

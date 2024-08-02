@@ -57,8 +57,10 @@
 
 (defrecord IpnsNameService
   [ipfs-endpoint ipns-key base-address sync?]
-  ns-proto/iNameService
+  ns-proto/Publisher
   (-push [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
+
+  ns-proto/iNameService
   (-lookup [_ ledger-alias] (lookup-address ipfs-endpoint ipns-key ledger-alias nil))
   (-lookup [_ ledger-alias opts] (lookup-address ipfs-endpoint ipns-key ledger-alias opts))
   (-sync? [_] sync?)
