@@ -36,13 +36,6 @@ changes from different branches into existing metadata map"
   (let [[_ _ path] (str/split address #":")]
     (subs path 2)))
 
-(defn list-files-in-path
-  "Lists all files in the given directory path"
-  [path]
-  (let [directory (io/file path)
-        files (file-seq directory)]
-    files))
-
 (defn file-path
   "Returns fully formed file path where a ns record would be stored."
   [local-path alias]
