@@ -28,8 +28,6 @@
   (-lookup [_ ledger-alias] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
   (-lookup [_ ledger-alias opts] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
   (-push [_ commit-data] (push s3-client s3-bucket s3-prefix commit-data))
-  (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported S3NameService op: subscribe" {})))
-  (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported S3NameService op: unsubscribe" {})))
   (-sync? [_] sync?)
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported S3NameService op: ledgers" {})))
   (-address [_ ledger-alias {:keys [branch] :as _opts}]

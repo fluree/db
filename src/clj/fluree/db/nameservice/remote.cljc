@@ -72,8 +72,6 @@
   (-lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
   (-lookup [_ ledger-address opts] (remote-lookup conn-state server-state ledger-address)) ;; TODO - doesn't support branch yet
   (-push [_ commit-data] (throw (ex-info "Unsupported RemoteNameService op: push" {})))
-  (-subscribe [nameservice ledger-alias callback] (subscribe conn-state ledger-alias callback))
-  (-unsubscribe [nameservice ledger-alias] (unsubscribe conn-state ledger-alias))
   (-sync? [_] sync?)
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported RemoteNameService op: ledgers" {})))
   (-address [_ ledger-alias {:keys [branch]:as _opts}]
@@ -84,7 +82,11 @@
     ledger-address)
   (-close [nameservice]
     (async/close! msg-in)
-    (async/close! msg-out)))
+    (async/close! msg-out))
+
+  ns-proto/Publication
+  (-subscribe [nameservice ledger-alias callback] (subscribe conn-state ledger-alias callback))
+  (-unsubscribe [nameservice ledger-alias] (unsubscribe conn-state ledger-alias)))
 
 (defn initialize
   [server-state conn-state]

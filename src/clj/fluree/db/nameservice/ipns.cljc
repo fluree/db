@@ -61,8 +61,6 @@
   (-push [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
   (-lookup [_ ledger-alias] (lookup-address ipfs-endpoint ipns-key ledger-alias nil))
   (-lookup [_ ledger-alias opts] (lookup-address ipfs-endpoint ipns-key ledger-alias opts))
-  (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported IpfsNameService op: subscribe" {})))
-  (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported IpfsNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
   (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]

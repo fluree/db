@@ -76,8 +76,6 @@
   (-lookup [_ ledger-alias] (lookup state-atom ledger-alias))
   (-lookup [_ ledger-alias opts] (lookup state-atom ledger-alias)) ;; TODO - doesn't support branches yet
   (-push [_ commit-data] (push! state-atom commit-data))
-  (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported MemoryNameService op: subscribe" {})))
-  (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported MemoryNameService op: unsubscribe" {})))
   (-sync? [_] sync?)
   (-ledgers [_ opts] (ledger-list state-atom opts))
   (-address [_ ledger-alias opts]
