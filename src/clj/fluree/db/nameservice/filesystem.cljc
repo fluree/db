@@ -218,7 +218,6 @@ changes from different branches into existing metadata map"
   (-lookup [_ ledger-alias] (lookup ledger-alias local-path base-address nil))
   (-lookup [_ ledger-alias opts] (lookup ledger-alias local-path base-address opts))
   (-sync? [_] sync?)
-  (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]
     (go (address base-address ledger-alias opts)))
   (-alias [_ ledger-address]

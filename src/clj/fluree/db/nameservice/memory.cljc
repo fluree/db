@@ -79,7 +79,6 @@
   (-lookup [_ ledger-alias] (lookup state-atom ledger-alias))
   (-lookup [_ ledger-alias opts] (lookup state-atom ledger-alias)) ;; TODO - doesn't support branches yet
   (-sync? [_] sync?)
-  (-ledgers [_ opts] (ledger-list state-atom opts))
   (-address [_ ledger-alias opts]
     (address ledger-alias opts))
   (-alias [_ ledger-address]

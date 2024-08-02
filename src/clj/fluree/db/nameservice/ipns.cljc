@@ -64,7 +64,6 @@
   (-lookup [_ ledger-alias] (lookup-address ipfs-endpoint ipns-key ledger-alias nil))
   (-lookup [_ ledger-alias opts] (lookup-address ipfs-endpoint ipns-key ledger-alias opts))
   (-sync? [_] sync?)
-  (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]
     (ipns-address ipfs-endpoint ipns-key ledger-alias opts))
   (-alias [_ ledger-address]
