@@ -162,11 +162,11 @@
 (defn datatype-matcher
   "Return a function that returns true if the datatype of a matched pattern equals
   the supplied datatype iri `type`."
-  [type]
+  [type context]
   (fn [soln mch]
     (let [type* (if (variable? type)
                   (-> soln (get type) get-iri)
-                  type)]
+                  (json-ld/expand-iri type context))]
       (-> mch
           get-datatype-iri
           (= type*)))))
