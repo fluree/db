@@ -10,7 +10,8 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.iri :as iri])
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -32,6 +33,29 @@
        (match-value x dt-iri)
        (assoc ::meta m))))
 
+(defn matched-value?
+  [match]
+  (-> match ::val some?))
+
+(defn get-value
+  [match]
+  (::val match))
+
+(defn get-variable
+  [match]
+  (::var match))
+
+(defn get-datatype-iri
+  [mch]
+  (if (or (contains? mch ::iri)
+          (contains? mch ::sids))
+    const/iri-anyURI
+    (-> mch ::datatype-iri iri/unwrap)))
+
+(defn match-sid
+  [iri-mch db-alias sid]
+  (update iri-mch ::sids assoc db-alias sid))
+
 (defn match-iri
   ([iri]
    (match-iri unmatched iri))
@@ -40,19 +64,17 @@
 
 (defn get-iri
   [match]
-  (-> match ::iri iri/unwrap))
+  (cond
+    (contains? match ::iri)
+    (-> match ::iri iri/unwrap)
+
+    (-> match get-datatype-iri #{const/iri-anyURI})
+    (-> match get-value iri/unwrap)))
 
 (defn matched-iri?
   [match]
   (-> match ::iri some?))
 
-(defn matched-value?
-  [match]
-  (-> match ::val some?))
-
-(defn match-sid
-  [iri-mch db-alias sid]
-  (update iri-mch ::sids assoc db-alias sid))
 
 (defn matched-sid?
   [mch]
@@ -64,18 +86,16 @@
   (let [db-alias (:alias db)]
     (get-in iri-mch [::sids db-alias])))
 
-(defn get-datatype-iri
-  [mch]
-  (if (or (matched-iri? mch)
-          (matched-sid? mch))
-    const/iri-anyURI
-    (-> mch ::datatype-iri iri/unwrap)))
-
 (defn matched?
   [match]
   (or (matched-value? match)
       (matched-iri? match)
       (matched-sid? match)))
+
+(defn get-binding
+  [match]
+  (or (get-value match)
+      (get-iri match)))
 
 (defn all-matched?
   [[s p o]]
@@ -102,19 +122,6 @@
   [match]
   (and (contains? match ::var)
        (unmatched? match)))
-
-(defn get-value
-  [match]
-  (::val match))
-
-(defn get-variable
-  [match]
-  (::var match))
-
-(defn get-binding
-  [match]
-  (or (get-value match)
-      (get-iri match)))
 
 (defn get-meta
   [match]
