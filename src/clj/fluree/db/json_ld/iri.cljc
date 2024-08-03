@@ -10,7 +10,9 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defrecord IRI [^String s])
+(defrecord IRI [^String s]
+  Object
+  (toString [_] s))
 
 (defn iri?
   [x]
