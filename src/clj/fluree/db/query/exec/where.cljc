@@ -69,7 +69,7 @@
   (if (or (matched-iri? mch)
           (matched-sid? mch))
     const/iri-anyURI
-    (::datatype-iri mch)))
+    (-> mch ::datatype-iri iri/unwrap)))
 
 (defn matched?
   [match]
@@ -151,6 +151,18 @@
                   (-> soln (get lang) get-value)
                   lang)]
       (-> mch ::meta :lang (= lang*)))))
+
+(defn datatype-matcher
+  "Return a function that returns true if the datatype of a matched pattern equals
+  the supplied datatype iri `type`."
+  [type]
+  (fn [soln mch]
+    (let [type* (if (variable? type)
+                  (-> soln (get type) get-iri)
+                  type)]
+      (-> mch
+          get-datatype-iri
+          (= type*)))))
 
 (defn with-filter
   [mch f]

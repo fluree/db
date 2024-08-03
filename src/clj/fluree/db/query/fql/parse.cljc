@@ -63,12 +63,30 @@
       (where/anonymous-value v const/iri-lang-string {:lang lang})
       (where/anonymous-value v))))
 
+(defn every-binary-pred
+  [& fs]
+  (fn [x y]
+    (every? (fn [f]
+              (f x y))
+            fs)))
+
+(defn combine-filters
+  [& fs]
+  (some->> fs
+           (remove nil?)
+           not-empty
+           (apply every-binary-pred)))
+
 (defn parse-value-attributes
   [v attrs context]
-  (let [mch (parse-value-datatype v attrs context)]
-    (if-let [lang (get attrs const/iri-language)]
-      (let [lang-matcher (where/lang-matcher lang)]
-        (where/with-filter mch lang-matcher))
+  (let [mch          (parse-value-datatype v attrs context)
+        lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
+        dt-matcher   (some-> attrs
+                             (get const/iri-type)
+                             (json-ld/expand-iri context)
+                             where/datatype-matcher)]
+    (if-let [f (combine-filters lang-matcher dt-matcher)]
+      (where/with-filter mch f)
       mch)))
 
 (defn match-value-binding-map
@@ -235,23 +253,17 @@
                  (parse-pattern pattern vars context)))
        where/->where-clause))
 
-(defn every-binary-pred
-  [& fs]
-  (fn [x y]
-    (every? (fn [f]
-              (f x y))
-            fs)))
-
 (defn parse-variable-attributes
   [var attrs vars context]
   (let [lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
+        dt-matcher   (some-> attrs
+                             (get const/iri-type)
+                             (json-ld/expand-iri context)
+                             where/datatype-matcher)
         filter-fn    (some-> attrs
                              (get const/iri-filter)
                              (parse-filter-function var vars context))]
-    (if-let [f (some->> [lang-matcher filter-fn]
-                        (remove nil?)
-                        not-empty
-                        (apply every-binary-pred))]
+    (if-let [f (combine-filters lang-matcher dt-matcher filter-fn)]
       (where/->var-filter var f)
       (where/unmatched-var var))))
 
