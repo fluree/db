@@ -5,6 +5,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
+            [fluree.db.json-ld.iri :as iri]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
@@ -205,7 +206,8 @@
 
 (defmacro datatype
   [var]
-  (-> var var->dt-var where/match-iri))
+  (let [dt-var (var->dt-var var)]
+    `(iri/->IRI ~dt-var)))
 
 (defn regex
   [text pattern]
@@ -301,7 +303,7 @@
   [s]
   `(-> ~s
        (json-ld/expand-iri ~context-var)
-       where/match-iri))
+       iri/->IRI))
 
 (def allowed-scalar-fns
   '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if iri lang

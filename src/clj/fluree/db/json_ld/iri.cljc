@@ -10,6 +10,18 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defrecord IRI [^String s])
+
+(defn iri?
+  [x]
+  (instance? IRI x))
+
+(defn unwrap
+  [x]
+  (if (iri? x)
+    (:s x)
+    x))
+
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")
 (def ^:const f-did-ns "did:fluree:")

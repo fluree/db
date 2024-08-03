@@ -343,7 +343,16 @@
             results @(fluree/query db query)]
         (is (= [[36 :xsd/long] ["forever 10" :xsd/string]]
                results))))
-    (testing "filtering query results with datatype fn")
+    (testing "filtering query results with datatype fn"
+      (let [query   {:context [test-utils/default-context
+                               {:ex "http://example.org/ns/"}]
+                     :select  '[?age ?dt]
+                     :where   '[{:ex/age ?age}
+                                [:bind ?dt (datatype ?age)]
+                                [:filter (= (iri :xsd/long) ?dt)]]}
+            results @(fluree/query db query)]
+        (is (= [[36 :xsd/long]]
+               results))))
     (testing "filtering query results with @type value map")))
 
 (deftest ^:integration subject-object-test
