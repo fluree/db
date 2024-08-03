@@ -353,7 +353,19 @@
             results @(fluree/query db query)]
         (is (= [[36 :xsd/long]]
                results))))
-    (testing "filtering query results with @type value map")))
+    (testing "filtering query results with @type value map"
+      (let [query   {:context [test-utils/default-context
+                               {:ex    "http://example.org/ns/"
+                                :value "@value"
+                                :type  "@type"}]
+                     :select  '[?name ?age]
+                     :where   '[{:ex/name ?name
+                                 :ex/age  {:value ?age
+                                           :type  :xsd/string}}]}
+            results @(fluree/query db query)]
+        (is (= [["Bart" "forever 10"]]
+               results))))
+    (testing "filtering query results with @type value map with variable type")))
 
 (deftest ^:integration subject-object-test
   (let [conn   (test-utils/create-conn)
