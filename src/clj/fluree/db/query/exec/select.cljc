@@ -38,7 +38,8 @@
 (defmethod display const/iri-anyURI
   [match db iri-cache compact error-ch]
   (go
-    (or (some-> match ::where/iri compact)
+    (or (some-> match where/get-iri compact)
+        (some-> match where/get-value iri/unwrap compact)
         (let [db-alias (:alias db)
               v        (where/get-sid match db-alias)]
           (if-let [cached (-> @iri-cache (get v) :as)]

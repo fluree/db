@@ -40,7 +40,7 @@
 
 (defn get-iri
   [match]
-  (::iri match))
+  (-> match ::iri iri/unwrap))
 
 (defn matched-iri?
   [match]
@@ -592,14 +592,11 @@
 
 (defn bind-function-result
   [solution var-name result]
-  (if (matched? result)
-    (let [mch (assoc result ::var var-name)]
-      (assoc solution var-name mch))
-    (let [dt  (datatype/infer-iri result)
-          mch (-> var-name
-                  unmatched-var
-                  (match-value result dt))]
-      (assoc solution var-name mch))))
+  (let [dt  (datatype/infer-iri result)
+        mch (-> var-name
+                unmatched-var
+                (match-value result dt))]
+    (assoc solution var-name mch)))
 
 (defmethod match-pattern :bind
   [_db _fuel-tracker solution pattern error-ch]

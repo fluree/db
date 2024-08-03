@@ -104,7 +104,8 @@
                     const/$xsd:string)
      (integer? x) const/$xsd:long ; infer to long to prevent overflow
      (number? x)  const/$xsd:decimal
-     (boolean? x) const/$xsd:boolean)))
+     (boolean? x) const/$xsd:boolean
+     (iri/iri? x) const/$xsd:anyURI)))
 
 (defn infer-iri
   ([x]
