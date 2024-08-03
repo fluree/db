@@ -81,10 +81,7 @@
   [v attrs context]
   (let [mch          (parse-value-datatype v attrs context)
         lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
-        dt-matcher   (some-> attrs
-                             (get const/iri-type)
-                             (json-ld/expand-iri context)
-                             where/datatype-matcher)]
+        dt-matcher   (some-> attrs (get const/iri-type) (where/datatype-matcher context))]
     (if-let [f (combine-filters lang-matcher dt-matcher)]
       (where/with-filter mch f)
       mch)))
@@ -256,10 +253,7 @@
 (defn parse-variable-attributes
   [var attrs vars context]
   (let [lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
-        dt-matcher   (some-> attrs
-                             (get const/iri-type)
-                             (json-ld/expand-iri context)
-                             where/datatype-matcher)
+        dt-matcher   (some-> attrs (get const/iri-type) (where/datatype-matcher context))
         filter-fn    (some-> attrs
                              (get const/iri-filter)
                              (parse-filter-function var vars context))]
