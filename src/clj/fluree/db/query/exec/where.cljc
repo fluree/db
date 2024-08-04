@@ -96,6 +96,14 @@
       (match-value value const/iri-lang-string)
       (match-meta {:lang lang})))
 
+(defn match-transaction
+  [mch t]
+  (assoc mch ::t t))
+
+(defn get-transaction
+  [mch]
+  (::t mch))
+
 (defn matched?
   [match]
   (or (matched-value? match)
@@ -292,6 +300,7 @@
       (let [dt-iri (iri/decode-sid db dt)]
         (-> o-match
             (match-value (flake/o flake) dt-iri)
+            (match-transaction (flake/t flake))
             (match-meta (flake/m flake)))))))
 
 (defn match-flake
