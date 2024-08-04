@@ -53,11 +53,11 @@
     [nil]))
 
 (defmethod select/display ::grouping
-  [match db select-cache compact error-ch]
+  [match compact error-ch]
   (let [group (where/get-value match)]
     (->> group
          (map (fn [grouped-val]
-                (select/display grouped-val db select-cache compact error-ch)))
+                (select/display grouped-val compact error-ch)))
          (async/map vector))))
 
 (defn combine
