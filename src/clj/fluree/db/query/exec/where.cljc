@@ -348,54 +348,50 @@
     [o o-fn]))
 
 (defn resolve-flake-range
-  ([db fuel-tracker error-ch components]
-   (resolve-flake-range db fuel-tracker nil error-ch components))
+  [{:keys [t] :as db} fuel-tracker error-ch [s-mch p-mch o-mch]]
+  (let [s    (get-sid s-mch db)
+        s-fn (::fn s-mch)
+        p    (get-sid p-mch db)
+        p-fn (::fn p-mch)
+        o    (or (get-value o-mch)
+                 (get-sid o-mch db))
+        o-fn (::fn o-mch)
+        o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
 
-  ([{:keys [t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
-   (let [s    (get-sid s-mch db)
-         s-fn (::fn s-mch)
-         p    (get-sid p-mch db)
-         p-fn (::fn p-mch)
-         o    (or (get-value o-mch)
-                  (get-sid o-mch db))
-         o-fn (::fn o-mch)
-         o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
-
-         idx         (try* (index/for-components s p o o-dt)
-                           (catch* e
-                             (log/error e "Error resolving flake range")
-                             (async/put! error-ch e)))
-         [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
-         start-flake (flake/create s p o* o-dt nil nil util/min-integer)
-         end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
-         track-fuel  (when fuel-tracker
-                       (fuel/track fuel-tracker error-ch))
-         subj-filter (when s-fn
-                       (filter (fn [f]
-                                 (-> unmatched
-                                     (match-subject db f)
-                                     s-fn))))
-         pred-filter (when p-fn
-                       (filter (fn [f]
-                                 (-> unmatched
-                                     (match-predicate db f)
-                                     p-fn))))
-         obj-filter  (when o-fn*
-                       (filter (fn [f]
-                                 (-> unmatched
-                                     (match-object db f)
-                                     o-fn*))))
-         flake-xf*   (->> [subj-filter pred-filter obj-filter
-                           flake-xf track-fuel]
-                          (remove nil?)
-                          (apply comp))
-         opts        {:idx         idx
-                      :from-t      t
-                      :to-t        t
-                      :start-flake start-flake
-                      :end-flake   end-flake
-                      :flake-xf    flake-xf*}]
-     (query-range/resolve-flake-slices db idx error-ch opts))))
+        idx         (try* (index/for-components s p o o-dt)
+                          (catch* e
+                                  (log/error e "Error resolving flake range")
+                                  (async/put! error-ch e)))
+        [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
+        start-flake (flake/create s p o* o-dt nil nil util/min-integer)
+        end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
+        track-fuel  (when fuel-tracker
+                      (fuel/track fuel-tracker error-ch))
+        subj-filter (when s-fn
+                      (filter (fn [f]
+                                (-> unmatched
+                                    (match-subject db f)
+                                    s-fn))))
+        pred-filter (when p-fn
+                      (filter (fn [f]
+                                (-> unmatched
+                                    (match-predicate db f)
+                                    p-fn))))
+        obj-filter  (when o-fn*
+                      (filter (fn [f]
+                                (-> unmatched
+                                    (match-object db f)
+                                    o-fn*))))
+        flake-xf    (->> [subj-filter pred-filter obj-filter track-fuel]
+                        (remove nil?)
+                        (apply comp))
+        opts        {:idx         idx
+                     :from-t      t
+                     :to-t        t
+                     :start-flake start-flake
+                     :end-flake   end-flake
+                     :flake-xf    flake-xf}]
+    (query-range/resolve-flake-slices db idx error-ch opts)))
 
 
 (defn compute-sid
