@@ -207,7 +207,7 @@
 (defmacro datatype
   [var]
   (let [dt-var (var->dt-var var)]
-    `(iri/->IRI ~dt-var)))
+    `(iri/string->iri ~dt-var)))
 
 (defn regex
   [text pattern]
@@ -303,7 +303,7 @@
   [s]
   `(-> ~s
        (json-ld/expand-iri ~context-var)
-       iri/->IRI))
+       iri/string->iri))
 
 (def allowed-scalar-fns
   '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if iri lang
