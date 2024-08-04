@@ -96,6 +96,10 @@
       (match-value value const/iri-lang-string)
       (match-meta {:lang lang})))
 
+(defn get-lang
+  [mch]
+  (-> mch get-meta (get :lang)))
+
 (defn match-transaction
   [mch t]
   (assoc mch ::t t))
