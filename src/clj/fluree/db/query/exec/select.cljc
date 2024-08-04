@@ -19,27 +19,21 @@
 (defmulti display
   "Format a where-pattern match for presentation based on the match's datatype.
   Return an async channel that will eventually contain the formatted match."
-  (fn [match _compact _error-ch]
+  (fn [match _compact]
     (where/get-datatype-iri match)))
 
 (defmethod display :default
-  [match _ _]
-  (go (where/get-value match)))
+  [match _]
+  (where/get-value match))
 
 (defmethod display const/iri-json
-  [match _compact error-ch]
-  (go
-    (let [v (where/get-value match)]
-      (try* (json/parse v false)
-            (catch* e
-                    (log/error e "Error displaying json:" v)
-                    (>! error-ch e))))))
+  [match _compact]
+  (-> match where/get-value (json/parse false)))
 
 (defmethod display const/iri-anyURI
-  [match compact error-ch]
-  (go
-    (or (some-> match where/get-iri compact)
-        (some-> match where/get-value iri/unwrap compact))))
+  [match compact]
+  (or (some-> match where/get-iri compact)
+      (some-> match where/get-value iri/unwrap compact)))
 
 (defprotocol ValueSelector
   (format-value [fmt db iri-cache context compact fuel-tracker error-ch solution]
@@ -55,11 +49,11 @@
 (defrecord VariableSelector [var]
   ValueSelector
   (format-value
-    [_ db iri-cache _context compact _fuel-tracker error-ch solution]
+    [_ _db _iri-cache _context compact _fuel-tracker _error-ch solution]
     (log/trace "VariableSelector format-value var:" var "solution:" solution)
-    (-> solution
-        (get var)
-        (display compact error-ch)))
+    (go (-> solution
+            (get var)
+            (display compact))))
   ValueAdapter
   (solution-value
     [_ _ solution]
@@ -74,13 +68,12 @@
 (defrecord WildcardSelector []
   ValueSelector
   (format-value
-    [_ db iri-cache _context compact _fuel-tracker error-ch solution]
+    [_ _db _iri-cache _context compact _fuel-tracker _error-ch solution]
     (go-loop [[var & vars] (sort (keys solution))
               result {}]
       (if var
-        (recur vars (assoc result var (-> (get solution var)
-                                          (display compact error-ch)
-                                          <!)))
+        (let [display-var (-> solution (get var) (display compact))]
+          (recur vars (assoc result var display-var)))
         result)))
   ValueAdapter
   (solution-value
@@ -225,7 +218,7 @@
 (defn subquery-format
   "Formats each solution within the stream of solutions in `solution-ch` according
   to the selectors within the select clause of the supplied parsed query `q`."
-  [db q fuel-tracker error-ch solution-ch]
+  [_db q _fuel-tracker error-ch solution-ch]
   (let [selectors (or (:select q)
                       (:select-one q)
                       (:select-distinct q))
