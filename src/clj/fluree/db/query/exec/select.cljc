@@ -32,8 +32,7 @@
 
 (defmethod display const/iri-anyURI
   [match compact]
-  (or (some-> match where/get-iri iri/unwrap compact)
-      (some-> match where/get-value iri/unwrap compact)))
+  (some-> match where/get-iri iri/unwrap compact))
 
 (defprotocol ValueSelector
   (format-value [fmt db iri-cache context compact fuel-tracker error-ch solution]
