@@ -23,29 +23,30 @@
   [s]
   (->IRI s))
 
-(defn iri->string
-  [iri]
-  (:s iri))
-
 (defn unwrap
   [x]
   (if (iri? x)
-    (iri->string x)
+    (str x)
     x))
 
-(defn display-iri ^String
+(defn serialize-iri ^String
   [iri]
-  (str "<\"" iri "\">"))
+  (str "\"" iri "\""))
 
 #?(:clj (defmethod print-method IRI [^IRI iri ^java.io.Writer w]
-          (let [iri-str (display-iri iri)]
+          (let [iri-str (serialize-iri iri)]
             (doto w
               (.write "#fluree/IRI ")
               (.write iri-str))))
    :cljs (extend-protocol IPrintWithWriter
            IRI
            (-pr-writer [iri writer _]
-             (write-all writer "#fluree/IRI " (display-iri iri)))))
+             (write-all writer "#fluree/IRI " (serialize-iri iri)))))
+
+#?(:clj (defmethod print-dup IRI
+          [^IRI iri ^java.io.Writer w]
+          (let [iri-string (str iri)]
+            (.write w (str "#=" `(string->iri ~iri-string))))))
 
 (defmethod pprint/simple-dispatch IRI [^IRI iri]
   (pr iri))
