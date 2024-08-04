@@ -80,9 +80,10 @@
 (defn parse-value-attributes
   [v attrs context]
   (let [mch          (parse-value-datatype v attrs context)
-        lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
-        dt-matcher   (some-> attrs (get const/iri-type) (where/datatype-matcher context))]
-    (if-let [f (combine-filters lang-matcher dt-matcher)]
+        t-matcher    (some-> attrs (get const/iri-t) (where/transaction-matcher))
+        dt-matcher   (some-> attrs (get const/iri-type) (where/datatype-matcher context))
+        lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)]
+    (if-let [f (combine-filters t-matcher lang-matcher dt-matcher)]
       (where/with-filter mch f)
       mch)))
 
@@ -252,12 +253,13 @@
 
 (defn parse-variable-attributes
   [var attrs vars context]
-  (let [lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
+  (let [t-matcher    (some-> attrs (get const/iri-t) (where/transaction-matcher))
         dt-matcher   (some-> attrs (get const/iri-type) (where/datatype-matcher context))
+        lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
         filter-fn    (some-> attrs
                              (get const/iri-filter)
                              (parse-filter-function var vars context))]
-    (if-let [f (combine-filters lang-matcher dt-matcher filter-fn)]
+    (if-let [f (combine-filters t-matcher dt-matcher lang-matcher filter-fn)]
       (where/->var-filter var f)
       (where/unmatched-var var))))
 
