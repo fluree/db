@@ -450,12 +450,12 @@
         (mapcat (fn [var]
                   (let [dt-var   (var->dt-var var)
                         lang-var (var->lang-var var)]
-                    `[mch#         (get ~soln-sym (quote ~var))
-                      ~dt-var      (where/get-datatype-iri mch#)
-                      ~lang-var    (-> mch# ::where/meta :lang (or ""))
-                      ~var         (cond->> (where/get-binding mch#)
-                                     (= ~dt-var ::group/grouping)
-                                     (mapv where/get-value))])))
+                    `[mch#      (get ~soln-sym (quote ~var))
+                      ~dt-var   (where/get-datatype-iri mch#)
+                      ~lang-var (-> mch# ::where/meta :lang (or ""))
+                      ~var      (cond->> (where/get-binding mch#)
+                                  (= ~dt-var ::group/grouping)
+                                  (mapv where/get-value))])))
         var-syms))
 
 (defn compile
