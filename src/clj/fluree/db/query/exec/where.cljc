@@ -62,19 +62,19 @@
   ([mch iri]
    (assoc mch ::iri iri)))
 
-(defn get-iri
-  [match]
-  (cond
-    (contains? match ::iri)
-    (-> match ::iri iri/unwrap)
-
-    (-> match get-datatype-iri #{const/iri-anyURI})
-    (-> match get-value iri/unwrap)))
-
 (defn matched-iri?
   [match]
   (-> match ::iri some?))
 
+(defn iri-datatype?
+  [mch]
+  (-> mch get-datatype-iri (= const/iri-anyURI)))
+
+(defn get-iri
+  [match]
+  (cond
+    (matched-iri? match)  (-> match ::iri iri/unwrap)
+    (iri-datatype? match) (-> match get-value iri/unwrap)))
 
 (defn matched-sid?
   [mch]
