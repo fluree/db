@@ -49,11 +49,15 @@
 (defrecord VariableSelector [var]
   ValueSelector
   (format-value
-    [_ _db _iri-cache _context compact _fuel-tracker _error-ch solution]
+    [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
     (log/trace "VariableSelector format-value var:" var "solution:" solution)
-    (go (-> solution
-            (get var)
-            (display compact))))
+    (go (try*
+          (-> solution
+              (get var)
+              (display compact))
+          (catch* e
+                  (log/error e "Error formatting variable:" var)
+                  (>! error-ch e)))))
   ValueAdapter
   (solution-value
     [_ _ solution]
@@ -68,13 +72,18 @@
 (defrecord WildcardSelector []
   ValueSelector
   (format-value
-    [_ _db _iri-cache _context compact _fuel-tracker _error-ch solution]
-    (go-loop [[var & vars] (sort (keys solution))
-              result {}]
-      (if var
-        (let [display-var (-> solution (get var) (display compact))]
-          (recur vars (assoc result var display-var)))
-        result)))
+    [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
+    (go
+      (try*
+        (loop [[var & vars] (sort (keys solution))
+               result {}]
+          (if var
+            (let [display-var (-> solution (get var) (display compact))]
+              (recur vars (assoc result var display-var)))
+            result))
+        (catch* e
+                (log/error e "Error formatting wildcard")
+                (>! error-ch e)))))
   ValueAdapter
   (solution-value
     [_ _ solution]
