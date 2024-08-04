@@ -32,7 +32,7 @@
 
 (defmethod display const/iri-anyURI
   [match compact]
-  (or (some-> match where/get-iri compact)
+  (or (some-> match where/get-iri iri/unwrap compact)
       (some-> match where/get-value iri/unwrap compact)))
 
 (defprotocol ValueSelector

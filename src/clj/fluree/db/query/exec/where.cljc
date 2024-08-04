@@ -73,8 +73,8 @@
 (defn get-iri
   [match]
   (cond
-    (matched-iri? match)  (-> match ::iri iri/unwrap)
-    (iri-datatype? match) (-> match get-value iri/unwrap)))
+    (matched-iri? match)  (::iri match)
+    (iri-datatype? match) (get-value match)))
 
 (defn matched-sid?
   [mch]
@@ -165,7 +165,7 @@
   [type context]
   (fn [soln mch]
     (let [type* (if (variable? type)
-                  (-> soln (get type) get-iri)
+                  (-> soln (get type) get-iri iri/unwrap)
                   (json-ld/expand-iri type context))]
       (-> mch
           get-datatype-iri
@@ -452,6 +452,7 @@
   (go
     (let [f (pattern-data pattern)]
       (try*
+        (log/info "filtering" solution)
        (when (f solution)
          solution)
        (catch* e (>! error-ch (filter-exception e solution f)))))))
@@ -612,9 +613,13 @@
 (defn bind-function-result
   [solution var-name result]
   (let [dt  (datatype/infer-iri result)
-        mch (-> var-name
-                unmatched-var
-                (match-value result dt))]
+        mch (if (= dt const/iri-anyURI)
+              (-> var-name
+                  unmatched-var
+                  (match-iri result))
+              (-> var-name
+                  unmatched-var
+                  (match-value result dt)))]
     (assoc solution var-name mch)))
 
 (defmethod match-pattern :bind
