@@ -24,14 +24,10 @@
   (assoc unmatched ::var var-sym))
 
 (defn match-value
-  ([mch x dt-iri]
-   (assoc mch
-     ::val x
-     ::datatype-iri dt-iri))
-  ([mch x dt-iri m]
-   (-> mch
-       (match-value x dt-iri)
-       (assoc ::meta m))))
+  [mch x dt-iri]
+  (assoc mch
+         ::val x
+         ::datatype-iri dt-iri))
 
 (defn matched-value?
   [match]
@@ -86,6 +82,20 @@
   (let [db-alias (:alias db)]
     (get-in iri-mch [::sids db-alias])))
 
+(defn match-meta
+  [mch m]
+  (assoc mch ::meta m))
+
+(defn get-meta
+  [match]
+  (::meta match))
+
+(defn match-lang
+  [mch value lang]
+  (-> mch
+      (match-value value const/iri-lang-string)
+      (match-meta {:lang lang})))
+
 (defn matched?
   [match]
   (or (matched-value? match)
@@ -114,18 +124,12 @@
    (let [dt-iri (datatype/infer-iri v)]
      (anonymous-value v dt-iri)))
   ([v dt-iri]
-   (match-value unmatched v dt-iri))
-  ([v dt-iri m]
-   (match-value unmatched v dt-iri m)))
+   (match-value unmatched v dt-iri)))
 
 (defn unmatched-var?
   [match]
   (and (contains? match ::var)
        (unmatched? match)))
-
-(defn get-meta
-  [match]
-  (::meta match))
 
 (defn sanitize-match
   [match]
@@ -286,7 +290,9 @@
             (match-sid alias oid)
             (match-iri o-iri)))
       (let [dt-iri (iri/decode-sid db dt)]
-        (match-value o-match (flake/o flake) dt-iri (flake/m flake))))))
+        (-> o-match
+            (match-value (flake/o flake) dt-iri)
+            (match-meta (flake/m flake)))))))
 
 (defn match-flake
   "Assigns the unmatched variables within the supplied `triple-pattern` to their

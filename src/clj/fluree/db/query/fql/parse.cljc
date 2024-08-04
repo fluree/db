@@ -60,7 +60,7 @@
           (where/anonymous-value dt-iri))
       (where/anonymous-value v dt-iri))
     (if-let [lang (get attrs const/iri-language)]
-      (where/anonymous-value v const/iri-lang-string {:lang lang})
+      (where/match-lang where/unmatched v lang)
       (where/anonymous-value v))))
 
 (defn every-binary-pred
@@ -97,7 +97,7 @@
           (where/match-iri var-match expanded))
         (where/match-value var-match val dt-iri))
       (if-let [lang (get attrs const/iri-language)]
-        (where/match-value var-match val const/iri-lang-string {:lang lang})
+        (where/match-lang var-match val lang)
         (let [dt (datatype/infer-iri val)]
           (where/match-value var-match val dt))))))
 
@@ -630,7 +630,8 @@
   (let [datatype* (iri/normalize datatype)]
     (if (= datatype* const/iri-id)
       (where/match-iri (json-ld/expand-iri v context))
-      (where/anonymous-value v datatype* metadata))))
+      (-> (where/anonymous-value v datatype*)
+          (where/match-meta metadata)))))
 
 (defn parse-obj-cmp
   [allowed-vars context subj-cmp pred-cmp m triples
@@ -717,7 +718,7 @@
     (catch* e
             (throw (ex-info (str "Parsing failure due to: " (ex-message e)
                                  ". Query: " expanded)
-                            (ex-data e)
+                            (or (ex-data e) {})
                             e)))))
 
 (defn parse-txn
