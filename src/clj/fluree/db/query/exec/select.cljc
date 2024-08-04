@@ -19,15 +19,15 @@
 (defmulti display
   "Format a where-pattern match for presentation based on the match's datatype.
   Return an async channel that will eventually contain the formatted match."
-  (fn [match db _iri-cache _compact _error-ch]
+  (fn [match _compact _error-ch]
     (where/get-datatype-iri match)))
 
 (defmethod display :default
-  [match _ _ _ _]
+  [match _ _]
   (go (where/get-value match)))
 
 (defmethod display const/iri-json
-  [match _db _iri-cach _compact error-ch]
+  [match _compact error-ch]
   (go
     (let [v (where/get-value match)]
       (try* (json/parse v false)
@@ -36,7 +36,7 @@
                     (>! error-ch e))))))
 
 (defmethod display const/iri-anyURI
-  [match db iri-cache compact error-ch]
+  [match compact error-ch]
   (go
     (or (some-> match where/get-iri compact)
         (some-> match where/get-value iri/unwrap compact))))
@@ -59,7 +59,7 @@
     (log/trace "VariableSelector format-value var:" var "solution:" solution)
     (-> solution
         (get var)
-        (display db iri-cache compact error-ch)))
+        (display compact error-ch)))
   ValueAdapter
   (solution-value
     [_ _ solution]
@@ -79,7 +79,7 @@
               result {}]
       (if var
         (recur vars (assoc result var (-> (get solution var)
-                                          (display db iri-cache compact error-ch)
+                                          (display compact error-ch)
                                           <!)))
         result)))
   ValueAdapter
