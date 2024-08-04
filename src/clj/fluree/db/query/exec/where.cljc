@@ -169,7 +169,7 @@
     (let [lang* (if (variable? lang)
                   (-> soln (get lang) get-value)
                   lang)]
-      (-> mch ::meta :lang (= lang*)))))
+      (-> mch get-meta :lang (= lang*)))))
 
 (defn datatype-matcher
   "Return a function that returns true if the datatype of a matched pattern equals
@@ -182,6 +182,14 @@
       (-> mch
           get-datatype-iri
           (= type*)))))
+
+(defn transaction-matcher
+  [t]
+  (fn [soln mch]
+    (let [t* (if (variable? t)
+                  (-> soln (get t) get-value)
+                  t)]
+      (-> mch get-transaction (= t*)))))
 
 (defn with-filter
   [mch f]
