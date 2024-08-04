@@ -53,12 +53,11 @@
     [nil]))
 
 (defmethod select/display ::grouping
-  [match db select-cache compact error-ch]
+  [match compact]
   (let [group (where/get-value match)]
-    (->> group
-         (map (fn [grouped-val]
-                (select/display grouped-val db select-cache compact error-ch)))
-         (async/map vector))))
+    (mapv (fn [grouped-val]
+            (select/display grouped-val compact))
+          group)))
 
 (defn combine
   "Returns a channel of solutions from `solution-ch` collected into groups defined

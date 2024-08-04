@@ -319,32 +319,68 @@
             (is (= [["ex:bob"]] sut)
                 "returns correctly filtered results")))))))
 
-(deftest ^:integration ^:pending datatype-test
-  (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "people")
-        db     @(fluree/stage
-                  (fluree/db ledger)
-                  {"@context" ["https://ns.flur.ee"
-                               test-utils/default-context
-                               {:ex "http://example.org/ns/"}]
-                   "insert"
-                   [{:id      :ex/homer
-                     :ex/name "Homer"
-                     :ex/age  36}
-                    {:id      :ex/bart
-                     :ex/name "Bart"
-                     :ex/age  "forever 10"}]})]
-    (testing "including datatype in query results"
-      (let [query   {:context [test-utils/default-context
-                               {:ex "http://example.org/ns/"}]
-                     :select  '[?age ?dt]
-                     :where   '[{:ex/age ?age}
-                                [:bind ?dt (datatype ?age)]]}
-            results @(fluree/query db query)]
-        (is (= [["forever 10" "xsd:string"] [36 "xsd:long"]]
-               results))))
-    (testing "filtering query results with datatype fn")
-    (testing "filtering query results with @type value map")))
+(deftest ^:integration datatype-test
+  (testing "querying with datatypes"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "people")
+          db     @(fluree/stage
+                    (fluree/db ledger)
+                    {"@context" ["https://ns.flur.ee"
+                                 test-utils/default-context
+                                 {:ex "http://example.org/ns/"}]
+                     "insert"
+                     [{:id      :ex/homer
+                       :ex/name "Homer"
+                       :ex/age  36}
+                      {:id      :ex/bart
+                       :ex/name "Bart"
+                       :ex/age  "forever 10"}]})]
+      (testing "bound to variables in 'bind' patterns"
+        (testing "included datatype in query results"
+          (let [query   {:context [test-utils/default-context
+                                   {:ex "http://example.org/ns/"}]
+                         :select  '[?age ?dt]
+                         :where   '[{:ex/age ?age}
+                                    [:bind ?dt (datatype ?age)]]}
+                results @(fluree/query db query)]
+            (is (= [[36 :xsd/long] ["forever 10" :xsd/string]]
+                   results))))
+        (testing "filtered with the datatype function"
+          (let [query   {:context [test-utils/default-context
+                                   {:ex "http://example.org/ns/"}]
+                         :select  '[?age ?dt]
+                         :where   '[{:ex/age ?age}
+                                    [:bind ?dt (datatype ?age)]
+                                    [:filter (= (iri :xsd/long) ?dt)]]}
+                results @(fluree/query db query)]
+            (is (= [[36 :xsd/long]]
+                   results)))))
+      (testing "filtered in value maps"
+        (testing "with explicit type IRIs"
+          (let [query   {:context [test-utils/default-context
+                                   {:ex    "http://example.org/ns/"
+                                    :value "@value"
+                                    :type  "@type"}]
+                         :select  '[?name ?age]
+                         :where   '[{:ex/name ?name
+                                     :ex/age  {:value ?age
+                                               :type  :xsd/string}}]}
+                results @(fluree/query db query)]
+            (is (= [["Bart" "forever 10"]]
+                   results))))
+        (testing "with variable types"
+          (let [query   {:context [test-utils/default-context
+                                   {:ex    "http://example.org/ns/"
+                                    :value "@value"
+                                    :type  "@type"}]
+                         :select  '[?name ?age]
+                         :where   '[[:bind ?ageType (iri :xsd/string)]
+                                    {:ex/name ?name
+                                     :ex/age  {:value ?age
+                                               :type  ?ageType}}]}
+                results @(fluree/query db query)]
+            (is (= [["Bart" "forever 10"]]
+                   results))))))))
 
 (deftest ^:integration subject-object-test
   (let [conn   (test-utils/create-conn)
