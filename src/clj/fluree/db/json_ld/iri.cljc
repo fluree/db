@@ -15,6 +15,24 @@
   Object
   (toString [_] s))
 
+(defn iri?
+  [x]
+  (instance? IRI x))
+
+(defn string->iri
+  [s]
+  (->IRI s))
+
+(defn iri->string
+  [iri]
+  (:s iri))
+
+(defn unwrap
+  [x]
+  (if (iri? x)
+    (iri->string x)
+    x))
+
 (defn display-iri ^String
   [iri]
   (str "<\"" iri "\">"))
@@ -31,16 +49,6 @@
 
 (defmethod pprint/simple-dispatch IRI [^IRI iri]
   (pr iri))
-
-(defn iri?
-  [x]
-  (instance? IRI x))
-
-(defn unwrap
-  [x]
-  (if (iri? x)
-    (:s x)
-    x))
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")
