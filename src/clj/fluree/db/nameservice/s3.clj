@@ -24,21 +24,20 @@
 
 (defrecord S3NameService
   [s3-client s3-bucket s3-prefix sync?]
+  ns-proto/Publisher
+  (-push [_ commit-data] (push s3-client s3-bucket s3-prefix commit-data))
+
   ns-proto/iNameService
   (-lookup [_ ledger-alias] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
-  (-lookup [_ ledger-alias opts] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
-  (-push [_ commit-data] (push s3-client s3-bucket s3-prefix commit-data))
-  (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported S3NameService op: subscribe" {})))
-  (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported S3NameService op: unsubscribe" {})))
+  (-lookup [_ ledger-alias _opts] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
   (-sync? [_] sync?)
-  (-ledgers [nameservice opts] (throw (ex-info "Unsupported S3NameService op: ledgers" {})))
   (-address [_ ledger-alias {:keys [branch] :as _opts}]
     (let [branch (if branch (name branch) "main")]
       (go (s3/s3-address s3-bucket s3-prefix (str ledger-alias "/" branch "/head")))))
   (-alias [_ ledger-address]
     (-> ledger-address (->> (s3/address-path s3-bucket s3-prefix)) (str/split #"/")
         (->> (drop-last 2) (str/join #"/"))))
-  (-close [nameservice] true))
+  (-close [_] true))
 
 
 (defn initialize
