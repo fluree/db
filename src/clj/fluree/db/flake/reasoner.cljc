@@ -167,22 +167,19 @@
 
 (defn rules-from-dbs
   [methods inserts dbs]
-  (let [clause-chan (async/to-chan! dbs)
-        out-chan (async/chan)]
-    (doall
-     (for [method methods]
-       (async/pipeline-async
-        1
-        out-chan
-        (fn [db out-ch]
-          (async/pipe (go-try
-                        (as-> db $
-                          (<? (resolve/rules-from-db $ method))
-                          (rules-from-graph method inserts $)))
-                      out-ch)
-          out-ch)
-        clause-chan)))
-    (async/into [] out-chan)))
+  (let [rules (atom [])]
+    (go-try
+      (loop [methods methods]
+        (when-let [method (first methods)]
+          (loop [dbs dbs]
+            (when-let [db (first dbs)]
+              (swap! rules concat
+                     (as-> db $
+                       (<? (resolve/rules-from-db $ method))
+                       (rules-from-graph method inserts $)))
+              (recur (rest dbs))))
+          (recur (rest methods))))
+      (remove empty? @rules))))
 
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
@@ -204,7 +201,7 @@
           all-rule-dbs          (if (or (nil? rule-dbs) (empty? rule-dbs))
                                   [db]
                                   (conj rule-dbs db))
-          all-rules-from-dbs    (apply concat (<? (rules-from-dbs methods inserts all-rule-dbs)))
+          all-rules-from-dbs    (<? (rules-from-dbs methods inserts all-rule-dbs))
           all-rules             (concat all-rules-from-graphs all-rules-from-dbs)]
       all-rules)))
 

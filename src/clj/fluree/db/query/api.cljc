@@ -159,20 +159,17 @@
 
 (defn load-aliased-rule-dbs
   [conn rule-sources]
-  (let [clause-chan (async/to-chan! rule-sources)
-        out-chan (async/chan)]
-    (async/pipeline-async
-     1
-     out-chan
-     (fn [rule-source out-ch]
-       (async/pipe (go-try
-                     (if (string? rule-source)
-                       (ledger/-db (<? (jld-ledger/load conn rule-source)))
-                       rule-source))
-                   out-ch))
-     clause-chan)
-    (async/into [] out-chan)))
-                     
+  (let [rule-dbs (atom [])]
+    (go-try
+      (loop [rule-sources rule-sources]
+        (when-let [rule-source (first rule-sources)]
+          (swap! rule-dbs concat
+                 (if (string? rule-source)
+                   (ledger/-db (<? (jld-ledger/load conn rule-source)))
+                   rule-source))
+          (recur (rest rule-sources))))
+      @rule-dbs)))
+
 (defn load-alias
   [conn alias t opts]
   (go-try
