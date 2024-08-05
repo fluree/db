@@ -165,35 +165,49 @@
            first
            (= \?))))
 
+(defn matched-lang?
+  [mch lang]
+  (-> mch get-lang (= lang)))
+
 (defn lang-matcher
   "Return a function that returns true if the language metadata of a matched
   pattern equals the supplied language code `lang`."
   [lang]
   (fn [soln mch]
-    (let [lang* (if (variable? lang)
-                  (-> soln (get lang) get-value)
-                  lang)]
-      (-> mch get-meta :lang (= lang*)))))
+    (if (variable? lang)
+      (if-let [lang* (some-> soln (get lang) get-value)]
+        (matched-lang? mch lang*)
+        true)
+      (matched-lang? mch lang))))
+
+(defn matched-datatype?
+  [mch dt-iri]
+  (-> mch get-datatype-iri (= dt-iri)))
 
 (defn datatype-matcher
   "Return a function that returns true if the datatype of a matched pattern equals
   the supplied datatype iri `type`."
   [type context]
   (fn [soln mch]
-    (let [type* (if (variable? type)
-                  (-> soln (get type) get-iri iri/unwrap)
-                  (json-ld/expand-iri type context))]
-      (-> mch
-          get-datatype-iri
-          (= type*)))))
+    (if (variable? type)
+      (if-let [dt-iri (some-> soln (get type) get-iri iri/unwrap)]
+        (matched-datatype? mch dt-iri)
+        true)
+      (let [dt-iri (json-ld/expand-iri type context)]
+        (matched-datatype? mch dt-iri)))))
+
+(defn matched-transaction?
+  [mch t]
+  (-> mch get-transaction (= t)))
 
 (defn transaction-matcher
   [t]
   (fn [soln mch]
-    (let [t* (if (variable? t)
-                  (-> soln (get t) get-value)
-                  t)]
-      (-> mch get-transaction (= t*)))))
+    (if (variable? t)
+      (if-let [t* (some-> soln (get t) get-value)]
+        (matched-transaction? mch t*)
+        true)
+      (matched-transaction? mch t))))
 
 (defn with-filter
   [mch f]
