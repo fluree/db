@@ -62,7 +62,7 @@
                                  (get-first-value const/iri-address))
             commit-t         (-> commit
                                  (get-first const/iri-data)
-                                 (get-first-value const/iri-t))
+                                 (get-first-value const/iri-fluree-t))
             commit-tuples*   (conj commit-tuples [commit proof])]
         (when (or (nil? commit-t)
                   (and last-t (not= (dec last-t) commit-t)))

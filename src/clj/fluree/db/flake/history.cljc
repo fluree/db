@@ -62,7 +62,7 @@
                          (group-by flake/t)
                          (vals)
                          (async/to-chan!))
-        t-key       (json-ld/compact const/iri-t compact)
+        t-key       (json-ld/compact const/iri-fluree-t compact)
         assert-key  (json-ld/compact const/iri-assert compact)
         retract-key (json-ld/compact const/iri-retract compact)]
 
@@ -209,7 +209,7 @@
 
            assert-key          (json-ld/compact const/iri-assert compact)
            retract-key         (json-ld/compact const/iri-retract compact)
-           t-key               (json-ld/compact const/iri-t compact)
+           t-key               (json-ld/compact const/iri-fluree-t compact)
            data-key            (json-ld/compact const/iri-data compact)
            commit-key          (json-ld/compact const/iri-commit compact)
            annotation-key      (json-ld/compact const/iri-annotation compact)]
@@ -279,7 +279,7 @@
   Chunks together history results with consecutive `t`s to reduce `time-range`
   calls. "
   [db context include error-ch history-results-ch]
-  (let [t-key      (json-ld/compact const/iri-t context)
+  (let [t-key      (json-ld/compact const/iri-fluree-t context)
         out-ch     (async/chan 2 cat)
         chunked-ch (async/chan 2 (with-consecutive-ts t-key))]
     (async/pipe history-results-ch chunked-ch)

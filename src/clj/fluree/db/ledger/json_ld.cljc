@@ -239,7 +239,7 @@
                          keyword)
           commit-t   (-> expanded-commit
                          (get-first const/iri-data)
-                         (get-first-value const/iri-t))
+                         (get-first-value const/iri-fluree-t))
           current-db (current-db ledger branch)
           current-t  (:t current-db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
