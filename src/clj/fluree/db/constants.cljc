@@ -12,7 +12,7 @@
 (def ^:const iri-commit (fluree-iri "commit"))
 (def ^:const iri-DB (fluree-iri "DB"))
 (def ^:const iri-data (fluree-iri "data"))
-(def ^:const iri-t (fluree-iri "t"))
+(def ^:const iri-fluree-t (fluree-iri "t"))
 (def ^:const iri-address (fluree-iri "address"))
 (def ^:const iri-v (fluree-iri "v"))
 (def ^:const iri-flakes (fluree-iri "flakes"))
@@ -149,7 +149,7 @@
 (def ^:const $_commit:data (iri/iri->sid iri-data))
 (def ^:const $_commitdata:flakes (iri/iri->sid iri-flakes))
 (def ^:const $_commitdata:size (iri/iri->sid iri-size))
-(def ^:const $_commitdata:t (iri/iri->sid iri-t))
+(def ^:const $_commitdata:t (iri/iri->sid iri-fluree-t))
 
 (def ^:const $id (iri/iri->sid iri-id))
 
