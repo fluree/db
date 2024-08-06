@@ -58,9 +58,8 @@
       (throw (ex-info "Language tags are not allowed when the data type is specified."
                       {:status 400, :error :db/invalid-query}))
       (if (= const/iri-anyURI dt-iri)
-        (-> v
-            (json-ld/expand-iri context)
-            (where/anonymous-value dt-iri))
+        (let [expanded (json-ld/expand-iri v context)]
+          (where/match-iri where/unmatched expanded))
         (where/anonymous-value v dt-iri)))
     (if-let [lang (get attrs const/iri-language)]
       (where/match-lang where/unmatched v lang)
