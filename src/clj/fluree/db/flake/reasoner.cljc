@@ -167,19 +167,21 @@
 
 (defn rules-from-dbs
   [methods inserts dbs]
-  (let [rules (atom [])]
-    (go-try
-      (loop [methods methods]
-        (when-let [method (first methods)]
-          (loop [dbs dbs]
-            (when-let [db (first dbs)]
-              (swap! rules concat
-                     (as-> db $
-                       (<? (resolve/rules-from-db $ method))
-                       (rules-from-graph method inserts $)))
-              (recur (rest dbs))))
-          (recur (rest methods))))
-      (remove empty? @rules))))
+  (go-try
+    (loop [[method & remaining-methods] methods
+           rules []]
+      (if method
+        (recur remaining-methods
+               (loop [[db & remaining-dbs] dbs
+                      rules* rules]
+                 (if db
+                   (recur remaining-dbs
+                          (into rules*
+                                (as-> db $
+                                  (<? (resolve/rules-from-db $ method))
+                                  (rules-from-graph method inserts $))))
+                   rules*)))
+        (remove empty? rules)))))
 
 (defn all-rules
   "Gets all relevant rules for the specified methods from the

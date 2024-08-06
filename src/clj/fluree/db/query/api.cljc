@@ -159,16 +159,16 @@
 
 (defn load-aliased-rule-dbs
   [conn rule-sources]
-  (let [rule-dbs (atom [])]
-    (go-try
-      (loop [rule-sources rule-sources]
-        (when-let [rule-source (first rule-sources)]
-          (swap! rule-dbs concat
-                 (if (string? rule-source)
-                   (ledger/-db (<? (jld-ledger/load conn rule-source)))
-                   rule-source))
-          (recur (rest rule-sources))))
-      @rule-dbs)))
+  (go-try
+    (loop [[rule-source & rule-sources] rule-sources
+           rule-results []]
+      (when-let [rule-source (first rule-sources)]
+        (if rule-source
+          (into rule-results
+                (if (string? rule-source)
+                  (ledger/-db (<? (jld-ledger/load conn rule-source)))
+                  rule-source))
+          (recur rule-sources rule-results))))))
 
 (defn load-alias
   [conn alias t opts]
