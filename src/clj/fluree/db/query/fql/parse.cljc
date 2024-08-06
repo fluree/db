@@ -54,11 +54,14 @@
 (defn parse-value-datatype
   [v attrs context]
   (if-let [dt-iri (get-expanded-datatype attrs context)]
-    (if (= const/iri-anyURI dt-iri)
-      (-> v
-          (json-ld/expand-iri context)
-          (where/anonymous-value dt-iri))
-      (where/anonymous-value v dt-iri))
+    (if (contains? attrs const/iri-language)
+      (throw (ex-info "Language tags are not allowed when the data type is specified."
+                      {:status 400, :error :db/invalid-query}))
+      (if (= const/iri-anyURI dt-iri)
+        (-> v
+            (json-ld/expand-iri context)
+            (where/anonymous-value dt-iri))
+        (where/anonymous-value v dt-iri)))
     (if-let [lang (get attrs const/iri-language)]
       (where/match-lang where/unmatched v lang)
       (where/anonymous-value v))))
@@ -253,15 +256,19 @@
 
 (defn parse-variable-attributes
   [var attrs vars context]
-  (let [t-matcher    (some-> attrs (get const/iri-t) (where/transaction-matcher))
-        dt-matcher   (some-> attrs (get const/iri-type) (where/datatype-matcher context))
-        lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
-        filter-fn    (some-> attrs
-                             (get const/iri-filter)
-                             (parse-filter-function var vars context))]
-    (if-let [f (combine-filters t-matcher dt-matcher lang-matcher filter-fn)]
-      (where/->var-filter var f)
-      (where/unmatched-var var))))
+  (if (and (contains? attrs const/iri-type)
+           (contains? attrs const/iri-language))
+    (throw (ex-info "Language tags are not allowed when the data type is specified."
+                    {:status 400, :error :db/invalid-query}))
+    (let [t-matcher    (some-> attrs (get const/iri-t) (where/transaction-matcher))
+          dt-matcher   (some-> attrs (get const/iri-type) (where/datatype-matcher context))
+          lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
+          filter-fn    (some-> attrs
+                               (get const/iri-filter)
+                               (parse-filter-function var vars context))]
+      (if-let [f (combine-filters t-matcher dt-matcher lang-matcher filter-fn)]
+        (where/->var-filter var f)
+        (where/unmatched-var var)))))
 
 (defn generate-subject-var
   "Generate a unique subject variable"
