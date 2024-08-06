@@ -70,6 +70,7 @@
 (def ^:const iri-language "@language")
 (def ^:const iri-type "@type")
 (def ^:const iri-filter "@filter")
+(def ^:const iri-t "@t")
 (def ^:const iri-json "http://www.w3.org/2001/XMLSchema#json")
 (def ^:const iri-anyURI "http://www.w3.org/2001/XMLSchema#anyURI")
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
