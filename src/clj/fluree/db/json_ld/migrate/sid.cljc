@@ -12,7 +12,8 @@
             [fluree.db.nameservice.core :as nameservice]
             [fluree.db.query.exec.update :as update]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]))
+            [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
+            [fluree.db.util.log :as log]))
 
 (defrecord NamespaceMapping [mapping]
   iri/IRICodec
@@ -46,6 +47,7 @@
 
           db-data            (<? (db/read-db (:conn db) db-address))
           t-new              (db/db-t db-data)
+          _ (log/info "Migrating commit " db-address " at t " t-new)
 
           ;; the ns-mapping has all the parts of the db necessary for create-flakes to encode iris properly
           ns-mapping         (db->namespace-mapping db)
@@ -124,6 +126,7 @@
    (migrate conn address indexing-opts nil))
   ([conn address indexing-opts changes-ch]
    (go-try
+     (log/info "Starting SID migration.")
      (let [last-commit-addr  (<? (nameservice/lookup-commit conn address))
            last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
            all-commit-tuples (<? (reify/trace-commits conn last-commit-tuple 1))
@@ -144,4 +147,5 @@
          (-> (map second tuples-chans)
              async/merge
              (async/pipe changes-ch)))
+       (log/info "Completed SID migration.")
        ledger))))
