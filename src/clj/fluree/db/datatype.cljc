@@ -353,8 +353,10 @@
       value)
 
     const/$xsd:anyURI
-    (when (string? value)
-      value)
+    (if (iri/iri? value)
+      value
+      (when (string? value)
+        (iri/string->iri value)))
 
     const/$xsd:boolean
     (coerce-boolean value)

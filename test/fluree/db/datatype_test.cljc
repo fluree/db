@@ -11,7 +11,7 @@
     (is (= nil (coerce 42 const/$xsd:string))))
 
   (testing "anyURI"
-    (is (= "foo" (coerce "foo" const/$xsd:anyURI)))
+    (is (= #fluree/IRI "foo" (coerce "foo" const/$xsd:anyURI)))
     (is (= nil (coerce 42 const/$xsd:anyURI))))
   (testing "boolean"
     (is (= true (coerce "true" const/$xsd:boolean)))
