@@ -1,5 +1,6 @@
 (ns fluree.db.query.fql-test
   (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.util.core :refer [exception?]]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.api :as fluree]))
 
@@ -335,6 +336,32 @@
                       {:id      :ex/bart
                        :ex/name "Bart"
                        :ex/age  "forever 10"}]})]
+      (testing "with literal values"
+        (testing "specifying an explicit data type"
+          (testing "compatible with the value"
+            (let [query   {:context [test-utils/default-context
+                                     {:ex    "http://example.org/ns/"
+                                      :value "@value"
+                                      :type  "@type"}]
+                           :select  '[?name]
+                           :where   '{:ex/name ?name
+                                      :ex/age  {:value 36
+                                                :type  :xsd/long}}}
+                  results @(fluree/query db query)]
+              (is (= [["Homer"]] results)
+                  "should return the matching items")))
+          (testing "not compatible with the value"
+            (let [query   {:context [test-utils/default-context
+                                     {:ex    "http://example.org/ns/"
+                                      :value "@value"
+                                      :type  "@type"}]
+                           :select  '[?name]
+                           :where   '{:ex/name ?name
+                                      :ex/age  {:value 36
+                                                :type  :xsd/string}}}
+                  results @(fluree/query db query)]
+              (is (exception? results)
+                  "should return an error")))))
       (testing "bound to variables in 'bind' patterns"
         (testing "included datatype in query results"
           (let [query   {:context [test-utils/default-context

@@ -45,24 +45,40 @@
                  (assoc expanded p* o)))
              {} m))
 
-(defn get-expanded-datatype
-  [attrs context]
-  (some-> attrs
-          (get const/iri-type)
-          (json-ld/expand-iri context)))
-
-(defn parse-value-datatype
-  [v attrs context]
-  (if-let [dt-iri (get-expanded-datatype attrs context)]
+(defn get-type
+  [attrs]
+  (when-let [dt (get attrs const/iri-type)]
     (if (contains? attrs const/iri-language)
       (throw (ex-info "Language tags are not allowed when the data type is specified."
                       {:status 400, :error :db/invalid-query}))
-      (if (= const/iri-anyURI dt-iri)
-        (let [expanded (json-ld/expand-iri v context)]
-          (where/match-iri where/unmatched expanded))
-        (where/anonymous-value v dt-iri)))
-    (if-let [lang (get attrs const/iri-language)]
-      (where/match-lang where/unmatched v lang)
+      dt)))
+
+(defn get-lang
+  [attrs]
+  (when-let [lang (get attrs const/iri-language)]
+    (if (contains? attrs const/iri-type)
+      (throw (ex-info "Language tags are not allowed when the data type is specified."
+                      {:status 400, :error :db/invalid-query}))
+      lang)))
+
+(defn parse-value-datatype
+  [v attrs context]
+  (if-let [dt (get-type attrs)]
+    (if (v/variable? dt)
+      (-> v where/untyped-value (where/link-dt-var dt))
+      (let [dt-iri (json-ld/expand-iri dt context)
+            dt-sid (iri/iri->sid dt-iri)
+            v*     (datatype/coerce-value v dt-sid)]
+        (if (= const/iri-anyURI dt-iri)
+          (let [expanded (json-ld/expand-iri v* context)]
+            (where/match-iri where/unmatched expanded))
+          (where/anonymous-value v* dt-iri))))
+    (if-let [lang (get-lang attrs)]
+      (if (v/variable? lang)
+        (-> where/unmatched
+            (where/match-value v const/iri-lang-string)
+            (where/link-lang-var lang))
+        (where/match-lang where/unmatched v lang))
       (where/anonymous-value v))))
 
 (defn every-binary-pred
@@ -88,6 +104,12 @@
     (if-let [f (combine-filters t-matcher lang-matcher dt-matcher)]
       (where/with-filter mch f)
       mch)))
+
+(defn get-expanded-datatype
+  [attrs context]
+  (some-> attrs
+          (get const/iri-type)
+          (json-ld/expand-iri context)))
 
 (defn match-value-binding-map
   [var-match binding-map context]
