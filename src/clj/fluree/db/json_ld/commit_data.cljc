@@ -367,7 +367,7 @@
   Assumes commit is not yet created (but db is persisted), so
   commit-id and commit-address are added after finalizing and persisting commit."
   [{:keys [old-commit issuer message tag dbid t db-address flakes size author
-           txn-id annotation]
+           txn-id annotation time]
     :as   _commit}]
   (let [prev-data   (select-keys (data old-commit) [:id :address])
         data-commit (new-db-commit dbid t db-address prev-data flakes size)
@@ -377,7 +377,7 @@
                                 :prev-commit)
                         (assoc :address ""
                                :data data-commit
-                               :time (util/current-time-iso)))]
+                               :time time))]
     (cond-> commit
             txn-id (assoc :txn txn-id)
             author (assoc :author author)
