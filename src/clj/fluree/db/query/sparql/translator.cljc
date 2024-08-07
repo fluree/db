@@ -363,6 +363,7 @@
                         select-clause)
            result     []]
       (if term
+        ;; either multiple terms or a single wildcard
         (cond (rule? term)
               (let [[tag & body] term]
                 (if (= tag :Var)
@@ -377,7 +378,7 @@
                     (recur (if as? r* r) (conj result expr)))))
 
               (= "*" term)
-              (recur r (conj result "*")))
+              (recur nil term))
         [[select-key result]]))))
 
 (defmethod parse-term :DefaultGraphClause

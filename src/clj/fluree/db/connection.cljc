@@ -24,7 +24,8 @@
   (-txn-write [conn ledger-alias txn-data] "Writes a transaction to storage and returns the key. Expects string keys.")
   (-txn-read [conn txn-key] "Reads a transaction from storage")
   (-index-file-write [conn ledger-alias idx-type index-data] "Writes an index item to storage")
-  (-index-file-read [conn file-address] "Reads an index item from storage"))
+  (-index-file-read [conn file-address] "Reads an index item from storage")
+  (-index-file-delete [conn file-address] "Deletes an index item from storage"))
 
 (comment
  ;; state machine looks like this:

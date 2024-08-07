@@ -196,21 +196,21 @@
 
       (testing "Testing rdfs:domain - rule: prp-dom"
         (let [db-prp-dom @(fluree/reason
-                            db-base :owl2rl
-                            [{"@context"    {"ex"   "http://example.org/"
-                                             "owl"  "http://www.w3.org/2002/07/owl#"
-                                             "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                              "@id"         "ex:parents"
-                              "@type"       ["owl:ObjectProperty"]
-                              "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]}])]
+                           db-base :owl2rl
+                           [{"@context"    {"ex"   "http://example.org/"
+                                            "owl"  "http://www.w3.org/2002/07/owl#"
+                                            "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                             "@id"         "ex:parents"
+                             "@type"       ["owl:ObjectProperty"]
+                             "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]}])]
 
           (is (= (list "ex:Child" "ex:Person")
                  (sort
-                   @(fluree/query db-prp-dom
-                                  {:context {"ex" "http://example.org/"}
-                                   :select  "?t"
-                                   :where   {"@id"   "ex:brian"
-                                             "@type" "?t"}})))
+                  @(fluree/query db-prp-dom
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?t"
+                                  :where   {"@id"   "ex:brian"
+                                            "@type" "?t"}})))
               "ex:brian should be of type ex:Person and ex:Child")
 
           (is (= ["ex:brian" "ex:carol"]
@@ -223,21 +223,21 @@
 
       (testing "Testing rdfs:range - rule: prp-rng"
         (let [db-prp-rng @(fluree/reason
-                            db-base :owl2rl
-                            [{"@context"   {"ex"   "http://example.org/"
-                                            "owl"  "http://www.w3.org/2002/07/owl#"
-                                            "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                              "@id"        "ex:parents"
-                              "@type"      ["owl:ObjectProperty"]
-                              "rdfs:range" [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
+                           db-base :owl2rl
+                           [{"@context"   {"ex"   "http://example.org/"
+                                           "owl"  "http://www.w3.org/2002/07/owl#"
+                                           "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                             "@id"        "ex:parents"
+                             "@type"      ["owl:ObjectProperty"]
+                             "rdfs:range" [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
 
           (is (= (list "ex:Person" "ex:parents")
                  (sort
-                   @(fluree/query db-prp-rng
-                                  {:context {"ex" "http://example.org/"}
-                                   :select  "?t"
-                                   :where   {"@id"   "ex:carol"
-                                             "@type" "?t"}})))
+                  @(fluree/query db-prp-rng
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?t"
+                                  :where   {"@id"   "ex:carol"
+                                            "@type" "?t"}})))
               "ex:carol should be of type ex:Person and ex:parents")
 
           (is (= ["ex:carol" "ex:cheryl"]
@@ -251,14 +251,14 @@
 
       (testing "Testing multiple rules rdfs:domain + rdfs:range - rules: prp-dom & prp-rng"
         (let [db-prp-dom+rng @(fluree/reason
-                                db-base :owl2rl
-                                [{"@context"    {"ex"   "http://example.org/"
-                                                 "owl"  "http://www.w3.org/2002/07/owl#"
-                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                  "@id"         "ex:parents"
-                                  "@type"       ["owl:ObjectProperty"]
-                                  "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]
-                                  "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
+                               db-base :owl2rl
+                               [{"@context"    {"ex"   "http://example.org/"
+                                                "owl"  "http://www.w3.org/2002/07/owl#"
+                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                 "@id"         "ex:parents"
+                                 "@type"       ["owl:ObjectProperty"]
+                                 "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]
+                                 "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
 
           (is (= ["ex:brian" "ex:carol"]
                  @(fluree/query db-prp-dom+rng
@@ -278,11 +278,149 @@
 
           (is (= (list "ex:brian" "ex:carol" "ex:cheryl")
                  (sort
-                   @(fluree/query db-prp-dom+rng
-                                  {:context {"ex" "http://example.org/"}
-                                   :select  "?s"
-                                   :where   {"@id"   "?s"
-                                             "@type" "ex:Person"}})))
+                  @(fluree/query db-prp-dom+rng
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?s"
+                                  :where   {"@id"   "?s"
+                                            "@type" "ex:Person"}})))
+              "ex:brian, ex:carol, and ex:cheryl should be of type ex:Person")))
+
+      (testing "Testing multiple rules from multiple db sources rdfs:domain + rdfs:range - rules: prp-dom & prp-rng"
+        (let [domain-rule {"@context"    {"ex"   "http://example.org/"
+                                          "owl"  "http://www.w3.org/2002/07/owl#"
+                                          "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                           "@id"         "ex:parents"
+                           "@type"       ["owl:ObjectProperty"]
+                           "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]}
+              range-rule {"@context"    {"ex"   "http://example.org/"
+                                         "owl"  "http://www.w3.org/2002/07/owl#"
+                                         "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                          "@id"         "ex:parents"
+                          "@type"       ["owl:ObjectProperty"]
+                          "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:parents"}]}
+
+              domain-rule-ledger @(fluree/create conn "reasoner/domain-rule")
+              domain-rule-db     @(fluree/stage (fluree/db domain-rule-ledger) {"insert" [domain-rule]})
+
+              range-rule-ledger @(fluree/create conn "reasoner/range-rule")
+              range-rule-db     @(fluree/stage (fluree/db range-rule-ledger) {"insert" [range-rule]})
+              
+              db-prp-dom+rng @(fluree/reason
+                               db-base :owl2rl
+                               [domain-rule-db range-rule-db])]
+
+          (is (= ["ex:brian" "ex:carol"]
+                 @(fluree/query db-prp-dom+rng
+                                {:context {"ex" "http://example.org/"}
+                                 :select  "?s"
+                                 :where   {"@id"   "?s"
+                                           "@type" "ex:Child"}}))
+              "ex:brian and ex:carol should be the only subjects of type ex:Child")
+
+          (is (= ["ex:carol" "ex:cheryl"]
+                 @(fluree/query db-prp-dom+rng
+                                {:context {"ex" "http://example.org/"}
+                                 :select  "?s"
+                                 :where   {"@id"   "?s"
+                                           "@type" "ex:parents"}}))
+              "ex:carol and ex:cheryl should be the only subjects of type ex:parents")
+
+          (is (= (list "ex:brian" "ex:carol" "ex:cheryl")
+                 (sort
+                  @(fluree/query db-prp-dom+rng
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?s"
+                                  :where   {"@id"   "?s"
+                                            "@type" "ex:Person"}})))
+              "ex:brian, ex:carol, and ex:cheryl should be of type ex:Person")))
+
+      (testing "Testing multiple rules from multiple graph sources rdfs:domain + rdfs:range - rules: prp-dom & prp-rng"
+        (let [domain-rule {"@context"    {"ex"   "http://example.org/"
+                                          "owl"  "http://www.w3.org/2002/07/owl#"
+                                          "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                           "@id"         "ex:parents"
+                           "@type"       ["owl:ObjectProperty"]
+                           "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]}
+              range-rule {"@context"    {"ex"   "http://example.org/"
+                                         "owl"  "http://www.w3.org/2002/07/owl#"
+                                         "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                          "@id"         "ex:parents"
+                          "@type"       ["owl:ObjectProperty"]
+                          "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:parents"}]}
+
+              db-prp-dom+rng @(fluree/reason
+                               db-base :owl2rl
+                               [domain-rule range-rule])]
+
+          (is (= ["ex:brian" "ex:carol"]
+                 @(fluree/query db-prp-dom+rng
+                                {:context {"ex" "http://example.org/"}
+                                 :select  "?s"
+                                 :where   {"@id"   "?s"
+                                           "@type" "ex:Child"}}))
+              "ex:brian and ex:carol should be the only subjects of type ex:Child")
+
+          (is (= ["ex:carol" "ex:cheryl"]
+                 @(fluree/query db-prp-dom+rng
+                                {:context {"ex" "http://example.org/"}
+                                 :select  "?s"
+                                 :where   {"@id"   "?s"
+                                           "@type" "ex:parents"}}))
+              "ex:carol and ex:cheryl should be the only subjects of type ex:parents")
+
+          (is (= (list "ex:brian" "ex:carol" "ex:cheryl")
+                 (sort
+                  @(fluree/query db-prp-dom+rng
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?s"
+                                  :where   {"@id"   "?s"
+                                            "@type" "ex:Person"}})))
+              "ex:brian, ex:carol, and ex:cheryl should be of type ex:Person")))
+
+      (testing "Testing multiple rules from multiple types of sources rdfs:domain + rdfs:range - rules: prp-dom & prp-rng"
+        (let [domain-rule {"@context"    {"ex"   "http://example.org/"
+                                          "owl"  "http://www.w3.org/2002/07/owl#"
+                                          "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                           "@id"         "ex:parents"
+                           "@type"       ["owl:ObjectProperty"]
+                           "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]}
+              range-rule {"@context"    {"ex"   "http://example.org/"
+                                         "owl"  "http://www.w3.org/2002/07/owl#"
+                                         "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                          "@id"         "ex:parents"
+                          "@type"       ["owl:ObjectProperty"]
+                          "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:parents"}]}
+
+              domain-rule-ledger @(fluree/create conn "reasoner/domain-rule-mixed")
+              domain-rule-db     @(fluree/stage (fluree/db domain-rule-ledger) {"insert" [domain-rule]})
+
+              db-prp-dom+rng @(fluree/reason
+                               db-base :owl2rl
+                               [domain-rule-db range-rule])]
+
+          (is (= ["ex:brian" "ex:carol"]
+                 @(fluree/query db-prp-dom+rng
+                                {:context {"ex" "http://example.org/"}
+                                 :select  "?s"
+                                 :where   {"@id"   "?s"
+                                           "@type" "ex:Child"}}))
+              "ex:brian and ex:carol should be the only subjects of type ex:Child")
+
+          (is (= ["ex:carol" "ex:cheryl"]
+                 @(fluree/query db-prp-dom+rng
+                                {:context {"ex" "http://example.org/"}
+                                 :select  "?s"
+                                 :where   {"@id"   "?s"
+                                           "@type" "ex:parents"}}))
+              "ex:carol and ex:cheryl should be the only subjects of type ex:parents")
+
+          (is (= (list "ex:brian" "ex:carol" "ex:cheryl")
+                 (sort
+                  @(fluree/query db-prp-dom+rng
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?s"
+                                  :where   {"@id"   "?s"
+                                            "@type" "ex:Person"}})))
               "ex:brian, ex:carol, and ex:cheryl should be of type ex:Person"))))))
 
 (deftest ^:integration functional-properties

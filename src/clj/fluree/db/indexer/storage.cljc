@@ -59,9 +59,10 @@
 (defn write-garbage
   "Writes garbage record out for latest index."
   [db garbage]
-  (let [{:keys [alias conn t]} db
+  (let [{:keys [alias branch conn t]} db
 
-        data {:ledger-alias alias
+        data {:alias        alias
+              :branch       branch
               :t            t
               :garbage      garbage}
         ser  (serdeproto/-serialize-garbage (serde conn) data)]
@@ -70,7 +71,8 @@
 (defn write-db-root
   [db garbage-addr]
   (let [{:keys [alias conn schema t stats spot post opst tspo commit
-                namespace-codes reindex-min-bytes reindex-max-bytes]}
+                namespace-codes reindex-min-bytes reindex-max-bytes
+                max-old-indexes]}
         db
         prev-idx-t    (-> commit :index :data :t)
         prev-idx-addr (-> commit :index :address)
@@ -87,10 +89,11 @@
                         :timestamp       (util/current-time-millis)
                         :namespace-codes namespace-codes
                         :config          {:reindex-min-bytes reindex-min-bytes
-                                          :reindex-max-bytes reindex-max-bytes}}
+                                          :reindex-max-bytes reindex-max-bytes
+                                          :max-old-indexes   max-old-indexes}}
                        prev-idx-t (assoc :prev-index {:t       prev-idx-t
                                                       :address prev-idx-addr})
-                       garbage-addr (assoc :garbage garbage-addr))
+                       garbage-addr (assoc-in [:garbage :address] garbage-addr))
         ser           (serdeproto/-serialize-db-root (serde conn) data)]
     (connection/-index-file-write conn alias :root ser)))
 
@@ -135,12 +138,16 @@
 
 (defn read-garbage
   "Returns garbage file data for a given index t."
-  [conn ledger-alias t]
+  [conn garbage-address]
   (go-try
-    (let [key  (ledger-garbage-key ledger-alias t)
-          data (<? (connection/-index-file-read conn key))]
-      (when data
-        (serdeproto/-deserialize-garbage (serde conn) data)))))
+   (when-let [data (<? (connection/-index-file-read conn garbage-address))]
+     (serdeproto/-deserialize-garbage (serde conn) data))))
+
+(defn delete-garbage-item
+  "Deletes an index segment during garbage collection.
+  Returns async chan"
+  [conn idx-segment-address]
+  (connection/-index-file-delete conn idx-segment-address))
 
 (defn reify-schema
   [{:keys [namespace-codes v] :as root-map}]

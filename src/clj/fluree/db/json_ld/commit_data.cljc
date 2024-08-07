@@ -376,11 +376,11 @@
                         (dissoc :id :address :data :issuer :time :message :tag
                                 :prev-commit)
                         (assoc :address ""
-                               :author author
                                :data data-commit
                                :time (util/current-time-iso)))]
     (cond-> commit
             txn-id (assoc :txn txn-id)
+            author (assoc :author author)
             issuer (assoc :issuer {:id issuer})
             prev-commit (assoc :previous prev-commit)
             message (assoc :message message)
@@ -466,8 +466,6 @@
      (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil)
      ;; data
      (flake/create commit-sid const/$_commit:data db-sid const/$xsd:anyURI t true nil)
-     ;; author
-     (flake/create commit-sid const/$_commit:author author const/$xsd:string t true nil)
 
      ;; db flakes
      ;; t
@@ -477,8 +475,7 @@
      ;; size
      (flake/create db-sid const/$_commitdata:size size const/$xsd:int t true nil)
      ;; flakes
-     (flake/create db-sid const/$_commitdata:flakes flakes const/$xsd:int t true
-                   nil)]))
+     (flake/create db-sid const/$_commitdata:flakes flakes const/$xsd:int t true nil)]))
 
 (defn prev-commit-flakes
   "Builds and returns a channel containing the previous commit flakes for the
@@ -528,6 +525,11 @@
   [t commit-sid txn]
   (flake/create commit-sid const/$_commit:txn txn const/$xsd:string t true nil))
 
+(defn author-flake
+  "Builds and returns the commit txn flake for the given t and transaction id."
+  [t commit-sid author]
+  (flake/create commit-sid const/$_commit:author author const/$xsd:string t true nil))
+
 (defn annotation-flakes
   [db t commit-sid annotation]
   (if annotation
@@ -544,7 +546,7 @@
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
   [{:keys [commit] :as db} prev-commit]
-  (let [{:keys [data id issuer message annotation txn]} commit
+  (let [{:keys [data id issuer message annotation txn author]} commit
         {db-t :t, db-id :id} data
         {previous-id :id prev-data :data} prev-commit
         prev-data-id       (:id prev-data)
@@ -570,6 +572,7 @@
                                    issuer-flakes (into issuer-flakes)
                                    annotation-flakes (into annotation-flakes)
                                    message-flakes (into message-flakes)
+                                   author (conj (author-flake t commit-sid author))
                                    txn (conj (txn-flake t commit-sid txn)))]
     (-> db*
         (update-novelty commit-flakes)

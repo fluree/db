@@ -577,7 +577,7 @@
   ([db methods rule-sources opts]
    (log/warn "DEPRECATED function `reason` superseded by `fluree.db.api/reason`")
    (promise-wrap
-     (reasoner/reason db methods rule-sources opts))))
+    (reasoner/reason db methods rule-sources opts))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/reasoned-count"}

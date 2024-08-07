@@ -286,17 +286,14 @@
           tx-state           (flake.transact/->tx-state :db db*)
           inserts            (atom nil)
           ;; TODO - rules can be processed in parallel
-          raw-rules          (<? (all-rules methods db* inserts rule-sources))
-          _                  (log/debug "Reasoner - extracted rules: " raw-rules)
-          duplicate-ids      (find-duplicate-ids raw-rules)
-          deduplicated-rules (when (not (empty? duplicate-ids))
-                               (log/error "Duplicate ids detected. Some rules will be overwritten:" (apply str (map first duplicate-ids))))
-          reasoning-rules    (-> raw-rules 
-                                 resolve/rules->graph
-                                 add-rule-dependencies)
-          db**               (if-let [inserts* @inserts]
-                               (<? (process-inserts db* fuel-tracker inserts*))
-                               db*)]
+          raw-rules       (<? (all-rules methods db* inserts rule-sources))
+          _               (log/debug "Reasoner - extracted rules: " raw-rules)
+          reasoning-rules (-> raw-rules
+                              resolve/rules->graph
+                              add-rule-dependencies)
+          db**            (if-let [inserts* @inserts]
+                            (<? (process-inserts db* fuel-tracker inserts*))
+                            db*)]
       (log/trace "Reasoner - parsed rules: " reasoning-rules)
       (if (empty? reasoning-rules)
         db**

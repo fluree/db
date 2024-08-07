@@ -25,6 +25,12 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn q
+  ([ds-or-db query]
+   (fql/query ds-or-db query))
+  ([ds-or-db fuel-tracker query]
+   (fql/query ds-or-db fuel-tracker query)))
+
 (defn history
   "Return a summary of the changes over time, optionally with the full commit
   details included."
@@ -37,6 +43,31 @@
   [opts did]
   (cond-> (util/parse-opts opts)
     did (assoc :did did :issuer did)))
+
+(defn db->policy-db
+  [db context {:keys [did default-allow?] :as _opts}]
+  (go-try
+    (if did
+      (<? (perm/wrap-identity-policy db did default-allow? nil))
+      db)))
+
+(defn db->time-travel-db
+  [db t]
+  (go-try
+    (if t
+      (<? (time-travel/as-of db t))
+      db)))
+
+(defn db->reasoned-db
+  [db request-opts]
+  (go-try
+    (let [{:keys [reasoner-methods rule-graphs rule-dbs] :as reasoning} request-opts]
+      (if reasoner-methods
+        (<? (reasoner/reason db
+                             reasoner-methods
+                             reasoning
+                             request-opts))
+        db))))
 
 (defn restrict-db
   [db t {:keys [did default-allow? reasoner-methods rule-sources] :as opts}]
@@ -61,7 +92,7 @@
     (let [start #?(:clj (System/nanoTime)
                    :cljs (util/current-time-millis))
           fuel-tracker  (fuel/tracker max-fuel)]
-      (try* (let [result (<? (fql/query ds fuel-tracker query))]
+      (try* (let [result (<? (q ds fuel-tracker query))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start)
@@ -73,37 +104,29 @@
                                      :fuel   (fuel/tally fuel-tracker)}
                                     e)))))))
 
-(defn query-fql
-  "Execute a query against a database source. Returns core async channel
-  containing result or exception."
-  ([ds query] (query-fql ds query nil))
-  ([ds query {:keys [did issuer] :as _opts}]
-   (go-try
-    ;; TODO - verify if both 'did' and 'issuer' opts are still needed upstream
-    (let [{:keys [t opts] :as query*} (update query :opts sanitize-query-options (or did issuer))
-
-          ;; TODO - remove restrict-db from here, restriction should happen
-          ;;      - upstream if needed
-          ds*      (if (dataset? ds)
-                     ds
-                     (<? (restrict-db ds t opts)))
-          query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
-          max-fuel (:max-fuel opts)]
-      (if (::util/track-fuel? opts)
-        (<? (track-query ds* max-fuel query**))
-        (<? (fql/query ds* query**)))))))
-
-(defn query-sparql
-  [db query]
-  (go-try
-    (let [fql (sparql/->fql query)]
-      (<? (query-fql db fql)))))
-
 (defn query
-  [db query {:keys [format] :as _opts :or {format :fql}}]
-  (case format
-    :fql (query-fql db query)
-    :sparql (query-sparql db query)))
+  ([db query*]
+   (query db query* nil))
+  ([db query {:keys [format did] :as opts}]
+   (go-try
+     (let [fql-query   (if (= :sparql format)
+                         (sparql/->fql query)
+                         query)          
+           
+           {:keys [t opts] :as sanitized-query}
+           (update fql-query :opts sanitize-query-options did)
+           
+           final-query (update sanitized-query :opts dissoc :meta :max-fuel ::util/track-fuel?)
+           
+           dataset     (if (dataset? db)
+                         db
+                         (as-> db $
+                           (<? (db->policy-db $ (ctx-util/extract final-query) opts))
+                           (<? (db->time-travel-db $ t))
+                           (<? (db->reasoned-db $ opts))))]
+       (if (::util/track-fuel? opts)
+         (<? (track-query dataset (:max-fuel opts) final-query))
+         (<? (q dataset final-query)))))))
 
 (defn contextualize-ledger-400-error
   [info-str e]
@@ -245,7 +268,7 @@
               max-fuel      (:max-fuel opts)]
           (if (::util/track-fuel? opts)
             (<? (track-query ds max-fuel trimmed-query))
-            (<? (fql/query ds trimmed-query))))
+            (<? (q ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))
 
