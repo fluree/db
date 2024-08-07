@@ -96,7 +96,7 @@
           staged-db          (-> (<? (flake.transact/final-db db all-flakes tx-state))
                                  :db-after
                                  (set-namespaces ns-mapping))]
-      (<? (jld-ledger/commit! ledger staged-db nil)))))
+      (<? (jld-ledger/commit! ledger staged-db {:time (get-first-value commit const/iri-time)})))))
 
 (defn migrate-commits
   "Reduce over each commmit and integrate its data into the ledger's db."

@@ -80,12 +80,12 @@
      :flakes  flakes
      :commit  commit}))
 
-(defn normalize-opts
-  "Normalizes commit options"
+(defn parse-commit-options
+  "Parses the commit options and removes non-public opts."
   [opts]
   (if (string? opts)
     {:message opts}
-    opts))
+    (select-keys opts [:context :did :private :message :tag :file-data? :index-files-ch])))
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
@@ -99,7 +99,7 @@
     (context/stringify parsed-context)))
 
 (defn- enrich-commit-opts
-  [ledger {:keys [context did private message tag file-data? index-files-ch] :as _opts}]
+  [ledger {:keys [context did private message tag file-data? index-files-ch time] :as _opts}]
   (let [context*      (parse-commit-context context)
         private*      (or private
                           (:private did)
@@ -109,18 +109,24 @@
                           (:did ledger))
         ctx-used-atom (atom {})
         compact-fn    (json-ld/compact-fn context* ctx-used-atom)]
-    {:message        message
-     :tag            tag
-     :file-data?     file-data? ;; if instead of returning just a db from commit, return also the written files (for consensus)
-     :context        context*
-     :private        private*
-     :did            did*
-     :ctx-used-atom  ctx-used-atom
-     :compact-fn     compact-fn
-     :compact        (fn [iri] (json-ld/compact iri compact-fn))
-     :id-key         (json-ld/compact "@id" compact-fn)
-     :type-key       (json-ld/compact "@type" compact-fn)
-     :index-files-ch index-files-ch})) ;; optional async chan passed in which will stream out all new index files created (for consensus)
+    {:commit-opts
+     {:message message
+      :tag tag
+      :time (or time (util/current-time-iso))
+      :file-data? file-data? ;; if true, return the db as well as the written files (for consensus)
+      :context context*
+      :private private*
+      :did did*}
+
+     :commit-data-helpers
+     {:compact-fn compact-fn
+      :compact (fn [iri] (json-ld/compact iri compact-fn))
+      :id-key (json-ld/compact "@id" compact-fn)
+      :type-key (json-ld/compact "@type" compact-fn)
+      :ctx-used-atom ctx-used-atom}
+
+     ;; optional async chan passed in which will stream out all new index files created (for consensus)
+     :index-files-ch index-files-ch}))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don' think the db should be handling any of it
@@ -172,11 +178,13 @@
   returns a db with an updated :commit."
   [{:keys [alias conn] :as ledger} {:keys [branch t stats commit] :as staged-db} opts]
   (go-try
-    (let [{:keys [did message tag file-data? index-files-ch] :as opts*}
-          (->> opts normalize-opts (enrich-commit-opts ledger))
+    (let [{index-files-ch :index-files-ch
+           commit-data-opts :commit-data-helpers
+           {:keys [did message private tag file-data? time]} :commit-opts}
+          (enrich-commit-opts ledger opts)
 
           {:keys [dbid db-jsonld staged-txns]}
-          (flake-db/db->jsonld staged-db opts*)
+          (flake-db/db->jsonld staged-db commit-data-opts)
 
           ;; TODO - we do not support multiple "transactions" in a single commit (although other code assumes we do which needs cleaning)
           [[txn-id author annotation] :as txns]
@@ -185,16 +193,13 @@
           data-write-result (<? (connection/-c-write conn alias db-jsonld)) ; write commit data
           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
 
-          commit-time (util/current-time-iso)
-          _           (log/debug "Committing t" t "at" commit-time)
-
           base-commit-map {:old-commit commit
                            :issuer     did
                            :message    message
                            :tag        tag
                            :dbid       dbid
                            :t          t
-                           :time       commit-time
+                           :time       time
                            :db-address db-address
                            :author     author
                            :annotation annotation
@@ -202,13 +207,15 @@
                            :flakes     (:flakes stats)
                            :size       (:size stats)}
           new-commit      (commit-data/new-db-commit-map base-commit-map)
-          keypair         (select-keys opts* [:did :private])
+          keypair         {:did did :private private}
 
           {:keys [commit-map write-result] :as commit-write-map}
           (<? (write-commit conn alias keypair new-commit))
 
           db  (formalize-commit staged-db commit-map)
           db* (update-commit! ledger branch db index-files-ch)]
+
+      (log/debug "Committing t" t "at" time)
 
       (<? (push-commit conn commit-write-map))
 
@@ -274,7 +281,7 @@
 (defrecord JsonLDLedger [id address alias did state cache conn reasoner]
   ledger/iCommit
   (-commit! [ledger db] (commit! ledger db nil))
-  (-commit! [ledger db opts] (commit! ledger db opts))
+  (-commit! [ledger db opts] (commit! ledger db (parse-commit-options opts)))
   (-notify [ledger expanded-commit] (notify ledger expanded-commit))
 
   ledger/iLedger
