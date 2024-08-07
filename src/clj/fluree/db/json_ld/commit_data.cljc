@@ -275,7 +275,7 @@
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
-  [alias branch ns-addresses]
+  [alias branch ns-addresses init-time]
   (let [commit-json  (->json-ld {:alias  alias
                                  :v      0
                                  :branch (if branch
@@ -284,7 +284,7 @@
                                  :data   {:t      0
                                           :flakes 0
                                           :size   0}
-                                 :time   (util/current-time-iso)
+                                 :time   init-time
                                  :ns     (mapv #(if (map? %)
                                                   %
                                                   {:id %})

@@ -299,9 +299,9 @@
     ledger-alias))
 
 (defn write-genesis-commit
-  [conn ledger-alias branch ns-addresses]
+  [conn ledger-alias branch ns-addresses init-time]
   (go-try
-    (let [genesis-commit            (commit-data/blank-commit ledger-alias branch ns-addresses)
+    (let [genesis-commit            (commit-data/blank-commit ledger-alias branch ns-addresses init-time)
           initial-context           (get genesis-commit "@context")
           initial-db-data           (-> genesis-commit
                                         (get "data")
@@ -338,16 +338,16 @@
 
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
-  [conn ledger-alias opts]
+  [conn ledger-alias {:keys [did branch indexing] :as opts}]
   (go-try
-    (let [{:keys [did branch indexing]}
-          (parse-ledger-options conn opts)
-
-          ledger-alias*  (normalize-alias ledger-alias)
+    (let [ledger-alias*  (normalize-alias ledger-alias)
           address        (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
           ns-addresses   (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
+          ;; internal-only opt used for migrating ledgers without genesis commits
+          init-time      (or (:fluree.db.json-ld.migrate.sid/time opts)
+                             (util/current-time-iso))
           genesis-commit (json-ld/expand
-                           (<? (write-genesis-commit conn ledger-alias branch ns-addresses)))
+                           (<? (write-genesis-commit conn ledger-alias branch ns-addresses init-time)))
           ;; map of all branches and where they are branched from
           branches       {branch (branch/state-map conn ledger-alias* branch genesis-commit indexing)}]
       (map->JsonLDLedger
@@ -365,7 +365,7 @@
   (go-try
     (let [[not-cached? ledger-chan] (register-ledger conn ledger-alias)] ;; holds final cached ledger in a promise-chan avoid race conditions
       (if not-cached?
-        (let [ledger (<! (create* conn ledger-alias opts))]
+        (let [ledger (<! (create* conn ledger-alias (parse-ledger-options conn opts)))]
           (when (util/exception? ledger)
             (release-ledger conn ledger-alias))
           (async/put! ledger-chan ledger)

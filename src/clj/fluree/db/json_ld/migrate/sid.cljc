@@ -131,11 +131,11 @@
            ledger-alias      (jld-ledger/commit->ledger-alias conn address first-commit)
            branch            (or (keyword (get-first-value first-commit const/iri-branch))
                                  :main)
-           ;; have to release the ledger so we can re-create a blank one with the same name
-           _                 (connection/release-ledger conn ledger-alias)
-           ledger            (<? (jld-ledger/create conn ledger-alias {:did      nil
-                                                                       :branch   branch
-                                                                       :indexing indexing-opts}))
+           ledger            (<? (jld-ledger/create* conn ledger-alias
+                                                     {:did nil
+                                                      :branch branch
+                                                      :indexing indexing-opts
+                                                      ::time (get-first-value first-commit const/iri-time)}))
            tuples-chans      (map (fn [commit-tuple]
                                     [commit-tuple (when changes-ch (async/chan))])
                                   all-commit-tuples)
