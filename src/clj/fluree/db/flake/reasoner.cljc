@@ -15,7 +15,7 @@
             [fluree.db.query.fql.parse :as fql.parse]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
             [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]
-            [fluree.db.query.exec.where :as where]))
+            [fluree.db.query.exec :refer [queryable?]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -167,48 +167,43 @@
 
 (defn rules-from-dbs
   [methods inserts dbs]
-  (let [clause-chan (async/to-chan! dbs)
-        out-chan (async/chan)]
-    (doall
-     (for [method methods]
-       (async/pipeline-async
-        1
-        out-chan
-        (fn [db out-ch]
-          (async/pipe (go-try
-                        (as-> db $
-                          (<? (resolve/rules-from-db $ method))
-                          (rules-from-graph method inserts $)))
-                      out-ch)
-          out-ch)
-        clause-chan)))
-    (async/into [] out-chan)))
-
-(defn db?
-  [x]
-  (satisfies? where/Matcher x))
+  (go-try
+    (loop [[method & remaining-methods] methods
+           rules []]
+      (if method
+        (recur remaining-methods
+               (loop [[db & remaining-dbs] dbs
+                      rules* rules]
+                 (if db
+                   (recur remaining-dbs
+                          (into rules*
+                                (as-> db $
+                                  (<? (resolve/rules-from-db $ method))
+                                  (rules-from-graph method inserts $))))
+                   rules*)))
+        (remove empty? rules)))))
 
 (defn all-rules
   "Gets all relevant rules for the specified methods from the
   supplied rules graph or from the db if no graph is supplied."
   [methods db inserts rule-sources]
   (go-try
-    (let [rule-graphs           (filter #(and (map? %) (not (db? %))) rule-sources)
+    (let [rule-graphs           (filter #(and (map? %) (not (queryable? %))) rule-sources)
           parsed-rule-graphs    (try*
                                   (map parse-rules-graph rule-graphs)
                                   (catch* e
                                           (log/error "Error parsing supplied rules graph:" e)
                                           (throw e)))
-          all-rules-from-graphs (apply concat
-                                       (for [method methods]
-                                         (mapcat (fn [parsed-rules-graph]
-                                                   (rules-from-graph method inserts parsed-rules-graph))
-                                                 parsed-rule-graphs)))
-          rule-dbs              (filter #(or (string? %) (db? %)) rule-sources)
+          all-rules-from-graphs (mapcat (fn [method]
+                                          (mapcat (fn [parsed-rules-graph]
+                                                    (rules-from-graph method inserts parsed-rules-graph))
+                                                  parsed-rule-graphs))
+                                        methods)
+          rule-dbs              (filter #(or (string? %) (queryable? %)) rule-sources)
           all-rule-dbs          (if (or (nil? rule-dbs) (empty? rule-dbs))
                                   [db]
                                   (conj rule-dbs db))
-          all-rules-from-dbs    (apply concat (<? (rules-from-dbs methods inserts all-rule-dbs)))
+          all-rules-from-dbs    (<? (rules-from-dbs methods inserts all-rule-dbs))
           all-rules             (concat all-rules-from-graphs all-rules-from-dbs)]
       all-rules)))
 
@@ -266,7 +261,7 @@
   (let [rule-ids (map first raw-rules)]
     (->> rule-ids
          frequencies
-         (filter #(< 1 (last %))))))
+         (filter #(< 1 (val %))))))
 
 (defn deduplicate-raw-rules
   "Given a list of reasoning rules, identifies rules with duplicate ids and renames them using
