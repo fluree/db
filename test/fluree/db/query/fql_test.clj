@@ -328,11 +328,17 @@
                     (fluree/db ledger)
                     {"@context" ["https://ns.flur.ee"
                                  test-utils/default-context
-                                 {:ex "http://example.org/ns/"}]
+                                 {:ex    "http://example.org/ns/"
+                                  :value "@value"
+                                  :type  "@type"}]
                      "insert"
                      [{:id      :ex/homer
                        :ex/name "Homer"
                        :ex/age  36}
+                      {:id      :ex/marge
+                       :ex/name "Marge"
+                       :ex/age  {:value 36
+                                 :type  :xsd/int}}
                       {:id      :ex/bart
                        :ex/name "Bart"
                        :ex/age  "forever 10"}]})]
@@ -346,10 +352,10 @@
                            :select  '[?name]
                            :where   '{:ex/name ?name
                                       :ex/age  {:value 36
-                                                :type  :xsd/long}}}
+                                                :type  :xsd/int}}}
                   results @(fluree/query db query)]
-              (is (= [["Homer"]] results)
-                  "should return the matching items")))
+              (is (= [["Marge"]] results)
+                  "should only return the matching items with the specified type")))
           (testing "not compatible with the value"
             (let [query   {:context [test-utils/default-context
                                      {:ex    "http://example.org/ns/"
@@ -366,11 +372,14 @@
         (testing "included datatype in query results"
           (let [query   {:context [test-utils/default-context
                                    {:ex "http://example.org/ns/"}]
-                         :select  '[?age ?dt]
-                         :where   '[{:ex/age ?age}
+                         :select  '[?name ?age ?dt]
+                         :where   '[{:ex/name ?name
+                                     :ex/age  ?age}
                                     [:bind ?dt (datatype ?age)]]}
                 results @(fluree/query db query)]
-            (is (= [[36 :xsd/long] ["forever 10" :xsd/string]]
+            (is (= [["Bart" "forever 10" :xsd/string]
+                    ["Homer" 36 :xsd/long]
+                    ["Marge" 36 :xsd/int]]
                    results))))
         (testing "filtered with the datatype function"
           (let [query   {:context [test-utils/default-context
