@@ -77,6 +77,7 @@
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
 (def ^:const iri-lang-string "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
 (def ^:const iri-string "http://www.w3.org/2001/XMLSchema#string")
+(def ^:const iri-long "http://www.w3.org/2001/XMLSchema#long")
 
 ;; rdfs
 (def ^:const iri-rdfs:Class "http://www.w3.org/2000/01/rdf-schema#Class")
@@ -255,7 +256,7 @@
 ;; major types (a) ref, (b) string, (c) number, (d) boolean
 ;; xsd common types
 (def ^:const $xsd:anyURI (iri/iri->sid iri-anyURI))
-(def ^:const $xsd:string (iri/iri->sid "http://www.w3.org/2001/XMLSchema#string"))
+(def ^:const $xsd:string (iri/iri->sid iri-string))
 (def ^:const $xsd:boolean (iri/iri->sid "http://www.w3.org/2001/XMLSchema#boolean"))
 (def ^:const $xsd:date (iri/iri->sid "http://www.w3.org/2001/XMLSchema#date"))
 (def ^:const $xsd:dateTime (iri/iri->sid "http://www.w3.org/2001/XMLSchema#dateTime"))
@@ -263,7 +264,7 @@
 (def ^:const $xsd:decimal (iri/iri->sid "http://www.w3.org/2001/XMLSchema#decimal"))
 (def ^:const $xsd:double (iri/iri->sid "http://www.w3.org/2001/XMLSchema#double"))
 (def ^:const $xsd:integer (iri/iri->sid "http://www.w3.org/2001/XMLSchema#integer"))
-(def ^:const $xsd:long (iri/iri->sid "http://www.w3.org/2001/XMLSchema#long"))
+(def ^:const $xsd:long (iri/iri->sid iri-long))
 (def ^:const $xsd:int (iri/iri->sid "http://www.w3.org/2001/XMLSchema#int"))
 (def ^:const $xsd:short (iri/iri->sid "http://www.w3.org/2001/XMLSchema#short"))
 (def ^:const $xsd:float (iri/iri->sid "http://www.w3.org/2001/XMLSchema#float"))
