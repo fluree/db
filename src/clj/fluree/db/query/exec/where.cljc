@@ -363,6 +363,21 @@
             (match-transaction (flake/t flake))
             (match-meta (flake/m flake)))))))
 
+(defn match-linked-vars
+  [solution o-mch db flake]
+  (reduce (fn [soln [var-type linked-var]]
+            (let [var-mch (unmatched-var linked-var)
+                  val-mch (case var-type
+                            :dt   (let [dt-sid (flake/dt flake)
+                                        dt-iri (iri/decode-sid db dt-sid)]
+                                    (match-iri var-mch dt-iri))
+                            :lang (let [lang (-> flake flake/m :lang)]
+                                    (match-value var-mch lang const/iri-string))
+                            :t    (let [t (flake/t flake)]
+                                    (match-value var-mch t const/iri-long)))]
+              (assoc soln linked-var val-mch)))
+          solution (get-linked-vars o-mch)))
+
 (defn match-flake
   "Assigns the unmatched variables within the supplied `triple-pattern` to their
   corresponding values from `flake` in the supplied match `solution`."
@@ -371,8 +386,10 @@
     (cond-> solution
       (unmatched-var? s) (assoc (::var s) (match-subject s db flake))
       (unmatched-var? p) (assoc (::var p) (match-predicate p db flake))
-      (unmatched-var? o) (assoc (::var o) (match-object o db flake)))))
-
+      (unmatched-var? o) (assoc (::var o) (-> o
+                                              unlink-vars
+                                              (match-object db flake)))
+      (linked-vars? o)   (match-linked-vars o db flake))))
 
 (defn augment-object-fn
   "Returns a pair consisting of an object value and boolean function that will
