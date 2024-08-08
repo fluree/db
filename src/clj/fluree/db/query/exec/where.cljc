@@ -24,10 +24,12 @@
   (assoc unmatched ::var var-sym))
 
 (defn match-value
-  [mch x dt-iri]
-  (assoc mch
-         ::val x
-         ::datatype-iri dt-iri))
+  ([mch x]
+   (assoc mch ::val x))
+  ([mch x dt-iri]
+   (-> mch
+       (match-value x)
+       (assoc ::datatype-iri dt-iri))))
 
 (defn matched-value?
   [match]
@@ -129,6 +131,10 @@
   "Returns true if the triple pattern component `match` represents a variable
   without an associated value."
   (complement matched?))
+
+(defn untyped-value
+  [v]
+  (match-value unmatched v))
 
 (defn anonymous-value
   "Build a pattern that already matches an explicit value."
