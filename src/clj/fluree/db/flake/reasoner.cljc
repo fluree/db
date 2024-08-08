@@ -6,7 +6,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.exec :refer [queryable?]]
+            [fluree.db.query.exec :as exec]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
@@ -14,8 +14,7 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql.parse :as fql.parse]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
-            [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]
-            [fluree.db.query.exec :refer [queryable?]]))
+            [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -188,7 +187,7 @@
   supplied rules graph or from the db if no graph is supplied."
   [methods db inserts rule-sources]
   (go-try
-    (let [rule-graphs           (filter #(and (map? %) (not (queryable? %))) rule-sources)
+    (let [rule-graphs           (filter #(and (map? %) (not (exec/queryable? %))) rule-sources)
           parsed-rule-graphs    (try*
                                   (map parse-rules-graph rule-graphs)
                                   (catch* e
@@ -199,7 +198,7 @@
                                                     (rules-from-graph method inserts parsed-rules-graph))
                                                   parsed-rule-graphs))
                                         methods)
-          rule-dbs              (filter #(or (string? %) (queryable? %)) rule-sources)
+          rule-dbs              (filter #(or (string? %) (exec/queryable? %)) rule-sources)
           all-rule-dbs          (if (or (nil? rule-dbs) (empty? rule-dbs))
                                   [db]
                                   (conj rule-dbs db))
