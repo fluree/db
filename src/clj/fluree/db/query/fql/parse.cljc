@@ -281,15 +281,22 @@
            (contains? attrs const/iri-language))
     (throw (ex-info "Language tags are not allowed when the data type is specified."
                     {:status 400, :error :db/invalid-query}))
-    (let [t-matcher    (some-> attrs (get const/iri-t) (where/transaction-matcher))
-          dt-matcher   (some-> attrs (get const/iri-type) (where/datatype-matcher context))
-          lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
+    (let [var-mch      (where/unmatched-var var)
+          t            (get attrs const/iri-t)
+          t-matcher    (some-> t (where/transaction-matcher))
+          dt           (get attrs const/iri-type)
+          dt-matcher   (some-> dt (where/datatype-matcher context))
+          lang         (get attrs const/iri-language)
+          lang-matcher (some-> lang where/lang-matcher)
           filter-fn    (some-> attrs
                                (get const/iri-filter)
-                               (parse-filter-function var vars context))]
-      (if-let [f (combine-filters t-matcher dt-matcher lang-matcher filter-fn)]
-        (where/->var-filter var f)
-        (where/unmatched-var var)))))
+                               (parse-filter-function var vars context))
+          f            (combine-filters t-matcher dt-matcher lang-matcher filter-fn)]
+      (cond-> var-mch
+        (v/variable? dt)   (where/link-dt-var dt)
+        (v/variable? lang) (where/link-lang-var lang)
+        (v/variable? t)    (where/link-t-var t)
+        f                  (where/with-filter f)))))
 
 (defn generate-subject-var
   "Generate a unique subject variable"
