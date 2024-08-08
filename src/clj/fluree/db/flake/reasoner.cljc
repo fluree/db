@@ -164,6 +164,18 @@
     (log/debug "Reasoner - source OWL rules: " graph)
     (owl-datalog/owl->datalog inserts graph)))
 
+(defn extract-rules-from-dbs
+  [method inserts dbs]
+  (loop [[db & remaining-dbs] dbs
+         rules []]
+    (if db
+      (recur remaining-dbs
+             (into rules
+                   (as-> db $
+                     (<? (resolve/rules-from-db $ method))
+                     (rules-from-graph method inserts $))))
+      rules)))
+
 (defn rules-from-dbs
   [methods inserts dbs]
   (go-try
@@ -171,15 +183,7 @@
            rules []]
       (if method
         (recur remaining-methods
-               (loop [[db & remaining-dbs] dbs
-                      rules* rules]
-                 (if db
-                   (recur remaining-dbs
-                          (into rules*
-                                (as-> db $
-                                  (<? (resolve/rules-from-db $ method))
-                                  (rules-from-graph method inserts $))))
-                   rules*)))
+               (into rules (extract-rules-from-dbs method inserts dbs)))
         (remove empty? rules)))))
 
 (defn all-rules
@@ -202,9 +206,8 @@
           all-rule-dbs          (if (or (nil? rule-dbs) (empty? rule-dbs))
                                   [db]
                                   (conj rule-dbs db))
-          all-rules-from-dbs    (<? (rules-from-dbs methods inserts all-rule-dbs))
-          all-rules             (concat all-rules-from-graphs all-rules-from-dbs)]
-      all-rules)))
+          all-rules-from-dbs    (<? (rules-from-dbs methods inserts all-rule-dbs))]
+      (concat all-rules-from-graphs all-rules-from-dbs))))
 
 (defn triples->map
   "Turns triples from same subject (@id) originating from
@@ -266,7 +269,7 @@
   "Given a list of reasoning rules, identifies rules with duplicate ids and renames them using
   indexes."
   [raw-rules]
-  (let [duplicate-ids (find-duplicate-ids raw-rules)]
+  (let [duplicate-id-frequencies (find-duplicate-ids raw-rules)]
     (reduce (fn [rules [duplicate-id occurances]]
               (let [grouped-rules (group-by #(= duplicate-id (first %)) rules)]
                 (loop [suffix occurances
@@ -276,7 +279,7 @@
                     updated-rules-list
                     (let [updated-rule [(str duplicate-id suffix) (last (first rules-to-update))]]
                       (recur (dec suffix) (rest rules-to-update) (conj updated-rules-list updated-rule)))))))
-            raw-rules duplicate-ids)))
+            raw-rules duplicate-id-frequencies)))
 
 (defn reason
   [db methods rule-sources fuel-tracker reasoner-max]
@@ -287,9 +290,9 @@
           ;; TODO - rules can be processed in parallel
           raw-rules          (<? (all-rules methods db* inserts rule-sources))
           _                  (log/debug "Reasoner - extracted rules: " raw-rules)
-          duplicate-ids      (find-duplicate-ids raw-rules)
-          deduplicated-rules (when (not (empty? duplicate-ids))
-                               (log/error "Duplicate ids detected. Some rules will be overwritten:" (apply str (map first duplicate-ids))))
+          duplicate-id-freqs (find-duplicate-ids raw-rules)
+          deduplicated-rules (when (not (empty? duplicate-id-freqs))
+                               (log/error "Duplicate ids detected. Some rules will be overwritten:" (apply str (map first duplicate-id-freqs))))
           reasoning-rules    (-> raw-rules 
                                  resolve/rules->graph
                                  add-rule-dependencies)
