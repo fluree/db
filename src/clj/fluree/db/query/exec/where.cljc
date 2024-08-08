@@ -96,7 +96,7 @@
   [mch value lang]
   (-> mch
       (match-value value const/iri-lang-string)
-      (match-meta {:lang lang})))
+      (update ::meta assoc :lang lang)))
 
 (defn get-lang
   [mch]
@@ -148,6 +148,34 @@
   [match]
   (and (contains? match ::var)
        (unmatched? match)))
+
+(defn link-var
+  [mch var-type var]
+  (assoc-in mch [::linked-vars var-type] var))
+
+(defn get-linked-vars
+  [mch]
+  (::linked-vars mch))
+
+(defn linked-vars?
+  [mch]
+  (contains? mch ::linked-vars))
+
+(defn unlink-vars
+  [mch]
+  (dissoc mch ::linked-vars))
+
+(defn link-lang-var
+  [mch var]
+  (link-var mch :lang var))
+
+(defn link-dt-var
+  [mch var]
+  (link-var mch :dt var))
+
+(defn link-t-var
+  [mch var]
+  (link-var mch :t var))
 
 (defn sanitize-match
   [match]
