@@ -650,30 +650,32 @@
   [solution var-name result]
   (let [dt  (datatype/infer-iri result)
         mch (if (= dt const/iri-anyURI)
-              (-> var-name
-                  unmatched-var
-                  (match-iri result))
-              (-> var-name
-                  unmatched-var
-                  (match-value result dt)))]
-    (assoc solution var-name mch)))
+              (-> var-name unmatched-var (match-iri result))
+              (-> var-name unmatched-var (match-value result dt)))]
+    (if-let [current (get solution var-name)]
+      (when (and (= (-> mch get-binding iri/unwrap) (get-binding current))
+                 (= (-> mch get-datatype-iri iri/unwrap) (get-datatype-iri current))
+                 (= (get-lang mch) (get-lang current)))
+        solution)
+      (assoc solution var-name mch))))
 
 (defmethod match-pattern :bind
   [_db _fuel-tracker solution pattern error-ch]
-  (let [bind (pattern-data pattern)]
-    (go
-      (let [result
-            (reduce (fn [solution* b]
-                      (let [f        (::fn b)
-                            var-name (::var b)]
-                        (try*
-                          (let [result (f solution)]
-                            (bind-function-result solution* var-name result))
-                          (catch* e (update solution* ::errors conj e)))))
-                    solution (vals bind))]
-        (when-let [errors (::errors result)]
-          (async/onto-chan! error-ch errors))
-        result))))
+  (go
+    (let [binds     (-> pattern pattern-data vals)
+          solution* (reduce (fn [soln b]
+                              (let [f        (::fn b)
+                                    var-name (::var b)]
+                                (try*
+                                  (let [result (f soln)]
+                                    (or (bind-function-result soln var-name result)
+                                        (assoc soln ::invalidated true)))
+                                  (catch* e (update soln ::errors conj e)))))
+                            solution binds)]
+      (if-let [errors (::errors solution*)]
+        (async/onto-chan! error-ch errors)
+        (when-not (::invalidated solution*)
+          solution*)))))
 
 (def blank-solution {})
 
