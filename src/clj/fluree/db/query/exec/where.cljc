@@ -363,19 +363,37 @@
             (match-transaction (flake/t flake))
             (match-meta (flake/m flake)))))))
 
+(defn match-linked-datatype
+  [var db flake]
+  (let [var-mch (unmatched-var var)
+        dt-sid (flake/dt flake)
+        dt-iri (iri/decode-sid db dt-sid)]
+    (match-iri var-mch dt-iri)))
+
+(defn match-linked-lang
+  [var flake]
+  (let [var-mch (unmatched-var var)
+        lang    (-> flake flake/m :lang)]
+    (match-value var-mch lang const/iri-string)))
+
+(defn match-linked-t
+  [var flake]
+  (let [var-mch (unmatched-var var)
+        t       (flake/t flake)]
+    (match-value var-mch t const/iri-long)))
+
+(defn match-linked-var
+  [var-type linked-var db flake]
+  (case var-type
+    :dt   (match-linked-datatype linked-var db flake)
+    :lang (match-linked-lang linked-var flake)
+    :t    (match-linked-t linked-var flake)))
+
 (defn match-linked-vars
   [solution o-mch db flake]
   (reduce (fn [soln [var-type linked-var]]
-            (let [var-mch (unmatched-var linked-var)
-                  val-mch (case var-type
-                            :dt   (let [dt-sid (flake/dt flake)
-                                        dt-iri (iri/decode-sid db dt-sid)]
-                                    (match-iri var-mch dt-iri))
-                            :lang (let [lang (-> flake flake/m :lang)]
-                                    (match-value var-mch lang const/iri-string))
-                            :t    (let [t (flake/t flake)]
-                                    (match-value var-mch t const/iri-long)))]
-              (assoc soln linked-var val-mch)))
+            (let [var-mch (match-linked-var var-type linked-var db flake)]
+              (assoc soln linked-var var-mch)))
           solution (get-linked-vars o-mch)))
 
 (defn match-flake
