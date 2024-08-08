@@ -409,13 +409,13 @@
                                    {:ex    "http://example.org/ns/"
                                     :value "@value"
                                     :type  "@type"}]
-                         :select  '[?name ?age]
-                         :where   '[[:bind ?ageType (iri :xsd/string)]
-                                    {:ex/name ?name
+                         :select  '[?name ?age ?ageType]
+                         :where   '[{:ex/name ?name
                                      :ex/age  {:value ?age
-                                               :type  ?ageType}}]}
+                                               :type  ?ageType}}
+                                    [:bind ?ageType (iri :xsd/int)]]}
                 results @(fluree/query db query)]
-            (is (= [["Bart" "forever 10"]]
+            (is (= [["Marge" 36 :xsd/int]]
                    results))))))))
 
 (deftest ^:integration subject-object-test
