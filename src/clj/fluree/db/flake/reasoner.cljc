@@ -166,15 +166,16 @@
 
 (defn extract-rules-from-dbs
   [method inserts dbs]
-  (loop [[db & remaining-dbs] dbs
-         rules []]
-    (if db
-      (recur remaining-dbs
-             (into rules
-                   (as-> db $
-                     (<? (resolve/rules-from-db $ method))
-                     (rules-from-graph method inserts $))))
-      rules)))
+  (go-try
+    (loop [[db & remaining-dbs] dbs
+           rules []]
+      (if db
+        (recur remaining-dbs
+               (into rules
+                     (as-> db $
+                       (<? (resolve/rules-from-db $ method))
+                       (rules-from-graph method inserts $))))
+        rules))))
 
 (defn rules-from-dbs
   [methods inserts dbs]
@@ -183,7 +184,7 @@
            rules []]
       (if method
         (recur remaining-methods
-               (into rules (extract-rules-from-dbs method inserts dbs)))
+               (into rules (<? (extract-rules-from-dbs method inserts dbs))))
         (remove empty? rules)))))
 
 (defn all-rules
