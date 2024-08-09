@@ -92,3 +92,16 @@
   (let [branch-id   (get-in root [(name idx-type) "id"])
         branch-data (idx-branch root idx-type)]
     [branch-id (expand-addresses branch-data)]))
+
+(defn idx-depth
+  "Returns the depth of the index structure"
+  [root idx-type]
+  (let [addresses (idx-addresses root idx-type)]
+    (loop [branch addresses
+           depth 1]
+      ;; each level down it is of the structure [addr [child-addr [child-addr [leaf1, leaf2]]]]
+      (let [branch? (sequential? (first (second branch)))]
+        (if branch?
+          (recur (first (second branch))
+                 (inc depth))
+          depth)))))
