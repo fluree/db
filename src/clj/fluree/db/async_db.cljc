@@ -180,6 +180,10 @@
             (async/put! root-ch e))))
       root-db)))
 
+(defn db?
+  [x]
+  (instance? AsyncDB x))
+
 (def ^String label "#fluree/AsyncDB ")
 
 (defn display

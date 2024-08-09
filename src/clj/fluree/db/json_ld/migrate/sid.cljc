@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.migrate.sid
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
+            [fluree.db.async-db :as async-db]
             [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
             [fluree.db.flake.flake-db :as db]
@@ -97,18 +98,19 @@
                                :annotation (get-first-value commit const/iri-annotation))
           staged-db          (-> (<? (flake.transact/final-db db all-flakes tx-state))
                                  :db-after
-                                 (set-namespaces ns-mapping))]
-      (<? (jld-ledger/commit! ledger staged-db {:time (get-first-value commit const/iri-time)})))))
+                                 (set-namespaces ns-mapping))
+          committed-db       (<? (jld-ledger/commit! ledger staged-db
+                                                     {:time (get-first-value commit const/iri-time)}))]
+      (if (async-db/db? committed-db)
+        (<? (async-db/deref-async committed-db))
+        committed-db))))
 
 (defn migrate-commits
   "Reduce over each commmit and integrate its data into the ledger's db."
   [ledger branch tuples-chans]
   (go-try
     (loop [[[commit-tuple ch] & r] tuples-chans
-           ;; need a FlakeDb, not an AsyncDb
-           db                      (-> (jld-ledger/current-db ledger)
-                                       :db-chan
-                                       <?)]
+           db (<? (async-db/deref-async (jld-ledger/current-db ledger)))]
       (if commit-tuple
         (recur r (<? (migrate-commit ledger db commit-tuple)))
         db))))
