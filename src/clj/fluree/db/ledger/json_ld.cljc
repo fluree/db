@@ -322,10 +322,12 @@
 (defn parse-ledger-options
   [conn {:keys [did branch indexing]
          :or   {branch :main}}]
-  (let [did* (parse-did conn did)]
+  (let [did*           (parse-did conn did)
+        ledger-default (-> conn :ledger-defaults :indexing)
+        indexing*      (merge ledger-default indexing)]
     {:did      did*
      :branch   branch
-     :indexing indexing}))
+     :indexing indexing*}))
 
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
