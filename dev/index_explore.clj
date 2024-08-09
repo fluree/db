@@ -81,3 +81,14 @@
                            [child-addr (expand-addresses (read-index-file child-addr))])))
                      children)]
     child-addrs))
+
+(defn idx-addresses
+  "Reads all index address and puts in nested vector data structure
+  until reaching leafs.
+
+  e.g.
+  [root [child1 [child1-1 [child 1-1-1 child1-1-2...]"
+  [root idx-type]
+  (let [branch-id   (get-in root [(name idx-type) "id"])
+        branch-data (idx-branch root idx-type)]
+    [branch-id (expand-addresses branch-data)]))
