@@ -42,3 +42,9 @@
 (defn latest-root
   [roots]
   (at-t (latest-t roots) roots))
+
+(defn idx-branch
+  [root idx-type]
+  (let [idx*        (name idx-type)
+        idx-address (get-in root [idx* "id"])]
+    (read-index-file idx-address)))
