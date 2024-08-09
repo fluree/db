@@ -63,3 +63,21 @@
                          (expand-idx child*))))
                    children)]
     (assoc branch "children" children*)))
+
+(defn idx-children
+  [root idx-type]
+  (let [branch (idx-branch root idx-type)]
+    (expand-idx branch)))
+
+(defn expand-addresses
+  [branch]
+  (let [children    (get branch "children")
+        child-addrs (mapv
+                     (fn [child]
+                       (let [child-addr (get child "id")
+                             leaf?      (true? (get child "leaf"))]
+                         (if leaf?
+                           child-addr
+                           [child-addr (expand-addresses (read-index-file child-addr))])))
+                     children)]
+    child-addrs))
