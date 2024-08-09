@@ -233,7 +233,7 @@
         meta   (::meta v-map)]
     (if (and ref-id (node? v-map))
       (let [ref-sid (iri/encode-iri db ref-id)]
-        (flake/create sid pid ref-sid const/$xsd:anyURI t assert? meta))
+        (flake/create sid pid ref-sid const/$id t assert? meta))
       (let [[value dt] (datatype/from-expanded v-map nil)]
         (flake/create sid pid value dt t assert? meta)))))
 
@@ -257,7 +257,7 @@
         (map (fn [type-item]
                (let [type-sid (iri/encode-iri db type-item)]
                  (flake/create sid const/$rdf:type type-sid
-                               const/$xsd:anyURI t assert? nil))))
+                               const/$id t assert? nil))))
         type))
 
 (defn node->flakes
@@ -606,7 +606,7 @@
          all-refs? nil
          acc       nil]
     (let [pdt  (flake/dt p-flake)
-          ref? (= const/$xsd:anyURI pdt)
+          ref? (= const/$id pdt)
           [obj all-refs?] (if ref?
                             [{"@id" (get-s-iri db (flake/o p-flake) compact-fn)}
                              (if (nil? all-refs?) true all-refs?)]
