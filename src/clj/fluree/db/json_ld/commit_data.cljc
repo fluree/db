@@ -275,7 +275,7 @@
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
-  [alias branch ns-addresses]
+  [alias branch ns-addresses init-time]
   (let [commit-json  (->json-ld {:alias  alias
                                  :v      0
                                  :branch (if branch
@@ -284,7 +284,7 @@
                                  :data   {:t      0
                                           :flakes 0
                                           :size   0}
-                                 :time   (util/current-time-iso)
+                                 :time   init-time
                                  :ns     (mapv #(if (map? %)
                                                   %
                                                   {:id %})
@@ -367,7 +367,7 @@
   Assumes commit is not yet created (but db is persisted), so
   commit-id and commit-address are added after finalizing and persisting commit."
   [{:keys [old-commit issuer message tag dbid t db-address flakes size author
-           txn-id annotation]
+           txn-id annotation time]
     :as   _commit}]
   (let [prev-data   (select-keys (data old-commit) [:id :address])
         data-commit (new-db-commit dbid t db-address prev-data flakes size)
@@ -377,7 +377,7 @@
                                 :prev-commit)
                         (assoc :address ""
                                :data data-commit
-                               :time (util/current-time-iso)))]
+                               :time time))]
     (cond-> commit
             txn-id (assoc :txn txn-id)
             author (assoc :author author)
