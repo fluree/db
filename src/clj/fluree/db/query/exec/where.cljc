@@ -349,19 +349,19 @@
   "Matches the object, data type, and metadata of the supplied `flake` to the
   triple object pattern component `o-match`."
   [o-match db flake]
-  (let [dt (flake/dt flake)]
+  (let [o-match* (-> o-match
+                     (match-transaction (flake/t flake))
+                     (match-meta (flake/m flake)))
+        dt (flake/dt flake)]
     (if (= const/$xsd:anyURI dt)
       (let [alias (:alias db)
             oid   (flake/o flake)
             o-iri (iri/decode-sid db oid)]
-        (-> o-match
+        (-> o-match*
             (match-sid alias oid)
             (match-iri o-iri)))
       (let [dt-iri (iri/decode-sid db dt)]
-        (-> o-match
-            (match-value (flake/o flake) dt-iri)
-            (match-transaction (flake/t flake))
-            (match-meta (flake/m flake)))))))
+        (match-value o-match* (flake/o flake) dt-iri)))))
 
 (defn match-linked-datatype
   [var db flake]
