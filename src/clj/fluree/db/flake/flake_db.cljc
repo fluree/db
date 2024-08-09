@@ -468,8 +468,8 @@
     (policy/root-db db))
 
   reasoner/Reasoner
-  (-reason [db methods rules-graph fuel-tracker reasoner-max]
-    (flake.reasoner/reason db methods rules-graph fuel-tracker reasoner-max))
+  (-reason [db methods rule-sources fuel-tracker reasoner-max]
+    (flake.reasoner/reason db methods rule-sources fuel-tracker reasoner-max))
   (-reasoned-facts [db]
     (flake.reasoner/reasoned-facts db)))
 
