@@ -32,3 +32,13 @@
           (when (= t (get r "t"))
             r))
         roots))
+
+(defn latest-t
+  [roots]
+  (->> roots
+       (map #(get % "t"))
+       (apply max)))
+
+(defn latest-root
+  [roots]
+  (at-t (latest-t roots) roots))
