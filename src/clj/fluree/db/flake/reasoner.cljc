@@ -170,11 +170,11 @@
     (loop [[db & remaining-dbs] dbs
            rules []]
       (if db
-        (recur remaining-dbs
-               (into rules
+        (let [updated-rules (into rules
                      (as-> db $
                        (<? (resolve/rules-from-db $ method))
-                       (rules-from-graph method inserts $))))
+                       (rules-from-graph method inserts $)))]
+          (recur remaining-dbs updated-rules))
         rules))))
 
 (defn rules-from-dbs
@@ -183,8 +183,7 @@
     (loop [[method & remaining-methods] methods
            rules []]
       (if method
-        (recur remaining-methods
-               (into rules (<? (extract-rules-from-dbs method inserts dbs))))
+        (recur remaining-methods (into rules (<? (extract-rules-from-dbs method inserts dbs))))
         (remove empty? rules)))))
 
 (defn all-rules
