@@ -74,10 +74,6 @@
      (binding [*out* w]
        (pr (connection/printer-map conn)))))
 
-(defn ledger-defaults
-  [{:keys [did]}]
-  {:did did})
-
 (defn validate-http-url
   "Tests that URL starts with http:// or https://, returns exception or
   original url if passes. Appends a '/' at the end if not already present."
@@ -132,7 +128,6 @@
                              :sync?        true}}}]
   (go-try
     (let [ipfs-endpoint   (validate-http-url server)
-          ledger-defaults (ledger-defaults defaults)
           conn-id         (str (random-uuid))
           state           (connection/blank-state)
           nameservices*   (if nameservices ;; provided pre-configured nameservices to connection
@@ -157,7 +152,7 @@
       (map->IPFSConnection {:id              conn-id
                             :store           ipfs-store
                             :ipfs-endpoint   ipfs-endpoint
-                            :ledger-defaults ledger-defaults
+                            :ledger-defaults defaults
                             :serializer      serializer
                             :parallelism     parallelism
                             :msg-in-ch       (chan)
