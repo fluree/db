@@ -122,16 +122,16 @@
   compact SIDs. This migration traverses the commit chain and holds them all in memory,
   then processes each one, properly generating the necessary namespace codes for SIDs
   along the way and rewriting the commit chain to use the newer commit structure."
-  ([conn address indexing-opts]
-   (migrate conn address indexing-opts nil))
-  ([conn address indexing-opts changes-ch]
+  ([conn ledger-alias indexing-opts]
+   (migrate conn ledger-alias indexing-opts nil))
+  ([conn ledger-alias indexing-opts changes-ch]
    (go-try
      (log/info "Starting SID migration.")
-     (let [last-commit-addr  (<? (nameservice/lookup-commit conn address))
+     (let [ledger-address    (<? (nameservice/primary-address conn ledger-alias nil))
+           last-commit-addr  (<? (nameservice/lookup-commit conn ledger-address))
            last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
            all-commit-tuples (<? (reify/trace-commits conn last-commit-tuple 1))
            first-commit      (ffirst all-commit-tuples)
-           ledger-alias      (jld-ledger/commit->ledger-alias conn address first-commit)
            branch            (or (keyword (get-first-value first-commit const/iri-branch))
                                  :main)
            ledger            (<? (jld-ledger/create* conn ledger-alias
