@@ -3,7 +3,7 @@
             [fluree.db.util.json :as json]
             [fluree.db.storage :as storage]))
 
-(def data-directory "./data")
+(def data-directory "./dev/data")
 
 (defn set-data-dir!
   [data-dir]
@@ -28,6 +28,7 @@
 
 (defn at-t
   [t roots]
-  (filter (fn [r]
-            (= t (get r "t")))
-          roots))
+  (some (fn [r]
+          (when (= t (get r "t"))
+            r))
+        roots))
