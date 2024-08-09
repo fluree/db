@@ -190,7 +190,7 @@
 (defn db-t
   "Returns 't' value from commit data."
   [db-data]
-  (let [t (get-first-value db-data const/iri-t)]
+  (let [t (get-first-value db-data const/iri-fluree-t)]
     (when-not (pos-int? t)
       (commit-error
        (str "Invalid, or non existent 't' value inside commit: " t) db-data))
@@ -589,7 +589,7 @@
                          indexed-db)
            commit-t    (-> commit-jsonld
                            (get-first const/iri-data)
-                           (get-first-value const/iri-t))
+                           (get-first-value const/iri-fluree-t))
            index-t     (:t indexed-db*)]
        (if (= commit-t index-t)
          indexed-db*
@@ -723,7 +723,7 @@
   "Creates the JSON-LD map containing a new ledger update"
   [{:keys [t commit stats staged] :as db}
    {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
-  (let [prev-dbid   (commit-data/data-id commit)
+  (let [prev-dbid (commit-data/data-id commit)
 
         {:keys [assert retract refs-ctx]}
         (generate-commit db commit-opts)
@@ -732,20 +732,20 @@
         assert-key  (compact const/iri-assert)
         retract-key (compact const/iri-retract)
         refs-ctx*   (cond-> refs-ctx
-                      prev-dbid (assoc-in [prev-db-key "@type"] "@id")
-                      (seq assert) (assoc-in [assert-key "@container"] "@graph")
+                      prev-dbid     (assoc-in [prev-db-key "@type"] "@id")
+                      (seq assert)  (assoc-in [assert-key "@container"] "@graph")
                       (seq retract) (assoc-in [retract-key "@container"] "@graph"))
         nses        (new-namespaces db)
         db-json     (cond-> {id-key                nil ;; comes from hash later
                              type-key              [(compact const/iri-DB)]
-                             (compact const/iri-t) t
+                             (compact const/iri-fluree-t) t
                              (compact const/iri-v) data-version}
-                      prev-dbid (assoc prev-db-key prev-dbid)
-                      (seq assert) (assoc assert-key assert)
-                      (seq retract) (assoc retract-key retract)
-                      (seq nses) (assoc (compact const/iri-namespaces) nses)
+                      prev-dbid       (assoc prev-db-key prev-dbid)
+                      (seq assert)    (assoc assert-key assert)
+                      (seq retract)   (assoc retract-key retract)
+                      (seq nses)      (assoc (compact const/iri-namespaces) nses)
                       (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
-                      (:size stats) (assoc (compact const/iri-size) (:size stats)))
+                      (:size stats)   (assoc (compact const/iri-size) (:size stats)))
         ;; TODO - this is re-normalized below, can try to do it just once
         dbid        (commit-data/db-json->db-id db-json)
         db-json*    (-> db-json
