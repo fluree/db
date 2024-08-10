@@ -128,10 +128,14 @@
    (migrate conn ledger-alias indexing-opts nil))
   ([conn ledger-alias indexing-opts changes-ch]
    (go-try
-     (log/info "Starting SID migration.")
      (let [ledger-address    (<? (nameservice/primary-address conn ledger-alias nil))
            last-commit-addr  (<? (nameservice/lookup-commit conn ledger-address))
            last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
+           last-data-stats   (-> (first last-commit-tuple)
+                                 (get-first const/iri-data)
+                                 (update-keys {const/iri-t :t const/iri-size :size const/iri-flakes :flakes})
+                                 (select-keys [:t :size :flakes])
+                                 (update-vals (comp :value first)))
            all-commit-tuples (<? (reify/trace-commits conn last-commit-tuple 1))
            first-commit      (ffirst all-commit-tuples)
            branch            (or (keyword (get-first-value first-commit const/iri-branch))
@@ -144,10 +148,11 @@
            tuples-chans      (map (fn [commit-tuple]
                                     [commit-tuple (when changes-ch (async/chan))])
                                   all-commit-tuples)
+           _ (log/info :migrate/sid "ledger" ledger-alias "before stats:" last-data-stats)
            indexed-db        (<? (migrate-commits ledger branch tuples-chans))]
+       (log/info :migrate/sid "ledger" ledger-alias "after stats:" (:stats indexed-db))
        (when changes-ch
          (-> (map second tuples-chans)
              async/merge
              (async/pipe changes-ch)))
-       (log/info "Completed SID migration.")
        ledger))))
