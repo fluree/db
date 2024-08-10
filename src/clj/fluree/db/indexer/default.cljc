@@ -220,7 +220,7 @@
   "Stores the original id of a node under the `::old-id` key if the `node` was
   resolved, leaving unresolved nodes unchanged. Useful for keeping track of the
   original id for modified nodes during the indexing process for garbage
-  collection purposes"
+  collection"
   [{:keys [id] :as node}]
   (cond-> node
     (index/resolved? node) (assoc ::old-id id)))
