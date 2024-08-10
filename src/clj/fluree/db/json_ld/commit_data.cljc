@@ -10,6 +10,8 @@
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]))
 
+(def commit-version 1)
+
 (comment
   ;; commit map - this map is what gets recorded in a few places:
   ;; - in a 'commit' file: (translated to JSON-LD, and optionally wrapped in a Verifiable Credential)
@@ -59,7 +61,7 @@
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
   [["@context" "https://ns.flur.ee/ledger/v1"]
    ["id" :id]
-   ["v" 0]
+   ["v" :v]
    ["address" :address]
    ["type" ["Commit"]]
    ["alias" :alias]
@@ -376,6 +378,7 @@
                         (dissoc :id :address :data :issuer :time :message :tag
                                 :prev-commit)
                         (assoc :address ""
+                               :v commit-version
                                :data data-commit
                                :time time))]
     (cond-> commit
