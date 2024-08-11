@@ -196,11 +196,9 @@
                         (vswap! stack pop)
                         (xf result* child))
                  (if (overflow-children? child-nodes)
-                   (let [new-branches (rebalance-children node t child-nodes)
-                         result**     (reduce xf result* new-branches)]
-                     (recur new-branches
-                            stack*
-                            result**))
+                   (let [new-branches (rebalance-children node t child-nodes)]
+                     (vswap! stack into new-branches)
+                     result*)
                    (let [branch (update-branch node t child-nodes)]
                      (vswap! stack conj branch)
                      result*)))))))
