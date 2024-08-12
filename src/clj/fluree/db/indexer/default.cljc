@@ -203,16 +203,29 @@
                      (vswap! stack conj branch)
                      result*)))))))
 
-        ;; Completion: Flush the stack iterating each remaining node with the
-        ;; nested transformer before calling the nested transformer's completion
-        ;; fn on the iterated result.
+        ;; Completion: If there is only one node left in the stack, then it's
+        ;; the root. We iterate it with the nested transformer before calling
+        ;; the nested transformer's completion arity. If there is more than one
+        ;; node left in the stack, then the root was split because it
+        ;; overflowed, so we make a new root, iterate all remaining nodes
+        ;; including the new root, and then call the nested transformer's
+        ;; completing arity.
         ([result]
-         (loop [stack*  @stack
-                result* result]
-           (if-let [node (peek stack*)]
-             (recur (vswap! stack pop)
-                    (unreduced (xf result* node)))
-             (xf result*))))))))
+         (if-let [remaining-nodes (not-empty @stack)]
+           (do (vreset! stack [])
+               (if (= (count remaining-nodes) 1)
+                 (let [root-node (first remaining-nodes)]
+                   (-> result
+                       (xf root-node)
+                       xf))
+                 (let [child-nodes      (map index/unresolve remaining-nodes)
+                       root-node        (update-branch (first remaining-nodes) t child-nodes)
+                       remaining-nodes* (conj remaining-nodes root-node)
+                       result*          (reduce (fn [res node]
+                                                  (xf res node))
+                                                result remaining-nodes*)]
+                   (xf result*))))
+           (xf result)))))))
 
 (defn preserve-id
   "Stores the original id of a node under the `::old-id` key if the `node` was
