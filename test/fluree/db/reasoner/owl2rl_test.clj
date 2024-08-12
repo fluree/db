@@ -301,7 +301,7 @@
                                        "owl" "http://www.w3.org/2002/07/owl#"}
                            "@id"      "ex:mother"
                            "@type"    ["owl:ObjectProperty" "owl:FunctionalProperty"]}])]
-      
+
       (is (= (list "ex:carol" "ex:carol2")
              (sort
                @(fluree/query db-reasoned
@@ -553,11 +553,6 @@
                                         "@type"         ["owl:ObjectProperty"]
                                         "owl:inverseOf" {"@id" "ex:parents"}}])]
 
-     (println "JMR" (fluree/query db-reasoned
-                            {:context {"ex" "http://example.org/"}
-                             :select  "?x"
-                             :where   {"@id"      "ex:mom"
-                                       "ex:child" "?x"}})) 
       (is (= ["ex:son"]
              @(fluree/query db-reasoned
                             {:context {"ex" "http://example.org/"}
