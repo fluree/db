@@ -222,12 +222,14 @@
                      (xf result* branch))))))))
 
         ;; Completion: If there is only one node left in the stack, then it's
-        ;; the root. We iterate it with the nested transformer before calling
-        ;; the nested transformer's completion arity. If there is more than one
-        ;; node left in the stack, then the root was split because it
-        ;; overflowed, so we make a new root, iterate all remaining nodes
-        ;; including the new root, and then call the nested transformer's
-        ;; completing arity.
+        ;; the root and we're done, so we call the nested transformer's
+        ;; completion arity. If there is more than one node left in the stack,
+        ;; then the root was split because it overflowed. We first make a new
+        ;; root that is the parent of the nodes resulting from the split, then
+        ;; we check if that new root overflows If the new root does overflow, we
+        ;; iterate all of the newly split nodes with the nested transformer and
+        ;; repeat the process. If the new root does not overflow, we iterate the
+        ;; new root before calling the nested transformer's completion arity.
         ([result]
          (let [remaining-nodes @stack]
            (vreset! stack [])
@@ -235,16 +237,16 @@
                    (= (count remaining-nodes) 1))
              (xf result)
              (loop [child-nodes   remaining-nodes
-                    node-template (first remaining-nodes)
+                    root-template (first remaining-nodes)
                     result*       result]
                (if (overflow-children? child-nodes)
-                 (let [new-branches (rebalance-children node-template t child-nodes)
+                 (let [new-branches (rebalance-children root-template t child-nodes)
                        child-nodes* (map index/unresolve new-branches)
                        result**     (transduce-nodes xf result* new-branches)]
                    (recur child-nodes*
                           (first child-nodes*)
                           result**))
-                 (let [root-node (reconstruct-branch node-template t child-nodes)]
+                 (let [root-node (reconstruct-branch root-template t child-nodes)]
                    (-> result
                        (xf root-node)
                        xf)))))))))))
