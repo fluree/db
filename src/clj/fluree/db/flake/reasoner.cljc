@@ -6,7 +6,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.exec :refer [queryable?]]
+            [fluree.db.query.exec :as exec]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
@@ -14,8 +14,7 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.query.fql.parse :as fql.parse]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
-            [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]
-            [fluree.db.query.exec :refer [queryable?]]))
+            [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -165,22 +164,26 @@
     (log/debug "Reasoner - source OWL rules: " graph)
     (owl-datalog/owl->datalog inserts graph)))
 
+(defn extract-rules-from-dbs
+  [method inserts dbs]
+  (go-try
+    (loop [[db & remaining-dbs] dbs
+           rules []]
+      (if db
+        (let [updated-rules (into rules
+                     (as-> db $
+                       (<? (resolve/rules-from-db $ method))
+                       (rules-from-graph method inserts $)))]
+          (recur remaining-dbs updated-rules))
+        rules))))
+
 (defn rules-from-dbs
   [methods inserts dbs]
   (go-try
     (loop [[method & remaining-methods] methods
            rules []]
       (if method
-        (recur remaining-methods
-               (loop [[db & remaining-dbs] dbs
-                      rules* rules]
-                 (if db
-                   (recur remaining-dbs
-                          (into rules*
-                                (as-> db $
-                                  (<? (resolve/rules-from-db $ method))
-                                  (rules-from-graph method inserts $))))
-                   rules*)))
+        (recur remaining-methods (into rules (<? (extract-rules-from-dbs method inserts dbs))))
         (remove empty? rules)))))
 
 (defn all-rules
@@ -188,7 +191,7 @@
   supplied rules graph or from the db if no graph is supplied."
   [methods db inserts rule-sources]
   (go-try
-    (let [rule-graphs           (filter #(and (map? %) (not (queryable? %))) rule-sources)
+    (let [rule-graphs           (filter #(and (map? %) (not (exec/queryable? %))) rule-sources)
           parsed-rule-graphs    (try*
                                   (map parse-rules-graph rule-graphs)
                                   (catch* e
@@ -199,13 +202,12 @@
                                                     (rules-from-graph method inserts parsed-rules-graph))
                                                   parsed-rule-graphs))
                                         methods)
-          rule-dbs              (filter #(or (string? %) (queryable? %)) rule-sources)
+          rule-dbs              (filter #(or (string? %) (exec/queryable? %)) rule-sources)
           all-rule-dbs          (if (or (nil? rule-dbs) (empty? rule-dbs))
                                   [db]
                                   (conj rule-dbs db))
-          all-rules-from-dbs    (<? (rules-from-dbs methods inserts all-rule-dbs))
-          all-rules             (concat all-rules-from-graphs all-rules-from-dbs)]
-      all-rules)))
+          all-rules-from-dbs    (<? (rules-from-dbs methods inserts all-rule-dbs))]
+      (concat all-rules-from-graphs all-rules-from-dbs))))
 
 (defn triples->map
   "Turns triples from same subject (@id) originating from
@@ -267,7 +269,7 @@
   "Given a list of reasoning rules, identifies rules with duplicate ids and renames them using
   indexes."
   [raw-rules]
-  (let [duplicate-ids (find-duplicate-ids raw-rules)]
+  (let [duplicate-id-frequencies (find-duplicate-ids raw-rules)]
     (reduce (fn [rules [duplicate-id occurances]]
               (let [grouped-rules (group-by #(= duplicate-id (first %)) rules)]
                 (loop [suffix occurances
@@ -277,7 +279,7 @@
                     updated-rules-list
                     (let [updated-rule [(str duplicate-id suffix) (last (first rules-to-update))]]
                       (recur (dec suffix) (rest rules-to-update) (conj updated-rules-list updated-rule)))))))
-            raw-rules duplicate-ids)))
+            raw-rules duplicate-id-frequencies)))
 
 (defn reason
   [db methods rule-sources fuel-tracker reasoner-max]
