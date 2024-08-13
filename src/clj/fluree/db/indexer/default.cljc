@@ -229,16 +229,25 @@
         ;; including the new root, and then call the nested transformer's
         ;; completing arity.
         ([result]
-         (if-let [remaining-nodes (not-empty @stack)]
-           (do (vreset! stack [])
-               (if (= (count remaining-nodes) 1)
-                 (xf result)
-                 (let [root-template (first remaining-nodes)
-                       root-node     (reconstruct-branch root-template t remaining-nodes)]
+         (let [remaining-nodes @stack]
+           (vreset! stack [])
+           (if (or (empty? remaining-nodes)
+                   (= (count remaining-nodes) 1))
+             (xf result)
+             (loop [child-nodes   remaining-nodes
+                    node-template (first remaining-nodes)
+                    result*       result]
+               (if (overflow-children? child-nodes)
+                 (let [new-branches (rebalance-children node-template t child-nodes)
+                       child-nodes* (map index/unresolve new-branches)
+                       result**     (transduce-nodes xf result* new-branches)]
+                   (recur child-nodes*
+                          (first child-nodes*)
+                          result**))
+                 (let [root-node (reconstruct-branch node-template t child-nodes)]
                    (-> result
                        (xf root-node)
-                       xf))))
-           (xf result)))))))
+                       xf)))))))))))
 
 (defn preserve-id
   "Stores the original id of a node under the `::old-id` key if the `node` was
