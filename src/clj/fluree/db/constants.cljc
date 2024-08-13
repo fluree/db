@@ -245,10 +245,6 @@
 (def ^:const sh_in (iri/iri->sid "http://www.w3.org/ns/shacl#in"))
 (def ^:const sh_hasValue (iri/iri->sid "http://www.w3.org/ns/shacl#hasValue"))
 
-
-;; fluree-specific
-(def ^:const $fluree:targetClass (iri/iri->sid iri-target-class))
-
 ;; owl
 (def ^:const $owl:Class (iri/iri->sid "http://www.w3.org/2002/07/owl#Class"))
 (def ^:const $owl:ObjectProperty (iri/iri->sid "http://www.w3.org/2002/07/owl#ObjectProperty"))
