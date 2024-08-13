@@ -61,23 +61,27 @@
                (< t node-t)))
        boolean))
 
+(defn reconstruct-branch
+  [{:keys [comparator], :as branch} t child-nodes]
+  (let [children    (apply index/child-map comparator child-nodes)
+        size        (->> child-nodes
+                         (map :size)
+                         (reduce +))
+        first-flake (->> children first key)
+        rhs         (->> children flake/last val :rhs)
+        new-id      (random-uuid)]
+    (assoc branch
+           :id new-id
+           :t t
+           :children children
+           :size size
+           :first first-flake
+           :rhs rhs)))
+
 (defn update-branch
-  [{:keys [comparator], branch-t :t, :as branch} t child-nodes]
+  [{branch-t :t, :as branch} t child-nodes]
   (if (some-update-after? branch-t child-nodes)
-    (let [children    (apply index/child-map comparator child-nodes)
-          size        (->> child-nodes
-                           (map :size)
-                           (reduce +))
-          first-flake (->> children first key)
-          rhs         (->> children flake/last val :rhs)
-          new-id      (random-uuid)]
-      (assoc branch
-        :id new-id
-        :t t
-        :children children
-        :size size
-        :first first-flake
-        :rhs rhs))
+    (reconstruct-branch branch t child-nodes)
     branch))
 
 (defn update-sibling-leftmost
@@ -94,7 +98,7 @@
     (->> child-nodes
          (partition-all target-count)
          (map (fn [kids]
-                (update-branch branch t kids)))
+                (reconstruct-branch branch t kids)))
          update-sibling-leftmost)))
 
 (defn filter-predicates
@@ -219,7 +223,7 @@
                        (xf root-node)
                        xf))
                  (let [child-nodes      (map index/unresolve remaining-nodes)
-                       root-node        (update-branch (first remaining-nodes) t child-nodes)
+                       root-node        (reconstruct-branch (first remaining-nodes) t child-nodes)
                        remaining-nodes* (conj remaining-nodes root-node)
                        result*          (reduce (fn [res node]
                                                   (xf res node))
