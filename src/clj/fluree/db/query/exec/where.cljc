@@ -10,7 +10,8 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.iri :as iri])
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -32,49 +33,69 @@
        (match-value x dt-iri)
        (assoc ::meta m))))
 
+(defn matched-value?
+  [match]
+  (-> match ::val some?))
+
+(defn get-value
+  [match]
+  (::val match))
+
+(defn get-variable
+  [match]
+  (::var match))
+
+(defn get-datatype-iri
+  [mch]
+  (if (or (contains? mch ::iri)
+          (contains? mch ::sids))
+    const/iri-anyURI
+    (-> mch ::datatype-iri iri/unwrap)))
+
+(defn match-sid
+  [iri-mch db-alias sid]
+  (update iri-mch ::sids assoc db-alias sid))
+
 (defn match-iri
   ([iri]
    (match-iri unmatched iri))
   ([mch iri]
    (assoc mch ::iri iri)))
 
-(defn get-iri
-  [match]
-  (::iri match))
-
 (defn matched-iri?
   [match]
   (-> match ::iri some?))
 
-(defn matched-value?
-  [match]
-  (-> match ::val some?))
+(defn iri-datatype?
+  [mch]
+  (-> mch get-datatype-iri (= const/iri-anyURI)))
 
-(defn match-sid
-  [iri-mch db-alias sid]
-  (update iri-mch ::sids assoc db-alias sid))
+(defn get-iri
+  [match]
+  (cond
+    (matched-iri? match)  (::iri match)
+    (iri-datatype? match) (get-value match)))
 
 (defn matched-sid?
   [mch]
-  (contains? mch ::sids))
+  (and (map? mch)
+       (contains? mch ::sids)))
 
 (defn get-sid
   [iri-mch db]
   (let [db-alias (:alias db)]
     (get-in iri-mch [::sids db-alias])))
 
-(defn get-datatype-iri
-  [mch]
-  (if (or (matched-iri? mch)
-          (matched-sid? mch))
-    const/iri-anyURI
-    (::datatype-iri mch)))
-
 (defn matched?
   [match]
   (or (matched-value? match)
       (matched-iri? match)
       (matched-sid? match)))
+
+(defn get-binding
+  [match]
+  (or (get-value match)
+      (get-iri match)))
 
 (defn all-matched?
   [[s p o]]
@@ -101,19 +122,6 @@
   [match]
   (and (contains? match ::var)
        (unmatched? match)))
-
-(defn get-value
-  [match]
-  (::val match))
-
-(defn get-variable
-  [match]
-  (::var match))
-
-(defn get-binding
-  [match]
-  (or (get-value match)
-      (get-iri match)))
 
 (defn get-meta
   [match]
@@ -150,6 +158,18 @@
                   (-> soln (get lang) get-value)
                   lang)]
       (-> mch ::meta :lang (= lang*)))))
+
+(defn datatype-matcher
+  "Return a function that returns true if the datatype of a matched pattern equals
+  the supplied datatype iri `type`."
+  [type context]
+  (fn [soln mch]
+    (let [type* (if (variable? type)
+                  (-> soln (get type) get-iri iri/unwrap)
+                  (json-ld/expand-iri type context))]
+      (-> mch
+          get-datatype-iri
+          (= type*)))))
 
 (defn with-filter
   [mch f]
@@ -589,12 +609,16 @@
     (-> (match-clause db fuel-tracker solution clause error-ch)
         (async/pipe opt-ch))))
 
-(defn add-fn-result-to-solution
+(defn bind-function-result
   [solution var-name result]
   (let [dt  (datatype/infer-iri result)
-        mch (-> var-name
-                unmatched-var
-                (match-value result dt))]
+        mch (if (= dt const/iri-anyURI)
+              (-> var-name
+                  unmatched-var
+                  (match-iri result))
+              (-> var-name
+                  unmatched-var
+                  (match-value result dt)))]
     (assoc solution var-name mch)))
 
 (defmethod match-pattern :bind
@@ -606,8 +630,8 @@
                       (let [f        (::fn b)
                             var-name (::var b)]
                         (try*
-                          (->> (f solution)
-                               (add-fn-result-to-solution solution* var-name))
+                          (let [result (f solution)]
+                            (bind-function-result solution* var-name result))
                           (catch* e (update solution* ::errors conj e)))))
                     solution (vals bind))]
         (when-let [errors (::errors result)]

@@ -4,6 +4,8 @@
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.json-ld.iri :as iri]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
@@ -202,6 +204,11 @@
   [var]
   (var->lang-var var))
 
+(defmacro datatype
+  [var]
+  (let [dt-var (var->dt-var var)]
+    `(iri/string->iri ~dt-var)))
+
 (defn regex
   [text pattern]
   (boolean (re-find (re-pattern pattern) text)))
@@ -289,20 +296,34 @@
   [term expressions]
   (contains? (set expressions) term))
 
+(def context-var
+  (symbol "$-CONTEXT"))
+
+(defmacro iri
+  [s]
+  `(-> ~s
+       (json-ld/expand-iri ~context-var)
+       iri/string->iri))
+
 (def allowed-scalar-fns
-  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if lang nil? as
-     not not= or re-find re-pattern in
+  '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if iri lang
+     nil? as not not= or re-find re-pattern in
+
      ;; string fns
-     strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter concat regex replace
+     strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter
+     concat regex replace
+
      ;; numeric fns
      abs round ceil floor rand
+
      ;; datetime fns
      now year month day hours minutes seconds tz
+
      ;; hash fns
      sha256 sha512
+
      ;; rdf term fns
      uuid struuid isNumeric isBlank str})
-
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
@@ -322,9 +343,11 @@
     contains       fluree.db.query.exec.eval/contains
     count-distinct fluree.db.query.exec.eval/count-distinct
     count          clojure.core/count
+    datatype       fluree.db.query.exec.eval/datatype
     floor          fluree.db.query.exec.eval/floor
     groupconcat    fluree.db.query.exec.eval/groupconcat
     in             fluree.db.query.exec.eval/in
+    iri            fluree.db.query.exec.eval/iri
     lang           fluree.db.query.exec.eval/lang
     lcase          fluree.db.query.exec.eval/lcase
     median         fluree.db.query.exec.eval/median
@@ -422,8 +445,8 @@
             code))
 
 (defn bind-variables
-  [soln-sym var-syms]
-  (into []
+  [soln-sym var-syms ctx]
+  (into `[~context-var ~ctx]
         (mapcat (fn [var]
                   (let [dt-var   (var->dt-var var)
                         lang-var (var->lang-var var)]
@@ -436,12 +459,12 @@
         var-syms))
 
 (defn compile
-  ([code] (compile code true))
-  ([code allow-aggregates?]
+  ([code ctx] (compile code ctx true))
+  ([code ctx allow-aggregates?]
    (let [qualified-code (coerce code allow-aggregates?)
          vars           (variables qualified-code)
          soln-sym       'solution
-         bdg            (bind-variables soln-sym vars)
+         bdg            (bind-variables soln-sym vars ctx)
          fn-code        `(fn [~soln-sym]
                            (log/trace "fn solution:" ~soln-sym)
                            (log/trace "fn bindings:" (quote ~bdg))
@@ -451,8 +474,8 @@
      (eval fn-code))))
 
 (defn compile-filter
-  [code var]
-  (let [f        (compile code)
+  [code var ctx]
+  (let [f        (compile code ctx)
         soln-sym 'solution]
     (eval `(fn [~soln-sym ~var]
              (-> ~soln-sym
