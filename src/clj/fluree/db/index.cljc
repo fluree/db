@@ -10,7 +10,7 @@
             [fluree.db.conn.cache :as conn-cache]))
 
 (def comparators
-  "Map of default index comparators for the five index types"
+  "Map of default index comparators for the four index types"
   {:spot flake/cmp-flakes-spot
    :post flake/cmp-flakes-post
    :opst flake/cmp-flakes-opst
