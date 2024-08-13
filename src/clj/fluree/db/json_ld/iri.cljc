@@ -2,6 +2,7 @@
   (:require [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.db.util.bytes :as bytes]
+            [fluree.json-ld :as json-ld]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]
@@ -50,6 +51,12 @@
 
 (defmethod pprint/simple-dispatch IRI [^IRI iri]
   (pr iri))
+
+(defn expand
+  [compact-string context]
+  (-> compact-string
+      (json-ld/expand-iri context)
+      string->iri))
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")

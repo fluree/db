@@ -168,7 +168,7 @@
 (defn parse-db-data
   [data]
   {:id      (:id data)
-   :t       (get-first-value data const/iri-t)
+   :t       (get-first-value data const/iri-fluree-t)
    :address (get-first-value data const/iri-address)
    :flakes  (get-first-value data const/iri-flakes)
    :size    (get-first-value data const/iri-size)})

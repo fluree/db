@@ -301,9 +301,7 @@
 
 (defmacro iri
   [s]
-  `(-> ~s
-       (json-ld/expand-iri ~context-var)
-       iri/string->iri))
+  `(iri/expand ~s ~context-var))
 
 (def allowed-scalar-fns
   '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if iri lang
@@ -329,8 +327,7 @@
   (set/union allowed-aggregate-fns allowed-scalar-fns))
 
 (def qualified-symbols
-  '{
-    !              fluree.db.query.exec.eval/!
+  '{!              fluree.db.query.exec.eval/!
     ||             fluree.db.query.exec.eval/||
     &&             fluree.db.query.exec.eval/&&
     abs            clojure.core/abs
