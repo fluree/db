@@ -160,6 +160,20 @@
            new-leaves))
     [leaf]))
 
+(defn push-node
+  [stack node]
+  (conj stack (index/unresolve node)))
+
+(defn push-all-nodes
+  [stack nodes]
+  (into stack (map index/unresolve) nodes))
+
+(defn transduce-nodes
+  [xf result nodes]
+  (reduce (fn [res node]
+            (xf res node))
+          result nodes))
+
 (defn integrate-novelty
   "Returns a transducer that transforms a stream of index nodes in depth first
   order by incorporating the novelty flakes into the nodes, rebalancing the
@@ -184,8 +198,8 @@
         ([result node]
          (if (index/leaf? node)
            (let [leaves (update-leaf node t novelty)]
-             (vswap! stack into leaves)
-             result)
+             (vswap! stack push-all-nodes leaves)
+             (transduce-nodes xf result leaves))
 
            (loop [child-nodes []
                   stack*      @stack
@@ -196,16 +210,16 @@
                                                             ; branch's children
                                                             ; should be at the top
                                                             ; of the stack
-                 (recur (conj child-nodes (index/unresolve child))
+                 (recur (conj child-nodes child)
                         (vswap! stack pop)
-                        (xf result* child))
+                        result*)
                  (if (overflow-children? child-nodes)
                    (let [new-branches (rebalance-children node t child-nodes)]
-                     (vswap! stack into new-branches)
-                     result*)
+                     (vswap! stack push-all-nodes new-branches)
+                     (transduce-nodes xf result* new-branches))
                    (let [branch (update-branch node t child-nodes)]
-                     (vswap! stack conj branch)
-                     result*)))))))
+                     (vswap! stack push-node branch)
+                     (xf result* branch))))))))
 
         ;; Completion: If there is only one node left in the stack, then it's
         ;; the root. We iterate it with the nested transformer before calling
@@ -218,17 +232,12 @@
          (if-let [remaining-nodes (not-empty @stack)]
            (do (vreset! stack [])
                (if (= (count remaining-nodes) 1)
-                 (let [root-node (first remaining-nodes)]
+                 (xf result)
+                 (let [root-template (first remaining-nodes)
+                       root-node     (reconstruct-branch root-template t remaining-nodes)]
                    (-> result
                        (xf root-node)
-                       xf))
-                 (let [child-nodes      (map index/unresolve remaining-nodes)
-                       root-node        (reconstruct-branch (first remaining-nodes) t child-nodes)
-                       remaining-nodes* (conj remaining-nodes root-node)
-                       result*          (reduce (fn [res node]
-                                                  (xf res node))
-                                                result remaining-nodes*)]
-                   (xf result*))))
+                       xf))))
            (xf result)))))))
 
 (defn preserve-id
