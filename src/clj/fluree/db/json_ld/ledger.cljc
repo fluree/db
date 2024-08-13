@@ -86,8 +86,7 @@
           "http://www.w3.org/ns/shacl#qualifiedMinCount"        const/sh_qualifiedMinCount
           "http://www.w3.org/ns/shacl#qualifiedMaxCount"        const/sh_qualifiedMaxCount
           "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint" const/sh_qualifiedValueShapesDisjoint
-          ;; fluree
-          const/iri-role                                        const/$f:role}))
+          }))
 
 (def class-or-property-sid
   (into #{} (map predefined-properties class+property-iris)))

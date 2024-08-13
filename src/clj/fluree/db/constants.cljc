@@ -294,7 +294,6 @@
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
 
-(def ^:const $f:role (iri/iri->sid iri-role))
 ;; fluree vector data types
 (def ^:const $f:vectorDotProduct (iri/iri->sid iri-vectorDotProduct))
 (def ^:const $f:vectorCosine (iri/iri->sid iri-vectorCosine))
