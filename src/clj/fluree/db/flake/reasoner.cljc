@@ -195,7 +195,7 @@
           parsed-rule-graphs    (try*
                                   (map parse-rules-graph rule-graphs)
                                   (catch* e
-                                          (log/error "Error parsing supplied rules graph:" e)
+                                          (log/error e "Error parsing supplied rules graph:")
                                           (throw e)))
           all-rules-from-graphs (mapcat (fn [method]
                                           (mapcat (fn [parsed-rules-graph]
@@ -203,9 +203,9 @@
                                                   parsed-rule-graphs))
                                         methods)
           rule-dbs              (filter #(or (string? %) (exec/queryable? %)) rule-sources)
-          all-rule-dbs          (if (or (nil? rule-dbs) (empty? rule-dbs))
-                                  [db]
-                                  (conj rule-dbs db))
+          all-rule-dbs          (if (seq rule-dbs)
+                                  (conj rule-dbs db)
+                                  [db])
           all-rules-from-dbs    (<? (rules-from-dbs methods inserts all-rule-dbs))]
       (concat all-rules-from-graphs all-rules-from-dbs))))
 
