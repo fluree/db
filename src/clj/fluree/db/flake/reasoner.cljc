@@ -276,7 +276,7 @@
           _                  (log/debug "Reasoner - extracted rules: " raw-rules)
           duplicate-id-freqs (find-duplicate-ids raw-rules)
           deduplicated-rules (when (not (empty? duplicate-id-freqs))
-                               (log/error "Duplicate ids detected. Some rules will be overwritten:" (apply str (map first duplicate-id-freqs))))
+                               (log/warn "Duplicate ids detected. Some rules will be overwritten:" (apply str (map first duplicate-id-freqs))))
           reasoning-rules    (-> raw-rules 
                                  resolve/rules->graph
                                  add-rule-dependencies)
