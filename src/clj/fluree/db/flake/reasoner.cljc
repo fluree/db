@@ -265,22 +265,6 @@
          frequencies
          (filter #(< 1 (val %))))))
 
-(defn deduplicate-raw-rules
-  "Given a list of reasoning rules, identifies rules with duplicate ids and renames them using
-  indexes."
-  [raw-rules]
-  (let [duplicate-id-frequencies (find-duplicate-ids raw-rules)]
-    (reduce (fn [rules [duplicate-id occurances]]
-              (let [grouped-rules (group-by #(= duplicate-id (first %)) rules)]
-                (loop [suffix occurances
-                       rules-to-update (get grouped-rules true)
-                       updated-rules-list (get grouped-rules false)]
-                  (if (empty? rules-to-update)
-                    updated-rules-list
-                    (let [updated-rule [(str duplicate-id suffix) (last (first rules-to-update))]]
-                      (recur (dec suffix) (rest rules-to-update) (conj updated-rules-list updated-rule)))))))
-            raw-rules duplicate-id-frequencies)))
-
 (defn reason
   [db methods rule-sources fuel-tracker reasoner-max]
   (go-try

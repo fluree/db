@@ -38,23 +38,39 @@
   (cond-> (util/parse-opts opts)
     did (assoc :did did :issuer did)))
 
-(defn restrict-db
-  [db t {:keys [did default-allow? reasoner-methods rule-sources] :as opts}]
+(defn load-aliased-rule-dbs
+  [conn rule-sources]
   (go-try
-    (let [policy-db      (if did
-                           (<? (perm/wrap-identity-policy db did default-allow? nil))
-                           db)
-          time-travel-db (-> (if t
-                               (<? (time-travel/as-of policy-db t))
-                               policy-db))
-          reasoned-db    (if reasoner-methods
-                           (<? (reasoner/reason time-travel-db
-                                                reasoner-methods
-                                                rule-sources
-                                                opts))
-                           time-travel-db)]
-      (assoc-in reasoned-db [:policy :cache] (atom {})))))
-    
+   (loop [rule-sources rule-sources
+          rule-results []]
+     (if-let [rule-source (first rule-sources)]
+       (let [updated-rule-results (into rule-results
+                                    (if (string? rule-source)
+                                      (ledger/-db (<? (jld-ledger/load conn rule-source)))
+                                      rule-source))]
+         (recur (rest rule-sources) updated-rule-results))
+       rule-results))))
+
+(defn restrict-db
+  ([db t {:keys [did default-allow? reasoner-methods rule-sources] :as opts}]
+   (restrict-db db t opts nil))
+  ([db t {:keys [did default-allow? reasoner-methods rule-sources] :as opts} conn]
+   (go-try
+    (let [processed-rule-sources (<? (load-aliased-rule-dbs conn rule-sources))
+          policy-db              (if did
+                                   (<? (perm/wrap-identity-policy db did default-allow? nil))
+                                   db)
+          time-travel-db         (-> (if t
+                                       (<? (time-travel/as-of policy-db t))
+                                       policy-db))
+          reasoned-db            (if reasoner-methods
+                                   (<? (reasoner/reason time-travel-db
+                                                        reasoner-methods
+                                                        processed-rule-sources
+                                                        opts))
+                                   time-travel-db)]
+      (assoc-in reasoned-db [:policy :cache] (atom {}))))))
+
 (defn track-query
   [ds max-fuel query]
   (go-try
@@ -157,19 +173,6 @@
                  parse-t-val)]
       [alias nil])))
 
-(defn load-aliased-rule-dbs
-  [conn rule-sources]
-  (go-try
-   (loop [rule-sources rule-sources
-          rule-results []]
-     (if-let [rule-source (first rule-sources)]
-       (let [updated-rule-results (into rule-results
-                                    (if (string? rule-source)
-                                      (ledger/-db (<? (jld-ledger/load conn rule-source)))
-                                      rule-source))]
-         (recur (rest rule-sources) updated-rule-results))
-       rule-results))))
-
 (defn load-alias
   [conn alias t opts]
   (go-try
@@ -178,10 +181,8 @@
             address      (<? (nameservice/primary-address conn alias nil))
             ledger       (<? (jld-ledger/load conn address))
             db           (ledger/-db ledger)
-            t*           (or explicit-t t)
-            rule-sources (<? (load-aliased-rule-dbs conn (:rule-sources opts)))
-            opts*        (assoc opts :rule-sources rule-sources)]
-        (<? (restrict-db db t* opts*))) 
+            t*           (or explicit-t t)]
+        (<? (restrict-db db t* opts conn)))
       (catch* e
               (throw (contextualize-ledger-400-error
                        (str "Error loading ledger " alias ": ")
