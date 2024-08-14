@@ -195,15 +195,15 @@ changes from different branches into existing metadata map"
         commit-address))))
 
 (defn lookup
-  "When provided a 'relative' ledger alias, looks in file system to see if
-  nameservice file exists and if so returns the latest commit address."
-  [ns-address local-path base-address {:keys [branch] :as _opts}]
+  "Return the commit address from the nameservice record for the provided ledger
+  address. If no nameservice record is found, throws an error."
+  [ledger-address local-path base-address {:keys [branch] :as _opts}]
   (go-try
-    (let [{:keys [alias branch* address]} (resolve-address base-address ns-address branch)
+    (let [{:keys [alias branch* address]} (resolve-address base-address ledger-address branch)
           ns-record (<? (retrieve-ns-record local-path alias))]
       (if ns-record
         (or (commit-address-from-record ns-record branch*)
-            (throw (ex-info (str "No nameservice record found for ledger alias: " ns-address)
+            (throw (ex-info (str "No nameservice record found for ledger alias: " ledger-address)
                             {:status 404 :error :db/ledger-not-found})))
         ;; Note, below is for leagacy conversion only, will get removed in v3 GA
         (<? (try-legacy-ns-lookup local-path alias))))))
@@ -212,8 +212,8 @@ changes from different branches into existing metadata map"
 (defrecord FileNameService
   [local-path sync? base-address]
   ns-proto/iNameService
-  (-lookup [_ ledger-alias] (lookup ledger-alias local-path base-address nil))
-  (-lookup [_ ledger-alias opts] (lookup ledger-alias local-path base-address opts))
+  (-lookup [_ ledger-address] (lookup ledger-address local-path base-address nil))
+  (-lookup [_ ledger-address opts] (lookup ledger-address local-path base-address opts))
   (-push [_ commit-data] (push! local-path base-address commit-data))
   (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported FileNameService op: subscribe" {})))
   (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported FileNameService op: unsubscribe" {})))
