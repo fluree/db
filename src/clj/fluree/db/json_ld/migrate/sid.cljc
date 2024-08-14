@@ -110,7 +110,10 @@
   [ledger branch tuples-chans]
   (go-try
     (loop [[[commit-tuple ch] & r] tuples-chans
-           db (<? (async-db/deref-async (jld-ledger/current-db ledger)))]
+           db (let [current-db (jld-ledger/current-db ledger)]
+                (if (async-db/db? current-db)
+                  (<? (async-db/deref-async current-db))
+                  current-db))]
       (if commit-tuple
         (recur r (<? (migrate-commit ledger db commit-tuple)))
         db))))
