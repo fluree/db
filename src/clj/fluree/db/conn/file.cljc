@@ -36,10 +36,16 @@
        :size    (count json)
        :address address})))
 
-(defn read-data [conn address keywordize?]
+(defn read-data
+  [conn address keywordize?]
   (go-try
-    (-> (<? (storage/read (:store conn) address))
-        (json/parse keywordize?))))
+   (some-> (<? (storage/read (:store conn) address))
+           (json/parse keywordize?))))
+
+(defn delete-data
+  "Will throw if not deleted."
+  [conn address]
+  (storage/delete (:store conn) address))
 
 (defn close
   [id state]
@@ -61,6 +67,7 @@
   (-index-file-write [conn ledger-alias index-type index-data]
     (write-data conn ledger-alias (str "index/" (name index-type)) index-data))
   (-index-file-read [conn index-address] (read-data conn index-address true))
+  (-index-file-delete [conn index-address] (delete-data conn index-address))
 
   connection/iConnection
   (-close [_] (close id state))

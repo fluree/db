@@ -92,16 +92,16 @@
          (io/delete-file (io/file path))
          :deleted
          (catch Exception e
-           (log/error e (str "Failed to delete file: " path))
-           (throw e))))
+           (log/trace (str "Failed to delete file: " path))
+           e)))
      :cljs
      (async/go
        (try
          (fs/unlinkSync path)
          :deleted
          (catch :default e
-           (log/error e (str "Failed to delete file: " path))
-           (throw e))))))
+           (log/trace (str "Failed to delete file: " path))
+           e)))))
 
 (defn list-files
   [path]

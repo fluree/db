@@ -425,4 +425,10 @@
                  {?favNums [7], ?name "Brian", ?s :ex/brian}
                  {?favNums [5 10], ?name "Cam", ?s :ex/cam}
                  {?favNums [11 42], ?name "Liam", ?s :ex/liam}]
-               results))))))
+               results))))
+    (testing "select * does not compose with other selectors"
+      (let [query {:context {:ex "http://example.com/ns/"}
+                   :select [:* '?foo]
+                   :where [{:id '?s :ex/foo '?foo}]}]
+        (is (= "Error in value for \"select\"; Select must be a valid selector, a wildcard symbol (`*`), or a vector of selectors; Provided: [:* ?foo];  See documentation for details: https://next.developers.flur.ee/docs/reference/errorcodes#query-invalid-select"
+               (ex-message @(fluree/query db query))))))))

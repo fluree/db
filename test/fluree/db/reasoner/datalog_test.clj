@@ -198,8 +198,8 @@
                                               :where   {"@id"            "?person",
                                                         "ex:grandParent" "?grandParent"}})]
 
-          (is (= #{["ex:carol" "ex:alice"]}
-                 (set grandparents-of)))
+          (is (= [["ex:carol" "ex:alice"]]
+                 grandparents-of))
 
           (is (= 1 (fluree/reasoned-count grandparents-db))
               "Only one reasoned triple should be added"))))))

@@ -28,11 +28,12 @@
                  (and platform/BROWSER (.getItem js/localStorage addr-path))))))
 
 (defn push!
-  [data-atom {commit-address   :address
-              nameservice-iris :ns
+  [data-atom {commit-address   "address"
+              nameservice-iris "ns"
               :as              commit-data}]
   (go
-    (let [my-ns-iri   (some #(when (re-matches #"^fluree:memory:(.+)" (:id %)) (:id %)) nameservice-iris)
+    (let [my-ns-iri (->> (map #(get % "id") nameservice-iris)
+                         (some #(when (re-matches #"^fluree:memory:.+" %) %)))
           commit-path (address-path commit-address)
           head-path   (address-path my-ns-iri)]
       (swap! data-atom

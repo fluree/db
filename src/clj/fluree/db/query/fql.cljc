@@ -41,9 +41,9 @@
   ([ds fuel-tracker query-map]
    (if (cache? query-map)
      (cache-query ds query-map)
-     (let [q   (try*
-                 (parse/parse-query query-map)
-                 (catch* e e))]
+     (let [q (try*
+               (parse/parse-query query-map)
+               (catch* e e))]
        (if (util/exception? q)
          (async/to-chan! [q])
          (exec/query ds fuel-tracker q))))))
