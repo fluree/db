@@ -228,7 +228,7 @@
                    (= (count remaining-nodes) 1))
              (xf result)
              (loop [child-nodes   remaining-nodes
-                    root-template (first remaining-nodes)
+                    root-template (peek remaining-nodes)
                     result*       result]
                (if (overflow-children? child-nodes)
                  (let [new-branches (rebalance-children root-template t child-nodes)
