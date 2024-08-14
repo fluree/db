@@ -4,7 +4,7 @@
             [fluree.db.async-db :as async-db]
             [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
-            [fluree.db.flake.flake-db :as db]
+            [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
@@ -46,17 +46,17 @@
                                  (get-first const/iri-data)
                                  (get-first-value const/iri-address))
 
-          db-data            (<? (db/read-db (:conn db) db-address))
-          t-new              (db/db-t db-data)
+          db-data            (<? (flake-db/read-db (:conn db) db-address))
+          t-new              (flake-db/db-t db-data)
           _ (log/info "Migrating commit " db-address " at t " t-new)
 
           ;; the ns-mapping has all the parts of the db necessary for create-flakes to encode iris properly
           ns-mapping         (db->namespace-mapping db)
 
-          assert             (db/db-assert db-data)
-          asserted-flakes    (db/create-flakes true ns-mapping t-new assert)
-          retract            (db/db-retract db-data)
-          retracted-flakes   (db/create-flakes false ns-mapping t-new retract)
+          assert             (flake-db/db-assert db-data)
+          asserted-flakes    (flake-db/create-flakes true ns-mapping t-new assert)
+          retract            (flake-db/db-retract db-data)
+          retracted-flakes   (flake-db/create-flakes false ns-mapping t-new retract)
 
           {:keys [previous issuer message data] :as commit-metadata}
           (commit-data/json-ld->map commit db)
