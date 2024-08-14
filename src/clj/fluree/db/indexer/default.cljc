@@ -67,6 +67,7 @@
         size        (->> child-nodes
                          (map :size)
                          (reduce +))
+        leftmost?   (->> children first val :leftmost? true?)
         first-flake (->> children first key)
         rhs         (->> children flake/last val :rhs)
         new-id      (random-uuid)]
@@ -75,6 +76,7 @@
            :t t
            :children children
            :size size
+           :leftmost? leftmost?
            :first first-flake
            :rhs rhs)))
 
@@ -118,8 +120,10 @@
                 last-leaf (-> leaf
                               (assoc :flakes subrange
                                      :first cur-first
-                                     :rhs rhs)
-                              (dissoc :id :leftmost?))]
+                                     :rhs rhs
+                                     :leftmost? (and (empty? leaves)
+                                                     leftmost?))
+                              (dissoc :id))]
             (conj leaves last-leaf))
           (let [new-size (-> f flake/size-flake (+ cur-size) long)]
             (if (> new-size target-size)
