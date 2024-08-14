@@ -101,15 +101,6 @@
                 (reconstruct-branch branch t kids)))
          update-sibling-leftmost)))
 
-(defn filter-predicates
-  [preds & flake-sets]
-  (if (seq preds)
-    (->> flake-sets
-         (apply concat)
-         (filter (fn [f]
-                   (contains? preds (flake/p f)))))
-    []))
-
 (defn rebalance-leaf
   "Splits leaf nodes if the combined size of its flakes is greater than
   `*overflow-bytes*`."
