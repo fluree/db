@@ -55,7 +55,8 @@
                    :TODO
                    [(into ["?$this"] (keys values-map))
                     [(into [{"@value" this-var
-                             "@type"  "@id"}] (vals values-map))]])]
+                             "@type" const/iri-id}]
+                           (vals values-map))]])]
     (assoc query "values" values)))
 
 (defn modify-exception
