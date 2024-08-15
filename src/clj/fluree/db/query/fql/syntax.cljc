@@ -170,7 +170,7 @@
     ::direction         [:orn {:error/message "Direction must be \"asc\" or \"desc\""}
                          [:asc [:fn asc?]]
                          [:desc [:fn desc?]]]
-    ::ordering          [:orn {:error/message "Ordering must be a var or two-tuple formatted ['ASC' or 'DESC', var]"
+    ::ordering          [:orn {:error/message "Ordering must be a var or a direction function call such as '(asc ?var)' or '(desc ?var)'."
                                :decode/fql  string->ordering
                                :decode/json string->ordering}
                          [:scalar ::var]
