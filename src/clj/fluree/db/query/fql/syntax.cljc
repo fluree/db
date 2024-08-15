@@ -96,7 +96,6 @@
 
 (defn string->ordering
   [x]
-  (log/info "Decoding ordering:" x)
   (if (string? x)
     (edn/read-string x)
     x))
