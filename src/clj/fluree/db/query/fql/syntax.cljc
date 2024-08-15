@@ -175,8 +175,7 @@
                                :decode/fql  string->ordering
                                :decode/json string->ordering}
                          [:scalar ::var]
-                         [:vector [:and
-                                   list?
+                         [:vector [:and list?
                                    [:catn
                                     [:direction ::direction]
                                     [:dimension ::var]]]]]
