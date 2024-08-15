@@ -73,6 +73,9 @@
 (def ^:const iri-type "@type")
 (def ^:const iri-filter "@filter")
 (def ^:const iri-t "@t")
+(def ^:const iri-score "@score")
+(def ^:const iri-vec-search "@vector")
+(def ^:const iri-metric "@metric")
 (def ^:const iri-json "http://www.w3.org/2001/XMLSchema#json")
 (def ^:const iri-anyURI "http://www.w3.org/2001/XMLSchema#anyURI")
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
@@ -294,6 +297,5 @@
 ;; NOTE: Add geo types? string-encoded GeoJSON?
 
 ;; fluree vector data types
-(def ^:const $f:vectorDotProduct (iri/iri->sid iri-vectorDotProduct))
-(def ^:const $f:vectorCosine (iri/iri->sid iri-vectorCosine))
-(def ^:const $f:vectorEuclidean (iri/iri->sid iri-vectorEuclidean))
+(def ^:const $f:vector (iri/iri->sid iri-vector))
+(def ^:const $f:sparseVector (iri/iri->sid iri-sparseVector))
