@@ -151,9 +151,9 @@
                                                "@vector" [0.7, 0.6]
                                                "@score"  "?score"
                                                "@metric" "dotproduct"}}]
-                       "orderBy"  [["DESC" "?score"]]}
+                       "orderBy"  "?score"}
               results @(fluree/query db query)]
-          (is (= [["ex:homer" 0.72 [0.6, 0.5]]
+          (is (= [["ex:bart" 0.61 [0.1, 0.9]]
                   ["ex:bart" 0.68 [0.2, 0.9]]
-                  ["ex:bart" 0.61 [0.1, 0.9]]]
+                  ["ex:homer" 0.72 [0.6, 0.5]]]
                  results)))))))
