@@ -20,6 +20,12 @@
   [x]
   (boolean (#{'desc "desc" "DESC" :desc} x)))
 
+(defn order-by-tuple?
+  [x]
+  (and (sequential? x)
+       (or (-> x first desc?)
+           (-> x first asc?))))
+
 (defn one-select-key-present?
   [q]
   (log/trace "one-select-key-present? q:" q)
