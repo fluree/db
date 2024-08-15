@@ -14,17 +14,11 @@
 
 (defn asc?
   [x]
-  (boolean (#{'asc "asc" "ASC" :asc} x)))
+  (boolean (#{'asc "asc" :asc} x)))
 
 (defn desc?
   [x]
-  (boolean (#{'desc "desc" "DESC" :desc} x)))
-
-(defn order-by-tuple?
-  [x]
-  (and (sequential? x)
-       (or (-> x first desc?)
-           (-> x first asc?))))
+  (boolean (#{'desc "desc" :desc} x)))
 
 (defn one-select-key-present?
   [q]
@@ -171,7 +165,7 @@
                          [:desc [:fn desc?]]]
     ::ordering          [:orn {:error/message "Ordering must be a var or two-tuple formatted ['ASC' or 'DESC', var]"}
                          [:scalar ::var]
-                         [:vector [:and sequential?
+                         [:vector [:and list?
                                    [:catn
                                     [:direction ::direction]
                                     [:dimension ::var]]]]]

@@ -625,18 +625,11 @@
            ensure-vector
            (mapv parse-var-name)))
 
-(defn wrap-order-statement
-  [order-by]
-  (if (syntax/order-by-tuple? order-by)
-    [order-by]
-    order-by))
-
 (defn parse-ordering
   [q]
   (some->> (or (:order-by q)
                (:orderBy q))
            ensure-vector
-           wrap-order-statement
            (mapv (fn [ord]
                    (if-let [v (parse-var-name ord)]
                      [v :asc]
