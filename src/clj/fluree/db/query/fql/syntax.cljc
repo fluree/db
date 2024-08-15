@@ -3,6 +3,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
             [fluree.db.util.docs :as docs]
+            [clojure.edn :as edn]
             [malli.core :as m]
             [malli.transform :as mt]))
 
@@ -93,6 +94,12 @@
       (into extra-kvs)
       wrap-query-map-schema))
 
+(defn string->ordering
+  [x]
+  (if (string? x)
+    (edn/read-string x)
+    x))
+
 (def registry
   (merge
    (m/predicate-schemas)
@@ -163,12 +170,16 @@
     ::direction         [:orn {:error/message "Direction must be \"asc\" or \"desc\""}
                          [:asc [:fn asc?]]
                          [:desc [:fn desc?]]]
-    ::ordering          [:orn {:error/message "Ordering must be a var or two-tuple formatted ['ASC' or 'DESC', var]"}
+    ::ordering          [:orn {:error/message "Ordering must be a var or two-tuple formatted ['ASC' or 'DESC', var]"
+                               :decode/fql  string->ordering
+                               :decode/json string->ordering}
                          [:scalar ::var]
-                         [:vector [:and list?
-                                   [:catn
-                                    [:direction ::direction]
-                                    [:dimension ::var]]]]]
+                         [:vector
+                          [:and
+                           list?
+                           [:catn
+                            [:direction ::direction]
+                            [:dimension ::var]]]]]
     ::order-by          [:orn {:error/message "orderBy clause must be variable or two-tuple formatted ['ASC' or 'DESC', var]"}
                          [:clause ::ordering]
                          [:collection [:sequential ::ordering]]]
