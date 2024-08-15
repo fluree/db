@@ -96,6 +96,7 @@
 
 (defn string->ordering
   [x]
+  (log/info "Decoding ordering:" x)
   (if (string? x)
     (edn/read-string x)
     x))
@@ -174,12 +175,11 @@
                                :decode/fql  string->ordering
                                :decode/json string->ordering}
                          [:scalar ::var]
-                         [:vector
-                          [:and
-                           list?
-                           [:catn
-                            [:direction ::direction]
-                            [:dimension ::var]]]]]
+                         [:vector [:and
+                                   list?
+                                   [:catn
+                                    [:direction ::direction]
+                                    [:dimension ::var]]]]]
     ::order-by          [:orn {:error/message "orderBy clause must be variable or two-tuple formatted ['ASC' or 'DESC', var]"}
                          [:clause ::ordering]
                          [:collection [:sequential ::ordering]]]
