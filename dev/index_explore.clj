@@ -33,10 +33,16 @@
             r))
         roots))
 
-(defn latest-t
+(defn t-values
   [roots]
   (->> roots
        (map #(get % "t"))
+       sort))
+
+(defn latest-t
+  [roots]
+  (->> roots
+       t-values
        (apply max)))
 
 (defn latest-root
