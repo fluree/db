@@ -320,16 +320,13 @@
 
 (defn add-predicates
   [db pred-map pids]
-  (reduce (partial add-pid db)
-          pred-map pids))
+  (reduce (partial add-pid db) pred-map pids))
 
-(defn build-schema
-  [db pids vocab-flakes]
-  (let [{:keys [schema t]} db
-        schema* (-> schema
-                    (update :pred (partial add-predicates db) pids)
-                    (as-> s (update-with s db t vocab-flakes)))]
-    schema*))
+(defn update-schema
+  [{:keys [schema t] :as db} pids vocab-flakes]
+  (-> schema
+      (update :pred (partial add-predicates db) pids)
+      (update-with db t vocab-flakes)))
 
 (defn hydrate-schema
   "Updates the :schema key of db by processing just the vocabulary flakes out of
@@ -337,14 +334,16 @@
   ([db new-flakes]
    (hydrate-schema db new-flakes {}))
   ([db new-flakes mods]
-   (let [pred-sids    (collect-predicate-ids db new-flakes)
-         vocab-flakes (into #{}
-                            (filter (fn [f]
-                                      (or (contains? pred-sids (flake/s f))
-                                          (contains? jld-ledger/predicate-refs (flake/p f)))))
-                            new-flakes)
-         schema       (-> (build-schema db pred-sids vocab-flakes)
-                          (add-pred-datatypes (pred-dt-constraints new-flakes)))]
+   (let [pred-sids      (collect-predicate-ids db new-flakes)
+         vocab-flakes   (into #{}
+                              (filter (fn [f]
+                                        (or (contains? pred-sids (flake/s f))
+                                            (contains? jld-ledger/predicate-refs (flake/p f)))))
+                              new-flakes)
+         pred-datatypes (pred-dt-constraints new-flakes)
+         schema         (-> db
+                            (update-schema pred-sids vocab-flakes)
+                            (add-pred-datatypes pred-datatypes))]
      (invalidate-shape-cache! db mods)
      (assoc db :schema schema))))
 
