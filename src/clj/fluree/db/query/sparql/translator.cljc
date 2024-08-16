@@ -462,7 +462,7 @@
   (let [parsed-constraint (parse-term constraint)]
     (if (contains? #{"exists" "not-exists"} (first parsed-constraint))
       parsed-constraint
-      [:filter [parsed-constraint]])))
+      [:filter parsed-constraint])))
 
 (defmethod parse-term :OptionalGraphPattern
   ;; OptionalGraphPattern ::= <'OPTIONAL'> GroupGraphPattern
