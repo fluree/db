@@ -378,8 +378,11 @@
             (add-pred-datatypes (filterv #(> (count %) 1) preds)))))))
 
 ;; schema serialization
-(def ^:const serialized-pred-keys [:id :datatype :subclassOf :parentProps :childProps])
-(def ^:const serialized-pred-keys-reverse (reverse serialized-pred-keys))
+(def ^:const serialized-pred-keys
+  [:id :datatype :subclassOf :parentProps :childProps])
+
+(def ^:const serialized-pred-keys-reverse
+  (reverse serialized-pred-keys))
 
 (defn schema-tuple
   [pred-map]
@@ -418,7 +421,9 @@
   [{:keys [t pred] :as _db-schema}]
   (let [pred-keys (mapv name serialized-pred-keys)
         pred-vals (->> pred
-                       (filter #(string? (key %))) ;; every pred map is duplicated for both keys iri, and sid - keep only 1
+                       (filter #(string? (key %))) ; every pred map is
+                                                   ; duplicated for both keys
+                                                   ; iri, and sid - keep only 1
                        vals
                        (mapv schema-tuple))]
     {"t"    t
@@ -477,4 +482,3 @@
         (assoc :t t
                :pred pred)
         (refresh-subclasses))))
-
