@@ -308,24 +308,25 @@
               (-> schema
                   (assoc-in [:pred pid] pred-meta)
                   (assoc-in [:pred iri] pred-meta))))
-          schema
-          pred-tuples))
+          schema pred-tuples))
 
 (defn add-pid
-  [db preds pid]
+  [preds db pid]
   (if (contains? preds pid)
     preds
     (let [{:keys [iri] :as p-map} (initial-property-map db pid)]
       (assoc preds pid p-map, iri p-map))))
 
 (defn add-predicates
-  [db pred-map pids]
-  (reduce (partial add-pid db) pred-map pids))
+  [pred-map db pids]
+  (reduce (fn [pred-map* pid]
+            (add-pid pred-map* db pid))
+          pred-map pids))
 
 (defn update-schema
   [{:keys [schema t] :as db} pids vocab-flakes]
   (-> schema
-      (update :pred (partial add-predicates db) pids)
+      (update :pred add-predicates db pids)
       (update-with db t vocab-flakes)))
 
 (defn hydrate-schema
