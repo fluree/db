@@ -69,10 +69,6 @@
           (assoc acc iri subclasses)))
       subclass-map subclass-map)))
 
-(def property-sids #{const/$rdf:Property
-                     const/$owl:DatatypeProperty
-                     const/$owl:ObjectProperty})
-
 (def ^:const base-property-map
   {:id          nil
    :iri         nil
@@ -347,18 +343,6 @@
                             (add-pred-datatypes pred-datatypes))]
      (invalidate-shape-cache! db mods)
      (assoc db :schema schema))))
-
-(defn serialize-schema-predicates
-  [schema]
-  (reduce (fn [root [k {:keys [datatype]}]]
-            (if (iri/sid? k)
-              (let [sid (iri/serialize-sid k)]
-                (if datatype
-                  (conj root [sid (iri/serialize-sid datatype)])
-                  (conj root [sid])))
-              root))
-          []
-          (:pred schema)))
 
 (defn load-schema
   [{:keys [t] :as db} preds]
