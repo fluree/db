@@ -96,13 +96,13 @@
   (update prop-map :parentProps into parent-properties))
 
 (defn update-parent-with-children
-  [db prop-map parent-prop child-props]
+  [prop-map db parent-prop child-props]
   (let [initial-map       (initial-property-map db parent-prop)
         with-new-children (fnil add-child-properties initial-map)]
     (update prop-map parent-prop with-new-children child-props)))
 
 (defn update-child-with-parents
-  [db prop-map child-prop parent-props]
+  [prop-map db child-prop parent-props]
   (let [initial-map      (initial-property-map db child-prop)
         with-new-parents (fnil add-parent-properties initial-map)]
     (update prop-map child-prop with-new-parents parent-props)))
@@ -110,17 +110,17 @@
 (defn add-new-children-to-parents
   "Adds new :childProps to parents in the schema map all the way up
   the hierarchy"
-  [db pred-map all-parents new-child-properties]
+  [pred-map db all-parents new-child-properties]
   (reduce (fn [p-map parent-prop]
-            (update-parent-with-children db p-map parent-prop new-child-properties))
+            (update-parent-with-children p-map db parent-prop new-child-properties))
           pred-map all-parents))
 
 (defn add-new-parents-to-children
   "Adds new :parentProps to children in the schema map all the way down
   the hierarchy"
-  [db pred-map all-children new-parent-properties]
+  [pred-map db all-children new-parent-properties]
   (reduce (fn [p-map child-prop]
-            (update-child-with-parents db p-map child-prop new-parent-properties))
+            (update-child-with-parents p-map db child-prop new-parent-properties))
           pred-map all-children))
 
 (defn update-rdfs-subproperty-of
@@ -129,14 +129,14 @@
 
   owl:equivalentProperty also uses this, as an equivalent property
   relationship is where each property is a subproperty of the other."
-  [db pred-map parent-prop child-prop]
+  [pred-map db parent-prop child-prop]
   (let [parent-parents      (get-in pred-map [parent-prop :parentProps])
         child-children      (get-in pred-map [child-prop :childProps])
         new-parent-children (conj child-children child-prop)
         new-child-parents   (conj parent-parents parent-prop)]
-    (as-> pred-map props
-          (add-new-children-to-parents db props new-child-parents new-parent-children)
-          (add-new-parents-to-children db props new-parent-children new-child-parents))))
+    (-> pred-map
+        (add-new-children-to-parents db new-child-parents new-parent-children)
+        (add-new-parents-to-children db new-parent-children new-child-parents))))
 
 (defn update-related-properties
   "Adds owl:equivalentProperty and rdfs:subPropertyOf rules to the schema map as the
@@ -151,13 +151,13 @@
   For subPropertyOf, the relationship is one way. e.g.:
   [ex:father rdfs:subPropertyOf ex:parent]
    - ex:parent -> ex:father"
-  [db pred-map sid pid obj]
+  [pred-map db sid pid obj]
   (if (iri/sid? obj)
     (if (= const/$owl:equivalentProperty pid)
-      (as-> pred-map props
-            (update-rdfs-subproperty-of db props sid obj)
-            (update-rdfs-subproperty-of db props obj sid))
-      (update-rdfs-subproperty-of db pred-map obj sid))
+      (-> pred-map
+          (update-rdfs-subproperty-of db sid obj)
+          (update-rdfs-subproperty-of db obj sid))
+      (update-rdfs-subproperty-of pred-map db obj sid))
     (do
       (log/warn (str "Triple of ["
                      (iri/decode-sid db sid) " "
@@ -172,7 +172,7 @@
       pred-map)))
 
 (defn update-pred-map
-  [db pred-map vocab-flake]
+  [pred-map db vocab-flake]
   (let [[sid pid obj]   ((juxt flake/s flake/p flake/o) vocab-flake)
         initial-map     (initial-property-map db sid)
         with-subclass   (fnil add-subclass initial-map)]
@@ -182,13 +182,15 @@
 
       (or (= const/$owl:equivalentProperty pid)
           (= const/$rdfs:subPropertyOf pid))
-      (update-related-properties db pred-map sid pid obj)
+      (update-related-properties pred-map db sid pid obj)
 
       :else pred-map)))
 
 (defn with-vocab-flakes
-  [db pred-map vocab-flakes]
-  (let [new-pred-map  (reduce (partial update-pred-map db) pred-map vocab-flakes)]
+  [pred-map db vocab-flakes]
+  (let [new-pred-map  (reduce (fn [pred-map* vocab-flake]
+                                (update-pred-map pred-map*  db vocab-flake))
+                              pred-map vocab-flakes)]
     (reduce-kv (fn [preds k v]
                  (if (iri/sid? k)
                    (assoc preds k v, (:iri v) v)
@@ -205,7 +207,7 @@
   [schema db t vocab-flakes]
   (-> schema
       (assoc :t t)
-      (update :pred (partial with-vocab-flakes db) vocab-flakes)
+      (update :pred with-vocab-flakes db vocab-flakes)
       refresh-subclasses))
 
 (defn base-schema
