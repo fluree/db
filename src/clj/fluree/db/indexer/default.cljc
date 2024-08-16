@@ -61,23 +61,27 @@
                (< t node-t)))
        boolean))
 
+(defn reconstruct-branch
+  [{:keys [comparator], :as branch} t child-nodes]
+  (let [children    (apply index/child-map comparator child-nodes)
+        size        (->> child-nodes
+                         (map :size)
+                         (reduce +))
+        first-flake (->> children first key)
+        rhs         (->> children flake/last val :rhs)
+        new-id      (random-uuid)]
+    (assoc branch
+           :id new-id
+           :t t
+           :children children
+           :size size
+           :first first-flake
+           :rhs rhs)))
+
 (defn update-branch
-  [{:keys [comparator], branch-t :t, :as branch} t child-nodes]
+  [{branch-t :t, :as branch} t child-nodes]
   (if (some-update-after? branch-t child-nodes)
-    (let [children    (apply index/child-map comparator child-nodes)
-          size        (->> child-nodes
-                           (map :size)
-                           (reduce +))
-          first-flake (->> children first key)
-          rhs         (->> children flake/last val :rhs)
-          new-id      (random-uuid)]
-      (assoc branch
-        :id new-id
-        :t t
-        :children children
-        :size size
-        :first first-flake
-        :rhs rhs))
+    (reconstruct-branch branch t child-nodes)
     branch))
 
 (defn update-sibling-leftmost
@@ -94,7 +98,7 @@
     (->> child-nodes
          (partition-all target-count)
          (map (fn [kids]
-                (update-branch branch t kids)))
+                (reconstruct-branch branch t kids)))
          update-sibling-leftmost)))
 
 (defn filter-predicates
@@ -196,31 +200,42 @@
                         (vswap! stack pop)
                         (xf result* child))
                  (if (overflow-children? child-nodes)
-                   (let [new-branches (rebalance-children node t child-nodes)
-                         result**     (reduce xf result* new-branches)]
-                     (recur new-branches
-                            stack*
-                            result**))
+                   (let [new-branches (rebalance-children node t child-nodes)]
+                     (vswap! stack into new-branches)
+                     result*)
                    (let [branch (update-branch node t child-nodes)]
                      (vswap! stack conj branch)
                      result*)))))))
 
-        ;; Completion: Flush the stack iterating each remaining node with the
-        ;; nested transformer before calling the nested transformer's completion
-        ;; fn on the iterated result.
+        ;; Completion: If there is only one node left in the stack, then it's
+        ;; the root. We iterate it with the nested transformer before calling
+        ;; the nested transformer's completion arity. If there is more than one
+        ;; node left in the stack, then the root was split because it
+        ;; overflowed, so we make a new root, iterate all remaining nodes
+        ;; including the new root, and then call the nested transformer's
+        ;; completing arity.
         ([result]
-         (loop [stack*  @stack
-                result* result]
-           (if-let [node (peek stack*)]
-             (recur (vswap! stack pop)
-                    (unreduced (xf result* node)))
-             (xf result*))))))))
+         (if-let [remaining-nodes (not-empty @stack)]
+           (do (vreset! stack [])
+               (if (= (count remaining-nodes) 1)
+                 (let [root-node (first remaining-nodes)]
+                   (-> result
+                       (xf root-node)
+                       xf))
+                 (let [child-nodes      (map index/unresolve remaining-nodes)
+                       root-node        (reconstruct-branch (first remaining-nodes) t child-nodes)
+                       remaining-nodes* (conj remaining-nodes root-node)
+                       result*          (reduce (fn [res node]
+                                                  (xf res node))
+                                                result remaining-nodes*)]
+                   (xf result*))))
+           (xf result)))))))
 
 (defn preserve-id
   "Stores the original id of a node under the `::old-id` key if the `node` was
   resolved, leaving unresolved nodes unchanged. Useful for keeping track of the
   original id for modified nodes during the indexing process for garbage
-  collection purposes"
+  collection"
   [{:keys [id] :as node}]
   (cond-> node
     (index/resolved? node) (assoc ::old-id id)))

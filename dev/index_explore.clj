@@ -105,4 +105,21 @@
           (recur (first (second branch))
                  (inc depth))
           depth)))))
-(comment (def ledger-name "") ;; get latest index-root (-> (read-roots ledger-name)     (latest-root)) ;; get all nested addresses for :spot (-> (read-roots ledger-name)     (latest-root)     (idx-addresses :spot)) ;; get the depth (how many parents) of index type (-> (read-roots ledger-name)     (latest-root)     (idx-depth :spot)) )
+(comment
+  (def ledger-name "")
+
+  ;; get latest index-root
+  (-> (read-roots ledger-name)
+      (latest-root))
+
+  ;; get all nested addresses for :spot
+  (-> (read-roots ledger-name)
+      (latest-root)
+      (idx-addresses :spot))
+
+  ;; get the depth (how many parents) of index type
+  (-> (read-roots ledger-name)
+      (latest-root)
+      (idx-depth :spot))
+
+  )
