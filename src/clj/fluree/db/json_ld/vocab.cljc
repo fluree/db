@@ -77,11 +77,14 @@
    :childProps  #{}
    :datatype    nil})
 
+(defn initial-property-map*
+  [iri sid]
+  (assoc base-property-map :id sid, :iri iri))
+
 (defn initial-property-map
   [db sid]
   (let [iri (iri/decode-sid db sid)]
-    (assoc base-property-map :id sid
-                             :iri iri)))
+    (initial-property-map* iri sid)))
 
 (defn add-subclass
   [prop-map subclass]
@@ -186,6 +189,12 @@
 
       :else pred-map)))
 
+(def initial-type-map
+  (initial-property-map* const/iri-type const/$rdf:type))
+
+(def initial-class-map
+  (initial-property-map* const/iri-class const/$rdfs:Class))
+
 (defn with-vocab-flakes
   [pred-map db vocab-flakes]
   (let [new-pred-map  (reduce (fn [pred-map* vocab-flake]
@@ -195,9 +204,7 @@
                  (if (iri/sid? k)
                    (assoc preds k v, (:iri v) v)
                    preds))
-               {"@type" {:iri "@type"
-                         :id  const/$rdf:type}}
-               new-pred-map)))
+               {const/iri-type initial-type-map} new-pred-map)))
 
 (defn refresh-subclasses
   [{:keys [pred] :as schema}]
@@ -212,10 +219,7 @@
 
 (defn base-schema
   []
-  (let [pred (map-pred-id+iri [{:iri "@type"
-                                :id  const/$rdf:type}
-                               {:iri "http://www.w3.org/2000/01/rdf-schema#Class"
-                                :id  const/$rdfs:Class}])]
+  (let [pred (map-pred-id+iri [initial-type-map initial-class-map])]
     {:t          0
      :pred       pred
      :shapes     (atom {:class {} ; TODO: Does this need to be an atom?
