@@ -1,6 +1,12 @@
-(ns fluree.db.flake.index.balance
-  (:require [fluree.db.flake :as flake]
-            [fluree.db.flake.index :as index]))
+(ns fluree.db.flake.index.rebalance
+  (:require [clojure.core.async :as async :refer [<! >! go]]
+            [fluree.db.flake :as flake]
+            [fluree.db.flake.index :as index]
+            [fluree.db.flake.index.storage :as storage]
+            [fluree.db.flake.index.novelty :refer [update-node-id]]
+            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.log :as log]))
 
 (defn partition-flakes
   [target-size]
@@ -25,6 +31,7 @@
         ([result]
          (if-let [chunk (not-empty @current-chunk)]
            (do (vreset! current-chunk [])
+               (vreset! current-size 0)
                (-> result
                    (xf chunk)
                    xf))
@@ -87,5 +94,44 @@
                       (rebalance-leaves-xf alias t target-size cmp))]
     (index/tree-chan conn root always 4 leaf-xf error-ch)))
 
+(defn write-leaf
+  [db idx leaf error-ch]
+  (go
+    (try*
+      (let [write-response (<? (storage/write-leaf db idx leaf))]
+        (-> leaf
+            (update-node-id write-response)
+            index/unresolve))
+      (catch* e
+              (log/error e "Error writing rebalanced flake index leaf node")
+              (>! error-ch e)))))
+
+(defn write-branch
+  [db idx branch error-ch]
+  (go
+    (try*
+      (let [write-response (<? (storage/write-branch db idx branch))]
+        (-> branch
+            (update-node-id write-response)
+            index/unresolve))
+      (catch* e
+              (log/error e "Error writing rebalanced flake index branch node")
+              (>! error-ch e)))))
+
+(defn write-node
+  [db idx node error-ch]
+  (if (index/leaf? node)
+    (write-leaf db idx node error-ch)
+    (write-branch db idx node error-ch)))
+
 (defn write-nodes
-  [conn error-ch node-ch])
+  [db idx error-ch node-ch]
+  (let [out-ch (async/chan)]
+    (go
+      (loop []
+        (if-let [node (<! node-ch)]
+          (let [written-node (<! (write-node db idx node error-ch))]
+            (>! out-ch written-node)
+            (recur))
+          (async/close! out-ch))))
+    out-ch))
