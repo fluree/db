@@ -325,16 +325,15 @@
       (if (index/resolved? node)
         (let [updated-ids  (:updated-ids stats)
               written-node (<! (write-node db idx node updated-ids changes-ch error-ch))
-              stats*       (cond-> stats
-                             (not= old-id :empty) (update :garbage conj old-id)
-                             true                 (update :novel inc)
-                             true                 (assoc-in [:updated-ids (:id node)] (:id written-node)))]
+              stats*  (-> stats
+                          (update :novel inc)
+                          (assoc-in [:updated-ids (:id node)] (:id written-node))
+                          (cond-> (not= old-id :empty) (update :garbage conj old-id)))]
           (recur stats*
                  written-node))
         (recur (update stats :unchanged inc)
                node))
       (assoc stats :root (index/unresolve last-node)))))
-
 
 (defn refresh-index
   [{:keys [conn] :as db} changes-ch error-ch {::keys [idx t novelty root]}]

@@ -10,6 +10,8 @@
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]))
 
+(def commit-version 1)
+
 (comment
   ;; commit map - this map is what gets recorded in a few places:
   ;; - in a 'commit' file: (translated to JSON-LD, and optionally wrapped in a Verifiable Credential)
@@ -59,7 +61,7 @@
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
   [["@context" "https://ns.flur.ee/ledger/v1"]
    ["id" :id]
-   ["v" 0]
+   ["v" :v]
    ["address" :address]
    ["type" ["Commit"]]
    ["alias" :alias]
@@ -275,7 +277,7 @@
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
-  [alias branch ns-addresses]
+  [alias branch ns-addresses init-time]
   (let [commit-json  (->json-ld {:alias  alias
                                  :v      0
                                  :branch (if branch
@@ -284,7 +286,7 @@
                                  :data   {:t      0
                                           :flakes 0
                                           :size   0}
-                                 :time   (util/current-time-iso)
+                                 :time   init-time
                                  :ns     (mapv #(if (map? %)
                                                   %
                                                   {:id %})
@@ -367,7 +369,7 @@
   Assumes commit is not yet created (but db is persisted), so
   commit-id and commit-address are added after finalizing and persisting commit."
   [{:keys [old-commit issuer message tag dbid t db-address flakes size author
-           txn-id annotation]
+           txn-id annotation time]
     :as   _commit}]
   (let [prev-data   (select-keys (data old-commit) [:id :address])
         data-commit (new-db-commit dbid t db-address prev-data flakes size)
@@ -376,8 +378,9 @@
                         (dissoc :id :address :data :issuer :time :message :tag
                                 :prev-commit)
                         (assoc :address ""
+                               :v commit-version
                                :data data-commit
-                               :time (util/current-time-iso)))]
+                               :time time))]
     (cond-> commit
             txn-id (assoc :txn txn-id)
             author (assoc :author author)
