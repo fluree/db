@@ -5,7 +5,7 @@
             [clojure.core.async :as async :refer [go]]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.connection :as connection]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.util.async :refer [<? go-try]]

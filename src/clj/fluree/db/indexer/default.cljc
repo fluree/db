@@ -1,5 +1,5 @@
 (ns fluree.db.indexer.default
-  (:require [fluree.db.index :as index]
+  (:require [fluree.db.flake.index :as index]
             [fluree.db.indexer.storage :as storage]
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.flake :as flake]

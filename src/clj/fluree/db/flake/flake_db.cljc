@@ -20,7 +20,7 @@
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.util.core :as util :refer [get-first get-first-value
                                                   get-first-id vswap!]]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             [fluree.db.indexer :as indexer]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.query.fql :as fql]

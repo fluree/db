@@ -1,4 +1,4 @@
-(ns fluree.db.index
+(ns fluree.db.flake.index
   (:refer-clojure :exclude [resolve])
   (:require [fluree.db.constants :as const]
             [fluree.db.flake :as flake]

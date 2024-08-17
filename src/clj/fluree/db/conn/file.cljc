@@ -4,7 +4,7 @@
             [clojure.string :as str]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             [fluree.db.connection :as connection]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.util.log :as log :include-macros true]
