@@ -1,4 +1,5 @@
 (ns fluree.db.json-ld.vocab
+  "Generates vocabulary/schema pre-cached maps."
   (:require [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.ledger :as jld-ledger]
@@ -8,8 +9,6 @@
             [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-;; generates vocabulary/schema pre-cached maps.
 
 (defn map-pred-id+iri
   "In the schema map, we index properties by both integer :id and :iri for easy lookup of either."
