@@ -7,7 +7,7 @@
             [fluree.db.connection :as connection]
             [fluree.db.flake.index :as index]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.indexer.storage :as index-storage]
+            [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]

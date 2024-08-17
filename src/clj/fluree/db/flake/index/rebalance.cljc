@@ -86,3 +86,6 @@
         leaf-xf (comp only-leaves
                       (rebalance-leaves-xf alias t target-size cmp))]
     (index/tree-chan conn root always 4 leaf-xf error-ch)))
+
+(defn write-nodes
+  [conn error-ch node-ch])

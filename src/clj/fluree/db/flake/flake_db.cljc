@@ -24,7 +24,7 @@
             [fluree.db.indexer :as indexer]
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.fql :as fql]
-            [fluree.db.indexer.storage :as index-storage]
+            [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
