@@ -190,10 +190,12 @@
       :else pred-map)))
 
 (def initial-type-map
-  (initial-property-map* const/iri-type const/$rdf:type))
+  (assoc (initial-property-map* const/iri-type const/$rdf:type)
+         :datatype const/$id))
 
 (def initial-class-map
-  (initial-property-map* const/iri-class const/$rdfs:Class))
+  (assoc (initial-property-map* const/iri-class const/$rdfs:Class)
+         :datatype const/$id))
 
 (defn with-vocab-flakes
   [pred-map db vocab-flakes]
