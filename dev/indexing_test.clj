@@ -12,7 +12,6 @@
             [fluree.db.connection :as connection]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
-            [fluree.db.indexer.default :as indexer]
             [fluree.db.indexer :as indexer]
             [fluree.db.util.log :as log]
             [fluree.db.flake.index :as index]))

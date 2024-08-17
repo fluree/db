@@ -1,4 +1,4 @@
-(ns fluree.db.indexer.default
+(ns fluree.db.flake.index.novelty
   (:require [fluree.db.flake.index :as index]
             [fluree.db.indexer.storage :as storage]
             [fluree.db.indexer.garbage :as garbage]
