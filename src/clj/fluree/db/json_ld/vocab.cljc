@@ -374,6 +374,18 @@
 (def ^:const serialized-pred-keys-reverse
   (reverse serialized-pred-keys))
 
+(defn serialize-property-set
+  [tuple st]
+  (if (seq st)
+    (conj tuple
+          (mapv #(if (iri/sid? %)
+                   (iri/serialize-sid %)
+                   %)
+                st))
+    (if (seq tuple) ; if 'tuple' is still empty, keep it that if nothing to add
+      (conj tuple nil)
+      tuple)))
+
 (defn schema-tuple
   [pred-map]
   (reduce
@@ -381,15 +393,7 @@
      (let [next-val (get pred-map next-key)]
        (cond
          (set? next-val)
-         (if (seq next-val) ;; non-empty?
-           (conj acc
-                 (mapv #(if (iri/sid? %)
-                          (iri/serialize-sid %)
-                          %)
-                       next-val))
-           (if (seq acc) ;; if 'acc' is still empty, keep it that if nothing to add
-             (conj acc nil)
-             acc))
+         (serialize-property-set acc next-val)
 
          (iri/sid? next-val)
          (conj acc (iri/serialize-sid next-val))
