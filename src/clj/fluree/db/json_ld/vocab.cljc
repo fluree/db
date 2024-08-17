@@ -10,8 +10,9 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn map-pred-id+iri
-  "In the schema map, we index properties by both integer :id and :iri for easy lookup of either."
+(defn build-pred-map
+  "In the schema map, we index properties by both sid :id and :iri for easy
+  lookup of either."
   [properties]
   (reduce
     (fn [acc prop-map]
@@ -218,7 +219,7 @@
 
 (defn base-schema
   []
-  (let [pred (map-pred-id+iri [initial-type-map initial-class-map])]
+  (let [pred (build-pred-map [initial-type-map initial-class-map])]
     {:t          0
      :pred       pred
      :shapes     (atom {:class {} ; TODO: Does this need to be an atom?
