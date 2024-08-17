@@ -61,23 +61,29 @@
                (< t node-t)))
        boolean))
 
+(defn reconstruct-branch
+  [{:keys [comparator], :as branch} t child-nodes]
+  (let [children    (apply index/child-map comparator child-nodes)
+        size        (->> child-nodes
+                         (map :size)
+                         (reduce +))
+        leftmost?   (->> children first val :leftmost? true?)
+        first-flake (->> children first key)
+        rhs         (->> children flake/last val :rhs)
+        new-id      (random-uuid)]
+    (assoc branch
+           :id new-id
+           :t t
+           :children children
+           :size size
+           :leftmost? leftmost?
+           :first first-flake
+           :rhs rhs)))
+
 (defn update-branch
-  [{:keys [comparator], branch-t :t, :as branch} t child-nodes]
+  [{branch-t :t, :as branch} t child-nodes]
   (if (some-update-after? branch-t child-nodes)
-    (let [children    (apply index/child-map comparator child-nodes)
-          size        (->> child-nodes
-                           (map :size)
-                           (reduce +))
-          first-flake (->> children first key)
-          rhs         (->> children flake/last val :rhs)
-          new-id      (random-uuid)]
-      (assoc branch
-        :id new-id
-        :t t
-        :children children
-        :size size
-        :first first-flake
-        :rhs rhs))
+    (reconstruct-branch branch t child-nodes)
     branch))
 
 (defn update-sibling-leftmost
@@ -94,17 +100,8 @@
     (->> child-nodes
          (partition-all target-count)
          (map (fn [kids]
-                (update-branch branch t kids)))
+                (reconstruct-branch branch t kids)))
          update-sibling-leftmost)))
-
-(defn filter-predicates
-  [preds & flake-sets]
-  (if (seq preds)
-    (->> flake-sets
-         (apply concat)
-         (filter (fn [f]
-                   (contains? preds (flake/p f)))))
-    []))
 
 (defn rebalance-leaf
   "Splits leaf nodes if the combined size of its flakes is greater than
@@ -123,8 +120,10 @@
                 last-leaf (-> leaf
                               (assoc :flakes subrange
                                      :first cur-first
-                                     :rhs rhs)
-                              (dissoc :id :leftmost?))]
+                                     :rhs rhs
+                                     :leftmost? (and (empty? leaves)
+                                                     leftmost?))
+                              (dissoc :id))]
             (conj leaves last-leaf))
           (let [new-size (-> f flake/size-flake (+ cur-size) long)]
             (if (> new-size target-size)
@@ -156,6 +155,20 @@
            new-leaves))
     [leaf]))
 
+(defn push-node
+  [stack node]
+  (conj stack (index/unresolve node)))
+
+(defn push-all-nodes
+  [stack nodes]
+  (into stack (map index/unresolve) nodes))
+
+(defn transduce-nodes
+  [xf result nodes]
+  (reduce (fn [res node]
+            (xf res node))
+          result nodes))
+
 (defn integrate-novelty
   "Returns a transducer that transforms a stream of index nodes in depth first
   order by incorporating the novelty flakes into the nodes, rebalancing the
@@ -180,8 +193,8 @@
         ([result node]
          (if (index/leaf? node)
            (let [leaves (update-leaf node t novelty)]
-             (vswap! stack into leaves)
-             result)
+             (vswap! stack push-all-nodes leaves)
+             (transduce-nodes xf result leaves))
 
            (loop [child-nodes []
                   stack*      @stack
@@ -192,35 +205,52 @@
                                                             ; branch's children
                                                             ; should be at the top
                                                             ; of the stack
-                 (recur (conj child-nodes (index/unresolve child))
+                 (recur (conj child-nodes child)
                         (vswap! stack pop)
-                        (xf result* child))
+                        result*)
                  (if (overflow-children? child-nodes)
-                   (let [new-branches (rebalance-children node t child-nodes)
-                         result**     (reduce xf result* new-branches)]
-                     (recur new-branches
-                            stack*
-                            result**))
+                   (let [new-branches (rebalance-children node t child-nodes)]
+                     (vswap! stack push-all-nodes new-branches)
+                     (transduce-nodes xf result* new-branches))
                    (let [branch (update-branch node t child-nodes)]
-                     (vswap! stack conj branch)
-                     result*)))))))
+                     (vswap! stack push-node branch)
+                     (xf result* branch))))))))
 
-        ;; Completion: Flush the stack iterating each remaining node with the
-        ;; nested transformer before calling the nested transformer's completion
-        ;; fn on the iterated result.
+        ;; Completion: If there is only one node left in the stack, then it's
+        ;; the root and we're done, so we call the nested transformer's
+        ;; completion arity. If there is more than one node left in the stack,
+        ;; then the root was split because it overflowed. We first make a new
+        ;; root that is the parent of the nodes resulting from the split, then
+        ;; we check if that new root overflows If the new root does overflow, we
+        ;; iterate all of the newly split nodes with the nested transformer and
+        ;; repeat the process. If the new root does not overflow, we iterate the
+        ;; new root before calling the nested transformer's completion arity.
         ([result]
-         (loop [stack*  @stack
-                result* result]
-           (if-let [node (peek stack*)]
-             (recur (vswap! stack pop)
-                    (unreduced (xf result* node)))
-             (xf result*))))))))
+         (let [remaining-nodes @stack]
+           (vreset! stack [])
+           (if (or (empty? remaining-nodes)
+                   (= (count remaining-nodes) 1))
+             (xf result)
+             (loop [child-nodes   remaining-nodes
+                    root-template (peek remaining-nodes)
+                    result*       result]
+               (if (overflow-children? child-nodes)
+                 (let [new-branches (rebalance-children root-template t child-nodes)
+                       child-nodes* (map index/unresolve new-branches)
+                       result**     (transduce-nodes xf result* new-branches)]
+                   (recur child-nodes*
+                          (first child-nodes*)
+                          result**))
+                 (let [root-node (reconstruct-branch root-template t child-nodes)]
+                   (-> result
+                       (xf root-node)
+                       xf)))))))))))
 
 (defn preserve-id
   "Stores the original id of a node under the `::old-id` key if the `node` was
   resolved, leaving unresolved nodes unchanged. Useful for keeping track of the
   original id for modified nodes during the indexing process for garbage
-  collection purposes"
+  collection"
   [{:keys [id] :as node}]
   (cond-> node
     (index/resolved? node) (assoc ::old-id id)))
@@ -291,16 +321,15 @@
       (if (index/resolved? node)
         (let [updated-ids  (:updated-ids stats)
               written-node (<! (write-node db idx node updated-ids changes-ch error-ch))
-              stats*       (cond-> stats
-                             (not= old-id :empty) (update :garbage conj old-id)
-                             true                 (update :novel inc)
-                             true                 (assoc-in [:updated-ids (:id node)] (:id written-node)))]
+              stats*  (-> stats
+                          (update :novel inc)
+                          (assoc-in [:updated-ids (:id node)] (:id written-node))
+                          (cond-> (not= old-id :empty) (update :garbage conj old-id)))]
           (recur stats*
                  written-node))
         (recur (update stats :unchanged inc)
                node))
       (assoc stats :root (index/unresolve last-node)))))
-
 
 (defn refresh-index
   [{:keys [conn] :as db} changes-ch error-ch {::keys [idx t novelty root]}]

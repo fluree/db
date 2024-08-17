@@ -195,7 +195,7 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:favNums" "?num"}
-              [:filter ["(> ?num 10)"]]]
+              [:filter "(> ?num 10)"]]
              where)))
     (let [query "PREFIX schema: <http://schema.org/>
                  SELECT ?s ?t ?name
@@ -208,7 +208,7 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?s", "@type" "?t"}
               {"@id" "?s", "schema:name" "?name"}
-              [:filter ["(regex ?name \"^Jon\" \"i\")"]]]
+              [:filter "(regex ?name \"^Jon\" \"i\")"]]
              where)
           "filter by regex call"))
     (let [query "SELECT ?s
@@ -259,7 +259,7 @@
         (is (= [{"@id" "?person", "person:handle" "?handle"}
                 [:optional
                  [{"@id" "?person", "person:favNums" "?num"}
-                  [:filter ["(> ?num 10)"]]]]]
+                  [:filter "(> ?num 10)"]]]]
                where)))))
   (testing "VALUES"
     (testing "pattern"
@@ -484,7 +484,7 @@
             {:keys [where]} (sparql/->fql query)]
         (is (= [{"@id" "?x", ":p" "?n"}
                 [:minus [{"@id" "?x", ":q" "?m"}
-                         [:filter ["(= ?n ?m)"]]]]]
+                         [:filter "(= ?n ?m)"]]]]
                where)))))
   (testing "subquery"
       (let [query "PREFIX : <http://people.example/>
@@ -701,6 +701,14 @@
                  results @(fluree/query db query {:format :sparql})]
              (is (= [["ex:jdoe" "Jane Doe"]]
                     results))))
+         (testing "basic filter works"
+           (let [query "PREFIX person: <http://example.org/Person#>
+                          SELECT ?handle ?favNum
+                          WHERE {?person person:handle ?handle ;
+                                         person:favNums ?favNum .
+                                 FILTER ( ?favNum > 10 ) .}"]
+             (is (= [["bbob" 23] ["jdoe" 42] ["jdoe" 99]]
+                    @(fluree/query db query {:format :sparql})))))
          (testing "basic wildcard query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT *
