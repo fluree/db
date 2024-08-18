@@ -136,7 +136,7 @@
   "Returns avl sorted map whose keys are the first flakes of the index node
   sequence `child-nodes`, and whose values are the corresponding nodes from
   `child-nodes`."
-  [cmp & child-nodes]
+  [cmp child-nodes]
   (->> child-nodes
        (mapcat child-entry)
        (apply flake/sorted-map-by cmp)))
@@ -146,7 +146,7 @@
   provided `ledger-alias` and index comparator `cmp`."
   [ledger-alias cmp]
   (let [child-node (empty-leaf ledger-alias cmp)
-        children   (child-map cmp child-node)]
+        children   (child-map cmp [child-node])]
     {:comparator   cmp
      :ledger-alias ledger-alias
      :id           :empty

@@ -63,7 +63,7 @@
 
 (defn reconstruct-branch
   [{:keys [comparator], :as branch} t child-nodes]
-  (let [children    (apply index/child-map comparator child-nodes)
+  (let [children    (index/child-map comparator child-nodes)
         size        (->> child-nodes
                          (map :size)
                          (reduce +))
