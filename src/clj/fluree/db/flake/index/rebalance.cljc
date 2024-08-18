@@ -126,14 +126,11 @@
 
 (defn write-nodes
   [db idx error-ch node-ch]
-  (let [out-ch (async/chan)]
-    (go-loop []
-      (if-let [node (<! node-ch)]
-        (let [written-node (<! (write-node db idx node error-ch))]
-          (>! out-ch written-node)
-          (recur))
-        (async/close! out-ch)))
-    out-ch))
+  (go-loop [written-nodes []]
+    (if-let [node (<! node-ch)]
+      (let [written-node (<! (write-node db idx node error-ch))]
+        (recur (conj written-nodes written-node)))
+      written-nodes)))
 
 (defn build-branches
   [ledger-alias t cmp]
