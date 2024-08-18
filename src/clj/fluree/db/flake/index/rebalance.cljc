@@ -133,37 +133,39 @@
       written-nodes)))
 
 (defn build-branches
-  [ledger-alias t cmp]
-  (fn [xf]
-    (let [last-branch (volatile! nil)]
-      (fn
-        ([]
-         (xf))
+  [{:keys [alias t] :as _db} idx]
+  (let [cmp (get index/comparators idx)]
+    (fn [xf]
+      (let [last-branch (volatile! nil)]
+        (fn
+          ([]
+           (xf))
 
-        ([result nodes]
-         (let [child-map   (index/child-map cmp nodes)
-               first-flake (->> child-map first key)
-               total-size  (transduce (map :size) + nodes)
-               next-branch (assoc (index/empty-branch ledger-alias cmp)
-                                  :first first-flake
-                                  :children child-map
-                                  :size total-size
-                                  :t t
-                                  :id (random-uuid))]
+          ([result nodes]
+           (let [child-map   (index/child-map cmp nodes)
+                 first-flake (->> child-map first key)
+                 total-size  (transduce (map :size) + nodes)
+                 next-branch (assoc (index/empty-branch alias cmp)
+                                    :first first-flake
+                                    :children child-map
+                                    :size total-size
+                                    :t t
+                                    :id (random-uuid))]
+             (if-let [branch @last-branch]
+               (let [branch*      (assoc branch :rhs first-flake)
+                     next-branch* (assoc next-branch :leftmost? false)]
+                 (vreset! last-branch next-branch*)
+                 (xf result branch*))
+               (let [next-branch* (assoc next-branch :leftmost? true)]
+                 (vreset! last-branch next-branch*)
+                 result))))
+
+          ([result]
            (if-let [branch @last-branch]
-             (let [branch*      (assoc branch :rhs first-flake)
-                   next-branch* (assoc next-branch :leftmost? false)]
-               (vreset! last-branch next-branch*)
-               (xf result branch*))
-             (let [next-branch* (assoc next-branch :leftmost? true)]
-               (vreset! last-branch next-branch*)
-               result))))
+             (let [branch* (assoc branch :rhs nil)]
+               (vreset! last-branch nil)
+               (-> result
+                   (xf branch*)
+                   xf))
+             (xf result))))))))
 
-        ([result]
-         (if-let [branch @last-branch]
-           (let [branch* (assoc branch :rhs nil)]
-             (vreset! last-branch nil)
-             (-> result
-                 (xf branch*)
-                 xf))
-           (xf result)))))))
