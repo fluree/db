@@ -12,25 +12,26 @@
     f))
 
 (defn migrate-leaves-xf
-  [ledger-alias t cmp]
+  [ledger-alias t leaf-size cmp]
   (comp :flakes
         cat
         (map migrate-flake)
+        (rebalance/partition-flakes leaf-size)
         (rebalance/build-leaves ledger-alias t cmp)))
 
 (defn migrate-leaves
-  [{:keys [alias conn t] :as db} idx error-ch]
+  [{:keys [alias conn t] :as db} idx leaf-size error-ch]
   (let [root    (get db idx)
         cmp     (get index/comparators idx)
         leaf-xf (comp rebalance/only-leaves
-                      (migrate-leaves-xf alias t cmp))]
+                      (migrate-leaves-xf alias t leaf-size cmp))]
     (->> (index/tree-chan conn root rebalance/always 4 leaf-xf error-ch)
          (rebalance/write-nodes db idx error-ch))))
 
 (defn migrate-index
-  [db idx branch-size error-ch]
+  [db idx leaf-size branch-size error-ch]
   (go
-    (let [leaves (<! (migrate-leaves db idx error-ch))]
+    (let [leaves (<! (migrate-leaves db idx leaf-size error-ch))]
       (loop [branches (<! (rebalance/homogenize-branches db idx branch-size error-ch leaves))]
         (if (= (count branches) 1)
           (let [root (first branches)]
@@ -38,10 +39,10 @@
           (recur (<! (rebalance/homogenize-branches db idx branch-size error-ch branches))))))))
 
 (defn migrate
-  [db branch-size error-ch]
+  [db leaf-size branch-size error-ch]
   (->> index/types
        (map (fn [idx]
-              (migrate-index db idx branch-size error-ch)))
+              (migrate-index db idx leaf-size branch-size error-ch)))
        async/merge
        (async/reduce (fn [db {:keys [idx root]}]
                        (assoc db idx root))
