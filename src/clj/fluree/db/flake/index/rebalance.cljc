@@ -1,5 +1,5 @@
 (ns fluree.db.flake.index.rebalance
-  (:require [clojure.core.async :as async :refer [<! >! go]]
+  (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index :as index]
             [fluree.db.flake.index.storage :as storage]
@@ -127,11 +127,10 @@
 (defn write-nodes
   [db idx error-ch node-ch]
   (let [out-ch (async/chan)]
-    (go
-      (loop []
-        (if-let [node (<! node-ch)]
-          (let [written-node (<! (write-node db idx node error-ch))]
-            (>! out-ch written-node)
-            (recur))
-          (async/close! out-ch))))
+    (go-loop []
+      (if-let [node (<! node-ch)]
+        (let [written-node (<! (write-node db idx node error-ch))]
+          (>! out-ch written-node)
+          (recur))
+        (async/close! out-ch)))
     out-ch))
