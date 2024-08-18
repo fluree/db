@@ -74,11 +74,13 @@
            (xf result)))))))
 
 (defn rebalance-leaves-xf
-  [ledger-alias t target-size cmp]
-  (comp :flakes
-        cat
-        (partition-flakes target-size)
-        (build-leaves ledger-alias t cmp)))
+  [ledger-alias t target-size flake-xf cmp]
+  (let [flake-xf* (or flake-xf identity)]
+    (comp :flakes
+          cat
+          flake-xf*
+          (partition-flakes target-size)
+          (build-leaves ledger-alias t cmp))))
 
 (def always
   (constantly true))
@@ -87,11 +89,11 @@
   (filter index/leaf?))
 
 (defn rebalance-leaves
-  [{:keys [alias conn t] :as db} idx target-size error-ch]
+  [{:keys [alias conn t] :as db} idx target-size flake-xf error-ch]
   (let [root    (get db idx)
         cmp     (get index/comparators idx)
         leaf-xf (comp only-leaves
-                      (rebalance-leaves-xf alias t target-size cmp))]
+                      (rebalance-leaves-xf alias t target-size flake-xf cmp))]
     (index/tree-chan conn root always 4 leaf-xf error-ch)))
 
 (defn write-leaf
@@ -170,8 +172,8 @@
              (xf result))))))))
 
 (defn homogenize-leaves
-  [db idx leaf-size error-ch]
-  (->> (rebalance-leaves db idx leaf-size error-ch)
+  [db idx leaf-size flake-xf error-ch]
+  (->> (rebalance-leaves db idx leaf-size flake-xf error-ch)
        (write-nodes db idx error-ch)))
 
 (defn homogenize-branches
@@ -184,9 +186,9 @@
       (write-nodes db idx error-ch branch-ch))))
 
 (defn homogenize-index
-  [db idx leaf-size branch-size error-ch]
+  [db idx leaf-size branch-size flake-xf error-ch]
   (go
-    (let [leaves (<! (homogenize-leaves db idx leaf-size error-ch))]
+    (let [leaves (<! (homogenize-leaves db idx leaf-size flake-xf error-ch))]
       (loop [branches (<! (homogenize-branches db idx branch-size error-ch leaves))]
         (if (= (count branches) 1)
           (let [root (first branches)]
@@ -194,11 +196,11 @@
           (recur (<! (homogenize-branches db idx branch-size error-ch branches))))))))
 
 (defn homogenize
-  [db leaf-size branch-size error-ch]
-  (->> index/types
-       (map (fn [idx]
-              (homogenize-index db idx leaf-size branch-size error-ch)))
-       async/merge
-       (async/reduce (fn [db {:keys [idx root]}]
-                       (assoc db idx root))
-                     db)))
+  ([db leaf-size branch-size flake-xf error-ch]
+   (->> index/types
+        (map (fn [idx]
+               (homogenize-index db idx leaf-size branch-size flake-xf error-ch)))
+        async/merge
+        (async/reduce (fn [db {:keys [idx root]}]
+                        (assoc db idx root))
+                      db))))
