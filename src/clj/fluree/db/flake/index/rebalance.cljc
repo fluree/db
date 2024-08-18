@@ -169,3 +169,36 @@
                    xf))
              (xf result))))))))
 
+(defn homogenize-leaves
+  [db idx leaf-size error-ch]
+  (->> (rebalance-leaves db idx leaf-size error-ch)
+       (write-nodes db idx error-ch)))
+
+(defn homogenize-branches
+  [db idx branch-size error-ch child-nodes]
+  (go
+    (let [branch-xf (comp (partition-all branch-size)
+                          (build-branches db idx))
+          branch-ch (async/chan 4 branch-xf)]
+      (async/onto-chan! branch-ch child-nodes)
+      (write-nodes db idx error-ch branch-ch))))
+
+(defn homogenize-index
+  [db idx leaf-size branch-size error-ch]
+  (go
+    (let [leaves (<! (homogenize-leaves db idx leaf-size error-ch))]
+      (loop [branches (<! (homogenize-branches db idx branch-size error-ch leaves))]
+        (if (= (count branches) 1)
+          (let [root (first branches)]
+            {:idx idx, :root root})
+          (recur (<! (homogenize-branches db idx branch-size error-ch branches))))))))
+
+(defn homogenize
+  [db leaf-size branch-size error-ch]
+  (->> index/types
+       (map (fn [idx]
+              (homogenize-index db idx leaf-size branch-size error-ch)))
+       async/merge
+       (async/reduce (fn [db {:keys [idx root]}]
+                       (assoc db idx root))
+                     db)))
