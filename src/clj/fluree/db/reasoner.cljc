@@ -9,11 +9,11 @@
   (-reasoned-facts [reasoner]))
 
 (defn reason
-  [db methods rules-graph {:keys [max-fuel reasoner-max]
-                           :or   {reasoner-max 10} :as _opts}]
+  [db methods rule-sources {:keys [max-fuel reasoner-max]
+                            :or   {reasoner-max 10} :as _opts}]
   (let [methods*        (set (util/sequential methods))
         fuel-tracker    (fuel/tracker max-fuel)]
-    (-reason db methods* rules-graph fuel-tracker reasoner-max)))
+    (-reason db methods* rule-sources fuel-tracker reasoner-max)))
 
 
 (defn reasoned-facts
