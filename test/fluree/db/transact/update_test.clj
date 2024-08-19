@@ -627,12 +627,12 @@
         (let [db2 @(fluree/stage
                      db1
                      {"@context" ["https://ns.flur.ee"
-                                  {:ex "http://example.org/ns/", :value "@value"}
+                                  {:ex "http://example.org/ns/", :id "@id", :value "@value"}
                                   test-utils/default-context]
                       "where"    {:id "?s", :schema/name "?o"}
                       "delete"   {:id "?s", :schema/name "?o"}
                       "insert"   {:id "?s", :schema/name "Rutherford B. Hayes"}
-                      "values"   ["?s" [{:value :ex/rutherford, :type :xsd/anyURI}]]})]
+                      "values"   ["?s" [{:value :ex/rutherford, :type :id}]]})]
           (is (= [{:type :ex/User,
                    :schema/age 55,
                    :schema/email "rbhayes@usa.gov",
@@ -654,12 +654,12 @@
         (let [db2 @(fluree/stage
                      db1
                      {"@context" ["https://ns.flur.ee"
-                                  {:ex "http://example.org/ns/", :value "@value"}
+                                  {:ex "http://example.org/ns/", :id "@id", :value "@value"}
                                   test-utils/default-context]
                       "where"    {:id "?s", :schema/name "?o"}
                       "delete"   {:id "?s", :schema/name "?o"}
                       "insert"   {:id "?s", :schema/name "Chester A. Arthur"}
-                      "values"   ["?s" [{:value :ex/chester, :type :xsd/anyURI}]]})]
+                      "values"   ["?s" [{:value :ex/chester, :type :id}]]})]
           (is (= [{:type :ex/User,
                    :schema/age 55,
                    :schema/email "rbhayes@usa.gov",

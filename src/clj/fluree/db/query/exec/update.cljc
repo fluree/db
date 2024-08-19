@@ -65,7 +65,7 @@
   [db-vol sid pid o-mch t m]
   (let [o-iri (where/get-iri o-mch)
         oid   (generate-sid! db-vol o-iri)
-        dt    const/$xsd:anyURI]
+        dt    const/$id]
     (flake/create sid pid oid dt t true m)))
 
 (defn create-scalar-flake

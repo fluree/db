@@ -275,9 +275,9 @@
                         ?person person:handle ?handle.}"]
         (is (= [[:values
                  ["?person"
-                  [{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                  [{"@type" "@id",
                     "@value" ":personA"}
-                   {"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                   {"@type" "@id",
                     "@value" ":personB"}]]]
                 {"@id" "?person", "person:handle" "?handle"}]
                (:where (sparql/->fql query)))
@@ -289,10 +289,10 @@
                    }}"]
         (is (= [[:values
                  [["?color" "?direction"]]
-                 [[{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                 [[{"@type" "@id",
                     "@value" "dm:red"}
                    "north"]
-                  [{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                  [{"@type" "@id",
                     "@value" "dm:blue"}
                    "west"]]]]
                (:where (sparql/->fql query)))
@@ -304,9 +304,9 @@
         (is (= {:where [{"@id" "?person", "person:handle" "?handle"}],
                 :values
                 ["?person"
-                 [{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                 [{"@type" "@id",
                    "@value" ":personA"}
-                  {"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                  {"@type" "@id",
                    "@value" ":personB"}]]}
                (select-keys (sparql/->fql query) [:where :values]))
             "where pattern: single var, multiple values"))))

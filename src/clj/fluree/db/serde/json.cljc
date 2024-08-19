@@ -17,7 +17,7 @@
 
 (defn subject-reference?
   [dt]
-  (= const/$xsd:anyURI dt))
+  (= const/$id dt))
 
 (defn deserialize-object
   [serialized-obj dt]
@@ -98,7 +98,7 @@
   the same objects upon loading."
   [val dt]
   (uc/case dt
-    const/$xsd:anyURI    (iri/serialize-sid val)
+    const/$id    (iri/serialize-sid val)
     const/$xsd:dateTime  #?(:clj (.format xsdDateTimeFormatter val)
                             :cljs (.toJSON val))
     const/$xsd:date      #?(:clj (.format xsdDateFormatter val)
