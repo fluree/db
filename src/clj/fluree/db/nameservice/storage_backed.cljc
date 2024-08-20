@@ -1,4 +1,4 @@
-(ns fluree.db.nameservice.stored
+(ns fluree.db.nameservice.storage-backed
   (:require [clojure.core.async :refer [go]]
             [fluree.db.storage :as storage]
             [fluree.db.nameservice :as nameservice]
@@ -16,7 +16,7 @@
   nameservice/iNameService
   (-lookup [_ ledger-alias]
     (let [ns-address (nameservice/full-address address-prefix ledger-alias)]
-      (storage/read store ns-address)))
+      (storage/read-bytes store ns-address)))
 
   (-address [_ ledger-alias branch]
     (go
