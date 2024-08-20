@@ -586,6 +586,19 @@
           {:keys [offset]} (sparql/->fql query)]
       (is (= 10
              offset))))
+  (testing "LIMIT+OFFSET"
+    (let [query "SELECT ?person
+                 WHERE {?person person:fullName ?fullName}
+                 LIMIT 10
+                 OFFSET 10"]
+      (is (= {:limit 10, :offset 10}
+             (select-keys (sparql/->fql query) [:limit :offset]))))
+    (let [query "SELECT ?person
+                 WHERE {?person person:fullName ?fullName}
+                 OFFSET 10
+                 LIMIT 10"]
+      (is (= {:limit 10, :offset 10}
+             (select-keys (sparql/->fql query) [:limit :offset])))))
   (testing "ORDER BY"
     (testing "ASC"
       (let [query "SELECT ?favNums
