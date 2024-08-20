@@ -3,6 +3,7 @@
                             #?(:clj ratio? :cljs uuid)])
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.vector.scoring :as score]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
@@ -321,7 +322,11 @@
      sha256 sha512
 
      ;; rdf term fns
-     uuid struuid isNumeric isBlank str})
+     uuid struuid isNumeric isBlank str
+
+     ;; vector search
+     dotproduct
+     })
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
@@ -380,7 +385,9 @@
     isBlank        fluree.db.query.exec.eval/isBlank
     str            fluree.db.query.exec.eval/sparql-str
     max            fluree.db.query.exec.eval/max
-    min            fluree.db.query.exec.eval/min})
+    min            fluree.db.query.exec.eval/min
+
+    dotproduct     fluree.db.vector.scoring/dotproduct})
 
 
 (defn as*
