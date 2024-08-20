@@ -332,6 +332,13 @@
               {"@id" "?person", "person:age" "?age"}]
              where)))
     (testing "function calls"
+      (let [query "SELECT ?finger
+                 WHERE {?person ex:thumb ?thumb.
+                        BIND (!bound(?thumb) AS ?finger)}"
+            {:keys [where]} (sparql/->fql query)]
+        (is (= [{"@id" "?person", "ex:thumb" "?thumb"}
+                [:bind "?finger" "(not (bound ?thumb))"]]
+               where)))
       (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day
                         ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes
                         ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore
