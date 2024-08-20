@@ -21,6 +21,37 @@
   (-subscribe [nameservice ledger-alias callback] "Creates a subscription to nameservice(s) for ledger events. Will call callback with event data as received.")
   (-unsubscribe [nameservice ledger-alias] "Unsubscribes to nameservice(s) for ledger events"))
 
+(defn full-address
+  [prefix ledger-alias]
+  (str prefix ledger-alias))
+
+(defn ns-record
+  "Generates nameservice metadata map for JSON storage. For now, since we only
+  have a single branch possible, always sets default-branch. Eventually will
+  need to merge changes from different branches into existing metadata map"
+  [ns-address {address "address", alias "alias", branch "branch", :as commit-jsonld}]
+  (let [branch-iri (str ns-address "(" branch ")")]
+    {"@context"      "https://ns.flur.ee/ledger/v1"
+     "@id"           ns-address
+     "defaultBranch" branch-iri
+     "ledgerAlias"   alias
+     "branches"      [{"@id"     branch-iri
+                       "address" address
+                       "commit"  commit-jsonld}]}))
+
+(defn address-path
+  [address]
+  (let [[_ _ path] (str/split address #":")]
+    (subs path 2)))
+
+(defn address->alias
+  [ledger-address]
+  (-> ledger-address
+      address-path
+      (str/split #"/")
+      (->> (drop-last 2) ; branch-name, head
+           (str/join #"/"))))
+
 (defn nameservices
   [conn]
   (connection/-nameservices conn))
