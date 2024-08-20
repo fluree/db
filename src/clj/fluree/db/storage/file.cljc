@@ -61,7 +61,11 @@
   storage/ByteStore
   (write-bytes [_ address bytes]
    (let [path (storage-path root address)]
-     (fs/write-file path bytes))))
+     (fs/write-file path bytes)))
+
+  (read-bytes [_ address]
+    (let [path (storage-path root address)]
+      (fs/read-file path))))
 
 (defn open
   [root-path]
