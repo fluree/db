@@ -18,8 +18,10 @@
     (let [ns-address (nameservice/full-address address-prefix ledger-alias)]
       (storage/read store ns-address)))
 
-  (-address [_ ledger-alias]
-    (go (str address-prefix ledger-alias)))
+  (-address [_ ledger-alias branch]
+    (go
+      (let [branch (if branch (name branch) "main")]
+        (str address-prefix ledger-alias "/" branch))))
 
   (-close [_]
     true))

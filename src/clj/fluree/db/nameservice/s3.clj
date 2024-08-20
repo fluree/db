@@ -31,7 +31,7 @@
   (-lookup [_ ledger-alias] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
   (-lookup [_ ledger-alias _opts] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
   (-sync? [_] sync?)
-  (-address [_ ledger-alias {:keys [branch] :as _opts}]
+  (-address [_ ledger-alias branch]
     (let [branch (if branch (name branch) "main")]
       (go (s3/s3-address s3-bucket s3-prefix (str ledger-alias "/" branch "/head")))))
   (-alias [_ ledger-address]

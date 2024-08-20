@@ -12,7 +12,7 @@
   (-sync? [nameservice] "Indicates if nameservice updates should be performed synchronously, before commit is finalized. Failure will cause commit to fail")
   (-close [nameservice] "Closes all resources for this nameservice")
   (-alias [nameservice ledger-address] "Given a ledger address, returns ledger's default alias name else nil, if not avail")
-  (-address [nameservice ledger-alias key] "Returns full nameservice address/iri which will get published in commit. If 'private', return nil."))
+  (-address [nameservice ledger-alias branch] "Returns full nameservice address/iri which will get published in commit. If 'private', return nil."))
 
 (defprotocol Publisher
   (-push [nameservice commit-data] "Pushes new commit to nameservice."))

@@ -48,7 +48,7 @@ changes from different branches into existing metadata map"
        fs/read-file))
 
 (defn address
-  [base-address ledger-alias _opts]
+  [base-address ledger-alias branch]
   (when base-address
     (str base-address ledger-alias)))
 
@@ -211,8 +211,8 @@ changes from different branches into existing metadata map"
   (-lookup [_ ledger-alias] (lookup ledger-alias local-path base-address nil))
   (-lookup [_ ledger-alias opts] (lookup ledger-alias local-path base-address opts))
   (-sync? [_] sync?)
-  (-address [_ ledger-alias opts]
-    (go (address base-address ledger-alias opts)))
+  (-address [_ ledger-alias branch]
+    (go (address base-address ledger-alias branch)))
   (-alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?
     (-> (address-path ledger-address)
