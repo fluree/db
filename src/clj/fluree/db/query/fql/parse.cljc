@@ -45,44 +45,83 @@
                  (assoc expanded p* o)))
              {} m))
 
+(defn get-type
+  [attrs]
+  (when-let [dt (get attrs const/iri-type)]
+    (if (contains? attrs const/iri-language)
+      (throw (ex-info "Language tags are not allowed when the data type is specified."
+                      {:status 400, :error :db/invalid-query}))
+      dt)))
+
+(defn get-lang
+  [attrs]
+  (when-let [lang (get attrs const/iri-language)]
+    (if (contains? attrs const/iri-type)
+      (throw (ex-info "Language tags are not allowed when the data type is specified."
+                      {:status 400, :error :db/invalid-query}))
+      lang)))
+
+(defn parse-value-datatype
+  [v attrs context]
+  (if-let [dt (get-type attrs)]
+    (if (v/variable? dt)
+      (-> v where/untyped-value (where/link-dt-var dt))
+      (let [dt-iri (json-ld/expand-iri dt context)
+            dt-sid (iri/iri->sid dt-iri)
+            v*     (datatype/coerce-value v dt-sid)]
+        (if (= const/iri-id dt-iri)
+          (let [expanded (json-ld/expand-iri v* context)]
+            (where/match-iri where/unmatched expanded))
+          (where/anonymous-value v* dt-iri))))
+    (if-let [lang (get-lang attrs)]
+      (if (v/variable? lang)
+        (-> where/unmatched
+            (where/match-value v const/iri-lang-string)
+            (where/link-lang-var lang))
+        (where/match-lang where/unmatched v lang))
+      (where/anonymous-value v))))
+
+(defn every-binary-pred
+  [& fs]
+  (fn [x y]
+    (every? (fn [f]
+              (f x y))
+            fs)))
+
+(defn combine-filters
+  [& fs]
+  (some->> fs
+           (remove nil?)
+           not-empty
+           (apply every-binary-pred)))
+
+(defn parse-value-attributes
+  [v attrs context]
+  (let [mch          (parse-value-datatype v attrs context)
+        t-matcher    (some-> attrs (get const/iri-t) (where/transaction-matcher))
+        dt-matcher   (some-> attrs (get const/iri-type) (where/datatype-matcher context))
+        lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)]
+    (if-let [f (combine-filters t-matcher lang-matcher dt-matcher)]
+      (where/with-filter mch f)
+      mch)))
+
 (defn get-expanded-datatype
   [attrs context]
   (some-> attrs
           (get const/iri-type)
           (json-ld/expand-iri context)))
 
-(defn parse-value-datatype
-  [v attrs context]
-  (if-let [dt-iri (get-expanded-datatype attrs context)]
-    (if (= const/iri-anyURI dt-iri)
-      (-> v
-          (json-ld/expand-iri context)
-          (where/anonymous-value dt-iri))
-      (where/anonymous-value v dt-iri))
-    (if-let [lang (get attrs const/iri-language)]
-      (where/anonymous-value v const/iri-lang-string {:lang lang})
-      (where/anonymous-value v))))
-
-(defn parse-value-attributes
-  [v attrs context]
-  (let [mch (parse-value-datatype v attrs context)]
-    (if-let [lang (get attrs const/iri-language)]
-      (let [lang-matcher (where/lang-matcher lang)]
-        (where/with-filter mch lang-matcher))
-      mch)))
-
 (defn match-value-binding-map
   [var-match binding-map context]
   (let [attrs (expand-keys binding-map context)
         {val const/iri-value} attrs]
     (if-let [dt-iri (get-expanded-datatype attrs context)]
-      (if (or (= const/iri-anyURI dt-iri)
-              (= const/iri-id dt-iri))
+      (if (= const/iri-id dt-iri)
         (let [expanded (json-ld/expand-iri val context)]
           (where/match-iri var-match expanded))
         (where/match-value var-match val dt-iri))
       (if-let [lang (get attrs const/iri-language)]
-        (where/match-value var-match val const/iri-lang-string {:lang lang})
+        (where/match-lang var-match val lang)
         (let [dt (datatype/infer-iri val)]
           (where/match-value var-match val dt))))))
 
@@ -181,14 +220,14 @@
 
 (defn parse-filter-function
   "Evals and returns filter function."
-  [fltr fltr-var vars]
+  [fltr fltr-var vars ctx]
   (let [code      (parse-code fltr)
         code-vars (or (not-empty (variables code))
                       (throw (ex-info (str "Filter function must contain a valid variable. Provided: " code)
                                       {:status 400 :error :db/invalid-query})))
         var-name  (find-filtered-var code-vars vars)]
     (if (= var-name fltr-var)
-      (eval/compile-filter code var-name)
+      (eval/compile-filter code var-name ctx)
       (throw (ex-info (str "Variable filter must only reference the variable bound in its value map: "
                            fltr-var
                            ". Provided:" code)
@@ -196,9 +235,9 @@
 
 (defn parse-bind-function
   "Evals and returns bind function."
-  [var-name fn-code]
+  [var-name fn-code context]
   (let [code (parse-code fn-code)
-        f    (eval/compile code false)]
+        f    (eval/compile code context false)]
     (where/->var-filter var-name f)))
 
 (defn parse-iri
@@ -218,12 +257,12 @@
     (v/where-pattern-type pattern)))
 
 (defn parse-bind-map
-  [binds]
+  [binds context]
   (into {}
         (comp (partition-all 2)
               (map (fn [[k v]]
                      (let [var (parse-var-name k)
-                           f   (parse-bind-function var v)]
+                           f   (parse-bind-function var v context)]
                        [var f]))))
         binds))
 
@@ -235,25 +274,28 @@
                  (parse-pattern pattern vars context)))
        where/->where-clause))
 
-(defn every-binary-pred
-  [& fs]
-  (fn [x y]
-    (every? (fn [f]
-              (f x y))
-            fs)))
-
 (defn parse-variable-attributes
-  [var attrs vars]
-  (let [lang-matcher (some-> attrs (get const/iri-language) where/lang-matcher)
-        filter-fn    (some-> attrs
-                             (get const/iri-filter)
-                             (parse-filter-function var vars))]
-    (if-let [f (some->> [lang-matcher filter-fn]
-                        (remove nil?)
-                        not-empty
-                        (apply every-binary-pred))]
-      (where/->var-filter var f)
-      (where/unmatched-var var))))
+  [var attrs vars context]
+  (if (and (contains? attrs const/iri-type)
+           (contains? attrs const/iri-language))
+    (throw (ex-info "Language tags are not allowed when the data type is specified."
+                    {:status 400, :error :db/invalid-query}))
+    (let [var-mch      (where/unmatched-var var)
+          t            (get attrs const/iri-t)
+          t-matcher    (some-> t (where/transaction-matcher))
+          dt           (get attrs const/iri-type)
+          dt-matcher   (some-> dt (where/datatype-matcher context))
+          lang         (get attrs const/iri-language)
+          lang-matcher (some-> lang where/lang-matcher)
+          filter-fn    (some-> attrs
+                               (get const/iri-filter)
+                               (parse-filter-function var vars context))
+          f            (combine-filters t-matcher dt-matcher lang-matcher filter-fn)]
+      (cond-> var-mch
+        (v/variable? dt)   (where/link-dt-var dt)
+        (v/variable? lang) (where/link-lang-var lang)
+        (v/variable? t)    (where/link-t-var t)
+        f                  (where/with-filter f)))))
 
 (defn generate-subject-var
   "Generate a unique subject variable"
@@ -294,9 +336,6 @@
         (where/->predicate const/iri-rdf-type reverse)
         (where/->predicate expanded reverse)))))
 
-(def id-predicate-match
-  (parse-predicate const/iri-id nil))
-
 (declare parse-statement parse-statements)
 
 (defn flip-reverse-pattern
@@ -311,7 +350,7 @@
     (if-let [v (get o* const/iri-value)]
       (let [attrs (dissoc o* const/iri-value)
             o-mch (if-let [var (parse-var-name v)]
-                    (parse-variable-attributes var attrs vars)
+                    (parse-variable-attributes var attrs vars context)
                     (parse-value-attributes v attrs context))]
         [(flip-reverse-pattern [s-mch p-mch o-mch])])
       ;; ref
@@ -384,10 +423,11 @@
   (parse-node-map m vars context))
 
 (defmethod parse-pattern :filter
-  [[_ & codes] _vars _context]
+  [[_ & codes] _vars context]
   (let [f (->> codes
                (map parse-code)
-               (map eval/compile)
+               (map (fn [code]
+                      (eval/compile code context)))
                (apply every-pred))]
     [(where/->pattern :filter (with-meta f {:fns codes}))]))
 
@@ -407,12 +447,12 @@
         optionals))
 
 (defmethod parse-pattern :bind
-  [[_ & binds] _vars _context]
-  (let [parsed (parse-bind-map binds)]
+  [[_ & binds] _vars context]
+  (let [parsed (parse-bind-map binds context)]
     [(where/->pattern :bind parsed)]))
 
 (defmethod parse-pattern :values
-  [[_ values] vars context]
+  [[_ values] _vars context]
   (let [[_vars solutions] (parse-values values context)]
     [(where/->pattern :values solutions)]))
 
@@ -442,19 +482,19 @@
         syntax/coerce-where
         (parse-where-clause vars context))))
 
-(defn parse-as-fn
-  [f]
+(defn parse-select-as-fn
+  [f context]
   (let [parsed-fn  (parse-code f)
         fn-name    (some-> parsed-fn second first)
         bind-var   (last parsed-fn)
         aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
     (-> parsed-fn
-        eval/compile
+        (eval/compile context)
         (select/as-selector bind-var aggregate?))))
 
-(defn parse-fn
-  [f]
-  (-> f parse-code eval/compile select/aggregate-selector))
+(defn parse-select-aggregate
+  [f context]
+  (-> f parse-code (eval/compile context) select/aggregate-selector))
 
 (defn reverse?
   [context k]
@@ -512,11 +552,11 @@
         :var (-> selector-val symbol select/variable-selector)
         :aggregate (case (first selector-val)
                      :string-fn (if (re-find #"^\(as " s)
-                                  (parse-as-fn s)
-                                  (parse-fn s))
+                                  (parse-select-as-fn s context)
+                                  (parse-select-aggregate s context))
                      :list-fn (if (= 'as (first s))
-                                (parse-as-fn s)
-                                (parse-fn s)))
+                                (parse-select-as-fn s context)
+                                (parse-select-aggregate s context)))
         :select-map (parse-select-map s depth context)))))
 
 (defn parse-select-clause
@@ -577,9 +617,9 @@
                          [v :desc])))))))
 
 (defn parse-having
-  [q]
+  [q context]
   (if-let [code (some-> q :having parse-code)]
-    (assoc q :having (eval/compile code))
+    (assoc q :having (eval/compile code context))
     q))
 
 (defn parse-fuel
@@ -603,7 +643,7 @@
          (cond-> (seq values) (assoc :values values)
                  grouping (assoc :group-by grouping)
                  ordering (assoc :order-by ordering))
-         parse-having
+         (parse-having context)
          (parse-select context)
          parse-fuel))))
 
@@ -626,7 +666,8 @@
   (let [datatype* (iri/normalize datatype)]
     (if (= datatype* const/iri-id)
       (where/match-iri (json-ld/expand-iri v context))
-      (where/anonymous-value v datatype* metadata))))
+      (-> (where/anonymous-value v datatype*)
+          (where/match-meta metadata)))))
 
 (defn parse-obj-cmp
   [allowed-vars context subj-cmp pred-cmp m triples
@@ -713,7 +754,7 @@
     (catch* e
             (throw (ex-info (str "Parsing failure due to: " (ex-message e)
                                  ". Query: " expanded)
-                            (ex-data e)
+                            (or (ex-data e) {})
                             e)))))
 
 (defn parse-txn

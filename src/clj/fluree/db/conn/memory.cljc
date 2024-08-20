@@ -87,12 +87,6 @@
      (binding [*out* w]
        (pr (connection/printer-map conn)))))
 
-(defn ledger-defaults
-  "Normalizes ledger defaults settings"
-  [{:keys [did] :as _defaults}]
-  (go
-    {:did did}))
-
 (defn default-memory-nameservice
   "Returns memory nameservice"
   [store]
@@ -102,8 +96,7 @@
   "Creates a new memory connection."
   [{:keys [parallelism lru-cache-atom cache-max-mb defaults nameservices]}]
   (go-try
-    (let [ledger-defaults (<? (ledger-defaults defaults))
-          conn-id         (str (random-uuid))
+    (let [conn-id         (str (random-uuid))
           state           (connection/blank-state)
           mem-store       (memory-storage/create)
           nameservices*   (util/sequential
@@ -122,7 +115,7 @@
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]
       (map->MemoryConnection {:id              conn-id
-                              :ledger-defaults ledger-defaults
+                              :ledger-defaults defaults
                               :store           mem-store
                               :parallelism     parallelism
                               :msg-in-ch       (async/chan)

@@ -10,7 +10,8 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.iri :as iri])
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -23,14 +24,35 @@
   (assoc unmatched ::var var-sym))
 
 (defn match-value
+  ([mch x]
+   (assoc mch ::val x))
   ([mch x dt-iri]
-   (assoc mch
-     ::val x
-     ::datatype-iri dt-iri))
-  ([mch x dt-iri m]
    (-> mch
-       (match-value x dt-iri)
-       (assoc ::meta m))))
+       (match-value x)
+       (assoc ::datatype-iri dt-iri))))
+
+(defn matched-value?
+  [match]
+  (-> match ::val some?))
+
+(defn get-value
+  [match]
+  (::val match))
+
+(defn get-variable
+  [match]
+  (::var match))
+
+(defn get-datatype-iri
+  [mch]
+  (if (or (contains? mch ::iri)
+          (contains? mch ::sids))
+    const/iri-id
+    (-> mch ::datatype-iri iri/unwrap)))
+
+(defn match-sid
+  [iri-mch db-alias sid]
+  (update iri-mch ::sids assoc db-alias sid))
 
 (defn match-iri
   ([iri]
@@ -38,43 +60,66 @@
   ([mch iri]
    (assoc mch ::iri iri)))
 
-(defn get-iri
-  [match]
-  (::iri match))
-
 (defn matched-iri?
   [match]
   (-> match ::iri some?))
 
-(defn matched-value?
-  [match]
-  (-> match ::val some?))
+(defn iri-datatype?
+  [mch]
+  (-> mch get-datatype-iri (= const/iri-id)))
 
-(defn match-sid
-  [iri-mch db-alias sid]
-  (update iri-mch ::sids assoc db-alias sid))
+(defn get-iri
+  [match]
+  (cond
+    (matched-iri? match)  (::iri match)
+    (iri-datatype? match) (get-value match)))
 
 (defn matched-sid?
   [mch]
-  (contains? mch ::sids))
+  (and (map? mch)
+       (contains? mch ::sids)))
 
 (defn get-sid
   [iri-mch db]
   (let [db-alias (:alias db)]
     (get-in iri-mch [::sids db-alias])))
 
-(defn get-datatype-iri
+(defn match-meta
+  [mch m]
+  (assoc mch ::meta m))
+
+(defn get-meta
+  [match]
+  (::meta match))
+
+(defn match-lang
+  [mch value lang]
+  (-> mch
+      (match-value value const/iri-lang-string)
+      (update ::meta assoc :lang lang)))
+
+(defn get-lang
   [mch]
-  (if (or (matched-iri? mch)
-          (matched-sid? mch))
-    const/iri-anyURI
-    (::datatype-iri mch)))
+  (-> mch get-meta (get :lang)))
+
+(defn match-transaction
+  [mch t]
+  (assoc mch ::t t))
+
+(defn get-transaction
+  [mch]
+  (::t mch))
 
 (defn matched?
   [match]
   (or (matched-value? match)
       (matched-iri? match)
       (matched-sid? match)))
+
+(defn get-binding
+  [match]
+  (or (get-value match)
+      (get-iri match)))
 
 (defn all-matched?
   [[s p o]]
@@ -87,37 +132,50 @@
   without an associated value."
   (complement matched?))
 
+(defn untyped-value
+  [v]
+  (match-value unmatched v))
+
 (defn anonymous-value
   "Build a pattern that already matches an explicit value."
   ([v]
    (let [dt-iri (datatype/infer-iri v)]
      (anonymous-value v dt-iri)))
   ([v dt-iri]
-   (match-value unmatched v dt-iri))
-  ([v dt-iri m]
-   (match-value unmatched v dt-iri m)))
+   (match-value unmatched v dt-iri)))
 
 (defn unmatched-var?
   [match]
   (and (contains? match ::var)
        (unmatched? match)))
 
-(defn get-value
-  [match]
-  (::val match))
+(defn link-var
+  [mch var-type var]
+  (assoc-in mch [::linked-vars var-type] var))
 
-(defn get-variable
-  [match]
-  (::var match))
+(defn get-linked-vars
+  [mch]
+  (::linked-vars mch))
 
-(defn get-binding
-  [match]
-  (or (get-value match)
-      (get-iri match)))
+(defn linked-vars?
+  [mch]
+  (contains? mch ::linked-vars))
 
-(defn get-meta
-  [match]
-  (::meta match))
+(defn unlink-vars
+  [mch]
+  (dissoc mch ::linked-vars))
+
+(defn link-lang-var
+  [mch var]
+  (link-var mch :lang var))
+
+(defn link-dt-var
+  [mch var]
+  (link-var mch :dt var))
+
+(defn link-t-var
+  [mch var]
+  (link-var mch :t var))
 
 (defn sanitize-match
   [match]
@@ -141,15 +199,49 @@
            first
            (= \?))))
 
+(defn matched-lang?
+  [mch lang]
+  (-> mch get-lang (= lang)))
+
 (defn lang-matcher
   "Return a function that returns true if the language metadata of a matched
   pattern equals the supplied language code `lang`."
   [lang]
   (fn [soln mch]
-    (let [lang* (if (variable? lang)
-                  (-> soln (get lang) get-value)
-                  lang)]
-      (-> mch ::meta :lang (= lang*)))))
+    (if (variable? lang)
+      (if-let [lang* (some-> soln (get lang) get-value)]
+        (matched-lang? mch lang*)
+        true)
+      (matched-lang? mch lang))))
+
+(defn matched-datatype?
+  [mch dt-iri]
+  (-> mch get-datatype-iri (= dt-iri)))
+
+(defn datatype-matcher
+  "Return a function that returns true if the datatype of a matched pattern equals
+  the supplied datatype iri `type`."
+  [type context]
+  (fn [soln mch]
+    (if (variable? type)
+      (if-let [dt-iri (some-> soln (get type) get-iri iri/unwrap)]
+        (matched-datatype? mch dt-iri)
+        true)
+      (let [dt-iri (json-ld/expand-iri type context)]
+        (matched-datatype? mch dt-iri)))))
+
+(defn matched-transaction?
+  [mch t]
+  (-> mch get-transaction (= t)))
+
+(defn transaction-matcher
+  [t]
+  (fn [soln mch]
+    (if (variable? t)
+      (if-let [t* (some-> soln (get t) get-value)]
+        (matched-transaction? mch t*)
+        true)
+      (matched-transaction? mch t))))
 
 (defn with-filter
   [mch f]
@@ -257,16 +349,52 @@
   "Matches the object, data type, and metadata of the supplied `flake` to the
   triple object pattern component `o-match`."
   [o-match db flake]
-  (let [dt (flake/dt flake)]
-    (if (= const/$xsd:anyURI dt)
+  (let [o-match* (-> o-match
+                     (match-transaction (flake/t flake))
+                     (match-meta (flake/m flake)))
+        dt (flake/dt flake)]
+    (if (= const/$id dt)
       (let [alias (:alias db)
             oid   (flake/o flake)
             o-iri (iri/decode-sid db oid)]
-        (-> o-match
+        (-> o-match*
             (match-sid alias oid)
             (match-iri o-iri)))
       (let [dt-iri (iri/decode-sid db dt)]
-        (match-value o-match (flake/o flake) dt-iri (flake/m flake))))))
+        (match-value o-match* (flake/o flake) dt-iri)))))
+
+(defn match-linked-datatype
+  [var db flake]
+  (let [var-mch (unmatched-var var)
+        dt-sid (flake/dt flake)
+        dt-iri (iri/decode-sid db dt-sid)]
+    (match-iri var-mch dt-iri)))
+
+(defn match-linked-lang
+  [var flake]
+  (let [var-mch (unmatched-var var)
+        lang    (-> flake flake/m :lang)]
+    (match-value var-mch lang const/iri-string)))
+
+(defn match-linked-t
+  [var flake]
+  (let [var-mch (unmatched-var var)
+        t       (flake/t flake)]
+    (match-value var-mch t const/iri-long)))
+
+(defn match-linked-var
+  [var-type linked-var db flake]
+  (case var-type
+    :dt   (match-linked-datatype linked-var db flake)
+    :lang (match-linked-lang linked-var flake)
+    :t    (match-linked-t linked-var flake)))
+
+(defn match-linked-vars
+  [solution o-mch db flake]
+  (reduce (fn [soln [var-type linked-var]]
+            (let [var-mch (match-linked-var var-type linked-var db flake)]
+              (assoc soln linked-var var-mch)))
+          solution (get-linked-vars o-mch)))
 
 (defn match-flake
   "Assigns the unmatched variables within the supplied `triple-pattern` to their
@@ -276,8 +404,10 @@
     (cond-> solution
       (unmatched-var? s) (assoc (::var s) (match-subject s db flake))
       (unmatched-var? p) (assoc (::var p) (match-predicate p db flake))
-      (unmatched-var? o) (assoc (::var o) (match-object o db flake)))))
-
+      (unmatched-var? o) (assoc (::var o) (-> o
+                                              unlink-vars
+                                              (match-object db flake)))
+      (linked-vars? o)   (match-linked-vars o db flake))))
 
 (defn augment-object-fn
   "Returns a pair consisting of an object value and boolean function that will
@@ -305,54 +435,50 @@
     [o o-fn]))
 
 (defn resolve-flake-range
-  ([db fuel-tracker error-ch components]
-   (resolve-flake-range db fuel-tracker nil error-ch components))
+  [{:keys [t] :as db} fuel-tracker error-ch [s-mch p-mch o-mch]]
+  (let [s    (get-sid s-mch db)
+        s-fn (::fn s-mch)
+        p    (get-sid p-mch db)
+        p-fn (::fn p-mch)
+        o    (or (get-value o-mch)
+                 (get-sid o-mch db))
+        o-fn (::fn o-mch)
+        o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
 
-  ([{:keys [t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
-   (let [s    (get-sid s-mch db)
-         s-fn (::fn s-mch)
-         p    (get-sid p-mch db)
-         p-fn (::fn p-mch)
-         o    (or (get-value o-mch)
-                  (get-sid o-mch db))
-         o-fn (::fn o-mch)
-         o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
-
-         idx         (try* (index/for-components s p o o-dt)
-                           (catch* e
-                             (log/error e "Error resolving flake range")
-                             (async/put! error-ch e)))
-         [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
-         start-flake (flake/create s p o* o-dt nil nil util/min-integer)
-         end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
-         track-fuel  (when fuel-tracker
-                       (fuel/track fuel-tracker error-ch))
-         subj-filter (when s-fn
-                       (filter (fn [f]
-                                 (-> unmatched
-                                     (match-subject db f)
-                                     s-fn))))
-         pred-filter (when p-fn
-                       (filter (fn [f]
-                                 (-> unmatched
-                                     (match-predicate db f)
-                                     p-fn))))
-         obj-filter  (when o-fn*
-                       (filter (fn [f]
-                                 (-> unmatched
-                                     (match-object db f)
-                                     o-fn*))))
-         flake-xf*   (->> [subj-filter pred-filter obj-filter
-                           flake-xf track-fuel]
-                          (remove nil?)
-                          (apply comp))
-         opts        {:idx         idx
-                      :from-t      t
-                      :to-t        t
-                      :start-flake start-flake
-                      :end-flake   end-flake
-                      :flake-xf    flake-xf*}]
-     (query-range/resolve-flake-slices db idx error-ch opts))))
+        idx         (try* (index/for-components s p o o-dt)
+                          (catch* e
+                                  (log/error e "Error resolving flake range")
+                                  (async/put! error-ch e)))
+        [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
+        start-flake (flake/create s p o* o-dt nil nil util/min-integer)
+        end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
+        track-fuel  (when fuel-tracker
+                      (fuel/track fuel-tracker error-ch))
+        subj-filter (when s-fn
+                      (filter (fn [f]
+                                (-> unmatched
+                                    (match-subject db f)
+                                    s-fn))))
+        pred-filter (when p-fn
+                      (filter (fn [f]
+                                (-> unmatched
+                                    (match-predicate db f)
+                                    p-fn))))
+        obj-filter  (when o-fn*
+                      (filter (fn [f]
+                                (-> unmatched
+                                    (match-object db f)
+                                    o-fn*))))
+        flake-xf    (->> [subj-filter pred-filter obj-filter track-fuel]
+                        (remove nil?)
+                        (apply comp))
+        opts        {:idx         idx
+                     :from-t      t
+                     :to-t        t
+                     :start-flake start-flake
+                     :end-flake   end-flake
+                     :flake-xf    flake-xf}]
+    (query-range/resolve-flake-slices db idx error-ch opts)))
 
 
 (defn compute-sid
@@ -589,30 +715,36 @@
     (-> (match-clause db fuel-tracker solution clause error-ch)
         (async/pipe opt-ch))))
 
-(defn add-fn-result-to-solution
+(defn bind-function-result
   [solution var-name result]
   (let [dt  (datatype/infer-iri result)
-        mch (-> var-name
-                unmatched-var
-                (match-value result dt))]
-    (assoc solution var-name mch)))
+        mch (if (= dt const/iri-id)
+              (-> var-name unmatched-var (match-iri result))
+              (-> var-name unmatched-var (match-value result dt)))]
+    (if-let [current (get solution var-name)]
+      (when (and (= (-> mch get-binding iri/unwrap) (get-binding current))
+                 (= (-> mch get-datatype-iri iri/unwrap) (get-datatype-iri current))
+                 (= (get-lang mch) (get-lang current)))
+        solution)
+      (assoc solution var-name mch))))
 
 (defmethod match-pattern :bind
   [_db _fuel-tracker solution pattern error-ch]
-  (let [bind (pattern-data pattern)]
-    (go
-      (let [result
-            (reduce (fn [solution* b]
-                      (let [f        (::fn b)
-                            var-name (::var b)]
-                        (try*
-                          (->> (f solution)
-                               (add-fn-result-to-solution solution* var-name))
-                          (catch* e (update solution* ::errors conj e)))))
-                    solution (vals bind))]
-        (when-let [errors (::errors result)]
-          (async/onto-chan! error-ch errors))
-        result))))
+  (go
+    (let [binds     (-> pattern pattern-data vals)
+          solution* (reduce (fn [soln b]
+                              (let [f        (::fn b)
+                                    var-name (::var b)]
+                                (try*
+                                  (let [result (f soln)]
+                                    (or (bind-function-result soln var-name result)
+                                        (assoc soln ::invalidated true)))
+                                  (catch* e (update soln ::errors conj e)))))
+                            solution binds)]
+      (if-let [errors (::errors solution*)]
+        (async/onto-chan! error-ch errors)
+        (when-not (::invalidated solution*)
+          solution*)))))
 
 (def blank-solution {})
 

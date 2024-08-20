@@ -10,6 +10,8 @@
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]))
 
+(def commit-version 1)
+
 (comment
   ;; commit map - this map is what gets recorded in a few places:
   ;; - in a 'commit' file: (translated to JSON-LD, and optionally wrapped in a Verifiable Credential)
@@ -59,7 +61,7 @@
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
   [["@context" "https://ns.flur.ee/ledger/v1"]
    ["id" :id]
-   ["v" 0]
+   ["v" :v]
    ["address" :address]
    ["type" ["Commit"]]
    ["alias" :alias]
@@ -168,7 +170,7 @@
 (defn parse-db-data
   [data]
   {:id      (:id data)
-   :t       (get-first-value data const/iri-t)
+   :t       (get-first-value data const/iri-fluree-t)
    :address (get-first-value data const/iri-address)
    :flakes  (get-first-value data const/iri-flakes)
    :size    (get-first-value data const/iri-size)})
@@ -275,7 +277,7 @@
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
-  [alias branch ns-addresses]
+  [alias branch ns-addresses init-time]
   (let [commit-json  (->json-ld {:alias  alias
                                  :v      0
                                  :branch (if branch
@@ -284,7 +286,7 @@
                                  :data   {:t      0
                                           :flakes 0
                                           :size   0}
-                                 :time   (util/current-time-iso)
+                                 :time   init-time
                                  :ns     (mapv #(if (map? %)
                                                   %
                                                   {:id %})
@@ -367,7 +369,7 @@
   Assumes commit is not yet created (but db is persisted), so
   commit-id and commit-address are added after finalizing and persisting commit."
   [{:keys [old-commit issuer message tag dbid t db-address flakes size author
-           txn-id annotation]
+           txn-id annotation time]
     :as   _commit}]
   (let [prev-data   (select-keys (data old-commit) [:id :address])
         data-commit (new-db-commit dbid t db-address prev-data flakes size)
@@ -376,8 +378,9 @@
                         (dissoc :id :address :data :issuer :time :message :tag
                                 :prev-commit)
                         (assoc :address ""
+                               :v commit-version
                                :data data-commit
-                               :time (util/current-time-iso)))]
+                               :time time))]
     (cond-> commit
             txn-id (assoc :txn txn-id)
             author (assoc :author author)
@@ -391,7 +394,7 @@
   [f]
   (-> f
       flake/dt
-      (= const/$xsd:anyURI)))
+      (= const/$id)))
 
 (defn ref-flakes
   "Returns ref flakes from set of all flakes. Uses Flake datatype to know if a ref."
@@ -465,7 +468,7 @@
      ;; time
      (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil)
      ;; data
-     (flake/create commit-sid const/$_commit:data db-sid const/$xsd:anyURI t true nil)
+     (flake/create commit-sid const/$_commit:data db-sid const/$id t true nil)
 
      ;; db flakes
      ;; t
@@ -484,7 +487,7 @@
   load."
   [db t commit-sid previous-id]
   (let [prev-sid (iri/encode-iri db previous-id)]
-    [(flake/create commit-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
+    [(flake/create commit-sid const/$_previous prev-sid const/$id t true nil)]))
 
 (defn prev-data-flakes
   "Builds and returns a channel containing the previous data flakes for the
@@ -493,7 +496,7 @@
   reifying a ledger from storage on load."
   [db db-sid t prev-data-id]
   (let [prev-sid (iri/encode-iri db prev-data-id)]
-    [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
+    [(flake/create db-sid const/$_previous prev-sid const/$id t true nil)]))
 
 (defn issuer-flakes
   "Builds and returns a channel containing the credential issuer's flakes for
@@ -505,11 +508,11 @@
   [db t commit-sid issuer-iri]
   (if-let [issuer-sid (iri/encode-iri db issuer-iri)]
     ;; create reference to existing issuer
-    [(flake/create commit-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true
+    [(flake/create commit-sid const/$_commit:signer issuer-sid const/$id t true
                    nil)]
     ;; create new issuer flake and a reference to it
     (let [new-issuer-sid (iri/encode-iri db issuer-iri)]
-      [(flake/create commit-sid const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
+      [(flake/create commit-sid const/$_commit:signer new-issuer-sid const/$id t
                      true nil)])))
 
 (defn message-flakes
@@ -537,7 +540,7 @@
           parsed       (q-parse/parse-triples allowed-vars nil (util/sequential annotation))
           a-sid        (->> parsed ffirst where/get-iri (iri/encode-iri db))
           db-vol       (volatile! db)
-          flakes       (into [(flake/create commit-sid const/$_commit:annotation a-sid const/$xsd:anyURI t true nil)]
+          flakes       (into [(flake/create commit-sid const/$_commit:annotation a-sid const/$id t true nil)]
                              (map (partial update/build-flake db-vol t))
                              parsed)]
       [@db-vol flakes])

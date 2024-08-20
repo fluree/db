@@ -91,10 +91,6 @@
   (binding [*out* w]
     (pr (connection/printer-map conn))))
 
-(defn ledger-defaults
-  [{:keys [did]}]
-  {:did did})
-
 (defn default-S3-nameservice
   "Returns S3 nameservice or will throw if storage-path generates an exception."
   [s3-client s3-bucket s3-prefix]
@@ -120,7 +116,7 @@
       (map->S3Connection {:id              conn-id
                           :store           s3-store
                           :state           state
-                          :ledger-defaults (ledger-defaults defaults)
+                          :ledger-defaults defaults
                           :serializer      serializer
                           :parallelism     parallelism
                           :msg-in-ch       (async/chan)

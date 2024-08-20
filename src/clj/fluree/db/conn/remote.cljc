@@ -59,12 +59,6 @@
      (binding [*out* w]
        (pr (connection/printer-map conn)))))
 
-(defn ledger-defaults
-  "Normalizes ledger defaults settings"
-  [{:keys [did] :as _defaults}]
-  (go
-    {:did did}))
-
 (defn default-remote-nameservice
   "Returns remote nameservice or will throw if generates an exception."
   [server-state state-atom]
@@ -76,8 +70,7 @@
   [{:keys [parallelism lru-cache-atom cache-max-mb defaults servers serializer nameservices]
     :or   {serializer (json-serde)}}]
   (go-try
-    (let [ledger-defaults (<? (ledger-defaults defaults))
-          servers*        (str/split servers #",")
+    (let [servers*        (str/split servers #",")
           server-state    (atom {:servers      servers*
                                  :connected-to nil
                                  :stats        {:connected-at nil}})
@@ -96,6 +89,6 @@
                               :state           state
                               :lru-cache-atom  lru-cache-atom
                               :serializer      serializer
-                              :ledger-defaults ledger-defaults
+                              :ledger-defaults defaults
                               :parallelism     parallelism
                               :nameservices    nameservices*}))))

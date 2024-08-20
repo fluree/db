@@ -462,7 +462,7 @@
   (let [parsed-constraint (parse-term constraint)]
     (if (contains? #{"exists" "not-exists"} (first parsed-constraint))
       parsed-constraint
-      [:filter [parsed-constraint]])))
+      [:filter parsed-constraint])))
 
 (defmethod parse-term :OptionalGraphPattern
   ;; OptionalGraphPattern ::= <'OPTIONAL'> GroupGraphPattern
@@ -483,7 +483,7 @@
   [[_ [tag :as value]]]
   (cond
     ;; iri values need to be wrapped in a value-map
-    (= tag :iri) {const/iri-type const/iri-anyURI const/iri-value (parse-term value)}
+    (= tag :iri) {const/iri-type const/iri-id const/iri-value (parse-term value)}
     (= value "UNDEF")      nil
     :else                  (parse-term value)))
 
