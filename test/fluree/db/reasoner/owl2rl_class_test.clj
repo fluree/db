@@ -478,18 +478,18 @@
 
       (testing "Testing owl:oneOf simple declaration as list"
         (let [db-equiv @(fluree/reason db-base :owl2rl
-                                       {"@context" {"owl" "http://www.w3.org/2002/07/owl#"
-                                                    "ex"  "http://example.org/"}
-                                        "@graph"   [{"@id"                 "ex:RedOrGreen"
-                                                     "@type"               ["owl:Class"]
-                                                     "owl:equivalentClass" [{"@type"     "owl:Class"
-                                                                             "owl:oneOf" {"@list" [{"@id" "ex:Red"}
-                                                                                                   {"@id" "ex:Green"}]}}]}
-                                                    {"@id"                 "ex:RedOrBlue"
-                                                     "@type"               ["owl:Class"]
-                                                     "owl:equivalentClass" [{"@type"     "owl:Class"
-                                                                             "owl:oneOf" {"@list" [{"@id" "ex:Red"}
-                                                                                                   {"@id" "ex:Blue"}]}}]}]})]
+                                       [{"@context" {"owl" "http://www.w3.org/2002/07/owl#"
+                                                     "ex"  "http://example.org/"}
+                                         "@graph"   [{"@id"                 "ex:RedOrGreen"
+                                                      "@type"               ["owl:Class"]
+                                                      "owl:equivalentClass" [{"@type"     "owl:Class"
+                                                                              "owl:oneOf" {"@list" [{"@id" "ex:Red"}
+                                                                                                    {"@id" "ex:Green"}]}}]}
+                                                     {"@id"                 "ex:RedOrBlue"
+                                                      "@type"               ["owl:Class"]
+                                                      "owl:equivalentClass" [{"@type"     "owl:Class"
+                                                                              "owl:oneOf" {"@list" [{"@id" "ex:Red"}
+                                                                                                    {"@id" "ex:Blue"}]}}]}]}])]
           (is (= (list "ex:Green" "ex:Red")
                  (sort
                    @(fluree/query db-equiv
@@ -508,18 +508,18 @@
 
       (testing "Testing owl:oneOf simple declaration as multi-cardinality"
         (let [db-equiv @(fluree/reason db-base :owl2rl
-                                       {"@context" {"owl" "http://www.w3.org/2002/07/owl#"
-                                                    "ex"  "http://example.org/"}
-                                        "@graph"   [{"@id"                 "ex:RedOrGreen"
-                                                     "@type"               ["owl:Class"]
-                                                     "owl:equivalentClass" [{"@type"     "owl:Class"
-                                                                             "owl:oneOf" [{"@id" "ex:Red"}
-                                                                                          {"@id" "ex:Green"}]}]}
-                                                    {"@id"                 "ex:RedOrBlue"
-                                                     "@type"               ["owl:Class"]
-                                                     "owl:equivalentClass" [{"@type"     "owl:Class"
-                                                                             "owl:oneOf" [{"@id" "ex:Red"}
-                                                                                          {"@id" "ex:Blue"}]}]}]})]
+                                       [{"@context" {"owl" "http://www.w3.org/2002/07/owl#"
+                                                     "ex"  "http://example.org/"}
+                                         "@graph"   [{"@id"                 "ex:RedOrGreen"
+                                                      "@type"               ["owl:Class"]
+                                                      "owl:equivalentClass" [{"@type"     "owl:Class"
+                                                                              "owl:oneOf" [{"@id" "ex:Red"}
+                                                                                           {"@id" "ex:Green"}]}]}
+                                                     {"@id"                 "ex:RedOrBlue"
+                                                      "@type"               ["owl:Class"]
+                                                      "owl:equivalentClass" [{"@type"     "owl:Class"
+                                                                              "owl:oneOf" [{"@id" "ex:Red"}
+                                                                                           {"@id" "ex:Blue"}]}]}]}])]
           (is (= (list "ex:Green" "ex:Red")
                  (sort
                    @(fluree/query db-equiv
@@ -561,7 +561,7 @@
                                             "owl:equivalentClass" [{"@type"              ["owl:Class"]
                                                                     "owl:intersectionOf" {"@list" [{"@id" "ex:Woman"}
                                                                                                    {"@id" "ex:Parent"}]}}]}])]
-
+          
           (is (= (list "ex:carol" "ex:jen")
                  (sort
                    @(fluree/query db-reasoned
@@ -635,7 +635,7 @@
                                             "owl:equivalentClass" [{"@type"       ["owl:Class"]
                                                                     "owl:unionOf" {"@list" [{"@id" "ex:Mother"}
                                                                                             {"@id" "ex:Father"}]}}]}])]
-
+          
           (is (= (list "ex:bob" "ex:carol")
                  (sort
                    @(fluree/query db-reasoned
@@ -667,7 +667,7 @@
                                                                                             {"@type"          ["owl:Restriction"]
                                                                                              "owl:onProperty" {"@id" "ex:isParent"}
                                                                                              "owl:hasValue"   true}]}}]}])]
-
+          
           (is (= (list "ex:bob" "ex:carol" "ex:sue")
                  (sort
                    @(fluree/query db-reasoned

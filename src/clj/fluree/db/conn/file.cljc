@@ -97,10 +97,6 @@
      (binding [*out* w]
        (pr (connection/printer-map conn)))))
 
-(defn ledger-defaults
-  [{:keys [did]}]
-  {:did did})
-
 (defn default-file-nameservice
   "Returns file nameservice or will throw if storage-path generates an exception."
   [path]
@@ -129,7 +125,7 @@
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id              conn-id
                             :store           store*
-                            :ledger-defaults (ledger-defaults defaults)
+                            :ledger-defaults defaults
                             :serializer      serializer
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)

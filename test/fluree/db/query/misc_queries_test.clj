@@ -173,56 +173,56 @@
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
                                          :where   {:id '?s, '?p '?o}})]
-          (is (=[["fluree:db:sha256:bbsfu5hq2mkalfpirabumzsohpwwz3legce6hie6tpb6nlqwvzigc"
-                  :f/address
-                  "fluree:memory://1066be3c23dc5635881c1b4ce74cd944fc96b25556bc9508f4a5c1843a4421af"]
-                 ["fluree:db:sha256:bbsfu5hq2mkalfpirabumzsohpwwz3legce6hie6tpb6nlqwvzigc"
-                  :f/flakes
-                  11]
-                 ["fluree:db:sha256:bbsfu5hq2mkalfpirabumzsohpwwz3legce6hie6tpb6nlqwvzigc"
-                  :f/previous
-                  "fluree:db:sha256:beuoec4c6zqxfjglld3evwjdtavsdktncoh6bbxiz677cc4zz3qr"]
-                 ["fluree:db:sha256:bbsfu5hq2mkalfpirabumzsohpwwz3legce6hie6tpb6nlqwvzigc"
-                  :f/size
-                  1082]
-                 ["fluree:db:sha256:bbsfu5hq2mkalfpirabumzsohpwwz3legce6hie6tpb6nlqwvzigc"
-                  :f/t
-                  1]
-                 ["fluree:commit:sha256:bbebuepz3rvtndg3ouopnpzuvwogygngg773ugln7twvzw4czyja7"
-                  "https://www.w3.org/2018/credentials#issuer"
-                  "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                 ["fluree:commit:sha256:bbebuepz3rvtndg3ouopnpzuvwogygngg773ugln7twvzw4czyja7"
-                  :f/address
-                  "fluree:memory://322ca14416b1a885bd87c1d0be9b6bf2a56432fef2456b53e06a335d0aa5b7d5"]
-                 ["fluree:commit:sha256:bbebuepz3rvtndg3ouopnpzuvwogygngg773ugln7twvzw4czyja7"
-                  :f/alias
-                  "query/everything"]
-                 ["fluree:commit:sha256:bbebuepz3rvtndg3ouopnpzuvwogygngg773ugln7twvzw4czyja7"
-                  :f/branch
-                  "main"]
-                 ["fluree:commit:sha256:bbebuepz3rvtndg3ouopnpzuvwogygngg773ugln7twvzw4czyja7"
-                  :f/data
-                  "fluree:db:sha256:bbsfu5hq2mkalfpirabumzsohpwwz3legce6hie6tpb6nlqwvzigc"]
-                 ["fluree:commit:sha256:bbebuepz3rvtndg3ouopnpzuvwogygngg773ugln7twvzw4czyja7"
-                  :f/previous
-                  "fluree:commit:sha256:bvvou3uvnd6ffhehsrw23mw4w3fux5jbpacko2ecosb2nzxkfu5v"]
-                 ["fluree:commit:sha256:bbebuepz3rvtndg3ouopnpzuvwogygngg773ugln7twvzw4czyja7"
-                  :f/time
-                  720000]
-                 ["fluree:commit:sha256:bbebuepz3rvtndg3ouopnpzuvwogygngg773ugln7twvzw4czyja7"
-                  :f/v
-                  0]
-                 [:ex/alice :type :ex/User]
-                 [:ex/alice :schema/age 42]
-                 [:ex/alice :schema/email "alice@flur.ee"]
-                 [:ex/alice :schema/name "Alice"]
-                 [:ex/bob :type :ex/User]
-                 [:ex/bob :schema/age 22]
-                 [:ex/bob :schema/name "Bob"]
-                 [:ex/jane :type :ex/User]
-                 [:ex/jane :schema/age 30]
-                 [:ex/jane :schema/email "jane@flur.ee"]
-                 [:ex/jane :schema/name "Jane"]]
+          (is (= [["fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"
+                   :f/address
+                   "fluree:memory://04be3eee73fc4a553f3b481bfb8867e337a8b2d76a2aea347a3b9c10c8582c6f"]
+                  ["fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"
+                   :f/flakes
+                   11]
+                  ["fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"
+                   :f/previous
+                   "fluree:db:sha256:beuoec4c6zqxfjglld3evwjdtavsdktncoh6bbxiz677cc4zz3qr"]
+                  ["fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"
+                   :f/size
+                   1058]
+                  ["fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"
+                   :f/t
+                   1]
+                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                   "https://www.w3.org/2018/credentials#issuer"
+                   "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
+                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                   :f/address
+                   "fluree:memory://4dce4a82096f49ce3f39ba416cb89aefe5e0d9daa50278631b91672b55324595"]
+                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                   :f/alias
+                   "query/everything"]
+                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                   :f/branch
+                   "main"]
+                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                   :f/data
+                   "fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"]
+                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                   :f/previous
+                   "fluree:commit:sha256:bvvou3uvnd6ffhehsrw23mw4w3fux5jbpacko2ecosb2nzxkfu5v"]
+                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                   :f/time
+                   720000]
+                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                   :f/v
+                   1]
+                  [:ex/alice :type :ex/User]
+                  [:ex/alice :schema/age 42]
+                  [:ex/alice :schema/email "alice@flur.ee"]
+                  [:ex/alice :schema/name "Alice"]
+                  [:ex/bob :type :ex/User]
+                  [:ex/bob :schema/age 22]
+                  [:ex/bob :schema/name "Bob"]
+                  [:ex/jane :type :ex/User]
+                  [:ex/jane :schema/age 30]
+                  [:ex/jane :schema/email "jane@flur.ee"]
+                  [:ex/jane :schema/name "Jane"]]
                  result)
               (str "query result was: " (pr-str result))))))))
 

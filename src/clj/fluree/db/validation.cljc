@@ -240,9 +240,6 @@
    (m/predicate-schemas)
    {::iri                  [:or {:error/message "invalid iri"}
                             :string :keyword]
-    ::iri-key              [:fn iri-key?]
-    ::iri-map              [:map-of {:max 1}
-                            ::iri-key ::iri]
     ::json-ld-keyword      [:keyword {:decode/json decode-json-ld-keyword
                                       :decode/fql  decode-json-ld-keyword}]
     ::var                  [:fn {:error/message "variable should be one or more characters beginning with `?`"}
