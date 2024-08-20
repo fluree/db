@@ -634,7 +634,7 @@
   (if union-patterns
     (->> (mapv parse-term (rest term))
          ;; this presumes that each GroupGraphPattern has the same number of patterns per group
-         (apply map (fn [& patterns] (into [:union] patterns))))
+         (apply map (fn [& patterns] (conj [:union] (vec patterns)))))
     (parse-term group-pattern)))
 
 (defmethod parse-term :GroupGraphPatternSub

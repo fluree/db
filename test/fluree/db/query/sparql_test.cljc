@@ -171,8 +171,8 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?person", "person:age" 70}
               [:union
-               {"@id" "?person", "person:handle" "dsanchez"}
-               {"@id" "?person", "person:handle" "anguyen"}]
+               [{"@id" "?person", "person:handle" "dsanchez"}
+                {"@id" "?person", "person:handle" "anguyen"}]]
               {"@id" "?person", "person:age" "?age"}]
              where)))
     (let [query "SELECT ?title ?author
@@ -181,11 +181,24 @@
                           { ?book dc11:title ?title .  ?book dc11:creator ?author } }"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:union
-               {"@id" "?book" "dc10:title" "?title"}
-               {"@id" "?book" "dc11:title" "?title"}]
+               [{"@id" "?book" "dc10:title" "?title"}
+                {"@id" "?book" "dc11:title" "?title"}]]
               [:union
-               {"@id" "?book" "dc10:creator" "?author"}
-               {"@id" "?book" "dc11:creator" "?author"}]]
+               [{"@id" "?book" "dc10:creator" "?author"}
+                {"@id" "?book" "dc11:creator" "?author"}]]]
+             where)))
+    (let [query "SELECT ?title ?author
+                 WHERE  { { ?book dc10:price ?p1 .  ?book dc10:creator ?author . FILTER ( ?p1> 420 ) }
+                          UNION
+                          { ?book dc11:price ?p2 .  ?book dc11:creator ?author . FILTER ( ?p2 > 42 ) } }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [[:union
+               [{"@id" "?book", "dc10:price" "?p1"}
+                {"@id" "?book", "dc11:price" "?p2"}]]
+              [:union
+               [{"@id" "?book", "dc10:creator" "?author"}
+                {"@id" "?book", "dc11:creator" "?author"}]]
+              [:union [[:filter "(> ?p1 420)"] [:filter "(> ?p2 42)"]]]]
              where))))
   (testing "FILTER"
     (let [query "SELECT ?handle ?num
