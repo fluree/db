@@ -1,12 +1,25 @@
-(ns fluree.db.nameservice.core
-  (:refer-clojure :exclude [exists?])
+(ns fluree.db.nameservice
+  (:refer-clojure :exclude [-lookup exists?])
   (:require [clojure.string :as str]
             [fluree.db.connection :as connection]
-            [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(defprotocol iNameService
+  (-lookup [nameservice ledger-address] [nameservice ledger-alias opts] "Performs lookup operation on ledger alias and returns map of latest commit and other metadata")
+  (-sync? [nameservice] "Indicates if nameservice updates should be performed synchronously, before commit is finalized. Failure will cause commit to fail")
+  (-close [nameservice] "Closes all resources for this nameservice")
+  (-alias [nameservice ledger-address] "Given a ledger address, returns ledger's default alias name else nil, if not avail")
+  (-address [nameservice ledger-alias key] "Returns full nameservice address/iri which will get published in commit. If 'private', return nil."))
+
+(defprotocol Publisher
+  (-push [nameservice commit-data] "Pushes new commit to nameservice."))
+
+(defprotocol Publication
+  (-subscribe [nameservice ledger-alias callback] "Creates a subscription to nameservice(s) for ledger events. Will call callback with event data as received.")
+  (-unsubscribe [nameservice ledger-alias] "Unsubscribes to nameservice(s) for ledger events"))
 
 (defn nameservices
   [conn]
@@ -19,7 +32,7 @@
 (defn ns-address
   "Returns async channel"
   [nameservice ledger-alias branch]
-  (ns-proto/-address nameservice ledger-alias {:branch branch}))
+  (-address nameservice ledger-alias {:branch branch}))
 
 (defn addresses
   "Retrieve address for each nameservices based on a relative ledger-alias.
@@ -60,10 +73,10 @@
     (go-try
       (loop [nameservices* nameservices]
         (when-let [ns (first nameservices*)]
-          (let [sync? (ns-proto/-sync? ns)]
+          (let [sync? (-sync? ns)]
             (if sync?
-              (<? (ns-proto/-push ns json-ld-commit))
-              (ns-proto/-push ns json-ld-commit))
+              (<? (-push ns json-ld-commit))
+              (-push ns json-ld-commit))
             (recur (rest nameservices*))))))))
 
 (defn lookup-commit
@@ -74,7 +87,7 @@
     (go-try
       (loop [nameservices* nameservices]
         (when-let [ns (first nameservices*)]
-          (let [commit-address (<? (ns-proto/-lookup ns ledger-address))]
+          (let [commit-address (<? (-lookup ns ledger-address))]
             (if commit-address
               commit-address
               (recur (rest nameservices*)))))))))
@@ -108,7 +121,7 @@
     (go-try
       (loop [nameservices* nameservices]
         (if-let [ns (first nameservices*)]
-          (let [exists? (<? (ns-proto/-lookup ns ledger-alias))]
+          (let [exists? (<? (-lookup ns ledger-alias))]
             (if exists?
               true
               (recur (rest nameservices*))))
@@ -129,7 +142,7 @@
     (go-try
       (loop [nameservices* nameservices]
         (when-let [ns (first nameservices*)]
-          (<? (ns-proto/-subscribe ns ledger-alias callback))
+          (<? (-subscribe ns ledger-alias callback))
           (recur (rest nameservices*)))))))
 
 (defn unsubscribe-ledger
@@ -139,5 +152,5 @@
     (go-try
       (loop [nameservices* nameservices]
         (when-let [ns (first nameservices*)]
-          (<? (ns-proto/-unsubscribe ns ledger-alias))
+          (<? (-unsubscribe ns ledger-alias))
           (recur (rest nameservices*)))))))

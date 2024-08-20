@@ -19,7 +19,7 @@
             [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.validation :as v]))
 
@@ -236,7 +236,7 @@
     (let [{:keys [t opts] :as sanitized-query} (-> query
                                                    syntax/coerce-query
                                                    (update :opts sanitize-query-options did))
-          
+
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
       (if (or (seq default-aliases)

@@ -5,7 +5,7 @@
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.transact :as tx]
             [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.context :as ctx-util]

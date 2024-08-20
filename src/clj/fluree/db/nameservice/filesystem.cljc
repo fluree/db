@@ -1,5 +1,5 @@
 (ns fluree.db.nameservice.filesystem
-  (:require [fluree.db.nameservice.proto :as ns-proto]
+  (:require [fluree.db.nameservice :as nameservice]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.util.bytes :as bytes]
@@ -204,10 +204,10 @@ changes from different branches into existing metadata map"
 
 (defrecord FileNameService
   [local-path sync? base-address]
-  ns-proto/Publisher
+  nameservice/Publisher
   (-push [_ commit-data] (push! local-path base-address commit-data))
 
-  ns-proto/iNameService
+  nameservice/iNameService
   (-lookup [_ ledger-alias] (lookup ledger-alias local-path base-address nil))
   (-lookup [_ ledger-alias opts] (lookup ledger-alias local-path base-address opts))
   (-sync? [_] sync?)

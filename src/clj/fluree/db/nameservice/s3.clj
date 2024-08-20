@@ -1,5 +1,5 @@
 (ns fluree.db.nameservice.s3
-  (:require [fluree.db.nameservice.proto :as ns-proto]
+  (:require [fluree.db.nameservice :as nameservice]
             [clojure.core.async :as async :refer [go <!]]
             [clojure.string :as str]
             [fluree.db.method.s3.core :as s3]))
@@ -24,10 +24,10 @@
 
 (defrecord S3NameService
   [s3-client s3-bucket s3-prefix sync?]
-  ns-proto/Publisher
+  nameservice/Publisher
   (-push [_ commit-data] (push s3-client s3-bucket s3-prefix commit-data))
 
-  ns-proto/iNameService
+  nameservice/iNameService
   (-lookup [_ ledger-alias] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
   (-lookup [_ ledger-alias _opts] (lookup-alias s3-client s3-bucket s3-prefix ledger-alias))
   (-sync? [_] sync?)

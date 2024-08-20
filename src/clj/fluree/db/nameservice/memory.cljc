@@ -1,5 +1,5 @@
 (ns fluree.db.nameservice.memory
-  (:require [fluree.db.nameservice.proto :as ns-proto]
+  (:require [fluree.db.nameservice :as nameservice]
             [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.db.platform :as platform]
@@ -72,10 +72,10 @@
 
 (defrecord MemoryNameService
   [state-atom sync?]
-  ns-proto/Publisher
+  nameservice/Publisher
   (-push [_ commit-data] (push! state-atom commit-data))
 
-  ns-proto/iNameService
+  nameservice/iNameService
   (-lookup [_ ledger-alias] (lookup state-atom ledger-alias))
   (-lookup [_ ledger-alias opts] (lookup state-atom ledger-alias)) ;; TODO - doesn't support branches yet
   (-sync? [_] sync?)

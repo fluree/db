@@ -10,7 +10,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.reify :as reify]
             [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.query.exec.update :as update]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]

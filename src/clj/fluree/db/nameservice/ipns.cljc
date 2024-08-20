@@ -1,6 +1,6 @@
 (ns fluree.db.nameservice.ipns
   (:require [clojure.string :as str]
-            [fluree.db.nameservice.proto :as ns-proto]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.method.ipfs.core :as ipfs]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
@@ -57,10 +57,10 @@
 
 (defrecord IpnsNameService
   [ipfs-endpoint ipns-key base-address sync?]
-  ns-proto/Publisher
+  nameservice/Publisher
   (-push [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
 
-  ns-proto/iNameService
+  nameservice/iNameService
   (-lookup [_ ledger-alias] (lookup-address ipfs-endpoint ipns-key ledger-alias nil))
   (-lookup [_ ledger-alias opts] (lookup-address ipfs-endpoint ipns-key ledger-alias opts))
   (-sync? [_] sync?)
