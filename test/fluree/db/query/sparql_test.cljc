@@ -230,6 +230,16 @@
       (is (= [{"@id" "?s" "?p" "?o"}
               ["not-exists" [{"@id" "?s" "ex:name" "Larry"}]]]
              where)
+          "NOT EXISTS expression parsing"))
+    (let [query "SELECT ?s
+                 WHERE {
+                   ?s ex:test ?testVar
+                   FILTER (!bound(?testVar))
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s", "ex:test" "?testVar"}
+              [:filter "(not (bound ?testVar))"]]
+             where)
           "NOT EXISTS expression parsing")))
   (testing "OPTIONAL"
     (let [query "SELECT ?handle ?num

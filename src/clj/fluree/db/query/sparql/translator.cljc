@@ -237,6 +237,14 @@
                     {:status 400 :error :db/invalid-query :term arglist})))
   (parse-term iri))
 
+(defmethod parse-term :UnaryExpression
+  [[_ op-or-expr expr]]
+  (condp = op-or-expr
+    "!" (str "(not " (parse-term expr) ")")
+    "+" (str "+" (parse-term expr) ")")
+    "-" (str "-" (parse-term expr) ")")
+    (parse-term op-or-expr)))
+
 (defmethod parse-term :MultiplicativeExpression
   ;; MultiplicativeExpression ::= UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
   ;; <UnaryExpression> ::= '!' PrimaryExpression
