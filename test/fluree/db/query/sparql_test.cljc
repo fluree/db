@@ -171,8 +171,8 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?person", "person:age" 70}
               [:union
-               {"@id" "?person", "person:handle" "dsanchez"}
-               {"@id" "?person", "person:handle" "anguyen"}]
+               [{"@id" "?person", "person:handle" "dsanchez"}
+                {"@id" "?person", "person:handle" "anguyen"}]]
               {"@id" "?person", "person:age" "?age"}]
              where)))
     (let [query "SELECT ?title ?author
@@ -181,11 +181,24 @@
                           { ?book dc11:title ?title .  ?book dc11:creator ?author } }"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:union
-               {"@id" "?book" "dc10:title" "?title"}
-               {"@id" "?book" "dc11:title" "?title"}]
+               [{"@id" "?book" "dc10:title" "?title"}
+                {"@id" "?book" "dc11:title" "?title"}]]
               [:union
-               {"@id" "?book" "dc10:creator" "?author"}
-               {"@id" "?book" "dc11:creator" "?author"}]]
+               [{"@id" "?book" "dc10:creator" "?author"}
+                {"@id" "?book" "dc11:creator" "?author"}]]]
+             where)))
+    (let [query "SELECT ?title ?author
+                 WHERE  { { ?book dc10:price ?p1 .  ?book dc10:creator ?author . FILTER ( ?p1> 420 ) }
+                          UNION
+                          { ?book dc11:price ?p2 .  ?book dc11:creator ?author . FILTER ( ?p2 > 42 ) } }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [[:union
+               [{"@id" "?book", "dc10:price" "?p1"}
+                {"@id" "?book", "dc11:price" "?p2"}]]
+              [:union
+               [{"@id" "?book", "dc10:creator" "?author"}
+                {"@id" "?book", "dc11:creator" "?author"}]]
+              [:union [[:filter "(> ?p1 420)"] [:filter "(> ?p2 42)"]]]]
              where))))
   (testing "FILTER"
     (let [query "SELECT ?handle ?num
@@ -229,6 +242,16 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?s" "?p" "?o"}
               ["not-exists" [{"@id" "?s" "ex:name" "Larry"}]]]
+             where)
+          "NOT EXISTS expression parsing"))
+    (let [query "SELECT ?s
+                 WHERE {
+                   ?s ex:test ?testVar
+                   FILTER (!bound(?testVar))
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s", "ex:test" "?testVar"}
+              [:filter "(not (bound ?testVar))"]]
              where)
           "NOT EXISTS expression parsing")))
   (testing "OPTIONAL"
@@ -332,6 +355,13 @@
               {"@id" "?person", "person:age" "?age"}]
              where)))
     (testing "function calls"
+      (let [query "SELECT ?finger
+                 WHERE {?person ex:thumb ?thumb.
+                        BIND (!bound(?thumb) AS ?finger)}"
+            {:keys [where]} (sparql/->fql query)]
+        (is (= [{"@id" "?person", "ex:thumb" "?thumb"}
+                [:bind "?finger" "(not (bound ?thumb))"]]
+               where)))
       (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day
                         ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes
                         ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore
@@ -556,6 +586,19 @@
           {:keys [offset]} (sparql/->fql query)]
       (is (= 10
              offset))))
+  (testing "LIMIT+OFFSET"
+    (let [query "SELECT ?person
+                 WHERE {?person person:fullName ?fullName}
+                 LIMIT 10
+                 OFFSET 10"]
+      (is (= {:limit 10, :offset 10}
+             (select-keys (sparql/->fql query) [:limit :offset]))))
+    (let [query "SELECT ?person
+                 WHERE {?person person:fullName ?fullName}
+                 OFFSET 10
+                 LIMIT 10"]
+      (is (= {:limit 10, :offset 10}
+             (select-keys (sparql/->fql query) [:limit :offset])))))
   (testing "ORDER BY"
     (testing "ASC"
       (let [query "SELECT ?favNums
