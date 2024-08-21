@@ -226,6 +226,18 @@
           "filter by regex call"))
     (let [query "SELECT ?s
                  WHERE {
+                   ?product1 ex:numProp1 ?p1.
+                   ?product2 ex:numProp2 ?p2.
+                   FILTER (?p1 > (?p2 - 120) && ?p1 < (?p1 + 120))
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?product1", "ex:numProp1" "?p1"}
+              {"@id" "?product2", "ex:numProp2" "?p2"}
+              [:filter "(and (> ?p1 (- ?p2 120)) (< ?p1 (+ ?p1 120)))"]]
+             where)
+          "EXISTS expression parsing"))
+    (let [query "SELECT ?s
+                 WHERE {
                    ?s ?p ?o
                    FILTER EXISTS { ?s ex:name \"Larry\" }
                  }"
