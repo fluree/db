@@ -16,8 +16,8 @@
 (defn extract-supplied-context
   "Retrieves the context from the given data"
   [jsonld]
-  (cond (contains? jsonld :context) (:context jsonld)
-        (contains? jsonld "@context") (get jsonld "@context")))
+  (or (get jsonld "@context")
+      (get jsonld :context)))
 
 (defn txn-context
   "Remove the fluree context from the supplied context."
