@@ -83,8 +83,8 @@
                                    "where" [{"@id" "?s" "schema:name" "?name"}
                                             {"@id" "?s" "schema:email" "?email"}
                                             ["values"
-                                             ["?s" [{"@type" "xsd:anyURI" "@value" "ex:cam"}
-                                                    {"@type" "xsd:anyURI" "@value" "ex:brian"}]]]]}))
+                                             ["?s" [{"@type" "id" "@value" "ex:cam"}
+                                                    {"@type" "id" "@value" "ex:brian"}]]]]}))
             "syntactic form is parsed correctly"))
       (testing "multiple vars"
         (is (= [["Brian" "brian@example.org"]
@@ -94,7 +94,7 @@
                                    "where" [{"@id" "?s" "schema:name" "?name"}
                                             {"@id" "?s" "schema:email" "?email"}
                                             ["values"
-                                             [["?s"] [[{"@type" "xsd:anyURI" "@value" "ex:cam"}]
+                                             [["?s"] [[{"@type" "id" "@value" "ex:cam"}]
                                                       [{"@type" "@id" "@value" "ex:brian"}]]]]]}))
             "syntactic form is parsed correctly"))
       (testing "nested under optional clause"
@@ -106,7 +106,7 @@
                                                "schema:name" "?name"
                                                "ex:cool" "?cool"}
                                               ["values"
-                                               ["?s" [{"@type" "xsd:anyURI" "@value" "ex:nikola"}]]]]]]}))
+                                               ["?s" [{"@type" "id" "@value" "ex:nikola"}]]]]]]}))
             "syntactic form is parsed correctly"))
       (testing "federated"
         (let [db3 @(fluree/create-with-txn conn
@@ -121,8 +121,8 @@
                                             "select" ["?name"]
                                             "where" [{"@id" "?s" "schema:name" "?name"}
                                                      ["values"
-                                                      ["?s" [{"@type" "xsd:anyURI" "@value" "ex:nikola"}
-                                                             {"@type" "xsd:anyURI" "@value" "ex:khris"}]]]]
+                                                      ["?s" [{"@type" "id" "@value" "ex:nikola"}
+                                                             {"@type" "id" "@value" "ex:khris"}]]]]
                                             ;; federated queries async/merge solutions from different
                                             ;; graphs nondeterministically
                                             "orderBy" "?name"}))
