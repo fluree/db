@@ -187,7 +187,7 @@
                      policies
                      (policy-from-query policies))
          val-map   (assoc values-map "?$identity" {"@value" identity
-                                                   "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"})]
+                                                   "@type"  const/iri-id})]
      (log/trace "wrap-identity-policy - extracted policy from identity: " identity
                 " policy: " policies*)
      (if (util/exception? policies*)
