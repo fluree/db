@@ -120,7 +120,7 @@ RelationalExpression	  ::=  	NumericExpression WS ( '=' NumericExpression | '!='
 NumericExpression	  ::=  	WS AdditiveExpression WS
 As ::= WS <('AS' | 'as')> WS
 
-<AdditiveExpression>	  ::=  	MultiplicativeExpression ( '+' MultiplicativeExpression | '-' MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralNegative ) ( ( '*' UnaryExpression ) | ( '/' UnaryExpression ) )* )*
+<AdditiveExpression>	  ::=  	MultiplicativeExpression (WS '+' WS MultiplicativeExpression | WS '-' WS MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralNegative ) ( (WS '*' WS UnaryExpression ) | (WS '/' WS UnaryExpression ) )* )*
 
 
 MultiplicativeExpression ::= UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
