@@ -175,13 +175,12 @@
         (testing "with an iri"
           (let [q {:context [test-utils/default-context
                              {:ex    "http://example.org/ns/"
-                              :value "@value"
-                              :id "@id"}]
+                              :value "@value"}]
                    :select  '[?name ?age]
                    :where   '{:id          ?s
                               :schema/name ?name
                               :schema/age  ?age}
-                   :values  '[?s [{:value :ex/alice, :type :id}]]}]
+                   :values  '[?s [{:value :ex/alice, :type :xsd/anyURI}]]}]
             (is (= [["Alice" 50]]
                    @(fluree/query db q))
                 "returns only the results related to the bound value")))

@@ -1,5 +1,4 @@
 (ns fluree.db.json-ld.vocab
-  "Generates vocabulary/schema pre-cached maps."
   (:require [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.ledger :as jld-ledger]
@@ -10,9 +9,10 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn build-pred-map
-  "In the schema map, we index properties by both sid :id and :iri for easy
-  lookup of either."
+;; generates vocabulary/schema pre-cached maps.
+
+(defn map-pred-id+iri
+  "In the schema map, we index properties by both integer :id and :iri for easy lookup of either."
   [properties]
   (reduce
     (fn [acc prop-map]
@@ -69,6 +69,10 @@
           (assoc acc iri subclasses)))
       subclass-map subclass-map)))
 
+(def property-sids #{const/$rdf:Property
+                     const/$owl:DatatypeProperty
+                     const/$owl:ObjectProperty})
+
 (def ^:const base-property-map
   {:id          nil
    :iri         nil
@@ -77,14 +81,11 @@
    :childProps  #{}
    :datatype    nil})
 
-(defn initial-property-map*
-  [iri sid]
-  (assoc base-property-map :id sid, :iri iri))
-
 (defn initial-property-map
   [db sid]
   (let [iri (iri/decode-sid db sid)]
-    (initial-property-map* iri sid)))
+    (assoc base-property-map :id sid
+                             :iri iri)))
 
 (defn add-subclass
   [prop-map subclass]
@@ -99,13 +100,13 @@
   (update prop-map :parentProps into parent-properties))
 
 (defn update-parent-with-children
-  [prop-map db parent-prop child-props]
+  [db prop-map parent-prop child-props]
   (let [initial-map       (initial-property-map db parent-prop)
         with-new-children (fnil add-child-properties initial-map)]
     (update prop-map parent-prop with-new-children child-props)))
 
 (defn update-child-with-parents
-  [prop-map db child-prop parent-props]
+  [db prop-map child-prop parent-props]
   (let [initial-map      (initial-property-map db child-prop)
         with-new-parents (fnil add-parent-properties initial-map)]
     (update prop-map child-prop with-new-parents parent-props)))
@@ -113,17 +114,17 @@
 (defn add-new-children-to-parents
   "Adds new :childProps to parents in the schema map all the way up
   the hierarchy"
-  [pred-map db all-parents new-child-properties]
+  [db pred-map all-parents new-child-properties]
   (reduce (fn [p-map parent-prop]
-            (update-parent-with-children p-map db parent-prop new-child-properties))
+            (update-parent-with-children db p-map parent-prop new-child-properties))
           pred-map all-parents))
 
 (defn add-new-parents-to-children
   "Adds new :parentProps to children in the schema map all the way down
   the hierarchy"
-  [pred-map db all-children new-parent-properties]
+  [db pred-map all-children new-parent-properties]
   (reduce (fn [p-map child-prop]
-            (update-child-with-parents p-map db child-prop new-parent-properties))
+            (update-child-with-parents db p-map child-prop new-parent-properties))
           pred-map all-children))
 
 (defn update-rdfs-subproperty-of
@@ -132,14 +133,14 @@
 
   owl:equivalentProperty also uses this, as an equivalent property
   relationship is where each property is a subproperty of the other."
-  [pred-map db parent-prop child-prop]
+  [db pred-map parent-prop child-prop]
   (let [parent-parents      (get-in pred-map [parent-prop :parentProps])
         child-children      (get-in pred-map [child-prop :childProps])
         new-parent-children (conj child-children child-prop)
         new-child-parents   (conj parent-parents parent-prop)]
-    (-> pred-map
-        (add-new-children-to-parents db new-child-parents new-parent-children)
-        (add-new-parents-to-children db new-parent-children new-child-parents))))
+    (as-> pred-map props
+          (add-new-children-to-parents db props new-child-parents new-parent-children)
+          (add-new-parents-to-children db props new-parent-children new-child-parents))))
 
 (defn update-related-properties
   "Adds owl:equivalentProperty and rdfs:subPropertyOf rules to the schema map as the
@@ -154,13 +155,13 @@
   For subPropertyOf, the relationship is one way. e.g.:
   [ex:father rdfs:subPropertyOf ex:parent]
    - ex:parent -> ex:father"
-  [pred-map db sid pid obj]
+  [db pred-map sid pid obj]
   (if (iri/sid? obj)
     (if (= const/$owl:equivalentProperty pid)
-      (-> pred-map
-          (update-rdfs-subproperty-of db sid obj)
-          (update-rdfs-subproperty-of db obj sid))
-      (update-rdfs-subproperty-of pred-map db obj sid))
+      (as-> pred-map props
+            (update-rdfs-subproperty-of db props sid obj)
+            (update-rdfs-subproperty-of db props obj sid))
+      (update-rdfs-subproperty-of db pred-map obj sid))
     (do
       (log/warn (str "Triple of ["
                      (iri/decode-sid db sid) " "
@@ -175,7 +176,7 @@
       pred-map)))
 
 (defn update-pred-map
-  [pred-map db vocab-flake]
+  [db pred-map vocab-flake]
   (let [[sid pid obj]   ((juxt flake/s flake/p flake/o) vocab-flake)
         initial-map     (initial-property-map db sid)
         with-subclass   (fnil add-subclass initial-map)]
@@ -185,28 +186,20 @@
 
       (or (= const/$owl:equivalentProperty pid)
           (= const/$rdfs:subPropertyOf pid))
-      (update-related-properties pred-map db sid pid obj)
+      (update-related-properties db pred-map sid pid obj)
 
       :else pred-map)))
 
-(def initial-type-map
-  (assoc (initial-property-map* const/iri-type const/$rdf:type)
-         :datatype const/$id))
-
-(def initial-class-map
-  (assoc (initial-property-map* const/iri-class const/$rdfs:Class)
-         :datatype const/$id))
-
 (defn with-vocab-flakes
-  [pred-map db vocab-flakes]
-  (let [new-pred-map  (reduce (fn [pred-map* vocab-flake]
-                                (update-pred-map pred-map*  db vocab-flake))
-                              pred-map vocab-flakes)]
+  [db pred-map vocab-flakes]
+  (let [new-pred-map  (reduce (partial update-pred-map db) pred-map vocab-flakes)]
     (reduce-kv (fn [preds k v]
                  (if (iri/sid? k)
                    (assoc preds k v, (:iri v) v)
                    preds))
-               {const/iri-type initial-type-map} new-pred-map)))
+               {"@type" {:iri "@type"
+                         :id  const/$rdf:type}}
+               new-pred-map)))
 
 (defn refresh-subclasses
   [{:keys [pred] :as schema}]
@@ -216,12 +209,15 @@
   [schema db t vocab-flakes]
   (-> schema
       (assoc :t t)
-      (update :pred with-vocab-flakes db vocab-flakes)
+      (update :pred (partial with-vocab-flakes db) vocab-flakes)
       refresh-subclasses))
 
 (defn base-schema
   []
-  (let [pred (build-pred-map [initial-type-map initial-class-map])]
+  (let [pred (map-pred-id+iri [{:iri "@type"
+                                :id  const/$rdf:type}
+                               {:iri "http://www.w3.org/2000/01/rdf-schema#Class"
+                                :id  const/$rdfs:Class}])]
     {:t          0
      :pred       pred
      :shapes     (atom {:class {} ; TODO: Does this need to be an atom?
@@ -312,26 +308,28 @@
               (-> schema
                   (assoc-in [:pred pid] pred-meta)
                   (assoc-in [:pred iri] pred-meta))))
-          schema pred-tuples))
+          schema
+          pred-tuples))
 
 (defn add-pid
-  [preds db pid]
+  [db preds pid]
   (if (contains? preds pid)
     preds
     (let [{:keys [iri] :as p-map} (initial-property-map db pid)]
       (assoc preds pid p-map, iri p-map))))
 
 (defn add-predicates
-  [pred-map db pids]
-  (reduce (fn [pred-map* pid]
-            (add-pid pred-map* db pid))
+  [db pred-map pids]
+  (reduce (partial add-pid db)
           pred-map pids))
 
-(defn update-schema
-  [{:keys [schema t] :as db} pids vocab-flakes]
-  (-> schema
-      (update :pred add-predicates db pids)
-      (update-with db t vocab-flakes)))
+(defn build-schema
+  [db pids vocab-flakes]
+  (let [{:keys [schema t]} db
+        schema* (-> schema
+                    (update :pred (partial add-predicates db) pids)
+                    (as-> s (update-with s db t vocab-flakes)))]
+    schema*))
 
 (defn hydrate-schema
   "Updates the :schema key of db by processing just the vocabulary flakes out of
@@ -339,18 +337,28 @@
   ([db new-flakes]
    (hydrate-schema db new-flakes {}))
   ([db new-flakes mods]
-   (let [pred-sids      (collect-predicate-ids db new-flakes)
-         vocab-flakes   (into #{}
-                              (filter (fn [f]
-                                        (or (contains? pred-sids (flake/s f))
-                                            (contains? jld-ledger/predicate-refs (flake/p f)))))
-                              new-flakes)
-         pred-datatypes (pred-dt-constraints new-flakes)
-         schema         (-> db
-                            (update-schema pred-sids vocab-flakes)
-                            (add-pred-datatypes pred-datatypes))]
+   (let [pred-sids    (collect-predicate-ids db new-flakes)
+         vocab-flakes (into #{}
+                            (filter (fn [f]
+                                      (or (contains? pred-sids (flake/s f))
+                                          (contains? jld-ledger/predicate-refs (flake/p f)))))
+                            new-flakes)
+         schema       (-> (build-schema db pred-sids vocab-flakes)
+                          (add-pred-datatypes (pred-dt-constraints new-flakes)))]
      (invalidate-shape-cache! db mods)
      (assoc db :schema schema))))
+
+(defn serialize-schema-predicates
+  [schema]
+  (reduce (fn [root [k {:keys [datatype]}]]
+            (if (iri/sid? k)
+              (let [sid (iri/serialize-sid k)]
+                (if datatype
+                  (conj root [sid (iri/serialize-sid datatype)])
+                  (conj root [sid])))
+              root))
+          []
+          (:pred schema)))
 
 (defn load-schema
   [{:keys [t] :as db} preds]
@@ -370,23 +378,8 @@
             (add-pred-datatypes (filterv #(> (count %) 1) preds)))))))
 
 ;; schema serialization
-(def ^:const serialized-pred-keys
-  [:id :datatype :subclassOf :parentProps :childProps])
-
-(def ^:const serialized-pred-keys-reverse
-  (reverse serialized-pred-keys))
-
-(defn serialize-property-set
-  [tuple st]
-  (if (seq st)
-    (conj tuple
-          (mapv #(if (iri/sid? %)
-                   (iri/serialize-sid %)
-                   %)
-                st))
-    (if (seq tuple) ; if 'tuple' is still empty, keep it that if nothing to add
-      (conj tuple nil)
-      tuple)))
+(def ^:const serialized-pred-keys [:id :datatype :subclassOf :parentProps :childProps])
+(def ^:const serialized-pred-keys-reverse (reverse serialized-pred-keys))
 
 (defn schema-tuple
   [pred-map]
@@ -395,7 +388,15 @@
      (let [next-val (get pred-map next-key)]
        (cond
          (set? next-val)
-         (serialize-property-set acc next-val)
+         (if (seq next-val) ;; non-empty?
+           (conj acc
+                 (mapv #(if (iri/sid? %)
+                          (iri/serialize-sid %)
+                          %)
+                       next-val))
+           (if (seq acc) ;; if 'acc' is still empty, keep it that if nothing to add
+             (conj acc nil)
+             acc))
 
          (iri/sid? next-val)
          (conj acc (iri/serialize-sid next-val))
@@ -417,9 +418,7 @@
   [{:keys [t pred] :as _db-schema}]
   (let [pred-keys (mapv name serialized-pred-keys)
         pred-vals (->> pred
-                       (filter #(string? (key %))) ; every pred map is
-                                                   ; duplicated for both keys
-                                                   ; iri, and sid - keep only 1
+                       (filter #(string? (key %))) ;; every pred map is duplicated for both keys iri, and sid - keep only 1
                        vals
                        (mapv schema-tuple))]
     {"t"    t
@@ -478,3 +477,4 @@
         (assoc :t t
                :pred pred)
         (refresh-subclasses))))
+

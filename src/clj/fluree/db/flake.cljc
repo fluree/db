@@ -578,7 +578,7 @@
         o-size  (#?@(:clj (util/case+)
                      :cljs (condp =)) dt
                   const/$xsd:string (* 2 (count o))
-                  const/$id (iri/measure-sid o)
+                  const/$xsd:anyURI (iri/measure-sid o)
                   const/$xsd:boolean 1
                   const/$xsd:long 8
                   const/$xsd:int 4
@@ -608,4 +608,4 @@
 
 (defn ref-flake?
   [f]
-  (= const/$id (dt f)))
+  (= const/$xsd:anyURI (dt f)))

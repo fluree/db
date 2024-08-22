@@ -14,7 +14,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (def default-data-types
-  {"@id"                                                   const/$id
+  {"http://www.w3.org/2001/XMLSchema#anyURI"               const/$xsd:anyURI
    "http://www.w3.org/2001/XMLSchema#string"               const/$xsd:string
    "http://www.w3.org/2001/XMLSchema#boolean"              const/$xsd:boolean
    "http://www.w3.org/2001/XMLSchema#date"                 const/$xsd:date
@@ -47,7 +47,6 @@
    "http://www.w3.org/2001/XMLSchema#unsignedByte"         const/$xsd:unsignedByte
    "http://www.w3.org/2001/XMLSchema#hexBinary"            const/$xsd:hexBinary
    "http://www.w3.org/2001/XMLSchema#base64Binary"         const/$xsd:base64Binary
-   "http://www.w3.org/2001/XMLSchema#anyURI"               const/$xsd:anyURI
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" const/$rdf:langString
    "http://www.w3.org/2001/XMLSchema#json"                 const/$rdf:json})
 
@@ -106,7 +105,7 @@
      (integer? x) const/$xsd:long ; infer to long to prevent overflow
      (number? x)  const/$xsd:decimal
      (boolean? x) const/$xsd:boolean
-     (iri/iri? x) const/$id)))
+     (iri/iri? x) const/$xsd:anyURI)))
 
 (defn infer-iri
   ([x]
@@ -353,7 +352,7 @@
     (when (string? value)
       value)
 
-    const/$id
+    const/$xsd:anyURI
     (if (iri/iri? value)
       value
       (when (string? value)

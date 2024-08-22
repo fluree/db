@@ -96,58 +96,58 @@
   (mapv parse-term expressions))
 
 (def supported-scalar-functions
-  {"abs"            "abs"
-   "bnode"          "bnode"
-   "bound"          "bound"
-   "ceil"           "ceil"
-   "coalesce"       "coalesce"
-   "concat"         "concat"
-   "contains"       "contains"
-   "datatype"       "datatype"
-   "day"            "day"
-   "encode_for_uri" "encodeForUri"
-   "floor"          "floor"
-   "hours"          "hours"
-   "if"             "if"
-   "iri"            "iri"
-   "lang"           "lang"
-   "langmatches"    "langMatches"
-   "lcase"          "lcase"
-   "md5"            "md5"
-   "minutes"        "minutes"
-   "month"          "month"
-   "now"            "now"
-   "rand"           "rand"
-   "round"          "round"
-   "seconds"        "seconds"
-   "sha1"           "sha1"
-   "sha256"         "sha256"
-   "sha512"         "sha512"
-   "str"            "str"
-   "strafter"       "strAfter"
-   "strbefore"      "strBefore"
-   "strdt"          "strDt"
-   "strends"        "strEnds"
-   "strlang"        "strLang"
-   "strlen"         "strLen"
-   "strstarts"      "strStarts"
-   "struuid"        "struuid"
-   "timezone"       "timezone"
-   "tz"             "tz"
-   "ucase"          "ucase"
-   "uri"            "uri"
-   "uuid"           "uuid"
-   "year"           "year"
-   "isblank"        "isBlank"
-   "isiri"          "isIri"
-   "isliteral"      "isLiteral"
-   "isnumeric"      "isNumeric"
-   "isuri"          "isUri"
-   "sameterm"       "sameTerm"})
+  {"ABS"            "abs"
+   "BNODE"          "bnode"
+   "BOUND"          "bound"
+   "CEIL"           "ceil"
+   "COALESCE"       "coalesce"
+   "CONCAT"         "concat"
+   "CONTAINS"       "contains"
+   "DATATYPE"       "datatype"
+   "DAY"            "day"
+   "ENCODE_FOR_URI" "encodeForUri"
+   "FLOOR"          "floor"
+   "HOURS"          "hours"
+   "IF"             "if"
+   "IRI"            "iri"
+   "LANG"           "lang"
+   "LANGMATCHES"    "langMatches"
+   "LCASE"          "lcase"
+   "MD5"            "md5"
+   "MINUTES"        "minutes"
+   "MONTH"          "month"
+   "NOW"            "now"
+   "RAND"           "rand"
+   "ROUND"          "round"
+   "SECONDS"        "seconds"
+   "SHA1"           "sha1"
+   "SHA256"         "sha256"
+   "SHA512"         "sha512"
+   "STR"            "str"
+   "STRAFTER"       "strAfter"
+   "STRBEFORE"      "strBefore"
+   "STRDT"          "strDt"
+   "STRENDS"        "strEnds"
+   "STRLANG"        "strLang"
+   "STRLEN"         "strLen"
+   "STRSTARTS"      "strStarts"
+   "STRUUID"        "struuid"
+   "TIMEZONE"       "timezone"
+   "TZ"             "tz"
+   "UCASE"          "ucase"
+   "URI"            "uri"
+   "UUID"           "uuid"
+   "YEAR"           "year"
+   "isBLANK"        "isBlank"
+   "isIRI"          "isIri"
+   "isLITERAL"      "isLiteral"
+   "isNUMERIC"      "isNumeric"
+   "isURI"          "isUri"
+   "sameTerm"       "sameTerm"})
 
 (defmethod parse-term :Func
   [[_ func & args]]
-  (let [f (get supported-scalar-functions (str/lower-case func))]
+  (let [f (get supported-scalar-functions func)]
     (case f
       "abs"          (str "(" f " " (parse-term (first args)) ")")
       "bnode"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
@@ -236,14 +236,6 @@
     (throw (ex-info "Unsupported syntax."
                     {:status 400 :error :db/invalid-query :term arglist})))
   (parse-term iri))
-
-(defmethod parse-term :UnaryExpression
-  [[_ op-or-expr expr]]
-  (condp = op-or-expr
-    "!" (str "(not " (parse-term expr) ")")
-    "+" (str "+" (parse-term expr) ")")
-    "-" (str "-" (parse-term expr) ")")
-    (parse-term op-or-expr)))
 
 (defmethod parse-term :MultiplicativeExpression
   ;; MultiplicativeExpression ::= UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
@@ -491,7 +483,7 @@
   [[_ [tag :as value]]]
   (cond
     ;; iri values need to be wrapped in a value-map
-    (= tag :iri) {const/iri-type const/iri-id const/iri-value (parse-term value)}
+    (= tag :iri) {const/iri-type const/iri-anyURI const/iri-value (parse-term value)}
     (= value "UNDEF")      nil
     :else                  (parse-term value)))
 
@@ -634,7 +626,7 @@
   (if union-patterns
     (->> (mapv parse-term (rest term))
          ;; this presumes that each GroupGraphPattern has the same number of patterns per group
-         (apply map (fn [& patterns] (conj [:union] (vec patterns)))))
+         (apply map (fn [& patterns] (into [:union] patterns))))
     (parse-term group-pattern)))
 
 (defmethod parse-term :GroupGraphPatternSub

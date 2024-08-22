@@ -10,7 +10,6 @@
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.query.api :as query-api]
             [fluree.db.api.transact :as transact-api]
-            [fluree.db.flake.flake-db :refer [db?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.ledger.json-ld :as jld-ledger]
@@ -413,10 +412,10 @@
   or if no rules graph is supplied, the rules will be looked for within
   the db itself."
   ([db methods] (reason db methods nil nil))
-  ([db methods rule-sources] (reason db methods rule-sources nil))
-  ([db methods rule-sources opts]
+  ([db methods rules-graph] (reason db methods rules-graph nil))
+  ([db methods rules-graph opts]
    (promise-wrap
-     (reasoner/reason db methods rule-sources opts))))
+     (reasoner/reason db methods rules-graph opts))))
 
 (defn reasoned-count
   "Returns a count of reasoned facts in the provided db."

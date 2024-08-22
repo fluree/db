@@ -30,7 +30,7 @@
   [match _compact]
   (-> match where/get-value (json/parse false)))
 
-(defmethod display const/iri-id
+(defmethod display const/iri-anyURI
   [match compact]
   (some-> match where/get-iri iri/unwrap compact))
 

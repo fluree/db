@@ -1,9 +1,7 @@
 (ns fluree.db.query.api
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require [clojure.core.async :as async]
-            [clojure.string :as str]
-            [fluree.json-ld :as json-ld]
+  (:require [clojure.string :as str]
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
@@ -18,10 +16,7 @@
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.json-ld.credential :as cred]
-            [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.reasoner :as reasoner]
-            [fluree.db.validation :as v]))
+            [fluree.db.nameservice.core :as nameservice]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -38,38 +33,16 @@
   (cond-> (util/parse-opts opts)
     did (assoc :did did :issuer did)))
 
-(defn load-aliased-rule-dbs
-  [conn rule-sources]
-  (go-try
-   (loop [rule-sources rule-sources
-          rule-results []]
-     (if-let [rule-source (first rule-sources)]
-       (let [updated-rule-results (into rule-results
-                                    (if (string? rule-source)
-                                      (ledger/-db (<? (jld-ledger/load conn rule-source)))
-                                      rule-source))]
-         (recur (rest rule-sources) updated-rule-results))
-       rule-results))))
-
 (defn restrict-db
-  ([db t {:keys [did default-allow? reasoner-methods rule-sources] :as opts}]
-   (restrict-db db t opts nil))
-  ([db t {:keys [did default-allow? reasoner-methods rule-sources] :as opts} conn]
-   (go-try
-    (let [processed-rule-sources (<? (load-aliased-rule-dbs conn rule-sources))
-          policy-db              (if did
-                                   (<? (perm/wrap-identity-policy db did default-allow? nil))
-                                   db)
-          time-travel-db         (-> (if t
-                                       (<? (time-travel/as-of policy-db t))
-                                       policy-db))
-          reasoned-db            (if reasoner-methods
-                                   (<? (reasoner/reason time-travel-db
-                                                        reasoner-methods
-                                                        processed-rule-sources
-                                                        opts))
-                                   time-travel-db)]
-      (assoc-in reasoned-db [:policy :cache] (atom {}))))))
+  [db t {:keys [did default-allow?] :as opts}]
+  (go-try
+    (let [db*  (if did
+                 (<? (perm/wrap-identity-policy db did default-allow? nil))
+                 db)
+          db** (-> (if t
+                     (<? (time-travel/as-of db* t))
+                     db*))]
+      (assoc-in db** [:policy :cache] (atom {})))))
 
 (defn track-query
   [ds max-fuel query]
@@ -178,11 +151,11 @@
   (go-try
     (try*
       (let [[alias explicit-t] (extract-query-string-t alias)
-            address      (<? (nameservice/primary-address conn alias nil))
-            ledger       (<? (jld-ledger/load conn address))
-            db           (ledger/-db ledger)
-            t*           (or explicit-t t)]
-        (<? (restrict-db db t* opts conn)))
+            address (<? (nameservice/primary-address conn alias nil))
+            ledger  (<? (jld-ledger/load conn address))
+            db      (ledger/-db ledger)
+            t*      (or explicit-t t)]
+        (<? (restrict-db db t* opts)))
       (catch* e
               (throw (contextualize-ledger-400-error
                        (str "Error loading ledger " alias ": ")

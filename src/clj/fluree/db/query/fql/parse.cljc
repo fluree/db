@@ -69,7 +69,7 @@
       (let [dt-iri (json-ld/expand-iri dt context)
             dt-sid (iri/iri->sid dt-iri)
             v*     (datatype/coerce-value v dt-sid)]
-        (if (= const/iri-id dt-iri)
+        (if (= const/iri-anyURI dt-iri)
           (let [expanded (json-ld/expand-iri v* context)]
             (where/match-iri where/unmatched expanded))
           (where/anonymous-value v* dt-iri))))
@@ -116,7 +116,8 @@
   (let [attrs (expand-keys binding-map context)
         {val const/iri-value} attrs]
     (if-let [dt-iri (get-expanded-datatype attrs context)]
-      (if (= const/iri-id dt-iri)
+      (if (or (= const/iri-anyURI dt-iri)
+              (= const/iri-id dt-iri))
         (let [expanded (json-ld/expand-iri val context)]
           (where/match-iri var-match expanded))
         (where/match-value var-match val dt-iri))

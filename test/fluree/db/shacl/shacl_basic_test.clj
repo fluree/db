@@ -194,7 +194,7 @@
                      :sh/focusNode           :ex/john,
                      :sh/constraintComponent :sh/datatype,
                      :sh/sourceShape         "_:fdb-2",
-                     :sh/value               [:id],
+                     :sh/value               [:xsd/anyURI],
                      :f/expectation          :xsd/string,
                      :sh/resultMessage       "the following values do not have expected datatype :xsd/string: :ex/john",
                      :sh/resultPath          [:schema/name]}]}}

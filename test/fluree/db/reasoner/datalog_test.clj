@@ -12,112 +12,17 @@
                 "ex:children" [{"@id" "ex:alice"}]
                 "ex:address"  {"ex:country" {"@id" "ex:Canada"}}
                 "ex:age"      42
-                "ex:parents"  [{"@id"        "ex:carol"
-                                "ex:name"    "Carol"
-                                "ex:age"     72
-                                "ex:address" {"ex:country" {"@id" "ex:Singapore"}}
-                                "ex:brother" {"@id" "ex:mike"}
-                                "ex:parents" [{"@id"     "ex:cheryl"
-                                               "ex:name" "Cheryl"}]}]}
+                "ex:parents"  {"@id"        "ex:carol"
+                               "ex:name"    "Carol"
+                               "ex:age"     72
+                               "ex:address" {"ex:country" {"@id" "ex:Singapore"}}
+                               "ex:brother" {"@id" "ex:mike"}}}
                {"@id"     "ex:laura"
                 "ex:name" "Laura"}
                {"@id"       "ex:bob"
                 "ex:name"   "Bob"
-                "ex:gender" {"@id" "ex:Male"}}
-               {"@id"       "ex:jim"
-                "ex:name"   "Jim"
-                "ex:spouse" {"@id" "ex:janine"}}
-               {"@id"       "ex:janine"
-                "ex:name"   "Janine"
-                "ex:gender" {"@id" "ex:Female"}}
-               {"@id"       "ex:mike"
-                "ex:name"   "Mike"
-                "ex:spouse" {"@id" "ex:holly"}}
-               {"@id"       "ex:holly"
-                "ex:name"   "Holly"
-                "ex:gender" {"@id" "ex:Female"}}]})
+                "ex:gender" {"@id" "ex:Male"}}]})
 
-(def uncle-rule
-  {"@context" {"f"  "https://ns.flur.ee/ledger#"
-               "ex" "http://example.org/"},
-   "@id"      "ex:uncleRule"
-   "f:rule"   {"@type"  "@json"
-               "@value" {"@context" {"ex" "http://example.org/"}
-                         "where"    {"@id"       "?person",
-                                     "ex:parents" {"ex:brother" {"@id" "?pBrother"}}},
-                         "insert"   {"@id"      "?person",
-                                     "ex:uncle" "?pBrother"}}}})
-
-(def aunt-rule
-  {"@context" {"f"  "https://ns.flur.ee/ledger#"
-               "ex" "http://example.org/"},
-   "@id"      "ex:auntRule"
-   "f:rule"   {"@type"  "@json"
-               "@value" {"@context" {"ex" "http://example.org/"}
-                         "where"    {"@id"       "?person",
-                                     "ex:uncle" {"ex:spouse" {"@id" "?aunt"
-                                                              "ex:gender" {"@id" "ex:Female"}}}},
-                         "insert"   {"@id"      "?person",
-                                     "ex:aunt" "?aunt"}}}})
-
-(def sibling-rule
-  {"@context" {"f"  "https://ns.flur.ee/ledger#"
-               "ex" "http://example.org/"},
-   "@id"      "ex:siblingRule"
-   "f:rule"   {"@type"  "@json"
-               "@value" {"@context" {"ex" "http://example.org/"}
-                         "where"    {"@id"        "?person",
-                                     "ex:sibling" "?sibling"
-                                     "ex:parents"  "?parent"},
-                         "insert"   {"@id"       "?sibling",
-                                     "ex:parents" "?parent"}}}})
-
-(def brother-rule
-  {"@context" {"f"  "https://ns.flur.ee/ledger#"
-               "ex" "http://example.org/"},
-   "@id"      "ex:brotherRule"
-   "f:rule"   {"@type"  "@json"
-               "@value" {"@context" {"ex" "http://example.org/"}
-                         "where"    {"@id"        "?person",
-                                     "ex:sibling" {"@id"       "?sibling"
-                                                   "ex:gender" {"@id" "ex:Male"}}}
-                         "insert"   {"@id"        "?person",
-                                     "ex:brother" "?sibling"}}}})
-
-(def grandparent-rule
-  {"@context" {"f"  "https://ns.flur.ee/ledger#"
-               "ex" "http://example.org/"}
-   "@id"    "ex:grandParentRule"
-   "f:rule" {"@type"  "@json"
-             "@value" {"@context" {"ex" "http://example.org/"}
-                       "where"    {"ex:children" "?children"
-                                   "ex:parents"  "?parents"}
-                       "insert"   {"@id"            "?children",
-                                   "ex:grandParent" {"@id" "?parents"}}}}})
-
-(def alt-grandparent-rule
-  {"@context" {"f"  "https://ns.flur.ee/ledger#"
-               "ex" "http://example.org/"}
-   "@id"    "ex:grandParentRule"
-   "f:rule" {"@type"  "@json"
-             "@value" {"@context" {"ex" "http://example.org/"}
-                       "where"    {"@id" "?person"
-                                   "ex:parents" {"@id" "?parent"
-                                                 "ex:parents" {"@id" "?grandParent"}}}
-                       "insert"   {"@id"            "?person",
-                                   "ex:grandParent" {"@id" "?grandParent"}}}}})
-
-(def senior-rule
-  {"@context" {"f"  "https://ns.flur.ee/ledger#"
-               "ex" "http://example.org/"}
-   "@id"    "ex:seniorRule"
-   "f:rule" {"@type"  "@json"
-             "@value" {"@context" {"ex" "http://example.org/"}
-                       "where"    [{"@id"    "?person",
-                                    "ex:age" "?age"}
-                                   ["filter" "(>= ?age 62)"]]
-                       "insert"   {"@id"              "?person",
-                                   "ex:seniorCitizen" true}}}})
 
 (deftest ^:integration basic-datalog-rule
   (testing "Some basic datalog rules"
@@ -128,9 +33,21 @@
 
 
       (testing "A standard relationship"
-        (let [grandparent-db  @(fluree/stage db0 {"insert" [grandparent-rule]})
+        (let [grandparent-db  @(fluree/stage
+                                 db0
+                                 {"@context" {"f"  "https://ns.flur.ee/ledger#"
+                                              "ex" "http://example.org/"},
+                                  "insert"
+                                  {"@id"    "ex:grandParentRule"
+                                   "f:rule" {"@type"  "@json"
+                                             "@value" {"@context" {"ex" "http://example.org/"}
+                                                       "where"    {"ex:children" "?children"
+                                                                   "ex:parents"  "?parents"}
+                                                       "insert"   {"@id"            "?children",
+                                                                   "ex:grandParent" {"@id" "?parents"}}}}}})
 
               grandparent-db* @(fluree/reason grandparent-db :datalog)
+
 
               grandparents-of @(fluree/query grandparent-db*
                                              {:context {"ex" "http://example.org/"}
@@ -150,7 +67,16 @@
       (testing "A filter rule works"
         (let [senior-db  @(fluree/stage
                             db0
-                            {"insert" [senior-rule]})
+                            {"@context" {"f"  "https://ns.flur.ee/ledger#"
+                                         "ex" "http://example.org/"},
+                             "insert"   {"@id"    "ex:seniorRule"
+                                         "f:rule" {"@type"  "@json"
+                                                   "@value" {"@context" {"ex" "http://example.org/"}
+                                                             "where"    [{"@id"    "?person",
+                                                                          "ex:age" "?age"}
+                                                                         ["filter" "(>= ?age 62)"]]
+                                                             "insert"   {"@id"              "?person",
+                                                                         "ex:seniorCitizen" true}}}}})
               senior-db* @(fluree/reason senior-db :datalog)
 
               seniors    @(fluree/query
@@ -168,7 +94,16 @@
       (testing "Inferring based on a relationship and IRI value"
         (let [brother-db  @(fluree/stage
                              db0
-                             {"insert" [brother-rule]})
+                             {"@context" {"f"  "https://ns.flur.ee/ledger#"
+                                          "ex" "http://example.org/"}
+                              "insert"   {"@id"    "ex:brotherRule"
+                                          "f:rule" {"@type"  "@json"
+                                                    "@value" {"@context" {"ex" "http://example.org/"}
+                                                              "where"    {"@id"        "?person",
+                                                                          "ex:sibling" {"@id"       "?sibling"
+                                                                                        "ex:gender" {"@id" "ex:Male"}}}
+                                                              "insert"   {"@id"        "?person",
+                                                                          "ex:brother" "?sibling"}}}}})
               brother-db* @(fluree/reason brother-db :datalog)]
 
           (is (= #{["ex:mike" "ex:carol"] ;; <- explicitly set
@@ -191,7 +126,15 @@
           db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
 
       (testing "A recursive relationship"
-        (let [grandparents-db @(fluree/reason db0 :datalog [grandparent-rule])
+        (let [grandparents-db @(fluree/reason db0 :datalog {"@context" {"f"  "https://ns.flur.ee/ledger#"
+                                                                        "ex" "http://example.org/"},
+                                                            "@id"      "ex:grandParentRule"
+                                                            "f:rule"   {"@type"  "@json"
+                                                                        "@value" {"@context" {"ex" "http://example.org/"}
+                                                                                  "where"    {"ex:children" "?children"
+                                                                                              "ex:parents"  "?parents"}
+                                                                                  "insert"   {"@id"            "?children",
+                                                                                              "ex:grandParent" {"@id" "?parents"}}}}})
               grandparents-of @(fluree/query grandparents-db
                                              {:context {"ex" "http://example.org/"}
                                               :select  ["?grandParent" "?person"]
@@ -204,110 +147,6 @@
           (is (= 1 (fluree/reasoned-count grandparents-db))
               "Only one reasoned triple should be added"))))))
 
-(deftest ^:integration multiple-sources
-  (testing "multiple rule sources"
-    (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "reasoner/multiple-rule-dbs")
-          db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)
-
-          rule-ledger-1 @(fluree/create conn "reasoner/rule-ledger-1")
-          rule-db-1     @(fluree/stage (fluree/db rule-ledger-1) {"insert" [uncle-rule]})
-
-          rule-ledger-2 @(fluree/create conn "reasoner/rule-ledger-2")
-          rule-db-2     @(fluree/stage (fluree/db rule-ledger-2) {"insert" [aunt-rule]})]
-
-
-      (testing "multiple graphs as rule sources"
-        (let [half-reasoned-db @(fluree/reason db0 :datalog [aunt-rule])
-              full-reasoned-db @(fluree/reason db0 :datalog [uncle-rule aunt-rule])]
-
-          (is (= [["ex:brian" "ex:janine"]]
-                 @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
-                                                  :select  ["?s" "?aunt"]
-                                                  :where   {"@id"     "?s",
-                                                            "ex:aunt" "?aunt"}}))
-              "Without only the aunt-rule included, only one result is returned.")
-
-          (is (= [["ex:brian" "ex:holly"] ["ex:brian" "ex:janine"]]
-                 @(fluree/query full-reasoned-db {:context {"ex" "http://example.org/"}
-                                                  :select  ["?s" "?aunt"]
-                                                  :where   {"@id"     "?s",
-                                                            "ex:aunt" "?aunt"}}))
-              "With both graphs included, two results are returned.")))
-
-      (testing "multiple dbs as rule sources"
-        (let [half-reasoned-db @(fluree/reason db0 :datalog [rule-db-1])
-              full-reasoned-db @(fluree/reason db0 :datalog [rule-db-1 rule-db-2])]
-
-          (is (= []
-                 @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
-                                                  :select  ["?s" "?aunt"]
-                                                  :where   {"@id"     "?s",
-                                                            "ex:aunt" "?aunt"}}))
-              "With only the uncle-rule, no results are returned.")
-          
-          (is (= [["ex:brian" "ex:holly"] ["ex:brian" "ex:janine"]]
-                 @(fluree/query full-reasoned-db {:context {"ex" "http://example.org/"}
-                                                  :select  ["?s" "?aunt"]
-                                                  :where   {"@id"     "?s",
-                                                            "ex:aunt" "?aunt"}}))
-              "With both rule dbs included, two results are returned.")))
-
-      (testing "a mixture of graphs and dbs as rule sources"
-        (let [half-reasoned-db @(fluree/reason db0 :datalog [rule-db-1])
-              full-reasoned-db @(fluree/reason db0 :datalog [rule-db-1 aunt-rule])]
-
-          (is (= []
-                 @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
-                                                  :select  ["?s" "?aunt"]
-                                                  :where   {"@id"     "?s",
-                                                            "ex:aunt" "?aunt"}}))
-              "With only the uncle-rule, no results are returned.")
-          (is (= [["ex:brian" "ex:holly"] ["ex:brian" "ex:janine"]]
-                 @(fluree/query full-reasoned-db {:context {"ex" "http://example.org/"}
-                                                  :select  ["?s" "?aunt"]
-                                                  :where   {"@id"     "?s",
-                                                            "ex:aunt" "?aunt"}}))
-              "With both sources included, two results are returned.")))
-
-      (testing "multiple sources targeting identical nodes"
-        (let [alt-rule-first-reasoned-db @(fluree/reason db0 :datalog [alt-grandparent-rule grandparent-rule])
-              alt-rule-last-reasoned-db @(fluree/reason db0 :datalog [grandparent-rule alt-grandparent-rule])]
-          (is (and (= [["ex:alice" "ex:carol"]]
-                      @(fluree/query alt-rule-first-reasoned-db {:context {"ex" "http://example.org/"}
-                                                                 :select  ["?s" "?grandParent"]
-                                                                 :where   {"@id"            "?s",
-                                                                           "ex:grandParent" "?grandParent"}}))
-                   (= [["ex:brian" "ex:cheryl"]]
-                      @(fluree/query alt-rule-last-reasoned-db {:context {"ex" "http://example.org/"}
-                                                                 :select  ["?s" "?grandParent"]
-                                                                 :where   {"@id"            "?s",
-                                                                           "ex:grandParent" "?grandParent"}})))
-              "Rules are deduplicated and used in reasoning"))))))
-
-
-(def has-subtask-rule
-  {"@context" {"f"  "https://ns.flur.ee/ledger#"
-               "ex" "http://example.org/"}
-   "@id"    "ex:hasSubTaskRule"
-   "f:rule" {"@type"  "@json"
-             "@value" {"@context" {"ex" "http://example.org/"}
-                       "where"    {"@id"                    "?task"
-                                   "ex:hasImmediateSubTask" "?sub-task"}
-                       "insert"   {"@id"           "?task",
-                                   "ex:hasSubTask" {"@id" "?sub-task"}}}}})
-
-
-(def has-subtask-transitive
-  {"@context" {"f"  "https://ns.flur.ee/ledger#"
-               "ex" "http://example.org/"}
-   "@id"    "ex:hasSubTaskTransitive"
-   "f:rule" {"@type"  "@json"
-             "@value" {"@context" {"ex" "http://example.org/"}
-                       "where"    {"@id"           "?task"
-                                   "ex:hasSubTask" {"ex:hasSubTask" "?sub-sub-task"}}
-                       "insert"   {"@id"           "?task",
-                                   "ex:hasSubTask" {"@id" "?sub-sub-task"}}}}})
 
 (deftest ^:integration recursive-datalog-rule
   (testing "Some basic datalog rules"
@@ -342,7 +181,23 @@
       (testing "A recursive relationship"
         (let [db1  @(fluree/stage
                       db0
-                      {"insert" [has-subtask-rule has-subtask-transitive]})
+                      {"@context" {"f"  "https://ns.flur.ee/ledger#"
+                                   "ex" "http://example.org/"},
+                       "insert"
+                       [{"@id"    "ex:hasSubTaskRule"
+                         "f:rule" {"@type"  "@json"
+                                   "@value" {"@context" {"ex" "http://example.org/"}
+                                             "where"    {"@id"                    "?task"
+                                                         "ex:hasImmediateSubTask" "?sub-task"}
+                                             "insert"   {"@id"           "?task",
+                                                         "ex:hasSubTask" {"@id" "?sub-task"}}}}}
+                        {"@id"    "ex:hasSubTaskTransitive"
+                         "f:rule" {"@type"  "@json"
+                                   "@value" {"@context" {"ex" "http://example.org/"}
+                                             "where"    {"@id"           "?task"
+                                                         "ex:hasSubTask" {"ex:hasSubTask" "?sub-sub-task"}}
+                                             "insert"   {"@id"           "?task",
+                                                         "ex:hasSubTask" {"@id" "?sub-sub-task"}}}}}]})
               db1* @(fluree/reason db1 :datalog)]
 
 

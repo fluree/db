@@ -52,7 +52,7 @@
 
           policy-db @(fluree/wrap-policy db policy true
                                          {"?$identity" {"@value" alice-did
-                                                        "@type"  "@id"}})]
+                                                        "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}})]
 
       (testing " with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
@@ -154,12 +154,12 @@
           john-policy-db  @(fluree/wrap-policy
                             db policy true
                             {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}})
+                                           "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}})
 
           alice-policy-db @(fluree/wrap-policy
                             db policy true
                             {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}})]
+                                           "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}})]
 
       (testing " and values binding has user with policy relationship"
         (is (= [{"@id"                  "ex:widget",

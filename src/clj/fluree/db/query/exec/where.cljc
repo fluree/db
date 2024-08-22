@@ -47,7 +47,7 @@
   [mch]
   (if (or (contains? mch ::iri)
           (contains? mch ::sids))
-    const/iri-id
+    const/iri-anyURI
     (-> mch ::datatype-iri iri/unwrap)))
 
 (defn match-sid
@@ -66,7 +66,7 @@
 
 (defn iri-datatype?
   [mch]
-  (-> mch get-datatype-iri (= const/iri-id)))
+  (-> mch get-datatype-iri (= const/iri-anyURI)))
 
 (defn get-iri
   [match]
@@ -353,7 +353,7 @@
                      (match-transaction (flake/t flake))
                      (match-meta (flake/m flake)))
         dt (flake/dt flake)]
-    (if (= const/$id dt)
+    (if (= const/$xsd:anyURI dt)
       (let [alias (:alias db)
             oid   (flake/o flake)
             o-iri (iri/decode-sid db oid)]
@@ -718,7 +718,7 @@
 (defn bind-function-result
   [solution var-name result]
   (let [dt  (datatype/infer-iri result)
-        mch (if (= dt const/iri-id)
+        mch (if (= dt const/iri-anyURI)
               (-> var-name unmatched-var (match-iri result))
               (-> var-name unmatched-var (match-value result dt)))]
     (if-let [current (get solution var-name)]

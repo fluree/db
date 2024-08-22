@@ -143,7 +143,7 @@
           shape]
       (if q-disjoint?
         (let [parent-shape-id
-              (first (<? (query-range/index-range shape-db :opst = [[shape-id const/$id] const/sh_property]
+              (first (<? (query-range/index-range shape-db :opst = [[shape-id const/$xsd:anyURI] const/sh_property]
                                                   {:flake-xf (map flake/s)})))
               sibling-sids
               (<? (query-range/index-range shape-db :spot = [parent-shape-id const/sh_property]
@@ -182,7 +182,7 @@
 (defn sid-node
   "Create a value node with the given sid."
   [sid]
-  [sid const/$id])
+  [sid const/$xsd:anyURI])
 
 (defn subject-node
   "Create a value node out of the subject of a flake."
@@ -303,7 +303,7 @@
   (go-try
     (let [target-pid (first (get shape const/sh_targetObjectsOf))]
       (let [sid             (some-> s-flakes first flake/s)
-            referring-pids  (not-empty (<? (query-range/index-range db :opst = [[sid const/$id]]
+            referring-pids  (not-empty (<? (query-range/index-range db :opst = [[sid const/$xsd:anyURI]]
                                                                     {:flake-xf (map flake/p)})))
             p-flakes        (filterv (fn [f] (= (flake/p f) target-pid)) s-flakes)
             focus-nodes     (mapv object-node p-flakes)]
@@ -1079,7 +1079,7 @@
 (defn all-node-shape-ids
   "Returns the sids of all subjects with an @type of sh:NodeShape."
   [db]
-  (query-range/index-range db :post = [const/$rdf:type [const/sh_NodeShape const/$id]]
+  (query-range/index-range db :post = [const/$rdf:type [const/sh_NodeShape const/$xsd:anyURI]]
                            {:flake-xf (map flake/s)}))
 
 (defn make-display

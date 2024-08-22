@@ -10,9 +10,9 @@
     (is (= "foo" (coerce "foo" const/$xsd:string)))
     (is (= nil (coerce 42 const/$xsd:string))))
 
-  (testing "@id"
-    (is (= #fluree/IRI "foo" (coerce "foo" const/$id)))
-    (is (= nil (coerce 42 const/$id))))
+  (testing "anyURI"
+    (is (= #fluree/IRI "foo" (coerce "foo" const/$xsd:anyURI)))
+    (is (= nil (coerce 42 const/$xsd:anyURI))))
   (testing "boolean"
     (is (= true (coerce "true" const/$xsd:boolean)))
     (is (= false (coerce "false" const/$xsd:boolean)))

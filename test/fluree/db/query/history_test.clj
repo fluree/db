@@ -1417,7 +1417,7 @@
                                         {:annotation [{"ex:originator" "opts" "ex:friend"
                                                        {"@type" "id" "@value" "ex:betty"}}]})]
             (is (= "Commit annotation cannot reference other subjects." (ex-message invalid4))
-                "using value-map with type id"))
+                "using value-map with type xsd:anyURI"))
           (let [invalid1 @(fluree/stage db0 {"@context" context
                                              "insert"   [{"@id"         "ex:betty"
                                                           "@type"       "ex:Yeti"

@@ -55,10 +55,10 @@
                                                                     "ex:user" {"@id" "?$this"}}]}}}
 
           john-params       {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}}
+                                           "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}}
 
           alice-params      {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}}
+                                           "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}}
 
           john-allowed      @(fluree/stage
                               @(fluree/wrap-policy db policy true john-params)
@@ -148,10 +148,10 @@
                                                                    "ex:productManager" {"@id" "?$this"}}]}}}
 
           john-params       {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}}
+                                           "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}}
 
           alice-params      {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}}
+                                           "@type"  "http://www.w3.org/2001/XMLSchema#anyURI"}}
 
           john-allowed      @(fluree/stage
                               @(fluree/wrap-policy db policy true john-params)

@@ -218,17 +218,13 @@
 
         ;; Completion: If there is only one node left in the stack, then it's
         ;; the root and we're done, so we call the nested transformer's
-        ;; completion arity.
-        ;;
-        ;; If there is more than one node left in the stack, then the root was
-        ;; split because it overflowed. We first make a new root that is the
-        ;; parent of the nodes resulting from the split, then we check if that
-        ;; new root overflows.
-        ;;
-        ;; If the new root does overflow, we iterate all of the newly split
-        ;; nodes with the nested transformer and repeat the process. If the new
-        ;; root does not overflow, we iterate the new root before calling the
-        ;; nested transformer's completion arity.
+        ;; completion arity. If there is more than one node left in the stack,
+        ;; then the root was split because it overflowed. We first make a new
+        ;; root that is the parent of the nodes resulting from the split, then
+        ;; we check if that new root overflows If the new root does overflow, we
+        ;; iterate all of the newly split nodes with the nested transformer and
+        ;; repeat the process. If the new root does not overflow, we iterate the
+        ;; new root before calling the nested transformer's completion arity.
         ([result]
          (let [remaining-nodes @stack]
            (vreset! stack [])

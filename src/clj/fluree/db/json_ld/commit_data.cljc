@@ -394,7 +394,7 @@
   [f]
   (-> f
       flake/dt
-      (= const/$id)))
+      (= const/$xsd:anyURI)))
 
 (defn ref-flakes
   "Returns ref flakes from set of all flakes. Uses Flake datatype to know if a ref."
@@ -468,7 +468,7 @@
      ;; time
      (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil)
      ;; data
-     (flake/create commit-sid const/$_commit:data db-sid const/$id t true nil)
+     (flake/create commit-sid const/$_commit:data db-sid const/$xsd:anyURI t true nil)
 
      ;; db flakes
      ;; t
@@ -487,7 +487,7 @@
   load."
   [db t commit-sid previous-id]
   (let [prev-sid (iri/encode-iri db previous-id)]
-    [(flake/create commit-sid const/$_previous prev-sid const/$id t true nil)]))
+    [(flake/create commit-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
 
 (defn prev-data-flakes
   "Builds and returns a channel containing the previous data flakes for the
@@ -496,7 +496,7 @@
   reifying a ledger from storage on load."
   [db db-sid t prev-data-id]
   (let [prev-sid (iri/encode-iri db prev-data-id)]
-    [(flake/create db-sid const/$_previous prev-sid const/$id t true nil)]))
+    [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
 
 (defn issuer-flakes
   "Builds and returns a channel containing the credential issuer's flakes for
@@ -508,11 +508,11 @@
   [db t commit-sid issuer-iri]
   (if-let [issuer-sid (iri/encode-iri db issuer-iri)]
     ;; create reference to existing issuer
-    [(flake/create commit-sid const/$_commit:signer issuer-sid const/$id t true
+    [(flake/create commit-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true
                    nil)]
     ;; create new issuer flake and a reference to it
     (let [new-issuer-sid (iri/encode-iri db issuer-iri)]
-      [(flake/create commit-sid const/$_commit:signer new-issuer-sid const/$id t
+      [(flake/create commit-sid const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
                      true nil)])))
 
 (defn message-flakes
@@ -540,7 +540,7 @@
           parsed       (q-parse/parse-triples allowed-vars nil (util/sequential annotation))
           a-sid        (->> parsed ffirst where/get-iri (iri/encode-iri db))
           db-vol       (volatile! db)
-          flakes       (into [(flake/create commit-sid const/$_commit:annotation a-sid const/$id t true nil)]
+          flakes       (into [(flake/create commit-sid const/$_commit:annotation a-sid const/$xsd:anyURI t true nil)]
                              (map (partial update/build-flake db-vol t))
                              parsed)]
       [@db-vol flakes])
