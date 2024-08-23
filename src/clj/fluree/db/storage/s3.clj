@@ -45,13 +45,11 @@
     (throw (ex-info "Unsupported operation S3Store method: delete." {:prefix prefix})))
 
   storage/ByteStore
-  (write-bytes [_ address bytes]
-    (let [path (-> address storage/parse-address :local)]
-      (s3/write-s3-data client bucket prefix path bytes)))
+  (write-bytes [_ path bytes]
+    (s3/write-s3-data client bucket prefix path bytes))
 
-  (read-bytes [_ address]
-    (let [path (-> address storage/parse-address :local)]
-      (s3/read-s3-data client bucket prefix path))))
+  (read-bytes [_ path]
+    (s3/read-s3-data client bucket prefix path)))
 
 (defn open
   ([bucket prefix]

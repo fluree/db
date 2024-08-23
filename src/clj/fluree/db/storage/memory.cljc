@@ -45,13 +45,11 @@
         (contains? @contents path))))
 
   storage/ByteStore
-  (write-bytes [_ address bytes]
-    (let [k (-> address storage/parse-address :local)]
-      (swap! contents assoc k bytes)))
+  (write-bytes [_ path bytes]
+    (swap! contents assoc path bytes))
 
-  (read-bytes [_ address]
-    (let [k (-> address storage/parse-address :local)]
-      (get @contents k))))
+  (read-bytes [_ path]
+    (get @contents path)))
 
 (defn create
   []
