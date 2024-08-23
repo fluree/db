@@ -39,6 +39,15 @@
                        "address" address
                        "commit"  commit-jsonld}]}))
 
+(defn commit-address-from-record
+  [record branch]
+  (let [branch-iri (if branch
+                     (str (get record "@id") "(" branch ")")
+                     (get record "defaultBranch"))]
+    (->> (get record "branches")
+         (some #(when (= (get % "@id") branch-iri)
+                  (get % "address"))))))
+
 (defn address-path
   [address]
   (let [[_ _ path] (str/split address #":")]
@@ -52,6 +61,37 @@
       (->> (drop-last 2) ; branch-name, head
            (str/join #"/"))))
 
+(defn extract-branch
+  "Splits a given namespace address into its nameservice and branch parts.
+  Returns two-tuple of [nameservice branch].
+  If no branch is found, returns nil as branch value and original ns-address as the nameservice."
+  [ns-address]
+  (if (str/ends-with? ns-address ")")
+    (let [[_ ns branch] (re-matches #"(.*)\((.*)\)" ns-address)]
+      [ns branch])
+    [ns-address nil]))
+
+(defn resolve-address
+  "Resolves a provided namespace address, which might be relative or absolute,
+   into three parts returned as a map:
+  - :alias - ledger alias
+  - :branch - branch (or nil if default)
+  - :address - absolute namespace address (including branch if provided)
+  If 'branch' parameter is provided will always use it as the branch regardless
+  of if a branch is specificed in the ns-address."
+  [base-address ns-address branch]
+  (let [[ns-address* extracted-branch] (extract-branch ns-address)
+        branch*   (or branch extracted-branch)
+        absolute? (str/starts-with? ns-address base-address)
+        [ns-address** alias] (if absolute?
+                               [ns-address* (subs ns-address* (count base-address))]
+                               [(str base-address ns-address*) ns-address*])]
+    {:alias   alias
+     :branch  branch*
+     :address (if branch*
+                (str ns-address** "(" branch* ")")
+                ns-address*)}))
+
 (defn nameservices
   [conn]
   (connection/-nameservices conn))
@@ -63,7 +103,7 @@
 (defn ns-address
   "Returns async channel"
   [nameservice ledger-alias branch]
-  (-address nameservice ledger-alias {:branch branch}))
+  (-address nameservice ledger-alias branch))
 
 (defn addresses
   "Retrieve address for each nameservices based on a relative ledger-alias.

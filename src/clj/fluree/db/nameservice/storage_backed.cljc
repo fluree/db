@@ -2,26 +2,44 @@
   (:require [clojure.core.async :refer [go]]
             [fluree.db.storage :as storage]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.util.bytes :as bytes]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log]))
 
-(defrecord StorageBackedNameService [store address-prefix]
+(defn local-filename
+  [ledger-alias]
+  (str ledger-alias ".json"))
+
+(defrecord StorageBackedNameService [address-prefix store sync?]
   nameservice/Publisher
   (-push [_ commit-jsonld]
-    (let [ledger-alias (get commit-jsonld "alias")
-          ns-address   (nameservice/full-address address-prefix ledger-alias)
-          record       (nameservice/ns-record ns-address commit-jsonld)
-          record-bytes (bytes/string->UTF8 record)]
-      (storage/write-bytes store ns-address record-bytes)))
+    (go-try
+      (let [ledger-alias (get commit-jsonld "alias")
+            ns-address   (nameservice/full-address address-prefix ledger-alias)
+            record       (nameservice/ns-record ns-address commit-jsonld)
+            record-bytes (json/stringify-UTF8 record)
+            filename     (local-filename ledger-alias)]
+        (<? (storage/write-bytes store filename record-bytes)))))
 
   nameservice/iNameService
-  (-lookup [_ ledger-alias]
-    (let [ns-address (nameservice/full-address address-prefix ledger-alias)]
-      (storage/read-bytes store ns-address)))
+  (-lookup [_ ledger-address]
+    (go-try
+      (let [{:keys [alias _branch]} (nameservice/resolve-address address-prefix ledger-address nil)
+            filename                (local-filename alias)]
+        (when-let [record-bytes (<? (storage/read-bytes store filename))]
+          (let [ns-record (json/parse record-bytes false)]
+            (nameservice/commit-address-from-record ns-record nil))))))
 
-  (-address [_ ledger-alias branch]
+  (-address [_ ledger-alias _branch]
     (go
-      (let [branch (if branch (name branch) "main")]
-        (str address-prefix ledger-alias "/" branch))))
+      (str address-prefix ledger-alias)))
+
+  (-sync? [_]
+    sync?)
 
   (-close [_]
     true))
+
+(defn start
+  [address-prefix store sync?]
+  (->StorageBackedNameService address-prefix store sync?))
