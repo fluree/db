@@ -1,7 +1,7 @@
 (ns fluree.db.conn.s3
   (:require [cognitect.aws.client.api :as aws]
             [clojure.string :as str]
-            [fluree.db.nameservice.s3 :as ns-s3]
+            [fluree.db.nameservice.storage-backed :as storage-ns]
             [clojure.core.async :as async :refer [go]]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.connection :as connection]
@@ -91,28 +91,21 @@
   (binding [*out* w]
     (pr (connection/printer-map conn))))
 
-(defn default-S3-nameservice
-  "Returns S3 nameservice or will throw if storage-path generates an exception."
-  [s3-client s3-bucket s3-prefix]
-  (ns-s3/initialize s3-client s3-bucket s3-prefix))
-
 (defn connect
   "Create a new S3 connection."
   [{:keys [defaults parallelism s3-endpoint s3-bucket s3-prefix lru-cache-atom
            cache-max-mb serializer nameservices]
     :or   {serializer (json-serde)} :as _opts}]
   (go
-    (let [aws-opts       (cond-> {:api :s3}
-                           s3-endpoint (assoc :endpoint-override s3-endpoint))
-          client         (aws/client aws-opts)
-          conn-id        (str (random-uuid))
+    (let [conn-id        (str (random-uuid))
           state          (connection/blank-state)
-          nameservices*  (util/sequential
-                           (or nameservices (default-S3-nameservice client s3-bucket s3-prefix)))
+          s3-store       (s3-storage/open s3-bucket s3-prefix s3-endpoint)
+          nameservices*  (-> nameservices
+                             (or (storage-ns/start "fluree:s3://" s3-store true))
+                             util/sequential)
           cache-size     (conn-cache/memory->cache-size cache-max-mb)
           lru-cache-atom (or lru-cache-atom
-                             (atom (conn-cache/create-lru-cache cache-size)))
-          s3-store       (s3-storage/open s3-bucket s3-prefix s3-endpoint)]
+                             (atom (conn-cache/create-lru-cache cache-size)))]
       (map->S3Connection {:id              conn-id
                           :store           s3-store
                           :state           state

@@ -2,13 +2,12 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.index :as index]
-            [fluree.db.nameservice.memory :as ns-memory]
+            [fluree.db.nameservice.storage-backed :as storage-ns]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.json-ld :as json-ld]
             [fluree.db.storage :as storage]
             [fluree.db.storage.memory :as memory-storage]
             #?(:cljs [fluree.db.platform :as platform]))
@@ -87,11 +86,6 @@
      (binding [*out* w]
        (pr (connection/printer-map conn)))))
 
-(defn default-memory-nameservice
-  "Returns memory nameservice"
-  [store]
-  (ns-memory/initialize store))
-
 (defn connect
   "Creates a new memory connection."
   [{:keys [parallelism lru-cache-atom cache-max-mb defaults nameservices]}]
@@ -101,16 +95,7 @@
           mem-store       (memory-storage/create)
           nameservices*   (util/sequential
                             (or nameservices
-                                ;; TODO: We should not reach inside the storage
-                                ;; implementation to reuse the contents atom
-                                ;; because that breaks the abstraction and
-                                ;; implicitly couples components that should be
-                                ;; independent. We should change the memory
-                                ;; nameservice to either use a storage
-                                ;; implementation explicitly, or to use an atom
-                                ;; independent of the data held in commit and
-                                ;; index storage.
-                                (default-memory-nameservice (:contents mem-store))))
+                                (storage-ns/start "fluree:memory://" mem-store true)))
           cache-size      (conn-cache/memory->cache-size cache-max-mb)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]

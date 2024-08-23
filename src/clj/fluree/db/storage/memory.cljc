@@ -46,10 +46,12 @@
 
   storage/ByteStore
   (write-bytes [_ path bytes]
-    (swap! contents assoc path bytes))
+    (go
+      (swap! contents assoc path bytes)))
 
   (read-bytes [_ path]
-    (get @contents path)))
+    (go
+      (get @contents path))))
 
 (defn create
   []
