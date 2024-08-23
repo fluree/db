@@ -207,13 +207,18 @@
                                       {"@id"               "ex:data-2",
                                        "@type"             "ex:Data",
                                        "ex:classification" 2}
-                                      {"@id"               "ex:data-3",
-                                       "@type"             "ex:Data",
-                                       "ex:classification" 3}
                                       ;; note below is of class ex:Other, not ex:Data
                                       {"@id"               "ex:other",
                                        "@type"             "ex:Other",
-                                       "ex:classification" -99}]})
+                                       "ex:classification" -99}
+                                      ;; a node that refers to items in ex:Data which, if
+                                      ;; pulled in a graph crawl, should still be restricted
+                                      {"@id"          "ex:referred",
+                                       "@type"        "ex:Referrer",
+                                       "ex:referData" [{"@id" "ex:data-0"}
+                                                       {"@id" "ex:data-1"}
+                                                       {"@id" "ex:data-2"}]}
+                                      ]})
 
           policy       {"@context"  {"ex" "http://example.org/ns/"
                                      "f"  "https://ns.flur.ee/ledger#"}
@@ -237,7 +242,12 @@
           other-query  {"@context" {"ex" "http://example.org/ns/"},
                         "where"    {"@id"   "?s",
                                     "@type" "ex:Other"},
-                        "select"   {"?s" ["*"]}}]
+                        "select"   {"?s" ["*"]}}
+
+          refer-query  {"@context" {"ex" "http://example.org/ns/"},
+                        "where"    {"@id"   "?s",
+                                    "@type" "ex:Referrer"},
+                        "select"   {"?s" ["*" {"ex:referData" ["*"]}]}}]
 
       (testing " with policy default allow? set to true"
         (is (= [{"@id"               "ex:data-0",
@@ -249,7 +259,15 @@
                  "@type"             "ex:Other",
                  "ex:classification" -99}]
                @(fluree/query policy-allow other-query))
-            "ex:Other class should not be restricted"))
+            "ex:Other class should not be restricted")
+
+        (is (= [{"@id"          "ex:referred"
+                 "@type"        "ex:Referrer"
+                 "ex:referData" [{"@id"               "ex:data-0"
+                                  "@type"             "ex:Data"
+                                  "ex:classification" 0}]}]
+               @(fluree/query policy-allow refer-query))
+            " in graph crawl ex:Data is still restricted"))
 
       (testing " with policy default allow? set to false"
         (is (= [{"@id"               "ex:data-0",
