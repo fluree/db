@@ -67,7 +67,7 @@
   (go (-> @state-atom keys)))
 
 (defn address
-  [ledger-alias {:keys [branch] :as _opts}]
+  [ledger-alias branch]
   (go (memory-address (str ledger-alias "/" (name branch) "/head"))))
 
 (defrecord MemoryNameService
@@ -79,8 +79,8 @@
   (-lookup [_ ledger-alias] (lookup state-atom ledger-alias))
   (-lookup [_ ledger-alias opts] (lookup state-atom ledger-alias)) ;; TODO - doesn't support branches yet
   (-sync? [_] sync?)
-  (-address [_ ledger-alias opts]
-    (address ledger-alias opts))
+  (-address [_ ledger-alias branch]
+    (address ledger-alias branch))
   (-alias [_ ledger-address]
     (-> (address-path ledger-address)
         (str/split #"/")
