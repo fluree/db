@@ -189,3 +189,74 @@
                   "select"   {"?s" ["*"]}
                   "where"    {"@id"   "?s"
                               "@type" "ex:Product"}})))))))
+
+(deftest ^:integration class-policy-default-allow
+  (testing "Class policy only with default allow both true and false behavior "
+    (let [conn         (test-utils/create-conn)
+          ledger       @(fluree/create conn "policy/class-policy-default-test")
+          db           @(fluree/stage
+                         (fluree/db ledger)
+                         {"@context" {"ex" "http://example.org/ns/"
+                                      "f"  "https://ns.flur.ee/ledger#"}
+                          "insert"   [{"@id"               "ex:data-0",
+                                       "@type"             "ex:Data",
+                                       "ex:classification" 0}
+                                      {"@id"               "ex:data-1",
+                                       "@type"             "ex:Data",
+                                       "ex:classification" 1}
+                                      {"@id"               "ex:data-2",
+                                       "@type"             "ex:Data",
+                                       "ex:classification" 2}
+                                      {"@id"               "ex:data-3",
+                                       "@type"             "ex:Data",
+                                       "ex:classification" 3}
+                                      ;; note below is of class ex:Other, not ex:Data
+                                      {"@id"               "ex:other",
+                                       "@type"             "ex:Other",
+                                       "ex:classification" -99}]})
+
+          policy       {"@context"  {"ex" "http://example.org/ns/"
+                                     "f"  "https://ns.flur.ee/ledger#"}
+                        "@id"       "ex:unclassRestriction"
+                        "@type"     ["f:AccessPolicy", "ex:UnclassPolicy"]
+                        "f:onClass" [{"@id" "ex:Data"}]
+                        "f:action"  [{"@id" "f:view"}, {"@id" "f:modify"}]
+                        "f:query"   {"@type"  "@json"
+                                     "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                               "where"    [{"@id"               "?$this"
+                                                            "ex:classification" "?c"}
+                                                           ["filter", "(< ?c 1)"]]}}}
+          policy-allow @(fluree/wrap-policy db policy true)
+
+          policy-deny  @(fluree/wrap-policy db policy false)
+
+          data-query   {"@context" {"ex" "http://example.org/ns/"},
+                        "where"    {"@id"   "?s",
+                                    "@type" "ex:Data"},
+                        "select"   {"?s" ["*"]}}
+          other-query  {"@context" {"ex" "http://example.org/ns/"},
+                        "where"    {"@id"   "?s",
+                                    "@type" "ex:Other"},
+                        "select"   {"?s" ["*"]}}]
+
+      (testing " with policy default allow? set to true"
+        (is (= [{"@id"               "ex:data-0",
+                 "@type"             "ex:Data",
+                 "ex:classification" 0}]
+               @(fluree/query policy-allow data-query)))
+
+        (is (= [{"@id"               "ex:other",
+                 "@type"             "ex:Other",
+                 "ex:classification" -99}]
+               @(fluree/query policy-allow other-query))
+            "ex:Other class should not be restricted"))
+
+      (testing " with policy default allow? set to false"
+        (is (= [{"@id"               "ex:data-0",
+                 "@type"             "ex:Data",
+                 "ex:classification" 0}]
+               @(fluree/query policy-deny data-query)))
+
+        (is (= []
+               @(fluree/query policy-deny other-query))
+            "ex:Other class should be restricted")))))
