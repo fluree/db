@@ -1,6 +1,9 @@
 (ns fluree.db.storage
-  (:require [clojure.string :as str])
-  (:refer-clojure :exclude [read list exists?]))
+  (:refer-clojure :exclude [read list exists?])
+  (:require [clojure.string :as str]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.bytes :as bytes]
+            [fluree.json-ld :as json-ld]))
 
 (defn hashable?
   [x]
@@ -49,3 +52,13 @@
   "ByteStore is used by consensus to replicate files across servers"
   (write-bytes [store path bytes] "Async writes bytes to path in store.")
   (read-bytes [store path] "Async read bytes from path in store."))
+
+(defn content-write-json
+  [store path data]
+  (go-try
+    (let [json   (if (string? data)
+                   data
+                   (json-ld/normalize-data data))
+          bytes  (bytes/string->UTF8 json)
+          result (<? (write store path bytes))]
+      (assoc result :json json))))

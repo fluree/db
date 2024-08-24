@@ -35,7 +35,7 @@
   (-c-read [_ commit-key]
     (storage/read store commit-key))
   (-c-write [_ _ commit-data]
-    (storage/write store "commit" commit-data))
+    (storage/content-write-json store "commit" commit-data))
   (-txn-read [_ txn-key]
     (storage/read store txn-key))
   (-txn-write [_ _ txn-data]

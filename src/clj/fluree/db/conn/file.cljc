@@ -58,8 +58,9 @@
   connection/iStorage
   (-c-read [conn commit-key]
     (read-data conn commit-key false))
-  (-c-write [conn ledger-alias commit-data]
-    (write-data conn ledger-alias :commit commit-data))
+  (-c-write [_ ledger-alias commit-data]
+    (let [path (str/join "/" [ledger-alias "commit"])]
+      (storage/content-write-json store path commit-data)))
   (-txn-read [conn txn-key]
     (read-data conn txn-key false))
   (-txn-write [conn ledger-alias txn-data]

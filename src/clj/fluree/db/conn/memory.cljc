@@ -46,7 +46,8 @@
 
   connection/iStorage
   (-c-read [_ commit-key] (read-data store commit-key))
-  (-c-write [_ _ledger-alias commit-data] (write-data! store :commit commit-data))
+  (-c-write [_ _ledger-alias commit-data]
+    (storage/content-write-json store "commit" commit-data))
   (-txn-read [_ txn-key] (read-data store txn-key))
   (-txn-write [_ _ledger-alias txn-data] (write-data! store :transaction txn-data))
 

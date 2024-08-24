@@ -1,6 +1,5 @@
 (ns fluree.db.conn.s3
-  (:require [cognitect.aws.client.api :as aws]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [fluree.db.nameservice.storage-backed :as storage-ns]
             [clojure.core.async :as async :refer [go]]
             [fluree.db.conn.cache :as conn-cache]
@@ -58,8 +57,9 @@
   connection/iStorage
   (-c-read [conn commit-key]
     (read-commit conn commit-key))
-  (-c-write [conn ledger-alias commit-data]
-    (write-commit conn ledger-alias commit-data))
+  (-c-write [_ ledger-alias commit-data]
+    (let [path (str/join "/" [ledger-alias "commit"])]
+      (storage/content-write-json store path commit-data)))
   (-txn-read [_ txn-key]
     (go-try
       (let [txn-data (<? (storage/read store txn-key))]
