@@ -25,8 +25,8 @@ OrderClause	  ::=  	<'ORDER' WS 'BY'> WS OrderCondition+ WS
 <OrderCondition>	  ::=  	ExplicitOrderCondition | Constraint | Var
 ExplicitOrderCondition ::= ( 'ASC' | 'DESC' ) WS BrackettedExpression
 <LimitOffsetClauses>	  ::=  	LimitClause OffsetClause? | OffsetClause LimitClause?
-LimitClause	  ::=  	<'LIMIT'> WS INTEGER
-OffsetClause	  ::=  	<'OFFSET'> WS INTEGER
+LimitClause	  ::=  	<'LIMIT'> WS INTEGER WS
+OffsetClause	  ::=  	<'OFFSET'> WS INTEGER WS
 ValuesClause	  ::=  	( <'VALUES'> WS DataBlock )? WS
 Update	  ::=  	Prologue ( Update1 ( ';' Update )? )?
 Update1	  ::=  	Load | Clear | Drop | Add | Move | Copy | Create | InsertData | DeleteData | DeleteWhere | Modify
@@ -120,11 +120,11 @@ RelationalExpression	  ::=  	NumericExpression WS ( '=' NumericExpression | '!='
 NumericExpression	  ::=  	WS AdditiveExpression WS
 As ::= WS <('AS' | 'as')> WS
 
-<AdditiveExpression>	  ::=  	MultiplicativeExpression ( '+' MultiplicativeExpression | '-' MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralNegative ) ( ( '*' UnaryExpression ) | ( '/' UnaryExpression ) )* )*
+<AdditiveExpression>	  ::=  	MultiplicativeExpression (WS '+' WS MultiplicativeExpression | WS '-' WS MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralNegative ) ( (WS '*' WS UnaryExpression ) | (WS '/' WS UnaryExpression ) )* )*
 
 
-MultiplicativeExpression	  ::=  	UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
-<UnaryExpression>	  ::=  	  '!' PrimaryExpression
+MultiplicativeExpression ::= UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
+UnaryExpression ::= '!' PrimaryExpression
 | '+' PrimaryExpression
 | '-' PrimaryExpression
 | PrimaryExpression
@@ -139,54 +139,54 @@ BrackettedExpression	  ::=  	<'('> WS Expression WS <')'>
 | SubstringExpression
 | Func
 
-Func ::= 'ABS' <'('> Expression <')'>
-| 'BNODE' ( <'('> Expression <')'> | NIL )
-| 'BOUND' <'('> Var <')'>
-| 'CEIL' <'('> Expression <')'>
-| 'COALESCE' WS ExpressionList
-| 'CONCAT' ExpressionList
-| 'CONTAINS' <'('> Expression <','> Expression <')'>
-| 'DATATYPE' <'('> Expression <')'>
-| 'DAY' <'('> Expression <')'>
-| 'ENCODE_FOR_URI' <'('> Expression <')'>
-| 'FLOOR' <'('> Expression <')'>
-| 'HOURS' <'('> Expression <')'>
-| 'IF' <'('> Expression <','> Expression <','> Expression <')'>
-| 'IRI' <'('> Expression <')'>
-| 'LANG' <'('> Expression <')'>
-| 'LANGMATCHES' <'('> Expression <','> Expression <')'>
-| 'LCASE' <'('> Expression <')'>
-| 'MD5' <'('>Expression <')'>
-| 'MINUTES' <'('> Expression <')'>
-| 'MONTH' <'('> Expression <')'>
-| 'NOW' NIL
-| 'RAND' NIL
-| 'ROUND' <'('> Expression <')'>
-| 'SECONDS' <'('> Expression <')'>
-| 'SHA1' <'('> Expression <')'>
-| 'SHA256' <'('> Expression <')'>
-| 'SHA384' <'('> Expression <')'>
-| 'SHA512' <'('> Expression <')'>
-| 'STR' <'('> Expression <')'>
-| 'STRAFTER' <'('> Expression <','> Expression <')'>
-| 'STRBEFORE' <'('> Expression <','> Expression <')'>
-| 'STRDT' <'('> Expression <','> Expression <')'>
-| 'STRENDS' <'('> Expression <','> Expression <')'>
-| 'STRLANG' <'('> Expression <','> Expression <')'>
-| 'STRLEN' <'('> Expression <')'>
-| 'STRSTARTS' <'('> Expression <','> Expression <')'>
-| 'STRUUID' NIL
-| 'TIMEZONE' <'('> Expression <')'>
-| 'TZ' <'('> Expression <')'>
-| 'UCASE' <'('> Expression <')'>
-| 'URI' <'('> Expression <')'>
-| 'UUID' NIL
-| 'YEAR' <'('> Expression <')'>
-| 'isBLANK' <'('> Expression <')'>
-| 'isIRI' <'('> Expression <')'>
-| 'isLITERAL' <'('> Expression <')'>
-| 'isNUMERIC' <'('> Expression <')'>
-| 'isURI' <'('> Expression <')'>
+Func ::= ('ABS'|'abs') <'('> Expression <')'>
+| ('BNODE'|'bnode') ( <'('> Expression <')'> | NIL )
+| ('BOUND' | 'bound') <'('> Var <')'>
+| ('CEIL'|'ceil') <'('> Expression <')'>
+| ('COALESCE'|'coalesce') WS ExpressionList
+| ('CONCAT'|'concat') ExpressionList
+| ('CONTAINS'|'contains') <'('> Expression <','> Expression <')'>
+| ('DATATYPE'|'datatype') <'('> Expression <')'>
+| ('DAY'|'day') <'('> Expression <')'>
+| ('ENCODE_FOR_URI'|'encode_for_uri') <'('> Expression <')'>
+| ('FLOOR'|'floor') <'('> Expression <')'>
+| ('HOURS'|'hours') <'('> Expression <')'>
+| ('IF'|'if') <'('> Expression <','> Expression <','> Expression <')'>
+| ('IRI'|'iri') <'('> Expression <')'>
+| ('LANG'|'lang') <'('> Expression <')'>
+| ('LANGMATCHES'|'langmatches') <'('> Expression <','> Expression <')'>
+| ('LCASE'|'lcase') <'('> Expression <')'>
+| ('MD5'|'md5') <'('>Expression <')'>
+| ('MINUTES'|'minutes') <'('> Expression <')'>
+| ('MONTH'|'month') <'('> Expression <')'>
+| ('NOW'|'now') NIL
+| ('RAND'|'rand') NIL
+| ('ROUND'|'round') <'('> Expression <')'>
+| ('SECONDS'|'seconds') <'('> Expression <')'>
+| ('SHA1'|'sha1') <'('> Expression <')'>
+| ('SHA256'|'sha256') <'('> Expression <')'>
+| ('SHA384'|'sha384') <'('> Expression <')'>
+| ('SHA512'|'sha512') <'('> Expression <')'>
+| ('STR'|'str') <'('> Expression <')'>
+| ('STRAFTER'|'strafter') <'('> Expression <','> Expression <')'>
+| ('STRBEFORE'|'strbefore') <'('> Expression <','> Expression <')'>
+| ('STRDT'|'strdt') <'('> Expression <','> Expression <')'>
+| ('STRENDS'|'strends') <'('> Expression <','> Expression <')'>
+| ('STRLANG'|'strlang') <'('> Expression <','> Expression <')'>
+| ('STRLEN'|'strlen') <'('> Expression <')'>
+| ('STRSTARTS'|'strstarts') <'('> Expression <','> Expression <')'>
+| ('STRUUID'|'struuid') NIL
+| ('TIMEZONE'|'timezone') <'('> Expression <')'>
+| ('TZ'|'tz') <'('> Expression <')'>
+| ('UCASE'|'ucase') <'('> Expression <')'>
+| ('URI'|'uri') <'('> Expression <')'>
+| ('UUID'|'uuid') NIL
+| ('YEAR'|'year') <'('> Expression <')'>
+| ('isBLANK'|'isBlank') <'('> Expression <')'>
+| ('isIRI'|'isIri') <'('> Expression <')'>
+| ('isLITERAL'|'isLiteral') <'('> Expression <')'>
+| ('isNUMERIC'|'isNumeric') <'('> Expression <')'>
+| ('isURI'|'isUri') <'('> Expression <')'>
 | 'sameTerm' <'('> Expression <','> Expression <')'>
 
 RegexExpression   ::=   <'REGEX'> <'('> Expression <','> Expression ( <','> Expression )? <')'>
