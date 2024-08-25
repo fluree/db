@@ -978,10 +978,10 @@
                                                     root-privkey))]
       (is (= [{"f:data" {"f:t" 1}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-               "f:txn"    "fluree:memory://cba3a98584459b25115f12e11b30f504f6f985d82979f1f16fb1e2d3158ff659",
+               "f:txn"    "fluree:memory://1981b179d04ebf407784da1039d344c9a431ee0dbc3e6d4d94e0e47509da1dc3",
                "f:data"   {"f:t" 2}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-               "f:txn"    "fluree:memory://69063190b0a67fc6352ce405a28a76617bacfdd976a6d98eccd6dd0b78cf6f37",
+               "f:txn"    "fluree:memory://c8697d0d74ea5d72d80616d65961b6cc8801128cadc220538e17c939ae828820",
                "f:data"   {"f:t" 3}}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true

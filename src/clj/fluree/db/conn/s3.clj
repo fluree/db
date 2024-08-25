@@ -7,69 +7,31 @@
             [fluree.db.index :as index]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.indexer.storage :as index-storage]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
-            [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]
             [fluree.db.storage :as storage]
             [fluree.db.storage.s3 :as s3-storage])
   (:import (java.io Writer)))
 
 (set! *warn-on-reflection* true)
 
-(defn write-data
-  [{:keys [store] :as _conn} ledger-alias data-type data]
-  (go-try
-    (let [json     (if (string? data)
-                     data
-                     (json-ld/normalize-data data))
-          type-dir (name data-type)
-          dir      (str/join "/" [ledger-alias type-dir])
-          {:keys [address hash path]}  (<? (storage/write store dir json))]
-      {:name    path
-       :hash    hash
-       :json    json
-       :size    (count json)
-       :address address})))
-
-(defn read-commit
-  [{:keys [store] :as _conn} address]
-  (go-try
-    (let [commit-data (<? (storage/read store address))]
-      (json/parse commit-data false))))
-
-(defn write-commit
-  [conn ledger-alias commit-data]
-  (write-data conn ledger-alias :commit commit-data))
-
-(defn write-index
-  [conn ledger-alias index-type index-data]
-  (write-data conn ledger-alias (str "index/" (name index-type)) index-data))
-
-(defn read-index
-  [{:keys [store] :as _conn} index-address]
-  (go-try
-    (let [index-data (<? (storage/read store index-address))]
-      (json/parse index-data true))))
-
 (defrecord S3Connection [id state ledger-defaults parallelism lru-cache-atom nameservices store]
   connection/iStorage
-  (-c-read [conn commit-key]
-    (read-commit conn commit-key))
+  (-c-read [_ commit-address]
+    (storage/read-json store commit-address))
   (-c-write [_ ledger-alias commit-data]
     (let [path (str/join "/" [ledger-alias "commit"])]
       (storage/content-write-json store path commit-data)))
-  (-txn-read [_ txn-key]
-    (go-try
-      (let [txn-data (<? (storage/read store txn-key))]
-        (json/parse txn-data false))))
-  (-txn-write [conn ledger-alias txn-data]
-    (write-data conn ledger-alias :txn txn-data))
-  (-index-file-write [conn ledger-alias index-type index-data]
-    (write-index conn ledger-alias index-type index-data))
-  (-index-file-read [conn index-address]
-    (read-index conn index-address))
+  (-txn-read [_ txn-address]
+    (storage/read-json store txn-address))
+  (-txn-write [_ ledger-alias txn-data]
+    (let [path (str/join "/" [ledger-alias "txn"])]
+      (storage/content-write-json store path txn-data)))
+  (-index-file-write [_ ledger-alias index-type index-data]
+    (let [index-name (name index-type)
+          path       (str/join "/" [ledger-alias "index" index-name])]
+      (storage/content-write-json store path index-data)))
+  (-index-file-read [_ index-address]
+    (storage/read-json store index-address true))
 
   connection/iConnection
   (-close [_] (swap! state assoc :closed? true))

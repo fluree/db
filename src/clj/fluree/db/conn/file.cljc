@@ -1,51 +1,19 @@
 (ns fluree.db.conn.file
   (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.util.async :refer [<? go-try]]
             [clojure.string :as str]
             [fluree.db.util.core :as util]
-            [fluree.json-ld :as json-ld]
             [fluree.db.index :as index]
             [fluree.db.connection :as connection]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.util.bytes :as bytes]
-            [fluree.db.util.json :as json]
             [fluree.db.nameservice.storage-backed :as storage-ns]
             [fluree.db.storage :as storage]
             [fluree.db.storage.file :as file-storage])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn- write-data
-  [{:keys [store] :as _conn} ledger-alias data-type data]
-  (go-try
-    (let [json     (if (string? data)
-                     data
-                     (json-ld/normalize-data data))
-          bytes    (bytes/string->UTF8 json)
-          type-dir (name data-type)
-          path     (str/join "/" [ledger-alias type-dir])
-
-          {:keys [path hash address]} (<? (storage/write store path bytes))]
-      {:name    path
-       :hash    hash
-       :json    json
-       :size    (count json)
-       :address address})))
-
-(defn read-data
-  [conn address keywordize?]
-  (go-try
-   (some-> (<? (storage/read (:store conn) address))
-           (json/parse keywordize?))))
-
-(defn delete-data
-  "Will throw if not deleted."
-  [conn address]
-  (storage/delete (:store conn) address))
 
 (defn close
   [id state]
@@ -56,19 +24,24 @@
                            nameservices serializer msg-out-ch lru-cache-atom]
 
   connection/iStorage
-  (-c-read [conn commit-key]
-    (read-data conn commit-key false))
+  (-c-read [_ commit-address]
+    (storage/read-json store commit-address))
   (-c-write [_ ledger-alias commit-data]
     (let [path (str/join "/" [ledger-alias "commit"])]
       (storage/content-write-json store path commit-data)))
-  (-txn-read [conn txn-key]
-    (read-data conn txn-key false))
-  (-txn-write [conn ledger-alias txn-data]
-    (write-data conn ledger-alias :txn txn-data))
-  (-index-file-write [conn ledger-alias index-type index-data]
-    (write-data conn ledger-alias (str "index/" (name index-type)) index-data))
-  (-index-file-read [conn index-address] (read-data conn index-address true))
-  (-index-file-delete [conn index-address] (delete-data conn index-address))
+  (-txn-read [_ txn-address]
+    (storage/read-json store txn-address))
+  (-txn-write [_ ledger-alias txn-data]
+    (let [path (str/join "/" [ledger-alias "txn"])]
+      (storage/content-write-json store path txn-data)))
+  (-index-file-write [_ ledger-alias index-type index-data]
+    (let [index-name (name index-type)
+          path       (str/join "/" [ledger-alias "index" index-name])]
+      (storage/content-write-json store path index-data)))
+  (-index-file-read [_ index-address]
+    (storage/read-json store index-address true))
+  (-index-file-delete [_ index-address]
+    (storage/delete store index-address))
 
   connection/iConnection
   (-close [_] (close id state))

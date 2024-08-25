@@ -33,13 +33,13 @@
 
   connection/iStorage
   (-c-read [_ commit-key]
-    (storage/read store commit-key))
+    (storage/read-json store commit-key))
   (-c-write [_ _ commit-data]
     (storage/content-write-json store "commit" commit-data))
   (-txn-read [_ txn-key]
-    (storage/read store txn-key))
+    (storage/read-json store txn-key))
   (-txn-write [_ _ txn-data]
-    (storage/write store "txn" txn-data))
+    (storage/content-write-json store "txn" txn-data))
 
   connection/iConnection
   (-close [_] (close id state))

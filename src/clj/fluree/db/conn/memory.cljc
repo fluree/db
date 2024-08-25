@@ -1,12 +1,12 @@
 (ns fluree.db.conn.memory
-  (:require [clojure.core.async :as async :refer [go]]
+  (:require [clojure.core.async :as async]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.index :as index]
             [fluree.db.nameservice.storage-backed :as storage-ns]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.connection :as connection]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.async :refer [ go-try]]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.storage :as storage]
             [fluree.db.storage.memory :as memory-storage]
@@ -14,27 +14,6 @@
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-;; Memory Connection object
-
-(defn- write-data!
-  [store type data]
-  (go-try
-    (let [{:keys [address path hash size]}
-          (<? (storage/write store type data))]
-      {:name    path
-       :hash    hash
-       :size    size
-       :address address})))
-
-(defn- read-data
-  [store address]
-  (go-try
-    (let [data (<? (storage/read store address))]
-      #?(:cljs (if (and platform/BROWSER (string? data))
-                 (js->clj (.parse js/JSON data))
-                 data)
-         :clj  data))))
 
 (defn close
   [id state]
@@ -45,11 +24,14 @@
                              parallelism msg-in-ch msg-out-ch nameservices data-atom]
 
   connection/iStorage
-  (-c-read [_ commit-key] (read-data store commit-key))
+  (-c-read [_ commit-key]
+    (storage/read-json store commit-key))
   (-c-write [_ _ledger-alias commit-data]
     (storage/content-write-json store "commit" commit-data))
-  (-txn-read [_ txn-key] (read-data store txn-key))
-  (-txn-write [_ _ledger-alias txn-data] (write-data! store :transaction txn-data))
+  (-txn-read [_ txn-key]
+    (storage/read-json store txn-key))
+  (-txn-write [_ _ledger-alias txn-data]
+    (storage/content-write-json store "transaction" txn-data))
 
   connection/iConnection
   (-close [_] (close id state))
