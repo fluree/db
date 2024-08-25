@@ -12,33 +12,16 @@
             [clojure.string :as str])
   #?(:clj (:import (java.io Writer))))
 
-(defn close
-   [id state]
-  (log/info "Closing remote connection" id)
-  (swap! state assoc :closed? true))
-
 (defrecord RemoteConnection [id server-state state lru-cache-atom serializer
                              nameservices ledger-defaults parallelism]
-
   connection/iStorage
   (-c-read [_ commit-key] (remote/remote-read state server-state commit-key false))
   (-txn-read [_ txn-key] (remote/remote-read state server-state txn-key false))
   (-index-file-read [_ index-address] (remote/remote-read state server-state index-address true))
 
   connection/iConnection
-  (-close [_] (close id state))
-  (-closed? [_] (boolean (:closed? @state)))
   (-did [_] (:did ledger-defaults))
-  (-msg-in [_ msg] (go-try
-                     (log/warn "-msg-in: " msg)
-                     :TODO))
-  (-msg-out [_ msg] (go-try
-                      ;; TODO - register/submit event
-                      (log/warn "-msg-out: " msg)
-                      :TODO))
   (-nameservices [_] nameservices)
-  (-state [_] @state)
-  (-state [_ ledger] (get @state ledger))
 
   index/Resolver
   (resolve

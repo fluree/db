@@ -22,7 +22,6 @@
 
 (defrecord FileConnection [id state ledger-defaults parallelism msg-in-ch store
                            nameservices serializer msg-out-ch lru-cache-atom]
-
   connection/iStorage
   (-c-read [_ commit-address]
     (storage/read-json store commit-address))
@@ -44,14 +43,8 @@
     (storage/delete store index-address))
 
   connection/iConnection
-  (-close [_] (close id state))
-  (-closed? [_] (boolean (:closed? @state)))
   (-did [_] (:did ledger-defaults))
-  (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection op: msg-in" {})))
-  (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection op: msg-out" {})))
   (-nameservices [_] nameservices)
-  (-state [_] @state)
-  (-state [_ ledger] (get @state ledger))
 
   index/Resolver
   (resolve

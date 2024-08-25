@@ -34,20 +34,8 @@
     (storage/content-write-json store "transaction" txn-data))
 
   connection/iConnection
-  (-close [_] (close id state))
-  (-closed? [_] (boolean (:closed? @state)))
   (-did [_] (:did ledger-defaults))
-  (-msg-in [_ msg] (go-try
-                     ;; TODO - push into state machine
-                     (log/warn "-msg-in: " msg)
-                     :TODO))
-  (-msg-out [_ msg] (go-try
-                      ;; TODO - register/submit event
-                      (log/warn "-msg-out: " msg)
-                      :TODO))
   (-nameservices [_] nameservices)
-  (-state [_] @state)
-  (-state [_ ledger] (get @state ledger))
 
   index/Resolver
   (resolve

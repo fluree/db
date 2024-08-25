@@ -10,13 +10,8 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol iConnection
-  (-close [conn] "Closes all resources for this connection")
-  (-closed? [conn] "Indicates if connection is open or closed")
   (-did [conn] "Returns optional default did map if set at connection level")
-  (-msg-in [conn msg] "Handler for incoming message from nameservices")
-  (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")
-  (-nameservices [conn] "Returns a sequence of all nameservices configured for the connection.")
-  (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger"))
+  (-nameservices [conn] "Returns a sequence of all nameservices configured for the connection."))
 
 (defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")

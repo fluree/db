@@ -34,14 +34,8 @@
     (storage/read-json store index-address true))
 
   connection/iConnection
-  (-close [_] (swap! state assoc :closed? true))
-  (-closed? [_] (boolean (:closed? @state)))
   (-did [_] (:did ledger-defaults))
-  (-msg-in [_ _] (throw (ex-info "Unsupported S3Connection op: msg-in" {})))
-  (-msg-out [_ _] (throw (ex-info "Unsupported S3Connection op: msg-out" {})))
   (-nameservices [_] nameservices)
-  (-state [_] @state)
-  (-state [_ ledger] (get @state ledger))
 
   index/Resolver
   (resolve [conn node]
