@@ -70,7 +70,6 @@
   [conn-state server-state sync? msg-in msg-out]
   nameservice/iNameService
   (-lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
-  (-lookup [_ ledger-address opts] (remote-lookup conn-state server-state ledger-address)) ;; TODO - doesn't support branch yet
   (-sync? [_] sync?)
   (-address [_ ledger-alias {:keys [branch]:as _opts}]
     (go (if (and branch (not= "main" branch))
