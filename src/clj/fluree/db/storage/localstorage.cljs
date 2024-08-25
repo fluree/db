@@ -13,19 +13,7 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord LocalStorageStore []
-  storage/ContentAddressedStore
-  (write [_ k v]
-    (go
-      (let [hashable (if (storage/hashable? v)
-                       v
-                       (pr-str v))
-            hash     (crypto/sha2-256 hashable)]
-        (.setItem js/localStorage k v)
-        {:path    k
-         :address (local-storage-address k)
-         :hash    hash
-         :size    (count hashable)})))
-
+  storage/Store
   (list [_ prefix]
     (go
       (->> (js/Object.keys js/localstorage)
@@ -36,15 +24,29 @@
       (let [path (:local (storage/parse-address address))]
         (.getItem js/localStorage path))))
 
+  (exists? [store address]
+    (go
+      (let [path (:local (storage/parse-address address))]
+        (boolean (storage/read store path)))))
+
+  storage/EraseableStore
   (delete [_ address]
     (go
       (let [path (:local (storage/parse-address address))]
         (.removeItem js/localStorage path))))
 
-  (exists? [store address]
+  storage/ContentAddressedStore
+  (-content-write [_ k v]
     (go
-      (let [path (:local (storage/parse-address address))]
-        (boolean (storage/read store path))))))
+      (let [hashable (if (storage/hashable? v)
+                       v
+                       (pr-str v))
+            hash     (crypto/sha2-256 hashable)]
+        (.setItem js/localStorage k v)
+        {:path    k
+         :address (local-storage-address k)
+         :hash    hash
+         :size    (count hashable)}))))
 
 (defn open
   [config]

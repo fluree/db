@@ -11,19 +11,7 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord MemoryStore [contents]
-  storage/ContentAddressedStore
-  (write [_ _ v]
-    (go
-      (let [hashable (if (storage/hashable? v)
-                       v
-                       (pr-str v))
-            hash     (crypto/sha2-256 hashable)]
-        (swap! contents assoc hash v)
-        {:path    hash
-         :address (memory-address hash)
-         :hash    hash
-         :size    (count hashable)})))
-
+  storage/Store
   (list [_ prefix]
     (go
       (filter #(when (string? %) (str/starts-with? % prefix))
@@ -34,15 +22,29 @@
       (let [path (:local (storage/parse-address address))]
         (get @contents path))))
 
+  (exists? [_ address]
+    (go
+      (let [path (:local (storage/parse-address address))]
+        (contains? @contents path))))
+
+  storage/EraseableStore
   (delete [_ address]
     (go
       (let [path (:local (storage/parse-address address))]
         (swap! contents dissoc path))))
 
-  (exists? [_ address]
+  storage/ContentAddressedStore
+  (-content-write [_ _ v]
     (go
-      (let [path (:local (storage/parse-address address))]
-        (contains? @contents path))))
+      (let [hashable (if (storage/hashable? v)
+                       v
+                       (pr-str v))
+            hash     (crypto/sha2-256 hashable)]
+        (swap! contents assoc hash v)
+        {:path    hash
+         :address (memory-address hash)
+         :hash    hash
+         :size    (count hashable)})))
 
   storage/ByteStore
   (write-bytes [_ path bytes]

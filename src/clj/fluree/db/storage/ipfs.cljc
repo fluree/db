@@ -18,24 +18,7 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord IpfsStore [endpoint]
-  storage/ContentAddressedStore
-  (write [_ path v]
-    (go-try
-      (let [content (if (string? v)
-                      v
-                      (json-ld/normalize-data v))
-
-            {:keys [hash size] :as res} (<? (ipfs/add endpoint path content))]
-        (when-not size
-          (throw
-            (ex-info
-              "IPFS publish error, unable to retrieve IPFS name."
-              {:status 500 :error :db/push-ipfs :result res})))
-        {:path    hash
-         :hash    hash
-         :address (ipfs-address hash)
-         :size    size})))
-
+  storage/Store
   (list [_ prefix]
     (throw (ex-info "Unsupported operation IpfsStore method: list." {:prefix prefix})))
 
@@ -57,8 +40,23 @@
                         {:status 500 :error :db/invalid-address})))
       (ipfs/cat endpoint path false)))
 
-  (delete [_ address]
-    (throw (ex-info "Unsupported operation IpfsStore method: delete." {:address address}))))
+  storage/ContentAddressedStore
+  (-content-write [_ path v]
+    (go-try
+      (let [content (if (string? v)
+                      v
+                      (json-ld/normalize-data v))
+
+            {:keys [hash size] :as res} (<? (ipfs/add endpoint path content))]
+        (when-not size
+          (throw
+            (ex-info
+              "IPFS publish error, unable to retrieve IPFS name."
+              {:status 500 :error :db/push-ipfs :result res})))
+        {:path    hash
+         :hash    hash
+         :address (ipfs-address hash)
+         :size    size}))))
 
 (defn open
   [endpoint]

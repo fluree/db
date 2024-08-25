@@ -22,8 +22,25 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord FileStore [root]
+  storage/Store
+  (read [_ address]
+    (let [path (storage-path root address)]
+      (fs/read-file path)))
+
+  (list [_ prefix]
+    (fs/list-files (full-path root prefix)))
+
+  (exists? [_ address]
+    (let [path (storage-path root address)]
+      (fs/exists? path)))
+
+  storage/EraseableStore
+  (delete [_ address]
+    (let [path (storage-path root address)]
+      (fs/delete-file path)))
+
   storage/ContentAddressedStore
-  (write [_ dir data]
+  (-content-write [_ dir data]
     (go-try
       (when (not (storage/hashable? data))
         (throw (ex-info "Must serialize data before writing to FileStore."
@@ -42,21 +59,6 @@
          :address (file-address path)
          :hash    hash
          :size    (count bytes)})))
-
-  (read [_ address]
-    (let [path (storage-path root address)]
-      (fs/read-file path)))
-
-  (list [_ prefix]
-    (fs/list-files (full-path root prefix)))
-
-  (delete [_ address]
-    (let [path (storage-path root address)]
-      (fs/delete-file path)))
-
-  (exists? [_ address]
-    (let [path (storage-path root address)]
-      (fs/exists? path)))
 
   storage/ByteStore
   (write-bytes [_ path bytes]

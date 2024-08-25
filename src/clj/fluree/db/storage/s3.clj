@@ -12,8 +12,20 @@
   (s3/s3-address bucket prefix k))
 
 (defrecord S3Store [client bucket prefix]
+  storage/Store
+  (read [_ address]
+    (s3/read-address client bucket prefix address))
+
+  (exists? [_ address]
+    (s3/s3-key-exists? client bucket prefix address))
+
+  ;; TODO: Implement `list` and `delete` methods. We should never throw
+  ;; exceptions for protocol implementations
+  (list [_ prefix]
+    (throw (ex-info "Unsupported operation S3Store method: list." {:prefix prefix})))
+
   storage/ContentAddressedStore
-  (write [_ dir data]
+  (-content-write [_ dir data]
     (go
       (let [hash     (crypto/sha2-256 data)
             bytes    (if (string? data)
@@ -29,20 +41,6 @@
            :path    (str/replace address #"fluree:s3://" "")
            :size    (count bytes)
            :address address}))))
-
-  (read [_ address]
-    (s3/read-address client bucket prefix address))
-
-  (exists? [_ address]
-    (s3/s3-key-exists? client bucket prefix address))
-
-  ;; TODO: Implement `list` and `delete` methods. We should never throw
-  ;; exceptions for protocol implementations
-  (list [_ prefix]
-    (throw (ex-info "Unsupported operation S3Store method: list." {:prefix prefix})))
-
-  (delete [_ address]
-    (throw (ex-info "Unsupported operation S3Store method: delete." {:prefix prefix})))
 
   storage/ByteStore
   (write-bytes [_ path bytes]
