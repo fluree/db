@@ -3,6 +3,7 @@
   (:require [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
+            [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]))
 
 (defn hashable?
@@ -56,9 +57,15 @@
 (defn content-write-json
   [store path data]
   (go-try
-    (let [json   (if (string? data)
-                   data
-                   (json-ld/normalize-data data))
+    (let [json   (json-ld/normalize-data data)
           bytes  (bytes/string->UTF8 json)
           result (<? (write store path bytes))]
       (assoc result :json json))))
+
+(defn read-json
+  ([store address]
+   (read-json store address false))
+  ([store address keywordize?]
+   (go-try
+     (when-let [data (<? (read store address))]
+       (json/parse data keywordize?)))))
