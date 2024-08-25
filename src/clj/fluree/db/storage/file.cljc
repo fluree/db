@@ -22,17 +22,10 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord FileStore [root]
-  storage/Store
+  storage/ReadableStore
   (read [_ address]
     (let [path (storage-path root address)]
       (fs/read-file path)))
-
-  (list [_ prefix]
-    (fs/list-files (full-path root prefix)))
-
-  (exists? [_ address]
-    (let [path (storage-path root address)]
-      (fs/exists? path)))
 
   storage/EraseableStore
   (delete [_ address]

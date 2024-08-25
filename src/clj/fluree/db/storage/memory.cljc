@@ -11,21 +11,11 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord MemoryStore [contents]
-  storage/Store
-  (list [_ prefix]
-    (go
-      (filter #(when (string? %) (str/starts-with? % prefix))
-              (keys contents))))
-
+  storage/ReadableStore
   (read [_ address]
     (go
       (let [path (:local (storage/parse-address address))]
         (get @contents path))))
-
-  (exists? [_ address]
-    (go
-      (let [path (:local (storage/parse-address address))]
-        (contains? @contents path))))
 
   storage/EraseableStore
   (delete [_ address]

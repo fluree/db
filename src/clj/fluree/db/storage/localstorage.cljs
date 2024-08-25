@@ -13,21 +13,11 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord LocalStorageStore []
-  storage/Store
-  (list [_ prefix]
-    (go
-      (->> (js/Object.keys js/localstorage)
-           (filter #(str/starts-with? % prefix)))))
-
+  storage/ReadableStore
   (read [_ address]
     (go
       (let [path (:local (storage/parse-address address))]
         (.getItem js/localStorage path))))
-
-  (exists? [store address]
-    (go
-      (let [path (:local (storage/parse-address address))]
-        (boolean (storage/read store path)))))
 
   storage/EraseableStore
   (delete [_ address]

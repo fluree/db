@@ -18,19 +18,7 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord IpfsStore [endpoint]
-  storage/Store
-  (list [_ prefix]
-    (throw (ex-info "Unsupported operation IpfsStore method: list." {:prefix prefix})))
-
-  (exists? [_ address]
-    (go-try
-      (let [resp (<! (storage/read endpoint address))]
-        (if (util/exception? resp)
-          (if (= (-> resp ex-data :error) :xhttp/timeout)
-            false ; treat timeouts as non-existent
-            (throw resp))
-          (boolean resp)))))
-
+  storage/ReadableStore
   (read [_ address]
     (let [{:keys [ns method local]} (storage/parse-address address)
           path                      (build-ipfs-path method local)]

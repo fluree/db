@@ -42,10 +42,8 @@
   [address]
   (-> address parse-address :local))
 
-(defprotocol Store
-  (exists? [store address] "Returns true when address exists in store.")
-  (read [store address] "Returns value associated with `address`.")
-  (list [store prefix] "Returns sequence of keys that match prefix."))
+(defprotocol ReadableStore
+  (read [store address] "Returns value associated with `address`."))
 
 (defprotocol ContentAddressedStore
   (-content-write [store k v]
