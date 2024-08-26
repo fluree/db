@@ -6,7 +6,7 @@
 
 (deftest ^:integration vector-search-test
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "vector-search")
+        ledger @(fluree/create conn "vector-score")
         db     @(fluree/stage
                  (fluree/db ledger)
                  {"@context" {"ex" "http://example.org/ns/"}
@@ -64,7 +64,7 @@
 (deftest ^:integration vector-search-different-scores
   (testing "Multi-cardinality vector values work as expected"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "vector-search")
+          ledger @(fluree/create conn "vector-score-multi-card")
           db     @(fluree/stage
                    (fluree/db ledger)
                    {"@context" {"ex" "http://example.org/ns/"}
@@ -126,7 +126,7 @@
 (deftest ^:integration vector-search-mixed-datatype
   (testing "When a property has some vectors but other datatypes, filter non-vectors in scoring"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "vector-search")
+          ledger @(fluree/create conn "vector-score-mixed-dt")
           db     @(fluree/stage
                    (fluree/db ledger)
                    {"@context" {"ex" "http://example.org/ns/"}
