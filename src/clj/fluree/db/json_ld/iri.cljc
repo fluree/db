@@ -17,7 +17,7 @@
   (toString [_] s)
   Comparable
   (compareTo [_ o]
-    (compare s (str o))))
+    (compare s (str ^IRI o))))
 
 (defn iri?
   [x]

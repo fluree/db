@@ -246,14 +246,16 @@
       const/iri-xsd-date
       const/iri-xsd-time}))
 
+(def dt-sid->iri
+  {const/$xsd:string  const/iri-string
+   const/$xsd:long    const/iri-long
+   const/$xsd:decimal const/iri-xsd-decimal
+   const/$xsd:boolean const/iri-xsd-boolean
+   const/$id          const/iri-id})
+
 (defn infer-dt-iri
   [x]
-  (get {const/$xsd:string  const/iri-string
-        const/$xsd:long    const/iri-long
-        const/$xsd:decimal const/iri-xsd-decimal
-        const/$xsd:boolean const/iri-xsd-boolean
-        const/$id          const/iri-id}
-       (datatype/infer x)))
+  (get dt-sid->iri (datatype/infer x)))
 
 (defn compare*
   [val-a dt-a val-b dt-b]
