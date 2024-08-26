@@ -10,28 +10,36 @@
   #?(:clj  (v/vec v)
      :cljs v))
 
-(defn dotproduct
+(defn vec?
+  [x]
+  #?(:clj  (v/vec? x)
+     :cljs (vector? x)))
+
+(defn- dotproduct*
   [v1 v2]
-  (when (and (vector? v1) (vector? v2))
-    #?(:clj  (v/dot (vectorize v1) (vectorize v2))
-       :cljs (reduce + (map * v1 v2)))))
+  #?(:clj  (v/dot v1 v2)
+     :cljs (reduce + (map * v1 v2))))
 
 (defn- magnitude
   [v]
   #?(:clj  (v/magnitude v)
-     :cljs (Math/sqrt (dotproduct v v))))
+     :cljs (Math/sqrt (dotproduct* v v))))
+
+(defn dotproduct
+  [v1 v2]
+  (when (and (vec? v1) (vec? v2))
+    (dotproduct* v1 v2)))
 
 (defn cosine-similarity
   [v1 v2]
-  (when (and (vector? v1) (vector? v2))
-    (let [v1* (vectorize v1)
-          v2* (vectorize v2)]
-      (/ (v/dot v1* v2*)
-         (* (magnitude v1*)
-            (magnitude v2*))))))
+  (when (and (vec? v1) (vec? v2))
+    (/ (dotproduct* v1 v2)
+       (* (magnitude v1)
+          (magnitude v2)))))
 
 (defn euclidian-distance
   [v1 v2]
-  (when (and (vector? v1) (vector? v2))
-    #?(:clj  (v/distance (vectorize v1) (vectorize v2))
+  (when (and (vec? v1) (vec? v2))
+    #?(:clj  (v/distance v1 v2)
        :cljs (Math/sqrt (reduce + (map #(* % %) (map - v1 v2)))))))
+
