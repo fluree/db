@@ -62,6 +62,8 @@
 (def ^:const iri-onProperty (fluree-iri "onProperty"))
 (def ^:const iri-exMessage (fluree-iri "exMessage"))
 (def ^:const iri-policyClass (fluree-iri "policyClass"))
+(def ^:const iri-vector (fluree-iri "vector"))
+(def ^:const iri-sparseVector (fluree-iri "sparseVector"))
 (def ^:const iri-context "@context")
 (def ^:const iri-base "@base")
 (def ^:const iri-vocab "@vocab")
@@ -245,17 +247,13 @@
 (def ^:const sh_in (iri/iri->sid "http://www.w3.org/ns/shacl#in"))
 (def ^:const sh_hasValue (iri/iri->sid "http://www.w3.org/ns/shacl#hasValue"))
 
-
-;; fluree-specific
-(def ^:const $fluree:targetClass (iri/iri->sid iri-target-class))
-
 ;; owl
 (def ^:const $owl:Class (iri/iri->sid "http://www.w3.org/2002/07/owl#Class"))
 (def ^:const $owl:ObjectProperty (iri/iri->sid "http://www.w3.org/2002/07/owl#ObjectProperty"))
 (def ^:const $owl:DatatypeProperty (iri/iri->sid "http://www.w3.org/2002/07/owl#DatatypeProperty"))
 (def ^:const $owl:equivalentProperty (iri/iri->sid "http://www.w3.org/2002/07/owl#equivalentProperty"))
 
-;; == xsd data types ==
+;; == data types ==
 ;; major types (a) ref, (b) string, (c) number, (d) boolean
 ;; xsd common types
 (def ^:const $xsd:anyURI (iri/iri->sid iri-anyURI))
@@ -294,8 +292,9 @@
 (def ^:const $xsd:unsignedByte (iri/iri->sid "http://www.w3.org/2001/XMLSchema#unsignedByte")) ; store as number
 (def ^:const $xsd:hexBinary (iri/iri->sid "http://www.w3.org/2001/XMLSchema#hexBinary"))
 (def ^:const $xsd:base64Binary (iri/iri->sid "http://www.w3.org/2001/XMLSchema#base64Binary"))
+
 (def ^:const $rdf:json (iri/iri->sid iri-json))
+(def ^:const $fluree:vector (iri/iri->sid iri-vector)) ;; dense vector/embedding
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
 
-(def ^:const $f:role (iri/iri->sid iri-role))

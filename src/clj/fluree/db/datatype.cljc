@@ -5,6 +5,7 @@
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [clojure.string :as str]
+            [fluree.db.vector.scoring :as vector.score]
             #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc]))
   #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
@@ -49,7 +50,8 @@
    "http://www.w3.org/2001/XMLSchema#base64Binary"         const/$xsd:base64Binary
    "http://www.w3.org/2001/XMLSchema#anyURI"               const/$xsd:anyURI
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" const/$rdf:langString
-   "http://www.w3.org/2001/XMLSchema#json"                 const/$rdf:json})
+   "http://www.w3.org/2001/XMLSchema#json"                 const/$rdf:json
+   const/iri-vector                                        const/$fluree:vector})
 
 (def time-types
   #{const/$xsd:date
@@ -311,9 +313,23 @@
 (defn- coerce-json
   [value]
   (try*
-    (json-ld/normalize-data value)
-    (catch* e
-            (log/error e "Unable to normalize json" value))))
+   (json-ld/normalize-data value)
+   (catch* e
+           (throw (ex-info (str "Unable to normalize value to json" value)
+                           {:status 400
+                            :error  :db/invalid-json}
+                           e)))))
+
+(defn- coerce-dense-vector
+  [value]
+  (try*
+   (vector.score/vectorize value)
+   (catch* e
+           (log/error e "Unrecognized value for dense vector: " value)
+           (throw (ex-info (str "Unrecognized value for dense vector: " value)
+                           {:status 400
+                            :error  :db/invalid-dense-vector}
+                           e)))))
 
 (defn- check-signed
   "Returns nil if required-type and n conflict in terms of signedness
@@ -405,6 +421,9 @@
 
     const/$rdf:json
     (coerce-json value)
+
+    const/$fluree:vector
+    (coerce-dense-vector value)
 
     ;; else
     value))
