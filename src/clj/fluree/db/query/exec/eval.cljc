@@ -212,34 +212,8 @@
   (let [dt-var (var->dt-var var)]
     `(iri/string->iri ~dt-var)))
 
-(def mutually-comparable-datatypes
+(def numeric-datatypes
   #{const/iri-xsd-decimal
-    const/iri-xsd-double
-    const/iri-xsd-integer
-    const/iri-long
-    const/iri-xsd-int
-    const/iri-xsd-short
-    const/iri-xsd-float
-    const/iri-xsd-unsignedLong
-    const/iri-xsd-unsignedInt
-    const/iri-xsd-unsignedShort
-    const/iri-xsd-positiveInteger
-    const/iri-xsd-nonPositiveInteger
-    const/iri-xsd-negativeInteger
-    const/iri-xsd-nonNegativeInteger})
-
-(def self-comparable-datatypes
-  #{const/iri-id
-    const/iri-xsd-boolean
-    const/iri-string
-    const/iri-lang-string
-    const/iri-anyURI
-    const/iri-xsd-normalizedString
-    const/iri-xsd-token
-    const/iri-xsd-dateTime
-    const/iri-xsd-date
-    const/iri-xsd-time
-    const/iri-xsd-decimal
     const/iri-xsd-double
     const/iri-xsd-integer
     const/iri-long
@@ -255,38 +229,55 @@
     const/iri-xsd-negativeInteger
     const/iri-xsd-nonNegativeInteger})
 
+(def string-datatypes
+  #{const/iri-string
+    const/iri-xsd-normalizedString
+    const/iri-lang-string
+    const/iri-xsd-token})
+
+(def comparable-datatypes
+  (set/union
+    numeric-datatypes
+    string-datatypes
+    #{const/iri-xsd-boolean
+      const/iri-anyURI
+      const/iri-id
+      const/iri-xsd-dateTime
+      const/iri-xsd-date
+      const/iri-xsd-time}))
+
+(defn infer-dt-iri
+  [x]
+  (get {const/$xsd:string  const/iri-string
+        const/$xsd:long    const/iri-long
+        const/$xsd:decimal const/iri-xsd-decimal
+        const/$xsd:boolean const/iri-xsd-boolean
+        const/$id          const/iri-id}
+       (datatype/infer x)))
+
 (defn compare*
   [val-a dt-a val-b dt-b]
-  (cond
-    ;; can compare different numeric types
-    (or (and (contains? mutually-comparable-datatypes dt-a)
-             (or (contains? mutually-comparable-datatypes dt-b)
-                 (number? val-b)))
-        (and (contains? mutually-comparable-datatypes dt-b)
-             (or (contains? mutually-comparable-datatypes dt-a)
-                 (number? val-a)))
-        (and (number? val-a)
-             (number? val-b)
-             (or (nil? dt-a)
-                 (nil? dt-b))))
-    (compare val-a val-b)
+  (let [dt-a (or dt-a (infer-dt-iri val-a))
+        dt-b (or dt-b (infer-dt-iri val-b))]
+    (cond
+      ;; can compare across types
+      (or (and (contains? numeric-datatypes dt-a)
+               (contains? numeric-datatypes dt-b))
+          (and (contains? string-datatypes dt-a)
+               (contains? string-datatypes dt-b)))
+      (compare val-a val-b)
 
-    (not= dt-a dt-b)
-    (throw (ex-info (str "Cannot compare unequal datatypes: " dt-a " and " dt-b)
-                    {:a      val-a :a-dt dt-a
-                     :b      val-b :b-dt dt-b
-                     :status 400
-                     :error  :db/invalid-query}))
+      ;; can compare with same type
+      (and (= dt-a dt-b)
+           (contains? comparable-datatypes dt-a))
+      (compare val-a val-b)
 
-    (contains? self-comparable-datatypes dt-a)
-    (compare val-a val-b)
-
-    :else
-    (throw (ex-info (str "Incomparable datatype: " dt-a)
-                    {:a      val-a :a-dt dt-a
-                     :b      val-b :b-dt dt-b
-                     :status 400
-                     :error  :db/invalid-query}))))
+      :else
+      (throw (ex-info (str "Incomparable datatypes: " dt-a " and " dt-b)
+                      {:a      val-a :a-dt dt-a
+                       :b      val-b :b-dt dt-b
+                       :status 400
+                       :error  :db/invalid-query})))))
 
 (defmacro less-than
   [var-a var-b]
