@@ -14,7 +14,10 @@
 
 (defrecord IRI [^String s]
   Object
-  (toString [_] s))
+  (toString [_] s)
+  Comparable
+  (compareTo [_ o]
+    (compare s (str o))))
 
 (defn iri?
   [x]

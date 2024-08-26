@@ -210,33 +210,107 @@
   (let [dt-var (var->dt-var var)]
     `(iri/string->iri ~dt-var)))
 
+(def comparable-datatypes
+  #{const/iri-id
+    const/iri-xsd-boolean
+    const/iri-string
+    const/iri-lang-string
+    const/iri-anyURI
+    const/iri-xsd-normalizedString
+    const/iri-xsd-token
+    const/iri-xsd-dateTime
+    const/iri-xsd-date
+    const/iri-xsd-time
+    const/iri-xsd-decimal
+    const/iri-xsd-double
+    const/iri-xsd-integer
+    const/iri-long
+    const/iri-xsd-int
+    const/iri-xsd-byte
+    const/iri-xsd-short
+    const/iri-xsd-float
+    const/iri-xsd-unsignedLong
+    const/iri-xsd-unsignedInt
+    const/iri-xsd-unsignedShort
+    const/iri-xsd-positiveInteger
+    const/iri-xsd-nonPositiveInteger
+    const/iri-xsd-negativeInteger
+    const/iri-xsd-nonNegativeInteger})
+
 (defn less-than*
-  [val-a dt-a val-b dt-a]
+  [val-a dt-a val-b dt-b]
   (cond
     (not= dt-a dt-b)
-    (throw (ex-info (str "Incomporable datatypes: " dt-a " and " dt-b)
+    (throw (ex-info (str "Cannot compare unequal datatypes: " dt-a " and " dt-b)
                     {:a      val-a :a-dt dt-a
                      :b      val-b :b-dt dt-b
                      :status 400
                      :error  :db/invalid-query}))
 
-    (contains? datatype/numeric-type-iris dt-a)
-    (< val-a val-b)
+    (contains? comparable-datatypes dt-a)
+    (neg? (compare val-a val-b))
 
-    (= dt-a const/iri-xsd-dateTime)
-    (condp = (type val-a)
-      Instant        (.isBefore ^Instant val-a ^Instant val-b)
-      LocalDateTime  (.isBefore ^LocalDateTime val-a ^LocalDateTime val-b)
-      OffsetDateTime (.isBefore ^OffsetDateTime val-a ^OffsetDateTime val-b))
-
-    (= dt-a const/iri-string)
-    (neg? (compare val-a val-b))))
+    :else
+    (throw (ex-info (str "Incomparable datatype: " dt-a)
+                    {:a      val-a :a-dt dt-a
+                     :b      val-b :b-dt dt-b
+                     :status 400
+                     :error  :db/invalid-query}))))
 
 (defmacro less-than
   [var-a var-b]
   (let [dt-a (var->dt-var var-a)
         dt-b (var->dt-var var-b)]
     `(less-than* ~var-a ~dt-a ~var-b ~dt-b)))
+
+(defn less-than-or-equal*
+  [val-a dt-a val-b dt-b]
+  (or (= val-a val-b)
+      (less-than* val-a dt-a val-b dt-b)))
+
+(defmacro less-than-or-equal
+  [var-a var-b]
+  (let [dt-a (var->dt-var var-a)
+        dt-b (var->dt-var var-b)]
+    `(less-than-or-equal* ~var-a ~dt-a ~var-b ~dt-b)))
+
+(defn greater-than*
+  [val-a dt-a val-b dt-b]
+  (cond
+    (not= dt-a dt-b)
+    (throw (ex-info (str "Cannot compare unequal datatypes: " dt-a " and " dt-b)
+                    {:a      val-a :a-dt dt-a
+                     :b      val-b :b-dt dt-b
+                     :status 400
+                     :error  :db/invalid-query}))
+
+    (contains? comparable-datatypes dt-a)
+    (pos? (compare val-a val-b))
+
+    :else
+    (throw (ex-info (str "Incomparable datatype: " dt-a)
+                    {:a      val-a :a-dt dt-a
+                     :b      val-b :b-dt dt-b
+                     :status 400
+                     :error  :db/invalid-query}))))
+
+(defmacro greater-than
+  [var-a var-b]
+  (let [dt-a (var->dt-var var-a)
+        dt-b (var->dt-var var-b)]
+    `(greater-than* ~var-a ~dt-a ~var-b ~dt-b)))
+
+(defn greater-than-or-equal*
+  [val-a dt-a val-b dt-b]
+  (or (= val-a val-b)
+      (greater-than* val-a dt-a val-b dt-b)))
+
+(defmacro greater-than-or-equal
+  [var-a var-b]
+  (let [dt-a (var->dt-var var-a)
+        dt-b (var->dt-var var-b)]
+    `(greater-than-or-equal* ~var-a ~dt-a ~var-b ~dt-b)))
+
 (defn regex
   [text pattern]
   (boolean (re-find (re-pattern pattern) text)))
@@ -362,6 +436,9 @@
     ||             fluree.db.query.exec.eval/||
     &&             fluree.db.query.exec.eval/&&
     <              fluree.db.query.exec.eval/less-than
+    <=             fluree.db.query.exec.eval/less-than-or-equal
+    >              fluree.db.query.exec.eval/greater-than
+    >=             fluree.db.query.exec.eval/greater-than-or-equal
     abs            clojure.core/abs
     as             fluree.db.query.exec.eval/as
     avg            fluree.db.query.exec.eval/avg
