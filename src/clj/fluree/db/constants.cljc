@@ -250,7 +250,7 @@
 (def ^:const $owl:DatatypeProperty (iri/iri->sid "http://www.w3.org/2002/07/owl#DatatypeProperty"))
 (def ^:const $owl:equivalentProperty (iri/iri->sid "http://www.w3.org/2002/07/owl#equivalentProperty"))
 
-;; == xsd data types ==
+;; == data types ==
 ;; major types (a) ref, (b) string, (c) number, (d) boolean
 ;; xsd common types
 (def ^:const $xsd:anyURI (iri/iri->sid iri-anyURI))
@@ -289,7 +289,9 @@
 (def ^:const $xsd:unsignedByte (iri/iri->sid "http://www.w3.org/2001/XMLSchema#unsignedByte")) ; store as number
 (def ^:const $xsd:hexBinary (iri/iri->sid "http://www.w3.org/2001/XMLSchema#hexBinary"))
 (def ^:const $xsd:base64Binary (iri/iri->sid "http://www.w3.org/2001/XMLSchema#base64Binary"))
+
 (def ^:const $rdf:json (iri/iri->sid iri-json))
+(def ^:const $fluree:vector (iri/iri->sid iri-vector)) ;; dense vector/embedding
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
 
