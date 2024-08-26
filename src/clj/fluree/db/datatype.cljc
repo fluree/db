@@ -312,9 +312,12 @@
 (defn- coerce-json
   [value]
   (try*
-    (json-ld/normalize-data value)
-    (catch* e
-            (log/error e "Unable to normalize json" value))))
+   (json-ld/normalize-data value)
+   (catch* e
+           (throw (ex-info (str "Unable to normalize value to json" value)
+                           {:status 400
+                            :error  :db/invalid-json}
+                           e)))))
 
 (defn- coerce-dense-vector
   [value]
