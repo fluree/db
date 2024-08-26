@@ -191,15 +191,17 @@
 
 (defn var->lang-var
   [var]
-  (-> var
-      (str "$-LANG")
-      symbol))
+  (when (where/variable? var)
+    (-> var
+        (str "$-LANG")
+        symbol)))
 
 (defn var->dt-var
   [var]
-  (-> var
-      (str "$-DATATYPE")
-      symbol))
+  (when (where/variable? var)
+    (-> var
+        (str "$-DATATYPE")
+        symbol)))
 
 (defmacro lang
   [var]
@@ -210,7 +212,23 @@
   (let [dt-var (var->dt-var var)]
     `(iri/string->iri ~dt-var)))
 
-(def comparable-datatypes
+(def mutually-comparable-datatypes
+  #{const/iri-xsd-decimal
+    const/iri-xsd-double
+    const/iri-xsd-integer
+    const/iri-long
+    const/iri-xsd-int
+    const/iri-xsd-short
+    const/iri-xsd-float
+    const/iri-xsd-unsignedLong
+    const/iri-xsd-unsignedInt
+    const/iri-xsd-unsignedShort
+    const/iri-xsd-positiveInteger
+    const/iri-xsd-nonPositiveInteger
+    const/iri-xsd-negativeInteger
+    const/iri-xsd-nonNegativeInteger})
+
+(def self-comparable-datatypes
   #{const/iri-id
     const/iri-xsd-boolean
     const/iri-string
@@ -240,6 +258,19 @@
 (defn compare*
   [val-a dt-a val-b dt-b]
   (cond
+    ;; can compare different numeric types
+    (or (and (contains? mutually-comparable-datatypes dt-a)
+             (or (contains? mutually-comparable-datatypes dt-b)
+                 (number? val-b)))
+        (and (contains? mutually-comparable-datatypes dt-b)
+             (or (contains? mutually-comparable-datatypes dt-a)
+                 (number? val-a)))
+        (and (number? val-a)
+             (number? val-b)
+             (or (nil? dt-a)
+                 (nil? dt-b))))
+    (compare val-a val-b)
+
     (not= dt-a dt-b)
     (throw (ex-info (str "Cannot compare unequal datatypes: " dt-a " and " dt-b)
                     {:a      val-a :a-dt dt-a
@@ -247,7 +278,7 @@
                      :status 400
                      :error  :db/invalid-query}))
 
-    (contains? comparable-datatypes dt-a)
+    (contains? self-comparable-datatypes dt-a)
     (compare val-a val-b)
 
     :else
