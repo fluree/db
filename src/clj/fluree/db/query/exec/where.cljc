@@ -11,7 +11,6 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.vector.scoring :as v]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))
 
@@ -43,14 +42,6 @@
 (defn get-variable
   [match]
   (::var match))
-
-(defn get-metric
-  [match]
-  (::metric match))
-
-(defn get-vector
-  [match]
-  (::vector match))
 
 (defn get-datatype-iri
   [mch]
@@ -186,21 +177,6 @@
   [mch var]
   (link-var mch :t var))
 
-(defn link-metric
-  [mch metric]
-  (assoc mch ::metric (keyword metric)))
-
-(defn link-vector
-  [mch vector]
-  (assoc mch ::vector (v/vectorize vector)))
-
-(defn link-vector-score
-  [mch var vector metric]
-  (-> mch
-      (link-var :score var)
-      (link-vector vector)
-      (link-metric metric)))
-
 (defn sanitize-match
   [match]
   (select-keys match [::iri ::val ::datatype-iri ::sids]))
@@ -253,11 +229,6 @@
         true)
       (let [dt-iri (json-ld/expand-iri type context)]
         (matched-datatype? mch dt-iri)))))
-
-(defn score-matcher
-  "Filter out any values that are not of type iri-vector"
-  [_ mch]
-  (-> mch get-datatype-iri (= const/iri-vector)))
 
 (defn matched-transaction?
   [mch t]
@@ -405,17 +376,6 @@
         lang    (-> flake flake/m :lang)]
     (match-value var-mch lang const/iri-string)))
 
-(defn match-linked-score
-  [var o-mch flake]
-  (let [var-mch   (unmatched-var var)
-        cmp-vec   (get-vector o-mch)
-        flake-vec (v/vectorize (flake/o flake))
-        score     (case (get-metric o-mch)
-                    :dotproduct (v/dotproduct flake-vec cmp-vec)
-                    :cosine (v/cosine-similarity flake-vec cmp-vec)
-                    :distance (v/euclidian-distance flake-vec cmp-vec))]
-    (match-value var-mch score)))
-
 (defn match-linked-t
   [var flake]
   (let [var-mch (unmatched-var var)
@@ -423,17 +383,16 @@
     (match-value var-mch t const/iri-long)))
 
 (defn match-linked-var
-  [var-type linked-var o-mch db flake]
+  [var-type linked-var db flake]
   (case var-type
-    :dt    (match-linked-datatype linked-var db flake)
-    :lang  (match-linked-lang linked-var flake)
-    :score (match-linked-score linked-var o-mch flake)
-    :t     (match-linked-t linked-var flake)))
+    :dt   (match-linked-datatype linked-var db flake)
+    :lang (match-linked-lang linked-var flake)
+    :t    (match-linked-t linked-var flake)))
 
 (defn match-linked-vars
   [solution o-mch db flake]
   (reduce (fn [soln [var-type linked-var]]
-            (let [var-mch (match-linked-var var-type linked-var o-mch db flake)]
+            (let [var-mch (match-linked-var var-type linked-var db flake)]
               (assoc soln linked-var var-mch)))
           solution (get-linked-vars o-mch)))
 

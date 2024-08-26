@@ -61,19 +61,6 @@
                       {:status 400, :error :db/invalid-query}))
       lang)))
 
-(defn get-score
-  [attrs]
-  (parse-var-name
-   (get attrs const/iri-score)))
-
-(defn get-vector
- [attrs]
- (get attrs const/iri-vec-search))
-
-(defn get-metric
-  [attrs]
-  (get attrs const/iri-metric))
-
 (defn parse-value-datatype
   [v attrs context]
   (if-let [dt (get-type attrs)]
@@ -288,37 +275,28 @@
                  (parse-pattern pattern vars context)))
        where/->where-clause))
 
-(defn vector-score
-  [mch score attrs]
-  (let [vector (get-vector attrs)
-        metric (get-metric attrs)]
-    (where/link-vector-score mch score vector metric)))
-
 (defn parse-variable-attributes
   [var attrs vars context]
   (if (and (contains? attrs const/iri-type)
            (contains? attrs const/iri-language))
     (throw (ex-info "Language tags are not allowed when the data type is specified."
                     {:status 400, :error :db/invalid-query}))
-    (let [var-mch       (where/unmatched-var var)
-          t             (get attrs const/iri-t)
-          t-matcher     (some-> t (where/transaction-matcher))
-          dt            (get attrs const/iri-type)
-          dt-matcher    (some-> dt (where/datatype-matcher context))
-          lang          (get attrs const/iri-language)
-          lang-matcher  (some-> lang where/lang-matcher)
-          score         (get-score attrs)
-          score-matcher (when score where/score-matcher)
-          filter-fn     (some-> attrs
-                                (get const/iri-filter)
-                                (parse-filter-function var vars context))
-          f             (combine-filters t-matcher dt-matcher lang-matcher score-matcher filter-fn)]
+    (let [var-mch      (where/unmatched-var var)
+          t            (get attrs const/iri-t)
+          t-matcher    (some-> t (where/transaction-matcher))
+          dt           (get attrs const/iri-type)
+          dt-matcher   (some-> dt (where/datatype-matcher context))
+          lang         (get attrs const/iri-language)
+          lang-matcher (some-> lang where/lang-matcher)
+          filter-fn    (some-> attrs
+                               (get const/iri-filter)
+                               (parse-filter-function var vars context))
+          f            (combine-filters t-matcher dt-matcher lang-matcher filter-fn)]
       (cond-> var-mch
-        (v/variable? dt)    (where/link-dt-var dt)
-        (v/variable? lang)  (where/link-lang-var lang)
-        (v/variable? t)     (where/link-t-var t)
-        (v/variable? score) (vector-score score attrs)
-        f                   (where/with-filter f)))))
+        (v/variable? dt)   (where/link-dt-var dt)
+        (v/variable? lang) (where/link-lang-var lang)
+        (v/variable? t)    (where/link-t-var t)
+        f                  (where/with-filter f)))))
 
 (defn generate-subject-var
   "Generate a unique subject variable"
