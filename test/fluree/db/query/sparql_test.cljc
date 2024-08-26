@@ -171,8 +171,8 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?person", "person:age" 70}
               [:union
-               {"@id" "?person", "person:handle" "dsanchez"}
-               {"@id" "?person", "person:handle" "anguyen"}]
+               [{"@id" "?person", "person:handle" "dsanchez"}
+                {"@id" "?person", "person:handle" "anguyen"}]]
               {"@id" "?person", "person:age" "?age"}]
              where)))
     (let [query "SELECT ?title ?author
@@ -181,11 +181,24 @@
                           { ?book dc11:title ?title .  ?book dc11:creator ?author } }"
           {:keys [where]} (sparql/->fql query)]
       (is (= [[:union
-               {"@id" "?book" "dc10:title" "?title"}
-               {"@id" "?book" "dc11:title" "?title"}]
+               [{"@id" "?book" "dc10:title" "?title"}
+                {"@id" "?book" "dc11:title" "?title"}]]
               [:union
-               {"@id" "?book" "dc10:creator" "?author"}
-               {"@id" "?book" "dc11:creator" "?author"}]]
+               [{"@id" "?book" "dc10:creator" "?author"}
+                {"@id" "?book" "dc11:creator" "?author"}]]]
+             where)))
+    (let [query "SELECT ?title ?author
+                 WHERE  { { ?book dc10:price ?p1 .  ?book dc10:creator ?author . FILTER ( ?p1> 420 ) }
+                          UNION
+                          { ?book dc11:price ?p2 .  ?book dc11:creator ?author . FILTER ( ?p2 > 42 ) } }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [[:union
+               [{"@id" "?book", "dc10:price" "?p1"}
+                {"@id" "?book", "dc11:price" "?p2"}]]
+              [:union
+               [{"@id" "?book", "dc10:creator" "?author"}
+                {"@id" "?book", "dc11:creator" "?author"}]]
+              [:union [[:filter "(> ?p1 420)"] [:filter "(> ?p2 42)"]]]]
              where))))
   (testing "FILTER"
     (let [query "SELECT ?handle ?num
@@ -195,7 +208,7 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?person", "person:handle" "?handle"}
               {"@id" "?person", "person:favNums" "?num"}
-              [:filter ["(> ?num 10)"]]]
+              [:filter "(> ?num 10)"]]
              where)))
     (let [query "PREFIX schema: <http://schema.org/>
                  SELECT ?s ?t ?name
@@ -208,9 +221,21 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?s", "@type" "?t"}
               {"@id" "?s", "schema:name" "?name"}
-              [:filter ["(regex ?name \"^Jon\" \"i\")"]]]
+              [:filter "(regex ?name \"^Jon\" \"i\")"]]
              where)
           "filter by regex call"))
+    (let [query "SELECT ?s
+                 WHERE {
+                   ?product1 ex:numProp1 ?p1.
+                   ?product2 ex:numProp2 ?p2.
+                   FILTER (?p1 > (?p2 - 120) && ?p1 < (?p1 + 120))
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?product1", "ex:numProp1" "?p1"}
+              {"@id" "?product2", "ex:numProp2" "?p2"}
+              [:filter "(and (> ?p1 (- ?p2 120)) (< ?p1 (+ ?p1 120)))"]]
+             where)
+          "EXISTS expression parsing"))
     (let [query "SELECT ?s
                  WHERE {
                    ?s ?p ?o
@@ -229,6 +254,16 @@
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?s" "?p" "?o"}
               ["not-exists" [{"@id" "?s" "ex:name" "Larry"}]]]
+             where)
+          "NOT EXISTS expression parsing"))
+    (let [query "SELECT ?s
+                 WHERE {
+                   ?s ex:test ?testVar
+                   FILTER (!bound(?testVar))
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s", "ex:test" "?testVar"}
+              [:filter "(not (bound ?testVar))"]]
              where)
           "NOT EXISTS expression parsing")))
   (testing "OPTIONAL"
@@ -259,7 +294,7 @@
         (is (= [{"@id" "?person", "person:handle" "?handle"}
                 [:optional
                  [{"@id" "?person", "person:favNums" "?num"}
-                  [:filter ["(> ?num 10)"]]]]]
+                  [:filter "(> ?num 10)"]]]]
                where)))))
   (testing "VALUES"
     (testing "pattern"
@@ -275,9 +310,9 @@
                         ?person person:handle ?handle.}"]
         (is (= [[:values
                  ["?person"
-                  [{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                  [{"@type" "@id",
                     "@value" ":personA"}
-                   {"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                   {"@type" "@id",
                     "@value" ":personB"}]]]
                 {"@id" "?person", "person:handle" "?handle"}]
                (:where (sparql/->fql query)))
@@ -289,10 +324,10 @@
                    }}"]
         (is (= [[:values
                  [["?color" "?direction"]]
-                 [[{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                 [[{"@type" "@id",
                     "@value" "dm:red"}
                    "north"]
-                  [{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                  [{"@type" "@id",
                     "@value" "dm:blue"}
                    "west"]]]]
                (:where (sparql/->fql query)))
@@ -304,9 +339,9 @@
         (is (= {:where [{"@id" "?person", "person:handle" "?handle"}],
                 :values
                 ["?person"
-                 [{"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                 [{"@type" "@id",
                    "@value" ":personA"}
-                  {"@type" "http://www.w3.org/2001/XMLSchema#anyURI",
+                  {"@type" "@id",
                    "@value" ":personB"}]]}
                (select-keys (sparql/->fql query) [:where :values]))
             "where pattern: single var, multiple values"))))
@@ -332,6 +367,13 @@
               {"@id" "?person", "person:age" "?age"}]
              where)))
     (testing "function calls"
+      (let [query "SELECT ?finger
+                 WHERE {?person ex:thumb ?thumb.
+                        BIND (!bound(?thumb) AS ?finger)}"
+            {:keys [where]} (sparql/->fql query)]
+        (is (= [{"@id" "?person", "ex:thumb" "?thumb"}
+                [:bind "?finger" "(not (bound ?thumb))"]]
+               where)))
       (let [query "SELECT ?person ?abs ?bnode ?bound ?ceil ?coalesce ?concat ?contains ?datatype ?day
                         ?encodeForUri ?floor ?hours ?if ?iri ?lang ?langMatches ?lcase ?md5 ?minutes
                         ?month ?now ?rand ?round ?seconds ?sha1 ?sha256 ?sha512 ?str ?strAfter ?strBefore
@@ -484,7 +526,7 @@
             {:keys [where]} (sparql/->fql query)]
         (is (= [{"@id" "?x", ":p" "?n"}
                 [:minus [{"@id" "?x", ":q" "?m"}
-                         [:filter ["(= ?n ?m)"]]]]]
+                         [:filter "(= ?n ?m)"]]]]
                where)))))
   (testing "subquery"
       (let [query "PREFIX : <http://people.example/>
@@ -556,6 +598,19 @@
           {:keys [offset]} (sparql/->fql query)]
       (is (= 10
              offset))))
+  (testing "LIMIT+OFFSET"
+    (let [query "SELECT ?person
+                 WHERE {?person person:fullName ?fullName}
+                 LIMIT 10
+                 OFFSET 10"]
+      (is (= {:limit 10, :offset 10}
+             (select-keys (sparql/->fql query) [:limit :offset]))))
+    (let [query "SELECT ?person
+                 WHERE {?person person:fullName ?fullName}
+                 OFFSET 10
+                 LIMIT 10"]
+      (is (= {:limit 10, :offset 10}
+             (select-keys (sparql/->fql query) [:limit :offset])))))
   (testing "ORDER BY"
     (testing "ASC"
       (let [query "SELECT ?favNums
@@ -701,6 +756,14 @@
                  results @(fluree/query db query {:format :sparql})]
              (is (= [["ex:jdoe" "Jane Doe"]]
                     results))))
+         (testing "basic filter works"
+           (let [query "PREFIX person: <http://example.org/Person#>
+                          SELECT ?handle ?favNum
+                          WHERE {?person person:handle ?handle ;
+                                         person:favNums ?favNum .
+                                 FILTER ( ?favNum > 10 ) .}"]
+             (is (= [["bbob" 23] ["jdoe" 42] ["jdoe" 99]]
+                    @(fluree/query db query {:format :sparql})))))
          (testing "basic wildcard query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT *

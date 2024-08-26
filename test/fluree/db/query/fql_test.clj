@@ -69,6 +69,73 @@
                                     :having   '(>= (avg ?favNums) 10)}))
               "filters results according to the supplied having function code"))))))
 
+(deftest ^:integration ordering-test
+  (testing "Queries with order"
+    (let [conn   (test-utils/create-conn)
+          people (test-utils/load-people conn)
+          db     (fluree/db people)]
+      (testing "with a single ordered field"
+        (let [qry     {:context  [test-utils/default-context
+                                  {:ex "http://example.org/ns/"}]
+                       :select   '[?name ?email ?age]
+                       :where    '{:schema/name  ?name
+                                   :schema/email ?email
+                                   :schema/age   ?age}
+                       :order-by '?name}
+              subject @(fluree/query db qry)]
+          (is (= [["Alice" "alice@example.org" 50]
+                  ["Brian" "brian@example.org" 50]
+                  ["Cam" "cam@example.org" 34]
+                  ["Liam" "liam@example.org" 13]]
+                 subject)
+              "returns ordered results"))
+        (testing "with a specified direction"
+          (let [qry     {:context  [test-utils/default-context
+                                    {:ex "http://example.org/ns/"}]
+                         :select   '[?name ?email ?age]
+                         :where    '{:schema/name  ?name
+                                     :schema/email ?email
+                                     :schema/age   ?age}
+                         :order-by '(desc ?name)}
+                subject @(fluree/query db qry)]
+            (is (= [["Liam" "liam@example.org" 13]
+                    ["Cam" "cam@example.org" 34]
+                    ["Brian" "brian@example.org" 50]
+                    ["Alice" "alice@example.org" 50]]
+                   subject)
+                "returns ordered results"))))
+
+      (testing "with multiple ordered fields"
+        (let [qry     {:context  [test-utils/default-context
+                                  {:ex "http://example.org/ns/"}]
+                       :select   '[?name ?email ?age]
+                       :where    '{:schema/name  ?name
+                                   :schema/email ?email
+                                   :schema/age   ?age}
+                       :order-by '[?age ?name]}
+              subject @(fluree/query db qry)]
+          (is (= [["Liam" "liam@example.org" 13]
+                  ["Cam" "cam@example.org" 34]
+                  ["Alice" "alice@example.org" 50]
+                  ["Brian" "brian@example.org" 50]]
+                 subject)
+              "returns ordered results"))
+        (testing "with a specified direction"
+          (let [qry     {"@context" [test-utils/default-str-context
+                                     {"ex" "http://example.org/ns/"}]
+                         "select"   ["?name" "?email" "?age"]
+                         "where"    {"schema:name"  "?name"
+                                     "schema:email" "?email"
+                                     "schema:age"   "?age"}
+                         "orderBy"  ["(desc ?age)" "?name"]}
+                subject @(fluree/query db qry)]
+            (is (= [["Alice" "alice@example.org" 50]
+                    ["Brian" "brian@example.org" 50]
+                    ["Cam" "cam@example.org" 34]
+                    ["Liam" "liam@example.org" 13]]
+                   subject)
+                "returns ordered results")))))))
+
 (deftest ^:integration select-distinct-test
   (testing "Distinct queries"
     (let [conn   (test-utils/create-conn)
@@ -108,12 +175,13 @@
         (testing "with an iri"
           (let [q {:context [test-utils/default-context
                              {:ex    "http://example.org/ns/"
-                              :value "@value"}]
+                              :value "@value"
+                              :id "@id"}]
                    :select  '[?name ?age]
                    :where   '{:id          ?s
                               :schema/name ?name
                               :schema/age  ?age}
-                   :values  '[?s [{:value :ex/alice, :type :xsd/anyURI}]]}]
+                   :values  '[?s [{:value :ex/alice, :type :id}]]}]
             (is (= [["Alice" 50]]
                    @(fluree/query db q))
                 "returns only the results related to the bound value")))

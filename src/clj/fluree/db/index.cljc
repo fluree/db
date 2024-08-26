@@ -23,7 +23,7 @@
 
 (defn reference?
   [dt]
-  (= dt const/$xsd:anyURI))
+  (= dt const/$id))
 
 (defn for-components
   "Returns the index that should be used to scan for flakes that match the

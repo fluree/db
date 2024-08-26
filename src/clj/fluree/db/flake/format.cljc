@@ -60,7 +60,7 @@
   [db spec f]
   (let [obj (flake/o f)
         dt (flake/dt f)]
-    (if (= const/$xsd:anyURI dt)
+    (if (= const/$id dt)
       (format-reference db spec obj)
       (if (= const/$rdf:json dt)
         (json/parse obj false)
