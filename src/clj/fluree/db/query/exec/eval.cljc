@@ -136,8 +136,8 @@
 
 (defn now
   []
-  #?(:clj  (str (Instant/now))
-     :cljs (.toISOString (js/Date.))))
+  #?(:clj  (Instant/now)
+     :cljs (js/Date.)))
 
 (defn strStarts
   [s substr]
