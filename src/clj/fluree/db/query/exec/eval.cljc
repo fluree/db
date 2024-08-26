@@ -237,7 +237,7 @@
     const/iri-xsd-negativeInteger
     const/iri-xsd-nonNegativeInteger})
 
-(defn less-than*
+(defn compare*
   [val-a dt-a val-b dt-b]
   (cond
     (not= dt-a dt-b)
@@ -248,7 +248,7 @@
                      :error  :db/invalid-query}))
 
     (contains? comparable-datatypes dt-a)
-    (neg? (compare val-a val-b))
+    (compare val-a val-b)
 
     :else
     (throw (ex-info (str "Incomparable datatype: " dt-a)
@@ -261,55 +261,27 @@
   [var-a var-b]
   (let [dt-a (var->dt-var var-a)
         dt-b (var->dt-var var-b)]
-    `(less-than* ~var-a ~dt-a ~var-b ~dt-b)))
-
-(defn less-than-or-equal*
-  [val-a dt-a val-b dt-b]
-  (or (= val-a val-b)
-      (less-than* val-a dt-a val-b dt-b)))
+    `(neg? (compare* ~var-a ~dt-a ~var-b ~dt-b))))
 
 (defmacro less-than-or-equal
   [var-a var-b]
   (let [dt-a (var->dt-var var-a)
         dt-b (var->dt-var var-b)]
-    `(less-than-or-equal* ~var-a ~dt-a ~var-b ~dt-b)))
-
-(defn greater-than*
-  [val-a dt-a val-b dt-b]
-  (cond
-    (not= dt-a dt-b)
-    (throw (ex-info (str "Cannot compare unequal datatypes: " dt-a " and " dt-b)
-                    {:a      val-a :a-dt dt-a
-                     :b      val-b :b-dt dt-b
-                     :status 400
-                     :error  :db/invalid-query}))
-
-    (contains? comparable-datatypes dt-a)
-    (pos? (compare val-a val-b))
-
-    :else
-    (throw (ex-info (str "Incomparable datatype: " dt-a)
-                    {:a      val-a :a-dt dt-a
-                     :b      val-b :b-dt dt-b
-                     :status 400
-                     :error  :db/invalid-query}))))
+    `(or (= ~var-a ~var-b)
+         (neg? (compare* ~var-a ~dt-a ~var-b ~dt-b)))))
 
 (defmacro greater-than
   [var-a var-b]
   (let [dt-a (var->dt-var var-a)
         dt-b (var->dt-var var-b)]
-    `(greater-than* ~var-a ~dt-a ~var-b ~dt-b)))
-
-(defn greater-than-or-equal*
-  [val-a dt-a val-b dt-b]
-  (or (= val-a val-b)
-      (greater-than* val-a dt-a val-b dt-b)))
+    `(pos? (compare* ~var-a ~dt-a ~var-b ~dt-b))))
 
 (defmacro greater-than-or-equal
   [var-a var-b]
   (let [dt-a (var->dt-var var-a)
         dt-b (var->dt-var var-b)]
-    `(greater-than-or-equal* ~var-a ~dt-a ~var-b ~dt-b)))
+    `(or (= ~var-a ~var-b)
+         (pos? (compare* ~var-a ~dt-a ~var-b ~dt-b)))))
 
 (defn regex
   [text pattern]
