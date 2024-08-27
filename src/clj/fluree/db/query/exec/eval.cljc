@@ -136,8 +136,8 @@
 
 (defn now
   []
-  #?(:clj  (str (Instant/now))
-     :cljs (.toISOString (js/Date.))))
+  #?(:clj  (Instant/now)
+     :cljs (js/Date.)))
 
 (defn strStarts
   [s substr]
@@ -191,15 +191,17 @@
 
 (defn var->lang-var
   [var]
-  (-> var
-      (str "$-LANG")
-      symbol))
+  (when (where/variable? var)
+    (-> var
+        (str "$-LANG")
+        symbol)))
 
 (defn var->dt-var
   [var]
-  (-> var
-      (str "$-DATATYPE")
-      symbol))
+  (when (where/variable? var)
+    (-> var
+        (str "$-DATATYPE")
+        symbol)))
 
 (defmacro lang
   [var]
@@ -209,6 +211,101 @@
   [var]
   (let [dt-var (var->dt-var var)]
     `(iri/string->iri ~dt-var)))
+
+(def numeric-datatypes
+  #{const/iri-xsd-decimal
+    const/iri-xsd-double
+    const/iri-xsd-integer
+    const/iri-long
+    const/iri-xsd-int
+    const/iri-xsd-byte
+    const/iri-xsd-short
+    const/iri-xsd-float
+    const/iri-xsd-unsignedLong
+    const/iri-xsd-unsignedInt
+    const/iri-xsd-unsignedShort
+    const/iri-xsd-positiveInteger
+    const/iri-xsd-nonPositiveInteger
+    const/iri-xsd-negativeInteger
+    const/iri-xsd-nonNegativeInteger})
+
+(def string-datatypes
+  #{const/iri-string
+    const/iri-xsd-normalizedString
+    const/iri-lang-string
+    const/iri-xsd-token})
+
+(def comparable-datatypes
+  (set/union
+    numeric-datatypes
+    string-datatypes
+    #{const/iri-xsd-boolean
+      const/iri-anyURI
+      const/iri-id
+      const/iri-xsd-dateTime
+      const/iri-xsd-date
+      const/iri-xsd-time}))
+
+(def dt-sid->iri
+  {const/$xsd:string  const/iri-string
+   const/$xsd:long    const/iri-long
+   const/$xsd:decimal const/iri-xsd-decimal
+   const/$xsd:boolean const/iri-xsd-boolean
+   const/$id          const/iri-id})
+
+(defn infer-dt-iri
+  [x]
+  (get dt-sid->iri (datatype/infer x)))
+
+(defn compare*
+  [val-a dt-a val-b dt-b]
+  (let [dt-a (or dt-a (infer-dt-iri val-a))
+        dt-b (or dt-b (infer-dt-iri val-b))]
+    (cond
+      ;; can compare across types
+      (or (and (contains? numeric-datatypes dt-a)
+               (contains? numeric-datatypes dt-b))
+          (and (contains? string-datatypes dt-a)
+               (contains? string-datatypes dt-b)))
+      (compare val-a val-b)
+
+      ;; can compare with same type
+      (and (= dt-a dt-b)
+           (contains? comparable-datatypes dt-a))
+      (compare val-a val-b)
+
+      :else
+      (throw (ex-info (str "Incomparable datatypes: " dt-a " and " dt-b)
+                      {:a      val-a :a-dt dt-a
+                       :b      val-b :b-dt dt-b
+                       :status 400
+                       :error  :db/invalid-query})))))
+
+(defmacro less-than
+  [var-a var-b]
+  (let [dt-a (var->dt-var var-a)
+        dt-b (var->dt-var var-b)]
+    `(neg? (compare* ~var-a ~dt-a ~var-b ~dt-b))))
+
+(defmacro less-than-or-equal
+  [var-a var-b]
+  (let [dt-a (var->dt-var var-a)
+        dt-b (var->dt-var var-b)]
+    `(or (= ~var-a ~var-b)
+         (neg? (compare* ~var-a ~dt-a ~var-b ~dt-b)))))
+
+(defmacro greater-than
+  [var-a var-b]
+  (let [dt-a (var->dt-var var-a)
+        dt-b (var->dt-var var-b)]
+    `(pos? (compare* ~var-a ~dt-a ~var-b ~dt-b))))
+
+(defmacro greater-than-or-equal
+  [var-a var-b]
+  (let [dt-a (var->dt-var var-a)
+        dt-b (var->dt-var var-b)]
+    `(or (= ~var-a ~var-b)
+         (pos? (compare* ~var-a ~dt-a ~var-b ~dt-b)))))
 
 (defn regex
   [text pattern]
@@ -331,65 +428,68 @@
   (set/union allowed-aggregate-fns allowed-scalar-fns))
 
 (def qualified-symbols
-  '{!                  fluree.db.query.exec.eval/!
-    ||                 fluree.db.query.exec.eval/||
-    &&                 fluree.db.query.exec.eval/&&
-    abs                clojure.core/abs
-    as                 fluree.db.query.exec.eval/as
-    avg                fluree.db.query.exec.eval/avg
-    bound              fluree.db.query.exec.eval/bound
-    ceil               fluree.db.query.exec.eval/ceil
-    coalesce           fluree.db.query.exec.eval/coalesce
-    concat             fluree.db.query.exec.eval/concat
-    contains           fluree.db.query.exec.eval/contains
-    count-distinct     fluree.db.query.exec.eval/count-distinct
-    count              clojure.core/count
-    datatype           fluree.db.query.exec.eval/datatype
-    floor              fluree.db.query.exec.eval/floor
-    groupconcat        fluree.db.query.exec.eval/groupconcat
-    in                 fluree.db.query.exec.eval/in
-    iri                fluree.db.query.exec.eval/iri
-    lang               fluree.db.query.exec.eval/lang
-    lcase              fluree.db.query.exec.eval/lcase
-    median             fluree.db.query.exec.eval/median
-    now                fluree.db.query.exec.eval/now
-    rand               fluree.db.query.exec.eval/rand
-    regex              fluree.db.query.exec.eval/regex
-    replace            fluree.db.query.exec.eval/replace
-    round              clojure.math/round
-    sample             fluree.db.query.exec.eval/sample
-    sample1            fluree.db.query.exec.eval/sample1
-    stddev             fluree.db.query.exec.eval/stddev
-    strAfter           fluree.db.query.exec.eval/strAfter
-    strBefore          fluree.db.query.exec.eval/strBefore
-    strEnds            fluree.db.query.exec.eval/strEnds
-    strLen             fluree.db.query.exec.eval/strLen
-    strStarts          fluree.db.query.exec.eval/strStarts
-    subStr             fluree.db.query.exec.eval/subStr
-    sum                fluree.db.query.exec.eval/sum
-    ucase              fluree.db.query.exec.eval/ucase
-    variance           fluree.db.query.exec.eval/variance
-    year               fluree.db.query.exec.eval/year
-    month              fluree.db.query.exec.eval/month
-    day                fluree.db.query.exec.eval/day
-    hours              fluree.db.query.exec.eval/hours
-    minutes            fluree.db.query.exec.eval/minutes
-    seconds            fluree.db.query.exec.eval/seconds
-    tz                 fluree.db.query.exec.eval/tz
-    sha256             fluree.db.query.exec.eval/sha256
-    sha512             fluree.db.query.exec.eval/sha512
-    uuid               fluree.db.query.exec.eval/uuid
-    struuid            fluree.db.query.exec.eval/struuid
-    isNumeric          fluree.db.query.exec.eval/isNumeric
-    isBlank            fluree.db.query.exec.eval/isBlank
-    str                fluree.db.query.exec.eval/sparql-str
-    max                fluree.db.query.exec.eval/max
-    min                fluree.db.query.exec.eval/min
+  '{!              fluree.db.query.exec.eval/!
+    ||             fluree.db.query.exec.eval/||
+    &&             fluree.db.query.exec.eval/&&
+    <              fluree.db.query.exec.eval/less-than
+    <=             fluree.db.query.exec.eval/less-than-or-equal
+    >              fluree.db.query.exec.eval/greater-than
+    >=             fluree.db.query.exec.eval/greater-than-or-equal
+    abs            clojure.core/abs
+    as             fluree.db.query.exec.eval/as
+    avg            fluree.db.query.exec.eval/avg
+    bound          fluree.db.query.exec.eval/bound
+    ceil           fluree.db.query.exec.eval/ceil
+    coalesce       fluree.db.query.exec.eval/coalesce
+    concat         fluree.db.query.exec.eval/concat
+    contains       fluree.db.query.exec.eval/contains
+    count-distinct fluree.db.query.exec.eval/count-distinct
+    count          clojure.core/count
+    datatype       fluree.db.query.exec.eval/datatype
+    floor          fluree.db.query.exec.eval/floor
+    groupconcat    fluree.db.query.exec.eval/groupconcat
+    in             fluree.db.query.exec.eval/in
+    iri            fluree.db.query.exec.eval/iri
+    lang           fluree.db.query.exec.eval/lang
+    lcase          fluree.db.query.exec.eval/lcase
+    median         fluree.db.query.exec.eval/median
+    now            fluree.db.query.exec.eval/now
+    rand           fluree.db.query.exec.eval/rand
+    regex          fluree.db.query.exec.eval/regex
+    replace        fluree.db.query.exec.eval/replace
+    round          clojure.math/round
+    sample         fluree.db.query.exec.eval/sample
+    sample1        fluree.db.query.exec.eval/sample1
+    stddev         fluree.db.query.exec.eval/stddev
+    strAfter       fluree.db.query.exec.eval/strAfter
+    strBefore      fluree.db.query.exec.eval/strBefore
+    strEnds        fluree.db.query.exec.eval/strEnds
+    strLen         fluree.db.query.exec.eval/strLen
+    strStarts      fluree.db.query.exec.eval/strStarts
+    subStr         fluree.db.query.exec.eval/subStr
+    sum            fluree.db.query.exec.eval/sum
+    ucase          fluree.db.query.exec.eval/ucase
+    variance       fluree.db.query.exec.eval/variance
+    year           fluree.db.query.exec.eval/year
+    month          fluree.db.query.exec.eval/month
+    day            fluree.db.query.exec.eval/day
+    hours          fluree.db.query.exec.eval/hours
+    minutes        fluree.db.query.exec.eval/minutes
+    seconds        fluree.db.query.exec.eval/seconds
+    tz             fluree.db.query.exec.eval/tz
+    sha256         fluree.db.query.exec.eval/sha256
+    sha512         fluree.db.query.exec.eval/sha512
+    uuid           fluree.db.query.exec.eval/uuid
+    struuid        fluree.db.query.exec.eval/struuid
+    isNumeric      fluree.db.query.exec.eval/isNumeric
+    isBlank        fluree.db.query.exec.eval/isBlank
+    str            fluree.db.query.exec.eval/sparql-str
+    max            fluree.db.query.exec.eval/max
+    min            fluree.db.query.exec.eval/min
 
     dotproduct         fluree.db.vector.scoring/dotproduct
     cosine-similarity  fluree.db.vector.scoring/cosine-similarity
     euclidian-distance fluree.db.vector.scoring/euclidian-distance})
-
 
 (defn as*
   [val var]
