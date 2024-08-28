@@ -15,9 +15,12 @@
 (defrecord RemoteConnection [id server-state state lru-cache-atom serializer
                              nameservices ledger-defaults parallelism]
   connection/iStorage
-  (-c-read [_ commit-key] (remote/remote-read state server-state commit-key false))
-  (-txn-read [_ txn-key] (remote/remote-read state server-state txn-key false))
-  (-index-file-read [_ index-address] (remote/remote-read state server-state index-address true))
+  (-c-read [_ commit-key]
+    (remote/remote-read server-state commit-key false))
+  (-txn-read [_ txn-key]
+    (remote/remote-read server-state txn-key false))
+  (-index-file-read [_ index-address]
+    (remote/remote-read server-state index-address true))
 
   connection/iConnection
   (-did [_] (:did ledger-defaults))

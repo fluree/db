@@ -25,7 +25,7 @@
 
 (defn remote-read
   "Returns a core async channel with value of remote resource."
-  [state server-state commit-key keywordize-keys?]
+  [server-state commit-key keywordize-keys?]
   (log/debug "[remote conn] remote read initiated for: " commit-key)
   (let [server-host (pick-server server-state)]
     (xhttp/post-json (str server-host "/fluree/remoteResource")

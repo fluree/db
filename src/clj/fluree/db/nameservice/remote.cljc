@@ -12,7 +12,7 @@
 (defn remote-lookup
   [state server-state ledger-address]
   (go-try
-    (let [head-commit  (<? (remote/remote-read state server-state ledger-address false))
+    (let [head-commit  (<? (remote/remote-read server-state ledger-address false))
           head-address (get head-commit "address")]
       head-address)))
 
