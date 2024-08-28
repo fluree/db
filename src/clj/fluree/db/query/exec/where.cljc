@@ -553,14 +553,23 @@
     (log/warn (ex-message e*))
     e*))
 
+(defrecord TypedValue [value datatype-iri])
+
+(defn typed-value?
+  [x]
+  (instance? TypedValue x))
+
 (defmethod match-pattern :filter
   [_ds _fuel-tracker solution pattern error-ch]
   (go
     (let [f (pattern-data pattern)]
       (try*
-       (when (f solution)
-         solution)
-       (catch* e (>! error-ch (filter-exception e solution f)))))))
+        (let [result (f solution)]
+          (when (if (typed-value? result)
+                  (:value result)
+                  result)
+            solution))
+        (catch* e (>! error-ch (filter-exception e solution f)))))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
@@ -717,13 +726,15 @@
 
 (defn bind-function-result
   [solution var-name result]
-  (let [dt  (datatype/infer-iri result)
+  (let [[v dt]  (if (typed-value? result)
+                  [(:value result) (:datatype-iri result)]
+                  [result (datatype/infer result)])
         mch (if (= dt const/iri-id)
-              (-> var-name unmatched-var (match-iri result))
-              (-> var-name unmatched-var (match-value result dt)))]
+              (-> var-name unmatched-var (match-iri v))
+              (-> var-name unmatched-var (match-value v dt)))]
     (if-let [current (get solution var-name)]
-      (when (and (= (-> mch get-binding iri/unwrap) (get-binding current))
-                 (= (-> mch get-datatype-iri iri/unwrap) (get-datatype-iri current))
+      (when (and (= (get-binding mch) (get-binding current))
+                 (= (get-datatype-iri mch) (get-datatype-iri current))
                  (= (get-lang mch) (get-lang current)))
         solution)
       (assoc solution var-name mch))))

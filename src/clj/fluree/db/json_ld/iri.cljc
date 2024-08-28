@@ -55,12 +55,6 @@
 (defmethod pprint/simple-dispatch IRI [^IRI iri]
   (pr iri))
 
-(defn expand
-  [compact-string context]
-  (-> compact-string
-      (json-ld/expand-iri context)
-      string->iri))
-
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")
 (def ^:const f-did-ns "did:fluree:")
