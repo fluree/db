@@ -181,6 +181,11 @@
   [match]
   (select-keys match [::iri ::val ::datatype-iri ::sids]))
 
+(defn index-graph?
+  "Returns true if named graph alias is a virtual index (vector index) graph."
+  [graph-alias]
+  (str/starts-with? graph-alias iri/f-idx-flatrank-ns))
+
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]
@@ -628,7 +633,7 @@
 (defmethod match-pattern :graph
   [ds fuel-tracker solution pattern error-ch]
   (let [[g clause] (pattern-data pattern)]
-    (if-let [v (::var g)]
+    (if-let [v (get-variable g)]
       (if-let [v-match (get solution v)]
         (let [alias (or (get-iri v-match)
                         (get-value v-match))]
