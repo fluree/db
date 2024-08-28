@@ -63,6 +63,7 @@
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")
+(def ^:const f-idx-flatrank-ns "http://ns.flur.ee/index/vector/flatrank#")
 (def ^:const f-did-ns "did:fluree:")
 (def ^:const f-commit-256-ns "fluree:commit:sha256:")
 (def ^:const fdb-256-ns "fluree:db:sha256:")
