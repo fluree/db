@@ -25,6 +25,7 @@
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.query.fql :as fql]
             [fluree.db.indexer.storage :as index-storage]
+            [fluree.db.vector.index-graph :as index-graph]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
@@ -393,11 +394,23 @@
     (match/match-class db fuel-tracker solution s-mch error-ch))
 
   (-activate-alias [db alias']
-    (when (= alias alias')
-      db))
+    (cond
+      (= alias alias')
+      db
+
+      (iri/f-idx-flatrank-ns alias')
+      db
+
+      :else
+      (throw (ex-info (str "Unknown graph alias: " alias')
+                      {:status 400 :error :db/invalid-query}))))
 
   (-aliases [_]
     [alias])
+
+  where/Searcher
+  (-search [s fuel-tracker solution index-alias search-graph error-ch]
+    (index-graph/search s fuel-tracker solution index-alias search-graph error-ch))
 
   transact/Transactable
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]

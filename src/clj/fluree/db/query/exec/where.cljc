@@ -281,6 +281,9 @@
   (-activate-alias [s alias])
   (-aliases [s]))
 
+(defprotocol Searcher
+  (-search [s fuel-tracker solution graph-alias search-graph error-ch]))
+
 (defn matcher?
   [x]
   (satisfies? Matcher x))
@@ -592,9 +595,11 @@
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
-  (-> ds
-      (-activate-alias alias)
-      (match-clause fuel-tracker solution clause error-ch)))
+  (let [alias-ds (-activate-alias ds alias)]
+    (if (index-graph? alias)
+      (let [graph-pattern (->pattern :index-graph [alias clause])]
+        (match-pattern alias-ds fuel-tracker solution graph-pattern error-ch))
+      (match-clause alias-ds fuel-tracker solution clause error-ch))))
 
 (defmethod match-pattern :exists
   [ds fuel-tracker solution pattern error-ch]
@@ -649,6 +654,11 @@
                                 alias-ch)
           out-ch))
       (match-alias ds g fuel-tracker solution clause error-ch))))
+
+(defmethod match-pattern :index-graph
+  [ds fuel-tracker solution pattern error-ch]
+  (let [[g clause] (pattern-data pattern)]
+    (-search ds fuel-tracker solution g clause error-ch)))
 
 (defmethod match-pattern :union
   [db fuel-tracker solution pattern error-ch]
