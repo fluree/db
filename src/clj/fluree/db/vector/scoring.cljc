@@ -15,7 +15,7 @@
   #?(:clj  (v/vec? x)
      :cljs (vector? x)))
 
-(defn- dotproduct*
+(defn dotproduct*
   [v1 v2]
   #?(:clj  (v/dot v1 v2)
      :cljs (reduce + (map * v1 v2))))
