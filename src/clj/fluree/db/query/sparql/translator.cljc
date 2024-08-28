@@ -9,9 +9,10 @@
        (keyword? (first x))))
 
 (defn literal-quote
-  "Quote a non-variable string literal for use in an expression."
+  "Quote a non-variable, non-expression string literal for use in an expression."
   [x]
   (if (and (string? x)
+           (not (re-matches #"^\(.+\)$" x))
            (not (str/starts-with? x "?")))
     (str "\"" x "\"")
     x))
@@ -282,21 +283,21 @@
   (let [expr (parse-term n-exp)]
     (cond
       (= "IN" op)
-      (str "(in " expr " " (parse-term op-or-exp) ")")
+      (str "(in " (literal-quote expr) " " (literal-quote (parse-term op-or-exp)) ")")
 
       (and (= "NOT" op)
            (= "IN" op-or-exp))
-      (str "(not (in " expr " " (parse-term expr-list) "))")
+      (str "(not (in " (literal-quote expr) " " (literal-quote (parse-term expr-list)) "))")
 
       (nil? op)
       expr
 
       (= "!=" op)
-      (str "(not= " expr " " (parse-term op-or-exp) ")")
+      (str "(not= " (literal-quote expr) " " (literal-quote (parse-term op-or-exp)) ")")
 
       :else
       ;; op: =, <, >, <=, >=
-      (str "(" op " " expr " " (parse-term op-or-exp) ")"))))
+      (str "(" op " " (literal-quote expr) " " (literal-quote (parse-term op-or-exp)) ")"))))
 
 (defmethod parse-term :ConditionalOrExpression
   ;; ConditionalOrExpression ::= ConditionalAndExpression ( <'||'> ConditionalAndExpression )*
