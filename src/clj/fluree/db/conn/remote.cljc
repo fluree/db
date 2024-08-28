@@ -7,7 +7,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.method.remote.core :as remote]
+            [fluree.db.method.remote :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
             [clojure.string :as str])
   #?(:clj (:import (java.io Writer))))

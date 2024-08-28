@@ -1,4 +1,4 @@
-(ns fluree.db.method.remote.core
+(ns fluree.db.method.remote
   (:require [fluree.db.util.xhttp :as xhttp]
             [clojure.string :as str]
             [clojure.core.async :as async]

@@ -2,7 +2,7 @@
   (:require [clojure.string :as str]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.method.ipfs.core :as ipfs]
+            [fluree.db.method.ipfs :as ipfs]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.util.log :as log]))

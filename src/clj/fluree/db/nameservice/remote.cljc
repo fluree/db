@@ -1,6 +1,6 @@
 (ns fluree.db.nameservice.remote
   (:require [fluree.db.nameservice :as nameservice]
-            [fluree.db.method.remote.core :as remote]
+            [fluree.db.method.remote :as remote]
             [clojure.core.async :as async :refer [go go-loop]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
@@ -82,8 +82,10 @@
     (async/close! msg-out))
 
   nameservice/Publication
-  (-subscribe [_ ledger-alias callback] (subscribe conn-state ledger-alias callback))
-  (-unsubscribe [_ ledger-alias] (unsubscribe conn-state ledger-alias)))
+  (-subscribe [_ ledger-alias callback]
+    (subscribe conn-state ledger-alias callback))
+  (-unsubscribe [_ ledger-alias]
+    (unsubscribe conn-state ledger-alias)))
 
 (defn initialize
   [server-state conn-state]

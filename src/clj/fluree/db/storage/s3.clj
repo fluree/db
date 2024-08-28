@@ -1,7 +1,7 @@
 (ns fluree.db.storage.s3
   (:refer-clojure :exclude [read list])
   (:require [cognitect.aws.client.api :as aws]
-            [fluree.db.method.s3.core :as s3]
+            [fluree.db.method.s3 :as s3]
             [fluree.db.storage :as storage]
             [clojure.core.async :as async :refer [<! go]]
             [fluree.crypto :as crypto]

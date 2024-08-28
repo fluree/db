@@ -1,4 +1,4 @@
-(ns fluree.db.method.s3.core
+(ns fluree.db.method.s3
   (:require [clojure.core.async :as async :refer [go go-loop <! >!]]
             [clojure.java.io :as io]
             [clojure.string :as str]
