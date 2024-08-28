@@ -1,8 +1,8 @@
 (ns fluree.db.storage.memory
   (:require [clojure.core.async :as async :refer [go]]
-            [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.storage :as storage]))
+            [fluree.db.storage :as storage]
+            [fluree.db.util.json :as json]))
 
 (def method-name "memory")
 
@@ -11,11 +11,12 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord MemoryStore [contents]
-  storage/ReadableStore
-  (read [_ address]
+  storage/JsonArchive
+  (-read-json [_ address keywordize?]
     (go
       (let [path (:local (storage/parse-address address))]
-        (get @contents path))))
+        (when-let [data (get @contents path)]
+          (json/parse data keywordize?)))))
 
   storage/EraseableStore
   (delete [_ address]

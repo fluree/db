@@ -42,8 +42,8 @@
   [address]
   (-> address parse-address :local))
 
-(defprotocol ReadableStore
-  (read [store address] "Returns value associated with `address`."))
+(defprotocol JsonArchive
+  (-read-json [store address keywordize?] "Returns value associated with `address`."))
 
 (defprotocol ContentAddressedStore
   (-content-write [store k v]
@@ -68,8 +68,6 @@
 
 (defn read-json
   ([store address]
-   (read-json store address false))
+   (-read-json store address false))
   ([store address keywordize?]
-   (go-try
-     (when-let [data (<? (read store address))]
-       (json/parse data keywordize?)))))
+   (-read-json store address keywordize?)))

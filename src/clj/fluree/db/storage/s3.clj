@@ -3,6 +3,8 @@
   (:require [cognitect.aws.client.api :as aws]
             [fluree.db.method.s3 :as s3]
             [fluree.db.storage :as storage]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.json :as json]
             [clojure.core.async :as async :refer [<! go]]
             [fluree.crypto :as crypto]
             [clojure.string :as str]
@@ -12,9 +14,11 @@
   (s3/s3-address bucket prefix k))
 
 (defrecord S3Store [client bucket prefix]
-  storage/ReadableStore
-  (read [_ address]
-    (s3/read-address client bucket prefix address))
+  storage/JsonArchive
+  (-read-json [_ address keywordize?]
+    (go-try
+      (when-let [data (<? (s3/read-address client bucket prefix address))]
+        (json/parse data keywordize?))))
 
   storage/ContentAddressedStore
   (-content-write [_ dir data]

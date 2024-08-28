@@ -2,6 +2,7 @@
   (:require [fluree.crypto :as crypto]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
+            [fluree.db.util.json :as json]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.storage :as storage]
             [clojure.string :as str]))
@@ -22,10 +23,12 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord FileStore [root]
-  storage/ReadableStore
-  (read [_ address]
-    (let [path (storage-path root address)]
-      (fs/read-file path)))
+  storage/JsonArchive
+  (-read-json [_ address keywordize?]
+    (go-try
+      (let [path (storage-path root address)]
+        (when-let [data (<? (fs/read-file path))]
+          (json/parse data keywordize?)))))
 
   storage/EraseableStore
   (delete [_ address]

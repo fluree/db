@@ -2,9 +2,8 @@
   (:require [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
-            [clojure.core.async :refer [<!]]
             [clojure.string :as str]))
 
 (def method-name "ipfs")
@@ -18,15 +17,17 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord IpfsStore [endpoint]
-  storage/ReadableStore
-  (read [_ address]
-    (let [{:keys [ns method local]} (storage/parse-address address)
-          path                      (build-ipfs-path method local)]
-      (when-not (and (= "fluree" ns)
-                     (#{"ipfs" "ipns"} method))
-        (throw (ex-info (str "Invalid file type or method: " address)
-                        {:status 500 :error :db/invalid-address})))
-      (ipfs/cat endpoint path false)))
+  storage/JsonArchive
+  (-read-json [_ address keywordize?]
+    (go-try
+      (let [{:keys [ns method local]} (storage/parse-address address)
+            path                      (build-ipfs-path method local)]
+        (when-not (and (= "fluree" ns)
+                       (#{"ipfs" "ipns"} method))
+          (throw (ex-info (str "Invalid file type or method: " address)
+                          {:status 500 :error :db/invalid-address})))
+        (when-let [data (<? (ipfs/cat endpoint path false))]
+          (json/parse data keywordize?)))))
 
   storage/ContentAddressedStore
   (-content-write [_ path v]
