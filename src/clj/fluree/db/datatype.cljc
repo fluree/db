@@ -107,8 +107,7 @@
                     const/$xsd:string)
      (integer? x) const/$xsd:long ; infer to long to prevent overflow
      (number? x)  const/$xsd:decimal
-     (boolean? x) const/$xsd:boolean
-     (iri/iri? x) const/$id)))
+     (boolean? x) const/$xsd:boolean)))
 
 (defn infer-iri
   ([x]
@@ -368,12 +367,6 @@
      const/$rdf:langString)
     (when (string? value)
       value)
-
-    const/$id
-    (if (iri/iri? value)
-      value
-      (when (string? value)
-        (iri/string->iri value)))
 
     const/$xsd:boolean
     (coerce-boolean value)

@@ -209,8 +209,15 @@
 
 (defmacro datatype
   [var]
-  (let [dt-var (var->dt-var var)]
-    `(iri/string->iri ~dt-var)))
+  (let [dt (var->dt-var var)]
+    `(where/->TypedValue ~dt const/iri-id)))
+
+(def context-var
+  (symbol "$-CONTEXT"))
+
+(defmacro iri
+  [s]
+  `(where/->TypedValue (json-ld/expand-iri ~s ~context-var) const/iri-id))
 
 (def numeric-datatypes
   #{const/iri-xsd-decimal
@@ -393,13 +400,6 @@
 (defn in
   [term expressions]
   (contains? (set expressions) term))
-
-(def context-var
-  (symbol "$-CONTEXT"))
-
-(defmacro iri
-  [s]
-  `(iri/expand ~s ~context-var))
 
 (def allowed-scalar-fns
   '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if iri lang
