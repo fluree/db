@@ -472,10 +472,16 @@
 
 (defmethod parse-pattern :graph
   [[_ graph where] vars context]
-  (let [graph* (or (parse-variable graph)
-                   graph)
-        where* (parse-where-clause where vars context)]
-    [(where/->pattern :graph [graph* where*])]))
+  (let [graph*       (or (parse-variable graph)
+                         graph)
+        graph-iri    (when (string? graph*)
+                       (json-ld/expand-iri graph* context))
+        index-graph? (when graph-iri
+                       (where/index-graph? graph-iri))
+        where*       (parse-where-clause where vars context)]
+    (if index-graph?
+      [(where/->pattern :index-graph [graph-iri where*])]
+      [(where/->pattern :graph [graph* where*])])))
 
 (defn parse-where
   [q vars context]
