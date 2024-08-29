@@ -110,7 +110,7 @@
 
 (defn sample1
   [coll]
-  (->> coll (sample 1) first))
+  (->> coll (sample (where/->typed-val 1)) first))
 
 (defmacro coalesce
   "Evaluates args in order. The result of the first arg not to return error gets returned."
