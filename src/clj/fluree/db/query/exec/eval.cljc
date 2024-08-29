@@ -633,7 +633,7 @@
 
                     ;; literal
                     (not (sequential? x))
-                    (where/->TypedValue x (datatype/infer x) nil)
+                    (where/->TypedValue x (datatype/infer-iri x) nil)
 
                     :else
                     x))
