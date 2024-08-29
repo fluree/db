@@ -428,8 +428,8 @@
   [[_ & codes] _vars context]
   (let [f (->> codes
                (map parse-code)
-               (map (fn [code]
-                      (eval/compile code context)))
+               (map (fn [code] (comp (fn [tv] (:value tv))
+                                     (eval/compile code context))))
                (apply every-pred))]
     [(where/->pattern :filter (with-meta f {:fns codes}))]))
 

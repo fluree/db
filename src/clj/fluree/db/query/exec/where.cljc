@@ -567,7 +567,7 @@
     (let [f (pattern-data pattern)]
       (try*
         (let [result (f solution)]
-          (when (:value result)
+          (when result
             solution))
         (catch* e (>! error-ch (filter-exception e solution f)))))))
 
