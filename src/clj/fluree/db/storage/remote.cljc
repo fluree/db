@@ -7,6 +7,12 @@
   (-read-json [_ address keywordize?]
     (remote/remote-read server-state address keywordize?)))
 
-(defn remote-resource
-  [server-state]
-  (->RemoteResource server-state))
+(defn new-state
+  [servers]
+  (atom {:servers      servers
+         :connected-to nil
+         :stats        {:connected-at nil}}))
+
+(defn resource
+  [servers]
+  (-> servers new-state ->RemoteResource))
