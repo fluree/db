@@ -678,4 +678,5 @@
     (eval `(fn [~soln-sym ~var]
              (-> ~soln-sym
                  (assoc (quote ~var) ~var)
-                 ~f)))))
+                 ~f
+                 :value)))))
