@@ -40,8 +40,8 @@
          :size    (count hashable)}))))
 
 (defn open
-  [config]
+  []
   (if-not platform/BROWSER
     (throw (ex-info "LocalStorageStore is only supported on the Browser platform."
-                    {:config config}))
+                    {}))
     (->LocalStorageStore)))
