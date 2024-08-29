@@ -640,8 +640,8 @@
             code))
 
 (defn mch->typed-val
-  [{::where/keys [val iri datatype-iri lang]}]
-  (where/->typed-val (or iri val) (if iri const/iri-id datatype-iri) lang))
+  [{::where/keys [val iri datatype-iri meta]}]
+  (where/->typed-val (or iri val) (if iri const/iri-id datatype-iri) (:lang meta)))
 
 (defn bind-variables
   [soln-sym var-syms ctx]
