@@ -1,7 +1,8 @@
 (ns fluree.db.transact.update-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.api :as fluree]))
+            [fluree.db.api :as fluree]
+            [fluree.db.constants :as const]))
 
 (deftest ^:integration deleting-data
   (testing "Deletions of entire subjects."
@@ -189,7 +190,8 @@
                                                        {"ex" "http://example.com/"}]
                                           "selectOne" {"ex:hash-fns" ["ex:sha512" "ex:sha256"]}}))))))
     (testing "datetime functions"
-      (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
+      (with-redefs [fluree.db.query.exec.eval/now (fn [] {:value (java.time.Instant/parse "2023-06-13T19:53:57.234345Z")
+                                                          :datatype-iri const/iri-xsd-dateTime})]
         (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
                                                           test-utils/default-str-context
                                                           {"ex" "http://example.com/"}]
@@ -198,9 +200,12 @@
                                                 "ex:now"     0 "ex:year"    0 "ex:month"    0 "ex:day" 0 "ex:hours" 0
                                                 "ex:minutes" 0 "ex:seconds" 0 "ex:timezone" 0 "ex:tz"  0}
                                                {"id"                "ex:datetime-fns"
-                                                "ex:localdatetime"  "2023-06-13T14:17:22.435"
-                                                "ex:offsetdatetime" "2023-06-13T14:17:22.435-05:00"
-                                                "ex:utcdatetime"    "2023-06-13T14:17:22.435Z"}]})
+                                                "ex:localdatetime"  {"@value" "2023-06-13T14:17:22.435"
+                                                                     "@type" const/iri-xsd-dateTime}
+                                                "ex:offsetdatetime" {"@value" "2023-06-13T14:17:22.435-05:00"
+                                                                     "@type" const/iri-xsd-dateTime}
+                                                "ex:utcdatetime"    {"@value" "2023-06-13T14:17:22.435Z"
+                                                                     "@type" const/iri-xsd-dateTime}}]})
                           (fluree/stage {"@context" ["https://ns.flur.ee"
                                                      test-utils/default-str-context
                                                      {"ex" "http://example.com/"}]
@@ -375,8 +380,8 @@
                     "ex:replace"]}})))))
 
     (testing "rdf term functions"
-      (with-redefs [fluree.db.query.exec.eval/uuid    (fn [] "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47")
-                    fluree.db.query.exec.eval/struuid (fn [] "34bdb25f-9fae-419b-9c50-203b5f306e47")]
+      (with-redefs [fluree.db.query.exec.eval/uuid    (fn [] {:value "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47" :datatype-iri "@id"})
+                    fluree.db.query.exec.eval/struuid (fn [] {:value "34bdb25f-9fae-419b-9c50-203b5f306e47" :datatype-iri const/iri-string})]
         (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
                                                           test-utils/default-str-context
                                                           {"ex" "http://example.com/"}]
@@ -418,7 +423,7 @@
                                                       "ex:isNotBlank"   "?isNotBlank"}]
                                          "values"   ["?s" ["ex:rdf-term-fns"]]}))]
           (is (= {"ex:str"          ["1" "Abcdefg"]
-                  "ex:uuid"         "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"
+                  "ex:uuid"         {"id" "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"}
                   "ex:struuid"      "34bdb25f-9fae-419b-9c50-203b5f306e47",
                   "ex:isBlank"      false
                   "ex:isNotBlank"   false
