@@ -1,4 +1,4 @@
-(ns fluree.db.conn.ipfs
+(ns fluree.db.connection.ipfs
   (:require [fluree.db.storage.ipfs :as ipfs-storage]
             [clojure.string :as str]
             [fluree.db.indexer.storage :as index-storage]
@@ -12,7 +12,7 @@
             [fluree.db.nameservice.ipns :as ns-ipns]
             [fluree.db.nameservice.storage-backed :as storage-ns]
             [fluree.db.storage.file :as file-storage]
-            [fluree.db.conn.cache :as conn-cache]
+            [fluree.db.connection.cache :as conn-cache]
             [fluree.db.storage :as storage])
   #?(:clj (:import (java.io Writer))))
 

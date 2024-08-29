@@ -7,7 +7,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.cache :as conn-cache]))
+            [fluree.db.connection.cache :as conn-cache]))
 
 (def comparators
   "Map of default index comparators for the five index types"

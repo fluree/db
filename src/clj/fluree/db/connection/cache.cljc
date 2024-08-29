@@ -1,4 +1,4 @@
-(ns fluree.db.conn.cache
+(ns fluree.db.connection.cache
   "A simple default connection-level cache."
   (:require [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.core.async :as async]

@@ -1,4 +1,4 @@
-(ns fluree.db.conn.memory
+(ns fluree.db.connection.memory
   (:require [clojure.core.async :as async]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.index :as index]
@@ -7,7 +7,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [ go-try]]
-            [fluree.db.conn.cache :as conn-cache]
+            [fluree.db.connection.cache :as conn-cache]
             [fluree.db.storage :as storage]
             [fluree.db.storage.memory :as memory-storage]
             #?(:cljs [fluree.db.platform :as platform]))

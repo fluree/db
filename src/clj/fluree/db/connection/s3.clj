@@ -1,8 +1,8 @@
-(ns fluree.db.conn.s3
+(ns fluree.db.connection.s3
   (:require [clojure.string :as str]
             [fluree.db.nameservice.storage-backed :as storage-ns]
             [clojure.core.async :as async :refer [go]]
-            [fluree.db.conn.cache :as conn-cache]
+            [fluree.db.connection.cache :as conn-cache]
             [fluree.db.connection :as connection]
             [fluree.db.index :as index]
             [fluree.db.serde.json :refer [json-serde]]

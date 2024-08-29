@@ -1,10 +1,10 @@
-(ns fluree.db.conn.file
+(ns fluree.db.connection.file
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.db.util.core :as util]
             [fluree.db.index :as index]
             [fluree.db.connection :as connection]
-            [fluree.db.conn.cache :as conn-cache]
+            [fluree.db.connection.cache :as conn-cache]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.indexer.storage :as index-storage]
             [fluree.db.serde.json :refer [json-serde]]

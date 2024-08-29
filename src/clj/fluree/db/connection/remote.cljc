@@ -1,4 +1,4 @@
-(ns fluree.db.conn.remote
+(ns fluree.db.connection.remote
   (:require [fluree.db.indexer.storage :as index-storage]
             [fluree.db.index :as index]
             [fluree.db.util.core :as util]
@@ -6,7 +6,7 @@
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.conn.cache :as conn-cache]
+            [fluree.db.connection.cache :as conn-cache]
             [fluree.db.method.remote :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
             [clojure.string :as str])
