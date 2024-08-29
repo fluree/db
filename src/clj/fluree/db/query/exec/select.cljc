@@ -119,7 +119,7 @@
   (update-solution
     [_ solution]
     (log/trace "AsSelector update-solution solution:" solution)
-    (let [result (as-fn solution)
+    (let [result (:value (as-fn solution))
           dt     (datatype/infer-iri result)]
       (log/trace "AsSelector update-solution result:" result)
       (assoc solution bind-var (-> bind-var
