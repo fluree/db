@@ -30,7 +30,7 @@
 (defn avg
   [coll]
   (let [coll (mapv :value coll)
-        res (/ (sum coll)
+        res (/ (reduce + coll)
                (count coll))]
     (where/->typed-val
       (if (ratio? res)
