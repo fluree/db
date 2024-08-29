@@ -553,11 +553,13 @@
     (log/warn (ex-message e*))
     e*))
 
-(defrecord TypedValue [value datatype-iri])
+;; this is the arg and return type of all built-in functions
+(defrecord TypedValue [value datatype-iri lang])
 
-(defn typed-value?
-  [x]
-  (instance? TypedValue x))
+(defn ->typed-val
+  ([value] (->TypedValue value (datatype/infer-iri value) nil))
+  ([value dt-iri] (->TypedValue value dt-iri nil))
+  ([value dt-iri lang] (->TypedValue value dt-iri lang)))
 
 (defmethod match-pattern :filter
   [_ds _fuel-tracker solution pattern error-ch]
@@ -565,9 +567,7 @@
     (let [f (pattern-data pattern)]
       (try*
         (let [result (f solution)]
-          (when (if (typed-value? result)
-                  (:value result)
-                  result)
+          (when (:value result)
             solution))
         (catch* e (>! error-ch (filter-exception e solution f)))))))
 
@@ -726,9 +726,7 @@
 
 (defn bind-function-result
   [solution var-name result]
-  (let [[v dt]  (if (typed-value? result)
-                  [(:value result) (:datatype-iri result)]
-                  [result (datatype/infer result)])
+  (let [{v :value dt :datatype-iri} result
         mch (if (= dt const/iri-id)
               (-> var-name unmatched-var (match-iri v))
               (-> var-name unmatched-var (match-value v dt)))]
