@@ -101,7 +101,7 @@
   ValueSelector
   (format-value
     [_ _ _ _ _ _ error-ch solution]
-    (go (try* (agg-fn solution)
+    (go (try* (:value (agg-fn solution))
               (catch* e
                       (log/error e "Error applying aggregate selector")
                       (>! error-ch e))))))
