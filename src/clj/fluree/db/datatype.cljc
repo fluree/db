@@ -8,8 +8,8 @@
             [fluree.db.vector.scoring :as vector.score]
             #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc]))
-  #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
-                              LocalDateTime ZoneOffset)
+  #?(:clj (:import (java.time LocalDate LocalTime LocalDateTime
+                              OffsetDateTime OffsetTime ZoneOffset)
                    (java.time.format DateTimeFormatter))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -376,8 +376,14 @@
       (parse-iso8601-date value))
 
     const/$xsd:dateTime
-    (when (string? value)
-      (parse-iso8601-datetime value))
+    (cond (string? value)
+          (parse-iso8601-datetime value)
+          ;; these values don't need coercion
+          (or (instance? OffsetDateTime value)
+              (instance? LocalDateTime value))
+          value)
+
+
 
     const/$xsd:time
     (when (string? value)

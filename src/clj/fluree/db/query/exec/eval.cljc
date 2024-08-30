@@ -14,7 +14,7 @@
             [fluree.crypto :as crypto]
             [fluree.db.constants :as const]
             [clojure.math :as math])
-  #?(:clj (:import (java.time Instant OffsetDateTime LocalDateTime))))
+  #?(:clj (:import (java.time LocalDateTime OffsetDateTime ZoneId ZoneOffset))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -149,12 +149,6 @@
    `(let [or# (:value ~x)]
       (where/->typed-val (if or# or# (or (:value ~@next)))))))
 
-(defn now
-  []
-  (where/->typed-val #?(:clj (Instant/now)
-                        :cljs (js/Date.))
-                     const/iri-xsd-dateTime))
-
 (defn strStarts
   [{s :value} {substr :value}]
   (where/->typed-val (str/starts-with? s substr)))
@@ -256,6 +250,10 @@
       const/iri-xsd-date
       const/iri-xsd-time}))
 
+(defmulti to-odt type)
+(defmethod to-odt OffsetDateTime [^OffsetDateTime datetime] datetime)
+(defmethod to-odt LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC)))
+
 (defn compare*
   [val-a dt-a val-b dt-b]
   (let [dt-a (or dt-a (datatype/infer-iri val-a))
@@ -267,6 +265,10 @@
           (and (contains? string-datatypes dt-a)
                (contains? string-datatypes dt-b)))
       (compare val-a val-b)
+
+      ;; datetimes need to be converted to OffsetDateTimes for proper comparison
+      (= dt-a dt-b const/iri-xsd-dateTime)
+      (compare (to-odt val-a) (to-odt val-b))
 
       ;; can compare with same type
       (and (= dt-a dt-b)
@@ -316,46 +318,72 @@
   []
   (where/->typed-val (clojure.core/rand)))
 
+(defn now
+  []
+  (where/->typed-val
+    #?(:clj (OffsetDateTime/now (ZoneId/of "UTC"))
+       :cljs (js/Date.))
+    const/iri-xsd-dateTime))
+
 (defn year
   [{datetime :value}]
   (where/->typed-val
-    #?(:clj  (.getYear ^LocalDateTime datetime)
+    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
+                         (.toLocalDateTime ^OffsetDateTime datetime)
+                         datetime)]
+               (.getYear ^LocalDateTime ldt))
        :cljs (.getFullYear datetime))))
 
 (defn month
   [{datetime :value}]
   (where/->typed-val
-    #?(:clj  (.getMonthValue ^LocalDateTime datetime)
+    #?(:clj (let [ldt (if (instance? OffsetDateTime datetime)
+                        (.toLocalDateTime ^OffsetDateTime datetime)
+                        datetime)]
+              (.getMonthValue ^LocalDateTime ldt))
        :cljs (.getMonth datetime))))
 
 (defn day
   [{datetime :value}]
   (where/->typed-val
-    #?(:clj  (.getDayOfMonth ^LocalDateTime datetime)
+    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
+                         (.toLocalDateTime ^OffsetDateTime datetime)
+                         datetime)]
+               (.getDayOfMonth ^LocalDateTime ldt))
        :cljs (.getDate datetime))))
 
 (defn hours
   [{datetime :value}]
   (where/->typed-val
-    #?(:clj  (.getHour ^LocalDateTime datetime)
+    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
+                         (.toLocalDateTime ^OffsetDateTime datetime)
+                         datetime)]
+               (.getHour ^LocalDateTime ldt))
        :cljs (.getHours datetime))))
 
 (defn minutes
   [{datetime :value}]
   (where/->typed-val
-    #?(:clj  (.getMinute ^LocalDateTime datetime)
+    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
+                         (.toLocalDateTime ^OffsetDateTime datetime)
+                         datetime)]
+               (.getMinute ^LocalDateTime ldt))
        :cljs (.getMinutes datetime))))
 
 (defn seconds
   [{datetime :value}]
   (where/->typed-val
-    #?(:clj  (.getSecond ^LocalDateTime datetime)
+    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
+                         (.toLocalDateTime ^OffsetDateTime datetime)
+                         datetime)]
+               (.getSecond ^LocalDateTime ldt))
        :cljs (.getSeconds datetime))))
 
 (defn tz
   [{datetime :value}]
   (where/->typed-val
-    #?(:clj  (.toString (.getOffset ^OffsetDateTime datetime))
+    #?(:clj  (when (instance? OffsetDateTime datetime)
+               (.toString (.getOffset ^OffsetDateTime datetime)))
        :cljs (.getTimeZoneOffset ^js/Date datetime))))
 
 (defn sha256
