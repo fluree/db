@@ -483,18 +483,16 @@
   [db]
   (select-keys db [:alias :branch :t :stats :policy]))
 
-#?(:cljs
-   (extend-type FlakeDB
-     IPrintWithWriter
-     (-pr-writer [db w _opts]
-       (-write w label)
-       (-write w (-> db display pr)))))
+#?(:cljs (extend-type FlakeDB
+           IPrintWithWriter
+           (-pr-writer [db w _opts]
+             (-write w label)
+             (-write w (-> db display pr))))
 
-#?(:clj
-   (defmethod print-method FlakeDB [^FlakeDB db, ^Writer w]
-     (.write w label)
-     (binding [*out* w]
-       (-> db display pr))))
+   :clj (defmethod print-method FlakeDB [^FlakeDB db, ^Writer w]
+          (.write w label)
+          (binding [*out* w]
+            (-> db display pr))))
 
 (defmethod pprint/simple-dispatch FlakeDB
   [db]
