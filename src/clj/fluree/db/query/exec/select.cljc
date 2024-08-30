@@ -32,7 +32,7 @@
 
 (defmethod display const/iri-id
   [match compact]
-  (some-> match where/get-iri iri/unwrap compact))
+  (some-> match where/get-iri compact))
 
 (defmethod display const/iri-vector
   [match _compact]
