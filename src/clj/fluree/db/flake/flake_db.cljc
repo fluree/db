@@ -20,11 +20,11 @@
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.util.core :as util :refer [get-first get-first-value
                                                   get-first-id vswap!]]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             [fluree.db.indexer :as indexer]
-            [fluree.db.indexer.default :as idx-default]
+            [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.fql :as fql]
-            [fluree.db.indexer.storage :as index-storage]
+            [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
@@ -418,8 +418,8 @@
 
   indexer/Indexable
   (index [db changes-ch]
-    (if (idx-default/novelty-min? db reindex-min-bytes)
-      (idx-default/refresh db changes-ch max-old-indexes)
+    (if (novelty/novelty-min? db reindex-min-bytes)
+      (novelty/refresh db changes-ch max-old-indexes)
       (go)))
 
   TimeTravel

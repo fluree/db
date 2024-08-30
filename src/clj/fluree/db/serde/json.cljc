@@ -5,7 +5,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc]))
   #?(:clj (:import (java.time.format DateTimeFormatter))))

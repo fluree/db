@@ -1,6 +1,6 @@
 (ns fluree.db.indexer.garbage
   (:require [clojure.core.async :as async :refer [<! go]]
-            [fluree.db.indexer.storage :as storage]
+            [fluree.db.flake.index.storage :as storage]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))

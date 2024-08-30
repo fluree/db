@@ -34,6 +34,10 @@
   [match compact]
   (some-> match where/get-iri iri/unwrap compact))
 
+(defmethod display const/iri-vector
+  [match _compact]
+  (some-> match where/get-value vec))
+
 (defprotocol ValueSelector
   (format-value [fmt db iri-cache context compact fuel-tracker error-ch solution]
     "Async format a search solution (map of pattern matches) by extracting relevant match."))

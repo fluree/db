@@ -1,4 +1,4 @@
-(ns fluree.db.index
+(ns fluree.db.flake.index
   (:refer-clojure :exclude [resolve])
   (:require [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -10,7 +10,7 @@
             [fluree.db.conn.cache :as conn-cache]))
 
 (def comparators
-  "Map of default index comparators for the five index types"
+  "Map of default index comparators for the four index types"
   {:spot flake/cmp-flakes-spot
    :post flake/cmp-flakes-post
    :opst flake/cmp-flakes-opst
@@ -136,7 +136,7 @@
   "Returns avl sorted map whose keys are the first flakes of the index node
   sequence `child-nodes`, and whose values are the corresponding nodes from
   `child-nodes`."
-  [cmp & child-nodes]
+  [cmp child-nodes]
   (->> child-nodes
        (mapcat child-entry)
        (apply flake/sorted-map-by cmp)))
@@ -146,7 +146,7 @@
   provided `ledger-alias` and index comparator `cmp`."
   [ledger-alias cmp]
   (let [child-node (empty-leaf ledger-alias cmp)
-        children   (child-map cmp child-node)]
+        children   (child-map cmp [child-node])]
     {:comparator   cmp
      :ledger-alias ledger-alias
      :id           :empty
