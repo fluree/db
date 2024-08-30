@@ -217,7 +217,12 @@
                                                       "?minutes" "(minutes ?localdatetime)"
                                                       "?seconds" "(seconds ?localdatetime)"
                                                       "?tz1" "(tz ?utcdatetime)"
-                                                      "?tz2" "(tz ?offsetdatetime)"]]
+                                                      "?tz2" "(tz ?offsetdatetime)"
+                                                      "?comp=" "(= ?localdatetime (now))"
+                                                      "?comp<" "(< ?localdatetime (now))"
+                                                      "?comp<=" "(<= ?localdatetime (now))"
+                                                      "?comp>" "(> ?localdatetime (now))"
+                                                      "?comp>=" "(>= ?localdatetime (now))"]]
                                          "insert"   [{"id"         "?s"
                                                       "ex:now"     "?now"
                                                       "ex:year"    "?year"
@@ -226,7 +231,12 @@
                                                       "ex:hours"   "?hours"
                                                       "ex:minutes" "?minutes"
                                                       "ex:seconds" "?seconds"
-                                                      "ex:tz"      ["?tz1" "?tz2"]}]
+                                                      "ex:tz"      ["?tz1" "?tz2"]
+                                                      "ex:comp="   "?comp="
+                                                      "ex:comp<"   "?comp<"
+                                                      "ex:comp<="  "?comp<="
+                                                      "ex:comp>"   "?comp>"
+                                                      "ex:comp>="  "?comp>="}]
                                          "values"   ["?s" ["ex:datetime-fns"]]}))]
           (is (= {"ex:now"     "2023-06-13T19:53:57.234345Z"
                   "ex:year"    2023
@@ -235,7 +245,12 @@
                   "ex:hours"   14
                   "ex:minutes" 17
                   "ex:seconds" 22
-                  "ex:tz"      ["-05:00" "Z"]}
+                  "ex:tz"      ["-05:00" "Z"]
+                  "ex:comp="   false
+                  "ex:comp<"   true
+                  "ex:comp<="  true
+                  "ex:comp>"   false
+                  "ex:comp>="  false}
                  @(fluree/query @updated
                                 {"@context" [test-utils/default-str-context
                                              {"ex" "http://example.com/"}]
@@ -243,7 +258,10 @@
                                  {"ex:datetime-fns" ["ex:now" "ex:year"
                                                      "ex:month" "ex:day"
                                                      "ex:hours" "ex:minutes"
-                                                     "ex:seconds" "ex:tz"]}}))))))
+                                                     "ex:seconds" "ex:tz"
+                                                     "ex:comp="
+                                                     "ex:comp<" "ex:comp<="
+                                                     "ex:comp>" "ex:comp>="]}}))))))
 
     (testing "numeric functions"
       (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"

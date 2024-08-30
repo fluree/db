@@ -119,7 +119,9 @@
       (if (= const/iri-id dt-iri)
         (let [expanded (json-ld/expand-iri val context)]
           (where/match-iri var-match expanded))
-        (where/match-value var-match val dt-iri))
+        (let [dt-id (get datatype/default-data-types dt-iri)
+              val*  (datatype/coerce-value val dt-id)]
+          (where/match-value var-match val* dt-iri)))
       (if-let [lang (get attrs const/iri-language)]
         (where/match-lang var-match val lang)
         (let [dt (datatype/infer-iri val)]
