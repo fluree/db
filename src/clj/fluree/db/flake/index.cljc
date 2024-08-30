@@ -7,7 +7,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.connection.cache :as conn-cache]))
+            [fluree.db.cache :as cache]))
 
 (def comparators
   "Map of default index comparators for the four index types"
@@ -275,7 +275,7 @@
   (resolve [_ {:keys [id tempid tt-id] :as node}]
     (if (branch? node)
       (resolve node-resolver node)
-      (conn-cache/lru-lookup
+      (cache/lru-lookup
         cache
         [::t-range id tempid tt-id from-t to-t]
         (fn [_]
@@ -303,7 +303,7 @@
   (resolve [_ {:keys [id tempid tt-id] :as node}]
     (if (branch? node)
       (resolve node-resolver node)
-      (conn-cache/lru-lookup
+      (cache/lru-lookup
         lru-cache-atom
         [::history-t-range id tempid tt-id from-t to-t]
         (fn [_]

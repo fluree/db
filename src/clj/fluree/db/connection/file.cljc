@@ -4,7 +4,7 @@
             [fluree.db.util.core :as util]
             [fluree.db.flake.index :as index]
             [fluree.db.connection :as connection]
-            [fluree.db.connection.cache :as conn-cache]
+            [fluree.db.cache :as cache]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.serde.json :refer [json-serde]]
@@ -66,8 +66,8 @@
 
 (defn default-lru-cache
   [cache-max-mb]
-  (let [cache-size (conn-cache/memory->cache-size cache-max-mb)]
-    (atom (conn-cache/create-lru-cache cache-size))))
+  (let [cache-size (cache/memory->cache-size cache-max-mb)]
+    (atom (cache/create-lru-cache cache-size))))
 
 (defn connect
   "Create a new file system connection."

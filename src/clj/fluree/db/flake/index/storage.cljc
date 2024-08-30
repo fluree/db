@@ -10,7 +10,7 @@
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.connection.cache :as conn-cache]
+            [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -247,7 +247,7 @@
   (let [cache-key [::resolve id tempid]]
     (if (= :empty id)
       (resolve-empty-node node)
-      (conn-cache/lru-lookup
+      (cache/lru-lookup
        lru-cache-atom
        cache-key
        (fn [_]

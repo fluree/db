@@ -12,7 +12,7 @@
             [fluree.db.nameservice.ipns :as ns-ipns]
             [fluree.db.nameservice.storage-backed :as storage-ns]
             [fluree.db.storage.file :as file-storage]
-            [fluree.db.connection.cache :as conn-cache]
+            [fluree.db.cache :as cache]
             [fluree.db.storage :as storage])
   #?(:clj (:import (java.io Writer))))
 
@@ -124,8 +124,8 @@
                             (cond-> [] ;; utilize default nameservices with provided config options
                                     ipns-nameservice (conj (<? (default-ipns-nameservice ipns-nameservice ipfs-endpoint)))
                                     file-nameservice (conj (default-file-nameservice file-nameservice))))
-          cache-size      (conn-cache/memory->cache-size cache-max-mb)
-          lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))
+          cache-size      (cache/memory->cache-size cache-max-mb)
+          lru-cache-atom  (or lru-cache-atom (atom (cache/create-lru-cache cache-size)))
           ipfs-store      (ipfs-storage/open ipfs-endpoint)]
       (when (empty? nameservices*)
         (throw (ex-info "At least one nameservice must be provided for IPFS connection."

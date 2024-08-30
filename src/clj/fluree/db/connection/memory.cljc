@@ -7,7 +7,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [ go-try]]
-            [fluree.db.connection.cache :as conn-cache]
+            [fluree.db.cache :as cache]
             [fluree.db.storage :as storage]
             [fluree.db.storage.memory :as memory-storage]
             #?(:cljs [fluree.db.platform :as platform]))
@@ -67,8 +67,8 @@
           nameservices*   (util/sequential
                             (or nameservices
                                 (storage-ns/start "fluree:memory://" mem-store true)))
-          cache-size      (conn-cache/memory->cache-size cache-max-mb)
-          lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
+          cache-size      (cache/memory->cache-size cache-max-mb)
+          lru-cache-atom  (or lru-cache-atom (atom (cache/create-lru-cache
                                                      cache-size)))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults defaults

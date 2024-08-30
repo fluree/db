@@ -1,5 +1,5 @@
 (ns fluree.db.connection.system
-  (:require [fluree.db.connection.cache :as cache]
+  (:require [fluree.db.cache :as cache]
             [fluree.db.storage.file :as file-store]
             [fluree.db.storage.memory :as memory-store]
             [fluree.db.storage.remote :as remote-store]

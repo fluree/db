@@ -2,7 +2,7 @@
   (:require [clojure.string :as str]
             [fluree.db.nameservice.storage-backed :as storage-ns]
             [clojure.core.async :as async :refer [go]]
-            [fluree.db.connection.cache :as conn-cache]
+            [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
             [fluree.db.flake.index :as index]
             [fluree.db.serde.json :refer [json-serde]]
@@ -60,9 +60,9 @@
           nameservices*  (-> nameservices
                              (or (storage-ns/start "fluree:s3://" s3-store true))
                              util/sequential)
-          cache-size     (conn-cache/memory->cache-size cache-max-mb)
+          cache-size     (cache/memory->cache-size cache-max-mb)
           lru-cache-atom (or lru-cache-atom
-                             (atom (conn-cache/create-lru-cache cache-size)))]
+                             (atom (cache/create-lru-cache cache-size)))]
       (map->S3Connection {:id              conn-id
                           :store           s3-store
                           :state           state

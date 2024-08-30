@@ -7,7 +7,7 @@
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.connection.cache :as conn-cache]
+            [fluree.db.cache :as cache]
             [fluree.db.method.remote :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
             [clojure.string :as str])
@@ -67,8 +67,8 @@
                                 ;; if default ns, and returns exception, throw - connection fails
                                 ;; (likely due to unreachable server with websocket request)
                                 (<? (default-remote-nameservice server-state state))))
-          cache-size      (conn-cache/memory->cache-size cache-max-mb)
-          lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
+          cache-size      (cache/memory->cache-size cache-max-mb)
+          lru-cache-atom  (or lru-cache-atom (atom (cache/create-lru-cache
                                                      cache-size)))]
       (map->RemoteConnection {:id              conn-id
                               :server-state    server-state
