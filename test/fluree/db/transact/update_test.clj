@@ -2,7 +2,13 @@
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.api :as fluree]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const])
+  (:import [java.time OffsetDateTime]))
+
+(defn const-now
+  []
+  {:value (OffsetDateTime/parse "2024-06-13T19:53:57.000Z")
+   :datatype-iri const/iri-xsd-dateTime})
 
 (deftest ^:integration deleting-data
   (testing "Deletions of entire subjects."
@@ -164,7 +170,7 @@
         db1    (fluree/db ledger)]
 
     (testing "hash functions"
-      (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
+      (with-redefs [fluree.db.query.exec.eval/now const-now]
         (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
                                                           test-utils/default-str-context
                                                           {"ex" "http://example.com/"}]
@@ -190,60 +196,60 @@
                                                        {"ex" "http://example.com/"}]
                                           "selectOne" {"ex:hash-fns" ["ex:sha512" "ex:sha256"]}}))))))
     (testing "datetime functions"
-      (with-redefs [fluree.db.query.exec.eval/now (fn [] {:value (java.time.Instant/parse "2023-06-13T19:53:57.234345Z")
-                                                          :datatype-iri const/iri-xsd-dateTime})]
-        (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                                          test-utils/default-str-context
-                                                          {"ex" "http://example.com/"}]
-                                              "insert"
-                                              [{"id"         "ex:create-predicates"
-                                                "ex:now"     0 "ex:year"    0 "ex:month"    0 "ex:day" 0 "ex:hours" 0
-                                                "ex:minutes" 0 "ex:seconds" 0 "ex:timezone" 0 "ex:tz"  0}
-                                               {"id"                "ex:datetime-fns"
-                                                "ex:localdatetime"  {"@value" "2023-06-13T14:17:22.435"
-                                                                     "@type" const/iri-xsd-dateTime}
-                                                "ex:offsetdatetime" {"@value" "2023-06-13T14:17:22.435-05:00"
-                                                                     "@type" const/iri-xsd-dateTime}
-                                                "ex:utcdatetime"    {"@value" "2023-06-13T14:17:22.435Z"
-                                                                     "@type" const/iri-xsd-dateTime}}]})
-                          (fluree/stage {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-str-context
-                                                     {"ex" "http://example.com/"}]
-                                         "where"    [{"id"                "?s"
-                                                      "ex:localdatetime"  "?localdatetime"
-                                                      "ex:offsetdatetime" "?offsetdatetime"
-                                                      "ex:utcdatetime"    "?utcdatetime"}
-                                                     ["bind"
-                                                      "?now" "(now)"
-                                                      "?year" "(year ?localdatetime)"
-                                                      "?month" "(month ?localdatetime)"
-                                                      "?day" "(day ?localdatetime)"
-                                                      "?hours" "(hours ?localdatetime)"
-                                                      "?minutes" "(minutes ?localdatetime)"
-                                                      "?seconds" "(seconds ?localdatetime)"
-                                                      "?tz1" "(tz ?utcdatetime)"
-                                                      "?tz2" "(tz ?offsetdatetime)"
-                                                      "?comp=" "(= ?localdatetime (now))"
-                                                      "?comp<" "(< ?localdatetime (now))"
-                                                      "?comp<=" "(<= ?localdatetime (now))"
-                                                      "?comp>" "(> ?localdatetime (now))"
-                                                      "?comp>=" "(>= ?localdatetime (now))"]]
-                                         "insert"   [{"id"         "?s"
-                                                      "ex:now"     "?now"
-                                                      "ex:year"    "?year"
-                                                      "ex:month"   "?month"
-                                                      "ex:day"     "?day"
-                                                      "ex:hours"   "?hours"
-                                                      "ex:minutes" "?minutes"
-                                                      "ex:seconds" "?seconds"
-                                                      "ex:tz"      ["?tz1" "?tz2"]
-                                                      "ex:comp="   "?comp="
-                                                      "ex:comp<"   "?comp<"
-                                                      "ex:comp<="  "?comp<="
-                                                      "ex:comp>"   "?comp>"
-                                                      "ex:comp>="  "?comp>="}]
-                                         "values"   ["?s" ["ex:datetime-fns"]]}))]
-          (is (= {"ex:now"     "2023-06-13T19:53:57.234345Z"
+      (with-redefs [fluree.db.query.exec.eval/now const-now]
+        (let [db2 @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
+                                                  test-utils/default-str-context
+                                                  {"ex" "http://example.com/"}]
+                                      "insert"
+                                      [{"id"         "ex:create-predicates"
+                                        "ex:now"     0 "ex:year"    0 "ex:month"    0 "ex:day" 0 "ex:hours" 0
+                                        "ex:minutes" 0 "ex:seconds" 0 "ex:timezone" 0 "ex:tz"  0}
+                                       {"id"                "ex:datetime-fns"
+                                        "ex:localdatetime"  {"@value" "2023-06-13T14:17:22.435"
+                                                             "@type" const/iri-xsd-dateTime}
+                                        "ex:offsetdatetime" {"@value" "2023-06-13T14:17:22.435-05:00"
+                                                             "@type" const/iri-xsd-dateTime}
+                                        "ex:utcdatetime"    {"@value" "2023-06-13T14:17:22.435Z"
+                                                             "@type" const/iri-xsd-dateTime}}]})
+              db3 @(fluree/stage db2 {"@context" ["https://ns.flur.ee"
+                                                  test-utils/default-str-context
+                                                  {"ex" "http://example.com/"}]
+                                      "values" ["?s" [{"@value" "ex:datetime-fns" "@type" "@id"}]]
+                                      "where" [{"id" "?s"
+                                                "ex:localdatetime" "?localdatetime"
+                                                "ex:offsetdatetime" "?offsetdatetime"
+                                                "ex:utcdatetime" "?utcdatetime"}
+                                               ["bind"
+                                                "?now" "(str (now))"
+                                                "?year" "(year ?localdatetime)"
+                                                "?month" "(month ?localdatetime)"
+                                                "?day" "(day ?localdatetime)"
+                                                "?hours" "(hours ?localdatetime)"
+                                                "?minutes" "(minutes ?localdatetime)"
+                                                "?seconds" "(seconds ?localdatetime)"
+                                                "?tz1" "(tz ?utcdatetime)"
+                                                "?tz2" "(tz ?offsetdatetime)"
+                                                "?comp=" "(= ?localdatetime (now))"
+                                                "?comp<" "(< ?localdatetime (now))"
+                                                "?comp<=" "(<= ?localdatetime (now))"
+                                                "?comp>" "(> ?localdatetime (now))"
+                                                "?comp>=" "(>= ?localdatetime (now))"]]
+                                      "insert" [{"id" "?s"
+                                                 "ex:now"     "?now"
+                                                 "ex:year" "?year"
+                                                 "ex:month" "?month"
+                                                 "ex:day" "?day"
+                                                 "ex:hours" "?hours"
+                                                 "ex:minutes" "?minutes"
+                                                 "ex:seconds" "?seconds"
+                                                 "ex:tz" ["?tz1" "?tz2"]
+                                                 "ex:comp=" "?comp="
+                                                 "ex:comp<" "?comp<"
+                                                 "ex:comp<="  "?comp<="
+                                                 "ex:comp>"   "?comp>"
+                                                 "ex:comp>="  "?comp>="}]
+                                      })]
+          (is (= {"ex:now"     "2024-06-13T19:53:57Z"
                   "ex:year"    2023
                   "ex:month"   6
                   "ex:day"     13
@@ -256,7 +262,7 @@
                   "ex:comp<="  true
                   "ex:comp>"   false
                   "ex:comp>="  false}
-                 @(fluree/query @updated
+                 @(fluree/query db3
                                 {"@context" [test-utils/default-str-context
                                              {"ex" "http://example.com/"}]
                                  "selectOne"
@@ -297,7 +303,7 @@
                                                    "ex:ceil"  "?ceil"
                                                    "ex:floor" "?floor"
                                                    "ex:rand"  "?rand"}
-                                       "values"   ["?s" ["ex:numeric-fns"]]}))]
+                                       "values"   ["?s" [{"@value" "ex:numeric-fns" "@type" "@id"}]]}))]
         (is (= {"ex:abs"   2
                 "ex:round" 1
                 "ex:ceil"  2
@@ -356,7 +362,7 @@
                                                     "ex:strAfter"  "?strAfter"
                                                     "ex:concat"    "?concatted"
                                                     "ex:regex"     "?matched"}]
-                                       "values"   ["?s" ["ex:string-fns"]]}))]
+                                       "values"   ["?s" [{"@value" "ex:string-fns" "@type" "@id"}]]}))]
         (is (= {"ex:strEnds"   false
                 "ex:strStarts" false
                 "ex:contains"  false
@@ -421,7 +427,7 @@
                                                       "ex:isNotNumeric" "?isNotNum"
                                                       "ex:isBlank"      "?isBlank"
                                                       "ex:isNotBlank"   "?isNotBlank"}]
-                                         "values"   ["?s" ["ex:rdf-term-fns"]]}))]
+                                         "values"   ["?s" [{"@value" "ex:rdf-term-fns" "@type" "@id"}]]}))]
           (is (= {"ex:str"          ["1" "Abcdefg"]
                   "ex:uuid"         {"id" "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"}
                   "ex:struuid"      "34bdb25f-9fae-419b-9c50-203b5f306e47",
@@ -471,7 +477,7 @@
                                                    "ex:bound"  "?bound"
                                                    "ex:in"     "?in"
                                                    "ex:not-in" "?not-in"}
-                                       "values"   ["?s" ["ex:functional-fns"]]}))]
+                                       "values"   ["?s" [{"@value" "ex:functional-fns" "@type" "@id"}]]}))]
         (is (= {"ex:bound"  true
                 "ex:in"     true
                 "ex:not-in" false}
@@ -503,7 +509,7 @@
                                           "where"    [{"id" "?s", "ex:text" "?text"}
                                                       ["bind" "?err" "(foo ?text)"]]
                                           "insert"   {"id" "?s", "ex:text" "?err"}
-                                          "values"   ["?s" ["ex:error"]]})
+                                          "values"   ["?s" [{"@value" "ex:error" "@type" "@id"}]]})
 
             run-err @(fluree/stage db2 {"@context" ["https://ns.flur.ee"
                                                     test-utils/default-str-context
@@ -511,7 +517,7 @@
                                         "where"    [{"id" "?s", "ex:text" "?text"}
                                                     ["bind" "?err" "(abs ?text)"]]
                                         "insert"   {"id" "?s", "ex:error" "?err"}
-                                        "values"   ["?s" ["ex:error"]]})]
+                                        "values"   ["?s" [{"@value" "ex:error" "@type" "@id"}]]})]
         (is (= "Query function references illegal symbol: foo"
                (-> parse-err
                    Throwable->map
