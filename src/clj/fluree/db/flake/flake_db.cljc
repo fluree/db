@@ -367,10 +367,11 @@
 
 ;; ================ end Jsonld record support fns ============================
 
-(defrecord FlakeDB [conn alias branch commit t tt-id stats spot post opst tspo
-                    schema comparators staged novelty policy namespaces namespace-codes
-                    max-namespace-code reindex-min-bytes reindex-max-bytes max-old-indexes]
-  dbproto/IFlureeDb
+(defrecord FlakeDB [index-store conn alias branch commit t tt-id stats spot post
+                    opst tspo schema comparators staged novelty policy
+                    namespaces namespace-codes max-namespace-code
+                    reindex-min-bytes reindex-max-bytes max-old-indexes]
+                    dbproto/IFlureeDb
   (-query [this query-map] (fql/query this query-map))
   (-p-prop [_ meta-key property] (match/p-prop schema meta-key property))
   (-class-ids [this subject] (match/class-ids this subject))
@@ -569,9 +570,13 @@
                          (<? (index-storage/read-db-root conn address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
+           index-store (index-storage/index-store (:store conn)
+                                                  (:serializer conn)
+                                                  (:lru-cache-atom conn))
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
-                           (assoc :conn conn
+                           (assoc :index-store index-store
+                                  :conn conn
                                   :alias ledger-alias
                                   :branch branch
                                   :commit commit-map

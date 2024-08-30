@@ -15,88 +15,16 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defrecord IndexStore [storage serializer cache])
+
+(defn index-store
+  [storage serializer cache]
+  (->IndexStore storage serializer cache))
+
 (defn serde
   "Returns serializer from connection."
   [conn]
   (:serializer conn))
-
-(defn ledger-garbage-prefix
-  [ledger-alias]
-  (str/join "_" [ledger-alias "garbage"]))
-
-(defn ledger-garbage-key
-  [ledger-alias t]
-  (let [pre (ledger-garbage-prefix ledger-alias)]
-    (str/join "_" [pre t])))
-
-(defn child-data
-  "Given a child, unresolved node, extracts just the data that will go into
-  storage."
-  [child]
-  (select-keys child [:id :leaf :first :rhs :size :leftmost?]))
-
-(defn write-leaf
-  "Serializes and writes the index leaf node `leaf` to storage."
-  [{:keys [alias conn] :as _db} idx-type leaf]
-  (let [ser (serdeproto/-serialize-leaf (serde conn) leaf)]
-    (connection/-index-file-write conn alias idx-type ser)))
-
-(defn write-branch-data
-  "Serializes final data for branch and writes it to provided key.
-  Returns two-tuple of response output and raw bytes written."
-  [{:keys [alias conn] :as _db} idx-type data]
-  (let [ser (serdeproto/-serialize-branch (serde conn) data)]
-    (connection/-index-file-write conn alias idx-type ser)))
-
-(defn write-branch
-  "Writes the child attributes index branch node `branch` to storage."
-  [db idx-type {:keys [children] :as _branch}]
-  (let [child-vals (->> children
-                        (map val)
-                        (mapv child-data))
-        data       {:children child-vals}]
-    (write-branch-data db idx-type data)))
-
-(defn write-garbage
-  "Writes garbage record out for latest index."
-  [db garbage]
-  (let [{:keys [alias branch conn t]} db
-
-        data {:alias        alias
-              :branch       branch
-              :t            t
-              :garbage      garbage}
-        ser  (serdeproto/-serialize-garbage (serde conn) data)]
-    (connection/-index-file-write conn alias :garbage ser)))
-
-(defn write-db-root
-  [db garbage-addr]
-  (let [{:keys [alias conn schema t stats spot post opst tspo commit
-                namespace-codes reindex-min-bytes reindex-max-bytes
-                max-old-indexes]}
-        db
-        prev-idx-t    (-> commit :index :data :t)
-        prev-idx-addr (-> commit :index :address)
-        data          (cond->
-                       {:ledger-alias    alias
-                        :t               t
-                        :v               1 ;; version of db root file
-                        :schema          (vocab/serialize-schema schema)
-                        :stats           (select-keys stats [:flakes :size])
-                        :spot            (child-data spot)
-                        :post            (child-data post)
-                        :opst            (child-data opst)
-                        :tspo            (child-data tspo)
-                        :timestamp       (util/current-time-millis)
-                        :namespace-codes namespace-codes
-                        :config          {:reindex-min-bytes reindex-min-bytes
-                                          :reindex-max-bytes reindex-max-bytes
-                                          :max-old-indexes   max-old-indexes}}
-                       prev-idx-t (assoc :prev-index {:t       prev-idx-t
-                                                      :address prev-idx-addr})
-                       garbage-addr (assoc-in [:garbage :address] garbage-addr))
-        ser           (serdeproto/-serialize-db-root (serde conn) data)]
-    (connection/-index-file-write conn alias :root ser)))
 
 (defn read-branch
   [{:keys [serializer] :as conn} key]
@@ -252,3 +180,93 @@
        cache-key
        (fn [_]
          (resolve-index-node conn node))))))
+
+(extend-type IndexStore
+  index/Resolver
+  (resolve [{:keys [cache] :as this} {:keys [id tempid] :as node}]
+    (let [cache-key [::resolve id tempid]]
+      (if (= :empty id)
+        (resolve-empty-node node)
+        (cache/lru-lookup
+          cache
+          cache-key
+          (fn [_]
+            (resolve-index-node this node)))))))
+
+(defn ledger-garbage-prefix
+  [ledger-alias]
+  (str/join "_" [ledger-alias "garbage"]))
+
+(defn ledger-garbage-key
+  [ledger-alias t]
+  (let [pre (ledger-garbage-prefix ledger-alias)]
+    (str/join "_" [pre t])))
+
+(defn child-data
+  "Given a child, unresolved node, extracts just the data that will go into
+  storage."
+  [child]
+  (select-keys child [:id :leaf :first :rhs :size :leftmost?]))
+
+(defn write-leaf
+  "Serializes and writes the index leaf node `leaf` to storage."
+  [{:keys [alias conn] :as _db} idx-type leaf]
+  (let [ser (serdeproto/-serialize-leaf (serde conn) leaf)]
+    (connection/-index-file-write conn alias idx-type ser)))
+
+(defn write-branch-data
+  "Serializes final data for branch and writes it to provided key.
+  Returns two-tuple of response output and raw bytes written."
+  [{:keys [alias conn] :as _db} idx-type data]
+  (let [ser (serdeproto/-serialize-branch (serde conn) data)]
+    (connection/-index-file-write conn alias idx-type ser)))
+
+(defn write-branch
+  "Writes the child attributes index branch node `branch` to storage."
+  [db idx-type {:keys [children] :as _branch}]
+  (let [child-vals (->> children
+                        (map val)
+                        (mapv child-data))
+        data       {:children child-vals}]
+    (write-branch-data db idx-type data)))
+
+(defn write-garbage
+  "Writes garbage record out for latest index."
+  [db garbage]
+  (let [{:keys [alias branch conn t]} db
+
+        data {:alias        alias
+              :branch       branch
+              :t            t
+              :garbage      garbage}
+        ser  (serdeproto/-serialize-garbage (serde conn) data)]
+    (connection/-index-file-write conn alias :garbage ser)))
+
+(defn write-db-root
+  [db garbage-addr]
+  (let [{:keys [alias conn schema t stats spot post opst tspo commit
+                namespace-codes reindex-min-bytes reindex-max-bytes
+                max-old-indexes]}
+        db
+        prev-idx-t    (-> commit :index :data :t)
+        prev-idx-addr (-> commit :index :address)
+        data          (cond->
+                       {:ledger-alias    alias
+                        :t               t
+                        :v               1 ;; version of db root file
+                        :schema          (vocab/serialize-schema schema)
+                        :stats           (select-keys stats [:flakes :size])
+                        :spot            (child-data spot)
+                        :post            (child-data post)
+                        :opst            (child-data opst)
+                        :tspo            (child-data tspo)
+                        :timestamp       (util/current-time-millis)
+                        :namespace-codes namespace-codes
+                        :config          {:reindex-min-bytes reindex-min-bytes
+                                          :reindex-max-bytes reindex-max-bytes
+                                          :max-old-indexes   max-old-indexes}}
+                       prev-idx-t (assoc :prev-index {:t       prev-idx-t
+                                                      :address prev-idx-addr})
+                       garbage-addr (assoc-in [:garbage :address] garbage-addr))
+        ser           (serdeproto/-serialize-db-root (serde conn) data)]
+    (connection/-index-file-write conn alias :root ser)))
