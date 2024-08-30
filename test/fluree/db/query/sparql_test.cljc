@@ -224,6 +224,18 @@
               [:filter "(regex ?name \"^Jon\" \"i\")"]]
              where)
           "filter by regex call"))
+    (let [query "PREFIX schema: <http://schema.org/>
+                 SELECT ?pred
+                 FROM <cookbook/base>
+                 WHERE {
+                   ?s ?pred ?o.
+                   FILTER (schema:pred != ?pred)
+                 }"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?s", "?pred" "?o"}
+              [:filter "(not= \"schema:pred\" ?pred)"]]
+             where)
+          "filter string values"))
     (let [query "SELECT ?s
                  WHERE {
                    ?product1 ex:numProp1 ?p1.

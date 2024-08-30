@@ -4,7 +4,7 @@
             [fluree.db.constants :as const]
             [fluree.db.flake.format :as jld-format]
             [fluree.db.flake :as flake]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]

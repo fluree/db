@@ -1,10 +1,10 @@
-(ns fluree.db.indexer.storage
+(ns fluree.db.flake.index.storage
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake]
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
             [clojure.core.async :refer [go] :as async]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]

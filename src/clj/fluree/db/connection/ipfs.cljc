@@ -1,8 +1,8 @@
 (ns fluree.db.connection.ipfs
   (:require [fluree.db.storage.ipfs :as ipfs-storage]
             [clojure.string :as str]
-            [fluree.db.indexer.storage :as index-storage]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index.storage :as index-storage]
+            [fluree.db.flake.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.connection :as connection]

@@ -1,5 +1,5 @@
 (ns fluree.db.query.range
-  (:require [fluree.db.index :as index]
+  (:require [fluree.db.flake.index :as index]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]

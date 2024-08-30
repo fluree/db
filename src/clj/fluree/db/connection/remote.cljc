@@ -1,6 +1,7 @@
 (ns fluree.db.connection.remote
-  (:require [fluree.db.indexer.storage :as index-storage]
-            [fluree.db.index :as index]
+  (:require [clojure.core.async :as async :refer [go]]
+            [fluree.db.flake.index.storage :as index-storage]
+            [fluree.db.flake.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.connection :as connection]

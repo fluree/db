@@ -4,9 +4,10 @@
             [clojure.core.async :as async :refer [go]]
             [fluree.db.connection.cache :as conn-cache]
             [fluree.db.connection :as connection]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.indexer.storage :as index-storage]
+            [fluree.db.flake.index.storage :as index-storage]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.storage :as storage]
             [fluree.db.storage.s3 :as s3-storage])

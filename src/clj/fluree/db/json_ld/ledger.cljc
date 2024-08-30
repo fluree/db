@@ -75,9 +75,7 @@
           "http://www.w3.org/ns/shacl#qualifiedMinCount"        const/sh_qualifiedMinCount
           "http://www.w3.org/ns/shacl#qualifiedMaxCount"        const/sh_qualifiedMaxCount
           "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint" const/sh_qualifiedValueShapesDisjoint
-          ;; fluree
-          const/iri-role                                        const/$f:role
-          const/iri-target-class                                const/$fluree:targetClass}))
+          }))
 
 (def class+property-iris #{const/iri-class
                            "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
@@ -90,8 +88,7 @@
 
 (def predicate-refs
   "The following predicates have objects that are refs to other predicates."
-  #{const/$fluree:targetClass
-    const/$owl:equivalentProperty
+  #{const/$owl:equivalentProperty
     const/$rdfs:Class
     const/$rdfs:subClassOf
     const/$rdfs:subPropertyOf

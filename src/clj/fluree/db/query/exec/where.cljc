@@ -4,7 +4,7 @@
             [clojure.string :as str]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.datatype :as datatype]
