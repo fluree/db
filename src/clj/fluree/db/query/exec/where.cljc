@@ -48,7 +48,7 @@
   (if (or (contains? mch ::iri)
           (contains? mch ::sids))
     const/iri-id
-    (-> mch ::datatype-iri iri/unwrap)))
+    (::datatype-iri mch)))
 
 (defn match-sid
   [iri-mch db-alias sid]
@@ -224,7 +224,7 @@
   [type context]
   (fn [soln mch]
     (if (variable? type)
-      (if-let [dt-iri (some-> soln (get type) get-iri iri/unwrap)]
+      (if-let [dt-iri (some-> soln (get type) get-iri)]
         (matched-datatype? mch dt-iri)
         true)
       (let [dt-iri (json-ld/expand-iri type context)]
