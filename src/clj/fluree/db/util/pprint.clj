@@ -1,7 +1,7 @@
 (ns fluree.db.util.pprint
   (:require [clojure.core.async :as async]
             [fluree.db.flake :as flake]
-            [fluree.db.index :as index]))
+            [fluree.db.flake.index :as index]))
 
 (set! *warn-on-reflection* true)
 
