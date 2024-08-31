@@ -1,11 +1,16 @@
 (ns fluree.db.connection
   (:require [clojure.core.async :as async]
+            [clojure.pprint :as pprint]
+            [clojure.string :as str]
             [fluree.db.constants :as const]
+            [fluree.db.storage :as storage]
             [fluree.db.util.core :as util :refer [get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.serde.json :refer [json-serde]]
             [fluree.json-ld :as json-ld]
-            [fluree.db.ledger :as ledger]))
+            [fluree.db.ledger :as ledger])
+  #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -88,9 +93,46 @@
 (defn printer-map
   "Returns map of important data for print writer"
   [conn]
-  {:id              (:id conn)
-   :stats           (get @(:state conn) :stats)
-   :cached-ledgers  (keys (get @(:state conn) :ledgers))
-   :nameservices    (mapv type (:nameservices conn))
-   :ledger-defaults (:ledger-defaults conn)
-   :parallelism     (:parallelism conn)})
+  {:id    (:id conn)
+   :stats (get @(:state conn) :stats)})
+
+(defrecord Connection [id state parallelism store index-store nameservices
+                       serializer cache defaults]
+  iStorage
+  (-c-read [_ commit-address]
+    (storage/read-json store commit-address))
+  (-c-write [_ ledger-alias commit-data]
+    (let [path (str/join "/" [ledger-alias "commit"])]
+      (storage/content-write-json store path commit-data)))
+  (-txn-read [_ txn-address]
+    (storage/read-json store txn-address))
+  (-txn-write [_ ledger-alias txn-data]
+    (let [path (str/join "/" [ledger-alias "txn"])]
+      (storage/content-write-json store path txn-data)))
+
+  iConnection
+  (-did [_] (:did defaults))
+  (-nameservices [_] nameservices))
+
+#?(:clj
+   (defmethod print-method Connection [^Connection conn, ^Writer w]
+     (.write w (str "#fluree/Connection "))
+     (binding [*out* w]
+       (pr (printer-map conn))))
+   :cljs
+     (extend-type Connection
+       IPrintWithWriter
+       (-pr-writer [conn w _opts]
+         (-write w "#fluree/Connection ")
+         (-write w (pr (printer-map conn))))))
+
+(defmethod pprint/simple-dispatch Connection [^Connection conn]
+  (pr conn))
+
+(defn connect
+  [{:keys [parallelism store index-store cache serializer nameservices defaults]
+    :or   {serializer (json-serde)} :as _opts}]
+  (let [id    (random-uuid)
+        state (blank-state)]
+    (->Connection id state parallelism store index-store nameservices serializer cache
+                  defaults)))

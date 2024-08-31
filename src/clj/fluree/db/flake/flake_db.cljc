@@ -564,12 +564,9 @@
 (defn load
   ([conn ledger-alias branch commit-pair]
    (load conn ledger-alias branch commit-pair {}))
-  ([conn ledger-alias branch [commit-jsonld commit-map] indexing-opts]
+  ([{:keys [index-store] :as conn} ledger-alias branch [commit-jsonld commit-map] indexing-opts]
    (go-try
-     (let [index-store (index-storage/index-store (:store conn)
-                                                  (:serializer conn)
-                                                  (:lru-cache-atom conn))
-           root-map    (if-let [{:keys [address]} (:index commit-map)]
+     (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root index-store address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
