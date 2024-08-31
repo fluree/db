@@ -1,8 +1,6 @@
 (ns fluree.db.connection.ipfs
   (:require [fluree.db.storage.ipfs :as ipfs-storage]
             [clojure.string :as str]
-            [fluree.db.flake.index.storage :as index-storage]
-            [fluree.db.flake.index :as index]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.connection :as connection]
@@ -43,12 +41,7 @@
 
   connection/iConnection
   (-did [_] (:did ledger-defaults))
-  (-nameservices [_] nameservices)
-
-  index/Resolver
-  (resolve
-    [conn node]
-    (index-storage/index-resolver conn lru-cache-atom node)))
+  (-nameservices [_] nameservices))
 
 #?(:cljs
    (extend-type IPFSConnection

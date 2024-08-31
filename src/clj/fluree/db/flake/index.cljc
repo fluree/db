@@ -281,10 +281,6 @@
         (fn [_]
           (resolve-t-range node-resolver node novelty from-t to-t))))))
 
-(defn conn->t-range-resolver
-  [{:keys [lru-cache-atom] :as conn} novelty from-t to-t]
-  (->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom))
-
 (defn index-store->t-range-resolver
   [{:keys [cache] :as idx-store} novelty from-t to-t]
   (->CachedTRangeResolver idx-store novelty from-t to-t cache))

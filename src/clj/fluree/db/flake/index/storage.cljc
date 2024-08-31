@@ -167,20 +167,6 @@
       (resolve-empty-leaf node)
       (resolve-empty-branch node))))
 
-(defn index-resolver
-  "Attempts to resolve index-node from cache, and if cache miss
-  resolves from storage and caches. If resolution has an exception, removes
-  the cache entry."
-  [conn lru-cache-atom {:keys [id tempid] :as node}]
-  (let [cache-key [::resolve id tempid]]
-    (if (= :empty id)
-      (resolve-empty-node node)
-      (cache/lru-lookup
-       lru-cache-atom
-       cache-key
-       (fn [_]
-         (resolve-index-node conn node))))))
-
 (extend-type IndexStore
   index/Resolver
   (resolve [{:keys [cache] :as this} {:keys [id tempid] :as node}]

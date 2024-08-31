@@ -2,11 +2,9 @@
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.db.util.core :as util]
-            [fluree.db.flake.index :as index]
             [fluree.db.connection :as connection]
             [fluree.db.cache :as cache]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.nameservice.storage-backed :as storage-ns]
             [fluree.db.storage :as storage]
@@ -44,12 +42,7 @@
 
   connection/iConnection
   (-did [_] (:did ledger-defaults))
-  (-nameservices [_] nameservices)
-
-  index/Resolver
-  (resolve
-    [conn node]
-    (index-storage/index-resolver conn lru-cache-atom node)))
+  (-nameservices [_] nameservices))
 
 #?(:cljs
    (extend-type FileConnection

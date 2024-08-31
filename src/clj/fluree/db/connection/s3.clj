@@ -4,10 +4,7 @@
             [clojure.core.async :as async :refer [go]]
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
-            [fluree.db.flake.index :as index]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.flake.index.storage :as index-storage]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.storage :as storage]
             [fluree.db.storage.s3 :as s3-storage])
@@ -36,11 +33,7 @@
 
   connection/iConnection
   (-did [_] (:did ledger-defaults))
-  (-nameservices [_] nameservices)
-
-  index/Resolver
-  (resolve [conn node]
-    (index-storage/index-resolver conn lru-cache-atom node)))
+  (-nameservices [_] nameservices))
 
 
 (defmethod print-method S3Connection [^S3Connection conn, ^Writer w]

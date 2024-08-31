@@ -1,7 +1,5 @@
 (ns fluree.db.connection.memory
-  (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.flake.index.storage :as index-storage]
-            [fluree.db.flake.index :as index]
+  (:require [clojure.core.async :as async]
             [fluree.db.nameservice.storage-backed :as storage-ns]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
@@ -35,14 +33,7 @@
 
   connection/iConnection
   (-did [_] (:did ledger-defaults))
-  (-nameservices [_] nameservices)
-
-  index/Resolver
-  (resolve
-    [_ node]
-    ;; all root index nodes will be empty
-
-    (index-storage/resolve-empty-node node)))
+  (-nameservices [_] nameservices))
 
 #?(:cljs
    (extend-type MemoryConnection
