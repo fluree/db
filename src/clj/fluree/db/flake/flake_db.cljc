@@ -566,13 +566,13 @@
    (load conn ledger-alias branch commit-pair {}))
   ([conn ledger-alias branch [commit-jsonld commit-map] indexing-opts]
    (go-try
-     (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
-                         (<? (index-storage/read-db-root conn address))
-                         (genesis-root-map ledger-alias))
-           max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
-           index-store (index-storage/index-store (:store conn)
+     (let [index-store (index-storage/index-store (:store conn)
                                                   (:serializer conn)
                                                   (:lru-cache-atom conn))
+           root-map    (if-let [{:keys [address]} (:index commit-map)]
+                         (<? (index-storage/read-db-root index-store address))
+                         (genesis-root-map ledger-alias))
+           max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
                            (assoc :index-store index-store

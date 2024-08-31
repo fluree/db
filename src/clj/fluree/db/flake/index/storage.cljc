@@ -6,11 +6,12 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
-            [clojure.core.async :refer [go] :as async]
+            [clojure.core.async :as async]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.cache :as cache]
+            [fluree.db.storage :as storage]
             [fluree.db.connection :as connection]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -27,15 +28,15 @@
   (:serializer conn))
 
 (defn read-branch
-  [{:keys [serializer] :as conn} key]
+  [{:keys [storage serializer] :as _idx-store} branch-address]
   (go-try
-    (when-let [data (<? (connection/-index-file-read conn key))]
+    (when-let [data (<? (storage/read-json storage branch-address true))]
       (serdeproto/-deserialize-branch serializer data))))
 
 (defn read-leaf
-  [{:keys [serializer] :as conn} key]
+  [{:keys [storage serializer] :as _idx-store} leaf-address]
   (go-try
-    (when-let [data (<? (connection/-index-file-read conn key))]
+    (when-let [data (<? (storage/read-json storage leaf-address true))]
       (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
@@ -67,16 +68,15 @@
 
 (defn read-garbage
   "Returns garbage file data for a given index t."
-  [conn garbage-address]
+  [{:keys [storage serializer] :as _idx-store} garbage-address]
   (go-try
-   (when-let [data (<? (connection/-index-file-read conn garbage-address))]
-     (serdeproto/-deserialize-garbage (serde conn) data))))
+    (when-let [data (<? (storage/read-json storage garbage-address true))]
+      (serdeproto/-deserialize-garbage serializer data))))
 
 (defn delete-garbage-item
-  "Deletes an index segment during garbage collection.
-  Returns async chan"
-  [conn idx-segment-address]
-  (connection/-index-file-delete conn idx-segment-address))
+  "Deletes an index segment during garbage collection. Returns async chan"
+  [{:keys [storage] :as _idx-store} index-segment-address]
+  (storage/delete storage index-segment-address))
 
 (defn reify-schema
   [{:keys [namespace-codes v] :as root-map}]
@@ -87,25 +87,25 @@
 
 (defn read-db-root
   "Returns all data for a db index root of a given t."
-  ([conn idx-address]
-   (go-try
-     (if-let [data (<? (connection/-index-file-read conn idx-address))]
-       (let [{:keys [t] :as root-data}
-             (serdeproto/-deserialize-db-root (serde conn) data)]
-         (-> root-data
-             reify-index-roots
-             reify-namespaces
-             reify-schema
-             (update :stats assoc :indexed t)))
-       (throw (ex-info (str "Could not load index point at address: "
-                            idx-address ".")
-                       {:status 400
-                        :error  :db/unavailable}))))))
+  [{:keys [storage serializer] :as _idx-store} idx-address]
+  (go-try
+    (if-let [data (<? (storage/read-json storage idx-address true))]
+      (let [{:keys [t] :as root-data}
+            (serdeproto/-deserialize-db-root serializer data)]
+        (-> root-data
+            reify-index-roots
+            reify-namespaces
+            reify-schema
+            (update :stats assoc :indexed t)))
+      (throw (ex-info (str "Could not load index point at address: "
+                           idx-address ".")
+                      {:status 400
+                       :error  :db/unavailable})))))
 
 (defn fetch-child-attributes
-  [conn {:keys [id comparator leftmost?] :as branch}]
+  [idx-store {:keys [id comparator leftmost?] :as branch}]
   (go-try
-    (if-let [{:keys [children]} (<? (read-branch conn id))]
+    (if-let [{:keys [children]} (<? (read-branch idx-store id))]
       (let [branch-metadata (select-keys branch [:comparator :ledger-alias
                                                  :t :tt-id :tempid])
             child-attrs     (map-indexed (fn [i child]
@@ -122,20 +122,20 @@
                       {:status 500, :error :db/storage-error})))))
 
 (defn fetch-leaf-flakes
-  [conn {:keys [id comparator]}]
+  [idx-store {:keys [id comparator]}]
   (go-try
-    (if-let [{:keys [flakes] :as leaf} (<? (read-leaf conn id))]
+    (if-let [{:keys [flakes] :as _leaf} (<? (read-leaf idx-store id))]
       (apply flake/sorted-set-by comparator flakes)
       (throw (ex-info (str "Unable to retrieve leaf node with id: "
                            id " from storage")
                       {:status 500, :error :db/storage-error})))))
 
 (defn resolve-index-node
-  [conn {:keys [leaf] :as node}]
+  [idx-store {:keys [leaf] :as node}]
   (go-try
    (let [data (if leaf
-                  (<? (fetch-leaf-flakes conn node))
-                  (<? (fetch-child-attributes conn node)))
+                  (<? (fetch-leaf-flakes idx-store node))
+                  (<? (fetch-child-attributes idx-store node)))
          node* (if leaf
                  (assoc node :flakes data)
                  (assoc node :children data))]
@@ -208,65 +208,68 @@
   [child]
   (select-keys child [:id :leaf :first :rhs :size :leftmost?]))
 
+(defn write-index-file
+  [storage ledger-alias index-type serialized-data]
+  (let [index-name (name index-type)
+        path       (str/join "/" [ledger-alias "index" index-name])]
+    (storage/content-write-json storage path serialized-data)))
+
 (defn write-leaf
   "Serializes and writes the index leaf node `leaf` to storage."
-  [{:keys [alias conn] :as _db} idx-type leaf]
-  (let [ser (serdeproto/-serialize-leaf (serde conn) leaf)]
-    (connection/-index-file-write conn alias idx-type ser)))
+  [{:keys [storage serializer] :as _index-store} ledger-alias idx-type leaf]
+  (let [serialized (serdeproto/-serialize-leaf serializer leaf)]
+    (write-index-file storage ledger-alias idx-type serialized)))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key.
   Returns two-tuple of response output and raw bytes written."
-  [{:keys [alias conn] :as _db} idx-type data]
-  (let [ser (serdeproto/-serialize-branch (serde conn) data)]
-    (connection/-index-file-write conn alias idx-type ser)))
+  [{:keys [storage serializer] :as _index-store} ledger-alias idx-type data]
+  (let [serialized (serdeproto/-serialize-branch serializer data)]
+    (write-index-file storage ledger-alias idx-type serialized)))
 
 (defn write-branch
   "Writes the child attributes index branch node `branch` to storage."
-  [db idx-type {:keys [children] :as _branch}]
+  [index-store ledger-alias idx-type {:keys [children] :as _branch}]
   (let [child-vals (->> children
                         (map val)
                         (mapv child-data))
         data       {:children child-vals}]
-    (write-branch-data db idx-type data)))
+    (write-branch-data index-store ledger-alias idx-type data)))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
-  [db garbage]
-  (let [{:keys [alias branch conn t]} db
-
-        data {:alias        alias
-              :branch       branch
-              :t            t
-              :garbage      garbage}
-        ser  (serdeproto/-serialize-garbage (serde conn) data)]
-    (connection/-index-file-write conn alias :garbage ser)))
+  [{:keys [storage serializer] :as _index-store} ledger-alias branch t garbage]
+  (let [data       {:alias   ledger-alias
+                    :branch  branch
+                    :t       t
+                    :garbage garbage}
+        serialized (serdeproto/-serialize-garbage serializer data)]
+    (write-index-file storage ledger-alias :garbage serialized)))
 
 (defn write-db-root
-  [db garbage-addr]
-  (let [{:keys [alias conn schema t stats spot post opst tspo commit
-                namespace-codes reindex-min-bytes reindex-max-bytes
-                max-old-indexes]}
+  [{:keys [storage serializer] :as _index-store} db garbage-addr]
+  (let [{:keys [alias schema t stats spot post opst tspo commit namespace-codes
+                reindex-min-bytes reindex-max-bytes max-old-indexes]}
         db
+
         prev-idx-t    (-> commit :index :data :t)
         prev-idx-addr (-> commit :index :address)
-        data          (cond->
-                       {:ledger-alias    alias
-                        :t               t
-                        :v               1 ;; version of db root file
-                        :schema          (vocab/serialize-schema schema)
-                        :stats           (select-keys stats [:flakes :size])
-                        :spot            (child-data spot)
-                        :post            (child-data post)
-                        :opst            (child-data opst)
-                        :tspo            (child-data tspo)
-                        :timestamp       (util/current-time-millis)
-                        :namespace-codes namespace-codes
-                        :config          {:reindex-min-bytes reindex-min-bytes
-                                          :reindex-max-bytes reindex-max-bytes
-                                          :max-old-indexes   max-old-indexes}}
-                       prev-idx-t (assoc :prev-index {:t       prev-idx-t
-                                                      :address prev-idx-addr})
-                       garbage-addr (assoc-in [:garbage :address] garbage-addr))
-        ser           (serdeproto/-serialize-db-root (serde conn) data)]
-    (connection/-index-file-write conn alias :root ser)))
+        data          (cond-> {:ledger-alias alias
+                               :t               t
+                               :v               1 ;; version of db root file
+                               :schema          (vocab/serialize-schema schema)
+                               :stats           (select-keys stats [:flakes :size])
+                               :spot            (child-data spot)
+                               :post            (child-data post)
+                               :opst            (child-data opst)
+                               :tspo            (child-data tspo)
+                               :timestamp       (util/current-time-millis)
+                               :namespace-codes namespace-codes
+                               :config          {:reindex-min-bytes reindex-min-bytes
+                                                 :reindex-max-bytes reindex-max-bytes
+                                                 :max-old-indexes   max-old-indexes}}
+                        prev-idx-t   (assoc :prev-index {:t       prev-idx-t
+                                                         :address prev-idx-addr})
+                        garbage-addr (assoc-in [:garbage :address] garbage-addr))
+        serialized    (serdeproto/-serialize-db-root serializer data)]
+    (write-index-file storage alias :root serialized)))

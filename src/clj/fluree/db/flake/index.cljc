@@ -285,6 +285,10 @@
   [{:keys [lru-cache-atom] :as conn} novelty from-t to-t]
   (->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom))
 
+(defn index-store->t-range-resolver
+  [{:keys [cache] :as idx-store} novelty from-t to-t]
+  (->CachedTRangeResolver idx-store novelty from-t to-t cache))
+
 (defn history-t-range
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
   [{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
