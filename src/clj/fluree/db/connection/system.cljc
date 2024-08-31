@@ -142,9 +142,8 @@
 
 (defn ipfs-config
   [server file-storage-path parallelism cache-max-mb defaults]
-  (-> (base-config parallelism cache-max-mb defaults)
+  (-> (file-config file-storage-path parallelism cache-max-mb defaults)
       (assoc :fluree.storage/ipfs server
-             :fluree.storage/file file-storage-path
              :fluree.nameservice/ipns {:profile "self", :server server, :sync? false}
              :fluree/nameservices [(ig/ref :fluree.nameservice/storage-backed)
                                    (ig/ref :fluree.nameservice/ipns)])
