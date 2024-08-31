@@ -31,14 +31,6 @@
   (-txn-write [_ ledger-alias txn-data]
     (let [path (str/join "/" [ledger-alias "txn"])]
       (storage/content-write-json store path txn-data)))
-  (-index-file-write [_ ledger-alias index-type index-data]
-    (let [index-name (name index-type)
-          path       (str/join "/" [ledger-alias "index" index-name])]
-      (storage/content-write-json store path index-data)))
-  (-index-file-read [_ index-address]
-    (storage/read-json store index-address true))
-  (-index-file-delete [_ index-address]
-    (storage/delete store index-address))
 
   connection/iConnection
   (-did [_] (:did ledger-defaults))

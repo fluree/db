@@ -17,8 +17,6 @@
     (remote/remote-read server-state commit-key false))
   (-txn-read [_ txn-key]
     (remote/remote-read server-state txn-key false))
-  (-index-file-read [_ index-address]
-    (remote/remote-read server-state index-address true))
 
   connection/iConnection
   (-did [_] (:did ledger-defaults))
