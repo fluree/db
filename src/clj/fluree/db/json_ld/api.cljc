@@ -2,10 +2,7 @@
   {:deprecated "3.0"
    :superseded-by "fluree.db"}
   (:require [fluree.json-ld :as json-ld]
-            [fluree.db.flake.flake-db :as flake-db]
-            #?(:clj [fluree.db.connection.s3 :as s3-conn])
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.util.core :as util]
@@ -19,7 +16,6 @@
             [fluree.db.connection :refer [notify-ledger]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
-            [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy :as policy])
   (:refer-clojure :exclude [merge load range exists?]))
 
