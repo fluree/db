@@ -24,7 +24,7 @@
     'private', return nil."))
 
 (defprotocol Publisher
-  (-push [nameservice commit-data]
+  (publish [nameservice commit-data]
     "Publishes new commit to nameservice."))
 
 (defprotocol Publication
@@ -159,8 +159,8 @@
         (when-let [ns (first nameservices*)]
           (let [sync? (-sync? ns)]
             (if sync?
-              (<? (-push ns json-ld-commit))
-              (-push ns json-ld-commit))
+              (<? (publish ns json-ld-commit))
+              (publish ns json-ld-commit))
             (recur (rest nameservices*))))))))
 
 (defn lookup-commit

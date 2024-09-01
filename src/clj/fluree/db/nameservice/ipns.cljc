@@ -58,7 +58,7 @@
 (defrecord IpnsNameService
   [ipfs-endpoint ipns-key base-address sync?]
   nameservice/Publisher
-  (-push [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
+  (publish [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
 
   nameservice/iNameService
   (-lookup [_ ledger-alias]

@@ -12,7 +12,7 @@
 
 (defrecord StorageBackedNameService [address-prefix store sync?]
   nameservice/Publisher
-  (-push [_ commit-jsonld]
+  (publish [_ commit-jsonld]
     (go-try
       (let [ledger-alias (get commit-jsonld "alias")
             ns-address   (nameservice/full-address address-prefix ledger-alias)

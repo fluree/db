@@ -44,8 +44,6 @@
 
 (def data-version 0)
 
-;; ================ Jsonld record support fns ================================
-
 (defn empty-all-novelty
   [db]
   (let [cleared (reduce (fn [db* idx]
@@ -364,8 +362,6 @@
       (-> db*
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
-
-;; ================ end Jsonld record support fns ============================
 
 (defrecord FlakeDB [index-store conn alias branch commit t tt-id stats spot post
                     opst tspo schema comparators staged novelty policy
