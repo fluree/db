@@ -36,7 +36,6 @@
   :await  {:msg-id :async-res-ch} ;; map of msg-ids to response chans for messages awaiting responses
   :stats  {}}) ;; any stats about the connection itself
 
-
 (defn blank-state
   "Returns top-level state for connection"
   []
@@ -44,51 +43,6 @@
    {:ledger {}
     :await  {}
     :stats  {}}))
-
-(defn register-ledger
-  "Creates a promise-chan and saves it in a cache of ledgers being held
-  in-memory on the conn.
-
-  Returns a two-tuple of
-  [not-cached? promise-chan]
-
-  where not-cached? is true if a new promise-chan was created, false if an
-  existing promise-chan was found.
-
-  promise-chan is the new promise channel that must have the final ledger `put!` into it
-  assuming success? is true, otherwise it will return the existing found promise-chan when
-  success? is false"
-  [{:keys [state] :as _conn} ledger-alias]
-  (let [new-p-chan (async/promise-chan)
-        new-state  (swap! state update-in [:ledger ledger-alias]
-                           (fn [existing]
-                             (or existing new-p-chan)))
-        p-chan     (get-in new-state [:ledger ledger-alias])
-        cached?    (not= p-chan new-p-chan)]
-    (log/debug "Registering ledger: " ledger-alias " cached? " cached?)
-    [cached? p-chan]))
-
-(defn release-ledger
-  "Opposite of register-ledger. Removes reference to a ledger from conn"
-  [{:keys [state] :as _conn} ledger-alias]
-  (swap! state update :ledger dissoc ledger-alias))
-
-(defn cached-ledger
-  "Returns a cached ledger from the connection if it is cached, else nil"
-  [{:keys [state] :as _conn} ledger-alias]
-  (get-in @state [:ledger ledger-alias]))
-
-(defn notify-ledger
-  [conn commit-map]
-  (go-try
-    (let [expanded-commit (json-ld/expand commit-map)
-          ledger-alias    (get-first-value expanded-commit const/iri-alias)]
-      (if ledger-alias
-        (if-let [ledger-c (cached-ledger conn ledger-alias)]
-          (<? (ledger/-notify (<? ledger-c) expanded-commit))
-          (log/debug "No cached ledger found for commit: " commit-map))
-        (log/warn "Notify called with a data that does not have a ledger alias."
-                  "Are you sure it is a commit?: " commit-map)))))
 
 (defn printer-map
   "Returns map of important data for print writer"
@@ -138,3 +92,49 @@
         state (blank-state)]
     (->Connection id state parallelism store index-store primary-ns aux-nses
                   serializer cache defaults)))
+
+(defn register-ledger
+  "Creates a promise-chan and saves it in a cache of ledgers being held
+  in-memory on the conn.
+
+  Returns a two-tuple of
+  [not-cached? promise-chan]
+
+  where not-cached? is true if a new promise-chan was created, false if an
+  existing promise-chan was found.
+
+  promise-chan is the new promise channel that must have the final ledger `put!` into it
+  assuming success? is true, otherwise it will return the existing found promise-chan when
+  success? is false"
+  [{:keys [state] :as _conn} ledger-alias]
+  (let [new-p-chan (async/promise-chan)
+        new-state  (swap! state update-in [:ledger ledger-alias]
+                           (fn [existing]
+                             (or existing new-p-chan)))
+        p-chan     (get-in new-state [:ledger ledger-alias])
+        cached?    (not= p-chan new-p-chan)]
+    (log/debug "Registering ledger: " ledger-alias " cached? " cached?)
+    [cached? p-chan]))
+
+(defn release-ledger
+  "Opposite of register-ledger. Removes reference to a ledger from conn"
+  [{:keys [state] :as _conn} ledger-alias]
+  (swap! state update :ledger dissoc ledger-alias))
+
+(defn cached-ledger
+  "Returns a cached ledger from the connection if it is cached, else nil"
+  [{:keys [state] :as _conn} ledger-alias]
+  (get-in @state [:ledger ledger-alias]))
+
+(defn notify-ledger
+  [conn commit-map]
+  (go-try
+    (let [expanded-commit (json-ld/expand commit-map)
+          ledger-alias    (get-first-value expanded-commit const/iri-alias)]
+      (if ledger-alias
+        (if-let [ledger-c (cached-ledger conn ledger-alias)]
+          (<? (ledger/-notify (<? ledger-c) expanded-commit))
+          (log/debug "No cached ledger found for commit: " commit-map))
+        (log/warn "Notify called with a data that does not have a ledger alias."
+                  "Are you sure it is a commit?: " commit-map)))))
+
