@@ -11,9 +11,6 @@
   (-lookup [nameservice ledger-address]
     "Performs lookup operation on ledger alias and returns map of latest commit
     and other metadata")
-  (-sync? [nameservice]
-    "Indicates if nameservice updates should be performed synchronously, before
-    commit is finalized. Failure will cause commit to fail")
   (-close [nameservice]
     "Closes all resources for this nameservice")
   (-alias [nameservice ledger-address]
@@ -152,16 +149,13 @@
 
 (defn push!
   "Executes a push operation to all nameservices registered on the connection."
-  [conn json-ld-commit]
-  (let [nameservices (nameservices conn)]
-    (go-try
-      (loop [nameservices* nameservices]
-        (when-let [ns (first nameservices*)]
-          (let [sync? (-sync? ns)]
-            (if sync?
-              (<? (publish ns json-ld-commit))
-              (publish ns json-ld-commit))
-            (recur (rest nameservices*))))))))
+  [{:keys [primary-ns aux-nses] :as _conn} commit-jsonld]
+  (go-try
+    (let [result (<? (publish primary-ns commit-jsonld))]
+      (dorun (map (fn [ns]
+                    (publish ns commit-jsonld)))
+             aux-nses)
+      result)))
 
 (defn lookup-commit
   "Returns commit address from first matching nameservice on a conn

@@ -66,11 +66,9 @@
   [ns-state ledger-alias]
   (swap! ns-state update :subscription dissoc ledger-alias))
 
-(defrecord RemoteNameService
-  [conn-state server-state sync? msg-in msg-out]
+(defrecord RemoteNameService [conn-state server-state msg-in msg-out]
   nameservice/iNameService
   (-lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
-  (-sync? [_] sync?)
   (-address [_ ledger-alias {:keys [branch]:as _opts}]
     (go (if (and branch (not= "main" branch))
           (str ledger-alias "(" branch ")")
@@ -95,8 +93,7 @@
           remote-ns (map->RemoteNameService {:server-state server-state
                                              :msg-in       msg-in
                                              :msg-out      msg-out
-                                             :conn-state   (or conn-state (atom nil))
-                                             :sync?        true})
+                                             :conn-state   (or conn-state (atom nil))})
           websocket (async/<! (launch-subscription-socket remote-ns))]
       (if (util/exception? websocket)
         (nameservice/-close remote-ns)

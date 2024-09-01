@@ -75,7 +75,7 @@
 
 (defmethod ig/init-key :fluree.nameservice/storage-backed
   [_ {:keys [address-prefix store]}]
-  (storage-nameservice/start address-prefix store true))
+  (storage-nameservice/start address-prefix store))
 
 (defmethod ig/init-key :fluree.nameservice/ipns
   [_ {:keys [server profile]}]

@@ -10,7 +10,7 @@
   [ledger-alias]
   (str ledger-alias ".json"))
 
-(defrecord StorageBackedNameService [address-prefix store sync?]
+(defrecord StorageBackedNameService [address-prefix store]
   nameservice/Publisher
   (publish [_ commit-jsonld]
     (go-try
@@ -34,12 +34,9 @@
     (go
       (str address-prefix ledger-alias)))
 
-  (-sync? [_]
-    sync?)
-
   (-close [_]
     true))
 
 (defn start
-  [address-prefix store sync?]
-  (->StorageBackedNameService address-prefix store sync?))
+  [address-prefix store]
+  (->StorageBackedNameService address-prefix store))

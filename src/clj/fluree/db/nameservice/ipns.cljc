@@ -55,15 +55,13 @@
                                "Therefore, unable to get address for ledger: " ledger-alias)
                           {:status 400 :error :db/ipns-profile})))))))
 
-(defrecord IpnsNameService
-  [ipfs-endpoint ipns-key base-address sync?]
+(defrecord IpnsNameService [ipfs-endpoint ipns-key base-address?]
   nameservice/Publisher
   (publish [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
 
   nameservice/iNameService
   (-lookup [_ ledger-alias]
     (lookup-address ipfs-endpoint ipns-key ledger-alias))
-  (-sync? [_] sync?)
   (-address [_ ledger-alias branch]
     (ipns-address ipfs-endpoint ipns-key ledger-alias branch))
   (-alias [_ ledger-address]
@@ -81,5 +79,4 @@
                         {:status 400 :error :db/ipfs-keys})))
       (map->IpnsNameService {:ipfs-endpoint ipfs-endpoint
                              :ipns-key      ipns-key
-                             :base-address  base-address
-                             :sync?         false}))))
+                             :base-address  base-address}))))
