@@ -96,8 +96,8 @@
   {:id    (:id conn)
    :stats (get @(:state conn) :stats)})
 
-(defrecord Connection [id state parallelism store index-store nameservices
-                       serializer cache defaults]
+(defrecord Connection [id state parallelism store index-store primary-ns
+                       aux-nses serializer cache defaults]
   iStorage
   (-c-read [_ commit-address]
     (storage/read-json store commit-address))
@@ -112,7 +112,8 @@
 
   iConnection
   (-did [_] (:did defaults))
-  (-nameservices [_] nameservices))
+  (-nameservices [_]
+    (into [primary-ns] aux-nses)))
 
 #?(:clj
    (defmethod print-method Connection [^Connection conn, ^Writer w]
@@ -130,9 +131,10 @@
   (pr conn))
 
 (defn connect
-  [{:keys [parallelism store index-store cache serializer nameservices defaults]
+  [{:keys [parallelism store index-store cache serializer primary-ns
+           aux-nses defaults]
     :or   {serializer (json-serde)} :as _opts}]
   (let [id    (random-uuid)
         state (blank-state)]
-    (->Connection id state parallelism store index-store nameservices serializer cache
-                  defaults)))
+    (->Connection id state parallelism store index-store primary-ns aux-nses
+                  serializer cache defaults)))

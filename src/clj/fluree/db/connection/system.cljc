@@ -106,21 +106,21 @@
   {:fluree.serializer/json            {}
    :fluree/cache                      cache-max-mb
    :fluree.nameservice/storage-backed {:store (ig/ref :fluree/byte-storage)}
-   :fluree/nameservices               [(ig/ref :fluree/nameservice)]
    :fluree.index/storage              {:storage    (ig/ref :fluree/content-storage)
                                        :serializer (ig/ref :fluree/serializer)
                                        :cache      (ig/ref :fluree/cache)}
    :fluree.connection/id              {}
    :fluree.connection/state           {}
-   :fluree/connection                 {:id           (ig/ref :fluree.connection/id)
-                                       :state        (ig/ref :fluree.connection/state)
-                                       :cache        (ig/ref :fluree/cache)
-                                       :store        (ig/ref :fluree/content-storage)
-                                       :index-store  (ig/ref :fluree.index/storage)
-                                       :serializer   (ig/ref :fluree/serializer)
-                                       :nameservices (ig/ref :fluree/nameservices)
-                                       :parallelism  parallelism
-                                       :defaults     defaults}})
+   :fluree/connection                 {:id          (ig/ref :fluree.connection/id)
+                                       :state       (ig/ref :fluree.connection/state)
+                                       :cache       (ig/ref :fluree/cache)
+                                       :store       (ig/ref :fluree/content-storage)
+                                       :index-store (ig/ref :fluree.index/storage)
+                                       :serializer  (ig/ref :fluree/serializer)
+                                       :primary-ns  (ig/ref :fluree/nameservice)
+                                       :aux-nses    []
+                                       :parallelism parallelism
+                                       :defaults    defaults}})
 
 (defn memory-config
   [parallelism cache-max-mb defaults]
@@ -148,7 +148,9 @@
              :fluree/nameservices [(ig/ref :fluree.nameservice/storage-backed)
                                    (ig/ref :fluree.nameservice/ipns)])
       (update :fluree.index/storage assoc :storage (ig/ref :fluree.storage/ipfs))
-      (update :fluree/connection assoc :store (ig/ref :fluree.storage/ipfs))))
+      (update :fluree/connection assoc :store (ig/ref :fluree.storage/ipfs))
+      (update :fluree/connection assoc :primary-ns (ig/ref :fluree.nameservice/storage-backed))
+      (update :fluree/connection assoc :aux-nses [(ig/ref :fluree.nameservice/ipns)])))
 
 (defn start
   [config]
