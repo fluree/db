@@ -1,11 +1,7 @@
 (ns fluree.db.json-ld.api
   {:deprecated "3.0"
    :superseded-by "fluree.db"}
-  (:require [fluree.db.connection.ipfs :as ipfs-conn]
-            [fluree.db.connection.file :as file-conn]
-            [fluree.db.connection.memory :as memory-conn]
-            [fluree.db.connection.remote :as remote-conn]
-            [fluree.json-ld :as json-ld]
+  (:require [fluree.json-ld :as json-ld]
             [fluree.db.flake.flake-db :as flake-db]
             #?(:clj [fluree.db.connection.s3 :as s3-conn])
             [fluree.db.json-ld.iri :as iri]
@@ -73,25 +69,9 @@
     "
   [{:keys [method parallelism remote-servers] :as opts}]
   ;; TODO - do some validation
-  (log/warn "DEPRECATED function `connect` superseded by `fluree.db.api/connect`")
-  (promise-wrap
-    (let [opts* (assoc opts :parallelism (or parallelism 4))
-
-          method* (cond
-                    method         (keyword method)
-                    remote-servers :remote
-                    :else          (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
-                                                   {:status 500 :error :db/invalid-configuration})))]
-      (case method*
-        :remote (remote-conn/connect opts*)
-        :ipfs   (ipfs-conn/connect opts*)
-        :file   (if platform/BROWSER
-                  (throw (ex-info "File connection not supported in the browser" opts))
-                  (file-conn/connect opts*))
-        :memory (memory-conn/connect opts*)
-        :s3     #?(:clj  (s3-conn/connect opts*)
-                   :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
-                                         {:status 400, :error :db/unsupported-operation})))))))
+  (log/error "DEPRECATED function `connect` superseded by `fluree.db.api/connect`")
+  (throw (ex-info "DEPRECATED function `connect` superseded by `fluree.db.api/connect`"
+                  {:status 400, :error :db/deprecated-api})))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/connect-file"}
