@@ -59,14 +59,14 @@
   assuming success? is true, otherwise it will return the existing found promise-chan when
   success? is false"
   [{:keys [state] :as _conn} ledger-alias]
-  (let [new-p-chan  (async/promise-chan)
-        new-state   (swap! state update-in [:ledger ledger-alias]
+  (let [new-p-chan (async/promise-chan)
+        new-state  (swap! state update-in [:ledger ledger-alias]
                            (fn [existing]
                              (or existing new-p-chan)))
-        p-chan      (get-in new-state [:ledger ledger-alias])
-        not-cached? (= p-chan new-p-chan)]
-    (log/debug "Registering ledger: " ledger-alias " not-cached? " not-cached?)
-    [not-cached? p-chan]))
+        p-chan     (get-in new-state [:ledger ledger-alias])
+        cached?    (not= p-chan new-p-chan)]
+    (log/debug "Registering ledger: " ledger-alias " cached? " cached?)
+    [cached? p-chan]))
 
 (defn release-ledger
   "Opposite of register-ledger. Removes reference to a ledger from conn"

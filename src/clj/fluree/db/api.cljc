@@ -1,6 +1,7 @@
 (ns fluree.db.api
   (:require [fluree.db.connection.system :as system]
             [fluree.db.connection.remote :as remote-conn]
+            [fluree.db.connection :refer [notify-ledger]]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.platform :as platform]
@@ -14,7 +15,6 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.connection :refer [notify-ledger]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.json-ld.policy :as policy])
