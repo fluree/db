@@ -22,7 +22,7 @@
         (<? (storage/write-bytes store filename record-bytes)))))
 
   nameservice/iNameService
-  (-lookup [_ ledger-address]
+  (lookup [_ ledger-address]
     (go-try
       (let [{:keys [alias _branch]} (nameservice/resolve-address address-prefix ledger-address nil)
             filename                (local-filename alias)]

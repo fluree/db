@@ -1,5 +1,5 @@
 (ns fluree.db.nameservice
-  (:refer-clojure :exclude [-lookup exists?])
+  (:refer-clojure :exclude [exists?])
   (:require [clojure.string :as str]
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
@@ -8,7 +8,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol iNameService
-  (-lookup [nameservice ledger-address]
+  (lookup [nameservice ledger-address]
     "Performs lookup operation on ledger alias and returns map of latest commit
     and other metadata")
   (-close [nameservice]
@@ -165,7 +165,7 @@
     (go-try
       (loop [nameservices* nameservices]
         (when-let [ns (first nameservices*)]
-          (let [commit-address (<? (-lookup ns ledger-address))]
+          (let [commit-address (<? (lookup ns ledger-address))]
             (if commit-address
               commit-address
               (recur (rest nameservices*)))))))))
@@ -199,7 +199,7 @@
     (go-try
       (loop [nameservices* nameservices]
         (if-let [ns (first nameservices*)]
-          (let [exists? (<? (-lookup ns ledger-alias))]
+          (let [exists? (<? (lookup ns ledger-alias))]
             (if exists?
               true
               (recur (rest nameservices*))))

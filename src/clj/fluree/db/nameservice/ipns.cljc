@@ -60,7 +60,7 @@
   (publish [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
 
   nameservice/iNameService
-  (-lookup [_ ledger-alias]
+  (lookup [_ ledger-alias]
     (lookup-address ipfs-endpoint ipns-key ledger-alias))
   (-address [_ ledger-alias branch]
     (ipns-address ipfs-endpoint ipns-key ledger-alias branch))
