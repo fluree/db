@@ -97,10 +97,10 @@
     (index/tree-chan index-store root always 4 leaf-xf error-ch)))
 
 (defn write-leaf
-  [db idx leaf error-ch]
+  [{:keys [alias index-store] :as _db} idx leaf error-ch]
   (go
     (try*
-      (let [write-response (<? (storage/write-leaf db idx leaf))]
+      (let [write-response (<? (storage/write-leaf index-store alias idx leaf))]
         (-> leaf
             (update-node-id write-response)
             index/unresolve))
@@ -109,10 +109,10 @@
               (>! error-ch e)))))
 
 (defn write-branch
-  [db idx branch error-ch]
+  [{:keys [alias index-store] :as _db} idx branch error-ch]
   (go
     (try*
-      (let [write-response (<? (storage/write-branch db idx branch))]
+      (let [write-response (<? (storage/write-branch index-store alias idx branch))]
         (-> branch
             (update-node-id write-response)
             index/unresolve))
