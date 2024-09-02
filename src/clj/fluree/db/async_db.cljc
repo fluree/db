@@ -103,10 +103,6 @@
     (go-try
       (let [db (<? db-chan)]
         (<? (transact/-stage-txn db fuel-tracker context identity annotation raw-txn parsed-txn)))))
-  (-merge-commit [_ new-commit]
-    (go-try
-      (let [db (<? db-chan)]
-        (<? (transact/-merge-commit db new-commit)))))
   (-merge-commit [_ new-commit proof]
     (go-try
       (let [db (<? db-chan)]

@@ -400,7 +400,6 @@
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
     (flake.transact/stage db fuel-tracker context identity annotation raw-txn parsed-txn))
   (-merge-commit [db new-commit proof] (merge-commit conn db [new-commit proof]))
-  (-merge-commit [db new-commit] (merge-commit conn db [new-commit]))
 
   subject/SubjectFormatter
   (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
