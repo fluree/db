@@ -2,7 +2,7 @@
   "Generates vocabulary/schema pre-cached maps."
   (:require [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.ledger :as jld-ledger]
+            [fluree.db.ledger :as ledger]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
@@ -250,10 +250,10 @@
   [f]
   (let [[s p o] ((juxt flake/s flake/p flake/o) f)]
     (cond (and (= const/$rdf:type p)
-               (contains? jld-ledger/class-or-property-sid o))
+               (contains? ledger/class-or-property-sid o))
           [s p]
 
-          (contains? jld-ledger/predicate-refs p)
+          (contains? ledger/predicate-refs p)
           [p o]
 
           :else
@@ -343,7 +343,7 @@
          vocab-flakes   (into #{}
                               (filter (fn [f]
                                         (or (contains? pred-sids (flake/s f))
-                                            (contains? jld-ledger/predicate-refs (flake/p f)))))
+                                            (contains? ledger/predicate-refs (flake/p f)))))
                               new-flakes)
          pred-datatypes (pred-dt-constraints new-flakes)
          schema         (-> db
