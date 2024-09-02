@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async :refer [go >! <!]]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
+            [fluree.db.storage :as storage]
             [fluree.db.flake.format :as jld-format]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index :as index]
@@ -9,8 +10,7 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.connection :as connection]))
+            [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -217,8 +217,9 @@
          (cond-> (if txn
                    (let [txn-key     (json-ld/compact const/iri-txn compact)
                          txn-address (get commit-wrapper txn-key)
+                         storage     (-> db :conn :store)
                          raw-txn     (when txn-address
-                                       (<? (connection/-txn-read (:conn db) txn-address)))]
+                                       (<? (storage/read-json storage txn-address)))]
                      (assoc {} txn-key raw-txn))
                    {})
            commit (-> (assoc commit-key commit-wrapper)
