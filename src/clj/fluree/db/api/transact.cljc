@@ -87,7 +87,8 @@
      (<? (ledger/-commit! ledger db cmt-opts)))))
 
 (defn transact!
-  ([conn txn] (transact! conn txn {:raw-txn txn}))
+  ([conn txn]
+   (transact! conn txn {:raw-txn txn}))
   ([conn txn opts]
    (go-try
     (let [expanded  (json-ld/expand (ctx-util/use-fluree-context txn))
