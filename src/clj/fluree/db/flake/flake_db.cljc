@@ -3,7 +3,6 @@
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [go]]
             [clojure.set :refer [map-invert]]
-            [fluree.db.connection :as connection]
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
@@ -18,8 +17,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.flake.transact :as flake.transact]
-            [fluree.db.util.core :as util :refer [get-first get-first-value
-                                                  get-first-id vswap!]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value get-first-id vswap!]]
             [fluree.db.flake.index :as index]
             [fluree.db.indexer :as indexer]
             [fluree.db.flake.index.novelty :as novelty]
@@ -36,8 +34,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serde-json]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.util.log :as log])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -98,13 +95,6 @@
                  :tspo tspo)
           (assoc-in [:stats :indexed] index-t)))
     db))
-
-(defn read-db
-  [conn db-address]
-  (go-try
-    (let [file-data (<? (connection/-c-read conn db-address))
-          db        (assoc file-data "f:address" db-address)]
-      (json-ld/expand db))))
 
 (defn with-namespaces
   [{:keys [namespaces max-namespace-code] :as db} new-namespaces]
