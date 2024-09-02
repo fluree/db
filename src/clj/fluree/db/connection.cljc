@@ -4,7 +4,7 @@
             [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.storage :as storage]
-            [fluree.db.util.core :as util :refer [get-first-value]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
@@ -125,6 +125,42 @@
   "Returns a cached ledger from the connection if it is cached, else nil"
   [{:keys [state] :as _conn} ledger-alias]
   (get-in @state [:ledger ledger-alias]))
+
+;; TODO - validate commit signatures
+(defn validate-commit-proof
+  "Run proof validation, if exists.
+  Return actual commit data. In the case of a VerifiableCredential this is
+  the `credentialSubject`."
+  [proof]
+  ;; TODO - returning true for now
+  true)
+
+(defn credential?
+  [commit-data]
+  (contains? commit-data const/iri-cred-subj))
+
+(defn verify-commit
+  "Given a full commit json, returns two-tuple of [commit-data commit-proof]"
+  [commit-data]
+  (if (credential? commit-data)
+    (let [credential-subject (get-first commit-data const/iri-cred-subj)]
+      (validate-commit-proof commit-data)
+      [credential-subject commit-data])
+    [commit-data nil]))
+
+(defn read-commit
+  [{:keys [store] :as _conn} commit-address]
+  (go-try
+    (let [commit-data   (<? (storage/read-json store commit-address))
+          addr-key-path (if (contains? commit-data "credentialSubject")
+                          ["credentialSubject" "address"]
+                          ["address"])]
+      (log/trace "read-commit at:" commit-address "data:" commit-data)
+      (when commit-data
+        (-> commit-data
+            (assoc-in addr-key-path commit-address)
+            json-ld/expand
+            verify-commit)))))
 
 (defn notify-ledger
   [conn commit-map]
