@@ -103,10 +103,10 @@
     (go-try
       (let [db (<? db-chan)]
         (<? (transact/-stage-txn db fuel-tracker context identity annotation raw-txn parsed-txn)))))
-  (-merge-commit [_ new-commit]
+  (-merge-commit [_ commit-jsonld commit-data-jsonld]
     (go-try
       (let [db (<? db-chan)]
-        (<? (transact/-merge-commit db new-commit)))))
+        (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld)))))
 
   indexer/Indexable
   (index [_ changes-ch]

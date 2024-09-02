@@ -307,30 +307,23 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
   indexes and returns updated db"
-  [conn db commit-jsonld]
+  [conn db commit-jsonld commit-data-jsonld]
   (go-try
-    (let [db-address         (-> commit-jsonld
-                                 (get-first const/iri-data)
-                                 (get-first-value const/iri-address))
-          db-data            (<? (read-db conn db-address))
-          t-new              (db-t db-data)
-          assert             (db-assert db-data)
-          nses               (map :value
-                                  (get db-data const/iri-namespaces))
-          _                  (log/trace "merge-commit new namespaces:" nses)
-          _                  (log/trace "db max-namespace-code:"
-                                        (:max-namespace-code db))
-          db*                (with-namespaces db nses)
-          asserted-flakes    (create-flakes true db* t-new assert)
-          retract            (db-retract db-data)
-          retracted-flakes   (create-flakes false db* t-new retract)
+    (let [t-new            (db-t commit-data-jsonld)
+          assert           (db-assert commit-data-jsonld)
+          nses             (map :value
+                                (get commit-data-jsonld const/iri-namespaces))
+          db*              (with-namespaces db nses)
+          asserted-flakes  (create-flakes true db* t-new assert)
+          retract          (db-retract commit-data-jsonld)
+          retracted-flakes (create-flakes false db* t-new retract)
 
           {:keys [previous issuer message data] :as commit-metadata}
           (commit-data/json-ld->map commit-jsonld db*)
 
           commit-id          (:id commit-metadata)
           commit-sid         (iri/encode-iri db* commit-id)
-          [prev-commit _] (some->> previous :address (reify/read-commit conn) <?)
+          [prev-commit _]    (some->> previous :address (reify/read-commit conn) <?)
           db-sid             (iri/encode-iri db* (:id data))
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new commit-sid db-sid)
@@ -399,8 +392,8 @@
   transact/Transactable
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
     (flake.transact/stage db fuel-tracker context identity annotation raw-txn parsed-txn))
-  (-merge-commit [db new-commit]
-    (merge-commit conn db new-commit))
+  (-merge-commit [db commit-jsonld commit-data-jsonld]
+    (merge-commit conn db commit-jsonld commit-data-jsonld))
 
   subject/SubjectFormatter
   (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
@@ -525,8 +518,8 @@
     (loop [[commit-tuple & r] (<? (reify/trace-commits conn commit-jsonld (inc index-t)))
            db indexed-db]
       (if commit-tuple
-        (let [[commit-jsonld _proof] commit-tuple
-              new-db (<? (transact/-merge-commit db commit-jsonld))]
+        (let [[commit-jsonld _commit-proof commit-data-jsonld] commit-tuple
+              new-db (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld))]
           (recur r new-db))
         db))))
 

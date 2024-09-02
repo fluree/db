@@ -238,7 +238,7 @@
   If commit successful, returns successfully updated db."
   [ledger expanded-commit]
   (go-try
-    (let [[commit _proof] (jld-reify/verify-commit expanded-commit)
+    (let [[commit-jsonld _proof] (jld-reify/verify-commit expanded-commit)
 
           branch     (-> expanded-commit
                          (get-first-value const/iri-branch)
@@ -254,7 +254,11 @@
       (cond
 
         (= commit-t (flake/next-t current-t))
-        (let [updated-db  (<? (transact/-merge-commit current-db commit))]
+        (let [db-address     (-> commit-jsonld
+                                 (get-first const/iri-data)
+                                 (get-first-value const/iri-address))
+              db-data-jsonld (<? (jld-reify/read-commit (:conn ledger) db-address))
+              updated-db     (<? (transact/-merge-commit current-db commit-jsonld db-data-jsonld))]
           (update-commit! ledger branch updated-db))
 
         ;; missing some updates, dump in-memory ledger forcing a reload

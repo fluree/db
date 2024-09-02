@@ -45,6 +45,13 @@
             json-ld/expand
             verify-commit)))))
 
+(defn read-db
+  [conn db-address]
+  (go-try
+    (let [file-data (<? (connection/-c-read conn db-address))
+          db        (assoc file-data "f:address" db-address)]
+      (json-ld/expand db))))
+
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of `from-t` and increment from there."
@@ -57,13 +64,14 @@
             db-address       (-> commit
                                  (get-first const/iri-data)
                                  (get-first-value const/iri-address))
+            db-data-jsonld   (<? (read-db conn db-address))
             prev-commit-addr (-> commit
                                  (get-first const/iri-previous)
                                  (get-first-value const/iri-address))
             commit-t         (-> commit
                                  (get-first const/iri-data)
                                  (get-first-value const/iri-fluree-t))
-            commit-tuples*   (conj commit-tuples [commit proof])]
+            commit-tuples*   (conj commit-tuples [commit proof db-data-jsonld])]
         (when (or (nil? commit-t)
                   (and last-t (not= (dec last-t) commit-t)))
           (throw (ex-info (str "Commit t values are inconsistent. Last commit t was: " last-t
@@ -83,5 +91,5 @@
                                           (str commit))})))
         (if (= from-t commit-t)
           commit-tuples*
-          (let [commit-tuple (<? (read-commit conn prev-commit-addr))]
-            (recur commit-tuple commit-t commit-tuples*)))))))
+          (let [verified-commit (<? (read-commit conn prev-commit-addr))]
+            (recur verified-commit commit-t commit-tuples*)))))))
