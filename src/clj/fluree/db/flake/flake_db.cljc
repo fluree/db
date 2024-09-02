@@ -354,7 +354,7 @@
                                  (into asserted-flakes)
                                  (cond-> prev-commit-flakes (into prev-commit-flakes)
                                          prev-db-flakes (into prev-db-flakes)
-                                         issuer-flakes (into issuer-flakes)
+                                         issuer-flakes  (into issuer-flakes)
                                          message-flakes (into message-flakes)))]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
@@ -524,7 +524,8 @@
     (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
            db indexed-db]
       (if commit-tuple
-        (let [new-db (<? (merge-commit conn db commit-tuple))]
+        (let [[commit-jsonld proof] commit-tuple
+              new-db (<? (transact/-merge-commit db commit-jsonld proof))]
           (recur r new-db))
         db))))
 
