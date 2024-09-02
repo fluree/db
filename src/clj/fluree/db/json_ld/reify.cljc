@@ -1,5 +1,5 @@
 (ns fluree.db.json-ld.reify
-  (:require [fluree.db.connection :as connection]
+  (:require [fluree.db.storage :as storage]
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
@@ -32,9 +32,9 @@
     [commit-data nil]))
 
 (defn read-commit
-  [conn commit-address]
+  [{:keys [store] :as _conn} commit-address]
   (go-try
-    (let [commit-data   (<? (connection/-c-read conn commit-address))
+    (let [commit-data   (<? (storage/read-json store commit-address))
           addr-key-path (if (contains? commit-data "credentialSubject")
                           ["credentialSubject" "address"]
                           ["address"])]
@@ -46,9 +46,9 @@
             verify-commit)))))
 
 (defn read-db
-  [conn db-address]
+  [{:keys [store] :as _conn} db-address]
   (go-try
-    (let [file-data (<? (connection/-c-read conn db-address))
+    (let [file-data (<? (storage/read-json store db-address))
           db        (assoc file-data "f:address" db-address)]
       (json-ld/expand db))))
 

@@ -19,8 +19,8 @@
   {:id :ex/foo :ex/x 1 :ex/y 2}"
   [db cache context compact error-ch s-flakes]
   (jld-format/format-subject-flakes db cache context compact
-                                {:wildcard? true, :depth 0}
-                                0 nil error-ch s-flakes))
+                                    {:wildcard? true, :depth 0}
+                                    0 nil error-ch s-flakes))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
