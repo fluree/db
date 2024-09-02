@@ -11,8 +11,7 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.cache :as cache]
-            [fluree.db.storage :as storage]
-            [fluree.db.connection :as connection]))
+            [fluree.db.storage :as storage]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -21,11 +20,6 @@
 (defn index-store
   [storage serializer cache]
   (->IndexStore storage serializer cache))
-
-(defn serde
-  "Returns serializer from connection."
-  [conn]
-  (:serializer conn))
 
 (defn read-branch
   [{:keys [storage serializer] :as _idx-store} branch-address]
