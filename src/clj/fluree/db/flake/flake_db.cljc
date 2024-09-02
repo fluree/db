@@ -522,7 +522,7 @@
 (defn load-novelty
   [conn indexed-db index-t commit-jsonld]
   (go-try
-    (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
+    (loop [[commit-tuple & r] (<? (reify/trace-commits conn commit-jsonld (inc index-t)))
            db indexed-db]
       (if commit-tuple
         (let [[commit-jsonld _proof] commit-tuple

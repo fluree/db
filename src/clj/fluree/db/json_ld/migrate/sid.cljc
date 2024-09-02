@@ -143,7 +143,7 @@
                                    (update-keys {const/iri-t :t const/iri-size :size const/iri-flakes :flakes})
                                    (select-keys [:t :size :flakes])
                                    (update-vals (comp :value first)))
-               all-commit-tuples (<? (reify/trace-commits conn last-commit-tuple 1))
+               all-commit-tuples (<? (reify/trace-commits conn last-commit 1))
                first-commit (ffirst all-commit-tuples)
                branch (or (keyword (get-first-value first-commit const/iri-branch))
                           :main)

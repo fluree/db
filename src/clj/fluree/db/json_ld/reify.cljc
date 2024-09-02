@@ -48,11 +48,11 @@
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of `from-t` and increment from there."
-  [conn latest-commit-tuple from-t]
+  [conn latest-commit from-t]
   (go-try
-    (loop [[commit proof] latest-commit-tuple
-           last-t        nil
-           commit-tuples (list)]
+    (loop [[commit proof] (verify-commit latest-commit)
+           last-t         nil
+           commit-tuples  (list)]
       (let [dbid             (get-first-id commit const/iri-data)
             db-address       (-> commit
                                  (get-first const/iri-data)
