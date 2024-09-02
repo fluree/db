@@ -1,9 +1,7 @@
 (ns fluree.db.query.api
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require [clojure.core.async :as async]
-            [clojure.string :as str]
-            [fluree.json-ld :as json-ld]
+  (:require [clojure.string :as str]
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
@@ -18,10 +16,8 @@
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.reasoner :as reasoner]
-            [fluree.db.validation :as v]))
+            [fluree.db.reasoner :as reasoner]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
