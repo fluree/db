@@ -238,7 +238,7 @@
   If commit successful, returns successfully updated db."
   [ledger expanded-commit]
   (go-try
-    (let [[commit proof] (jld-reify/verify-commit expanded-commit)
+    (let [[commit _proof] (jld-reify/verify-commit expanded-commit)
 
           branch     (-> expanded-commit
                          (get-first-value const/iri-branch)
@@ -254,7 +254,7 @@
       (cond
 
         (= commit-t (flake/next-t current-t))
-        (let [updated-db  (<? (transact/-merge-commit current-db commit proof))]
+        (let [updated-db  (<? (transact/-merge-commit current-db commit))]
           (update-commit! ledger branch updated-db))
 
         ;; missing some updates, dump in-memory ledger forcing a reload

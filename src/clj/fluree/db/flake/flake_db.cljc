@@ -307,9 +307,9 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
   indexes and returns updated db"
-  [conn db [commit _proof]]
+  [conn db commit-jsonld]
   (go-try
-    (let [db-address         (-> commit
+    (let [db-address         (-> commit-jsonld
                                  (get-first const/iri-data)
                                  (get-first-value const/iri-address))
           db-data            (<? (read-db conn db-address))
@@ -326,7 +326,7 @@
           retracted-flakes   (create-flakes false db* t-new retract)
 
           {:keys [previous issuer message data] :as commit-metadata}
-          (commit-data/json-ld->map commit db*)
+          (commit-data/json-ld->map commit-jsonld db*)
 
           commit-id          (:id commit-metadata)
           commit-sid         (iri/encode-iri db* commit-id)
@@ -399,7 +399,8 @@
   transact/Transactable
   (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
     (flake.transact/stage db fuel-tracker context identity annotation raw-txn parsed-txn))
-  (-merge-commit [db new-commit proof] (merge-commit conn db [new-commit proof]))
+  (-merge-commit [db new-commit]
+    (merge-commit conn db new-commit))
 
   subject/SubjectFormatter
   (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
@@ -524,8 +525,8 @@
     (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
            db indexed-db]
       (if commit-tuple
-        (let [[commit-jsonld proof] commit-tuple
-              new-db (<? (transact/-merge-commit db commit-jsonld proof))]
+        (let [[commit-jsonld _proof] commit-tuple
+              new-db (<? (transact/-merge-commit db commit-jsonld))]
           (recur r new-db))
         db))))
 
