@@ -15,8 +15,6 @@
   connection/iStorage
   (-c-read [_ commit-key]
     (remote/remote-read server-state commit-key false))
-  (-txn-read [_ txn-key]
-    (remote/remote-read server-state txn-key false))
 
   connection/iConnection
   (-did [_] (:did ledger-defaults))

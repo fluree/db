@@ -21,8 +21,7 @@
 (defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")
   (-c-write [conn ledger-alias commit-data] "Writes a commit to storage")
-  (-txn-write [conn ledger-alias txn-data] "Writes a transaction to storage and returns the key. Expects string keys.")
-  (-txn-read [conn txn-key] "Reads a transaction from storage"))
+  (-txn-write [conn ledger-alias txn-data] "Writes a transaction to storage and returns the key. Expects string keys."))
 
 (comment
  ;; state machine looks like this:
@@ -58,8 +57,6 @@
   (-c-write [_ ledger-alias commit-data]
     (let [path (str/join "/" [ledger-alias "commit"])]
       (storage/content-write-json store path commit-data)))
-  (-txn-read [_ txn-address]
-    (storage/read-json store txn-address))
   (-txn-write [_ ledger-alias txn-data]
     (let [path (str/join "/" [ledger-alias "txn"])]
       (storage/content-write-json store path txn-data)))
@@ -173,4 +170,3 @@
           (log/debug "No cached ledger found for commit: " commit-map))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " commit-map)))))
-
