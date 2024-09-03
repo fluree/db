@@ -344,8 +344,8 @@
   [conn ledger-alias {:keys [did branch indexing] :as opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias ledger-alias)
-          address        (<? (nameservice/primary-address conn ledger-alias* (assoc opts :branch branch)))
-          ns-addresses   (<? (nameservice/addresses conn ledger-alias* (assoc opts :branch branch)))
+          address        (<? (nameservice/primary-address conn ledger-alias* opts))
+          ns-addresses   (<? (nameservice/addresses conn ledger-alias* opts))
           ;; internal-only opt used for migrating ledgers without genesis commits
           init-time      (or (:fluree.db.json-ld.migrate.sid/time opts)
                              (util/current-time-iso))
