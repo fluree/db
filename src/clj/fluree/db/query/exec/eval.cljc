@@ -203,11 +203,19 @@
 
 (defn lang
   [tv]
-  (where/->typed-val (:lang tv) const/iri-string))
+  (where/->typed-val (or (:lang tv) "") const/iri-string))
+
+(defn str-lang
+  [{lexical-form :value} {langtag :value}]
+  (where/->typed-val (str lexical-form) const/iri-lang-string langtag))
 
 (defn datatype
   [tv]
   (where/->typed-val (:datatype-iri tv) const/iri-id))
+
+(defn str-dt
+  [{lexical-form :value} {datatype-iri :value}]
+  (where/->typed-val lexical-form datatype-iri))
 
 (def context-var
   (symbol "$-CONTEXT"))
@@ -586,6 +594,8 @@
     sha512         fluree.db.query.exec.eval/sha512
     uuid           fluree.db.query.exec.eval/uuid
     struuid        fluree.db.query.exec.eval/struuid
+    str-dt         fluree.db.query.exec.eval/str-dt
+    str-lang       fluree.db.query.exec.eval/str-lang
     isNumeric      fluree.db.query.exec.eval/isNumeric
     isBlank        fluree.db.query.exec.eval/isBlank
     str            fluree.db.query.exec.eval/sparql-str
@@ -619,6 +629,7 @@
 
      ;; rdf term fns
      uuid struuid isNumeric isBlank str iri lang datatype is-iri is-literal
+     str-lang str-dt
 
      ;; vector scoring fns
      dotproduct cosine-similarity euclidian-distance})

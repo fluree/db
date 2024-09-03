@@ -395,8 +395,8 @@
                                                            "ex:isBlank" 0 "ex:isNumeric"    0 "ex:str"        0 "ex:uuid" 0
                                                            "ex:struuid" 0 "ex:isNotNumeric" 0 "ex:isNotBlank" 0
                                                            "ex:lang" 0 "ex:datatype" 0 "ex:IRI" 0 "ex:isIRI" 0
-                                                           "ex:isLiteral" 0}
-                                                          ;; "ex:bnode" 0 "ex:strdt" 0 "ex:strLang" 0
+                                                           "ex:isLiteral" 0 "ex:strdt" 0 "ex:strLang" 0}
+                                                          ;; "ex:bnode" 0
 
 
                                                           {"id"        "ex:rdf-term-fns"
@@ -427,7 +427,9 @@
                                                       "?datatype" "(datatype ?langtext)"
                                                       "?IRI" "(iri (concat \"ex:\" ?text))"
                                                       "?isIRI" "(is-iri ?IRI)"
-                                                      "?isLiteral" "(is-literal ?num)"]]
+                                                      "?isLiteral" "(is-literal ?num)"
+                                                      "?strdt" "(str-dt ?text \"ex:mystring\")"
+                                                      "?strLang" "(str-lang ?text \"foo\")"]]
                                          "insert"   [{"id"              "?s"
                                                       "ex:uuid"         "?uuid"
                                                       "ex:struuid"      "?struuid"
@@ -440,7 +442,9 @@
                                                       "ex:datatype"     "?datatype"
                                                       "ex:IRI"          "?IRI"
                                                       "ex:isIRI"        "?isIRI"
-                                                      "ex:isLiteral"    "?isLiteral"}]
+                                                      "ex:isLiteral"    "?isLiteral"
+                                                      "ex:strdt"        "?strdt"
+                                                      "ex:strLang"      "?strLang"}]
                                          "values"   ["?s" [{"@value" "ex:rdf-term-fns" "@type" "@id"}]]}))]
           (is (= {"ex:str"          ["1" "Abcdefg"]
                   "ex:uuid"         {"id" "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"}
@@ -453,7 +457,9 @@
                   "ex:datatype" {"id" "rdf:langString"}
                   "ex:IRI" {"id" "ex:Abcdefg"}
                   "ex:isIRI" true
-                  "ex:isLiteral" true}
+                  "ex:isLiteral" true
+                  "ex:strLang" "Abcdefg"
+                  "ex:strdt" "Abcdefg"}
                  @(fluree/query @updated {"@context"  [test-utils/default-str-context
                                                        {"ex" "http://example.com/"}]
                                           "selectOne" {"ex:rdf-term-fns" ["ex:isIRI" "ex:isURI" "ex:isLiteral"
