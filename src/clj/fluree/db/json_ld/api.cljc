@@ -10,7 +10,7 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log]
-            [fluree.db.query.api :as query-api]
+            [fluree.db.api.query :as query-api]
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.connection :refer [notify-ledger]]

@@ -1,4 +1,4 @@
-(ns fluree.db.query.api
+(ns fluree.db.api.query
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.string :as str]
