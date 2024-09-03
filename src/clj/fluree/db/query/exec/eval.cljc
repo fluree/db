@@ -220,6 +220,10 @@
   [tv]
   (where/->typed-val (= (:datatype-iri tv) const/iri-id)))
 
+(defn is-literal
+  [tv]
+  (where/->typed-val (not= (:datatype-iri tv) const/iri-id)))
+
 (def numeric-datatypes
   #{const/iri-xsd-decimal
     const/iri-xsd-double
@@ -545,6 +549,7 @@
     in             fluree.db.query.exec.eval/in
     iri            fluree.db.query.exec.eval/iri
     is-iri         fluree.db.query.exec.eval/is-iri
+    is-literal     fluree.db.query.exec.eval/is-literal
     lang           fluree.db.query.exec.eval/lang
     lcase          fluree.db.query.exec.eval/lcase
     median         fluree.db.query.exec.eval/median
@@ -613,7 +618,7 @@
      sha256 sha512
 
      ;; rdf term fns
-     uuid struuid isNumeric isBlank str iri lang datatype is-iri
+     uuid struuid isNumeric isBlank str iri lang datatype is-iri is-literal
 
      ;; vector scoring fns
      dotproduct cosine-similarity euclidian-distance})
