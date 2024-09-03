@@ -159,7 +159,7 @@
 (defn push-commit
   [conn {:keys [commit-map commit-jsonld]}]
   (let [commit-jsonld* (assoc commit-jsonld "address" (:address commit-map))]
-    (nameservice/push! conn commit-jsonld*)))
+    (connection/publish-commit conn commit-jsonld*)))
 
 (defn formalize-commit
   [{prev-commit :commit :as staged-db} new-commit]
@@ -332,8 +332,8 @@
   [conn ledger-alias {:keys [did branch indexing] :as opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias ledger-alias)
-          address        (<? (nameservice/primary-address conn ledger-alias* opts))
-          ns-addresses   (<? (nameservice/addresses conn ledger-alias* opts))
+          address        (<? (connection/primary-address conn ledger-alias* opts))
+          ns-addresses   (<? (connection/addresses conn ledger-alias* opts))
           ;; internal-only opt used for migrating ledgers without genesis commits
           init-time      (or (:fluree.db.json-ld.migrate.sid/time opts)
                              (util/current-time-iso))
@@ -370,7 +370,7 @@
   [conn db-alias commit-map]
   (or (get-first-value commit-map const/iri-alias)
       (->> (connection/-nameservices conn)
-           (some #(nameservice/-alias % db-alias)))))
+           (some #(nameservice/alias % db-alias)))))
 
 ;; TODO - once we have a different delimiter than `/` for branch/t-value this can simplified
 (defn address->alias
@@ -385,7 +385,7 @@
 (defn load*
   [{:keys [store] :as conn} ledger-chan address]
   (go-try
-    (let [commit-addr  (<? (nameservice/lookup-commit conn address))
+    (let [commit-addr  (<? (connection/lookup-commit conn address))
           _            (log/debug "Attempting to load from address:" address
                                   "with commit address:" commit-addr)
           _            (when-not commit-addr
@@ -412,7 +412,7 @@
                       :cache    (atom {})
                       :reasoner #{}
                       :conn     conn})]
-      (nameservice/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
+      (connection/subscribe-ledger conn ledger-alias) ; async in background, elect to receive update notifications
       (async/put! ledger-chan ledger)
       ledger)))
 
@@ -437,7 +437,7 @@
     (let [[cached? ledger-chan] (register-ledger conn alias)]
       (if cached?
         (<? ledger-chan)
-        (let [address (<! (nameservice/primary-address conn alias nil))]
+        (let [address (<! (connection/primary-address conn alias nil))]
           (if (util/exception? address)
             (do (release-ledger conn alias)
                 (async/put! ledger-chan

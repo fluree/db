@@ -69,11 +69,11 @@
 (defrecord RemoteNameService [conn-state server-state msg-in msg-out]
   nameservice/iNameService
   (lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
-  (-address [_ ledger-alias {:keys [branch]:as _opts}]
+  (address [_ ledger-alias {:keys [branch]:as _opts}]
     (go (if (and branch (not= "main" branch))
           (str ledger-alias "(" branch ")")
           ledger-alias)))
-  (-alias [_ ledger-address]
+  (alias [_ ledger-address]
     ledger-address)
   (-close [_]
     (async/close! msg-in)

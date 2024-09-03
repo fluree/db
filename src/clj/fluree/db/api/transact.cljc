@@ -5,7 +5,7 @@
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.transact :as tx]
             [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.nameservice :as nameservice]
+            [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.context :as ctx-util]
@@ -96,8 +96,8 @@
       (<? (transact! conn ledger-id txn opts)))))
   ([conn ledger-id txn opts]
    (go-try
-    (let [address     (<? (nameservice/primary-address conn ledger-id nil))]
-      (if-not (<? (nameservice/exists? conn address))
+    (let [address     (<? (connection/primary-address conn ledger-id nil))]
+      (if-not (<? (connection/ledger-exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))
         (let [ledger   (<? (jld-ledger/load conn address))]
           (<? (transact-ledger! ledger txn opts))))))))
@@ -123,9 +123,9 @@
           txn-context (or (ctx-util/txn-context txn)
                           context) ;; parent context from credential if present
           ledger-id   (extract-ledger-id expanded)
-          address     (<? (nameservice/primary-address conn ledger-id nil))
+          address     (<? (connection/primary-address conn ledger-id nil))
           parsed-opts (parse-opts expanded opts txn-context)]
-      (if (<? (nameservice/exists? conn address))
+      (if (<? (connection/ledger-exists? conn address))
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
         (let [ledger (<? (jld-ledger/create conn ledger-id parsed-opts))]

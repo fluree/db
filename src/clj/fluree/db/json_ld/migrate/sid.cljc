@@ -8,7 +8,7 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.nameservice :as nameservice]
+            [fluree.db.connection :as connection]
             [fluree.db.query.exec.update :as update]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-id get-first-id get-first-value]]
@@ -126,8 +126,8 @@
    (migrate conn ledger-alias indexing-opts false nil))
   ([{:keys [store] :as conn} ledger-alias indexing-opts force changes-ch]
    (go-try
-     (let [ledger-address       (<? (nameservice/primary-address conn ledger-alias nil))
-           last-commit-addr     (<? (nameservice/lookup-commit conn ledger-address))
+     (let [ledger-address       (<? (connection/primary-address conn ledger-alias nil))
+           last-commit-addr     (<? (connectiony/lookup-commit conn ledger-address))
            last-verified-commit (<? (commit-storage/read-commit-jsonld store last-commit-addr))
            last-commit          (first last-verified-commit)
            version              (get-first-value last-commit const/iri-v)]

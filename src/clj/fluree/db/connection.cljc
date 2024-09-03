@@ -1,10 +1,13 @@
 (ns fluree.db.connection
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [<!]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [fluree.db.constants :as const]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.commit.storage :as commit-storage]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
-            [fluree.db.util.core :as util :refer [get-first get-first-value]]
+            [fluree.db.util.core :as util :refer [get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
@@ -134,3 +137,127 @@
           (log/debug "No cached ledger found for commit: " commit-map))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " commit-map)))))
+
+(defn all-nameservices
+  [{:keys [primary-ns aux-nses] :as _conn}]
+  (cons primary-ns aux-nses))
+
+(def fluree-address-prefix
+  "fluree:")
+
+(defn fluree-address?
+  [x]
+  (str/starts-with? x fluree-address-prefix))
+
+(defn relative-ledger-alias?
+  [ledger-alias]
+  (not (fluree-address? ledger-alias)))
+
+(defn addresses
+  "Retrieve address for each nameservices based on a relative ledger-alias.
+  If ledger-alias is not relative, returns only the current ledger alias.
+
+  TODO - if a single non-relative address is used, and the ledger exists,
+  we should retrieve all stored ns addresses in the commit if possible and
+  try to use all nameservices."
+  ([conn ledger-alias]
+   (addresses conn ledger-alias "main"))
+  ([conn ledger-alias branch]
+   (go-try
+     (if (relative-ledger-alias? ledger-alias)
+       (let [nameservices (all-nameservices conn)]
+         (loop [nameservices* nameservices
+                addresses     []]
+           (let [ns (first nameservices*)]
+             (if ns
+               (if-let [address (<? (nameservice/address ns ledger-alias branch))]
+                 (recur (rest nameservices*) (conj addresses address))
+                 (recur (rest nameservices*) addresses))
+               addresses))))
+       [ledger-alias]))))
+
+(defn primary-address
+  "From a connection, lookup primary address from nameservice(s) for a given
+  ledger alias"
+  ([conn ledger-alias]
+   (go-try
+     (first (<? (addresses conn ledger-alias)))))
+  ([conn ledger-alias branch]
+   (go-try
+     (first (<? (addresses conn ledger-alias branch))))))
+
+(defn publish-commit
+  "Publishes commit to all nameservices registered on the connection."
+  [{:keys [primary-ns aux-nses] :as _conn} commit-jsonld]
+  (go-try
+    (let [result (<? (nameservice/publish primary-ns commit-jsonld))]
+      (dorun (map (fn [ns]
+                    (nameservice/publish ns commit-jsonld)))
+             aux-nses)
+      result)))
+
+(defn lookup-commit
+  "Returns commit address from first matching nameservice on a conn
+   for a given ledger alias and branch"
+  [conn ledger-address]
+  (let [nameservices (all-nameservices conn)]
+    (go-try
+      (loop [nameservices* nameservices]
+        (when-let [ns (first nameservices*)]
+          (if-let [commit-address (<? (nameservice/lookup ns ledger-address))]
+            commit-address
+            (recur (rest nameservices*))))))))
+
+(defn read-latest-commit
+  [{:keys [store] :as conn} ledger-address]
+  (go-try
+    (if-let [commit-addr (<? (lookup-commit conn ledger-address))]
+      (let [commit-data (<? (storage/read-json store commit-addr))]
+        (assoc commit-data "address" commit-addr))
+      (throw (ex-info (str "Unable to load. No commit exists for: " ledger-address)
+                      {:status 400 :error :db/invalid-commit-address})))))
+
+(defn file-read?
+  [address]
+  (str/ends-with? address ".json"))
+
+(defn read-resource
+  [{:keys [store] :as conn} resource-address]
+  (if (file-read? resource-address)
+    (storage/read-json store resource-address)
+    (read-latest-commit conn resource-address)))
+
+(defn ledger-exists?
+  "Checks nameservices on a connection and returns true if any nameservice
+  already has a ledger associated with the given alias."
+  [conn ledger-alias]
+  (go-try
+    (boolean (<? (lookup-commit conn ledger-alias)))))
+
+(defn subscribe-ledger
+  "Initiates subscription requests for a ledger into all namespaces on a connection."
+  [conn ledger-alias]
+  (let [nameservices (all-nameservices conn)
+        callback     (fn [msg]
+                       (log/info "Subscription message received: " msg)
+                       (let [action       (get msg "action")
+                             ledger-alias (get msg "ledger")
+                             data         (get msg "data")]
+                         (if (= "new-commit" action)
+                           (notify-ledger conn data)
+                           (log/info "New subscritipn message with action: " action "received, ignored."))))]
+    (go-try
+      (loop [nameservices* nameservices]
+        (when-let [ns (first nameservices*)]
+          (<? (nameservice/-subscribe ns ledger-alias callback))
+          (recur (rest nameservices*)))))))
+
+(defn unsubscribe-ledger
+  "Initiates unsubscription requests for a ledger into all namespaces on a connection."
+  [conn ledger-alias]
+  (let [nameservices (all-nameservices conn)]
+    (go-try
+      (loop [nameservices* nameservices]
+        (when-let [ns (first nameservices*)]
+          (<? (nameservice/-unsubscribe ns ledger-alias))
+          (recur (rest nameservices*)))))))

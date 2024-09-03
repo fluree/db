@@ -14,7 +14,6 @@
             [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
-            [fluree.db.nameservice :as nameservice]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.json-ld.policy :as policy])
@@ -151,7 +150,7 @@
   given ledger-alias."
   [conn ledger-alias]
   (log/debug "Looking up address for ledger alias" ledger-alias)
-  (nameservice/primary-address conn ledger-alias nil))
+  (connection/primary-address conn ledger-alias nil))
 
 (defn load
   "Loads an existing ledger by its alias (which will be converted to a
@@ -170,7 +169,7 @@
                       ledger-alias-or-address
                       (<! (alias->address conn ledger-alias-or-address)))]
         (log/debug "exists? - ledger address:" address)
-        (<! (nameservice/exists? conn address))))))
+        (<! (connection/ledger-exists? conn address))))))
 
 (defn notify
   "Notifies the connection with a new commit map (parsed JSON commit with string keys).

@@ -62,9 +62,9 @@
   nameservice/iNameService
   (lookup [_ ledger-alias]
     (lookup-address ipfs-endpoint ipns-key ledger-alias))
-  (-address [_ ledger-alias branch]
+  (address [_ ledger-alias branch]
     (ipns-address ipfs-endpoint ipns-key ledger-alias branch))
-  (-alias [_ ledger-address]
+  (alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
       alias))
   (-close [_] true))

@@ -12,8 +12,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.api.query :as query-api]
             [fluree.db.query.range :as query-range]
-            [fluree.db.nameservice :as nameservice]
-            [fluree.db.connection :refer [notify-ledger]]
+            [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.json-ld.policy :as policy])
@@ -142,7 +141,7 @@
   [conn ledger-alias]
   (log/warn "DEPRECATED function `alias->address` superseded by `fluree.db.api/alias->address`")
   (log/debug "Looking up address for ledger alias" ledger-alias)
-  (nameservice/primary-address conn ledger-alias nil))
+  (connection/primary-address conn ledger-alias nil))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/load"}
@@ -167,7 +166,7 @@
                       ledger-alias-or-address
                       (<! (alias->address conn ledger-alias-or-address)))]
         (log/debug "exists? - ledger address:" address)
-        (<! (nameservice/exists? conn address))))))
+        (<! (connection/ledger-exists? conn address))))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/notify"}

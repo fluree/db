@@ -31,11 +31,11 @@
           (let [ns-record (json/parse record-bytes false)]
             (nameservice/commit-address-from-record ns-record nil))))))
 
-  (-address [_ ledger-alias _branch]
+  (address [_ ledger-alias _branch]
     (go
       (str address-prefix ledger-alias)))
 
-  (-alias [_ ledger-address]
+  (alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?
     (-> (nameservice/address-path ledger-address)
         (str/split #"/")

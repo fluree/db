@@ -16,7 +16,7 @@
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.nameservice :as nameservice]
+            [fluree.db.connection :as connection]
             [fluree.db.reasoner :as reasoner]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -174,7 +174,7 @@
   (go-try
     (try*
       (let [[alias explicit-t] (extract-query-string-t alias)
-            address      (<? (nameservice/primary-address conn alias nil))
+            address      (<? (connection/primary-address conn alias nil))
             ledger       (<? (jld-ledger/load conn address))
             db           (ledger/-db ledger)
             t*           (or explicit-t t)]
