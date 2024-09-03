@@ -232,6 +232,10 @@
   [tv]
   (where/->typed-val (not= (:datatype-iri tv) const/iri-id)))
 
+(defn bnode
+  []
+  (where/->typed-val (iri/new-blank-node-id) const/iri-id))
+
 (def numeric-datatypes
   #{const/iri-xsd-decimal
     const/iri-xsd-double
@@ -543,6 +547,7 @@
     as             fluree.db.query.exec.eval/as
     and            fluree.db.query.exec.eval/-and
     avg            fluree.db.query.exec.eval/avg
+    bnode          fluree.db.query.exec.eval/bnode
     bound          fluree.db.query.exec.eval/bound
     ceil           fluree.db.query.exec.eval/ceil
     coalesce       fluree.db.query.exec.eval/coalesce
@@ -629,7 +634,7 @@
 
      ;; rdf term fns
      uuid struuid isNumeric isBlank str iri lang datatype is-iri is-literal
-     str-lang str-dt
+     str-lang str-dt bnode
 
      ;; vector scoring fns
      dotproduct cosine-similarity euclidian-distance})
