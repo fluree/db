@@ -216,6 +216,10 @@
   [tv]
   `(where/->typed-val (json-ld/expand-iri (:value ~tv) ~context-var) const/iri-id))
 
+(defn is-iri
+  [tv]
+  (where/->typed-val (= (:datatype-iri tv) const/iri-id)))
+
 (def numeric-datatypes
   #{const/iri-xsd-decimal
     const/iri-xsd-double
@@ -540,6 +544,7 @@
     if             fluree.db.query.exec.eval/-if
     in             fluree.db.query.exec.eval/in
     iri            fluree.db.query.exec.eval/iri
+    is-iri         fluree.db.query.exec.eval/is-iri
     lang           fluree.db.query.exec.eval/lang
     lcase          fluree.db.query.exec.eval/lcase
     median         fluree.db.query.exec.eval/median
@@ -591,7 +596,7 @@
      median max min rand sample sample1 stddev str sum variance})
 
 (def allowed-scalar-fns
-  '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if iri lang
+  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if
      nil? as not not= or re-find re-pattern in
 
      ;; string fns
@@ -608,7 +613,7 @@
      sha256 sha512
 
      ;; rdf term fns
-     uuid struuid isNumeric isBlank str
+     uuid struuid isNumeric isBlank str iri lang datatype is-iri
 
      ;; vector scoring fns
      dotproduct cosine-similarity euclidian-distance})
