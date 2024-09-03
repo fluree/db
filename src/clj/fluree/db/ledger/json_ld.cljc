@@ -10,7 +10,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.reify :as jld-reify]
+            [fluree.db.commit.storage :as commit-storage]
             [clojure.string :as str]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.nameservice :as nameservice]
@@ -150,7 +150,7 @@
           signed-commit        (if did
                                  (<? (cred/generate jld-commit private (:id did)))
                                  jld-commit)
-          commit-res           (<? (connection/-c-write conn alias signed-commit))
+          commit-res           (<? (commit-storage/write-jsonld (:store conn) alias signed-commit))
           commit**             (commit-data/update-commit-address commit* (:address commit-res))]
       {:commit-map    commit**
        :commit-jsonld jld-commit
@@ -189,7 +189,7 @@
           [[txn-id author annotation] :as txns]
           (<? (write-transactions! conn ledger staged-txns))
 
-          data-write-result (<? (connection/-c-write conn alias db-jsonld)) ; write commit data
+          data-write-result (<? (commit-storage/write-jsonld (:store conn) alias db-jsonld)) ; write commit data
           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
 
           base-commit-map {:old-commit commit
@@ -238,7 +238,7 @@
   If commit successful, returns successfully updated db."
   [ledger expanded-commit]
   (go-try
-    (let [[commit-jsonld _proof] (jld-reify/verify-commit expanded-commit)
+    (let [[commit-jsonld _proof] (commit-storage/verify-commit expanded-commit)
 
           branch     (-> expanded-commit
                          (get-first-value const/iri-branch)
@@ -257,7 +257,8 @@
         (let [db-address     (-> commit-jsonld
                                  (get-first const/iri-data)
                                  (get-first-value const/iri-address))
-              db-data-jsonld (<? (jld-reify/read-commit (:conn ledger) db-address))
+              commit-storage (-> ledger :conn :store)
+              db-data-jsonld (<? (commit-storage/read-commit-jsonld commit-storage db-address))
               updated-db     (<? (transact/-merge-commit current-db commit-jsonld db-data-jsonld))]
           (update-commit! ledger branch updated-db))
 
@@ -301,19 +302,6 @@
     (subs ledger-alias 1)
     ledger-alias))
 
-(defn write-genesis-commit
-  [conn ledger-alias branch ns-addresses init-time]
-  (go-try
-    (let [genesis-commit            (commit-data/blank-commit ledger-alias branch ns-addresses init-time)
-          initial-context           (get genesis-commit "@context")
-          initial-db-data           (-> genesis-commit
-                                        (get "data")
-                                        (assoc "@context" initial-context))
-          {db-address :address}     (<? (connection/-c-write conn ledger-alias initial-db-data))
-          genesis-commit*           (assoc-in genesis-commit ["data" "address"] db-address)
-          {commit-address :address} (<? (connection/-c-write conn ledger-alias genesis-commit*))]
-      (assoc genesis-commit* "address" commit-address))))
-
 (defn initial-state
   [branches current-branch]
   {:closed?  false
@@ -349,8 +337,7 @@
           ;; internal-only opt used for migrating ledgers without genesis commits
           init-time      (or (:fluree.db.json-ld.migrate.sid/time opts)
                              (util/current-time-iso))
-          genesis-commit (json-ld/expand
-                           (<? (write-genesis-commit conn ledger-alias branch ns-addresses init-time)))
+          genesis-commit (<? (commit-storage/write-genesis-commit (:store conn) ledger-alias branch ns-addresses init-time))
           ;; map of all branches and where they are branched from
           branches       {branch (branch/state-map conn ledger-alias* branch genesis-commit indexing)}]
       (map->JsonLDLedger
@@ -396,7 +383,7 @@
       path)))
 
 (defn load*
-  [conn ledger-chan address]
+  [{:keys [store] :as conn} ledger-chan address]
   (go-try
     (let [commit-addr  (<? (nameservice/lookup-commit conn address))
           _            (log/debug "Attempting to load from address:" address
@@ -404,7 +391,7 @@
           _            (when-not commit-addr
                          (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
                                          {:status 400 :error :db/invalid-commit-address})))
-          [commit _]   (<? (jld-reify/read-commit conn commit-addr))
+          [commit _]   (<? (commit-storage/read-commit-jsonld store commit-addr))
           _            (when-not commit
                          (throw (ex-info (str "Unable to load. Commit file for ledger: " address
                                               " at location: " commit-addr " is not found.")

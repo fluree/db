@@ -7,13 +7,13 @@
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.json-ld.reify :as reify]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.query.exec.update :as update]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-id get-first-id get-first-value]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.commit.storage :as commit-storage]))
 
 (defrecord NamespaceMapping [mapping]
   iri/IRICodec
@@ -124,11 +124,11 @@
   along the way and rewriting the commit chain to use the newer commit structure."
   ([conn ledger-alias indexing-opts]
    (migrate conn ledger-alias indexing-opts false nil))
-  ([conn ledger-alias indexing-opts force changes-ch]
+  ([{:keys [store] :as conn} ledger-alias indexing-opts force changes-ch]
    (go-try
      (let [ledger-address       (<? (nameservice/primary-address conn ledger-alias nil))
            last-commit-addr     (<? (nameservice/lookup-commit conn ledger-address))
-           last-verified-commit (<? (reify/read-commit conn last-commit-addr))
+           last-verified-commit (<? (commit-storage/read-commit-jsonld store last-commit-addr))
            last-commit          (first last-verified-commit)
            version              (get-first-value last-commit const/iri-v)]
        (if (and (= version commit-data/commit-version) (not force))
@@ -138,7 +138,7 @@
                                      (update-keys {const/iri-t :t const/iri-size :size const/iri-flakes :flakes})
                                      (select-keys [:t :size :flakes])
                                      (update-vals (comp :value first)))
-               all-commit-tuples (<? (reify/trace-commits conn last-commit 1))
+               all-commit-tuples (<? (commit-storage/trace-commits store last-commit 1))
                first-commit      (ffirst all-commit-tuples)
                branch            (or (keyword (get-first-value first-commit const/iri-branch))
                                      :main)

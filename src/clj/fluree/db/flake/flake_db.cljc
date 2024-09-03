@@ -27,7 +27,7 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
             [fluree.db.json-ld.policy.rules :as policy-rules]
-            [fluree.db.json-ld.reify :as reify]
+            [fluree.db.commit.storage :as commit-storage]
             [fluree.db.transact :as transact]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.query.exec.select.subject :as subject]
@@ -297,7 +297,7 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
   indexes and returns updated db"
-  [conn db commit-jsonld commit-data-jsonld]
+  [{:keys [store] :as _conn} db commit-jsonld commit-data-jsonld]
   (go-try
     (let [t-new            (db-t commit-data-jsonld)
           assert           (db-assert commit-data-jsonld)
@@ -313,7 +313,8 @@
 
           commit-id          (:id commit-metadata)
           commit-sid         (iri/encode-iri db* commit-id)
-          [prev-commit _]    (some->> previous :address (reify/read-commit conn) <?)
+          [prev-commit _]    (when-let [prev-addr (:address previous)]
+                               (<? (commit-storage/read-commit-jsonld store prev-addr)))
           db-sid             (iri/encode-iri db* (:id data))
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new commit-sid db-sid)
@@ -503,9 +504,10 @@
      :schema          (vocab/base-schema)}))
 
 (defn load-novelty
-  [conn indexed-db index-t commit-jsonld]
+  [commit-storage indexed-db index-t commit-jsonld]
   (go-try
-    (loop [[commit-tuple & r] (<? (reify/trace-commits conn commit-jsonld (inc index-t)))
+    (log/info "loading novelty from:" commit-storage)
+    (loop [[commit-tuple & r] (<? (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t)))
            db indexed-db]
       (if commit-tuple
         (let [[commit-jsonld _commit-proof commit-data-jsonld] commit-tuple
@@ -544,7 +546,7 @@
 (defn load
   ([conn ledger-alias branch commit-pair]
    (load conn ledger-alias branch commit-pair {}))
-  ([{:keys [index-store] :as conn} ledger-alias branch [commit-jsonld commit-map] indexing-opts]
+  ([{:keys [store index-store] :as conn} ledger-alias branch [commit-jsonld commit-map] indexing-opts]
    (go-try
      (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root index-store address))
@@ -573,7 +575,7 @@
            index-t     (:t indexed-db*)]
        (if (= commit-t index-t)
          indexed-db*
-         (<? (load-novelty conn indexed-db* index-t commit-jsonld)))))))
+         (<? (load-novelty store indexed-db* index-t commit-jsonld)))))))
 
 (defn get-s-iri
   "Returns a compact IRI from a subject id (sid)."
