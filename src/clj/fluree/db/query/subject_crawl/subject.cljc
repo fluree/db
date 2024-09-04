@@ -4,7 +4,7 @@
             [fluree.db.flake.format :as jld-format]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.range :as query-range]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]

@@ -1,6 +1,6 @@
-(ns fluree.db.indexer.default
-  (:require [fluree.db.index :as index]
-            [fluree.db.indexer.storage :as storage]
+(ns fluree.db.flake.index.novelty
+  (:require [fluree.db.flake.index :as index]
+            [fluree.db.flake.index.storage :as storage]
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
@@ -63,7 +63,7 @@
 
 (defn reconstruct-branch
   [{:keys [comparator], :as branch} t child-nodes]
-  (let [children    (apply index/child-map comparator child-nodes)
+  (let [children    (index/child-map comparator child-nodes)
         size        (->> child-nodes
                          (map :size)
                          (reduce +))
