@@ -563,9 +563,18 @@
 
 (defn parse-select-clause
   [clause context depth]
-  (if (sequential? clause)
+  (cond
+    ;; singular function call
+    (list? clause)
+    (parse-selector context depth clause)
+
+    ;; collection of selectors
+    (sequential? clause)
     (mapv (partial parse-selector context depth)
           clause)
+
+    ;; singular selector
+    :else
     (parse-selector context depth clause)))
 
 (defn parse-select
