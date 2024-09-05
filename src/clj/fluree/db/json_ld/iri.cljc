@@ -58,7 +58,7 @@
    "http://www.w3.org/2008/05/skos#"             20
    "urn:uuid"                                    21
    "urn:isbn:"                                   22
-   "urn:issn"                                    23
+   "urn:issn:"                                   23
    "_:"                                          24})
 
 
