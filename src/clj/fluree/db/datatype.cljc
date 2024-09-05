@@ -2,6 +2,7 @@
   (:require [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [clojure.string :as str]
@@ -362,8 +363,11 @@
 (defn- coerce-dense-vector
   [value]
   (try*
-   (vector.score/vectorize value)
-   (catch* e
+    (if (string? value)
+      (-> (json/parse value nil)
+          (vector.score/vectorize))
+      (vector.score/vectorize value))
+    (catch* e
            (log/error e "Unrecognized value for dense vector: " value)
            (throw (ex-info (str "Unrecognized value for dense vector: " value)
                            {:status 400
