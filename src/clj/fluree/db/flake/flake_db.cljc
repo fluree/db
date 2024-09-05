@@ -234,7 +234,7 @@
     (if (and ref-id (node? v-map))
       (let [ref-sid (iri/encode-iri db ref-id)]
         (flake/create sid pid ref-sid const/$id t assert? meta))
-      (let [[value dt] (datatype/from-expanded v-map nil)]
+      (let [[value dt] (datatype/from-expanded db v-map)]
         (flake/create sid pid value dt t assert? meta)))))
 
 
