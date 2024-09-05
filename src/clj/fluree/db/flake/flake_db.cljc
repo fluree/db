@@ -17,7 +17,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.flake.transact :as flake.transact]
-            [fluree.db.util.core :as util :refer [get-first get-first-value get-first-id vswap!]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value get-first-id]]
             [fluree.db.flake.index :as index]
             [fluree.db.indexer :as indexer]
             [fluree.db.flake.index.novelty :as novelty]
@@ -351,7 +351,7 @@
                     opst tspo schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code
                     reindex-min-bytes reindex-max-bytes max-old-indexes]
-                    dbproto/IFlureeDb
+  dbproto/IFlureeDb
   (-query [this query-map] (fql/query this query-map))
   (-p-prop [_ meta-key property] (match/p-prop schema meta-key property))
   (-class-ids [this subject] (match/class-ids this subject))
@@ -622,7 +622,7 @@
   {"@list" (->> objs (sort-by :i) (map #(dissoc % :i)))})
 
 (defn- subject-block
-  [s-flakes db ^clojure.lang.Volatile ctx compact-fn]
+  [s-flakes db compact-fn]
   (loop [[p-flakes & r] (partition-by flake/p s-flakes)
          acc nil]
     (let [fflake (first p-flakes)
@@ -656,43 +656,41 @@
   :retract - retraction flakes
   :refs-ctx - context that must be included with final context, for refs (@id) values
   :flakes - all considered flakes, for any downstream processes that need it"
-  [{:keys [reasoner] :as db} {:keys [compact-fn id-key type-key] :as _opts}]
+  [{:keys [reasoner] :as db} {:keys [compact-fn id-key] :as _opts}]
   (when-let [flakes (cond-> (commit-flakes db)
                       reasoner flake.reasoner/non-reasoned-flakes)]
     (log/trace "generate-commit flakes:" flakes)
-    (let [ctx (volatile! {})]
-      (loop [[s-flakes & r] (partition-by flake/s flakes)
-             assert  []
-             retract []]
-        (if s-flakes
-          (let [sid   (flake/s (first s-flakes))
-                s-iri (get-s-iri db sid compact-fn)
-                [assert* retract*]
-                (if (and (= 1 (count s-flakes))
-                         (= const/$rdfs:Class (->> s-flakes first flake/o))
-                         (= const/$rdf:type (->> s-flakes first flake/p)))
-                  ;; we don't output auto-generated rdfs:Class definitions for classes
-                  ;; (they are implied when used in rdf:type statements)
-                  [assert retract]
-                  (let [{assert-flakes  true
-                         retract-flakes false}
-                        (group-by flake/op s-flakes)
+    (loop [[s-flakes & r] (partition-by flake/s flakes)
+           assert  []
+           retract []]
+      (if s-flakes
+        (let [sid   (flake/s (first s-flakes))
+              s-iri (get-s-iri db sid compact-fn)
+              [assert* retract*]
+              (if (and (= 1 (count s-flakes))
+                       (= const/$rdfs:Class (->> s-flakes first flake/o))
+                       (= const/$rdf:type (->> s-flakes first flake/p)))
+                ;; we don't output auto-generated rdfs:Class definitions for classes
+                ;; (they are implied when used in rdf:type statements)
+                [assert retract]
+                (let [{assert-flakes  true
+                       retract-flakes false}
+                      (group-by flake/op s-flakes)
 
-                        s-assert  (when assert-flakes
-                                    (-> (subject-block assert-flakes db ctx compact-fn)
-                                        (assoc id-key s-iri)))
-                        s-retract (when retract-flakes
-                                    (-> (subject-block retract-flakes db ctx compact-fn)
-                                        (assoc id-key s-iri)))]
-                    [(cond-> assert
-                       s-assert (conj s-assert))
-                     (cond-> retract
-                       s-retract (conj s-retract))]))]
-            (recur r assert* retract*))
-          {:refs-ctx (dissoc @ctx type-key) ; @type will be marked as @type: @id, which is implied
-           :assert   assert
-           :retract  retract
-           :flakes   flakes})))))
+                      s-assert  (when assert-flakes
+                                  (-> (subject-block assert-flakes db compact-fn)
+                                      (assoc id-key s-iri)))
+                      s-retract (when retract-flakes
+                                  (-> (subject-block retract-flakes db compact-fn)
+                                      (assoc id-key s-iri)))]
+                  [(cond-> assert
+                     s-assert (conj s-assert))
+                   (cond-> retract
+                     s-retract (conj s-retract))]))]
+          (recur r assert* retract*))
+        {:assert   assert
+         :retract  retract
+         :flakes   flakes}))))
 
 (defn new-namespaces
   [{:keys [max-namespace-code namespace-codes] :as _db}]
