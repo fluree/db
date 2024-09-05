@@ -238,13 +238,25 @@
          :cljs (let [n (js/parseFloat value)] (if (js/Number.isNaN n) nil n))))
 
     (float? value)
+    ;; convert to string first to keep float precision explosion at bay
+    #?(:clj (Double/parseDouble (Float/toString value))
+       :cljs value)
+
+    (double? value)
     value
 
     (integer? value)
     #?(:clj  (Double/parseDouble (str value ".0"))
        :cljs value)
 
-    :else nil))
+    :else
+    #?(:clj (when (decimal? value) ;; our json parsing library turns decimals into BigDecimal
+              (try (double value)
+                   (catch Exception _
+                     (throw (ex-info (str "xsd:double value exceeds maximum 64-bit float range: " value)
+                                     {:status 400
+                                      :error  :db/invalid-value})))))
+       :cljs nil)))
 
 (defn- coerce-float
   [value]
@@ -261,11 +273,26 @@
     (float? value)
     value
 
+    (double? value)
+    #?(:clj (try (float value)
+                 (catch Exception _
+                   (throw (ex-info (str "xsd:float value exceeds maximum 32-bit float range: " value)
+                                   {:status 400
+                                    :error  :db/invalid-value}))))
+       :cljs value)
+
     (integer? value)
     #?(:clj  (Float/parseFloat (str value ".0"))
        :cljs value)
 
-    :else nil))
+    :else
+    #?(:clj (when (decimal? value) ;; our json parsing library turns decimals into BigDecimal
+              (try (float value)
+                   (catch Exception _
+                     (throw (ex-info (str "xsd:float value exceeds maximum 32-bit float range: " value)
+                                     {:status 400
+                                      :error  :db/invalid-value})))))
+       :cljs nil)))
 
 (defn- coerce-int-fn
   "Returns a fn for coercing int-like values (e.g. short, long) from strings and
