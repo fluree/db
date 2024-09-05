@@ -53,14 +53,25 @@
    const/iri-json                   const/$rdf:json
    const/iri-vector                 const/$fluree:vector})
 
-(def time-types
-  #{const/$xsd:date
-    const/$xsd:dateTime
-    const/$xsd:time})
+(def JSON-LD-inferable-types
+  "Note these are inferable types for JSON-LD.
+  Turtle (ttl) also has inferable types that differ
+  slightly. In ttl, a normal fraction number (e.g. 1.23)
+  would translate into xsd:decimal, and a number that uses
+  'e' notation would translate into xsd:double (e.g. 1.23e0):
+  https://www.w3.org/TR/turtle/#abbrev"
+  #{const/$xsd:string
+    const/$xsd:boolean
+    const/$xsd:integer
+    const/$xsd:double})
 
-(defn time-type?
+(defn inferable?
+  "Returns true if the provided data type is one that can be inferred from the value.
+  Note this is for JSON-LD inferable types only:
+  https://www.w3.org/TR/json-ld11/#conversion-of-native-data-types
+  Includes: xsd:string, xsd:boolean, xsd:integer, xsd:double "
   [dt]
-  (contains? time-types dt))
+  (contains? JSON-LD-inferable-types dt))
 
 (def iso8601-offset-pattern
   "(Z|(?:[+-][0-9]{2}:[0-9]{2}))?")
