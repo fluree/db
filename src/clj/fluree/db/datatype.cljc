@@ -439,15 +439,19 @@
     const/$xsd:float
     (coerce-float value)
 
-    (const/$xsd:integer const/$xsd:int const/$xsd:unsignedInt
-     const/$xsd:nonPositiveInteger const/$xsd:positiveInteger
-     const/$xsd:nonNegativeInteger const/$xsd:negativeInteger)
+    ;; ·maxInclusive· to be 2147483647 and ·minInclusive· to be -2147483648
+    ;; https://www.w3.org/TR/xmlschema-2/#int
+    (const/$xsd:int const/$xsd:unsignedShort) ;; unsigned short will be outside of 'Short' value range
     (-> value coerce-integer (check-signed required-type))
 
-    (const/$xsd:long const/$xsd:unsignedLong)
+    ;; xsd:integer and parent of long and others - different from xsd:int which is 32-bit
+    (const/$xsd:integer const/$xsd:long
+     const/$xsd:nonNegativeInteger const/$xsd:unsignedLong
+     const/$xsd:positiveInteger const/$xsd:unsignedInt ;; unsigned int can be outside of xsd:int max range
+     const/$xsd:nonPositiveInteger const/$xsd:negativeInteger)
     (-> value coerce-long (check-signed required-type))
 
-    (const/$xsd:short const/$xsd:unsignedShort)
+    const/$xsd:short
     (-> value coerce-short (check-signed required-type))
 
     (const/$xsd:byte const/$xsd:unsignedByte)
