@@ -117,7 +117,7 @@
                     const/$rdf:langString
                     const/$xsd:string)
      (integer? x) const/$xsd:long ; infer to long to prevent overflow
-     (number? x)  const/$xsd:decimal
+     (number? x)  const/$xsd:double
      (boolean? x) const/$xsd:boolean)))
 
 (defn infer-iri
