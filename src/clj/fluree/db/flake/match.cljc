@@ -19,18 +19,9 @@
       (<? (query-range/index-range root :spot = [subject-id const/$rdf:type]
                                    {:flake-xf (map flake/o)})))))
 
-(defn p-prop
-  [schema property predicate]
-  (assert (#{:id :iri :subclassOf :parentProps :childProps :datatype}
-           property)
-          (str "Invalid predicate property: " (pr-str property)))
-  (get-in schema [:pred predicate property]))
-
-(defn class-prop
-  [{:keys [schema] :as _db} meta-key class]
-  (if (= :subclasses meta-key)
-    (get @(:subclasses schema) class)
-    (p-prop schema meta-key class)))
+(defn subclasses
+  [{:keys [schema] :as _db} class]
+  (get @(:subclasses schema) class))
 
 (defn match-id
   [db fuel-tracker solution s-mch error-ch]
@@ -116,7 +107,7 @@
                              (comp (map (fn [cls]
                                           (where/match-sid sub-obj db-alias cls)))
                                    (remove nil?))
-                             (class-prop db :subclasses cls))
+                             (subclasses db cls))
             class-ch   (async/to-chan! class-objs)]
         (async/pipeline-async 2
                               matched-ch

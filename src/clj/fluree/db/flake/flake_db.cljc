@@ -372,7 +372,6 @@
                     max-namespace-code reindex-min-bytes reindex-max-bytes max-old-indexes]
   dbproto/IFlureeDb
   (-query [this query-map] (fql/query this query-map))
-  (-p-prop [_ meta-key property] (match/p-prop schema meta-key property))
   (-class-ids [this subject] (match/class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))
 
