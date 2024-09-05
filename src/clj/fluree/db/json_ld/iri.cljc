@@ -12,54 +12,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defrecord IRI [^String s]
-  Object
-  (toString [_] s)
-  Comparable
-  (compareTo [_ o]
-    (compare s (str ^IRI o))))
-
-(defn iri?
-  [x]
-  (instance? IRI x))
-
-(defn string->iri
-  [s]
-  (->IRI s))
-
-(defn unwrap
-  [x]
-  (if (iri? x)
-    (str x)
-    x))
-
-(defn serialize-iri ^String
-  [iri]
-  (str "\"" iri "\""))
-
-#?(:clj (defmethod print-method IRI [^IRI iri ^java.io.Writer w]
-          (let [iri-str (serialize-iri iri)]
-            (doto w
-              (.write "#fluree/IRI ")
-              (.write iri-str))))
-   :cljs (extend-protocol IPrintWithWriter
-           IRI
-           (-pr-writer [iri writer _]
-             (write-all writer "#fluree/IRI " (serialize-iri iri)))))
-
-#?(:clj (defmethod print-dup IRI
-          [^IRI iri ^java.io.Writer w]
-          (let [iri-string (str iri)]
-            (.write w (str "#=" `(string->iri ~iri-string))))))
-
-(defmethod pprint/simple-dispatch IRI [^IRI iri]
-  (pr iri))
-
-(defn expand
-  [compact-string context]
-  (-> compact-string
-      (json-ld/expand-iri context)
-      string->iri))
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")
@@ -73,15 +25,20 @@
 
 (def ^:const type-iri "@type")
 (def ^:const json-iri "@json")
-
-(def json-iri-keywords
-  {type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-   json-iri "http://www.w3.org/2001/XMLSchema#json"})
+(def ^:const rdf:type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+(def ^:const rdf:JSON-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON")
 
 (defn normalize
   [iri]
-  (or (get json-iri-keywords iri)
-      iri))
+  (cond
+    (= iri type-iri)
+    rdf:type-iri
+
+    (= iri json-iri)
+    rdf:JSON-iri
+
+    :else
+    iri))
 
 (def default-namespaces
   "iri namespace mapping. 0 signifies relative iris. 1-100 are reserved; user
@@ -109,7 +66,7 @@
    "http://www.w3.org/2008/05/skos#"             20
    "urn:uuid"                                    21
    "urn:isbn:"                                   22
-   "urn:issn"                                    23
+   "urn:issn:"                                   23
    "_:"                                          24})
 
 

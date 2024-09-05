@@ -11,8 +11,8 @@
     (is (= nil (coerce 42 const/$xsd:string))))
 
   (testing "@id"
-    (is (= #fluree/IRI "foo" (coerce "foo" const/$id)))
-    (is (= nil (coerce 42 const/$id))))
+    (is (= "foo" (coerce "foo" const/$id)))
+    (is (= 42 (coerce 42 const/$id))))
   (testing "boolean"
     (is (= true (coerce "true" const/$xsd:boolean)))
     (is (= false (coerce "false" const/$xsd:boolean)))
@@ -265,8 +265,10 @@
     (is (= nil (coerce "-42" const/$xsd:unsignedShort)))
     (is (= nil (coerce 3.14 const/$xsd:unsignedShort)))
     (is (= nil (coerce "3.14" const/$xsd:unsignedShort)))
-    (is (= #?(:clj nil :cljs 32768) (coerce 32768 const/$xsd:unsignedShort)))
-    (is (= #?(:clj nil :cljs 32768) (coerce "32768" const/$xsd:unsignedShort))))
+    (is (= 32768 (coerce 32768 const/$xsd:unsignedShort)))
+    (is (= 32768 (coerce "32768" const/$xsd:unsignedShort)))
+    (is (= 65535 (coerce "65535" const/$xsd:unsignedShort)))
+    (is (= nil (coerce "65536" const/$xsd:unsignedShort))))
 
   (testing "byte"
     (is (= 42 (coerce 42 const/$xsd:byte)))
