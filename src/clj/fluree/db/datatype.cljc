@@ -50,7 +50,7 @@
    const/iri-xsd-base64Binary       const/$xsd:base64Binary
    const/iri-anyURI                 const/$xsd:anyURI
    const/iri-lang-string            const/$rdf:langString
-   const/iri-json                   const/$rdf:json
+   const/iri-rdf-json               const/$rdf:json
    const/iri-vector                 const/$fluree:vector})
 
 (def JSON-LD-inferable-types
