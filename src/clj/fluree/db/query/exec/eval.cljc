@@ -203,11 +203,19 @@
 
 (defn lang
   [tv]
-  (where/->typed-val (:lang tv) const/iri-string))
+  (where/->typed-val (or (:lang tv) "") const/iri-string))
+
+(defn str-lang
+  [{lexical-form :value} {langtag :value}]
+  (where/->typed-val (str lexical-form) const/iri-lang-string langtag))
 
 (defn datatype
   [tv]
   (where/->typed-val (:datatype-iri tv) const/iri-id))
+
+(defn str-dt
+  [{lexical-form :value} {datatype-iri :value}]
+  (where/->typed-val lexical-form datatype-iri))
 
 (def context-var
   (symbol "$-CONTEXT"))
@@ -215,6 +223,18 @@
 (defmacro iri
   [tv]
   `(where/->typed-val (json-ld/expand-iri (:value ~tv) ~context-var) const/iri-id))
+
+(defn is-iri
+  [tv]
+  (where/->typed-val (= (:datatype-iri tv) const/iri-id)))
+
+(defn is-literal
+  [tv]
+  (where/->typed-val (not= (:datatype-iri tv) const/iri-id)))
+
+(defn bnode
+  []
+  (where/->typed-val (iri/new-blank-node-id) const/iri-id))
 
 (def numeric-datatypes
   #{const/iri-xsd-decimal
@@ -527,6 +547,7 @@
     as             fluree.db.query.exec.eval/as
     and            fluree.db.query.exec.eval/-and
     avg            fluree.db.query.exec.eval/avg
+    bnode          fluree.db.query.exec.eval/bnode
     bound          fluree.db.query.exec.eval/bound
     ceil           fluree.db.query.exec.eval/ceil
     coalesce       fluree.db.query.exec.eval/coalesce
@@ -540,6 +561,8 @@
     if             fluree.db.query.exec.eval/-if
     in             fluree.db.query.exec.eval/in
     iri            fluree.db.query.exec.eval/iri
+    is-iri         fluree.db.query.exec.eval/is-iri
+    is-literal     fluree.db.query.exec.eval/is-literal
     lang           fluree.db.query.exec.eval/lang
     lcase          fluree.db.query.exec.eval/lcase
     median         fluree.db.query.exec.eval/median
@@ -576,6 +599,8 @@
     sha512         fluree.db.query.exec.eval/sha512
     uuid           fluree.db.query.exec.eval/uuid
     struuid        fluree.db.query.exec.eval/struuid
+    str-dt         fluree.db.query.exec.eval/str-dt
+    str-lang       fluree.db.query.exec.eval/str-lang
     isNumeric      fluree.db.query.exec.eval/isNumeric
     isBlank        fluree.db.query.exec.eval/isBlank
     str            fluree.db.query.exec.eval/sparql-str
@@ -591,7 +616,7 @@
      median max min rand sample sample1 stddev str sum variance})
 
 (def allowed-scalar-fns
-  '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if iri lang
+  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if
      nil? as not not= or re-find re-pattern in
 
      ;; string fns
@@ -608,7 +633,8 @@
      sha256 sha512
 
      ;; rdf term fns
-     uuid struuid isNumeric isBlank str
+     uuid struuid isNumeric isBlank str iri lang datatype is-iri is-literal
+     str-lang str-dt bnode
 
      ;; vector scoring fns
      dotproduct cosine-similarity euclidian-distance})

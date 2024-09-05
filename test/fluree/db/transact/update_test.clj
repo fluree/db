@@ -1,9 +1,11 @@
 (ns fluree.db.transact.update-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.api :as fluree]
             [fluree.db.constants :as const])
   (:import [java.time OffsetDateTime]))
+
+(use-fixtures :each test-utils/deterministic-blank-node-fixture)
 
 (defn const-now
   []
@@ -393,13 +395,14 @@
                                                           {"ex" "http://example.com/"}]
                                               "insert"   [{"id"         "ex:create-predicates"
                                                            "ex:isBlank" 0 "ex:isNumeric"    0 "ex:str"        0 "ex:uuid" 0
-                                                           "ex:struuid" 0 "ex:isNotNumeric" 0 "ex:isNotBlank" 0}
-                                                          ;; "ex:isIRI" 0 "ex:isURI" 0 "ex:isLiteral" 0 "ex:lang" 0
-                                                          ;; "ex:IRI" 0
-                                                          ;; "ex:datatype" 0 "ex:bnode" 0 "ex:strdt" 0 "ex:strLang" 0
-
+                                                           "ex:struuid" 0 "ex:isNotNumeric" 0 "ex:isNotBlank" 0
+                                                           "ex:lang" 0 "ex:datatype" 0 "ex:IRI" 0 "ex:isIRI" 0
+                                                           "ex:isLiteral" 0 "ex:strdt" 0 "ex:strLang" 0
+                                                           "ex:bnode" 0}
                                                           {"id"        "ex:rdf-term-fns"
                                                            "ex:text"   "Abcdefg"
+                                                           "ex:langText" {"@value" "hola"
+                                                                          "@language" "es"}
                                                            "ex:number" 1
                                                            "ex:ref"    {"ex:bool" false}}
                                                           {"ex:foo" "bar"}]})
@@ -408,6 +411,7 @@
                                                      {"ex" "http://example.com/"}]
                                          "where"    [{"id"        "?s"
                                                       "ex:text"   "?text"
+                                                      "ex:langText" "?langtext"
                                                       "ex:number" "?num"
                                                       "ex:ref"    "?r"}
                                                      ["bind"
@@ -418,7 +422,15 @@
                                                       "?isBlank" "(isBlank ?s)"
                                                       "?isNotBlank" "(isBlank ?num)"
                                                       "?isnum" "(isNumeric ?num)"
-                                                      "?isNotNum" "(isNumeric ?text)"]]
+                                                      "?isNotNum" "(isNumeric ?text)"
+                                                      "?lang" "(lang ?langtext)"
+                                                      "?datatype" "(datatype ?langtext)"
+                                                      "?IRI" "(iri (concat \"ex:\" ?text))"
+                                                      "?isIRI" "(is-iri ?IRI)"
+                                                      "?isLiteral" "(is-literal ?num)"
+                                                      "?strdt" "(str-dt ?text \"ex:mystring\")"
+                                                      "?strLang" "(str-lang ?text \"foo\")"
+                                                      "?bnode" "(bnode)"]]
                                          "insert"   [{"id"              "?s"
                                                       "ex:uuid"         "?uuid"
                                                       "ex:struuid"      "?struuid"
@@ -426,7 +438,15 @@
                                                       "ex:isNumeric"    "?isnum"
                                                       "ex:isNotNumeric" "?isNotNum"
                                                       "ex:isBlank"      "?isBlank"
-                                                      "ex:isNotBlank"   "?isNotBlank"}]
+                                                      "ex:isNotBlank"   "?isNotBlank"
+                                                      "ex:lang"         "?lang"
+                                                      "ex:datatype"     "?datatype"
+                                                      "ex:IRI"          "?IRI"
+                                                      "ex:isIRI"        "?isIRI"
+                                                      "ex:isLiteral"    "?isLiteral"
+                                                      "ex:strdt"        "?strdt"
+                                                      "ex:strLang"      "?strLang"
+                                                      "ex:bnode"        "?bnode"}]
                                          "values"   ["?s" [{"@value" "ex:rdf-term-fns" "@type" "@id"}]]}))]
           (is (= {"ex:str"          ["1" "Abcdefg"]
                   "ex:uuid"         {"id" "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"}
@@ -434,11 +454,20 @@
                   "ex:isBlank"      false
                   "ex:isNotBlank"   false
                   "ex:isNumeric"    true
-                  "ex:isNotNumeric" false}
+                  "ex:isNotNumeric" false
+                  "ex:lang"         "es"
+                  "ex:datatype"     {"id" "rdf:langString"}
+                  "ex:IRI"          {"id" "ex:Abcdefg"}
+                  "ex:isIRI"        true
+                  "ex:isLiteral"    true
+                  "ex:strLang"      "Abcdefg"
+                  "ex:strdt"        "Abcdefg"
+                  "ex:bnode"        {"id" "_:fdb-12"}}
                  @(fluree/query @updated {"@context"  [test-utils/default-str-context
                                                        {"ex" "http://example.com/"}]
                                           "selectOne" {"ex:rdf-term-fns" ["ex:isIRI" "ex:isURI" "ex:isLiteral"
-                                                                          "ex:lang" "ex:datatype" "ex:IRI" "ex:bnode" "ex:strdt" "ex:strLang"
+                                                                          "ex:lang" "ex:datatype" "ex:IRI"
+                                                                          "ex:bnode" "ex:strdt" "ex:strLang"
                                                                           "ex:isBlank"
                                                                           "ex:isNotBlank"
                                                                           "ex:isNumeric"
