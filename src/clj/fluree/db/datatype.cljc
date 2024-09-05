@@ -379,7 +379,7 @@
       (if (>= 0 n) nil n)
 
       (const/$xsd:nonNegativeInteger const/$xsd:unsignedInt
-       const/$xsd:unsignedLong const/$xsd:unsignedByte const/$xsd:unsignedShort)
+       const/$xsd:unsignedLong const/$xsd:unsignedByte)
       (if (> 0 n) nil n)
 
       const/$xsd:negativeInteger
@@ -387,6 +387,9 @@
 
       const/$xsd:nonPositiveInteger
       (if (< 0 n) nil n)
+
+      const/$xsd:unsignedShort
+      (when (>= 65535 n 0) n)
 
       ;; else
       n)))
