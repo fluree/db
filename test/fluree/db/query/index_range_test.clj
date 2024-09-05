@@ -59,9 +59,9 @@
                 alice-sid   (fluree/encode-iri db alice-iri)
                 favNums-iri (fluree/expand-iri context :ex/favNums)
                 favNums-pid (fluree/encode-iri db favNums-iri)]
-            (is (= [[alice-sid favNums-pid 9 const/$xsd:long 1 true nil]
-                    [alice-sid favNums-pid 42 const/$xsd:long 1 true nil]
-                    [alice-sid favNums-pid 76 const/$xsd:long 1 true nil]]
+            (is (= [[alice-sid favNums-pid 9 const/$xsd:integer 1 true nil]
+                    [alice-sid favNums-pid 42 const/$xsd:integer 1 true nil]
+                    [alice-sid favNums-pid 76 const/$xsd:integer 1 true nil]]
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid])
                         (mapv flake/Flake->parts)))
                 "Slice should only return Alice's favNums (multi-cardinality)")))
@@ -71,7 +71,7 @@
                 alice-sid   (fluree/encode-iri db alice-iri)
                 favNums-iri (fluree/expand-iri context :ex/favNums)
                 favNums-pid (fluree/encode-iri db favNums-iri)]
-            (is (= [[alice-sid favNums-pid 42 const/$xsd:long 1 true nil]]
+            (is (= [[alice-sid favNums-pid 42 const/$xsd:integer 1 true nil]]
                    (->> @(fluree/slice db :spot [alice-sid favNums-pid 42])
                         (mapv flake/Flake->parts)))
                 "Slice should only return the specified favNum value")))
@@ -81,8 +81,8 @@
                 alice-sid   (fluree/encode-iri db alice-iri)
                 favNums-iri (fluree/expand-iri context :ex/favNums)
                 favNums-pid (fluree/encode-iri db favNums-iri)]
-            (is (= [[alice-sid favNums-pid 42 const/$xsd:long 1 true nil]]
-                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 const/$xsd:long]])
+            (is (= [[alice-sid favNums-pid 42 const/$xsd:integer 1 true nil]]
+                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 const/$xsd:integer]])
                         (mapv flake/Flake->parts)))
                 "Slice should only return the specified favNum value with matching datatype")))
 

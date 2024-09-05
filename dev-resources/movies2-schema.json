@@ -32,12 +32,12 @@
       {
         "sh:path": { "@id": "https://example.com/population" },
         "sh:maxCount": 1,
-        "sh:datatype": { "@id": "xsd:float" }
+        "sh:datatype": { "@id": "xsd:integer" }
       },
       {
         "sh:path": { "@id": "https://example.com/area" },
         "sh:maxCount": 1,
-        "sh:datatype": { "@id": "xsd:float" },
+        "sh:datatype": { "@id": "xsd:integer" },
         "sh:description": "Area size in square miles"
 
       },
@@ -82,19 +82,19 @@
       {
         "sh:path": { "@id": "https://example.com/budget" },
         "sh:maxCount": 1,
-        "sh:datatype": { "@id": "xsd:float" },
+        "sh:datatype": { "@id": "xsd:integer" },
         "sh:description": "Budget in United States dollars ($)"
       },
       {
         "sh:path": { "@id": "https://example.com/revenue" },
         "sh:maxCount": 1,
-        "sh:datatype": { "@id": "xsd:float" },
+        "sh:datatype": { "@id": "xsd:integer" },
         "sh:description": "Revenue in United States dollars ($)"
       },
       {
         "sh:path": { "@id": "https://example.com/runtime" },
         "sh:maxCount": 1,
-        "sh:datatype": { "@id": "xsd:float" },
+        "sh:datatype": { "@id": "xsd:integer" },
         "sh:description": "Length of movie in minutes"
       },
       {

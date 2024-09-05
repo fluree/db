@@ -47,7 +47,7 @@
              (ex-message stage-id-only)))
       (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
              (ex-message stage-empty-txn)))
-      (is (= {:flakes 1, :size 88, :indexed 0}
+      (is (= {:flakes 1, :size 94, :indexed 0}
              (:stats stage-empty-node))
           "empty nodes are allowed as long as there is other data, they are just noops")
       (is (= [[:ex/alice :schema/age 42]]
@@ -260,7 +260,8 @@
             _       (assert (not (util/exception? db1)))
             db2     @(fluree/stage db0 {"@context" ["https://ns.flur.ee"
                                                     test-utils/default-str-context
-                                                    {"ex" "https://example.com/"}]
+                                                    {"ex"        "https://example.com/"
+                                                     "ex:rating" {"@type" "xsd:float"}}]
                                         "insert"   movies})
             _       (assert (not (util/exception? db2)))
             query   {"@context" [test-utils/default-str-context
@@ -531,6 +532,6 @@
            @(fluree/query db2 {"@context"  context
                                "selectOne" {"ex:freddy" ["schema:age"]}}))
         "8 is converted from a long to an int.")
-    (is (= "Value alot cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#integer."
+    (is (= "Subject ex:letti path [\"schema:age\"] violates constraint sh:datatype of shape ex:PropertyShape/age - the following values do not have expected datatype xsd:integer: alot."
            (ex-message db3))
         "datatype constraint is restored after a load")))
