@@ -173,43 +173,43 @@
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
                                          :where   {:id '?s, '?p '?o}})]
-          (is (= [["fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"
+          (is (= [["fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3"
                    :f/address
-                   "fluree:memory://04be3eee73fc4a553f3b481bfb8867e337a8b2d76a2aea347a3b9c10c8582c6f"]
-                  ["fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"
+                   "fluree:memory://29f8788bdf21c7b8f19b15819f5f24bc71f2b2c045c1cb5f6e1233c21ccd798d"]
+                  ["fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3"
                    :f/flakes
                    11]
-                  ["fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"
+                  ["fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3"
                    :f/previous
                    "fluree:db:sha256:beuoec4c6zqxfjglld3evwjdtavsdktncoh6bbxiz677cc4zz3qr"]
-                  ["fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"
+                  ["fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3"
                    :f/size
                    1058]
-                  ["fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"
+                  ["fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3"
                    :f/t
                    1]
-                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                  ["fluree:commit:sha256:bbfbm6d5y4vyje5vgalfo4ho2osldck3ctzcuduq3rueisrvp4grs"
                    "https://www.w3.org/2018/credentials#issuer"
                    "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                  ["fluree:commit:sha256:bbfbm6d5y4vyje5vgalfo4ho2osldck3ctzcuduq3rueisrvp4grs"
                    :f/address
-                   "fluree:memory://4dce4a82096f49ce3f39ba416cb89aefe5e0d9daa50278631b91672b55324595"]
-                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                   "fluree:memory://f27aaf853c6d8c3360b51101c966d30b1072cef6a99d7c6b317db39448f175c8"]
+                  ["fluree:commit:sha256:bbfbm6d5y4vyje5vgalfo4ho2osldck3ctzcuduq3rueisrvp4grs"
                    :f/alias
                    "query/everything"]
-                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                  ["fluree:commit:sha256:bbfbm6d5y4vyje5vgalfo4ho2osldck3ctzcuduq3rueisrvp4grs"
                    :f/branch
                    "main"]
-                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                  ["fluree:commit:sha256:bbfbm6d5y4vyje5vgalfo4ho2osldck3ctzcuduq3rueisrvp4grs"
                    :f/data
-                   "fluree:db:sha256:bb7yu65w6lgl7xpoic663lnws6lxeu36wyubphbyszpye5iirko7z"]
-                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                   "fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3"]
+                  ["fluree:commit:sha256:bbfbm6d5y4vyje5vgalfo4ho2osldck3ctzcuduq3rueisrvp4grs"
                    :f/previous
                    "fluree:commit:sha256:bvvou3uvnd6ffhehsrw23mw4w3fux5jbpacko2ecosb2nzxkfu5v"]
-                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                  ["fluree:commit:sha256:bbfbm6d5y4vyje5vgalfo4ho2osldck3ctzcuduq3rueisrvp4grs"
                    :f/time
                    720000]
-                  ["fluree:commit:sha256:bbfcquyjx3cthdcroffguybklk6p5zua3cifwkhm3p25zt4xfjwjs"
+                  ["fluree:commit:sha256:bbfbm6d5y4vyje5vgalfo4ho2osldck3ctzcuduq3rueisrvp4grs"
                    :f/v
                    1]
                   [:ex/alice :type :ex/User]
