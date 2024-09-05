@@ -97,15 +97,18 @@
   We need to serialize these into strings that will be successfully re-coerced into
   the same objects upon loading."
   [val dt]
-  (uc/case dt
-    const/$id    (iri/serialize-sid val)
-    const/$xsd:dateTime  #?(:clj (.format xsdDateTimeFormatter val)
-                            :cljs (.toJSON val))
-    const/$xsd:date      #?(:clj (.format xsdDateFormatter val)
-                            :cljs (.toJSON val))
-    const/$xsd:time      #?(:clj (.format xsdTimeFormatter val)
-                            :cljs (.toJSON val))
-    val))
+  (if (datatype/inferable? dt)
+    val
+    (uc/case dt
+      const/$id (iri/serialize-sid val)
+      const/$xsd:dateTime #?(:clj  (.format xsdDateTimeFormatter val)
+                             :cljs (.toJSON val))
+      const/$xsd:date #?(:clj  (.format xsdDateFormatter val)
+                         :cljs (.toJSON val))
+      const/$xsd:time #?(:clj  (.format xsdTimeFormatter val)
+                         :cljs (.toJSON val))
+      const/$rdf:json (json/parse val false)
+      (str val))))
 
 (defn serialize-meta
   [m]
