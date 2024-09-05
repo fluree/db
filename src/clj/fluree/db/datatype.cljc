@@ -476,7 +476,14 @@
     (coerce-dense-vector value)
 
     ;; else
-    value))
+    (if (or (string? value)
+            (number? value)
+            (boolean? value))
+      value
+      (throw (ex-info (str "Custom data types must be a string, number or boolean per JSON-LD spec. "
+                           "Attempted custom datatype value of: " value)
+                      {:status 400
+                       :error :db/invalid-datatype})))))
 
 (defn from-expanded
   "Returns a tuple of the value (possibly coerced from string) and the data type sid from
