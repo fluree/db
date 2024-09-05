@@ -19,6 +19,16 @@
           (is (= [["Alice" 3] ["Brian" 1] ["Cam" 2] ["Liam" 2]]
                  subject)
               "aggregates bindings within each group")))
+      (testing "with singular function selector"
+        (let [qry     {:context  [test-utils/default-context
+                                  {:ex "http://example.org/ns/"}]
+                       :select   '(count ?favNums)
+                       :where    '{:schema/name ?name
+                                   :ex/favNums  ?favNums}
+                       :group-by '?name}
+              subject @(fluree/query db qry)]
+          (is (= [3 1 2 2] subject)
+              "aggregates bindings within each group")))
       (testing "with implicit grouping"
         (let [qry     {:context test-utils/default-context
                        :select  '[(count ?name)]
