@@ -265,8 +265,10 @@
     (is (= nil (coerce "-42" const/$xsd:unsignedShort)))
     (is (= nil (coerce 3.14 const/$xsd:unsignedShort)))
     (is (= nil (coerce "3.14" const/$xsd:unsignedShort)))
-    (is (= #?(:clj nil :cljs 32768) (coerce 32768 const/$xsd:unsignedShort)))
-    (is (= #?(:clj nil :cljs 32768) (coerce "32768" const/$xsd:unsignedShort))))
+    (is (= 32768 (coerce 32768 const/$xsd:unsignedShort)))
+    (is (= 32768 (coerce "32768" const/$xsd:unsignedShort)))
+    (is (= 65535 (coerce "65535" const/$xsd:unsignedShort)))
+    (is (= nil (coerce "65536" const/$xsd:unsignedShort))))
 
   (testing "byte"
     (is (= 42 (coerce 42 const/$xsd:byte)))

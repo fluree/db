@@ -25,15 +25,20 @@
 
 (def ^:const type-iri "@type")
 (def ^:const json-iri "@json")
-
-(def json-iri-keywords
-  {type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-   json-iri "http://www.w3.org/2001/XMLSchema#json"})
+(def ^:const rdf:type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+(def ^:const rdf:JSON-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON")
 
 (defn normalize
   [iri]
-  (or (get json-iri-keywords iri)
-      iri))
+  (cond
+    (= iri type-iri)
+    rdf:type-iri
+
+    (= iri json-iri)
+    rdf:JSON-iri
+
+    :else
+    iri))
 
 (def default-namespaces
   "iri namespace mapping. 0 signifies relative iris. 1-100 are reserved; user
@@ -61,7 +66,7 @@
    "http://www.w3.org/2008/05/skos#"             20
    "urn:uuid"                                    21
    "urn:isbn:"                                   22
-   "urn:issn"                                    23
+   "urn:issn:"                                   23
    "_:"                                          24})
 
 

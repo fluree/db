@@ -26,7 +26,7 @@
   [match _]
   (where/get-value match))
 
-(defmethod display const/iri-json
+(defmethod display const/iri-rdf-json
   [match _compact]
   (-> match where/get-value (json/parse false)))
 
