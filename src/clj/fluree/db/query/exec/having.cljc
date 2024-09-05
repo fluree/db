@@ -11,7 +11,7 @@
       (async/pipeline-async 2
                             filtered-ch
                             (fn [solution ch]
-                              (go (try* (when (filter-fn solution)
+                              (go (try* (when (:value (filter-fn solution))
                                           (>! ch solution))
                                         (async/close! ch)
                                         (catch* e

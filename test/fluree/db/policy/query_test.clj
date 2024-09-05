@@ -165,7 +165,7 @@
         (is (= [{"@id"                  "ex:widget",
                  "@type"                "ex:Product",
                  "schema:name"          "Widget"
-                 "schema:price"         99.99M
+                 "schema:price"         99.99
                  "schema:priceCurrency" "USD"
                  "ex:internalId"        "widget-1234"
                  "ex:priorYearSales"    10000000

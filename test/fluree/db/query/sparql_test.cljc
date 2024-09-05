@@ -927,6 +927,7 @@
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"
                  results @(fluree/query db query {:format :sparql})]
+             (is (= 3 (count results)))
              (is (every? #(-> % first integer?) results))))
          (testing "SUM query works"
            (let [query   "PREFIX person: <http://example.org/Person#>

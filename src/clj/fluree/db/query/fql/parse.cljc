@@ -428,8 +428,8 @@
   [[_ & codes] _vars context]
   (let [f (->> codes
                (map parse-code)
-               (map (fn [code]
-                      (eval/compile code context)))
+               (map (fn [code] (comp (fn [tv] (:value tv))
+                                     (eval/compile code context))))
                (apply every-pred))]
     [(where/->pattern :filter (with-meta f {:fns codes}))]))
 
@@ -563,9 +563,18 @@
 
 (defn parse-select-clause
   [clause context depth]
-  (if (sequential? clause)
+  (cond
+    ;; singular function call
+    (list? clause)
+    (parse-selector context depth clause)
+
+    ;; collection of selectors
+    (sequential? clause)
     (mapv (partial parse-selector context depth)
           clause)
+
+    ;; singular selector
+    :else
     (parse-selector context depth clause)))
 
 (defn parse-select
