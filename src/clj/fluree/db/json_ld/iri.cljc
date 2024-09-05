@@ -24,12 +24,20 @@
 (def ^:const f-s3-ns "fluree:s3://")
 
 (def ^:const type-iri "@type")
+(def ^:const json-iri "@json")
 (def ^:const rdf:type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+(def ^:const rdf:JSON-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON")
 
 (defn normalize
   [iri]
-  (if (= iri type-iri)
+  (cond
+    (= iri type-iri)
     rdf:type-iri
+
+    (= iri json-iri)
+    rdf:JSON-iri
+
+    :else
     iri))
 
 (def default-namespaces

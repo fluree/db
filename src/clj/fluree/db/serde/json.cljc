@@ -108,7 +108,6 @@
                          :cljs (.toJSON val))
       const/$xsd:time #?(:clj  (.format xsdTimeFormatter val)
                          :cljs (.toJSON val))
-      const/$rdf:json (json/parse val false)
       (str val))))
 
 (defn serialize-meta

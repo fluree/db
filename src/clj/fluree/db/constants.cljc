@@ -71,7 +71,6 @@
 (def ^:const iri-value "@value")
 (def ^:const iri-language "@language")
 (def ^:const iri-type "@type")
-(def ^:const iri-json "@json")
 (def ^:const iri-filter "@filter")
 (def ^:const iri-t "@t")
 (def ^:const iri-anyURI "http://www.w3.org/2001/XMLSchema#anyURI")
@@ -79,6 +78,7 @@
 (def ^:const iri-rdf-first "http://www.w3.org/1999/02/22-rdf-syntax-ns#first")
 (def ^:const iri-rdf-rest "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest")
 (def ^:const iri-rdf-nil "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil")
+(def ^:const iri-rdf-json "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON")
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
 (def ^:const iri-lang-string "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
 
@@ -327,7 +327,7 @@
 (def ^:const $xsd:unsignedByte (iri/iri->sid iri-xsd-unsignedByte)) ; store as number
 (def ^:const $xsd:hexBinary (iri/iri->sid iri-xsd-hexBinary))
 (def ^:const $xsd:base64Binary (iri/iri->sid iri-xsd-base64Binary))
-(def ^:const $rdf:json (iri/iri->sid iri-json))
+(def ^:const $rdf:json (iri/iri->sid iri-rdf-json))
 (def ^:const $fluree:vector (iri/iri->sid iri-vector)) ;; dense vector/embedding
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
