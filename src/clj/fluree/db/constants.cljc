@@ -71,6 +71,7 @@
 (def ^:const iri-value "@value")
 (def ^:const iri-language "@language")
 (def ^:const iri-type "@type")
+(def ^:const iri-json "@json")
 (def ^:const iri-filter "@filter")
 (def ^:const iri-t "@t")
 (def ^:const iri-anyURI "http://www.w3.org/2001/XMLSchema#anyURI")
@@ -117,7 +118,6 @@
 (def ^:const iri-xsd-unsignedByte "http://www.w3.org/2001/XMLSchema#unsignedByte")
 (def ^:const iri-xsd-hexBinary "http://www.w3.org/2001/XMLSchema#hexBinary")
 (def ^:const iri-xsd-base64Binary "http://www.w3.org/2001/XMLSchema#base64Binary")
-(def ^:const iri-json "http://www.w3.org/2001/XMLSchema#json")
 
 ;; rdfs
 (def ^:const iri-rdfs:Class "http://www.w3.org/2000/01/rdf-schema#Class")
