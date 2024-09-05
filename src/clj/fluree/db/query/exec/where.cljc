@@ -48,7 +48,7 @@
   (if (or (contains? mch ::iri)
           (contains? mch ::sids))
     const/iri-id
-    (-> mch ::datatype-iri iri/unwrap)))
+    (::datatype-iri mch)))
 
 (defn match-sid
   [iri-mch db-alias sid]
@@ -224,7 +224,7 @@
   [type context]
   (fn [soln mch]
     (if (variable? type)
-      (if-let [dt-iri (some-> soln (get type) get-iri iri/unwrap)]
+      (if-let [dt-iri (some-> soln (get type) get-iri)]
         (matched-datatype? mch dt-iri)
         true)
       (let [dt-iri (json-ld/expand-iri type context)]
@@ -553,14 +553,23 @@
     (log/warn (ex-message e*))
     e*))
 
+;; this is the arg and return type of all built-in functions
+(defrecord TypedValue [value datatype-iri lang])
+
+(defn ->typed-val
+  ([value] (->TypedValue value (datatype/infer-iri value) nil))
+  ([value dt-iri] (->TypedValue value dt-iri nil))
+  ([value dt-iri lang] (->TypedValue value dt-iri lang)))
+
 (defmethod match-pattern :filter
   [_ds _fuel-tracker solution pattern error-ch]
   (go
     (let [f (pattern-data pattern)]
       (try*
-       (when (f solution)
-         solution)
-       (catch* e (>! error-ch (filter-exception e solution f)))))))
+        (let [result (f solution)]
+          (when result
+            solution))
+        (catch* e (>! error-ch (filter-exception e solution f)))))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
@@ -717,13 +726,13 @@
 
 (defn bind-function-result
   [solution var-name result]
-  (let [dt  (datatype/infer-iri result)
+  (let [{v :value dt :datatype-iri} result
         mch (if (= dt const/iri-id)
-              (-> var-name unmatched-var (match-iri result))
-              (-> var-name unmatched-var (match-value result dt)))]
+              (-> var-name unmatched-var (match-iri v))
+              (-> var-name unmatched-var (match-value v dt)))]
     (if-let [current (get solution var-name)]
-      (when (and (= (-> mch get-binding iri/unwrap) (get-binding current))
-                 (= (-> mch get-datatype-iri iri/unwrap) (get-datatype-iri current))
+      (when (and (= (get-binding mch) (get-binding current))
+                 (= (get-datatype-iri mch) (get-datatype-iri current))
                  (= (get-lang mch) (get-lang current)))
         solution)
       (assoc solution var-name mch))))
