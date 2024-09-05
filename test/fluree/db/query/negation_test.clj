@@ -116,7 +116,7 @@
                                                      "ex:p" 3.0
                                                      "ex:q" [4.0 5.0]}]})]
               (testing "where the filter is inside a not-exists pattern"
-                (is (= [["ex:b" 3.0M]]
+                (is (= [["ex:b" 3.0]]
                        @(fluree/query db1 {"where" [{"@id" "?x" "ex:p" "?p"}
                                                     ["not-exists" [{"@id" "?x" "ex:q" "?q"}
                                                                    ["filter" "(= ?p ?q)"]]]]
@@ -124,7 +124,7 @@
                     "existing bindings are available for filtering"))
               (testing "where the filter is inside a minus pattern and one result is filtered out"
                 (is (= [["ex:a" 1]
-                        ["ex:b" 3.0M]]
+                        ["ex:b" 3.0]]
                        @(fluree/query db1 {"where" [{"@id" "?x" "ex:p" "?p"}
                                                     ["minus" [{"@id" "?x" "ex:q" "?q"}
                                                               ["filter" "(= ?p ?q)"]]]]
