@@ -127,7 +127,7 @@
   ([{:keys [store] :as conn} ledger-alias indexing-opts force changes-ch]
    (go-try
      (let [ledger-address       (<? (connection/primary-address conn ledger-alias nil))
-           last-commit-addr     (<? (connectiony/lookup-commit conn ledger-address))
+           last-commit-addr     (<? (connection/lookup-commit conn ledger-address))
            last-verified-commit (<? (commit-storage/read-commit-jsonld store last-commit-addr))
            last-commit          (first last-verified-commit)
            version              (get-first-value last-commit const/iri-v)]
