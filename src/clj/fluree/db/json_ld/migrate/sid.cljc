@@ -136,30 +136,40 @@
            last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
            last-commit       (first last-commit-tuple)
            version           (get-first-value last-commit const/iri-v)]
-       (if (and (= version commit-data/commit-version) (not force))
-         (log/info :migrate/sid "ledger" ledger-alias "already migrated. Version:" version)
-         (let [last-data-stats (-> last-commit
-                                   (get-first const/iri-data)
-                                   (update-keys {const/iri-t :t const/iri-size :size const/iri-flakes :flakes})
-                                   (select-keys [:t :size :flakes])
-                                   (update-vals (comp :value first)))
-               all-commit-tuples (<? (reify/trace-commits conn last-commit-tuple 1))
-               first-commit (ffirst all-commit-tuples)
-               branch (or (keyword (get-first-value first-commit const/iri-branch))
-                          :main)
-               ledger (<? (jld-ledger/create* conn ledger-alias
-                                              {:did nil
-                                               :branch branch
-                                               :indexing indexing-opts
-                                               ::time (get-first-value first-commit const/iri-time)}))
-               tuples-chans (map (fn [commit-tuple]
-                                   [commit-tuple (when changes-ch (async/chan))])
-                                 all-commit-tuples)
-               _ (log/info :migrate/sid "ledger" ledger-alias "before stats:" last-data-stats)
-               indexed-db (<? (migrate-commits ledger branch tuples-chans))]
-           (log/info :migrate/sid "ledger" ledger-alias "after stats:" (:stats indexed-db))
-           (when changes-ch
-             (-> (map second tuples-chans)
-                 async/merge
-                 (async/pipe changes-ch)))
-           ledger))))))
+       (cond (nil? ledger-address)
+             (do
+               (log/warn :migrate/sid "ledger" ledger-alias "not found. Abandoning migration.")
+               (throw (ex-info (str "ledger" ledger-alias "not found. Abandoning migration.")
+                               {:ledger-alias ledger-alias
+                                :force force
+                                :indexing-opts indexing-opts})))
+
+             (and (= version commit-data/commit-version) (not force))
+             (log/info :migrate/sid "ledger" ledger-alias "already migrated. Version:" version)
+
+             :else
+             (let [last-data-stats (-> last-commit
+                                       (get-first const/iri-data)
+                                       (update-keys {const/iri-t :t const/iri-size :size const/iri-flakes :flakes})
+                                       (select-keys [:t :size :flakes])
+                                       (update-vals (comp :value first)))
+                   all-commit-tuples (<? (reify/trace-commits conn last-commit-tuple 1))
+                   first-commit (ffirst all-commit-tuples)
+                   branch (or (keyword (get-first-value first-commit const/iri-branch))
+                              :main)
+                   ledger (<? (jld-ledger/create* conn ledger-alias
+                                                  {:did nil
+                                                   :branch branch
+                                                   :indexing indexing-opts
+                                                   ::time (get-first-value first-commit const/iri-time)}))
+                   tuples-chans (map (fn [commit-tuple]
+                                       [commit-tuple (when changes-ch (async/chan))])
+                                     all-commit-tuples)
+                   _ (log/info :migrate/sid "ledger" ledger-alias "before stats:" last-data-stats)
+                   indexed-db (<? (migrate-commits ledger branch tuples-chans))]
+               (log/info :migrate/sid "ledger" ledger-alias "after stats:" (:stats indexed-db))
+               (when changes-ch
+                 (-> (map second tuples-chans)
+                     async/merge
+                     (async/pipe changes-ch)))
+               ledger))))))
