@@ -475,7 +475,7 @@
         to-type (if required-type required-type type-id)
         value* (coerce value to-type)]
     (if (nil? value*)
-      (throw (ex-info (str "Data type " to-type
+      (throw (ex-info (str "Data type " (iri/sid->iri to-type)
                            " cannot be coerced from provided value: " value ".")
                       {:status 400 :error, :db/shacl-value-coercion}))
       [value* to-type])))
