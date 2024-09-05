@@ -12,54 +12,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defrecord IRI [^String s]
-  Object
-  (toString [_] s)
-  Comparable
-  (compareTo [_ o]
-    (compare s (str ^IRI o))))
-
-(defn iri?
-  [x]
-  (instance? IRI x))
-
-(defn string->iri
-  [s]
-  (->IRI s))
-
-(defn unwrap
-  [x]
-  (if (iri? x)
-    (str x)
-    x))
-
-(defn serialize-iri ^String
-  [iri]
-  (str "\"" iri "\""))
-
-#?(:clj (defmethod print-method IRI [^IRI iri ^java.io.Writer w]
-          (let [iri-str (serialize-iri iri)]
-            (doto w
-              (.write "#fluree/IRI ")
-              (.write iri-str))))
-   :cljs (extend-protocol IPrintWithWriter
-           IRI
-           (-pr-writer [iri writer _]
-             (write-all writer "#fluree/IRI " (serialize-iri iri)))))
-
-#?(:clj (defmethod print-dup IRI
-          [^IRI iri ^java.io.Writer w]
-          (let [iri-string (str iri)]
-            (.write w (str "#=" `(string->iri ~iri-string))))))
-
-(defmethod pprint/simple-dispatch IRI [^IRI iri]
-  (pr iri))
-
-(defn expand
-  [compact-string context]
-  (-> compact-string
-      (json-ld/expand-iri context)
-      string->iri))
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")

@@ -32,7 +32,7 @@
 
 (defmethod display const/iri-id
   [match compact]
-  (some-> match where/get-iri iri/unwrap compact))
+  (some-> match where/get-iri compact))
 
 (defmethod display const/iri-vector
   [match _compact]
@@ -101,7 +101,7 @@
   ValueSelector
   (format-value
     [_ _ _ _ _ _ error-ch solution]
-    (go (try* (agg-fn solution)
+    (go (try* (:value (agg-fn solution))
               (catch* e
                       (log/error e "Error applying aggregate selector")
                       (>! error-ch e))))))
@@ -119,7 +119,7 @@
   (update-solution
     [_ solution]
     (log/trace "AsSelector update-solution solution:" solution)
-    (let [result (as-fn solution)
+    (let [result (:value (as-fn solution))
           dt     (datatype/infer-iri result)]
       (log/trace "AsSelector update-solution result:" result)
       (assoc solution bind-var (-> bind-var

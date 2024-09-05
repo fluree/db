@@ -10,11 +10,11 @@
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
-            [clojure.math]
             [fluree.db.datatype :as datatype]
             [fluree.crypto :as crypto]
-            [fluree.db.constants :as const])
-  #?(:clj (:import (java.time Instant OffsetDateTime LocalDateTime))))
+            [fluree.db.constants :as const]
+            [clojure.math :as math])
+  #?(:clj (:import (java.time LocalDateTime OffsetDateTime ZoneId ZoneOffset))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -25,71 +25,84 @@
 
 (defn sum
   [coll]
-  (reduce + coll))
+  (where/->typed-val (reduce + (mapv :value coll))))
 
 (defn avg
   [coll]
-  (let [res (/ (sum coll)
+  (let [coll (mapv :value coll)
+        res (/ (reduce + coll)
                (count coll))]
-    (if (ratio? res)
-      (double res)
-      res)))
+    (where/->typed-val
+      (if (ratio? res)
+        (double res)
+        res))))
 
 (defn median
   [coll]
-  (let [terms (sort coll)
+  (let [terms (sort (mapv :value coll))
         size  (count coll)
         med   (bit-shift-right size 1)
         res   (cond-> (nth terms med)
-                      (even? size)
-                      (-> (+ (nth terms (dec med)))
-                          (/ 2)))]
-    (if (ratio? res)
-      (double res)
-      res)))
+                (even? size)
+                (-> (+ (nth terms (dec med)))
+                    (/ 2)))]
+    (where/->typed-val
+      (if (ratio? res)
+        (double res)
+        res))))
 
 (defn variance
   [coll]
-  (let [mean (avg coll)
+  (let [mean (avg (mapv :value coll))
         sum  (sum (for [x coll
                         :let [delta (- x mean)]]
                     (* delta delta)))
         res  (/ sum (count coll))]
-    (if (ratio? res)
-      (double res)
-      res)))
+    (where/->typed-val
+      (if (ratio? res)
+        (double res)
+        res))))
 
 (defn stddev
   [coll]
-  (Math/sqrt (variance coll)))
+  (where/->typed-val
+    (Math/sqrt (:value (variance coll)))))
 
 (defn max
   [coll]
-  (apply clojure.core/max coll))
+  (where/->typed-val
+    (apply clojure.core/max (mapv :value coll))))
 
 (defn min
   [coll]
-  (apply clojure.core/min coll))
+  (where/->typed-val
+    (apply clojure.core/min (mapv :value coll))))
 
 (defn ceil
-  [n]
-  (cond (= n (int n)) n
-        (> n 0) (-> n int inc)
-        (< n 0) (-> n int)))
+  [{n :value}]
+  (where/->typed-val (cond (= n (int n)) n
+                           (> n 0) (-> n int inc)
+                           (< n 0) (-> n int))))
 
-(def count-distinct
-  (comp count distinct))
+(defn count-distinct
+  [coll]
+  (where/->typed-val
+    (count (distinct coll))))
+
+(defn -count
+  [coll]
+  (where/->typed-val (count coll)))
 
 (defn floor
-  [n]
-  (cond (= n (int n)) n
-        (> n 0) (-> n int)
-        (< n 0) (-> n int dec)))
+  [{n :value}]
+  (where/->typed-val (cond (= n (int n)) n
+                           (> n 0) (-> n int)
+                           (< n 0) (-> n int dec))))
 
 (def groupconcat clojure.core/concat)
 
 (defn sample
-  [n coll]
+  [{n :value} coll]
   (->> coll
        shuffle
        (take n)
@@ -97,120 +110,111 @@
 
 (defn sample1
   [coll]
-  (->> coll (sample 1) first))
-
-(def allowed-aggregate-fns
-  '#{avg ceil count count-distinct distinct floor groupconcat
-     median max min rand sample sample1 stddev str sum variance})
+  (->> coll (sample (where/->typed-val 1)) first))
 
 (defmacro coalesce
   "Evaluates args in order. The result of the first arg not to return error gets returned."
   ([] (throw (ex-info "COALESCE evaluation failed on all forms." {:status 400 :error :db/invalid-query})))
   ([arg] `(let [res# (try ~arg (catch Exception e# nil))]
-            (if (nil? res#)
-              (throw (ex-info "Coalesce evaluation failed on all forms." {:status 400 :error :db/invalid-query})) res#)))
+            (if (nil? (:value res#))
+              (throw (ex-info "Coalesce evaluation failed on all forms." {:status 400 :error :db/invalid-query}))
+              res#)))
   ([arg & args]
    `(let [res# (try ~arg (catch Exception e# nil))]
-      (if (nil? res#)
-        (coalesce ~@args) res#))))
+      (if (nil? (:value res#))
+        (coalesce ~@args)
+        res#))))
 
-(def bound some?)
+(defn bound
+  [{x :value}]
+  (where/->typed-val (some? x)))
 
-(def ! not)
+(defn -not
+  [{x :value}]
+  (where/->typed-val (not x)))
 
-(defmacro &&
+(defmacro -and
   "Equivalent to and"
-  ([] true)
+  ([] (where/->typed-val true))
   ([x] x)
   ([x & next]
-   `(let [and# ~x]
-      (if and# (and ~@next) and#))))
+   `(let [and# (:value ~x)]
+      (where/->typed-val (if and# (and (:value ~@next)) and#)))))
 
-(defmacro ||
+(defmacro -or
   "Equivalent to or"
-  ([] nil)
+  ([] (where/->typed-val nil))
   ([x] x)
   ([x & next]
-   `(let [or# ~x]
-      (if or# or# (or ~@next)))))
-
-(defn now
-  []
-  #?(:clj  (Instant/now)
-     :cljs (js/Date.)))
+   `(let [or# (:value ~x)]
+      (where/->typed-val (if or# or# (or (:value ~@next)))))))
 
 (defn strStarts
-  [s substr]
-  (str/starts-with? s substr))
+  [{s :value} {substr :value}]
+  (where/->typed-val (str/starts-with? s substr)))
 
 (defn strEnds
-  [s substr]
-  (str/ends-with? s substr))
+  [{s :value} {substr :value}]
+  (where/->typed-val (str/ends-with? s substr)))
 
 (defn subStr
   ;; The index of the first character in a string is 1.
-  ([s start]
-   (subs s (dec start)))
-  ([s start length]
+  ([{s :value} {start :value}]
+   (where/->typed-val (subs s (dec start))))
+  ([{s :value} {start :value} {length :value}]
    (let [start (dec start)]
-     (subs s start (clojure.core/min (+ start length) (count s))))))
+     (where/->typed-val (subs s start (clojure.core/min (+ start length) (count s)))))))
 
 (defn strLen
-  [s]
-  (count s))
+  [{s :value}]
+  (where/->typed-val (count s)))
 
 (defn ucase
-  [s]
-  (str/upper-case s))
+  [{s :value}]
+  (where/->typed-val (str/upper-case s)))
 
 (defn lcase
-  [s]
-  (str/lower-case s))
+  [{s :value}]
+  (where/->typed-val (str/lower-case s)))
 
 (defn contains
-  [s substr]
-  (str/includes? s substr))
+  [{s :value} {substr :value}]
+  (where/->typed-val (str/includes? s substr)))
 
 (defn strBefore
-  [s substr]
+  [{s :value} {substr :value}]
   (let [[before :as split] (str/split s (re-pattern substr))]
-    (if (> (count split) 1)
-      before
-      "")))
+    (where/->typed-val
+      (if (> (count split) 1)
+        before
+        ""))))
 
 (defn strAfter
-  [s substr]
+  [{s :value} {substr :value}]
   (let [split (str/split s (re-pattern substr))]
-    (if (> (count split) 1)
-      (last split)
-      "")))
+    (where/->typed-val
+      (if (> (count split) 1)
+        (last split)
+        ""))))
 
 (defn concat
   [& strs]
-  (apply str strs))
+  (where/->typed-val (apply str (mapv :value strs))))
 
-(defn var->lang-var
-  [var]
-  (when (where/variable? var)
-    (-> var
-        (str "$-LANG")
-        symbol)))
+(defn lang
+  [tv]
+  (where/->typed-val (:lang tv) const/iri-string))
 
-(defn var->dt-var
-  [var]
-  (when (where/variable? var)
-    (-> var
-        (str "$-DATATYPE")
-        symbol)))
+(defn datatype
+  [tv]
+  (where/->typed-val (:datatype-iri tv) const/iri-id))
 
-(defmacro lang
-  [var]
-  (var->lang-var var))
+(def context-var
+  (symbol "$-CONTEXT"))
 
-(defmacro datatype
-  [var]
-  (let [dt-var (var->dt-var var)]
-    `(iri/string->iri ~dt-var)))
+(defmacro iri
+  [tv]
+  `(where/->typed-val (json-ld/expand-iri (:value ~tv) ~context-var) const/iri-id))
 
 (def numeric-datatypes
   #{const/iri-xsd-decimal
@@ -246,21 +250,14 @@
       const/iri-xsd-date
       const/iri-xsd-time}))
 
-(def dt-sid->iri
-  {const/$xsd:string  const/iri-string
-   const/$xsd:long    const/iri-long
-   const/$xsd:decimal const/iri-xsd-decimal
-   const/$xsd:boolean const/iri-xsd-boolean
-   const/$id          const/iri-id})
-
-(defn infer-dt-iri
-  [x]
-  (get dt-sid->iri (datatype/infer x)))
+(defmulti to-odt type)
+(defmethod to-odt OffsetDateTime [^OffsetDateTime datetime] datetime)
+(defmethod to-odt LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC)))
 
 (defn compare*
   [val-a dt-a val-b dt-b]
-  (let [dt-a (or dt-a (infer-dt-iri val-a))
-        dt-b (or dt-b (infer-dt-iri val-b))]
+  (let [dt-a (or dt-a (datatype/infer-iri val-a))
+        dt-b (or dt-b (datatype/infer-iri val-b))]
     (cond
       ;; can compare across types
       (or (and (contains? numeric-datatypes dt-a)
@@ -268,6 +265,10 @@
           (and (contains? string-datatypes dt-a)
                (contains? string-datatypes dt-b)))
       (compare val-a val-b)
+
+      ;; datetimes need to be converted to OffsetDateTimes for proper comparison
+      (= dt-a dt-b const/iri-xsd-dateTime)
+      (compare (to-odt val-a) (to-odt val-b))
 
       ;; can compare with same type
       (and (= dt-a dt-b)
@@ -281,162 +282,250 @@
                        :status 400
                        :error  :db/invalid-query})))))
 
-(defmacro less-than
-  [var-a var-b]
-  (let [dt-a (var->dt-var var-a)
-        dt-b (var->dt-var var-b)]
-    `(neg? (compare* ~var-a ~dt-a ~var-b ~dt-b))))
+(defn less-than
+  [{a :value a-dt :datatype-iri}
+   {b :value b-dt :datatype-iri}]
+  (where/->typed-val (neg? (compare* a a-dt b b-dt))))
 
-(defmacro less-than-or-equal
-  [var-a var-b]
-  (let [dt-a (var->dt-var var-a)
-        dt-b (var->dt-var var-b)]
-    `(or (= ~var-a ~var-b)
-         (neg? (compare* ~var-a ~dt-a ~var-b ~dt-b)))))
+(defn less-than-or-equal
+  [{a :value a-dt :datatype-iri}
+   {b :value b-dt :datatype-iri}]
+  (where/->typed-val
+    (or (= a b)
+        (neg? (compare* a a-dt b b-dt)))))
 
-(defmacro greater-than
-  [var-a var-b]
-  (let [dt-a (var->dt-var var-a)
-        dt-b (var->dt-var var-b)]
-    `(pos? (compare* ~var-a ~dt-a ~var-b ~dt-b))))
+(defn greater-than
+  [{a :value a-dt :datatype-iri}
+   {b :value b-dt :datatype-iri}]
+  (where/->typed-val (pos? (compare* a a-dt b b-dt))))
 
-(defmacro greater-than-or-equal
-  [var-a var-b]
-  (let [dt-a (var->dt-var var-a)
-        dt-b (var->dt-var var-b)]
-    `(or (= ~var-a ~var-b)
-         (pos? (compare* ~var-a ~dt-a ~var-b ~dt-b)))))
+(defn greater-than-or-equal
+  [{a :value a-dt :datatype-iri}
+   {b :value b-dt :datatype-iri}]
+  (where/->typed-val
+    (or (= a b)
+        (pos? (compare* a a-dt b b-dt)))))
 
 (defn regex
-  [text pattern]
-  (boolean (re-find (re-pattern pattern) text)))
+  [{text :value} {pattern :value}]
+  (where/->typed-val (boolean (re-find (re-pattern pattern) text))))
 
 (defn replace
-  [s pattern replacement]
-  (str/replace s (re-pattern pattern) replacement))
+  [{s :value} {pattern :value} {replacement :value}]
+  (where/->typed-val (str/replace s (re-pattern pattern) replacement)))
 
 (defn rand
   []
-  (clojure.core/rand))
+  (where/->typed-val (clojure.core/rand)))
+
+(defn now
+  []
+  (where/->typed-val
+    #?(:clj (OffsetDateTime/now (ZoneId/of "UTC"))
+       :cljs (js/Date.))
+    const/iri-xsd-dateTime))
 
 (defn year
-  [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj  (.getYear ^LocalDateTime datetime)
+  [{datetime :value}]
+  (where/->typed-val
+    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
+                         (.toLocalDateTime ^OffsetDateTime datetime)
+                         datetime)]
+               (.getYear ^LocalDateTime ldt))
        :cljs (.getFullYear datetime))))
 
 (defn month
-  [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj  (.getMonthValue ^LocalDateTime datetime)
+  [{datetime :value}]
+  (where/->typed-val
+    #?(:clj (let [ldt (if (instance? OffsetDateTime datetime)
+                        (.toLocalDateTime ^OffsetDateTime datetime)
+                        datetime)]
+              (.getMonthValue ^LocalDateTime ldt))
        :cljs (.getMonth datetime))))
 
 (defn day
-  [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj  (.getDayOfMonth ^LocalDateTime datetime)
+  [{datetime :value}]
+  (where/->typed-val
+    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
+                         (.toLocalDateTime ^OffsetDateTime datetime)
+                         datetime)]
+               (.getDayOfMonth ^LocalDateTime ldt))
        :cljs (.getDate datetime))))
 
 (defn hours
-  [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj  (.getHour ^LocalDateTime datetime)
+  [{datetime :value}]
+  (where/->typed-val
+    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
+                         (.toLocalDateTime ^OffsetDateTime datetime)
+                         datetime)]
+               (.getHour ^LocalDateTime ldt))
        :cljs (.getHours datetime))))
 
 (defn minutes
-  [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj  (.getMinute ^LocalDateTime datetime)
+  [{datetime :value}]
+  (where/->typed-val
+    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
+                         (.toLocalDateTime ^OffsetDateTime datetime)
+                         datetime)]
+               (.getMinute ^LocalDateTime ldt))
        :cljs (.getMinutes datetime))))
 
 (defn seconds
-  [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj  (.getSecond ^LocalDateTime datetime)
+  [{datetime :value}]
+  (where/->typed-val
+    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
+                         (.toLocalDateTime ^OffsetDateTime datetime)
+                         datetime)]
+               (.getSecond ^LocalDateTime ldt))
        :cljs (.getSeconds datetime))))
 
 (defn tz
-  [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj  (.toString (.getOffset ^OffsetDateTime datetime))
+  [{datetime :value}]
+  (where/->typed-val
+    #?(:clj  (when (instance? OffsetDateTime datetime)
+               (.toString (.getOffset ^OffsetDateTime datetime)))
        :cljs (.getTimeZoneOffset ^js/Date datetime))))
 
 (defn sha256
-  [x]
-  (crypto/sha2-256 x))
+  [{x :value}]
+  (where/->typed-val (crypto/sha2-256 x)))
 
 (defn sha512
-  [x]
-  (crypto/sha2-512 x))
+  [{x :value}]
+  (where/->typed-val (crypto/sha2-512 x)))
 
 (defn uuid
   []
-  (str "urn:uuid:" (random-uuid)))
+  (where/->typed-val (str "urn:uuid:" (random-uuid)) const/iri-id))
 
 (defn struuid
   []
-  (str (random-uuid)))
+  (where/->typed-val (str (random-uuid))))
 
 (defn isNumeric
-  [x]
-  (number? x))
+  [{x :value}]
+  (where/->typed-val (number? x)))
 
 (defn isBlank
-  [x]
-  (and (string? x)
-       (str/starts-with? x "_:")))
+  [{x :value}]
+  (where/->typed-val
+    (and (string? x)
+         (str/starts-with? x "_:"))))
 
 (defn sparql-str
-  [x]
-  (str x))
+  [{x :value}]
+  (where/->typed-val (str x)))
 
 (defn in
-  [term expressions]
-  (contains? (set expressions) term))
+  [{term :value} expressions]
+  (where/->typed-val (contains? (set (mapv :value expressions)) term)))
 
-(def context-var
-  (symbol "$-CONTEXT"))
+(defn as*
+  [val var]
+  (log/trace "as binding value:" val "to variable:" var)
+  (if (where/variable? var)
+    val ; only needs to return the value b/c we store the binding variable in the AsSelector
+    (throw
+     (ex-info
+      (str "second arg to `as` must be a query variable (e.g. ?foo); provided:"
+           (pr-str var))
+      {:status 400, :error :db/invalid-query}))))
 
-(defmacro iri
-  [s]
-  `(iri/expand ~s ~context-var))
+(defmacro as
+  [val var]
+  `(as* ~val '~var))
 
-(def allowed-scalar-fns
-  '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if iri lang
-     nil? as not not= or re-find re-pattern in
+(defn plus
+  ([] (where/->typed-val 0))
+  ([{x :value}]  (where/->typed-val x))
+  ([{x :value} {y :value}] (where/->typed-val (+ x y)))
+  ([{x :value} {y :value} & more]
+   (where/->typed-val (reduce + (+ x y) (mapv :value more)))))
 
-     ;; string fns
-     strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter
-     concat regex replace
+(defn minus
+  ([{x :value}]  (where/->typed-val (- x)))
+  ([{x :value} {y :value}] (where/->typed-val (- x y)))
+  ([{x :value} {y :value} & more]
+   (where/->typed-val (reduce - (- x y) (mapv :value more)))))
 
-     ;; numeric fns
-     abs round ceil floor rand
+(defn multiply
+  ([] (where/->typed-val 1))
+  ([{x :value}]  (where/->typed-val x))
+  ([{x :value} {y :value}] (where/->typed-val (* x y)))
+  ([{x :value} {y :value} & more]
+   (where/->typed-val (reduce * (* x y) (mapv :value more)))))
 
-     ;; datetime fns
-     now year month day hours minutes seconds tz
+(defn divide
+  ([{x :value}]  (where/->typed-val (/ 1 x)))
+  ([{x :value} {y :value}] (where/->typed-val (/ x y)))
+  ([{x :value} {y :value} & more]
+   (where/->typed-val (reduce / (/ x y) (mapv :value more)))))
 
-     ;; hash fns
-     sha256 sha512
+(defn quotient
+  [{num :value} {div :value}]
+  (where/->typed-val (quot num div)))
 
-     ;; rdf term fns
-     uuid struuid isNumeric isBlank str
+(defn equal
+  ([{x :value}]  (where/->typed-val true))
+  ([{x :value} {y :value}] (where/->typed-val (= x y)))
+  ([{x :value} {y :value} & more]
+   (where/->typed-val (apply = x y (mapv :value more)))))
 
-     ;; vector scoring fns
-     dotproduct cosine-similarity euclidian-distance})
+(defn not-equal
+  ([{x :value}]  (where/->typed-val false))
+  ([{x :value} {y :value}] (where/->typed-val (not= x y)))
+  ([{x :value} {y :value} & more]
+   (where/->typed-val (apply not= x y (mapv :value more)))))
 
-(def allowed-symbols
-  (set/union allowed-aggregate-fns allowed-scalar-fns))
+(defn absolute-value
+  [{x :value}]
+  (where/->typed-val (abs x)))
+
+(defn round
+  [{a :value}]
+  (where/->typed-val (math/round a)))
+
+(defmacro -if
+  [test then else]
+  `(if (:value ~test)
+     ~then
+     ~else))
+
+(defn -nil?
+  [{x :value}]
+  (where/->typed-val (nil? x)))
+
+(defn dotproduct
+  [{v1 :value} {v2 :value}]
+  (where/->typed-val
+    (score/dotproduct v1 v2)))
+
+(defn cosine-similarity
+  [{v1 :value} {v2 :value}]
+  (where/->typed-val
+    (score/cosine-similarity v1 v2 )))
+
+(defn euclidean-distance
+  [{v1 :value} {v2 :value}]
+  (where/->typed-val
+    (score/euclidian-distance v1 v2 )))
 
 (def qualified-symbols
-  '{!              fluree.db.query.exec.eval/!
-    ||             fluree.db.query.exec.eval/||
-    &&             fluree.db.query.exec.eval/&&
+  '{!              fluree.db.query.exec.eval/-not
+    ||             fluree.db.query.exec.eval/-or
+    &&             fluree.db.query.exec.eval/-and
+    +              fluree.db.query.exec.eval/plus
+    -              fluree.db.query.exec.eval/minus
+    *              fluree.db.query.exec.eval/multiply
+    /              fluree.db.query.exec.eval/divide
+    =              fluree.db.query.exec.eval/equal
     <              fluree.db.query.exec.eval/less-than
     <=             fluree.db.query.exec.eval/less-than-or-equal
     >              fluree.db.query.exec.eval/greater-than
     >=             fluree.db.query.exec.eval/greater-than-or-equal
-    abs            clojure.core/abs
+    abs            fluree.db.query.exec.eval/absolute-value
     as             fluree.db.query.exec.eval/as
+    and            fluree.db.query.exec.eval/-and
     avg            fluree.db.query.exec.eval/avg
     bound          fluree.db.query.exec.eval/bound
     ceil           fluree.db.query.exec.eval/ceil
@@ -444,20 +533,26 @@
     concat         fluree.db.query.exec.eval/concat
     contains       fluree.db.query.exec.eval/contains
     count-distinct fluree.db.query.exec.eval/count-distinct
-    count          clojure.core/count
+    count          fluree.db.query.exec.eval/-count
     datatype       fluree.db.query.exec.eval/datatype
     floor          fluree.db.query.exec.eval/floor
     groupconcat    fluree.db.query.exec.eval/groupconcat
+    if             fluree.db.query.exec.eval/-if
     in             fluree.db.query.exec.eval/in
     iri            fluree.db.query.exec.eval/iri
     lang           fluree.db.query.exec.eval/lang
     lcase          fluree.db.query.exec.eval/lcase
     median         fluree.db.query.exec.eval/median
+    nil?           fluree.db.query.exec.eval/-nil?
+    not            fluree.db.query.exec.eval/-not
+    not=           fluree.db.query.exec.eval/not-equal
     now            fluree.db.query.exec.eval/now
+    or             fluree.db.query.exec.eval/-or
+    quot           fluree.db.query.exec.eval/quotient
     rand           fluree.db.query.exec.eval/rand
     regex          fluree.db.query.exec.eval/regex
     replace        fluree.db.query.exec.eval/replace
-    round          clojure.math/round
+    round          fluree.db.query.exec.eval/round
     sample         fluree.db.query.exec.eval/sample
     sample1        fluree.db.query.exec.eval/sample1
     stddev         fluree.db.query.exec.eval/stddev
@@ -487,24 +582,39 @@
     max            fluree.db.query.exec.eval/max
     min            fluree.db.query.exec.eval/min
 
-    dotproduct         fluree.db.vector.scoring/dotproduct
-    cosine-similarity  fluree.db.vector.scoring/cosine-similarity
-    euclidian-distance fluree.db.vector.scoring/euclidian-distance})
+    dotproduct         fluree.db.query.exec.eval/dotproduct
+    cosine-similarity  fluree.db.query.exec.eval/cosine-similarity
+    euclidian-distance fluree.db.query.exec.eval/euclidean-distance})
 
-(defn as*
-  [val var]
-  (log/trace "as binding value:" val "to variable:" var)
-  (if (where/variable? var)
-    val ; only needs to return the value b/c we store the binding variable in the AsSelector
-    (throw
-     (ex-info
-      (str "second arg to `as` must be a query variable (e.g. ?foo); provided:"
-           (pr-str var))
-      {:status 400, :error :db/invalid-query}))))
+(def allowed-aggregate-fns
+  '#{avg ceil count count-distinct distinct floor groupconcat
+     median max min rand sample sample1 stddev str sum variance})
 
-(defmacro as
-  [val var]
-  `(as* ~val '~var))
+(def allowed-scalar-fns
+  '#{&& || ! > < >= <= = + - * / quot and bound coalesce datatype if iri lang
+     nil? as not not= or re-find re-pattern in
+
+     ;; string fns
+     strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter
+     concat regex replace
+
+     ;; numeric fns
+     abs round ceil floor rand
+
+     ;; datetime fns
+     now year month day hours minutes seconds tz
+
+     ;; hash fns
+     sha256 sha512
+
+     ;; rdf term fns
+     uuid struuid isNumeric isBlank str
+
+     ;; vector scoring fns
+     dotproduct cosine-similarity euclidian-distance})
+
+(def allowed-symbols
+  (set/union allowed-aggregate-fns allowed-scalar-fns))
 
 (defn symbols
   [code]
@@ -543,38 +653,49 @@
 (defn coerce
   [code allow-aggregates?]
   (postwalk (fn [x]
-              (if (and (symbol? x)
-                       (not (where/variable? x)))
-                (qualify x allow-aggregates?)
-                x))
+              (cond (where/variable? x)
+                    x
+
+                    (symbol? x)
+                    (qualify x allow-aggregates?)
+
+                    ;; literal
+                    (not (sequential? x))
+                    (where/->TypedValue x (datatype/infer-iri x) nil)
+
+                    :else
+                    x))
             code))
+
+(defn mch->typed-val
+  [{::where/keys [val iri datatype-iri meta]}]
+  (where/->typed-val (or iri val) (if iri const/iri-id datatype-iri) (:lang meta)))
 
 (defn bind-variables
   [soln-sym var-syms ctx]
   (into `[~context-var ~ctx]
         (mapcat (fn [var]
-                  (let [dt-var   (var->dt-var var)
-                        lang-var (var->lang-var var)]
-                    `[mch#      (get ~soln-sym (quote ~var))
-                      ~dt-var   (where/get-datatype-iri mch#)
-                      ~lang-var (-> mch# ::where/meta :lang (or ""))
-                      ~var      (cond->> (where/get-binding mch#)
-                                  (= ~dt-var ::group/grouping)
-                                  (mapv where/get-value))])))
+                  `[mch# (get ~soln-sym (quote ~var))
+                    ;; convert match to TypedValue
+                    ~var (if (= ::group/grouping (::where/datatype-iri mch#))
+                           (mapv mch->typed-val (where/get-binding mch#))
+                           (mch->typed-val mch#))]))
         var-syms))
+
+(defn compile*
+  [code ctx allow-aggregates?]
+  (let [qualified-code (coerce code allow-aggregates?)
+        vars           (variables qualified-code)
+        soln-sym       'solution
+        bdg            (bind-variables soln-sym vars ctx)]
+    `(fn [~soln-sym]
+       (let ~bdg
+         ~qualified-code))))
 
 (defn compile
   ([code ctx] (compile code ctx true))
   ([code ctx allow-aggregates?]
-   (let [qualified-code (coerce code allow-aggregates?)
-         vars           (variables qualified-code)
-         soln-sym       'solution
-         bdg            (bind-variables soln-sym vars ctx)
-         fn-code        `(fn [~soln-sym]
-                           (log/trace "fn solution:" ~soln-sym)
-                           (log/trace "fn bindings:" (quote ~bdg))
-                           (let ~bdg
-                             ~qualified-code))]
+   (let [fn-code (compile* code ctx allow-aggregates?)]
      (log/trace "compiled fn:" fn-code)
      (eval fn-code))))
 
@@ -585,4 +706,5 @@
     (eval `(fn [~soln-sym ~var]
              (-> ~soln-sym
                  (assoc (quote ~var) ~var)
-                 ~f)))))
+                 ~f
+                 :value)))))

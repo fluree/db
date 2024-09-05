@@ -8,8 +8,8 @@
             [fluree.db.vector.scoring :as vector.score]
             #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc]))
-  #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
-                              LocalDateTime ZoneOffset)
+  #?(:clj (:import (java.time LocalDate LocalTime LocalDateTime
+                              OffsetDateTime OffsetTime ZoneOffset)
                    (java.time.format DateTimeFormatter))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -107,8 +107,7 @@
                     const/$xsd:string)
      (integer? x) const/$xsd:long ; infer to long to prevent overflow
      (number? x)  const/$xsd:decimal
-     (boolean? x) const/$xsd:boolean
-     (iri/iri? x) const/$id)))
+     (boolean? x) const/$xsd:boolean)))
 
 (defn infer-iri
   ([x]
@@ -369,12 +368,6 @@
     (when (string? value)
       value)
 
-    const/$id
-    (if (iri/iri? value)
-      value
-      (when (string? value)
-        (iri/string->iri value)))
-
     const/$xsd:boolean
     (coerce-boolean value)
 
@@ -383,8 +376,14 @@
       (parse-iso8601-date value))
 
     const/$xsd:dateTime
-    (when (string? value)
-      (parse-iso8601-datetime value))
+    (cond (string? value)
+          (parse-iso8601-datetime value)
+          ;; these values don't need coercion
+          (or (instance? OffsetDateTime value)
+              (instance? LocalDateTime value))
+          value)
+
+
 
     const/$xsd:time
     (when (string? value)
