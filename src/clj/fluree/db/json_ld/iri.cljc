@@ -24,16 +24,13 @@
 (def ^:const f-s3-ns "fluree:s3://")
 
 (def ^:const type-iri "@type")
-(def ^:const json-iri "@json")
-
-(def json-iri-keywords
-  {type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-   json-iri "http://www.w3.org/2001/XMLSchema#json"})
+(def ^:const rdf:type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 
 (defn normalize
   [iri]
-  (or (get json-iri-keywords iri)
-      iri))
+  (if (= iri type-iri)
+    rdf:type-iri
+    iri))
 
 (def default-namespaces
   "iri namespace mapping. 0 signifies relative iris. 1-100 are reserved; user
