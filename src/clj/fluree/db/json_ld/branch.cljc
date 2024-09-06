@@ -97,19 +97,16 @@
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
-  ([conn ledger-alias branch-name commit-jsonld]
-   (state-map conn ledger-alias branch-name commit-jsonld nil))
-  ([conn ledger-alias branch-name commit-jsonld indexing-opts]
-   (let [commit-store (:store conn)
-         index-store  (:index-store conn)
-         initial-db   (async-db/load ledger-alias branch-name commit-store index-store
+  ([ledger-alias branch-name commit-store index-store commit-jsonld]
+   (state-map ledger-alias branch-name commit-store index-store commit-jsonld nil))
+  ([ledger-alias branch-name commit-store index-store commit-jsonld indexing-opts]
+   (let [initial-db   (async-db/load ledger-alias branch-name commit-store index-store
                                      commit-jsonld indexing-opts)
          commit-map   (commit-data/jsonld->clj commit-jsonld)
          state        (atom {:commit     commit-map
                              :current-db initial-db})
          idx-q        (index-queue ledger-alias branch-name state)]
      {:name        branch-name
-      :conn        conn
       :alias       ledger-alias
       :state       state
       :index-queue idx-q})))

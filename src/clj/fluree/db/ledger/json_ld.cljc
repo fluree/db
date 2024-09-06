@@ -329,7 +329,7 @@
 
 (defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
-  [conn ledger-alias {:keys [did branch indexing] :as opts}]
+  [{:keys [store index-store] :as conn} ledger-alias {:keys [did branch indexing] :as opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias ledger-alias)
           address        (<? (connection/primary-address conn ledger-alias* opts))
@@ -339,7 +339,7 @@
                              (util/current-time-iso))
           genesis-commit (<? (commit-storage/write-genesis-commit (:store conn) ledger-alias branch ns-addresses init-time))
           ;; map of all branches and where they are branched from
-          branches       {branch (branch/state-map conn ledger-alias* branch genesis-commit indexing)}]
+          branches       {branch (branch/state-map ledger-alias* branch store index-store genesis-commit indexing)}]
       (map->JsonLDLedger
         {:id       (random-uuid)
          :did      did
@@ -383,7 +383,7 @@
       path)))
 
 (defn load*
-  [{:keys [store] :as conn} ledger-chan address]
+  [{:keys [store index-store] :as conn} ledger-chan address]
   (go-try
     (let [commit-addr  (<? (connection/lookup-commit conn address))
           _            (log/debug "Attempting to load from address:" address
@@ -402,7 +402,7 @@
 
           {:keys [did branch]} (parse-ledger-options conn {:branch branch})
 
-          branches {branch (branch/state-map conn ledger-alias branch commit)}
+          branches {branch (branch/state-map ledger-alias branch store index-store commit)}
           ledger   (map->JsonLDLedger
                      {:id       (random-uuid)
                       :did      did
