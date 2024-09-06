@@ -12,7 +12,7 @@
          metosin/malli                   {:mvn/version "0.16.2"}
          nano-id/nano-id                 {:mvn/version "1.1.0"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
-                                          :git/sha "97e5c713e1e9a2c833a509c71c615595ff5fcda0"}
+                                          :git/sha "452efeb51b6b7244de9dbbd461f068d62a33d53c"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.3.0"}
