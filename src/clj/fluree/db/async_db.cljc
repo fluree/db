@@ -186,18 +186,18 @@
   [db]
   (select-keys db [:alias :branch :t]))
 
-#?(:cljs
+#?(:clj
+   (defmethod print-method AsyncDB [^AsyncDB db, ^Writer w]
+     (.write w label)
+     (binding [*out* w]
+       (-> db display pr)))
+
+   :cljs
    (extend-type AsyncDB
      IPrintWithWriter
      (-pr-writer [db w _opts]
        (-write w label)
        (-write w (-> db display pr)))))
-
-#?(:clj
-   (defmethod print-method AsyncDB [^AsyncDB db, ^Writer w]
-     (.write w label)
-     (binding [*out* w]
-       (-> db display pr))))
 
 (defmethod pprint/simple-dispatch AsyncDB
   [db]
