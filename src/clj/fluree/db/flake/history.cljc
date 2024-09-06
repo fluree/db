@@ -159,7 +159,7 @@
 
 (defn commit-t-flakes->json-ld
   "Build a commit maps given a set of all flakes with the same t."
-  [db context {:keys [commit data txn] :as include} compact cache error-ch t-flakes]
+  [{:keys [commit-store] :as db} context {:keys [commit data txn] :as include} compact cache error-ch t-flakes]
   (go
     (try*
      (let [{commit-wrapper-flakes :commit-wrapper
@@ -217,9 +217,8 @@
          (cond-> (if txn
                    (let [txn-key     (json-ld/compact const/iri-txn compact)
                          txn-address (get commit-wrapper txn-key)
-                         storage     (-> db :conn :store)
                          raw-txn     (when txn-address
-                                       (<? (storage/read-json storage txn-address)))]
+                                       (<? (storage/read-json commit-store txn-address)))]
                      (assoc {} txn-key raw-txn))
                    {})
            commit (-> (assoc commit-key commit-wrapper)

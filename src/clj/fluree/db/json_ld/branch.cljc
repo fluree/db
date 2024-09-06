@@ -35,13 +35,14 @@
   (-> commit-map commit-data/->json-ld json-ld/expand))
 
 (defn load-db
-  [conn alias branch commit]
+  [alias branch commit-store index-store commit]
   (let [commit-jsonld (commit-map->commit-jsonld commit)]
-    (async-db/load conn alias branch commit-jsonld nil)))
+    (async-db/load alias branch commit-store index-store
+                   commit-jsonld nil)))
 
 (defn update-index
   [{current-commit :commit, :as current-state}
-   {:keys [conn alias branch], indexed-commit :commit, :as indexed-db}]
+   {:keys [alias branch commit-store index-store], indexed-commit :commit, :as indexed-db}]
   (if (same-t? current-commit indexed-commit)
     (if (newer-index? indexed-commit current-commit)
       (assoc current-state
@@ -52,7 +53,7 @@
       (if (newer-index? indexed-commit current-commit)
         (let [latest-index  (:index indexed-commit)
               latest-commit (assoc current-commit :index latest-index)
-              latest-db     (load-db conn alias branch latest-commit)]
+              latest-db     (load-db alias branch commit-store index-store latest-commit)]
           (assoc current-state
                  :commit     latest-commit
                  :current-db latest-db))
@@ -64,24 +65,24 @@
           current-state))))
 
 (defn reload-with-index
-  [{:keys [commit] :as _db} conn alias branch index]
+  [{:keys [commit-store index-store commit] :as _db} alias branch index]
   (let [indexed-commit (assoc commit :index index)]
-    (load-db conn alias branch indexed-commit)))
+    (load-db alias branch commit-store index-store indexed-commit)))
 
 (defn use-latest-index
-  [{db-commit :commit, :as db} idx-commit conn alias branch]
+  [{db-commit :commit, :as db} idx-commit alias branch]
   (if (newer-index? idx-commit db-commit)
     (let [latest-index  (:index idx-commit)]
-      (reload-with-index db conn alias branch latest-index))
+      (reload-with-index db alias branch latest-index))
     db))
 
 (defn index-queue
-  [conn alias branch branch-state]
+  [alias branch branch-state]
   (let [buf   (async/sliding-buffer 1)
         queue (async/chan buf)]
     (go-loop [last-index-commit nil]
       (when-let [{:keys [db index-files-ch]} (<! queue)]
-        (let [db* (use-latest-index db last-index-commit conn alias branch)]
+        (let [db* (use-latest-index db last-index-commit alias branch)]
           (if-let [indexed-db (try* (<? (indexer/index db* index-files-ch))
                                     (catch* e
                                       (log/error e "Error updating index")))]
@@ -99,11 +100,14 @@
   ([conn ledger-alias branch-name commit-jsonld]
    (state-map conn ledger-alias branch-name commit-jsonld nil))
   ([conn ledger-alias branch-name commit-jsonld indexing-opts]
-   (let [initial-db (async-db/load conn ledger-alias branch-name commit-jsonld indexing-opts)
-         commit-map (commit-data/jsonld->clj commit-jsonld)
-         state      (atom {:commit     commit-map
-                           :current-db initial-db})
-         idx-q      (index-queue conn ledger-alias branch-name state)]
+   (let [commit-store (:store conn)
+         index-store  (:index-store conn)
+         initial-db   (async-db/load ledger-alias branch-name commit-store index-store
+                                     commit-jsonld indexing-opts)
+         commit-map   (commit-data/jsonld->clj commit-jsonld)
+         state        (atom {:commit     commit-map
+                             :current-db initial-db})
+         idx-q        (index-queue ledger-alias branch-name state)]
      {:name        branch-name
       :conn        conn
       :alias       ledger-alias
@@ -121,12 +125,12 @@
 
 (defn update-commit
   [{current-commit :commit, :as current-state}
-   {:keys [conn alias branch], new-commit :commit, :as new-db}]
+   {:keys [alias branch index-store commit-store], new-commit :commit, :as new-db}]
   (if (next-commit? current-commit new-commit)
     (if (newer-index? current-commit new-commit)
       (let [latest-index  (:index current-commit)
             latest-commit (assoc new-commit :index latest-index)
-            latest-db     (load-db conn alias branch latest-commit)]
+            latest-db     (load-db alias branch commit-store index-store latest-commit)]
         (assoc current-state
                :commit     latest-commit
                :current-db latest-db))
