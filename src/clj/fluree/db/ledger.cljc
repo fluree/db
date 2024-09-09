@@ -20,10 +20,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defprotocol iCommit
-  (-commit! [ledger db] [ledger db opts] "Commits a db to a ledger.")
-  (-notify [ledger commit-notification] "Notifies of an updated commit for a given ledger, will attempt cached ledger."))
-
 (defprotocol iLedger
   (-db [ledger] "Returns queryable db with specified options")
   (-status [ledger] [ledger branch] "Returns status for branch (default branch if nil)"))
@@ -202,55 +198,57 @@
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [alias commit-store] :as ledger}
-   {:keys [branch t stats commit] :as staged-db} opts]
-  (go-try
-    (let [{index-files-ch :index-files-ch
-           commit-data-opts :commit-data-helpers
-           {:keys [did message private tag file-data? time]} :commit-opts}
-          (enrich-commit-opts ledger opts)
+  ([ledger staged-db]
+   (commit! ledger staged-db nil))
+  ([{:keys [alias commit-store] :as ledger}
+    {:keys [branch t stats commit] :as staged-db} opts]
+   (go-try
+     (let [{index-files-ch :index-files-ch
+            commit-data-opts :commit-data-helpers
+            {:keys [did message private tag file-data? time]} :commit-opts}
+           (enrich-commit-opts ledger opts)
 
-          {:keys [dbid db-jsonld staged-txns]}
-          (flake-db/db->jsonld staged-db commit-data-opts)
+           {:keys [dbid db-jsonld staged-txns]}
+           (flake-db/db->jsonld staged-db commit-data-opts)
 
-          ;; TODO - we do not support multiple "transactions" in a single commit (although other code assumes we do which needs cleaning)
-          [[txn-id author annotation] :as txns]
-          (<? (write-transactions! commit-store ledger staged-txns))
+           ;; TODO - we do not support multiple "transactions" in a single commit (although other code assumes we do which needs cleaning)
+           [[txn-id author annotation] :as txns]
+           (<? (write-transactions! commit-store ledger staged-txns))
 
-          data-write-result (<? (commit-storage/write-jsonld commit-store alias db-jsonld)) ; write commit data
-          db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
+           data-write-result (<? (commit-storage/write-jsonld commit-store alias db-jsonld)) ; write commit data
+           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
 
-          base-commit-map {:old-commit commit
-                           :issuer     did
-                           :message    message
-                           :tag        tag
-                           :dbid       dbid
-                           :t          t
-                           :time       time
-                           :db-address db-address
-                           :author     author
-                           :annotation annotation
-                           :txn-id     txn-id
-                           :flakes     (:flakes stats)
-                           :size       (:size stats)}
-          new-commit      (commit-data/new-db-commit-map base-commit-map)
-          keypair         {:did did :private private}
+           base-commit-map {:old-commit commit
+                            :issuer     did
+                            :message    message
+                            :tag        tag
+                            :dbid       dbid
+                            :t          t
+                            :time       time
+                            :db-address db-address
+                            :author     author
+                            :annotation annotation
+                            :txn-id     txn-id
+                            :flakes     (:flakes stats)
+                            :size       (:size stats)}
+           new-commit      (commit-data/new-db-commit-map base-commit-map)
+           keypair         {:did did :private private}
 
-          {:keys [commit-map write-result] :as commit-write-map}
-          (<? (write-commit commit-store alias keypair new-commit))
+           {:keys [commit-map write-result] :as commit-write-map}
+           (<? (write-commit commit-store alias keypair new-commit))
 
-          db  (formalize-commit staged-db commit-map)
-          db* (update-commit! ledger branch db index-files-ch)]
+           db  (formalize-commit staged-db commit-map)
+           db* (update-commit! ledger branch db index-files-ch)]
 
-      (log/debug "Committing t" t "at" time)
+       (log/debug "Committing t" t "at" time)
 
-      (<? (publish-commit ledger commit-write-map))
+       (<? (publish-commit ledger commit-write-map))
 
-      (if file-data?
-        {:data-file-meta   data-write-result
-         :commit-file-meta write-result
-         :db               db*}
-        db*))))
+       (if file-data?
+         {:data-file-meta   data-write-result
+          :commit-file-meta write-result
+          :db               db*}
+         db*)))))
 
 (defn close-ledger
   "Shuts down ledger and resources."
@@ -312,11 +310,6 @@
 
 (defrecord Ledger [id address alias did state cache primary-publisher
                    secondary-publishers commit-storage index-storage reasoner]
-  iCommit
-  (-commit! [ledger db] (commit! ledger db nil))
-  (-commit! [ledger db opts] (commit! ledger db (parse-commit-options opts)))
-  (-notify [ledger expanded-commit] (notify ledger expanded-commit))
-
   iLedger
   (-db [ledger] (current-db ledger))
   (-status [ledger] (status ledger nil))

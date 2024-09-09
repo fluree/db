@@ -83,7 +83,7 @@
          ;; whereas stage API takes a did IRI and unparsed context.
          ;; Dissoc them until deciding at a later point if they can carry through.
          cmt-opts    (dissoc parsed-opts :context :did)] ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
-     (<? (ledger/-commit! ledger db cmt-opts)))))
+     (<? (ledger/commit! ledger db cmt-opts)))))
 
 (defn transact!
   ([conn txn]

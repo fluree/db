@@ -129,7 +129,7 @@
           ledger-alias    (get-first-value expanded-commit const/iri-alias)]
       (if ledger-alias
         (if-let [ledger-c (cached-ledger conn ledger-alias)]
-          (<? (ledger/-notify (<? ledger-c) expanded-commit))
+          (<? (ledger/notify (<? ledger-c) expanded-commit))
           (log/debug "No cached ledger found for commit: " commit-map))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " commit-map)))))
