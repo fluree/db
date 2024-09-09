@@ -3,7 +3,6 @@
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
@@ -18,8 +17,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol iConnection
-  (-did [conn] "Returns optional default did map if set at connection level")
-  (-nameservices [conn] "Returns a sequence of all nameservices configured for the connection."))
+  (-did [conn] "Returns optional default did map if set at connection level"))
 
 (defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")
@@ -52,8 +50,8 @@
   {:id    (:id conn)
    :stats (get @(:state conn) :stats)})
 
-(defrecord Connection [id state parallelism store index-store primary-ns
-                       aux-nses serializer cache defaults]
+(defrecord Connection [id state parallelism store index-store primary-publisher
+                       secondary-publishers subscribers serializer cache defaults]
   iStorage
   (-c-read [_ commit-address]
     (storage/read-json store commit-address))
@@ -65,9 +63,7 @@
       (storage/content-write-json store path txn-data)))
 
   iConnection
-  (-did [_] (:did defaults))
-  (-nameservices [_]
-    (into [primary-ns] aux-nses)))
+  (-did [_] (:did defaults)))
 
 #?(:clj
    (defmethod print-method Connection [^Connection conn, ^Writer w]
@@ -85,13 +81,13 @@
   (pr conn))
 
 (defn connect
-  [{:keys [parallelism store index-store cache serializer primary-ns
-           aux-nses defaults]
+  [{:keys [parallelism store index-store cache serializer primary-publisher
+           secondary-publishers subscribers defaults]
     :or   {serializer (json-serde)} :as _opts}]
   (let [id    (random-uuid)
         state (blank-state)]
-    (->Connection id state parallelism store index-store primary-ns aux-nses
-                  serializer cache defaults)))
+    (->Connection id state parallelism store index-store primary-publisher
+                  secondary-publishers subscribers serializer cache defaults)))
 
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held
@@ -139,8 +135,8 @@
                   "Are you sure it is a commit?: " commit-map)))))
 
 (defn all-nameservices
-  [{:keys [primary-ns aux-nses] :as _conn}]
-  (cons primary-ns aux-nses))
+  [{:keys [primary-publisher secondary-publishers subscribers] :as _conn}]
+  (cons primary-publisher (concat secondary-publishers subscribers)))
 
 (def fluree-address-prefix
   "fluree:")
@@ -160,41 +156,26 @@
   TODO - if a single non-relative address is used, and the ledger exists,
   we should retrieve all stored ns addresses in the commit if possible and
   try to use all nameservices."
-  ([conn ledger-alias]
-   (addresses conn ledger-alias "main"))
-  ([conn ledger-alias branch]
-   (go-try
-     (if (relative-ledger-alias? ledger-alias)
-       (let [nameservices (all-nameservices conn)]
-         (loop [nameservices* nameservices
-                addresses     []]
-           (let [ns (first nameservices*)]
-             (if ns
-               (if-let [address (<? (nameservice/address ns ledger-alias branch))]
-                 (recur (rest nameservices*) (conj addresses address))
-                 (recur (rest nameservices*) addresses))
-               addresses))))
-       [ledger-alias]))))
+  [conn ledger-alias]
+  (go-try
+    (if (relative-ledger-alias? ledger-alias)
+      (let [nameservices (all-nameservices conn)]
+        (loop [nameservices* nameservices
+               addresses     []]
+          (let [ns (first nameservices*)]
+            (if ns
+              (if-let [address (<? (nameservice/address ns ledger-alias))]
+                (recur (rest nameservices*) (conj addresses address))
+                (recur (rest nameservices*) addresses))
+              addresses))))
+      [ledger-alias])))
 
 (defn primary-address
   "From a connection, lookup primary address from nameservice(s) for a given
   ledger alias"
   ([conn ledger-alias]
    (go-try
-     (first (<? (addresses conn ledger-alias)))))
-  ([conn ledger-alias branch]
-   (go-try
-     (first (<? (addresses conn ledger-alias branch))))))
-
-(defn publish-commit
-  "Publishes commit to all nameservices registered on the connection."
-  [{:keys [primary-ns aux-nses] :as _conn} commit-jsonld]
-  (go-try
-    (let [result (<? (nameservice/publish primary-ns commit-jsonld))]
-      (dorun (map (fn [ns]
-                    (nameservice/publish ns commit-jsonld)))
-             aux-nses)
-      result)))
+     (first (<? (addresses conn ledger-alias))))))
 
 (defn lookup-commit
   "Returns commit address from first matching nameservice on a conn
@@ -261,3 +242,113 @@
         (when-let [ns (first nameservices*)]
           (<? (nameservice/-unsubscribe ns ledger-alias))
           (recur (rest nameservices*)))))))
+
+(defn parse-did
+  [conn did]
+  (if did
+    (if (map? did)
+      did
+      {:id did})
+    (-did conn)))
+
+(defn parse-ledger-options
+  [conn {:keys [did branch indexing]
+         :or   {branch :main}}]
+  (let [did*           (parse-did conn did)
+        ledger-default (-> conn :ledger-defaults :indexing)
+        indexing*      (merge ledger-default indexing)]
+    {:did      did*
+     :branch   branch
+     :indexing indexing*}))
+
+(defn create-ledger
+  [{:keys [primary-publisher secondary-publishers subscribers index-store] commit-store :store,
+    :as conn}
+   ledger-alias opts]
+  (go-try
+    (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
+      (if cached?
+        (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
+                        {:status 400
+                         :error  :db/ledger-exists}))
+        (let [address      (<? (primary-address conn ledger-alias))
+              ns-addresses (<? (addresses conn ledger-alias))
+              ledger-opts  (parse-ledger-options conn opts)
+              ledger       (<! (ledger/create {:alias                ledger-alias
+                                               :address              address
+                                               :primary-publisher    primary-publisher
+                                               :secondary-publishers secondary-publishers
+                                               :subscribers          subscribers
+                                               :ns-addresses         ns-addresses
+                                               :commit-store         commit-store
+                                               :index-store          index-store}
+                                              ledger-opts))]
+          (when (util/exception? ledger)
+            (release-ledger conn ledger-alias))
+          (async/put! ledger-chan ledger)
+          ledger)))))
+
+(defn commit->ledger-alias
+  "Returns ledger alias from commit map, if present. If not present
+  then tries to resolve the ledger alias from the nameservice."
+  [conn db-alias commit-map]
+  (or (get-first-value commit-map const/iri-alias)
+      (->> (all-nameservices conn)
+           (some (fn [ns]
+                   (nameservice/alias ns db-alias))))))
+
+(defn load-ledger*
+  [{:keys [store index-store primary-publisher secondary-publishers] :as conn}
+   ledger-chan address]
+  (go-try
+    (let [commit-addr  (<? (lookup-commit conn address))
+          _            (log/debug "Attempting to load from address:" address
+                                  "with commit address:" commit-addr)
+          _            (when-not commit-addr
+                         (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
+                                         {:status 400 :error :db/invalid-commit-address})))
+          [commit _]   (<? (commit-storage/read-commit-jsonld store commit-addr))
+          _            (when-not commit
+                         (throw (ex-info (str "Unable to load. Commit file for ledger: " address
+                                              " at location: " commit-addr " is not found.")
+                                         {:status 400 :error :db/invalid-db})))
+          _            (log/debug "load commit:" commit)
+          ledger-alias (commit->ledger-alias conn address commit)
+          branch       (keyword (get-first-value commit const/iri-branch))
+
+          {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
+
+          ledger   (ledger/instantiate ledger-alias address primary-publisher secondary-publishers
+                                       branch store index-store did indexing commit)]
+      (subscribe-ledger conn ledger-alias)
+      (async/put! ledger-chan ledger)
+      ledger)))
+
+(defn load-ledger-address
+  [conn address]
+  (let [alias (nameservice/address-path address)
+        [cached? ledger-chan] (register-ledger conn alias)]
+    (if cached?
+      ledger-chan
+      (load-ledger* conn ledger-chan address))))
+
+(defn load-ledger-alias
+  [conn alias]
+  (go-try
+    (let [[cached? ledger-chan] (register-ledger conn alias)]
+      (if cached?
+        (<? ledger-chan)
+        (let [address (<! (primary-address conn alias))]
+          (if (util/exception? address)
+            (do (release-ledger conn alias)
+                (async/put! ledger-chan
+                            (ex-info (str "Load for " alias " failed due to failed address lookup.")
+                                     {:status 400 :error :db/invalid-address}
+                                     address)))
+            (<? (load-ledger* conn ledger-chan address))))))))
+
+(defn load-ledger
+  [conn alias-or-address]
+  (if (fluree-address? alias-or-address)
+    (load-ledger-address conn alias-or-address)
+    (load-ledger-alias conn alias-or-address)))

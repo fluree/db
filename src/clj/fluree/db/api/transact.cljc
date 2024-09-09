@@ -4,7 +4,6 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.transact :as tx]
-            [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [catch* try*]]
@@ -91,16 +90,16 @@
    (transact! conn txn {:raw-txn txn}))
   ([conn txn opts]
    (go-try
-    (let [expanded  (json-ld/expand (ctx-util/use-fluree-context txn))
-          ledger-id (extract-ledger-id expanded)]
+     (let [expanded  (json-ld/expand (ctx-util/use-fluree-context txn))
+           ledger-id (extract-ledger-id expanded)]
       (<? (transact! conn ledger-id txn opts)))))
   ([conn ledger-id txn opts]
    (go-try
-    (let [address     (<? (connection/primary-address conn ledger-id nil))]
-      (if-not (<? (connection/ledger-exists? conn address))
-        (throw (ex-info "Ledger does not exist" {:ledger address}))
-        (let [ledger   (<? (jld-ledger/load conn address))]
-          (<? (transact-ledger! ledger txn opts))))))))
+     (let [address (<? (connection/primary-address conn ledger-id))]
+       (if-not (<? (connection/ledger-exists? conn address))
+         (throw (ex-info "Ledger does not exist" {:ledger address}))
+         (let [ledger (<? (connection/load-ledger conn address))]
+           (<? (transact-ledger! ledger txn opts))))))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.
@@ -119,16 +118,16 @@
   ([conn txn] (create-with-txn conn txn nil))
   ([conn txn {:keys [context] :as opts}]
    (go-try
-    (let [expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
-          txn-context (or (ctx-util/txn-context txn)
-                          context) ;; parent context from credential if present
-          ledger-id   (extract-ledger-id expanded)
-          address     (<? (connection/primary-address conn ledger-id nil))
-          parsed-opts (parse-opts expanded opts txn-context)]
+     (let [expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
+           txn-context (or (ctx-util/txn-context txn)
+                           context) ;; parent context from credential if present
+           ledger-id   (extract-ledger-id expanded)
+           address     (<? (connection/primary-address conn ledger-id))
+           parsed-opts (parse-opts expanded opts txn-context)]
       (if (<? (connection/ledger-exists? conn address))
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
-        (let [ledger (<? (jld-ledger/create conn ledger-id parsed-opts))]
+        (let [ledger (<? (connection/create-ledger conn ledger-id parsed-opts))]
           (<? (transact-ledger! ledger expanded (assoc parsed-opts :expanded? true)))))))))
 
 (defn credential-create-with-txn!

@@ -42,7 +42,7 @@
 
 (defn ipns-address
   "Returns IPNS address for a given ipns profile and ledger alias."
-  [ipfs-endpoint ipns-profile ledger-alias _branch]
+  [ipfs-endpoint ipns-profile ledger-alias]
   (go-try
     (log/debug "Getting address for ledger alias:" ledger-alias)
     (let [base-address (<? (ipfs-keys/address ipfs-endpoint ipns-profile))]
@@ -62,8 +62,8 @@
   nameservice/iNameService
   (lookup [_ ledger-alias]
     (lookup-address ipfs-endpoint ipns-key ledger-alias))
-  (address [_ ledger-alias branch]
-    (ipns-address ipfs-endpoint ipns-key ledger-alias branch))
+  (address [_ ledger-alias]
+    (ipns-address ipfs-endpoint ipns-key ledger-alias))
   (alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
       alias))

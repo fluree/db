@@ -7,7 +7,7 @@
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.ledger.json-ld :as jld-ledger]
+            [fluree.db.ledger :as ledger]
             [fluree.db.connection :as connection]
             [fluree.db.query.exec.update :as update]
             [fluree.db.util.async :refer [<? go-try]]
@@ -94,7 +94,7 @@
           staged-db          (-> (<? (flake.transact/final-db db all-flakes tx-state))
                                  :db-after
                                  (set-namespaces ns-mapping))
-          committed-db       (<? (jld-ledger/commit! ledger staged-db
+          committed-db       (<? (ledger/commit! ledger staged-db
                                                      {:time (get-first-value commit const/iri-time)}))]
       (if (async-db/db? committed-db)
         (<? (async-db/deref-async committed-db))
@@ -105,7 +105,7 @@
   [ledger branch tuples-chans]
   (go-try
     (loop [[[commit-tuple ch] & r] tuples-chans
-           db (let [current-db (jld-ledger/current-db ledger)]
+           db (let [current-db (ledger/current-db ledger)]
                 (if (async-db/db? current-db)
                   (<? (async-db/deref-async current-db))
                   current-db))]
@@ -126,7 +126,7 @@
    (migrate conn ledger-alias indexing-opts false nil))
   ([{:keys [store] :as conn} ledger-alias indexing-opts force changes-ch]
    (go-try
-     (let [ledger-address       (<? (connection/primary-address conn ledger-alias nil))
+     (let [ledger-address       (<? (connection/primary-address conn ledger-alias))
            last-commit-addr     (<? (connection/lookup-commit conn ledger-address))
            last-verified-commit (<? (commit-storage/read-commit-jsonld store last-commit-addr))
            last-commit          (first last-verified-commit)
@@ -142,8 +142,8 @@
                first-commit      (ffirst all-commit-tuples)
                branch            (or (keyword (get-first-value first-commit const/iri-branch))
                                      :main)
-               ledger            (<? (jld-ledger/create* conn ledger-alias
-                                                         {:did      nil
+               ledger            (<? (ledger/create conn {:alias    ledger-alias
+                                                          :did      nil
                                                           :branch   branch
                                                           :indexing indexing-opts
                                                           ::time    (get-first-value first-commit const/iri-time)}))

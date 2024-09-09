@@ -31,7 +31,7 @@
           (let [ns-record (json/parse record-bytes false)]
             (nameservice/commit-address-from-record ns-record nil))))))
 
-  (address [_ ledger-alias _branch]
+  (address [_ ledger-alias]
     (go
       (str address-prefix ledger-alias)))
 

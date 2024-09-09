@@ -1,6 +1,7 @@
 (ns fluree.db.nameservice
   (:refer-clojure :exclude [alias])
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -11,7 +12,7 @@
   (alias [nameservice ledger-address]
     "Given a ledger address, returns ledger's default alias name else nil, if
     not avail")
-  (address [nameservice ledger-alias branch]
+  (address [nameservice ledger-alias]
     "Returns full nameservice address/iri which will get published in commit. If
     'private', return nil.")
   (-close [nameservice]
@@ -59,14 +60,6 @@
   [address]
   (let [[_ _ path] (str/split address #":")]
     (subs path 2)))
-
-(defn address->alias
-  [ledger-address]
-  (-> ledger-address
-      address-path
-      (str/split #"/")
-      (->> (drop-last 2) ; branch-name, head
-           (str/join #"/"))))
 
 (defn extract-branch
   "Splits a given namespace address into its nameservice and branch parts.

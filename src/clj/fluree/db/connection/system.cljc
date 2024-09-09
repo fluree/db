@@ -112,16 +112,16 @@
                                        :cache      (ig/ref :fluree/cache)}
    :fluree.connection/id              {}
    :fluree.connection/state           {}
-   :fluree/connection                 {:id          (ig/ref :fluree.connection/id)
-                                       :state       (ig/ref :fluree.connection/state)
-                                       :cache       (ig/ref :fluree/cache)
-                                       :store       (ig/ref :fluree/content-storage)
-                                       :index-store (ig/ref :fluree.index/storage)
-                                       :serializer  (ig/ref :fluree/serializer)
-                                       :primary-ns  (ig/ref :fluree/nameservice)
-                                       :aux-nses    []
-                                       :parallelism parallelism
-                                       :defaults    defaults}})
+   :fluree/connection                 {:id                   (ig/ref :fluree.connection/id)
+                                       :state                (ig/ref :fluree.connection/state)
+                                       :cache                (ig/ref :fluree/cache)
+                                       :store                (ig/ref :fluree/content-storage)
+                                       :index-store          (ig/ref :fluree.index/storage)
+                                       :serializer           (ig/ref :fluree/serializer)
+                                       :primary-publisher    (ig/ref :fluree/nameservice)
+                                       :secondary-publishers []
+                                       :parallelism          parallelism
+                                       :defaults             defaults}})
 
 (defn memory-config
   [parallelism cache-max-mb defaults]

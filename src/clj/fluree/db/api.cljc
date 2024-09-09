@@ -10,7 +10,6 @@
             [fluree.db.api.transact :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
@@ -117,7 +116,7 @@
   "Returns true if the argument is a full ledger address, false if it is just an
   alias."
   [ledger-alias-or-address]
-  (jld-ledger/fluree-address? ledger-alias-or-address))
+  (connection/fluree-address? ledger-alias-or-address))
 
 (defn create
   "Creates a new json-ld ledger. A connection (conn)
@@ -143,21 +142,20 @@
    (promise-wrap
     (do
       (log/info "Creating ledger" ledger-alias)
-      (jld-ledger/create conn ledger-alias opts)))))
+      (connection/create-ledger conn ledger-alias opts)))))
 
 (defn alias->address
   "Returns a core.async channel with the connection-specific address of the
   given ledger-alias."
   [conn ledger-alias]
-  (log/debug "Looking up address for ledger alias" ledger-alias)
-  (connection/primary-address conn ledger-alias nil))
+  (connection/primary-address conn ledger-alias))
 
 (defn load
   "Loads an existing ledger by its alias (which will be converted to a
   connection-specific address first)."
   [conn alias-or-address]
   (promise-wrap
-    (jld-ledger/load conn alias-or-address)))
+    (connection/load-ledger conn alias-or-address)))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false

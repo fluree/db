@@ -506,7 +506,6 @@
 (defn load-novelty
   [commit-storage indexed-db index-t commit-jsonld]
   (go-try
-    (log/info "loading novelty from:" commit-storage)
     (loop [[commit-tuple & r] (<? (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t)))
            db indexed-db]
       (if commit-tuple

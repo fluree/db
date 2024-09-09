@@ -7,7 +7,6 @@
             [fluree.db.api.transact :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log]
             [fluree.db.api.query :as query-api]
@@ -102,7 +101,7 @@
   alias."
   [ledger-alias-or-address]
   (log/warn "DEPRECATED function `address?` superseded by `fluree.db.api/address?`")
-  (jld-ledger/fluree-address? ledger-alias-or-address))
+  (connection/fluree-address? ledger-alias-or-address))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/create"}
@@ -131,7 +130,7 @@
    (promise-wrap
     (do
       (log/info "Creating ledger" ledger-alias)
-      (jld-ledger/create conn ledger-alias opts)))))
+      (connection/create-ledger conn ledger-alias opts)))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/alias->address"}
@@ -141,7 +140,7 @@
   [conn ledger-alias]
   (log/warn "DEPRECATED function `alias->address` superseded by `fluree.db.api/alias->address`")
   (log/debug "Looking up address for ledger alias" ledger-alias)
-  (connection/primary-address conn ledger-alias nil))
+  (connection/primary-address conn ledger-alias))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/load"}
@@ -151,7 +150,7 @@
   [conn alias-or-address]
   (log/warn "DEPRECATED function `load` superseded by `fluree.db.api/load`")
   (promise-wrap
-    (jld-ledger/load conn alias-or-address)))
+    (connection/load-ledger conn alias-or-address)))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/exists?"}

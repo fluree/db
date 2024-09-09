@@ -17,8 +17,7 @@
     (remote/remote-read server-state commit-key false))
 
   connection/iConnection
-  (-did [_] (:did ledger-defaults))
-  (-nameservices [_] nameservices))
+  (-did [_] (:did ledger-defaults)))
 
 #?(:cljs
    (extend-type RemoteConnection
