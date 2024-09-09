@@ -33,7 +33,7 @@
      (enforce/unrestricted-view? policy)
      true
 
-     ;; currently property-restrictions override class restrictions if present
+     ;; property restrictions override class restrictions if present
      (property-restrictions? policy)
      (<? (enforce/property-allow? db false flake))
 
