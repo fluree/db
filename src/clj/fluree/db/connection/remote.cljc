@@ -5,17 +5,12 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.cache :as cache]
-            [fluree.db.method.remote :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
             [clojure.string :as str])
   #?(:clj (:import (java.io Writer))))
 
 (defrecord RemoteConnection [id server-state state lru-cache-atom serializer
                              nameservices ledger-defaults parallelism]
-  connection/iStorage
-  (-c-read [_ commit-key]
-    (remote/remote-read server-state commit-key false))
-
   connection/iConnection
   (-did [_] (:did ledger-defaults)))
 

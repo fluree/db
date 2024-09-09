@@ -19,11 +19,6 @@
 (defprotocol iConnection
   (-did [conn] "Returns optional default did map if set at connection level"))
 
-(defprotocol iStorage
-  (-c-read [conn commit-key] "Reads a commit from storage")
-  (-c-write [conn ledger-alias commit-data] "Writes a commit to storage")
-  (-txn-write [conn ledger-alias txn-data] "Writes a transaction to storage and returns the key. Expects string keys."))
-
 (comment
  ;; state machine looks like this:
  {:ledger {"ledger-a" {:event-fn :main-system-event-fn ;; returns async-chan response once complete
@@ -52,16 +47,6 @@
 
 (defrecord Connection [id state parallelism store index-store primary-publisher
                        secondary-publishers subscribers serializer cache defaults]
-  iStorage
-  (-c-read [_ commit-address]
-    (storage/read-json store commit-address))
-  (-c-write [_ ledger-alias commit-data]
-    (let [path (str/join "/" [ledger-alias "commit"])]
-      (storage/content-write-json store path commit-data)))
-  (-txn-write [_ ledger-alias txn-data]
-    (let [path (str/join "/" [ledger-alias "txn"])]
-      (storage/content-write-json store path txn-data)))
-
   iConnection
   (-did [_] (:did defaults)))
 
