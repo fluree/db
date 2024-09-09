@@ -18,8 +18,8 @@
   (get-in policy [const/iri-view :property]))
 
 (defn unrestricted?
-  [{:keys [policy] :as _db}]
-  (enforce/unrestricted-view? policy))
+  [db]
+  (enforce/unrestricted-view? (:policy db)))
 
 (defn allow-flake?
   "Returns one of:
