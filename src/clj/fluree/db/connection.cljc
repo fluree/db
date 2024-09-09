@@ -16,9 +16,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defprotocol iConnection
-  (-did [conn] "Returns optional default did map if set at connection level"))
-
 (comment
  ;; state machine looks like this:
  {:ledger {"ledger-a" {:event-fn :main-system-event-fn ;; returns async-chan response once complete
@@ -46,9 +43,7 @@
    :stats (get @(:state conn) :stats)})
 
 (defrecord Connection [id state parallelism store index-store primary-publisher
-                       secondary-publishers subscribers serializer cache defaults]
-  iConnection
-  (-did [_] (:did defaults)))
+                       secondary-publishers subscribers serializer cache defaults])
 
 #?(:clj
    (defmethod print-method Connection [^Connection conn, ^Writer w]
@@ -234,7 +229,7 @@
     (if (map? did)
       did
       {:id did})
-    (-did conn)))
+    (-> conn :defaults :did)))
 
 (defn parse-ledger-options
   [conn {:keys [did branch indexing]
