@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.policy.rules
-  (:require [fluree.db.constants :as const]
+  (:require [clojure.core.async :refer [<! go]]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
@@ -86,15 +87,17 @@
 (defn restriction-map
   [restriction]
   (let [id          (util/get-id restriction) ;; @id name of restriction
-        on-property (util/get-all-ids restriction const/iri-onProperty) ;; can be multiple properties
+        on-property (when-let [props (util/get-all-ids restriction const/iri-onProperty)]
+                      (set props)) ;; can be multiple properties
         on-class    (when-let [classes (util/get-all-ids restriction const/iri-onClass)]
                       (set classes))
-        query       (when-let [q (util/get-first-value restriction const/iri-query)]
-                      (if (map? q)
-                        (assoc q "select" "?$this")
-                        (throw (ex-info (str "Invalid policy, unable to extract query from restriction: " restriction)
-                                        {:status 400
-                                         :error  :db/invalid-policy}))))
+        src-query   (util/get-first-value restriction const/iri-query)
+        query       (if (map? src-query)
+                      (assoc src-query "select" "?$this")
+                      (throw (ex-info (str "Invalid policy, unable to extract query from f:query. "
+                                           "Did you forget @context?. Parsed restriction: " restriction)
+                                      {:status 400
+                                       :error  :db/invalid-policy})))
         actions     (set (util/get-all-ids restriction const/iri-action))
         view?       (or (empty? actions) ;; if actions is not specified, default to all actions
                         (contains? actions const/iri-view))
@@ -155,19 +158,18 @@
    query-results))
 
 (defn wrap-policy
-  [db policy-rules default-allow? values-map]
+  [db policy-rules values-map]
   (go-try
    (let [policy-rules (->> (parse-rules-graph policy-rules)
                            (parse-policy-rules db))]
      (log/trace "policy-rules: " policy-rules)
      (assoc db :policy (assoc policy-rules :cache (atom {})
-                                           :values-map values-map
-                                           :default-allow? default-allow?)))))
+                                           :values-map values-map)))))
 
 (defn wrap-identity-policy
-  [db identity default-allow? values-map]
-  (go-try
-   (let [policies  (<? (dbproto/-query db {"select" {"?policy" ["*"]}
+  [db identity values-map]
+  (go
+   (let [policies  (<! (dbproto/-query db {"select" {"?policy" ["*"]}
                                            "where"  [{"@id"                 identity
                                                       const/iri-policyClass "?classes"}
                                                      {"@id"   "?policy"
@@ -180,8 +182,8 @@
      (log/trace "wrap-identity-policy - extracted policy from identity: " identity
                 " policy: " policies*)
      (if (util/exception? policies*)
-       (throw (ex-info (str "Unable to extract policies for identity: " identity
-                            " with error: " (ex-message policies*))
-                       {:status 400 :error :db/policy-exception}
-                       policies*))
-       (<? (wrap-policy db policies* default-allow? val-map))))))
+       (ex-info (str "Unable to extract policies for identity: " identity
+                     " with error: " (ex-message policies*))
+                {:status 400 :error :db/policy-exception}
+                policies*)
+       (<! (wrap-policy db policies* val-map))))))
