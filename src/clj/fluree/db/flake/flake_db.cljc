@@ -412,8 +412,7 @@
     (jld-format/reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch))
 
   (-iri-visible? [db iri]
-    (let [sid (iri/encode-iri db iri)]
-      (qpolicy/allow-iri? db sid)))
+    (qpolicy/allow-iri? db iri))
 
   indexer/Indexable
   (index [db changes-ch]

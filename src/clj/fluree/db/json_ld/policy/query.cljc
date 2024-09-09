@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.policy.query
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.constants :as const]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
@@ -45,9 +46,20 @@
      (:default-allow? policy))))
 
 (defn allow-iri?
-  [db sid]
-  (let [id-flake (flake/create sid const/$id nil nil nil nil nil)]
-    (allow-flake? db id-flake)))
+  "Returns async channel with truthy value if iri is visible for query results"
+  [db iri]
+  (if (unrestricted? db)
+    (go true)
+    (try*
+      (let [sid      (iri/encode-iri db iri)
+            id-flake (flake/create sid const/$id nil nil nil nil nil)]
+        (allow-flake? db id-flake))
+      (catch* e
+        (log/error e "Unexpected exception in allow-iri? checking permission for iri: " iri)
+        (go (ex-info (str "Unexpected exception in allow-iri? checking permission for iri: " iri
+                          "Exception encoding IRI to internal format.")
+                     {:status 500
+                      :error :db/unexpected-error}))))
 
 (defn filter-flakes
   "Iterates over multiple flakes and returns the allowed flakes from policy, or
