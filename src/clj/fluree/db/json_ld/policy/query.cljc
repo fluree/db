@@ -59,7 +59,7 @@
         (go (ex-info (str "Unexpected exception in allow-iri? checking permission for iri: " iri
                           "Exception encoding IRI to internal format.")
                      {:status 500
-                      :error :db/unexpected-error}))))
+                      :error :db/unexpected-error}))))))
 
 (defn filter-flakes
   "Iterates over multiple flakes and returns the allowed flakes from policy, or
