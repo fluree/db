@@ -226,8 +226,8 @@
 
 (defn status
   "Returns current status of ledger branch."
-  ([ledger] (ledger/-status ledger))
-  ([ledger branch] (ledger/-status ledger branch)))
+  ([ledger] (ledger/status ledger))
+  ([ledger branch] (ledger/status ledger branch)))
 
 
 ;; db operations
@@ -236,7 +236,7 @@
   "Retrieves latest db, or optionally a db at a moment in time
   and/or permissioned to a specific identity."
   ([ledger]
-   (ledger/-db ledger)))
+   (ledger/current-db ledger)))
 
 (defn wrap-policy
   ([db policy default-allow?]
@@ -332,12 +332,12 @@
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   ([ledger query]
-   (let [latest-db (ledger/-db ledger)
+   (let [latest-db (ledger/current-db ledger)
          res-chan  (query-api/history latest-db query)]
      (promise-wrap res-chan)))
   ([ledger query {:keys [policy identity default-allow? values-map] :as _opts}]
    (promise-wrap
-    (let [latest-db (ledger/-db ledger)
+    (let [latest-db (ledger/current-db ledger)
           policy-db (if identity
                       (<? (policy/wrap-identity-policy latest-db identity default-allow? values-map))
                       (<? (policy/wrap-policy latest-db policy default-allow? values-map)))]
@@ -354,7 +354,7 @@
   ([ledger cred-query {:keys [default-allow? values-map] :as opts}]
    (promise-wrap
     (go-try
-     (let [latest-db (ledger/-db ledger)
+     (let [latest-db (ledger/current-db ledger)
            {query :subject, identity :did} (<? (cred/verify cred-query))]
        (log/debug "Credential history query with identity: " identity " and query: " query)
        (cond

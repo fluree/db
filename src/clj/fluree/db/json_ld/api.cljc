@@ -263,10 +263,10 @@
         :superseded-by "fluree.db/status"}
   status
   "Returns current status of ledger branch."
-  ([ledger] (ledger/-status ledger))
+  ([ledger] (ledger/status ledger))
   ([ledger branch]
    (log/warn "DEPRECATED function `status` superseded by `fluree.db.api/status`")
-   (ledger/-status ledger branch)))
+   (ledger/status ledger branch)))
 
 
 (defn ^{:deprecated    "3.0"
@@ -315,7 +315,7 @@
    (if opts
      (throw (ex-info "DB opts not yet implemented"
                      {:status 500 :error :db/unexpected-error}))
-     (ledger/-db ledger))))
+     (ledger/current-db ledger))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/wrap-policy"}
@@ -427,13 +427,13 @@
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   ([ledger query]
-   (let [latest-db (ledger/-db ledger)
+   (let [latest-db (ledger/current-db ledger)
          res-chan  (query-api/history latest-db query)]
      (promise-wrap res-chan)))
   ([ledger query {:keys [policy identity default-allow? values-map] :as _opts}]
    (log/warn "DEPRECATED function `history` superseded by `fluree.db.api/history`")
    (promise-wrap
-     (let [latest-db (ledger/-db ledger)
+     (let [latest-db (ledger/current-db ledger)
            policy-db (if identity
                        (<? (policy/wrap-identity-policy latest-db identity default-allow? values-map))
                        (<? (policy/wrap-policy latest-db policy default-allow? values-map)))]
@@ -453,7 +453,7 @@
    (log/warn "DEPRECATED function `credential-history` superseded by `fluree.db.api/credential-history`")
    (promise-wrap
     (go-try
-      (let [latest-db                       (ledger/-db ledger)
+      (let [latest-db                       (ledger/current-db ledger)
             {query :subject, identity :did} (<? (cred/verify cred-query))]
        (log/debug "Credential history query with identity: " identity " and query: " query)
        (cond

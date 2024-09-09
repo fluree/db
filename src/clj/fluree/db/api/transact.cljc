@@ -78,7 +78,7 @@
                        txn
                        (q-parse/parse-txn expanded txn-context))
          parsed-opts (parse-opts expanded opts txn-context)
-         db          (<? (stage-triples (ledger/-db ledger) triples parsed-opts))
+         db          (<? (stage-triples (ledger/current-db ledger) triples parsed-opts))
          ;; commit API takes a did-map and parsed context as opts
          ;; whereas stage API takes a did IRI and unparsed context.
          ;; Dissoc them until deciding at a later point if they can carry through.

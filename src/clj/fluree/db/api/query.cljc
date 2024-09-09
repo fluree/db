@@ -41,7 +41,7 @@
      (if-let [rule-source (first rule-sources)]
        (let [updated-rule-results (into rule-results
                                     (if (string? rule-source)
-                                      (ledger/-db (<? (connection/load-ledger conn rule-source)))
+                                      (ledger/current-db (<? (connection/load-ledger conn rule-source)))
                                       rule-source))]
          (recur (rest rule-sources) updated-rule-results))
        rule-results))))
@@ -175,7 +175,7 @@
       (let [[alias explicit-t] (extract-query-string-t alias)
             address      (<? (connection/primary-address conn alias))
             ledger       (<? (connection/load-ledger conn address))
-            db           (ledger/-db ledger)
+            db           (ledger/current-db ledger)
             t*           (or explicit-t t)]
         (<? (restrict-db db t* opts conn)))
       (catch* e

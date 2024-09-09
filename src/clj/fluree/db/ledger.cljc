@@ -20,10 +20,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defprotocol iLedger
-  (-db [ledger] "Returns queryable db with specified options")
-  (-status [ledger] [ledger branch] "Returns status for branch (default branch if nil)"))
-
 (defn get-branch-meta
   "Retrieves branch metadata from ledger state"
   [{:keys [state] :as _ledger} requested-branch]
@@ -309,11 +305,7 @@
           false)))))
 
 (defrecord Ledger [id address alias did state cache primary-publisher
-                   secondary-publishers commit-storage index-storage reasoner]
-  iLedger
-  (-db [ledger] (current-db ledger))
-  (-status [ledger] (status ledger nil))
-  (-status [ledger branch] (status ledger branch)))
+                   secondary-publishers commit-storage index-storage reasoner])
 
 (defn initial-state
   [branches current-branch]
