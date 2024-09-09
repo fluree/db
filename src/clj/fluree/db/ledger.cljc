@@ -1,6 +1,5 @@
 (ns fluree.db.ledger
-  (:require [fluree.db.ledger :as ledger]
-            [fluree.db.storage :as storage]
+  (:require [fluree.db.storage :as storage]
             [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.transact :as transact]
@@ -313,12 +312,12 @@
 
 (defrecord Ledger [id address alias did state cache primary-publisher
                    secondary-publishers commit-storage index-storage reasoner]
-  ledger/iCommit
+  iCommit
   (-commit! [ledger db] (commit! ledger db nil))
   (-commit! [ledger db opts] (commit! ledger db (parse-commit-options opts)))
   (-notify [ledger expanded-commit] (notify ledger expanded-commit))
 
-  ledger/iLedger
+  iLedger
   (-db [ledger] (current-db ledger))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch)))
