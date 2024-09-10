@@ -6,7 +6,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
-            [fluree.db.api.query :as query-api]
+            [fluree.db.query.api :as query-api]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]

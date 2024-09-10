@@ -9,7 +9,7 @@
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log]
-            [fluree.db.api.query :as query-api]
+            [fluree.db.query.api :as query-api]
             [fluree.db.query.range :as query-range]
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.json-ld.credential :as cred]
