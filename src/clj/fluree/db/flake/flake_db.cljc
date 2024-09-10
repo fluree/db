@@ -412,8 +412,7 @@
     (jld-format/reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch))
 
   (-iri-visible? [db iri]
-    (let [sid (iri/encode-iri db iri)]
-      (qpolicy/allow-iri? db sid)))
+    (qpolicy/allow-iri? db iri))
 
   indexer/Indexable
   (index [db changes-ch]
@@ -459,10 +458,10 @@
     (history/query-commits db context from-t to-t include error-ch))
 
   policy/Restrictable
-  (wrap-policy [db policy default-allow? values-map]
-    (policy-rules/wrap-policy db policy default-allow? values-map))
-  (wrap-identity-policy [db identity default-allow? values-map]
-    (policy-rules/wrap-identity-policy db identity default-allow? values-map))
+  (wrap-policy [db policy values-map]
+    (policy-rules/wrap-policy db policy values-map))
+  (wrap-identity-policy [db identity values-map]
+    (policy-rules/wrap-identity-policy db identity values-map))
   (root [db]
     (policy/root-db db))
 

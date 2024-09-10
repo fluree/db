@@ -41,18 +41,23 @@
                                            {"@id"     john-did
                                             "ex:user" {"@id" "ex:john"}}]})
 
-          policy            {"@context"     {"ex"     "http://example.org/ns/"
-                                             "schema" "http://schema.org/"
-                                             "f"      "https://ns.flur.ee/ledger#"}
-                             "@id"          "ex:emailPropertyRestriction"
-                             "@type"        ["f:AccessPolicy"]
-                             "f:onProperty" [{"@id" "schema:email"}]
-                             "f:action"     [{"@id" "f:view"}, {"@id" "f:modify"}]
-                             "f:exMessage"  "Only users can update their own emails."
-                             "f:query"      {"@type"  "@json"
-                                             "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                                       "where"    [{"@id"     "?$identity"
-                                                                    "ex:user" {"@id" "?$this"}}]}}}
+          policy            {"@context" {"ex"     "http://example.org/ns/"
+                                         "schema" "http://schema.org/"
+                                         "f"      "https://ns.flur.ee/ledger#"}
+                             "@graph"   [{"@id"          "ex:emailPropertyRestriction"
+                                          "@type"        ["f:AccessPolicy"]
+                                          "f:onProperty" [{"@id" "schema:email"}]
+                                          "f:action"     [{"@id" "f:view"}, {"@id" "f:modify"}]
+                                          "f:exMessage"  "Only users can update their own emails."
+                                          "f:query"      {"@type"  "@json"
+                                                          "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                                    "where"    [{"@id"     "?$identity"
+                                                                                 "ex:user" {"@id" "?$this"}}]}}}
+                                         {"@id"      "ex:defaultAllowViewModify"
+                                          "@type"    ["f:AccessPolicy"]
+                                          "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
+                                          "f:query"  {"@type"  "@json"
+                                                      "@value" {}}}]}
 
           john-params       {"?$identity" {"@value" john-did
                                            "@type"  "@id"}}
@@ -61,7 +66,7 @@
                                            "@type"  "@id"}}
 
           john-allowed      @(fluree/stage
-                              @(fluree/wrap-policy db policy true john-params)
+                              @(fluree/wrap-policy db policy john-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
                                            "f"      "https://ns.flur.ee/ledger#"}
@@ -73,7 +78,7 @@
                                            "schema:email" "updatedEmail@flur.ee"}})
 
           alice-not-allowed @(fluree/stage
-                              @(fluree/wrap-policy db policy true alice-params)
+                              @(fluree/wrap-policy db policy alice-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
                                            "f"      "https://ns.flur.ee/ledger#"}
@@ -134,18 +139,23 @@
                                             "ex:user"           {"@id" "ex:john"}
                                             "ex:productManager" {"@id" "ex:widget"}}]})
 
-          policy            {"@context"    {"ex"     "http://example.org/ns/"
-                                            "schema" "http://schema.org/"
-                                            "f"      "https://ns.flur.ee/ledger#"}
-                             "@id"         "ex:productClassRestriction"
-                             "@type"       ["f:AccessPolicy"]
-                             "f:onClass"   [{"@id" "ex:Product"}]
-                             "f:action"    [{"@id" "f:view"}, {"@id" "f:modify"}]
-                             "f:exMessage" "Only products managed by the user can be modified."
-                             "f:query"     {"@type"  "@json"
-                                            "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                                      "where"    [{"@id"               "?$identity"
-                                                                   "ex:productManager" {"@id" "?$this"}}]}}}
+          policy            {"@context" {"ex"     "http://example.org/ns/"
+                                         "schema" "http://schema.org/"
+                                         "f"      "https://ns.flur.ee/ledger#"}
+                             "@graph"   [{"@id"         "ex:productClassRestriction"
+                                          "@type"       ["f:AccessPolicy"]
+                                          "f:onClass"   [{"@id" "ex:Product"}]
+                                          "f:action"    [{"@id" "f:view"}, {"@id" "f:modify"}]
+                                          "f:exMessage" "Only products managed by the user can be modified."
+                                          "f:query"     {"@type"  "@json"
+                                                         "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                                   "where"    [{"@id"               "?$identity"
+                                                                                "ex:productManager" {"@id" "?$this"}}]}}}
+                                         {"@id"      "ex:defaultAllowViewModify"
+                                          "@type"    ["f:AccessPolicy"]
+                                          "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
+                                          "f:query"  {"@type"  "@json"
+                                                      "@value" {}}}]}
 
           john-params       {"?$identity" {"@value" john-did
                                            "@type"  "@id"}}
@@ -154,7 +164,7 @@
                                            "@type"  "@id"}}
 
           john-allowed      @(fluree/stage
-                              @(fluree/wrap-policy db policy true john-params)
+                              @(fluree/wrap-policy db policy john-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
                                            "f"      "https://ns.flur.ee/ledger#"}
@@ -165,7 +175,7 @@
                                "insert"   {"@id"         "ex:widget",
                                            "schema:name" "Widget - Updated"}})
           alice-not-allowed @(fluree/stage
-                              @(fluree/wrap-policy db policy true alice-params)
+                              @(fluree/wrap-policy db policy alice-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
                                            "f"      "https://ns.flur.ee/ledger#"}
