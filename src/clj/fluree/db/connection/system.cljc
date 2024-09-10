@@ -31,9 +31,9 @@
 #?(:cljs (derive :fluree.storage/localstorage :fluree/content-storage))
 #?(:cljs (derive :fluree.storage/localstorage :fluree/json-archive))
 
-(derive :fluree.storage/remote-resource :fluree/json-archive)
+(derive :fluree.storage/remote-resources :fluree/json-archive)
 
-(derive :fluree.publication/remote-resource :fluree/publication)
+(derive :fluree.publication/remote-resources :fluree/publication)
 
 (derive :fluree.nameservice/storage-backed :fluree/nameservice)
 
@@ -66,9 +66,9 @@
   [_ endpoint]
   (ipfs-store/open endpoint))
 
-(defmethod ig/init-key :fluree.storage/remote-resource
+(defmethod ig/init-key :fluree.storage/remote-resources
   [_ servers]
-  (remote-store/resource servers))
+  (remote-store/open servers))
 
 #?(:cljs (defmethod ig/init-key :fluree.storage/localstorage
            [_ _]

@@ -2,7 +2,7 @@
   (:require [fluree.db.storage :as storage]
             [fluree.db.method.remote :as remote]))
 
-(defrecord RemoteResource [server-state]
+(defrecord RemoteResources [server-state]
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (remote/remote-read server-state address keywordize?)))
@@ -13,6 +13,6 @@
          :connected-to nil
          :stats        {:connected-at nil}}))
 
-(defn resource
+(defn open
   [servers]
-  (-> servers new-state ->RemoteResource))
+  (-> servers new-state ->RemoteResources))
