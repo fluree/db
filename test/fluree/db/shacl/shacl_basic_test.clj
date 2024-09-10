@@ -1672,9 +1672,21 @@ WORLD!")
                                 :schema/name  "John"
                                 :schema/age   40
                                 :schema/email 42}})]
-          (is (= {:status 400, :error :db/value-coercion}
+          (is (= {:error  :shacl/violation
+                  :report {:sh/conforms false
+                           :sh/result   [{:f/expectation          :xsd/string
+                                          :sh/constraintComponent :sh/datatype
+                                          :sh/focusNode           :ex/john
+                                          :sh/resultMessage       "the following values do not have expected datatype :xsd/string: 42"
+                                          :sh/resultPath          [:schema/email]
+                                          :sh/resultSeverity      :sh/Violation
+                                          :sh/sourceShape         "_:fdb-4"
+                                          :sh/value               [:xsd/integer]
+                                          :type                   :sh/ValidationResult}]
+                           :type        :sh/ValidationReport}
+                  :status 400}
                  (ex-data db-num-email)))
-          (is (= "Value 42 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
+          (is (= "Subject :ex/john path [:schema/email] violates constraint :sh/datatype of shape _:fdb-4 - the following values do not have expected datatype :xsd/string: 42."
                  (ex-message db-num-email))))))))
 
 (deftest ^:integration property-paths
@@ -2169,7 +2181,7 @@ WORLD!")
                                                   {"id"      "ex:Bob"
                                                    "ex:name" 123
                                                    "type"    "ex:User"}]})]
-          (is (= "Value 123 cannot be coerced to provided datatype: http://www.w3.org/2001/XMLSchema#string."
+          (is (= "Subject ex:Bob path [\"ex:name\"] violates constraint sh:datatype of shape _:fdb-2 - the following values do not have expected datatype xsd:string: 123."
                  (ex-message db-bad-friend-name)))))
       (testing "maxCount"
         (let [db1           @(fluree/stage db0

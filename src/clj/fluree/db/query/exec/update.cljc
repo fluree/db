@@ -74,7 +74,6 @@
         dt (or (some-> o-mch
                        where/get-datatype-iri
                        (->> (generate-sid! db-vol)))
-               (dbproto/-p-prop @db-vol :datatype p-iri)
                (datatype/infer v (:lang m)))
         v* (datatype/coerce-value v dt)]
     (flake/create sid pid v* dt t true m)))
