@@ -934,55 +934,54 @@
     (let [conn         @(fluree/connect {:method :memory})
           ledger-name  "authortest"
           ledger       @(fluree/create conn ledger-name)
-          context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
+          context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"
+                                                                             "f"  "https://ns.flur.ee/ledger#"}]
           root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
           root-did     (:id (did/private->did-map root-privkey))
 
-          db0 (fluree/db ledger)
-          db1 @(fluree/stage db0 {"@context" context
-                                  "insert"   [{"@id"         "ex:betty"
-                                               "@type"       "ex:Yeti"
-                                               "schema:name" "Betty"
-                                               "schema:age"  55}
-                                              {"@id"         "ex:freddy"
-                                               "@type"       "ex:Yeti"
-                                               "schema:name" "Freddy"
-                                               "schema:age"  1002}
-                                              {"@id"         "ex:letty"
-                                               "@type"       "ex:Yeti"
-                                               "schema:name" "Leticia"
-                                               "schema:age"  38}
-                                              {"@id"    root-did
-                                               "f:role" {"@id" "ex:rootRole"}}]})
-          db2 (->> @(fluree/stage db1 {"@context" context
-                                       "insert"   {"@id"          "ex:rootPolicy"
-                                                   "@type"        ["f:Policy"]
-                                                   "f:targetNode" {"@id" "f:allNodes"}
-                                                   "f:allow"      [{"@id"          "ex:rootAccessAllow"
-                                                                    "f:targetRole" {"@id" "ex:rootRole"}
-                                                                    "f:action"     [{"@id" "f:view"}
-                                                                                    {"@id" "f:modify"}]}]}})
-                   (fluree/commit! ledger)
-                   (deref))
+          db0          (fluree/db ledger)
+          db1          @(fluree/stage db0 {"@context" context
+                                           "insert"   [{"@id"         "ex:betty"
+                                                        "@type"       "ex:Yeti"
+                                                        "schema:name" "Betty"
+                                                        "schema:age"  55}
+                                                       {"@id"         "ex:freddy"
+                                                        "@type"       "ex:Yeti"
+                                                        "schema:name" "Freddy"
+                                                        "schema:age"  1002}
+                                                       {"@id"         "ex:letty"
+                                                        "@type"       "ex:Yeti"
+                                                        "schema:name" "Leticia"
+                                                        "schema:age"  38}
+                                                       {"@id"           root-did
+                                                        "f:policyClass" [{"@id" "ex:RootPolicy"}]}]})
+          db2          (->> @(fluree/stage db1 {"@context" context
+                                                "insert"   [{"@id"      "ex:defaultAllowViewModify"
+                                                             "@type"    ["f:AccessPolicy" "ex:RootPolicy"]
+                                                             "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
+                                                             "f:query"  {"@type"  "@json"
+                                                                         "@value" {}}}]})
+                            (fluree/commit! ledger)
+                            (deref))
 
-          db3  @(fluree/credential-transact! conn (crypto/create-jws
-                                                    (json/stringify {"@context" context
-                                                                     "ledger" ledger-name
-                                                                     "insert" {"ex:foo" 3}})
-                                                    root-privkey))
+          db3          @(fluree/credential-transact! conn (crypto/create-jws
+                                                           (json/stringify {"@context" context
+                                                                            "ledger"   ledger-name
+                                                                            "insert"   {"ex:foo" 3}})
+                                                           root-privkey))
 
-          db4  @(fluree/credential-transact! conn (crypto/create-jws
-                                                    (json/stringify {"@context" context
-                                                                     "ledger" ledger-name
-                                                                     "insert" {"ex:foo" 5}})
-                                                    root-privkey))]
+          db4          @(fluree/credential-transact! conn (crypto/create-jws
+                                                           (json/stringify {"@context" context
+                                                                            "ledger"   ledger-name
+                                                                            "insert"   {"ex:foo" 5}})
+                                                           root-privkey))]
       (is (= [{"f:data" {"f:t" 1}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-               "f:txn"    "fluree:memory://1981b179d04ebf407784da1039d344c9a431ee0dbc3e6d4d94e0e47509da1dc3",
-               "f:data"   {"f:t" 2}}
+               "f:data" {"f:t" 2},
+               "f:txn" "fluree:memory://ecdb35e5136082b09f10c3627982e2e1be32af4d0cf50c48ec8ee7f32467e4b7"}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-               "f:txn"    "fluree:memory://c8697d0d74ea5d72d80616d65961b6cc8801128cadc220538e17c939ae828820",
-               "f:data"   {"f:t" 3}}]
+               "f:data" {"f:t" 3},
+               "f:txn" "fluree:memory://d9130edd136b368943868d086d53f058523f6ca839acfa44d763030a0beb32e5"}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true
                                            :t              {:from 1 :to :latest}})
@@ -996,50 +995,50 @@
     (let [conn         @(fluree/connect {:method :memory})
           ledger-name  "authortest"
           ledger       @(fluree/create conn ledger-name)
-          context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
+          context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"
+                                                                             "f"  "https://ns.flur.ee/ledger#"}]
           root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
           root-did     (:id (did/private->did-map root-privkey))
 
-          db0 (fluree/db ledger)
-          db1 @(fluree/stage db0 {"@context" context
-                                  "insert"   [{"@id"         "ex:betty"
-                                               "@type"       "ex:Yeti"
-                                               "schema:name" "Betty"
-                                               "schema:age"  55}
-                                              {"@id"         "ex:freddy"
-                                               "@type"       "ex:Yeti"
-                                               "schema:name" "Freddy"
-                                               "schema:age"  1002}
-                                              {"@id"         "ex:letty"
-                                               "@type"       "ex:Yeti"
-                                               "schema:name" "Leticia"
-                                               "schema:age"  38}
-                                              {"@id"    root-did
-                                               "f:role" {"@id" "ex:rootRole"}}]})
-          db2 (->> @(fluree/stage db1 {"@context" context
-                                       "insert"   {"@id"          "ex:rootPolicy"
-                                                   "@type"        ["f:Policy"]
-                                                   "f:targetNode" {"@id" "f:allNodes"}
-                                                   "f:allow"      [{"@id"          "ex:rootAccessAllow"
-                                                                    "f:targetRole" {"@id" "ex:rootRole"}
-                                                                    "f:action"     [{"@id" "f:view"}
-                                                                                    {"@id" "f:modify"}]}]}})
-                   (fluree/commit! ledger)
-                   (deref))
+          db0          (fluree/db ledger)
+          db1          @(fluree/stage db0 {"@context" context
+                                           "insert"   [{"@id"         "ex:betty"
+                                                        "@type"       "ex:Yeti"
+                                                        "schema:name" "Betty"
+                                                        "schema:age"  55}
+                                                       {"@id"         "ex:freddy"
+                                                        "@type"       "ex:Yeti"
+                                                        "schema:name" "Freddy"
+                                                        "schema:age"  1002}
+                                                       {"@id"         "ex:letty"
+                                                        "@type"       "ex:Yeti"
+                                                        "schema:name" "Leticia"
+                                                        "schema:age"  38}
+                                                       {"@id"           root-did
+                                                        "f:policyClass" [{"@id" "ex:RootPolicy"}]}]})
+          db2          (->> @(fluree/stage db1 {"@context" context
+                                                "insert"   [{"@id"      "ex:defaultAllowViewModify"
+                                                             "@type"    ["f:AccessPolicy" "ex:RootPolicy"]
+                                                             "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
+                                                             "f:query"  {"@type"  "@json"
+                                                                         "@value" {}}}]})
+                            (fluree/commit! ledger)
+                            (deref))
 
-          jws1 (crypto/create-jws
-                 (json/stringify {"@context" context
-                                  "ledger"   ledger-name
-                                  "insert"   {"ex:foo" 3}})
-                 root-privkey)
-          db3  @(fluree/credential-transact! conn jws1)
+          jws1         (crypto/create-jws
+                        (json/stringify {"@context" context
+                                         "ledger"   ledger-name
+                                         "insert"   {"ex:foo" 3}})
+                        root-privkey)
+          db3          @(fluree/credential-transact! conn jws1)
 
-          jws2 (crypto/create-jws
-                 (json/stringify {"@context" context
-                                  "ledger"   ledger-name
-                                  "insert"   {"ex:foo" 5}})
-                 root-privkey)
-          db4  @(fluree/credential-transact! conn jws2)]
+          jws2         (crypto/create-jws
+                        (json/stringify {"@context" context
+                                         "ledger"   ledger-name
+                                         "insert"   {"ex:foo" 5}})
+                        root-privkey)
+          db4          @(fluree/credential-transact! conn jws2)]
+
       (testing ":txn returns the raw transaction"
         (is (= [{"f:txn" nil}
                 {"f:txn" jws1}
@@ -1047,86 +1046,80 @@
                @(fluree/history ledger {:context context
                                         :txn     true
                                         :t       {:from 1 :to :latest}}))))
+
       (testing ":commit returns just the commit wrapper"
         (is (pred-match?
-              [{"f:commit"
-                {"f:alias"    "authortest",
-                 "f:time"     720000,
-                 "f:previous" {"id" test-utils/commit-id?},
-                 "id"         test-utils/commit-id?
-                 "f:v"        1,
-                 "f:branch"   "main",
-                 "f:address"  test-utils/address?
-                 "f:data"
-                 {"f:address"  test-utils/address?
-                  "f:flakes"   16,
-                  "f:previous" {"id" test-utils/db-id?},
-                  "f:size"     pos-int?,
-                  "f:t"        1,
-                  "id"         test-utils/db-id?}}}
-               {"f:commit"
-                {"f:alias"    "authortest",
-                 "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-                 "f:time"     720000,
-                 "f:txn"      test-utils/address?
-                 "f:previous" {"id" test-utils/commit-id?}
-                 "id"         test-utils/commit-id?
-                 "f:v"        1,
-                 "f:branch"   "main",
-                 "f:address"  test-utils/address?
-                 "f:data"
-                 {"f:address"  test-utils/address?
-                  "f:flakes"   29,
-                  "f:previous" {"id" test-utils/db-id?},
-                  "f:size"     pos-int?
-                  "f:t"        2,
-                  "id"         test-utils/db-id?}}}
-               {"f:commit"
-                {"f:alias"    "authortest",
-                 "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-                 "f:time"     720000,
-                 "f:txn"      test-utils/address?
-                 "f:previous" {"id" test-utils/commit-id?},
-                 "id"         test-utils/commit-id?
-                 "f:v"        1,
-                 "f:branch"   "main",
-                 "f:address"  test-utils/address?
-                 "f:data"
-                 {"f:address"  test-utils/address?
-                  "f:flakes"   44,
-                  "f:previous" {"id" test-utils/db-id?},
-                  "f:size"     pos-int?,
-                  "f:t"        3,
-                  "id"         test-utils/db-id?}}}]
-              @(fluree/history ledger {:context context
-                                       :commit  true
-                                       :t       {:from 1 :to :latest}}))))
+             [{"f:commit"
+               {"f:alias"    "authortest",
+                "f:time"     720000,
+                "f:previous" {"id" test-utils/commit-id?},
+                "id"         test-utils/commit-id?
+                "f:v"        1,
+                "f:branch"   "main",
+                "f:address"  test-utils/address?
+                "f:data"     {"f:address"  test-utils/address?
+                              "f:flakes"   15,
+                              "f:previous" {"id" test-utils/db-id?},
+                              "f:size"     pos-int?,
+                              "f:t"        1,
+                              "id"         test-utils/db-id?}}}
+              {"f:commit"
+               {"f:alias"    "authortest",
+                "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                "f:time"     720000,
+                "f:txn"      test-utils/address?
+                "f:previous" {"id" test-utils/commit-id?}
+                "id"         test-utils/commit-id?
+                "f:v"        1,
+                "f:branch"   "main",
+                "f:address"  test-utils/address?
+                "f:data"     {"f:address"  test-utils/address?
+                              "f:flakes"   28,
+                              "f:previous" {"id" test-utils/db-id?},
+                              "f:size"     pos-int?
+                              "f:t"        2,
+                              "id"         test-utils/db-id?}}}
+              {"f:commit"
+               {"f:alias"    "authortest",
+                "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                "f:time"     720000,
+                "f:txn"      test-utils/address?
+                "f:previous" {"id" test-utils/commit-id?},
+                "id"         test-utils/commit-id?
+                "f:v"        1,
+                "f:branch"   "main",
+                "f:address"  test-utils/address?
+                "f:data"     {"f:address"  test-utils/address?
+                              "f:flakes"   43,
+                              "f:previous" {"id" test-utils/db-id?},
+                              "f:size"     pos-int?,
+                              "f:t"        3,
+                              "id"         test-utils/db-id?}}}]
+             @(fluree/history ledger {:context context
+                                      :commit  true
+                                      :t       {:from 1 :to :latest}}))))
+
       (testing ":data returns just the asserts and retracts"
-        (is (= [{"f:data"
-                 {"f:t"       1
-                  "f:assert"
-                  [{"f:role" {"id" "ex:rootRole"},
-                    "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
-                   {"type"        "ex:Yeti",
-                    "schema:age"  55,
-                    "schema:name" "Betty",
-                    "id"          "ex:betty"}
-                   {"type"        "ex:Yeti",
-                    "schema:age"  1002,
-                    "schema:name" "Freddy",
-                    "id"          "ex:freddy"}
-                   {"type"        "ex:Yeti",
-                    "schema:age"  38,
-                    "schema:name" "Leticia",
-                    "id"          "ex:letty"}
-                   {"f:action"     [{"id" "f:modify"} {"id" "f:view"}],
-                    "f:targetRole" {"id" "ex:rootRole"},
-                    "id"           "ex:rootAccessAllow"}
-                   {"type"         "f:Policy",
-                    "f:allow"      {"id" "ex:rootAccessAllow"},
-                    "f:targetNode" {"id" "f:allNodes"},
-                    "id"           "ex:rootPolicy"}],
-                  "f:retract" []}}
+        (is (= [{"f:data" {"f:t"       1
+                           "f:assert"  [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                                         "f:policyClass" {"id" "ex:RootPolicy"}}
+                                        {"type"        "ex:Yeti",
+                                         "schema:age"  55,
+                                         "schema:name" "Betty",
+                                         "id"          "ex:betty"}
+                                        {"id"       "ex:defaultAllowViewModify"
+                                         "type"     ["f:AccessPolicy" "ex:RootPolicy"],
+                                         "f:action" [{"id" "f:modify"} {"id" "f:view"}],
+                                         "f:query"  {}}
+                                        {"id"          "ex:freddy"
+                                         "type"        "ex:Yeti",
+                                         "schema:age"  1002,
+                                         "schema:name" "Freddy",}
+                                        {"id"          "ex:letty"
+                                         "type"        "ex:Yeti",
+                                         "schema:age"  38,
+                                         "schema:name" "Leticia"}]
+                           "f:retract" []}}
                 {"f:data" {"f:t"       2
                            "f:assert"  [{"ex:foo" 3, "id" "_:fdb-4"}],
                            "f:retract" []}}
@@ -1136,213 +1129,209 @@
                @(fluree/history ledger {:context context
                                         :data    true
                                         :t       {:from 1 :to :latest}}))))
+
       (testing ":commit :data :and txn can be composed together"
         (is (pred-match?
-              [{"f:txn" nil
-                "f:commit"
-                {"f:alias"    "authortest",
-                 "f:time"     720000,
-                 "f:previous" {"id" test-utils/commit-id?},
-                 "id"         test-utils/commit-id?
-                 "f:v"        1,
-                 "f:branch"   "main",
-                 "f:address"  test-utils/address?
-                 "f:data"
-                 {"f:address"  test-utils/address?
-                  "f:flakes"   16,
-                  "f:previous" {"id" test-utils/db-id?},
-                  "f:size"     pos-int?
-                  "f:t"        1,
-                  "id"         test-utils/db-id?}},
-                "f:data"
-                {"f:t"       1,
-                 "f:assert"
-                 [{"f:role" {"id" "ex:rootRole"},
-                   "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
-                  {"type"        "ex:Yeti",
-                   "schema:age"  55,
-                   "schema:name" "Betty",
-                   "id"          "ex:betty"}
-                  {"type"        "ex:Yeti",
-                   "schema:age"  1002,
-                   "schema:name" "Freddy",
-                   "id"          "ex:freddy"}
-                  {"type"        "ex:Yeti",
-                   "schema:age"  38,
-                   "schema:name" "Leticia",
-                   "id"          "ex:letty"}
-                  {"f:action"     [{"id" "f:modify"} {"id" "f:view"}],
-                   "f:targetRole" {"id" "ex:rootRole"},
-                   "id"           "ex:rootAccessAllow"}
-                  {"type"         "f:Policy",
-                   "f:allow"      {"id" "ex:rootAccessAllow"},
-                   "f:targetNode" {"id" "f:allNodes"},
-                   "id"           "ex:rootPolicy"}],
-                 "f:retract" []}}
-               {"f:txn"  jws1
-                "f:commit"
-                {"f:alias"    "authortest",
-                 "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-                 "f:time"     720000,
-                 "f:txn"      test-utils/address?
-                 "f:previous" {"id" test-utils/commit-id?},
-                 "id"         test-utils/commit-id?
-                 "f:v"        1,
-                 "f:branch"   "main",
-                 "f:address"  test-utils/address?
-                 "f:data"
-                 {"f:address"  test-utils/address?
-                  "f:flakes"   29,
-                  "f:previous" {"id" test-utils/db-id?},
-                  "f:size"     pos-int?
-                  "f:t"        2,
-                  "id"         test-utils/db-id?}},
-                "f:data" {"f:t"       2
-                          "f:assert"  [{"ex:foo" 3, "id" "_:fdb-4"}],
-                          "f:retract" []}}
-               {"f:txn"  jws2
-                "f:commit"
-                {"f:alias"    "authortest",
-                 "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-                 "f:time"     720000,
-                 "f:txn"      test-utils/address?
-                 "f:previous" {"id" test-utils/commit-id?},
-                 "id"         test-utils/commit-id?
-                 "f:v"        1,
-                 "f:branch"   "main",
-                 "f:address"  test-utils/address?
-                 "f:data"
-                 {"f:address"  test-utils/address?
-                  "f:flakes"   44,
-                  "f:previous" {"id" test-utils/db-id?},
-                  "f:size"     pos-int?
-                  "f:t"        3,
-                  "id"         test-utils/db-id?}},
-                "f:data" {"f:t"       3
-                          "f:assert"  [{"ex:foo" 5, "id" "_:fdb-6"}],
-                          "f:retract" []}}]
-              @(fluree/history ledger {:context context
-                                       :txn     true
-                                       :data    true
-                                       :commit  true
-                                       :t       {:from 1 :to :latest}}))))
+             [{"f:txn"    nil
+               "f:commit" {"f:alias"    "authortest",
+                           "f:time"     720000,
+                           "f:previous" {"id" test-utils/commit-id?},
+                           "id"         test-utils/commit-id?
+                           "f:v"        1,
+                           "f:branch"   "main",
+                           "f:address"  test-utils/address?
+                           "f:data"
+                           {"f:address"  test-utils/address?
+                            "f:flakes"   15,
+                            "f:previous" {"id" test-utils/db-id?},
+                            "f:size"     pos-int?
+                            "f:t"        1,
+                            "id"         test-utils/db-id?}},
+               "f:data"   {"f:t"       1,
+                           "f:assert"
+                           [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                             "f:policyClass" {"id" "ex:RootPolicy"}}
+                            {"type"        "ex:Yeti",
+                             "schema:age"  55,
+                             "schema:name" "Betty",
+                             "id"          "ex:betty"}
+                            {"id"       "ex:defaultAllowViewModify"
+                             "type"     ["f:AccessPolicy" "ex:RootPolicy"],
+                             "f:action" [{"id" "f:modify"} {"id" "f:view"}],
+                             "f:query"  {}}
+                            {"type"        "ex:Yeti",
+                             "schema:age"  1002,
+                             "schema:name" "Freddy",
+                             "id"          "ex:freddy"}
+                            {"type"        "ex:Yeti",
+                             "schema:age"  38,
+                             "schema:name" "Leticia",
+                             "id"          "ex:letty"}]
+                           "f:retract" []}}
+              {"f:txn"    jws1
+               "f:commit" {"f:alias"    "authortest",
+                           "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                           "f:time"     720000,
+                           "f:txn"      test-utils/address?
+                           "f:previous" {"id" test-utils/commit-id?},
+                           "id"         test-utils/commit-id?
+                           "f:v"        1,
+                           "f:branch"   "main",
+                           "f:address"  test-utils/address?
+                           "f:data"
+                           {"f:address"  test-utils/address?
+                            "f:flakes"   28,
+                            "f:previous" {"id" test-utils/db-id?},
+                            "f:size"     pos-int?
+                            "f:t"        2,
+                            "id"         test-utils/db-id?}},
+               "f:data"   {"f:t"       2
+                           "f:assert"  [{"ex:foo" 3, "id" "_:fdb-4"}],
+                           "f:retract" []}}
+              {"f:txn"    jws2
+               "f:commit" {"f:alias"    "authortest",
+                           "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                           "f:time"     720000,
+                           "f:txn"      test-utils/address?
+                           "f:previous" {"id" test-utils/commit-id?},
+                           "id"         test-utils/commit-id?
+                           "f:v"        1,
+                           "f:branch"   "main",
+                           "f:address"  test-utils/address?
+                           "f:data"
+                           {"f:address"  test-utils/address?
+                            "f:flakes"   43,
+                            "f:previous" {"id" test-utils/db-id?},
+                            "f:size"     pos-int?
+                            "f:t"        3,
+                            "id"         test-utils/db-id?}},
+               "f:data"   {"f:t"       3
+                           "f:assert"  [{"ex:foo" 5, "id" "_:fdb-6"}],
+                           "f:retract" []}}]
+             @(fluree/history ledger {:context context
+                                      :txn     true
+                                      :data    true
+                                      :commit  true
+                                      :t       {:from 1 :to :latest}}))))
+
       (testing ":commit :data :and txn can be composed together with history"
         (is (pred-match?
-              [{"f:t"       1,
-                "f:assert"  [{"type"        "ex:Yeti",
+             [{"f:t"       1,
+               "f:assert"  [{"type"        "ex:Yeti",
+                             "schema:age"  1002,
+                             "schema:name" "Freddy",
+                             "id"          "ex:freddy"}],
+               "f:retract" [],
+               "f:txn"     nil,
+               "f:commit"  {"f:alias"    "authortest",
+                            "f:time"     720000,
+                            "f:previous" {"id" test-utils/commit-id?},
+                            "id"         test-utils/commit-id?
+                            "f:v"        1,
+                            "f:branch"   "main",
+                            "f:address"  test-utils/address?
+                            "f:data"
+                            {"f:address"  test-utils/address?
+                             "f:flakes"   15,
+                             "f:previous" {"id" test-utils/db-id?},
+                             "f:size"     pos-int?,
+                             "f:t"        1,
+                             "id"         test-utils/db-id?}},
+               "f:data"    {"f:t"       1,
+                            "f:assert"
+                            [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                              "f:policyClass" {"id" "ex:RootPolicy"}}
+                             {"type"        "ex:Yeti",
+                              "schema:age"  55,
+                              "schema:name" "Betty",
+                              "id"          "ex:betty"}
+                             {"id"       "ex:defaultAllowViewModify"
+                              "type"     ["f:AccessPolicy" "ex:RootPolicy"],
+                              "f:action" [{"id" "f:modify"} {"id" "f:view"}],
+                              "f:query"  {}}
+                             {"type"        "ex:Yeti",
                               "schema:age"  1002,
                               "schema:name" "Freddy",
-                              "id"          "ex:freddy"}],
-                "f:retract" [],
-                "f:txn"     nil,
-                "f:commit"  {"f:alias"    "authortest",
-                             "f:time"     720000,
-                             "f:previous" {"id" test-utils/commit-id?},
-                             "id"         test-utils/commit-id?
-                             "f:v"        1,
-                             "f:branch"   "main",
-                             "f:address"  test-utils/address?
-                             "f:data"
-                             {"f:address"  test-utils/address?
-                              "f:flakes"   16,
-                              "f:previous" {"id" test-utils/db-id?},
-                              "f:size"     pos-int?,
-                              "f:t"        1,
-                              "id"         test-utils/db-id?}},
-                "f:data"    {"f:t"       1,
-                             "f:assert"
-                             [{"f:role" {"id" "ex:rootRole"},
-                               "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
-                              {"type"        "ex:Yeti",
-                               "schema:age"  55,
-                               "schema:name" "Betty",
-                               "id"          "ex:betty"}
-                              {"type"        "ex:Yeti",
-                               "schema:age"  1002,
-                               "schema:name" "Freddy",
-                               "id"          "ex:freddy"}
-                              {"type"        "ex:Yeti",
-                               "schema:age"  38,
-                               "schema:name" "Leticia",
-                               "id"          "ex:letty"}
-                              {"f:action"     [{"id" "f:modify"} {"id" "f:view"}],
-                               "f:targetRole" {"id" "ex:rootRole"},
-                               "id"           "ex:rootAccessAllow"}
-                              {"type"         "f:Policy",
-                               "f:allow"      {"id" "ex:rootAccessAllow"},
-                               "f:targetNode" {"id" "f:allNodes"},
-                               "id"           "ex:rootPolicy"}],
-                             "f:retract" []}}]
-              @(fluree/history ledger {:context context
-                                       :history "ex:freddy"
-                                       :txn     true
-                                       :data    true
-                                       :commit  true
-                                       :t       {:from 1 :to :latest}}))))
+                              "id"          "ex:freddy"}
+                             {"type"        "ex:Yeti",
+                              "schema:age"  38,
+                              "schema:name" "Leticia",
+                              "id"          "ex:letty"}],
+                            "f:retract" []}}]
+             @(fluree/history ledger {:context context
+                                      :history "ex:freddy"
+                                      :txn     true
+                                      :data    true
+                                      :commit  true
+                                      :t       {:from 1 :to :latest}}))))
+
       (testing ":commit :data :and txn can be composed together with commit-details"
         (is (pred-match?
-              [{"f:t"       1,
-                "f:assert"  [{"type"        "ex:Yeti",
+             [{"f:t"       1,
+               "f:assert"  [{"type"        "ex:Yeti",
+                             "schema:age"  1002,
+                             "schema:name" "Freddy",
+                             "id"          "ex:freddy"}],
+               "f:retract" [],
+               "f:txn"     nil,
+               "f:commit"  {"f:alias"    "authortest",
+                            "f:time"     720000,
+                            "f:previous" {"id" test-utils/commit-id?},
+                            "id"         test-utils/commit-id?
+                            "f:v"        1,
+                            "f:branch"   "main",
+                            "f:address"  test-utils/address?
+                            "f:data"
+                            {"f:address"  test-utils/address?
+                             "f:flakes"   15,
+                             "f:previous" {"id" test-utils/db-id?},
+                             "f:size"     pos-int?
+                             "f:t"        1,
+                             "id"         test-utils/db-id?}}
+               "f:data"    {"f:t"       1,
+                            "f:assert"
+                            [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                              "f:policyClass" {"id" "ex:RootPolicy"}}
+                             {"type"        "ex:Yeti",
+                              "schema:age"  55,
+                              "schema:name" "Betty",
+                              "id"          "ex:betty"}
+                             {"id"       "ex:defaultAllowViewModify"
+                              "type"     ["f:AccessPolicy" "ex:RootPolicy"],
+                              "f:action" [{"id" "f:modify"} {"id" "f:view"}],
+                              "f:query"  {}}
+                             {"type"        "ex:Yeti",
                               "schema:age"  1002,
                               "schema:name" "Freddy",
-                              "id"          "ex:freddy"}],
-                "f:retract" [],
-                "f:txn"     nil,
-                "f:commit"  {"f:alias"    "authortest",
-                             "f:time"     720000,
-                             "f:previous" {"id" test-utils/commit-id?},
-                             "id"         test-utils/commit-id?
-                             "f:v"        1,
-                             "f:branch"   "main",
-                             "f:address"  test-utils/address?
-                             "f:data"
-                             {"f:address"  test-utils/address?
-                              "f:flakes"   16,
-                              "f:previous" {"id" test-utils/db-id?},
-                              "f:size"     pos-int?
-                              "f:t"        1,
-                              "id"         test-utils/db-id?}}
-                "f:data"    {"f:t"       1,
-                             "f:assert"
-                             [{"f:role" {"id" "ex:rootRole"},
-                               "id"     "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"}
-                              {"type"        "ex:Yeti",
-                               "schema:age"  55,
-                               "schema:name" "Betty",
-                               "id"          "ex:betty"}
-                              {"type"        "ex:Yeti",
-                               "schema:age"  1002,
-                               "schema:name" "Freddy",
-                               "id"          "ex:freddy"}
-                              {"type"        "ex:Yeti",
-                               "schema:age"  38,
-                               "schema:name" "Leticia",
-                               "id"          "ex:letty"}
-                              {"f:action"     [{"id" "f:modify"} {"id" "f:view"}],
-                               "f:targetRole" {"id" "ex:rootRole"},
-                               "id"           "ex:rootAccessAllow"}
-                              {"type"         "f:Policy",
-                               "f:allow"      {"id" "ex:rootAccessAllow"},
-                               "f:targetNode" {"id" "f:allNodes"},
-                               "id"           "ex:rootPolicy"}],
-                             "f:retract" []}}]
-              @(fluree/history ledger {:context        context
-                                       :history        "ex:freddy"
-                                       :commit-details true
-                                       :txn            true
-                                       :data           true
-                                       :commit         true
-                                       :t              {:from 1 :to :latest}})))))))
+                              "id"          "ex:freddy"}
+                             {"type"        "ex:Yeti",
+                              "schema:age"  38,
+                              "schema:name" "Leticia",
+                              "id"          "ex:letty"}
+                             {"f:action"     [{"id" "f:modify"} {"id" "f:view"}],
+                              "f:targetRole" {"id" "ex:rootRole"},
+                              "id"           "ex:rootAccessAllow"}
+                             {"type"         "f:Policy",
+                              "f:allow"      {"id" "ex:rootAccessAllow"},
+                              "f:targetNode" {"id" "f:allNodes"},
+                              "id"           "ex:rootPolicy"}],
+                            "f:retract" []}}]
+             @(fluree/history ledger {:context        context
+                                      :history        "ex:freddy"
+                                      :txn            true
+                                      :data           true
+                                      :commit         true
+                                      :t              {:from 1 :to :latest}})))))))
 
 (deftest ^:integration txn-annotation
   (let [bnode-counter (atom 0)
 
-        conn        @(fluree/connect {:method :memory})
-        ledger-name "annotationtest"
-        ledger      @(fluree/create conn ledger-name)
-        context     [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
+        conn          @(fluree/connect {:method :memory})
+        ledger-name   "annotationtest"
+        ledger        @(fluree/create conn ledger-name)
+        context       [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
 
-        db0 (fluree/db ledger)]
+        db0           (fluree/db ledger)]
     (testing "valid annotations"
       (with-redefs [fluree.db.util.core/current-time-iso    (fn [] "1970-01-01T00:12:00.00000Z")
                     fluree.db.json-ld.iri/new-blank-node-id (fn [] (str "_:fdb-" (swap! bnode-counter inc)))]

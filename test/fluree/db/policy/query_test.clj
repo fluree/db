@@ -38,21 +38,25 @@
                                    {"@id"     alice-did
                                     "ex:user" {"@id" "ex:alice"}}]})
 
-          policy    [{"@context"     {"ex"     "http://example.org/ns/"
-                                      "schema" "http://schema.org/"
-                                      "f"      "https://ns.flur.ee/ledger#"}
-                      "@id"          "ex:ssnRestriction"
-                      "@type"        ["f:AccessPolicy"]
-                      "f:onProperty" [{"@id" "schema:ssn"}]
-                      "f:action"     {"@id" "f:view"}
-                      "f:query"      {"@type"  "@json"
-                                      "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                                "where"    {"@id"     "?$identity"
-                                                            "ex:user" {"@id" "?$this"}}}}}]
+          policy    {"@context" {"ex"     "http://example.org/ns/"
+                                 "schema" "http://schema.org/"
+                                 "f"      "https://ns.flur.ee/ledger#"}
+                     "@graph"   [{"@id"          "ex:ssnRestriction"
+                                  "@type"        ["f:AccessPolicy"]
+                                  "f:onProperty" [{"@id" "schema:ssn"}]
+                                  "f:action"     {"@id" "f:view"}
+                                  "f:query"      {"@type"  "@json"
+                                                  "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                            "where"    {"@id"     "?$identity"
+                                                                        "ex:user" {"@id" "?$this"}}}}}
+                                 {"@id"      "ex:defaultAllowView"
+                                  "@type"    ["f:AccessPolicy"]
+                                  "f:action" {"@id" "f:view"}
+                                  "f:query"  {"@type"  "@json"
+                                              "@value" {}}}]}
 
-          policy-db @(fluree/wrap-policy db policy true
-                                         {"?$identity" {"@value" alice-did
-                                                        "@type"  "@id"}})]
+          policy-db @(fluree/wrap-policy db policy {"?$identity" {"@value" alice-did
+                                                                  "@type"  "@id"}})]
 
       (testing " with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
@@ -140,24 +144,29 @@
                                           "ex:user"           {"@id" "ex:john"}
                                           "ex:productManager" {"@id" "ex:widget"}}]})
 
-          policy          {"@context"  {"ex"     "http://example.org/ns/"
-                                        "schema" "http://schema.org/"
-                                        "f"      "https://ns.flur.ee/ledger#"}
-                           "@id"       "ex:productPropertyRestriction"
-                           "@type"     ["f:AccessPolicy"]
-                           "f:onClass" [{"@id" "ex:Product"}]
-                           "f:action"  {"@id" "f:view"}
-                           "f:query"   {"@type"  "@json"
-                                        "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                                  "where"    [{"@id"               "?$identity"
-                                                               "ex:productManager" {"@id" "?$this"}}]}}}
+          policy          {"@context" {"ex"     "http://example.org/ns/"
+                                       "schema" "http://schema.org/"
+                                       "f"      "https://ns.flur.ee/ledger#"}
+                           "@graph"   [{"@id"       "ex:productPropertyRestriction"
+                                        "@type"     ["f:AccessPolicy"]
+                                        "f:onClass" [{"@id" "ex:Product"}]
+                                        "f:action"  {"@id" "f:view"}
+                                        "f:query"   {"@type"  "@json"
+                                                     "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                               "where"    [{"@id"               "?$identity"
+                                                                            "ex:productManager" {"@id" "?$this"}}]}}}
+                                       {"@id"      "ex:defaultAllowView"
+                                        "@type"    ["f:AccessPolicy"]
+                                        "f:action" {"@id" "f:view"}
+                                        "f:query"  {"@type"  "@json"
+                                                    "@value" {}}}]}
           john-policy-db  @(fluree/wrap-policy
-                            db policy true
+                            db policy
                             {"?$identity" {"@value" john-did
                                            "@type"  "@id"}})
 
           alice-policy-db @(fluree/wrap-policy
-                            db policy true
+                            db policy
                             {"?$identity" {"@value" alice-did
                                            "@type"  "@id"}})]
 
@@ -220,20 +229,26 @@
                                                        {"@id" "ex:data-2"}]}
                                       ]})
 
-          policy       {"@context"  {"ex" "http://example.org/ns/"
-                                     "f"  "https://ns.flur.ee/ledger#"}
-                        "@id"       "ex:unclassRestriction"
-                        "@type"     ["f:AccessPolicy", "ex:UnclassPolicy"]
-                        "f:onClass" [{"@id" "ex:Data"}]
-                        "f:action"  [{"@id" "f:view"}, {"@id" "f:modify"}]
-                        "f:query"   {"@type"  "@json"
-                                     "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                               "where"    [{"@id"               "?$this"
-                                                            "ex:classification" "?c"}
-                                                           ["filter", "(< ?c 1)"]]}}}
-          policy-allow @(fluree/wrap-policy db policy true)
+          policy       [{"@context"  {"ex" "http://example.org/ns/"
+                                      "f"  "https://ns.flur.ee/ledger#"}
+                         "@id"       "ex:unclassRestriction"
+                         "@type"     ["f:AccessPolicy", "ex:UnclassPolicy"]
+                         "f:onClass" [{"@id" "ex:Data"}]
+                         "f:action"  [{"@id" "f:view"}, {"@id" "f:modify"}]
+                         "f:query"   {"@type"  "@json"
+                                      "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                "where"    [{"@id"               "?$this"
+                                                             "ex:classification" "?c"}
+                                                            ["filter", "(< ?c 1)"]]}}}]
+          policy-allow @(fluree/wrap-policy db (conj policy {"@context" {"ex" "http://example.org/ns/"
+                                                                         "f"  "https://ns.flur.ee/ledger#"}
+                                                             "@id"      "ex:defaultAllowView"
+                                                             "@type"    ["f:AccessPolicy"]
+                                                             "f:action" {"@id" "f:view"}
+                                                             "f:query"  {"@type"  "@json"
+                                                                         "@value" {}}}))
 
-          policy-deny  @(fluree/wrap-policy db policy false)
+          policy-deny  @(fluree/wrap-policy db policy)
 
           data-query   {"@context" {"ex" "http://example.org/ns/"},
                         "where"    {"@id"   "?s",

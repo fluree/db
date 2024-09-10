@@ -45,9 +45,14 @@
                                     "f:query"      {"@type"  "@json"
                                                     "@value" {"@context" {"ex" "http://example.org/ns/"}
                                                               "where"    {"@id"     "?$identity"
-                                                                          "ex:user" {"@id" "?$this"}}}}}]})
+                                                                          "ex:user" {"@id" "?$this"}}}}}
+                                   {"@id"      "ex:defaultAllowView"
+                                    "@type"    ["f:AccessPolicy" "ex:EmployeePolicy"]
+                                    "f:action" {"@id" "f:view"}
+                                    "f:query"  {"@type"  "@json"
+                                                "@value" {}}}]})
 
-          policy-db @(fluree/wrap-identity-policy db alice-did true)]
+          policy-db @(fluree/wrap-identity-policy db alice-did)]
 
       (testing " with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
