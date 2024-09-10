@@ -132,10 +132,8 @@
                       "type"          "ct:User"
                       "ct:name"       "Plebian"
                       "f:policyClass" {"@id" "ct:DefaultUserPolicy"}}
-           policy    {"@context"    {"ex"     "http://example.org/ns/"
-                                     "schema" "http://schema.org/"
-                                     "f"      "https://ns.flur.ee/ledger#"
-                                     "ct"     "ledger:credentialtest/"}
+           policy    {"@context"    {"f"  "https://ns.flur.ee/ledger#"
+                                     "ct" "ledger:credentialtest/"}
                       "@id"         "ct:userPolicy"
                       "@type"       ["f:AccessPolicy" "ct:DefaultUserPolicy"]
                       "f:onClass"   [{"@id" "ct:User"}]
@@ -143,7 +141,14 @@
                       "f:exMessage" "Users can only manage their own data."
                       "f:query"     {"@type"  "@json"
                                      "@value" {"where" [["filter" "(= ?$this ?$identity)"]]}}}
-           tx        [root-user pleb-user policy]
+           d-policy  {"@context" {"f"  "https://ns.flur.ee/ledger#"
+                                  "ct" "ledger:credentialtest/"}
+                      "@id"      "ct:defaultAllowViewModify"
+                      "@type"    ["f:AccessPolicy" "ct:DefaultUserPolicy"]
+                      "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
+                      "f:query"  {"@type"  "@json"
+                                  "@value" {}}}
+           tx        [root-user pleb-user policy d-policy]
            ;; can't use credentials until after an identity with a role has been created
            db1       @(fluree/transact! conn {"@context" ["https://ns.flur.ee" context]
                                               "ledger"   ledger-id
@@ -186,10 +191,11 @@
                 (async/<!! (cred/generate query (:private pleb-auth)))))
            "query credential w/ policy forbidding access")
 
-       (is (= [{"id"         (:id auth)
-                "type"       "ct:User"
-                "ct:name"    "D"
-                "ct:favnums" [2 3 4 5 6]}]
+       (is (= [{"id"            (:id auth)
+                "type"          "ct:User"
+                "ct:name"       "D"
+                "ct:favnums"    [2 3 4 5 6]
+                "f:policyClass" {"id" "ct:DefaultUserPolicy"}}]
               @(fluree/credential-query
                 db2
                 (async/<!! (cred/generate query (:private auth)))))
@@ -202,10 +208,11 @@
            "query credential w/ no roles")
 
        (is (= [{"f:t"       2,
-                "f:assert"  [{"id"         (:id auth)
-                              "type"       "ct:User"
-                              "ct:name"    "Daniel"
-                              "ct:favnums" [1 2 3]}],
+                "f:assert"  [{"id"            (:id auth)
+                              "type"          "ct:User"
+                              "ct:name"       "Daniel"
+                              "ct:favnums"    [1 2 3]
+                              "f:policyClass" {"id" "ct:DefaultUserPolicy"}}],
                 "f:retract" []}
 
                {"f:t"       3,

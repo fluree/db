@@ -1,6 +1,8 @@
 (ns fluree.db.json-ld.policy.query
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
@@ -9,45 +11,62 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn class-restrictions?
-  [policy]
-  (get-in policy [const/iri-view :class]))
-
-(defn property-restrictions?
-  [policy]
-  (get-in policy [const/iri-view :property]))
-
 (defn unrestricted?
-  [{:keys [policy] :as _db}]
-  (enforce/unrestricted-view? policy))
+  [db]
+  (enforce/unrestricted-view? (:policy db)))
+
+;; TODO - could cache resolved policies and not  just classes
+;; TODO - need to look for any other use of (:cache policy) to see
+(defn cached-class-policies
+  [policy sid]
+  (when-let [classes (get @(:cache policy) sid)]
+    (enforce/policies-for-classes policy false classes)))
+
+(defn class-policies
+  [{:keys [policy] :as db} sid]
+  (go-try
+   (let [class-sids (<? (dbproto/-class-ids db sid))]
+     (swap! (:cache policy) assoc sid class-sids)
+     (enforce/policies-for-classes policy false class-sids))))
 
 (defn allow-flake?
   "Returns one of:
   (a) exception if there was an error
   (b) truthy value if flake is allowed
-  (c) falsey value if flake not allowed"
+  (c) falsey value if flake not allowed
+
+  Note: does not check here for unrestricted-view? as that should
+  happen upstream. Assumes this is a policy-wrapped db if it ever
+  hits this fn."
   [{:keys [policy] :as db} flake]
   (go-try
-   (cond
-
-     (enforce/unrestricted-view? policy)
-     true
-
-     ;; currently property-restrictions override class restrictions if present
-     (property-restrictions? policy)
-     (<? (enforce/property-allow? db false flake))
-
-     (class-restrictions? policy)
-     (let [sid (flake/s flake)]
-       (<? (enforce/class-allow? db sid false nil)))
-
-     :else ;; no restrictions, use default
-     (:default-allow? policy))))
+   (let [pid     (flake/p flake)
+         sid     (flake/s flake)
+         val-map (:values-map policy)]
+     (if-let [p-policies (enforce/policies-for-property policy false pid)]
+       (<? (enforce/policies-allow? db false sid val-map p-policies))
+       (if-let [c-policies (or (cached-class-policies policy sid)
+                               (<? (class-policies db sid)))]
+         (<? (enforce/policies-allow? db false sid val-map c-policies))
+         (if-let [d-policies (enforce/default-policies policy false)]
+           (<? (enforce/policies-allow? db false sid val-map d-policies))
+           false))))))
 
 (defn allow-iri?
-  [db sid]
-  (let [id-flake (flake/create sid const/$id nil nil nil nil nil)]
-    (allow-flake? db id-flake)))
+  "Returns async channel with truthy value if iri is visible for query results"
+  [db iri]
+  (if (unrestricted? db)
+    (go true)
+    (try*
+      (let [sid      (iri/encode-iri db iri)
+            id-flake (flake/create sid const/$id nil nil nil nil nil)]
+        (allow-flake? db id-flake))
+      (catch* e
+        (log/error e "Unexpected exception in allow-iri? checking permission for iri: " iri)
+        (go (ex-info (str "Unexpected exception in allow-iri? checking permission for iri: " iri
+                          "Exception encoding IRI to internal format.")
+                     {:status 500
+                      :error :db/unexpected-error}))))))
 
 (defn filter-flakes
   "Iterates over multiple flakes and returns the allowed flakes from policy, or

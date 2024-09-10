@@ -173,37 +173,37 @@
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
                                          :where   {:id '?s, '?p '?o}})]
-          (is (= [["fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3"
+          (is (= [["fluree:db:sha256:bvktsmao5ivreittrb4scd3hkc4qkefhqg42va3npk64dbmss4qt"
                    :f/address
-                   "fluree:memory://29f8788bdf21c7b8f19b15819f5f24bc71f2b2c045c1cb5f6e1233c21ccd798d"]
-                  ["fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3" :f/flakes 11]
-                  ["fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3"
+                   "fluree:memory://9269ae5eb352ef74fb9c78c0c8b18740f8ac497262e6dbb015fdec89e8bc7a1e"]
+                  ["fluree:db:sha256:bvktsmao5ivreittrb4scd3hkc4qkefhqg42va3npk64dbmss4qt" :f/flakes 11]
+                  ["fluree:db:sha256:bvktsmao5ivreittrb4scd3hkc4qkefhqg42va3npk64dbmss4qt"
                    :f/previous
                    "fluree:db:sha256:beuoec4c6zqxfjglld3evwjdtavsdktncoh6bbxiz677cc4zz3qr"]
-                  ["fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3" :f/size 1058]
-                  ["fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3" :f/t 1]
-                  ["fluree:commit:sha256:bbh3gbgrnfozcozryv4z3l55tfceif5htatcqtwp6zt7kd222prmg"
+                  ["fluree:db:sha256:bvktsmao5ivreittrb4scd3hkc4qkefhqg42va3npk64dbmss4qt" :f/size 1076]
+                  ["fluree:db:sha256:bvktsmao5ivreittrb4scd3hkc4qkefhqg42va3npk64dbmss4qt" :f/t 1]
+                  ["fluree:commit:sha256:bbvx22pr244fz6p3d35qmlxrrekzzspvbzobi6mael5q5trr63jet"
                    "https://www.w3.org/2018/credentials#issuer"
                    "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                  ["fluree:commit:sha256:bbh3gbgrnfozcozryv4z3l55tfceif5htatcqtwp6zt7kd222prmg"
+                  ["fluree:commit:sha256:bbvx22pr244fz6p3d35qmlxrrekzzspvbzobi6mael5q5trr63jet"
                    :f/address
-                   "fluree:memory://cff6533453e86637179aa051a2a6fc388b35a30b04481f78c1a4cef0619e2bef"]
-                  ["fluree:commit:sha256:bbh3gbgrnfozcozryv4z3l55tfceif5htatcqtwp6zt7kd222prmg"
+                   "fluree:memory://620f646cc34bde06470c84b5caa03bd67b164daab7382b4e6e3e826b72e0abfc"]
+                  ["fluree:commit:sha256:bbvx22pr244fz6p3d35qmlxrrekzzspvbzobi6mael5q5trr63jet"
                    :f/alias
                    "query/everything"]
-                  ["fluree:commit:sha256:bbh3gbgrnfozcozryv4z3l55tfceif5htatcqtwp6zt7kd222prmg"
+                  ["fluree:commit:sha256:bbvx22pr244fz6p3d35qmlxrrekzzspvbzobi6mael5q5trr63jet"
                    :f/branch
                    "main"]
-                  ["fluree:commit:sha256:bbh3gbgrnfozcozryv4z3l55tfceif5htatcqtwp6zt7kd222prmg"
+                  ["fluree:commit:sha256:bbvx22pr244fz6p3d35qmlxrrekzzspvbzobi6mael5q5trr63jet"
                    :f/data
-                   "fluree:db:sha256:bb2uy627whhmg66jhzqbncmwoc6wnjt6kboqzhmo6uomab53auug3"]
-                  ["fluree:commit:sha256:bbh3gbgrnfozcozryv4z3l55tfceif5htatcqtwp6zt7kd222prmg"
+                   "fluree:db:sha256:bvktsmao5ivreittrb4scd3hkc4qkefhqg42va3npk64dbmss4qt"]
+                  ["fluree:commit:sha256:bbvx22pr244fz6p3d35qmlxrrekzzspvbzobi6mael5q5trr63jet"
                    :f/previous
                    "fluree:commit:sha256:bbyuz7tgv5akbruljy4czxu47izkeanawa5fqyt7kwezhckp3g5ew"]
-                  ["fluree:commit:sha256:bbh3gbgrnfozcozryv4z3l55tfceif5htatcqtwp6zt7kd222prmg"
+                  ["fluree:commit:sha256:bbvx22pr244fz6p3d35qmlxrrekzzspvbzobi6mael5q5trr63jet"
                    :f/time
                    720000]
-                  ["fluree:commit:sha256:bbh3gbgrnfozcozryv4z3l55tfceif5htatcqtwp6zt7kd222prmg"
+                  ["fluree:commit:sha256:bbvx22pr244fz6p3d35qmlxrrekzzspvbzobi6mael5q5trr63jet"
                    :f/v
                    1]
                   [:ex/alice :type :ex/User]
