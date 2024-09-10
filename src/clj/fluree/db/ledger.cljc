@@ -62,19 +62,21 @@
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
-  [{:keys [address alias] :as ledger} requested-branch]
-  (let [branch-data (get-branch-meta ledger requested-branch)
-        current-db  (branch/current-db branch-data)
-        {:keys [commit stats t]} current-db
-        {:keys [size flakes]} stats
-        branch (or requested-branch (:branch @(:state ledger)))]
-    {:address address
-     :alias   alias
-     :branch  branch
-     :t       t
-     :size    size
-     :flakes  flakes
-     :commit  commit}))
+  ([ledger]
+   (status ledger "main"))
+  ([{:keys [address alias] :as ledger} requested-branch]
+   (let [branch-data (get-branch-meta ledger requested-branch)
+         current-db  (branch/current-db branch-data)
+         {:keys [commit stats t]} current-db
+         {:keys [size flakes]} stats
+         branch (or requested-branch (:branch @(:state ledger)))]
+     {:address address
+      :alias   alias
+      :branch  branch
+      :t       t
+      :size    size
+      :flakes  flakes
+      :commit  commit})))
 
 (defn parse-commit-options
   "Parses the commit options and removes non-public opts."
