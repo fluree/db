@@ -33,6 +33,7 @@
                 ::sort-fn  result-sort}})
 
 (defn- prop-iri
+  "Returns property IRI value from triple"
   [triple]
   (-> triple (nth 1) ::where/iri))
 
@@ -67,27 +68,28 @@
     (let [metric (extract-metric graph-alias)]
       (reduce
        (fn [acc triple]
-         (cond
-           (= iri-compare (prop-iri triple))
-           (assoc acc ::compare (obj-val triple solution))
+         (let [p-iri (prop-iri triple)]
+           (cond
+             (= iri-compare p-iri)
+             (assoc acc ::compare (obj-val triple solution))
 
-           (= iri-property (prop-iri triple))
-           (assoc acc ::property (obj-iri triple))
+             (= iri-property p-iri)
+             (assoc acc ::property (obj-iri triple))
 
-           (= iri-limit (prop-iri triple))
-           (assoc acc ::limit (obj-val triple solution))
+             (= iri-limit p-iri)
+             (assoc acc ::limit (obj-val triple solution))
 
-           (= iri-id (prop-iri triple))
-           (assoc-in acc [::result ::id] (obj-var triple))
+             (= iri-id p-iri)
+             (assoc-in acc [::result ::id] (obj-var triple))
 
-           (= iri-score (prop-iri triple))
-           (assoc-in acc [::result ::score] (obj-var triple))
+             (= iri-score p-iri)
+             (assoc-in acc [::result ::score] (obj-var triple))
 
-           (= iri-vector (prop-iri triple))
-           (assoc-in acc [::result ::vector] (obj-var triple))
+             (= iri-vector p-iri)
+             (assoc-in acc [::result ::vector] (obj-var triple))
 
-           :else
-           acc))
+             :else
+             acc)))
        {::metric metric}
        graph-triples))
     (catch* e
