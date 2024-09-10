@@ -2,14 +2,15 @@
   (:require [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [clojure.string :as str]
             [fluree.db.vector.scoring :as vector.score]
             #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc]))
-  #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
-                              LocalDateTime ZoneOffset)
+  #?(:clj (:import (java.time LocalDate LocalTime LocalDateTime
+                              OffsetDateTime OffsetTime ZoneOffset)
                    (java.time.format DateTimeFormatter))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -50,17 +51,28 @@
    const/iri-xsd-base64Binary       const/$xsd:base64Binary
    const/iri-anyURI                 const/$xsd:anyURI
    const/iri-lang-string            const/$rdf:langString
-   const/iri-json                   const/$rdf:json
+   const/iri-rdf-json               const/$rdf:json
    const/iri-vector                 const/$fluree:vector})
 
-(def time-types
-  #{const/$xsd:date
-    const/$xsd:dateTime
-    const/$xsd:time})
+(def JSON-LD-inferable-types
+  "Note these are inferable types for JSON-LD.
+  Turtle (ttl) also has inferable types that differ
+  slightly. In ttl, a normal fraction number (e.g. 1.23)
+  would translate into xsd:decimal, and a number that uses
+  'e' notation would translate into xsd:double (e.g. 1.23e0):
+  https://www.w3.org/TR/turtle/#abbrev"
+  #{const/$xsd:string
+    const/$xsd:boolean
+    const/$xsd:integer
+    const/$xsd:double})
 
-(defn time-type?
+(defn inferable?
+  "Returns true if the provided data type is one that can be inferred from the value.
+  Note this is for JSON-LD inferable types only:
+  https://www.w3.org/TR/json-ld11/#conversion-of-native-data-types
+  Includes: xsd:string, xsd:boolean, xsd:integer, xsd:double "
   [dt]
-  (contains? time-types dt))
+  (contains? JSON-LD-inferable-types dt))
 
 (def iso8601-offset-pattern
   "(Z|(?:[+-][0-9]{2}:[0-9]{2}))?")
@@ -105,10 +117,9 @@
      (string? x)  (if lang
                     const/$rdf:langString
                     const/$xsd:string)
-     (integer? x) const/$xsd:long ; infer to long to prevent overflow
-     (number? x)  const/$xsd:decimal
-     (boolean? x) const/$xsd:boolean
-     (iri/iri? x) const/$id)))
+     (integer? x) const/$xsd:integer
+     (number? x)  const/$xsd:double
+     (boolean? x) const/$xsd:boolean)))
 
 (defn infer-iri
   ([x]
@@ -228,13 +239,25 @@
          :cljs (let [n (js/parseFloat value)] (if (js/Number.isNaN n) nil n))))
 
     (float? value)
+    ;; convert to string first to keep float precision explosion at bay
+    #?(:clj (Double/parseDouble (Float/toString value))
+       :cljs value)
+
+    (double? value)
     value
 
     (integer? value)
     #?(:clj  (Double/parseDouble (str value ".0"))
        :cljs value)
 
-    :else nil))
+    :else
+    #?(:clj (when (decimal? value) ;; our json parsing library turns decimals into BigDecimal
+              (try (double value)
+                   (catch Exception _
+                     (throw (ex-info (str "xsd:double value exceeds maximum 64-bit float range: " value)
+                                     {:status 400
+                                      :error  :db/invalid-value})))))
+       :cljs nil)))
 
 (defn- coerce-float
   [value]
@@ -251,11 +274,26 @@
     (float? value)
     value
 
+    (double? value)
+    #?(:clj (try (float value)
+                 (catch Exception _
+                   (throw (ex-info (str "xsd:float value exceeds maximum 32-bit float range: " value)
+                                   {:status 400
+                                    :error  :db/invalid-value}))))
+       :cljs value)
+
     (integer? value)
     #?(:clj  (Float/parseFloat (str value ".0"))
        :cljs value)
 
-    :else nil))
+    :else
+    #?(:clj (when (decimal? value) ;; our json parsing library turns decimals into BigDecimal
+              (try (float value)
+                   (catch Exception _
+                     (throw (ex-info (str "xsd:float value exceeds maximum 32-bit float range: " value)
+                                     {:status 400
+                                      :error  :db/invalid-value})))))
+       :cljs nil)))
 
 (defn- coerce-int-fn
   "Returns a fn for coercing int-like values (e.g. short, long) from strings and
@@ -313,18 +351,23 @@
 (defn- coerce-json
   [value]
   (try*
-   (json-ld/normalize-data value)
-   (catch* e
-           (throw (ex-info (str "Unable to normalize value to json" value)
-                           {:status 400
-                            :error  :db/invalid-json}
-                           e)))))
+    (if (string? value)
+      value
+      (json-ld/normalize-data value))
+    (catch* e
+            (throw (ex-info (str "Unable to normalize value to json" value)
+                            {:status 400
+                             :error  :db/invalid-json}
+                            e)))))
 
 (defn- coerce-dense-vector
   [value]
   (try*
-   (vector.score/vectorize value)
-   (catch* e
+    (if (string? value)
+      (-> (json/parse value nil)
+          (vector.score/vectorize))
+      (vector.score/vectorize value))
+    (catch* e
            (log/error e "Unrecognized value for dense vector: " value)
            (throw (ex-info (str "Unrecognized value for dense vector: " value)
                            {:status 400
@@ -342,7 +385,7 @@
       (if (>= 0 n) nil n)
 
       (const/$xsd:nonNegativeInteger const/$xsd:unsignedInt
-       const/$xsd:unsignedLong const/$xsd:unsignedByte const/$xsd:unsignedShort)
+       const/$xsd:unsignedLong const/$xsd:unsignedByte)
       (if (> 0 n) nil n)
 
       const/$xsd:negativeInteger
@@ -350,6 +393,9 @@
 
       const/$xsd:nonPositiveInteger
       (if (< 0 n) nil n)
+
+      const/$xsd:unsignedShort
+      (when (>= 65535 n 0) n)
 
       ;; else
       n)))
@@ -369,12 +415,6 @@
     (when (string? value)
       value)
 
-    const/$id
-    (if (iri/iri? value)
-      value
-      (when (string? value)
-        (iri/string->iri value)))
-
     const/$xsd:boolean
     (coerce-boolean value)
 
@@ -383,8 +423,14 @@
       (parse-iso8601-date value))
 
     const/$xsd:dateTime
-    (when (string? value)
-      (parse-iso8601-datetime value))
+    (cond (string? value)
+          (parse-iso8601-datetime value)
+          ;; these values don't need coercion
+          (or (instance? OffsetDateTime value)
+              (instance? LocalDateTime value))
+          value)
+
+
 
     const/$xsd:time
     (when (string? value)
@@ -399,15 +445,19 @@
     const/$xsd:float
     (coerce-float value)
 
-    (const/$xsd:integer const/$xsd:int const/$xsd:unsignedInt
-     const/$xsd:nonPositiveInteger const/$xsd:positiveInteger
-     const/$xsd:nonNegativeInteger const/$xsd:negativeInteger)
+    ;; ·maxInclusive· to be 2147483647 and ·minInclusive· to be -2147483648
+    ;; https://www.w3.org/TR/xmlschema-2/#int
+    (const/$xsd:int const/$xsd:unsignedShort) ;; unsigned short will be outside of 'Short' value range
     (-> value coerce-integer (check-signed required-type))
 
-    (const/$xsd:long const/$xsd:unsignedLong)
+    ;; xsd:integer and parent of long and others - different from xsd:int which is 32-bit
+    (const/$xsd:integer const/$xsd:long
+     const/$xsd:nonNegativeInteger const/$xsd:unsignedLong
+     const/$xsd:positiveInteger const/$xsd:unsignedInt ;; unsigned int can be outside of xsd:int max range
+     const/$xsd:nonPositiveInteger const/$xsd:negativeInteger)
     (-> value coerce-long (check-signed required-type))
 
-    (const/$xsd:short const/$xsd:unsignedShort)
+    const/$xsd:short
     (-> value coerce-short (check-signed required-type))
 
     (const/$xsd:byte const/$xsd:unsignedByte)
@@ -426,22 +476,31 @@
     (coerce-dense-vector value)
 
     ;; else
-    value))
+    (if (or (string? value)
+            (number? value)
+            (boolean? value))
+      value
+      (throw (ex-info (str "Custom data types must be a string, number or boolean per JSON-LD spec. "
+                           "Attempted custom datatype value of: " value)
+                      {:status 400
+                       :error :db/invalid-datatype})))))
 
 (defn from-expanded
   "Returns a tuple of the value (possibly coerced from string) and the data type sid from
   an expanded json-ld value map. If type is defined but not a predefined data type, will
   return nil prompting downstream process to look up (or create) a custom data
   type. Value coercion is only attempted when a required-type is supplied."
-  [{:keys [type value] :as _value-map} required-type]
-  (let [type-id (if type (get default-data-types type) (infer value))
-        to-type (if required-type required-type type-id)
-        value* (coerce value to-type)]
+  [db {:keys [type value] :as _value-map}]
+  (let [type-id (if type
+                  (or (get default-data-types type)
+                      (iri/encode-iri db type))
+                  (infer value))
+        value* (coerce value type-id)]
     (if (nil? value*)
-      (throw (ex-info (str "Data type " to-type
+      (throw (ex-info (str "Data type " (iri/sid->iri type-id)
                            " cannot be coerced from provided value: " value ".")
                       {:status 400 :error, :db/shacl-value-coercion}))
-      [value* to-type])))
+      [value* type-id])))
 
 (defn coerce-value
   "Attempt to coerce the value into an in-memory instance of the supplied datatype. If no

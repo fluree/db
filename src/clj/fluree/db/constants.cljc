@@ -78,6 +78,7 @@
 (def ^:const iri-rdf-first "http://www.w3.org/1999/02/22-rdf-syntax-ns#first")
 (def ^:const iri-rdf-rest "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest")
 (def ^:const iri-rdf-nil "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil")
+(def ^:const iri-rdf-json "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON")
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
 (def ^:const iri-lang-string "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
 
@@ -117,7 +118,6 @@
 (def ^:const iri-xsd-unsignedByte "http://www.w3.org/2001/XMLSchema#unsignedByte")
 (def ^:const iri-xsd-hexBinary "http://www.w3.org/2001/XMLSchema#hexBinary")
 (def ^:const iri-xsd-base64Binary "http://www.w3.org/2001/XMLSchema#base64Binary")
-(def ^:const iri-json "http://www.w3.org/2001/XMLSchema#json")
 
 ;; rdfs
 (def ^:const iri-rdfs:Class "http://www.w3.org/2000/01/rdf-schema#Class")
@@ -327,7 +327,7 @@
 (def ^:const $xsd:unsignedByte (iri/iri->sid iri-xsd-unsignedByte)) ; store as number
 (def ^:const $xsd:hexBinary (iri/iri->sid iri-xsd-hexBinary))
 (def ^:const $xsd:base64Binary (iri/iri->sid iri-xsd-base64Binary))
-(def ^:const $rdf:json (iri/iri->sid iri-json))
+(def ^:const $rdf:json (iri/iri->sid iri-rdf-json))
 (def ^:const $fluree:vector (iri/iri->sid iri-vector)) ;; dense vector/embedding
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?

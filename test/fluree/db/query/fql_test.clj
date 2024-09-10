@@ -446,7 +446,7 @@
                                     [:bind ?dt (datatype ?age)]]}
                 results @(fluree/query db query)]
             (is (= [["Bart" "forever 10" :xsd/string]
-                    ["Homer" 36 :xsd/long]
+                    ["Homer" 36 :xsd/integer]
                     ["Marge" 36 :xsd/int]]
                    results))))
         (testing "filtered with the datatype function"
@@ -456,9 +456,9 @@
                          :where   '[{:ex/name ?name
                                      :ex/age  ?age}
                                     [:bind ?dt (datatype ?age)]
-                                    [:filter (= (iri :xsd/long) ?dt)]]}
+                                    [:filter (= (iri :xsd/integer) ?dt)]]}
                 results @(fluree/query db query)]
-            (is (= [["Homer" 36 :xsd/long]]
+            (is (= [["Homer" 36 :xsd/integer]]
                    results)))))
       (testing "filtered in value maps"
         (testing "with explicit type IRIs"

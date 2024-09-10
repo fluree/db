@@ -20,11 +20,11 @@
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.util.core :as util :refer [get-first get-first-value
                                                   get-first-id vswap!]]
-            [fluree.db.index :as index]
+            [fluree.db.flake.index :as index]
             [fluree.db.indexer :as indexer]
-            [fluree.db.indexer.default :as idx-default]
+            [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.fql :as fql]
-            [fluree.db.indexer.storage :as index-storage]
+            [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.vector.index-graph :as index-graph]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
@@ -235,7 +235,7 @@
     (if (and ref-id (node? v-map))
       (let [ref-sid (iri/encode-iri db ref-id)]
         (flake/create sid pid ref-sid const/$id t assert? meta))
-      (let [[value dt] (datatype/from-expanded v-map nil)]
+      (let [[value dt] (datatype/from-expanded db v-map)]
         (flake/create sid pid value dt t assert? meta)))))
 
 
@@ -373,7 +373,6 @@
                     max-namespace-code reindex-min-bytes reindex-max-bytes max-old-indexes]
   dbproto/IFlureeDb
   (-query [this query-map] (fql/query this query-map))
-  (-p-prop [_ meta-key property] (match/p-prop schema meta-key property))
   (-class-ids [this subject] (match/class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))
 
@@ -431,8 +430,8 @@
 
   indexer/Indexable
   (index [db changes-ch]
-    (if (idx-default/novelty-min? db reindex-min-bytes)
-      (idx-default/refresh db changes-ch max-old-indexes)
+    (if (novelty/novelty-min? db reindex-min-bytes)
+      (novelty/refresh db changes-ch max-old-indexes)
       (go)))
 
   TimeTravel
@@ -613,36 +612,40 @@
   [db sid compact-fn]
   (compact-fn (iri/decode-sid db sid)))
 
+(defn- serialize-obj
+  [flake db compact-fn]
+  (let [pdt (flake/dt flake)]
+    (cond
+      (= const/$id pdt) ;; ref to another node
+      (if (= const/$rdf:type (flake/p flake))
+        (get-s-iri db (flake/o flake) compact-fn) ;; @type values don't need to be in an @id map
+        {"@id" (get-s-iri db (flake/o flake) compact-fn)})
+
+      (datatype/inferable? pdt)
+      (serde-json/serialize-object (flake/o flake) pdt)
+
+      :else
+      {"@value" (serde-json/serialize-object (flake/o flake) pdt)
+       "@type"  (get-s-iri db pdt compact-fn)})))
+
+(defn- add-obj-list-meta
+  [obj-ser flake]
+  (let [list-i (-> flake flake/m :i)]
+    (if (map? obj-ser)
+      (assoc obj-ser :i list-i)
+      {"@value" obj-ser
+       :i       list-i})))
+
 (defn- subject-block-pred
   [db compact-fn list? p-flakes]
   (loop [[p-flake & r] p-flakes
-         all-refs? nil
-         acc       nil]
-    (let [pdt  (flake/dt p-flake)
-          ref? (= const/$id pdt)
-          [obj all-refs?] (if ref?
-                            [{"@id" (get-s-iri db (flake/o p-flake) compact-fn)}
-                             (if (nil? all-refs?) true all-refs?)]
-                            [{"@value" (-> p-flake
-                                           flake/o
-                                           (serde-json/serialize-object pdt))}
-                             false])
-          obj* (cond-> obj
-                 list? (assoc :i (-> p-flake flake/m :i))
-
-                  ;; need to retain the `@type` for times so they will be
-                  ;; coerced correctly when loading
-                 (datatype/time-type? pdt)
-                 (assoc "@type" (get-s-iri db pdt compact-fn)))
-          acc' (conj acc obj*)]
+         acc nil]
+    (let [obj-ser (cond-> (serialize-obj p-flake db compact-fn)
+                          list? (add-obj-list-meta p-flake))
+          acc'    (conj acc obj-ser)]
       (if (seq r)
-        (recur r all-refs? acc')
-        [acc' all-refs?]))))
-
-(defn- set-refs-type-in-ctx
-  [^clojure.lang.Volatile ctx p-iri refs]
-  (vswap! ctx assoc-in [p-iri "@type"] "@id")
-  (map #(get % "@id") refs))
+        (recur r acc')
+        acc'))))
 
 (defn- handle-list-values
   [objs]
@@ -652,19 +655,16 @@
   [s-flakes db ^clojure.lang.Volatile ctx compact-fn]
   (loop [[p-flakes & r] (partition-by flake/p s-flakes)
          acc nil]
-    (let [fflake          (first p-flakes)
-          list?           (-> fflake flake/m :i)
-          pid             (flake/p fflake)
-          p-iri           (get-s-iri db pid compact-fn)
-          [objs all-refs?] (subject-block-pred db compact-fn list?
-                                               p-flakes)
-          handle-all-refs (partial set-refs-type-in-ctx ctx p-iri)
-          objs*           (cond-> objs
-                                 ;; next line is for compatibility with json-ld/parse-type's expectations; should maybe revisit
-                            (and all-refs? (not list?)) handle-all-refs
-                            list? handle-list-values
-                            (= 1 (count objs)) first)
-          acc'            (assoc acc p-iri objs*)]
+    (let [fflake (first p-flakes)
+          list?  (-> fflake flake/m :i)
+          pid    (flake/p fflake)
+          p-iri  (get-s-iri db pid compact-fn)
+          objs   (subject-block-pred db compact-fn list?
+                                     p-flakes)
+          objs*  (cond-> objs
+                         list? handle-list-values
+                         (= 1 (count objs)) first)
+          acc'   (assoc acc p-iri objs*)]
       (if (seq r)
         (recur r acc')
         acc'))))

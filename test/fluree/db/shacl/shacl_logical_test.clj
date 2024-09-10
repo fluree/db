@@ -143,7 +143,7 @@
                           :sh/property    [{:sh/path     :schema/age
                                             :sh/minCount 1
                                             :sh/maxCount 1
-                                            :sh/datatype :xsd/long}]}})
+                                            :sh/datatype :xsd/integer}]}})
 
 
 
