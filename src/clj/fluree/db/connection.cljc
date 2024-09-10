@@ -42,7 +42,7 @@
   {:id    (:id conn)
    :stats (get @(:state conn) :stats)})
 
-(defrecord Connection [id state parallelism store index-store primary-publisher
+(defrecord Connection [id state parallelism commit-store index-store primary-publisher
                        secondary-publishers subscribers serializer cache defaults])
 
 #?(:clj
@@ -61,12 +61,12 @@
   (pr conn))
 
 (defn connect
-  [{:keys [parallelism store index-store cache serializer primary-publisher
-           secondary-publishers subscribers defaults]
+  [{:keys [parallelism commit-store index-store cache serializer
+           primary-publisher secondary-publishers subscribers defaults]
     :or   {serializer (json-serde)} :as _opts}]
   (let [id    (random-uuid)
         state (blank-state)]
-    (->Connection id state parallelism store index-store primary-publisher
+    (->Connection id state parallelism commit-store index-store primary-publisher
                   secondary-publishers subscribers serializer cache defaults)))
 
 (defn register-ledger
@@ -170,10 +170,10 @@
             (recur (rest nameservices*))))))))
 
 (defn read-latest-commit
-  [{:keys [store] :as conn} ledger-address]
+  [{:keys [commit-store] :as conn} ledger-address]
   (go-try
     (if-let [commit-addr (<? (lookup-commit conn ledger-address))]
-      (let [commit-data (<? (storage/read-json store commit-addr))]
+      (let [commit-data (<? (storage/read-json commit-store commit-addr))]
         (assoc commit-data "address" commit-addr))
       (throw (ex-info (str "Unable to load. No commit exists for: " ledger-address)
                       {:status 400 :error :db/invalid-commit-address})))))
@@ -183,9 +183,9 @@
   (str/ends-with? address ".json"))
 
 (defn read-resource
-  [{:keys [store] :as conn} resource-address]
+  [{:keys [commit-store] :as conn} resource-address]
   (if (file-read? resource-address)
-    (storage/read-json store resource-address)
+    (storage/read-json commit-store resource-address)
     (read-latest-commit conn resource-address)))
 
 (defn ledger-exists?
@@ -242,7 +242,7 @@
      :indexing indexing*}))
 
 (defn create-ledger
-  [{:keys [primary-publisher secondary-publishers subscribers index-store] commit-store :store,
+  [{:keys [primary-publisher secondary-publishers subscribers commit-store index-store]
     :as conn}
    ledger-alias opts]
   (go-try
@@ -278,7 +278,7 @@
                    (nameservice/alias ns db-alias))))))
 
 (defn load-ledger*
-  [{:keys [store index-store primary-publisher secondary-publishers] :as conn}
+  [{:keys [commit-store index-store primary-publisher secondary-publishers] :as conn}
    ledger-chan address]
   (go-try
     (let [commit-addr  (<? (lookup-commit conn address))
@@ -287,7 +287,7 @@
           _            (when-not commit-addr
                          (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
                                          {:status 400 :error :db/invalid-commit-address})))
-          [commit _]   (<? (commit-storage/read-commit-jsonld store commit-addr))
+          [commit _]   (<? (commit-storage/read-commit-jsonld commit-store commit-addr))
           _            (when-not commit
                          (throw (ex-info (str "Unable to load. Commit file for ledger: " address
                                               " at location: " commit-addr " is not found.")
@@ -299,7 +299,7 @@
           {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 
           ledger   (ledger/instantiate ledger-alias address primary-publisher secondary-publishers
-                                       branch store index-store did indexing commit)]
+                                       branch commit-store index-store did indexing commit)]
       (subscribe-ledger conn ledger-alias)
       (async/put! ledger-chan ledger)
       ledger)))
