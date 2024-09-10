@@ -320,12 +320,12 @@
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/wrap-policy"}
   wrap-policy
-  ([db policy default-allow?]
-   (wrap-policy db policy default-allow? nil))
-  ([db policy default-allow? values-map]
+  ([db policy]
+   (wrap-policy db policy nil))
+  ([db policy values-map]
    (log/warn "DEPRECATED function `wrap-policy` superseded by `fluree.db.api/wrap-policy`")
    (promise-wrap
-    (policy/wrap-policy db policy default-allow? values-map))))
+    (policy/wrap-policy db policy values-map))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/wrap-identity-policy"}
@@ -336,12 +336,12 @@
 
   With the policy classes, finds all policies containing that class
   declaration."
-  ([db identity default-allow?]
-   (wrap-identity-policy db identity default-allow? nil))
-  ([db identity default-allow? values-map]
+  ([db identity]
+   (wrap-identity-policy db identity nil))
+  ([db identity values-map]
    (log/warn "DEPRECATED function `wrap-identity-policy` superseded by `fluree.db.api/wrap-identity-policy`")
    (promise-wrap
-    (policy/wrap-identity-policy db identity default-allow? values-map))))
+    (policy/wrap-identity-policy db identity values-map))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/dataset"}
@@ -391,7 +391,7 @@
   signing identity, which is then used by `wrap-identity-policy` to extract
   the policy classes and apply the policies to the query."
   ([ds cred-query] (credential-query ds cred-query {}))
-  ([ds cred-query {:keys [default-allow? values-map] :as opts}]
+  ([ds cred-query {:keys [values-map] :as opts}]
    (log/warn "DEPRECATED function `credential-query` superseded by `fluree.db.api/credential-query`")
    (promise-wrap
     (go-try
@@ -399,7 +399,7 @@
        (log/debug "Credential query with identity: " identity " and query: " query)
        (cond
          (and query identity)
-         (let [policy-db (<? (policy/wrap-identity-policy ds identity default-allow? values-map))]
+         (let [policy-db (<? (policy/wrap-identity-policy ds identity values-map))]
            (<? (query-api/query policy-db query opts)))
 
          identity
@@ -430,13 +430,13 @@
    (let [latest-db (ledger/current-db ledger)
          res-chan  (query-api/history latest-db query)]
      (promise-wrap res-chan)))
-  ([ledger query {:keys [policy identity default-allow? values-map] :as _opts}]
+  ([ledger query {:keys [policy identity values-map] :as _opts}]
    (log/warn "DEPRECATED function `history` superseded by `fluree.db.api/history`")
    (promise-wrap
      (let [latest-db (ledger/current-db ledger)
            policy-db (if identity
-                       (<? (policy/wrap-identity-policy latest-db identity default-allow? values-map))
-                       (<? (policy/wrap-policy latest-db policy default-allow? values-map)))]
+                       (<? (policy/wrap-identity-policy latest-db identity values-map))
+                       (<? (policy/wrap-policy latest-db policy values-map)))]
       (query-api/history policy-db query)))))
 
 (defn ^{:deprecated    "3.0"
@@ -449,7 +449,7 @@
   signing identity, which is then used by `wrap-identity-policy` to extract
   the policy classes and apply the policies to the query."
   ([ledger cred-query] (credential-history ledger cred-query {}))
-  ([ledger cred-query {:keys [default-allow? values-map] :as opts}]
+  ([ledger cred-query {:keys [values-map] :as opts}]
    (log/warn "DEPRECATED function `credential-history` superseded by `fluree.db.api/credential-history`")
    (promise-wrap
     (go-try
@@ -458,7 +458,7 @@
        (log/debug "Credential history query with identity: " identity " and query: " query)
        (cond
          (and query identity)
-         (let [policy-db (<? (policy/wrap-identity-policy latest-db identity default-allow? values-map))]
+         (let [policy-db (<? (policy/wrap-identity-policy latest-db identity values-map))]
            (<? (query-api/history policy-db query)))
 
          identity

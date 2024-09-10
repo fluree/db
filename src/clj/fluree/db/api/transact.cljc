@@ -29,7 +29,7 @@
                          (:meta parsed-opts))
          identity    (:did parsed-opts)
          policy-db   (if identity
-                       (<? (policy/wrap-identity-policy db identity true nil))
+                       (<? (policy/wrap-identity-policy db identity nil))
                        db)]
      (if track-fuel?
        (let [start-time #?(:clj (System/nanoTime)

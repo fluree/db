@@ -13,6 +13,6 @@
   (assoc db :policy root-policy-map))
 
 (defprotocol Restrictable
-  (wrap-policy [db policy-rules default-allow? values-map])
-  (wrap-identity-policy [db identity default-allow? values-map])
+  (wrap-policy [db policy-rules values-map])
+  (wrap-identity-policy [db identity values-map])
   (root [db]))

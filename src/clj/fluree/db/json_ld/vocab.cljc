@@ -139,7 +139,7 @@
    #{{:id #fluree/SID[8 'address'],
       :iri 'http://schema.org/Patient',
       :subclassOf #{#fluree/SID[8 'location']}
-      :datatype nil} ...}
+      ...} ...}
    "
   [pred-items]
   (let [subclass-map (reduce
@@ -176,8 +176,7 @@
    :iri         nil
    :subclassOf  #{}
    :parentProps #{}
-   :childProps  #{}
-   :datatype    nil})
+   :childProps  #{}})
 
 (defn initial-property-map*
   [iri sid]
@@ -292,12 +291,10 @@
       :else pred-map)))
 
 (def initial-type-map
-  (assoc (initial-property-map* const/iri-type const/$rdf:type)
-         :datatype const/$id))
+  (initial-property-map* const/iri-type const/$rdf:type))
 
 (def initial-class-map
-  (assoc (initial-property-map* const/iri-class const/$rdfs:Class)
-         :datatype const/$id))
+  (initial-property-map* const/iri-class const/$rdfs:Class))
 
 (defn with-vocab-flakes
   [pred-map db vocab-flakes]
@@ -371,50 +368,9 @@
                           (not (contains? pred-map pid)))))
           flakes)))
 
-(defn datatype-constraint?
-  [f]
-  (-> f flake/p (= const/sh_datatype)))
-
 (defn descending
   [x y]
   (compare y x))
-
-(defn list-index
-  [f]
-  (-> f flake/op :i))
-
-(defn pred-dt-constraints
-  "Collect any shacl datatype constraints and the predicates they apply to."
-  [new-flakes]
-  (loop [[s-flakes & r] (partition-by flake/s new-flakes)
-         res []]
-    (if s-flakes
-      (if-let [dt-constraints (->> s-flakes
-                                   (filter datatype-constraint?)
-                                   (map flake/o)
-                                   first)]
-        (let [path (->> s-flakes
-                        (filter #(= const/sh_path (flake/p %)))
-                        (sort-by list-index descending)
-                        (map flake/o)
-                        first)]
-          (recur r (conj res [path dt-constraints])))
-        (recur r res))
-      res)))
-
-(defn add-pred-datatypes
-  "Add a :datatype key to the pred meta map for any predicates with a sh:datatype
-  constraint. Only one datatype constraint can be valid for a given datatype, most
-  recent wins."
-  [{:keys [pred] :as schema} pred-tuples]
-  (reduce (fn [schema [pid dt]]
-            (let [{:keys [iri] :as pred-meta} (-> pred
-                                                  (get pid)
-                                                  (assoc :datatype dt))]
-              (-> schema
-                  (assoc-in [:pred pid] pred-meta)
-                  (assoc-in [:pred iri] pred-meta))))
-          schema pred-tuples))
 
 (defn add-pid
   [preds db pid]
@@ -447,10 +403,7 @@
                                         (or (contains? pred-sids (flake/s f))
                                             (contains? predicate-refs (flake/p f)))))
                               new-flakes)
-         pred-datatypes (pred-dt-constraints new-flakes)
-         schema         (-> db
-                            (update-schema pred-sids vocab-flakes)
-                            (add-pred-datatypes pred-datatypes))]
+         schema         (update-schema db pred-sids vocab-flakes)]
      (invalidate-shape-cache! db mods)
      (assoc db :schema schema))))
 
@@ -468,12 +421,11 @@
         (-> db
             :schema
             (assoc :pred pred-map)
-            (update-with db t vocab-flakes)
-            (add-pred-datatypes (filterv #(> (count %) 1) preds)))))))
+            (update-with db t vocab-flakes))))))
 
 ;; schema serialization
 (def ^:const serialized-pred-keys
-  [:id :datatype :subclassOf :parentProps :childProps])
+  [:id :subclassOf :parentProps :childProps])
 
 (def ^:const serialized-pred-keys-reverse
   (reverse serialized-pred-keys))
@@ -540,16 +492,11 @@
                      :id (let [sid (iri/deserialize-sid raw-val)]
                            (assoc acc :id sid
                                       :iri (iri/sid->iri sid namespace-codes)))
-                     :datatype (assoc acc :datatype (iri/deserialize-sid raw-val))
                      :subclassOf (assoc acc :subclassOf (into (:subclassOf base-property-map) (map iri/deserialize-sid raw-val)))
                      :parentProps (assoc acc :parentProps (into (:parentProps base-property-map) (map iri/deserialize-sid raw-val)))
                      :childProps (assoc acc :childProps (into (:childProps base-property-map) (map iri/deserialize-sid raw-val)))
                      ;; else
-                     (throw (ex-info (str "Cannot deserialize schema from index root. "
-                                          "Unrecognized schema property key found: " k
-                                          "which contains a value of: " raw-val)
-                                     {:status 500
-                                      :error  :db/invalid-index})))
+                     acc)
                    acc)]
         (if (= idx max-idx)
           acc*

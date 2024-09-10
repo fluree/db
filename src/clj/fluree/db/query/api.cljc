@@ -47,13 +47,13 @@
        rule-results))))
 
 (defn restrict-db
-  ([db t {:keys [did default-allow? reasoner-methods rule-sources] :as opts}]
+  ([db t {:keys [did reasoner-methods rule-sources] :as opts}]
    (restrict-db db t opts nil))
-  ([db t {:keys [did default-allow? reasoner-methods rule-sources] :as opts} conn]
+  ([db t {:keys [did reasoner-methods rule-sources] :as opts} conn]
    (go-try
     (let [processed-rule-sources (<? (load-aliased-rule-dbs conn rule-sources))
           policy-db              (if did
-                                   (<? (perm/wrap-identity-policy db did default-allow? nil))
+                                   (<? (perm/wrap-identity-policy db did nil))
                                    db)
           time-travel-db         (-> (if t
                                        (<? (time-travel/as-of policy-db t))

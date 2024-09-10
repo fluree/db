@@ -117,7 +117,7 @@
      (string? x)  (if lang
                     const/$rdf:langString
                     const/$xsd:string)
-     (integer? x) const/$xsd:long ; infer to long to prevent overflow
+     (integer? x) const/$xsd:integer
      (number? x)  const/$xsd:double
      (boolean? x) const/$xsd:boolean)))
 
