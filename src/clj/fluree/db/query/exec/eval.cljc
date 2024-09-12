@@ -486,16 +486,16 @@
   (where/->typed-val (quot num div)))
 
 (defn equal
-  ([{x :value}]  (where/->typed-val true))
-  ([{x :value} {y :value}] (where/->typed-val (= x y)))
-  ([{x :value} {y :value} & more]
-   (where/->typed-val (apply = x y (mapv :value more)))))
+  ([x]  (where/->typed-val true))
+  ([x y] (where/->typed-val (= x y)))
+  ([x y & more]
+   (where/->typed-val (apply = x y more))))
 
 (defn not-equal
-  ([{x :value}]  (where/->typed-val false))
-  ([{x :value} {y :value}] (where/->typed-val (not= x y)))
-  ([{x :value} {y :value} & more]
-   (where/->typed-val (apply not= x y (mapv :value more)))))
+  ([x]  (where/->typed-val false))
+  ([x y] (where/->typed-val (not= x y)))
+  ([x y & more]
+   (where/->typed-val (apply not= x y more))))
 
 (defn absolute-value
   [{x :value}]
