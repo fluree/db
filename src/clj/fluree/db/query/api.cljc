@@ -47,7 +47,7 @@
        rule-results))))
 
 (defn restrict-db
-  ([db t {:keys [did reasoner-methods rule-sources] :as opts}]
+  ([db t opts]
    (restrict-db db t opts nil))
   ([db t {:keys [did reasoner-methods rule-sources] :as opts} conn]
    (go-try

@@ -169,24 +169,19 @@
             commit-address
             (recur (rest nameservices*))))))))
 
+(defn read-file-address
+  [{:keys [commit-store] :as _conn} addr]
+  (go-try
+    (let [json-data (<? (storage/read-json commit-store addr))]
+      (assoc json-data "address" addr))))
+
 (defn read-latest-commit
-  [{:keys [commit-store] :as conn} ledger-address]
+  [conn ledger-address]
   (go-try
     (if-let [commit-addr (<? (lookup-commit conn ledger-address))]
-      (let [commit-data (<? (storage/read-json commit-store commit-addr))]
-        (assoc commit-data "address" commit-addr))
+      (<? (read-file-address conn commit-addr))
       (throw (ex-info (str "Unable to load. No commit exists for: " ledger-address)
                       {:status 400 :error :db/invalid-commit-address})))))
-
-(defn file-read?
-  [address]
-  (str/ends-with? address ".json"))
-
-(defn read-resource
-  [{:keys [commit-store] :as conn} resource-address]
-  (if (file-read? resource-address)
-    (storage/read-json commit-store resource-address)
-    (read-latest-commit conn resource-address)))
 
 (defn ledger-exists?
   "Checks nameservices on a connection and returns true if any nameservice
