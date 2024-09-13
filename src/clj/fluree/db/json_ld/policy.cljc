@@ -37,6 +37,31 @@
       %)
    query-results))
 
+(defn wrap-class-policy
+  "Given one or more policy classes, queries for policies
+  containing those classes and calls `wrap-policy`"
+  [db classes values-map]
+  (go
+    (let [c-values  (->> classes ;; for passing in classes as query `values`
+                         util/sequential
+                         (mapv (fn [c] {"@value" c
+                                        "@type"  const/iri-id})))
+          policies  (<! (dbproto/-query db {"select" {"?policy" ["*"]}
+                                            "where"  [{"@id"   "?policy"
+                                                       "@type" "?classes"}]
+                                            "values" ["?classes" c-values]}))
+          policies* (if (util/exception? policies)
+                      policies
+                      (policy-from-query policies))]
+      (log/trace "wrap-class-policy - extracted policy from classes: " classes
+                 " policy: " policies*)
+      (if (util/exception? policies*)
+        (ex-info (str "Unable to extract policies for classes: " classes
+                      " with error: " (ex-message policies*))
+                 {:status 400 :error :db/policy-exception}
+                 policies*)
+        (<! (wrap-policy db policies* values-map))))))
+
 
 (defn wrap-identity-policy
   "Given an identity (@id) that exists in the db which contains a

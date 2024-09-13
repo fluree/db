@@ -239,6 +239,15 @@
    (promise-wrap
     (policy/wrap-policy db policy values-map))))
 
+(defn wrap-class-policy
+  "Restricts the provided db with policies in the db
+  which have a class @type of the provided class(es)."
+  ([db policy-classes]
+   (wrap-class-policy db policy-classes nil))
+  ([db policy-classes values-map]
+   (promise-wrap
+    (policy/wrap-class-policy db policy-classes values-map))))
+
 (defn wrap-identity-policy
   "For provided identity, locates specific property f:policyClass on
   the identity containing a list of class IRIs that identity the policies
