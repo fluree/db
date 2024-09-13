@@ -3,6 +3,7 @@
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
             [fluree.db.conn.remote :as remote-conn]
+            [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.json-ld.iri :as iri]
@@ -339,12 +340,22 @@
    (let [latest-db (ledger/-db ledger)
          res-chan  (query-api/history latest-db query)]
      (promise-wrap res-chan)))
-  ([ledger query {:keys [policy identity values-map] :as _opts}]
+  ([ledger query {:keys [policy identity policyClass policyValues] :as _opts}]
    (promise-wrap
     (let [latest-db (ledger/-db ledger)
-          policy-db (if identity
-                      (<? (policy/wrap-identity-policy latest-db identity values-map))
-                      (<? (policy/wrap-policy latest-db policy values-map)))]
+          context (context/extract query)
+          policy-db (cond
+                      identity
+                      (<? (policy/wrap-identity-policy latest-db (json-ld/expand identity context) policyValues))
+
+                      policy
+                      (<? (policy/wrap-policy latest-db (json-ld/expand policy context) policyValues))
+
+                      policyClass
+                      (<? (policy/wrap-class-policy latest-db (json-ld/expand policyClass context) policyValues))
+
+                      :else
+                      latest-db)]
       (query-api/history policy-db query)))))
 
 (defn credential-history
@@ -355,7 +366,7 @@
   signing identity, which is then used by `wrap-identity-policy` to extract
   the policy classes and apply the policies to the query."
   ([ledger cred-query] (credential-history ledger cred-query {}))
-  ([ledger cred-query {:keys [values-map] :as _opts}]
+  ([ledger cred-query {:keys [policyValues] :as _opts}]
    (promise-wrap
     (go-try
      (let [latest-db (ledger/-db ledger)
@@ -363,7 +374,7 @@
        (log/debug "Credential history query with identity: " identity " and query: " query)
        (cond
          (and query identity)
-         (let [policy-db (<? (policy/wrap-identity-policy latest-db identity values-map))]
+         (let [policy-db (<? (policy/wrap-identity-policy latest-db identity policyValues))]
            (<? (query-api/history policy-db query)))
 
          identity
