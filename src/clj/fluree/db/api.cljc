@@ -231,6 +231,8 @@
    (ledger/-db ledger)))
 
 (defn wrap-policy
+  "Restricts the provided db with the provided json-ld
+  policy restrictions"
   ([db policy]
    (wrap-policy db policy nil))
   ([db policy values-map]
