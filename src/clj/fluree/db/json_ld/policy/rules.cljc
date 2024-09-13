@@ -140,10 +140,18 @@
    {}
    policy-rules))
 
+(defn validate-values-map
+  [values-map]
+  (or (map? values-map)
+      (throw (ex-info (str "Invalid policy values map. Must be a map. Received: " values-map)
+                      {:status 400
+                       :error  :db/invalid-values-map}))))
 
 (defn wrap-policy
   [db policy-rules values-map]
   (go-try
+   (when values-map
+     (validate-values-map values-map))
    (let [policy-rules (->> (parse-rules-graph policy-rules)
                            (parse-policy-rules db))]
      (log/trace "policy-rules: " policy-rules)
