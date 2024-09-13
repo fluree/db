@@ -3,7 +3,8 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -60,7 +61,7 @@
                       " with error: " (ex-message policies*))
                  {:status 400 :error :db/policy-exception}
                  policies*)
-        (<! (wrap-policy db policies* values-map))))))
+        (<! (wrap-policy db (json-ld/expand policies*) values-map))))))
 
 
 (defn wrap-identity-policy
@@ -86,4 +87,4 @@
                      " with error: " (ex-message policies*))
                 {:status 400 :error :db/policy-exception}
                 policies*)
-       (<! (wrap-policy db policies* val-map))))))
+       (<! (wrap-policy db (json-ld/expand policies*) val-map))))))

@@ -237,7 +237,8 @@
    (wrap-policy db policy nil))
   ([db policy values-map]
    (promise-wrap
-    (policy/wrap-policy db policy values-map))))
+    (let [policy* (json-ld/expand policy)]
+      (policy/wrap-policy db policy* values-map)))))
 
 (defn wrap-class-policy
   "Restricts the provided db with policies in the db
