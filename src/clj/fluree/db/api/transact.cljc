@@ -16,10 +16,10 @@
 
 (defn parse-opts
   [expanded-txn opts txn-context]
-  (-> (util/get-first-value expanded-txn const/iri-opts)
-      (merge opts) ;; override opts 'did', 'raw-txn' with credential's if present
-      (util/keywordize-keys)
-      (assoc :context txn-context)))
+  (let [txn-opts (some-> (util/get-first-value expanded-txn const/iri-opts)
+                         util/keywordize-keys)
+        opts*    (merge txn-opts (util/keywordize-keys opts))]
+    (assoc opts* :context txn-context)))
 
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
