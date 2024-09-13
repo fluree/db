@@ -147,12 +147,23 @@
                       {:status 400
                        :error  :db/invalid-values-map}))))
 
+(defn expanded?
+  "Checks if json-ld is already expanded by looking for Fluree's special keys.
+  In the case of query-connection calling wrap-policy, it will attempt to expand
+  the policy json-ld using the query's context, so we don't need to re-attempt
+  expansion here."
+  [json-ld]
+  (and (sequential? json-ld)
+       (contains? (first json-ld) :idx)))
+
 (defn wrap-policy
   [db policy-rules values-map]
   (go-try
    (when values-map
      (validate-values-map values-map))
-   (let [policy-rules (->> (parse-rules-graph policy-rules)
+   (let [policy-rules (->> (if (expanded? policy-rules)
+                             policy-rules
+                             (parse-rules-graph policy-rules))
                            (parse-policy-rules db))]
      (log/trace "policy-rules: " policy-rules)
      (assoc db :policy (assoc policy-rules :cache (atom {})
