@@ -237,11 +237,11 @@
   distributed rules."
   ([ledger db]
    (promise-wrap
-     (ledger/commit! ledger db)))
+     (connection/commit! ledger db)))
   ([ledger db opts]
    (log/warn "DEPRECATED function `commit!` superseded by `fluree.db.api/commit!`")
    (promise-wrap
-     (ledger/commit! ledger db opts))))
+     (connection/commit! ledger db opts))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/transact!"}
