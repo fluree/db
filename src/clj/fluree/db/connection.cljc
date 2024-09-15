@@ -1,4 +1,5 @@
 (ns fluree.db.connection
+  (:refer-clojure :exclude [replicate])
   (:require [clojure.core.async :as async :refer [<!]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
@@ -550,3 +551,14 @@
   (go-try
     (let [ledger (<? (load-ledger conn ledger-id))]
       (<? (transact-ledger! conn ledger triples opts)))))
+
+(defn replicate
+  [byte-store address data]
+  (let [{:keys [local]} (storage/parse-address address)]
+    (if local
+      (async/<!! (storage/write-bytes byte-store local data))
+      (log/error "Cannot replicate index file, not a valid address:" address))))
+
+(defn replicate-index-node
+  [{:keys [index-store] :as _conn} address data]
+  (replicate (:storage index-store) address data))
