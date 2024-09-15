@@ -1,20 +1,11 @@
 (ns fluree.db.ledger
-  (:require [fluree.db.storage :as storage]
-            [fluree.db.flake.flake-db :as flake-db]
-            [fluree.db.json-ld.credential :as cred]
-            [fluree.db.transact :as transact]
-            [fluree.db.did :as did]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.context :as context]
+  (:require [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.constants :as const]
             [fluree.db.commit.storage :as commit-storage]
             [clojure.string :as str]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
-            [fluree.db.nameservice :as nameservice]
-            [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.json-ld :as json-ld]
             [fluree.db.util.log :as log]
             [fluree.db.flake :as flake]))
 
@@ -78,176 +69,6 @@
       :flakes  flakes
       :commit  commit})))
 
-(defn parse-commit-options
-  "Parses the commit options and removes non-public opts."
-  [opts]
-  (if (string? opts)
-    {:message opts}
-    (select-keys opts [:context :did :private :message :tag :file-data? :index-files-ch])))
-
-(def f-context {"f" "https://ns.flur.ee/ledger#"})
-
-(defn parse-commit-context
-  [context]
-  (let [parsed-context (if context
-                         (-> context
-                             json-ld/parse-context
-                             (json-ld/parse-context f-context))
-                         (json-ld/parse-context f-context))]
-    (context/stringify parsed-context)))
-
-(defn- enrich-commit-opts
-  [ledger {:keys [context did private message tag file-data? index-files-ch time] :as _opts}]
-  (let [context*      (parse-commit-context context)
-        private*      (or private
-                          (:private did)
-                          (-> ledger :did :private))
-        did*          (or (some-> private* did/private->did)
-                          did
-                          (:did ledger))
-        ctx-used-atom (atom {})
-        compact-fn    (json-ld/compact-fn context* ctx-used-atom)]
-    {:commit-opts
-     {:message message
-      :tag tag
-      :time (or time (util/current-time-iso))
-      :file-data? file-data? ;; if true, return the db as well as the written files (for consensus)
-      :context context*
-      :private private*
-      :did did*}
-
-     :commit-data-helpers
-     {:compact-fn compact-fn
-      :compact (fn [iri] (json-ld/compact iri compact-fn))
-      :id-key (json-ld/compact "@id" compact-fn)
-      :type-key (json-ld/compact "@type" compact-fn)
-      :ctx-used-atom ctx-used-atom}
-
-     ;; optional async chan passed in which will stream out all new index files created (for consensus)
-     :index-files-ch index-files-ch}))
-
-(defn write-transaction
-  [storage ledger-alias txn]
-  (let [path (str/join "/" [ledger-alias "txn"])]
-    (storage/content-write-json storage path txn)))
-
-;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
-;; TODO - however this is really a concern of "commit", not staging and I don' think the db should be handling any of it
-(defn write-transactions!
-  [storage {:keys [alias] :as _ledger} staged]
-  (go-try
-   (loop [[next-staged & r] staged
-          results []]
-     (if next-staged
-       (let [[txn author-did annotation] next-staged
-             results* (if txn
-                        (let [{txn-id :address} (<? (write-transaction storage alias txn))]
-                          (conj results [txn-id author-did annotation]))
-                        (conj results next-staged))]
-         (recur r results*))
-       results))))
-
-(defn update-commit-address
-  "Once a commit address is known, which might be after the commit is written
-  if IPFS, add the final address into the commit map."
-  [[commit-map commit-jsonld] commit-address]
-  [(assoc commit-map :address commit-address)
-   (assoc commit-jsonld "address" commit-address)])
-
-(defn write-commit
-  [commit-storage alias {:keys [did private]} commit]
-  (go-try
-    (let [[_ commit-jsonld :as commit-pair]
-          (commit-data/commit->jsonld commit)
-
-          signed-commit (if did
-                          (<? (cred/generate commit-jsonld private (:id did)))
-                          commit-jsonld)
-          commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
-
-          [commit* commit-jsonld*]
-          (update-commit-address commit-pair (:address commit-res))]
-      {:commit-map    commit*
-       :commit-jsonld commit-jsonld*
-       :write-result  commit-res})))
-
-(defn publish-commit
-  "Publishes commit to all nameservices registered with the ledger."
-  [{:keys [primary-publisher secondary-publishers] :as _ledger}
-   {:keys [commit-jsonld] :as _write-result}]
-  (go-try
-    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
-      (dorun (map (fn [ns]
-                    (nameservice/publish ns commit-jsonld)))
-             secondary-publishers)
-      result)))
-
-(defn formalize-commit
-  [{prev-commit :commit :as staged-db} new-commit]
-  (let [max-ns-code (-> staged-db :namespace-codes iri/get-max-namespace-code)]
-    (-> staged-db
-        (update :staged empty)
-        (assoc :commit new-commit
-               :prev-commit prev-commit
-               :max-namespace-code max-ns-code)
-        (commit-data/add-commit-flakes prev-commit))))
-
-(defn commit!
-  "Finds all uncommitted transactions and wraps them in a Commit document as the subject
-  of a VerifiableCredential. Persists according to the :ledger :conn :method and
-  returns a db with an updated :commit."
-  ([ledger staged-db]
-   (commit! ledger staged-db nil))
-  ([{:keys [alias commit-store] :as ledger}
-    {:keys [branch t stats commit] :as staged-db} opts]
-   (go-try
-     (let [{index-files-ch :index-files-ch
-            commit-data-opts :commit-data-helpers
-            {:keys [did message private tag file-data? time]} :commit-opts}
-           (enrich-commit-opts ledger opts)
-
-           {:keys [dbid db-jsonld staged-txns]}
-           (flake-db/db->jsonld staged-db commit-data-opts)
-
-           ;; TODO - we do not support multiple "transactions" in a single commit (although other code assumes we do which needs cleaning)
-           [[txn-id author annotation] :as txns]
-           (<? (write-transactions! commit-store ledger staged-txns))
-
-           data-write-result (<? (commit-storage/write-jsonld commit-store alias db-jsonld)) ; write commit data
-           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
-
-           base-commit-map {:old-commit commit
-                            :issuer     did
-                            :message    message
-                            :tag        tag
-                            :dbid       dbid
-                            :t          t
-                            :time       time
-                            :db-address db-address
-                            :author     author
-                            :annotation annotation
-                            :txn-id     txn-id
-                            :flakes     (:flakes stats)
-                            :size       (:size stats)}
-           new-commit      (commit-data/new-db-commit-map base-commit-map)
-           keypair         {:did did :private private}
-
-           {:keys [commit-map write-result] :as commit-write-map}
-           (<? (write-commit commit-store alias keypair new-commit))
-
-           db  (formalize-commit staged-db commit-map)
-           db* (update-commit! ledger branch db index-files-ch)]
-
-       (log/debug "Committing t" t "at" time)
-
-       (<? (publish-commit ledger commit-write-map))
-
-       (if file-data?
-         {:data-file-meta   data-write-result
-          :commit-file-meta write-result
-          :db               db*}
-         db*)))))
-
 (defn close-ledger
   "Shuts down ledger and resources."
   [{:keys [cache state] :as _ledger}]
@@ -306,7 +127,7 @@
                     " however, latest t is more current: " current-t)
           false)))))
 
-(defrecord Ledger [id address alias did state cache primary-publisher
+(defrecord Ledger [conn id address alias did state cache primary-publisher
                    secondary-publishers commit-storage index-storage reasoner])
 
 (defn initial-state
@@ -319,11 +140,12 @@
 (defn instantiate
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [ledger-alias ledger-address primary-publisher secondary-publishers branch
+  [conn ledger-alias ledger-address primary-publisher secondary-publishers branch
    commit-store index-store indexing-opts did latest-commit]
   (let [branches {branch (branch/state-map ledger-alias branch commit-store index-store
                                            latest-commit indexing-opts)}]
-    (map->Ledger {:id                   (random-uuid)
+    (map->Ledger {:conn                 conn
+                  :id                   (random-uuid)
                   :did                  did
                   :state                (atom (initial-state branches branch))
                   :alias                ledger-alias
@@ -346,7 +168,7 @@
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [{:keys [alias primary-address ns-addresses primary-publisher
+  [{:keys [conn alias primary-address ns-addresses primary-publisher
            secondary-publishers subscribers commit-store index-store]}
    {:keys [did branch indexing] :as opts}]
   (go-try
@@ -356,5 +178,5 @@
                              (util/current-time-iso))
           genesis-commit (<? (commit-storage/write-genesis-commit
                                commit-store alias branch ns-addresses init-time))]
-      (instantiate ledger-alias* primary-address primary-publisher secondary-publishers
+      (instantiate conn ledger-alias* primary-address primary-publisher secondary-publishers
                    branch commit-store index-store indexing did genesis-commit))))

@@ -202,10 +202,10 @@
   distributed rules."
   ([ledger db]
    (promise-wrap
-     (ledger/commit! ledger db)))
+     (connection/commit! ledger db)))
   ([ledger db opts]
    (promise-wrap
-     (ledger/commit! ledger db opts))))
+     (connection/commit! ledger db opts))))
 
 (defn transact!
   ([conn txn] (transact! conn txn nil))
