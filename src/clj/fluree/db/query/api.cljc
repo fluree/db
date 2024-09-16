@@ -2,6 +2,7 @@
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.string :as str]
+            [fluree.db.util.context :as context]
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger :as ledger]
             [fluree.db.time-travel :as time-travel]
@@ -13,10 +14,10 @@
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.connection :as connection]
-            [fluree.db.reasoner :as reasoner]))
+            [fluree.db.reasoner :as reasoner]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -25,7 +26,7 @@
   details included."
   [db query]
   (go-try
-    (let [context (ctx-util/extract query)]
+    (let [context (context/extract query)]
       (<? (history/query db context query)))))
 
 (defn sanitize-query-options
@@ -46,14 +47,41 @@
          (recur (rest rule-sources) updated-rule-results))
        rule-results))))
 
+
+(defn policy-restricted?
+  [query-opts]
+  (or (:did query-opts)
+      (:policyClass query-opts)
+      (:policy query-opts)))
+
+(defn policy-enforce-db
+  [db {:keys [opts] :as sanitized-query}]
+  (go-try
+   (let [context (context/extract sanitized-query)
+         {:keys [did policyClass policy policyValues]} opts]
+     (cond
+
+       did
+       (<? (perm/wrap-identity-policy db (json-ld/expand-iri did context) policyValues))
+
+       policyClass
+       (let [classes (map #(json-ld/expand-iri % context) (util/sequential policyClass))]
+         (<? (perm/wrap-class-policy db classes policyValues)))
+
+       policy
+       (let [expanded-policy (json-ld/expand policy context)]
+         (<? (perm/wrap-policy db expanded-policy policyValues)))))))
+
 (defn restrict-db
-  ([db t opts]
-   (restrict-db db t opts nil))
-  ([db t {:keys [did reasoner-methods rule-sources] :as opts} conn]
+  ([db sanitized-query]
+   (restrict-db db sanitized-query nil))
+  ([db {:keys [t opts] :as sanitized-query} conn]
    (go-try
-    (let [processed-rule-sources (<? (load-aliased-rule-dbs conn rule-sources))
-          policy-db              (if did
-                                   (<? (perm/wrap-identity-policy db did nil))
+    (let [{:keys [reasoner-methods rule-sources]} opts
+          processed-rule-sources (when rule-sources
+                                   (<? (load-aliased-rule-dbs conn rule-sources)))
+          policy-db              (if (policy-restricted? opts)
+                                   (<? (policy-enforce-db db sanitized-query))
                                    db)
           time-travel-db         (-> (if t
                                        (<? (time-travel/as-of policy-db t))
@@ -97,7 +125,7 @@
           ;;      - upstream if needed
           ds*      (if (dataset? ds)
                      ds
-                     (<? (restrict-db ds t opts)))
+                     (<? (restrict-db ds query*)))
           query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
           max-fuel (:max-fuel opts)]
       (if (::util/track-fuel? opts)
@@ -169,25 +197,26 @@
       [alias nil])))
 
 (defn load-alias
-  [conn alias t opts]
+  [conn alias {:keys [t] :as sanitized-query}]
   (go-try
     (try*
       (let [[alias explicit-t] (extract-query-string-t alias)
             address      (<? (connection/primary-address conn alias))
             ledger       (<? (connection/load-ledger conn address))
             db           (ledger/current-db ledger)
-            t*           (or explicit-t t)]
-        (<? (restrict-db db t* opts conn)))
+            t*           (or explicit-t t)
+            query*       (assoc sanitized-query :t t*)]
+        (<? (restrict-db db query* conn)))
       (catch* e
               (throw (contextualize-ledger-400-error
                        (str "Error loading ledger " alias ": ")
                        e))))))
 
 (defn load-aliases
-  [conn aliases global-t opts]
-  (when (some? global-t)
+  [conn aliases sanitized-query]
+  (when (some? (:t sanitized-query))
     (try*
-      (util/str->epoch-ms global-t)
+      (util/str->epoch-ms (:t sanitized-query))
       (catch* e
         (throw
          (contextualize-ledger-400-error
@@ -199,7 +228,7 @@
           db-map      {}]
      (if alias
        ;; TODO: allow restricting federated dataset components individually by t
-       (let [db      (<? (load-alias conn alias global-t opts))
+       (let [db      (<? (load-alias conn alias sanitized-query))
              db-map* (assoc db-map alias db)]
          (recur r db-map*))
        db-map))))
@@ -213,16 +242,16 @@
     (dataset/combine named-graphs default-coll)))
 
 (defn load-dataset
-  [conn defaults named global-t opts]
+  [conn defaults named sanitized-query]
   (go-try
     (if (and (= (count defaults) 1)
              (empty? named))
       (let [alias (first defaults)]
-        (<? (load-alias conn alias global-t opts))) ; return an unwrapped db if
+        (<? (load-alias conn alias sanitized-query))) ; return an unwrapped db if
                                                     ; the data set consists of
                                                     ; one ledger
       (let [all-aliases (->> defaults (concat named) distinct)
-            db-map      (<? (load-aliases conn all-aliases global-t opts))]
+            db-map      (<? (load-aliases conn all-aliases sanitized-query))]
         (dataset db-map defaults)))))
 
 (defn query-connection-fql
@@ -236,7 +265,7 @@
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [ds            (<? (load-dataset conn default-aliases named-aliases t opts))
+        (let [ds            (<? (load-dataset conn default-aliases named-aliases sanitized-query))
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel ::util/track-fuel?)
               max-fuel      (:max-fuel opts)]
           (if (::util/track-fuel? opts)

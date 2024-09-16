@@ -160,10 +160,6 @@
     (go-try
      (let [db (<? db-chan)]
        (<? (policy/wrap-policy db policy values-map)))))
-  (wrap-identity-policy [_ identity values-map]
-    (go-try
-      (let [db (<? db-chan)]
-        (<? (policy/wrap-identity-policy db identity values-map)))))
   (root [_]
     (let [root-ch (async/promise-chan)
           root-db (->AsyncDB alias branch commit t root-ch)]

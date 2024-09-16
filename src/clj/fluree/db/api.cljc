@@ -2,6 +2,7 @@
   (:require [fluree.db.connection.system :as system]
             [fluree.db.connection.remote :as remote-conn]
             [fluree.db.connection :as connection :refer [notify-ledger]]
+            [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.platform :as platform]
@@ -239,11 +240,23 @@
    (ledger/current-db ledger)))
 
 (defn wrap-policy
+  "Restricts the provided db with the provided json-ld
+  policy restrictions"
   ([db policy]
    (wrap-policy db policy nil))
   ([db policy values-map]
    (promise-wrap
-    (policy/wrap-policy db policy values-map))))
+    (let [policy* (json-ld/expand policy)]
+      (policy/wrap-policy db policy* values-map)))))
+
+(defn wrap-class-policy
+  "Restricts the provided db with policies in the db
+  which have a class @type of the provided class(es)."
+  ([db policy-classes]
+   (wrap-class-policy db policy-classes nil))
+  ([db policy-classes values-map]
+   (promise-wrap
+    (policy/wrap-class-policy db policy-classes values-map))))
 
 (defn wrap-identity-policy
   "For provided identity, locates specific property f:policyClass on
@@ -335,12 +348,22 @@
    (let [latest-db (ledger/current-db ledger)
          res-chan  (query-api/history latest-db query)]
      (promise-wrap res-chan)))
-  ([ledger query {:keys [policy identity values-map] :as _opts}]
+  ([ledger query {:keys [policy identity policyClass policyValues] :as _opts}]
    (promise-wrap
-    (let [latest-db (ledger/current-db ledger)
-          policy-db (if identity
-                      (<? (policy/wrap-identity-policy latest-db identity values-map))
-                      (<? (policy/wrap-policy latest-db policy values-map)))]
+     (let [latest-db (ledger/current-db ledger)
+           context   (context/extract query)
+           policy-db (cond
+                       identity
+                       (<? (policy/wrap-identity-policy latest-db (json-ld/expand identity context) policyValues))
+
+                       policy
+                       (<? (policy/wrap-policy latest-db (json-ld/expand policy context) policyValues))
+
+                       policyClass
+                       (<? (policy/wrap-class-policy latest-db (json-ld/expand policyClass context) policyValues))
+
+                       :else
+                       latest-db)]
       (query-api/history policy-db query)))))
 
 (defn credential-history
@@ -351,7 +374,7 @@
   signing identity, which is then used by `wrap-identity-policy` to extract
   the policy classes and apply the policies to the query."
   ([ledger cred-query] (credential-history ledger cred-query {}))
-  ([ledger cred-query {:keys [values-map] :as _opts}]
+  ([ledger cred-query {:keys [policyValues] :as _opts}]
    (promise-wrap
     (go-try
      (let [latest-db (ledger/current-db ledger)
@@ -359,7 +382,7 @@
        (log/debug "Credential history query with identity: " identity " and query: " query)
        (cond
          (and query identity)
-         (let [policy-db (<? (policy/wrap-identity-policy latest-db identity values-map))]
+         (let [policy-db (<? (policy/wrap-identity-policy latest-db identity policyValues))]
            (<? (query-api/history policy-db query)))
 
          identity
