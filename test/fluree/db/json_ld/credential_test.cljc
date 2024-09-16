@@ -238,17 +238,19 @@
                         FROM <" ledger-id ">
                         WHERE { \"" (:id auth) "\" ct:name ?name }")]
          (is (= [["D"]]
-                @(fluree/credential-query
-                  db2
-                  (crypto/create-jws sparql (:private auth))
-                  {:format :sparql}))
+                (:result
+                 @(fluree/credential-query
+                   db2
+                   (crypto/create-jws sparql (:private auth))
+                   {:format :sparql})))
              "SPARQL query credential - allowing access")
          
          (is (= []
-                @(fluree/credential-query
-                  (fluree/db ledger)
-                  (crypto/create-jws sparql (:private pleb-auth))
-                  {:format :sparql}))
+                (:result
+                 @(fluree/credential-query
+                   (fluree/db ledger)
+                   (crypto/create-jws sparql (:private pleb-auth))
+                   {:format :sparql})))
              "SPARQL query credential - forbidding access")
          
          (is (= [["D"]]
