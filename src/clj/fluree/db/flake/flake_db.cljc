@@ -460,8 +460,6 @@
   policy/Restrictable
   (wrap-policy [db policy values-map]
     (policy-rules/wrap-policy db policy values-map))
-  (wrap-identity-policy [db identity values-map]
-    (policy-rules/wrap-identity-policy db identity values-map))
   (root [db]
     (policy/root-db db))
 
