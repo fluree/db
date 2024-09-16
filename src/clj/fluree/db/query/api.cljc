@@ -282,9 +282,10 @@
 (defn query-connection-sparql
   [conn query did]
   (go-try
-    (let [fql (sparql/->fql query)]
-      (log/debug "query-connection SPARQL fql: " fql "did:" did)
-      (<? (query-connection-fql conn fql did)))))
+    (let [fql (sparql/->fql query)
+          fuel-enabled-fql (assoc-in fql [:opts :meta] true)]
+      (log/debug "query-connection SPARQL fql: " fuel-enabled-fql "did:" did)
+      (<? (query-connection-fql conn fuel-enabled-fql did)))))
 
 (defn query-connection
   [conn query {:keys [format did] :as opts :or {format :fql}}]
