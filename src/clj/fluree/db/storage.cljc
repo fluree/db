@@ -37,6 +37,11 @@
      :method method
      :local  local}))
 
+(defn split-address
+  "Splits `address` into the fully qualified storage method and local path."
+  [address]
+  (str/split address #":(?!.*:)" 2))
+
 (defn parse-local-path
   [address]
   (-> address parse-address :local))
