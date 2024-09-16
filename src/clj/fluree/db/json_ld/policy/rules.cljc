@@ -140,50 +140,21 @@
    {}
    policy-rules))
 
-;; TODO - For now, extracting a policy from a `select` clause does not retain the
-;  @value: 'x', @type: '@json' structure for the value of `f:query` which
-;  then creates an issue with JSON-LD parsing. This adds back the
-;  explicit @type declaration for the query itself. Once there is a way
-;  to have the query result come back as raw json-ld, then this step can
-;  be removed.
-(defn policy-from-query
-  "Recasts @type: @json from a raw query result which
-  would looses the @type information."
-  [query-results]
-  (mapv
-   #(if-let [query (get % const/iri-query)]
-      (assoc % const/iri-query {"@value" query
-                                "@type"  "@json"})
-      %)
-   query-results))
+(defn validate-values-map
+  [values-map]
+  (or (map? values-map)
+      (throw (ex-info (str "Invalid policy values map. Must be a map. Received: " values-map)
+                      {:status 400
+                       :error  :db/invalid-values-map}))))
 
 (defn wrap-policy
   [db policy-rules values-map]
   (go-try
-   (let [policy-rules (->> (parse-rules-graph policy-rules)
+   (when values-map
+     (validate-values-map values-map))
+   (let [policy-rules (->> policy-rules
+                           util/sequential
                            (parse-policy-rules db))]
      (log/trace "policy-rules: " policy-rules)
      (assoc db :policy (assoc policy-rules :cache (atom {})
                                            :values-map values-map)))))
-
-(defn wrap-identity-policy
-  [db identity values-map]
-  (go
-   (let [policies  (<! (dbproto/-query db {"select" {"?policy" ["*"]}
-                                           "where"  [{"@id"                 identity
-                                                      const/iri-policyClass "?classes"}
-                                                     {"@id"   "?policy"
-                                                      "@type" "?classes"}]}))
-         policies* (if (util/exception? policies)
-                     policies
-                     (policy-from-query policies))
-         val-map   (assoc values-map "?$identity" {"@value" identity
-                                                   "@type"  const/iri-id})]
-     (log/trace "wrap-identity-policy - extracted policy from identity: " identity
-                " policy: " policies*)
-     (if (util/exception? policies*)
-       (ex-info (str "Unable to extract policies for identity: " identity
-                     " with error: " (ex-message policies*))
-                {:status 400 :error :db/policy-exception}
-                policies*)
-       (<! (wrap-policy db policies* val-map))))))
