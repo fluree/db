@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.policy.rules
-  (:require [fluree.db.constants :as const]
+  (:require [clojure.core.async :refer [<! go]]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
@@ -15,7 +16,11 @@
 
 (defn class-restriction?
   [restriction-map]
-  (nil? (:on-property restriction-map)))
+  (seq (:on-class restriction-map)))
+
+(defn default-restriction?
+  [restriction-map]
+  (:default? restriction-map))
 
 (defn view-restriction?
   [restriction-map]
@@ -24,15 +29,6 @@
 (defn modify-restriction?
   [restriction-map]
   (:modify? restriction-map))
-
-(defn extract-query
-  [restriction]
-  (let [query (util/get-first-value restriction const/iri-query)]
-    (if (map? query)
-      (assoc query "select" "?$this")
-      (throw (ex-info (str "Invalid policy, unable to extract query from restriction: " restriction)
-                      {:status 400
-                       :error :db/invalid-policy})))))
 
 (defn policy-cids
   "Returns class subject ids for a given policy restriction map.
@@ -44,91 +40,84 @@
          (map #(iri/encode-iri db %))
          set)))
 
-(defn add-view-prop-restriction
-  [restriction pid policy]
-  (update-in policy [const/iri-view :property pid] util/conjv restriction))
+(defn add-default-restriction
+  [restriction policy]
+  (cond-> policy
 
-(defn add-modify-prop-restriction
-  [restriction pid policy]
-  (update-in policy [const/iri-modify :property pid] util/conjv restriction))
+          (view-restriction? restriction)
+          (update-in [const/iri-view :default] util/conjv restriction)
 
-(defn add-view-class-restriction
-  [restriction cid policy]
-  (update-in policy [const/iri-view :class cid] util/conjv restriction))
+          (modify-restriction? restriction)
+          (update-in [const/iri-modify :default] util/conjv restriction)))
 
-(defn add-modify-class-restriction
-  [restriction cid policy]
-  (update-in policy [const/iri-modify :class cid] util/conjv restriction))
-
-(defn parse-class-restriction
+(defn add-class-restriction
   [restriction-map db policy-map]
   (let [cids (policy-cids db restriction-map)]
     (reduce
-     (fn [acc cid]
+     (fn [policy cid]
        (let [restriction-map* (assoc restriction-map :cid cid)]
-         (cond->> acc
+         (cond-> policy
 
-                  (view-restriction? restriction-map)
-                  (add-view-class-restriction restriction-map* cid)
+                 (view-restriction? restriction-map*)
+                 (update-in [const/iri-view :class cid] util/conjv restriction-map*)
 
-                  (modify-restriction? restriction-map)
-                  (add-modify-class-restriction restriction-map* cid))))
+                 (modify-restriction? restriction-map*)
+                 (update-in [const/iri-modify :class cid] util/conjv restriction-map*))))
      policy-map
      cids)))
 
-(defn parse-property-restriction
+(defn add-property-restriction
   [restriction-map db policy-map]
   (let [cids (policy-cids db restriction-map)]
     (reduce
-     (fn [acc property]
+     (fn [policy property]
        (let [pid              (iri/encode-iri db property)
              restriction-map* (assoc restriction-map :pid pid
                                                      :cids cids)]
-         (cond->> acc
+         (cond-> policy
 
-                  (view-restriction? restriction-map)
-                  (add-view-prop-restriction restriction-map* pid)
+                 (view-restriction? restriction-map*)
+                 (update-in [const/iri-view :property pid] util/conjv restriction-map*)
 
-                  (modify-restriction? restriction-map)
-                  (add-modify-prop-restriction restriction-map* pid))))
+                 (modify-restriction? restriction-map*)
+                 (update-in [const/iri-modify :property pid] util/conjv restriction-map*))))
      policy-map
      (:on-property restriction-map))))
 
 (defn restriction-map
   [restriction]
   (let [id          (util/get-id restriction) ;; @id name of restriction
-        on-property (util/get-all-ids restriction const/iri-onProperty) ;; can be multiple properties
+        on-property (when-let [props (util/get-all-ids restriction const/iri-onProperty)]
+                      (set props)) ;; can be multiple properties
         on-class    (when-let [classes (util/get-all-ids restriction const/iri-onClass)]
                       (set classes))
-        query       (extract-query restriction)
+        src-query   (util/get-first-value restriction const/iri-query)
+        query       (if (map? src-query)
+                      (assoc src-query "select" "?$this")
+                      (throw (ex-info (str "Invalid policy, unable to extract query from f:query. "
+                                           "Did you forget @context?. Parsed restriction: " restriction)
+                                      {:status 400
+                                       :error  :db/invalid-policy})))
         actions     (set (util/get-all-ids restriction const/iri-action))
         view?       (or (empty? actions) ;; if actions is not specified, default to all actions
                         (contains? actions const/iri-view))
         modify?     (or (empty? actions)
                         (contains? actions const/iri-modify))]
-    (cond
-      ;; valid restriction must have at least one of view or modify, and on-property or on-class
-      (and (or view? modify?)
-           (or on-property on-class))
+    (if (or view? modify?)
       {:id          id
        :on-property on-property
        :on-class    on-class
+       :default?    (and (nil? on-property) (nil? on-class)) ;; with no class or property restrictions, becomes a default policy
        :ex-message  (util/get-first-value restriction const/iri-exMessage)
        :view?       view?
        :modify?     modify?
        :query       query}
-
-      ;; no property or class specified
-      (or on-property on-class)
-      (do
-        (log/warn "Policy Restriction contain f:on-property or f:on-class, ignoring restriction: " id)
-        ;; log returns nil, but explicit here to show intended nil value for downstream checks
-        nil)
-
-      :else ;; no view or modify specified
-      (do
-        (log/warn "Policy Restriction must be of type view or modify, ignoring restriction: " id)
-        nil))))
+      ;; policy has incorrectly formatted view? and/or modify?
+      ;; this might allow data through that was intended to be restricted, so throw.
+      (throw (ex-info (str "Invalid policy definition. Policies must have f:action of {@id: f:view} or {@id: f:modify}. "
+                           "Policy restriction data that failed: " restriction)
+                      {:status 400
+                       :error  :db/invalid-policy})))))
 
 (defn parse-policy-rules
   [db policy-rules]
@@ -138,61 +127,34 @@
        (cond
 
          (property-restriction? parsed-restriction)
-         (parse-property-restriction parsed-restriction db acc)
+         (add-property-restriction parsed-restriction db acc)
 
          (class-restriction? parsed-restriction)
-         (parse-class-restriction parsed-restriction db acc)
+         (add-class-restriction parsed-restriction db acc)
+
+         (default-restriction? parsed-restriction)
+         (add-default-restriction parsed-restriction acc)
 
          :else
          acc)))
    {}
    policy-rules))
 
-;; TODO - For now, extracting a policy from a `select` clause does not retain the
-;  @value: 'x', @type: '@json' structure for the value of `f:query` which
-;  then creates an issue with JSON-LD parsing. This adds back the
-;  explicit @type declaration for the query itself. Once there is a way
-;  to have the query result come back as raw json-ld, then this step can
-;  be removed.
-(defn policy-from-query
-  "Recasts @type: @json from a raw query result which
-  would looses the @type information."
-  [query-results]
-  (mapv
-   #(if-let [query (get % const/iri-query)]
-      (assoc % const/iri-query {"@value" query
-                                "@type"  "@json"})
-      %)
-   query-results))
+(defn validate-values-map
+  [values-map]
+  (or (map? values-map)
+      (throw (ex-info (str "Invalid policy values map. Must be a map. Received: " values-map)
+                      {:status 400
+                       :error  :db/invalid-values-map}))))
 
 (defn wrap-policy
-  [db policy-rules default-allow? values-map]
+  [db policy-rules values-map]
   (go-try
-   (let [policy-rules (->> (parse-rules-graph policy-rules)
+   (when values-map
+     (validate-values-map values-map))
+   (let [policy-rules (->> policy-rules
+                           util/sequential
                            (parse-policy-rules db))]
      (log/trace "policy-rules: " policy-rules)
      (assoc db :policy (assoc policy-rules :cache (atom {})
-                                           :values-map values-map
-                                           :default-allow? default-allow?)))))
-
-(defn wrap-identity-policy
-  [db identity default-allow? values-map]
-  (go-try
-   (let [policies  (<? (dbproto/-query db {"select" {"?policy" ["*"]}
-                                           "where"  [{"@id"                 identity
-                                                      const/iri-policyClass "?classes"}
-                                                     {"@id"   "?policy"
-                                                      "@type" "?classes"}]}))
-         policies* (if (util/exception? policies)
-                     policies
-                     (policy-from-query policies))
-         val-map   (assoc values-map "?$identity" {"@value" identity
-                                                   "@type"  const/iri-id})]
-     (log/trace "wrap-identity-policy - extracted policy from identity: " identity
-                " policy: " policies*)
-     (if (util/exception? policies*)
-       (throw (ex-info (str "Unable to extract policies for identity: " identity
-                            " with error: " (ex-message policies*))
-                       {:status 400 :error :db/policy-exception}
-                       policies*))
-       (<? (wrap-policy db policies* default-allow? val-map))))))
+                                           :values-map values-map)))))
