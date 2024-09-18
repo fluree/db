@@ -13,6 +13,13 @@
   (or (string? x)
       #?(:clj (bytes? x))))
 
+(defn build-location
+  [ns identifier method]
+  (let [components (if identifier
+                     [ns identifier method]
+                     [ns method])]
+    (str/join ":" components)))
+
 (defn sanitize-path
   [path]
   (if (str/starts-with? path "//")
@@ -23,11 +30,9 @@
   ([ns method path]
    (build-address ns nil method path))
   ([ns identifier method path]
-   (let [path* (sanitize-path path)
-         components (if identifier
-                      [ns identifier method path*]
-                      [ns method path*])]
-     (str/join ":" components))))
+   (let [location (build-location ns identifier method)
+         path*    (sanitize-path path)]
+     (str/join ":" [location path*]))))
 
 (def fluree-namespace "fluree")
 
