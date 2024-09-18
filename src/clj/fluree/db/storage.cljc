@@ -1,9 +1,12 @@
 (ns fluree.db.storage
   (:refer-clojure :exclude [read list exists?])
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :as async]
+            [clojure.pprint :as pprint]
+            [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
-            [fluree.json-ld :as json-ld]))
+            [fluree.json-ld :as json-ld])
+  #?(:clj (:import (java.io Writer))))
 
 (defn hashable?
   [x]
@@ -91,3 +94,44 @@
    (-read-json store address false))
   ([store address keywordize?]
    (-read-json store address keywordize?)))
+
+(defrecord Catalog [])
+
+#?(:clj
+   (defmethod print-method Catalog [^Catalog clg, ^Writer w]
+     (.write w (str "#fluree/Catalog "))
+     (binding [*out* w]
+       (pr (->> clg keys vec))))
+   :cljs
+     (extend-type Catalog
+       IPrintWithWriter
+       (-pr-writer [clg w opts]
+         (-write w "#fluree/Catalog ")
+         (-write w (pr (->> clg keys vec))))))
+
+(defmethod pprint/simple-dispatch Catalog [^Catalog clg]
+  (pr clg))
+
+(defn catalog
+  [& address-mappings]
+  (into (->Catalog) (partition-all 2) address-mappings))
+
+(defn async-location-error
+  [location]
+  (let [ex (ex-info (str "Unrecognized storage location:" location)
+                    {:status 500, :error :db/unexpected-error})]
+    (doto (async/chan)
+      (async/put! ex))))
+
+(defn read-address-json
+  [clg address]
+  (let [[location local-path] (split-address address)]
+    (if-let [store (get clg location)]
+      (read-json store local-path)
+      (async-location-error location))))
+
+(defn content-write-location-json
+  [clg location path data]
+  (if-let [store (get clg location)]
+    (content-write-json store path data)
+    (async-location-error location)))
