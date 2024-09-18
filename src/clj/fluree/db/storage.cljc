@@ -27,20 +27,36 @@
   [method path]
   (build-address fluree-namespace method path))
 
-(defn parse-address
-  [address]
-  (let [[ns method path] (str/split address #":")
-        local            (if (str/starts-with? path "//")
-                           (subs path 2)
-                           path)]
-    {:ns     ns
-     :method method
-     :local  local}))
-
 (defn split-address
   "Splits `address` into the fully qualified storage method and local path."
   [address]
   (str/split address #":(?!.*:)" 2))
+
+(defn split-location
+  [location]
+  (let [[ns ident method :as parts] (str/split location #":")]
+    (cond (= (count parts) 3)
+          [ns ident method]
+
+          (= (count parts) 2)
+          (let [ident*  nil
+                method* ident]
+            [ns ident* method*])
+
+          :else (throw (ex-info (str "Invalid address location:" location)
+                                {:status 500, :error :db/unexpected-error})))))
+
+(defn parse-address
+  [address]
+  (let [[location path]   (split-address address)
+        [ns ident method] (split-location location)
+        local             (if (str/starts-with? path "//")
+                            (subs path 2)
+                            path)]
+    (cond-> {:ns     ns
+             :method method
+             :local  local}
+      ident (assoc :ident ident))))
 
 (defn parse-local-path
   [address]
