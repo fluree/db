@@ -25,7 +25,7 @@
         (swap! contents dissoc path))))
 
   storage/ContentAddressedStore
-  (-content-write [_ _ v]
+  (-content-write-bytes [_ _ v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v

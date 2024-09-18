@@ -27,7 +27,7 @@
         (.removeItem js/localStorage path))))
 
   storage/ContentAddressedStore
-  (-content-write [_ k v]
+  (-content-write-bytes [_ k v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v

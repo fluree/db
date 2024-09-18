@@ -50,7 +50,7 @@
   (-read-json [store address keywordize?] "Returns value associated with `address`."))
 
 (defprotocol ContentAddressedStore
-  (-content-write [store k v]
+  (-content-write-bytes [store k v]
     "Writes pre-serialized data `v` to store associated with key `k` and the
     hashed value of `v`. Returns value's address."))
 
@@ -67,7 +67,7 @@
   (go-try
     (let [json   (json-ld/normalize-data data)
           bytes  (bytes/string->UTF8 json)
-          result (<? (-content-write store path bytes))]
+          result (<? (-content-write-bytes store path bytes))]
       (assoc result :json json))))
 
 (defn read-json

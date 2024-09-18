@@ -21,7 +21,7 @@
         (json/parse data keywordize?))))
 
   storage/ContentAddressedStore
-  (-content-write [_ dir data]
+  (-content-write-bytes [_ dir data]
     (go
       (let [hash     (crypto/sha2-256 data)
             bytes    (if (string? data)

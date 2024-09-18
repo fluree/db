@@ -36,7 +36,7 @@
       (fs/delete-file path)))
 
   storage/ContentAddressedStore
-  (-content-write [_ dir data]
+  (-content-write-bytes [_ dir data]
     (go-try
       (when (not (storage/hashable? data))
         (throw (ex-info "Must serialize data before writing to FileStore."

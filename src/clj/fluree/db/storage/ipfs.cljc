@@ -30,7 +30,7 @@
           (json/parse data keywordize?)))))
 
   storage/ContentAddressedStore
-  (-content-write [_ path v]
+  (-content-write-bytes [_ path v]
     (go-try
       (let [content (if (string? v)
                       v
