@@ -20,15 +20,19 @@
     (str "//" path)))
 
 (defn build-address
-  [ns method path]
-  (let [path* (sanitize-path path)]
-    (str/join ":" [ns method path*])))
+  ([ns method path]
+   (build-address ns nil method path))
+  ([ns identifier method path]
+   (let [path* (sanitize-path path)
+         components (if identifier
+                      [ns identifier method path*]
+                      [ns method path*])]
+     (str/join ":" components))))
 
 (def fluree-namespace "fluree")
 
-(defn build-fluree-address
-  [method path]
-  (build-address fluree-namespace method path))
+(def build-fluree-address
+  (partial build-address fluree-namespace))
 
 (defn split-address
   "Splits `address` into the fully qualified storage method and local path."
@@ -37,14 +41,14 @@
 
 (defn split-location
   [location]
-  (let [[ns ident method :as parts] (str/split location #":")]
-    (cond (= (count parts) 3)
-          [ns ident method]
+  (let [components (str/split location #":")]
+    (cond (= (count components) 3)
+          components
 
-          (= (count parts) 2)
-          (let [ident*  nil
-                method* ident]
-            [ns ident* method*])
+          (= (count components) 2)
+          (let [[ns method] components
+                identifier  nil]
+            [ns identifier method])
 
           :else (throw (ex-info (str "Invalid address location:" location)
                                 {:status 500, :error :db/unexpected-error})))))
@@ -52,14 +56,14 @@
 (defn parse-address
   [address]
   (let [[location path]   (split-address address)
-        [ns ident method] (split-location location)
+        [ns identifier method] (split-location location)
         local             (if (str/starts-with? path "//")
                             (subs path 2)
                             path)]
     (cond-> {:ns     ns
              :method method
              :local  local}
-      ident (assoc :ident ident))))
+      identifier (assoc :identifier identifier))))
 
 (defn parse-local-path
   [address]
