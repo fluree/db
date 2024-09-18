@@ -16,14 +16,14 @@
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go
-      (let [path (:local (storage/parse-address address))]
+      (let [path (storage/parse-local-path address)]
         (when-let [data (.getItem js/localStorage path)]
           (json/parse data keywordize?)))))
 
   storage/EraseableStore
   (delete [_ address]
     (go
-      (let [path (:local (storage/parse-address address))]
+      (let [path (storage/parse-local-path address)]
         (.removeItem js/localStorage path))))
 
   storage/ContentAddressedStore

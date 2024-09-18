@@ -15,7 +15,7 @@
 
 (defn storage-path
   [root address]
-  (let [relative-path (:local (storage/parse-address address))]
+  (let [relative-path (storage/parse-local-path address)]
     (full-path root relative-path)))
 
 (defn file-address
