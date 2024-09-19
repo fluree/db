@@ -94,10 +94,10 @@
       (< 0 (:KeyCount list)))))
 
 (defn s3-address
-  [s3-bucket s3-prefix path]
-  (storage/build-fluree-address nil method-name path [s3-bucket s3-prefix]))
+  [identifier s3-bucket s3-prefix path]
+  (storage/build-fluree-address identifier method-name path [s3-bucket s3-prefix]))
 
-(defrecord S3Store [client bucket prefix]
+(defrecord S3Store [identifier client bucket prefix]
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go-try
@@ -113,14 +113,13 @@
                        data)
             filename (str hash ".json")
             path     (str/join "/" [dir filename])
-            result   (<! (write-s3-data client bucket prefix path bytes))
-            address  (s3-address bucket prefix path)]
+            result   (<! (write-s3-data client bucket prefix path bytes))]
         (if (instance? Throwable result)
           result
           {:hash    hash
-           :path    (str/replace address #"fluree:s3://" "")
+           :path    path
            :size    (count bytes)
-           :address address}))))
+           :address (s3-address identifier bucket prefix path)}))))
 
   storage/ByteStore
   (write-bytes [_ path bytes]
@@ -131,9 +130,11 @@
 
 (defn open
   ([bucket prefix]
-   (open bucket prefix nil))
-  ([bucket prefix endpoint-override]
+   (open nil bucket prefix))
+  ([identifier bucket prefix]
+   (open identifier bucket prefix nil))
+  ([identifier bucket prefix endpoint-override]
    (let [aws-opts (cond-> {:api :s3}
                     endpoint-override (assoc :endpoint-override endpoint-override))
          client   (aws/client aws-opts)]
-     (->S3Store client bucket prefix))))
+     (->S3Store identifier client bucket prefix))))

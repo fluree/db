@@ -19,10 +19,10 @@
     (full-path root relative-path)))
 
 (defn file-address
-  [path]
-  (storage/build-fluree-address method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord FileStore [root]
+(defrecord FileStore [identifier root]
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go-try
@@ -52,7 +52,7 @@
                        data)]
         (<? (fs/write-file absolute bytes))
         {:path    path
-         :address (file-address path)
+         :address (file-address identifier path)
          :hash    hash
          :size    (count bytes)})))
 
@@ -68,5 +68,7 @@
         fs/read-file)))
 
 (defn open
-  [root-path]
-  (->FileStore root-path))
+  ([root-path]
+   (open nil root-path))
+  ([identifier root-path]
+   (->FileStore identifier root-path)))

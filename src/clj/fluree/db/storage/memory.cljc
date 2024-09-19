@@ -7,10 +7,10 @@
 (def method-name "memory")
 
 (defn memory-address
-  [path]
-  (storage/build-fluree-address method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord MemoryStore [contents]
+(defrecord MemoryStore [identifier contents]
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go
@@ -33,7 +33,7 @@
             hash     (crypto/sha2-256 hashable)]
         (swap! contents assoc hash v)
         {:path    hash
-         :address (memory-address hash)
+         :address (memory-address identifier hash)
          :hash    hash
          :size    (count hashable)})))
 
@@ -47,6 +47,8 @@
       (get @contents path))))
 
 (defn create
-  []
-  (let [contents (atom {})]
-    (->MemoryStore contents)))
+  ([]
+   (create nil))
+  ([identifier]
+   (let [contents (atom {})]
+     (->MemoryStore identifier contents))))

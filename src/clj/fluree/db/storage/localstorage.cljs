@@ -9,10 +9,10 @@
 (def method-name "localstorage")
 
 (defn local-storage-address
-  [path]
-  (storage/build-fluree-address method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord LocalStorageStore []
+(defrecord LocalStorageStore [identifier]
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go
@@ -35,13 +35,15 @@
             hash     (crypto/sha2-256 hashable)]
         (.setItem js/localStorage k v)
         {:path    k
-         :address (local-storage-address k)
+         :address (local-storage-address identifier k)
          :hash    hash
          :size    (count hashable)}))))
 
 (defn open
-  []
-  (if-not platform/BROWSER
-    (throw (ex-info "LocalStorageStore is only supported on the Browser platform."
-                    {}))
-    (->LocalStorageStore)))
+  ([]
+   (open nil))
+  ([identifier]
+   (if-not platform/BROWSER
+     (throw (ex-info "LocalStorageStore is only supported on the Browser platform."
+                     {}))
+     (->LocalStorageStore identifier))))
