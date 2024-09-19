@@ -98,6 +98,10 @@
   (storage/build-fluree-address identifier method-name path [s3-bucket s3-prefix]))
 
 (defrecord S3Store [identifier client bucket prefix]
+  storage/Addressable
+  (-location [_]
+    (storage/build-location storage/fluree-namespace identifier method-name [bucket prefix]))
+
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go-try

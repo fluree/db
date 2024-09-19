@@ -14,11 +14,13 @@
       #?(:clj (bytes? x))))
 
 (defn build-location
-  [ns identifier method auxiliary]
-  (->> [ns identifier (name method) auxiliary]
-       (remove nil?)
-       flatten
-       (str/join ":")))
+  ([ns identifier method]
+   (build-location ns identifier method []))
+  ([ns identifier method auxiliary]
+   (->> [ns identifier (name method) (not-empty auxiliary)]
+        (remove nil?)
+        flatten
+        (str/join ":"))))
 
 (defn sanitize-path
   [path]
@@ -79,6 +81,9 @@
   [address]
   (-> address parse-address :local))
 
+(defprotocol Addressable
+  (-location [section]))
+
 (defprotocol JsonArchive
   (-read-json [store address keywordize?] "Returns value associated with `address`."))
 
@@ -126,9 +131,14 @@
 (defmethod pprint/simple-dispatch Catalog [^Catalog clg]
   (pr clg))
 
+(defn section-entry
+  [section]
+  (let [loc (-location section)]
+    [loc section]))
+
 (defn catalog
-  [& address-mappings]
-  (into (->Catalog) (partition-all 2) address-mappings))
+  [& sections]
+  (into (->Catalog) (map section-entry) sections))
 
 (defn async-location-error
   [location]

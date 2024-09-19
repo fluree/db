@@ -17,6 +17,9 @@
   (storage/build-fluree-address identifier method-name path))
 
 (defrecord IpfsStore [identifier endpoint]
+  storage/Addressable
+  (-location [_]
+    (storage/build-location storage/fluree-namespace identifier method-name))
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go-try

@@ -11,6 +11,10 @@
   (storage/build-fluree-address identifier method-name path))
 
 (defrecord MemoryStore [identifier contents]
+  storage/Addressable
+  (-location [_]
+    (storage/build-location storage/fluree-namespace identifier method-name))
+
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go
