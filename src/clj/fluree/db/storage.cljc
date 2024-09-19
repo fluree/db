@@ -14,11 +14,11 @@
       #?(:clj (bytes? x))))
 
 (defn build-location
-  [ns identifier method]
-  (let [components (if identifier
-                     [ns identifier method]
-                     [ns method])]
-    (str/join ":" components)))
+  [ns identifier method auxiliary]
+  (->> [ns identifier (name method) auxiliary]
+       (remove nil?)
+       flatten
+       (str/join ":")))
 
 (defn sanitize-path
   [path]
@@ -30,7 +30,9 @@
   ([ns method path]
    (build-address ns nil method path))
   ([ns identifier method path]
-   (let [location (build-location ns identifier method)
+   (build-address ns identifier method path nil))
+  ([ns identifier method path auxiliary]
+   (let [location (build-location ns identifier method auxiliary)
          path*    (sanitize-path path)]
      (str/join ":" [location path*]))))
 
@@ -44,31 +46,34 @@
   [address]
   (str/split address #":(?!.*:)" 2))
 
-(defn split-location
+(defn valid-identifier?
+  [x]
+  (str/includes? x "/"))
+
+(defn parse-location
   [location]
-  (let [components (str/split location #":")]
-    (cond (= (count components) 3)
-          components
-
-          (= (count components) 2)
-          (let [[ns method] components
-                identifier  nil]
-            [ns identifier method])
-
-          :else (throw (ex-info (str "Invalid address location:" location)
-                                {:status 500, :error :db/unexpected-error})))))
+  (let [components   (str/split location #":")
+        address-ns   (nth components 0)
+        id-or-method (nth components 1)]
+    (if (valid-identifier? id-or-method)
+      (let [identifier id-or-method
+            method     (nth components 2)
+            auxiliary  (-> components (subvec 3) not-empty)]
+        (cond-> {:ns address-ns :identifier identifier, :method method}
+          auxiliary (assoc :auxiliary auxiliary)))
+      (let [method     id-or-method
+            auxiliary  (-> components (subvec 2) not-empty)]
+        (cond-> {:ns address-ns, :method method}
+          auxiliary (assoc :auxiliary auxiliary))))))
 
 (defn parse-address
   [address]
-  (let [[location path]   (split-address address)
-        [ns identifier method] (split-location location)
-        local             (if (str/starts-with? path "//")
-                            (subs path 2)
-                            path)]
-    (cond-> {:ns     ns
-             :method method
-             :local  local}
-      identifier (assoc :identifier identifier))))
+  (let [[location path] (split-address address)
+        parsed          (parse-location location)
+        local           (if (str/starts-with? path "//")
+                          (subs path 2)
+                          path)]
+    (assoc parsed :local local)))
 
 (defn parse-local-path
   [address]

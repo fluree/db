@@ -93,38 +93,15 @@
     (let [list (<! (s3-list s3-client s3-bucket s3-prefix key))]
       (< 0 (:KeyCount list)))))
 
-(defn address-path
-  ([s3-bucket s3-prefix address] (address-path s3-bucket s3-prefix address true))
-  ([s3-bucket s3-prefix address strip-prefix?]
-   (log/debug "address-path address:" address)
-   (let [path (-> address (str/split #"://") last)]
-     (if strip-prefix?
-       (-> path (str/replace-first (str s3-bucket "/" s3-prefix "/") ""))
-       (str "//" path)))))
-
-(defn read-s3-address
-  [s3-client s3-bucket s3-prefix address]
-  (->> address
-       (address-path s3-bucket s3-prefix)
-       (read-s3-data s3-client s3-bucket s3-prefix)))
-
-(defn full-path
-  [s3-bucket s3-prefix path]
-  (let [path* (if (str/starts-with? path "//")
-                (-> path (str/split #"//") last)
-                path)]
-    (str/join "/" [s3-bucket s3-prefix path*])))
-
 (defn s3-address
   [s3-bucket s3-prefix path]
-  (let [path* (full-path s3-bucket s3-prefix path)]
-    (storage/build-fluree-address method-name path*)))
+  (storage/build-fluree-address nil method-name path [s3-bucket s3-prefix]))
 
 (defrecord S3Store [client bucket prefix]
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go-try
-      (when-let [data (<? (read-s3-address client bucket prefix address))]
+      (when-let [data (<? (read-s3-data client bucket prefix address))]
         (json/parse data keywordize?))))
 
   storage/ContentAddressedStore
