@@ -94,7 +94,8 @@
   "Tests 'options' for a query or transaction to see if the options request
   policy enforcement."
   [opts]
-  (or (:did opts)
+  (or (:identity opts)
+      (:did opts)
       (:policyClass opts)
       (:policy opts)))
 
@@ -102,10 +103,10 @@
   "Policy enforces a db based on the query/transaction options"
   [db parsed-context opts]
   (go-try
-   (let [{:keys [did policyClass policy policyValues]} opts]
+   (let [{:keys [identity did policyClass policy policyValues]} opts]
      (cond
 
-       did
+       (or identity did)
        (<? (wrap-identity-policy db did policyValues))
 
        policyClass

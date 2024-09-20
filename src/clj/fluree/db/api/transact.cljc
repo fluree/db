@@ -28,7 +28,8 @@
   (go-try
     (let [track-fuel? (or (:maxFuel parsed-opts)
                           (:meta parsed-opts))
-          identity    (:did parsed-opts)
+          identity    (or (:identity parsed-opts)
+                          (:did parsed-opts))
           policy-db   (if (policy/policy-enforced-opts? parsed-opts)
                         (let [parsed-context (:context parsed-opts)]
                           (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
@@ -86,7 +87,7 @@
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
-          cmt-opts    (dissoc parsed-opts :context :did)] ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
+          cmt-opts    (dissoc parsed-opts :context :did :identity)] ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
       (<? (ledger/-commit! ledger db cmt-opts)))))
 
 (defn transact!
@@ -114,11 +115,12 @@
   Will throw if signature cannot be extracted."
   [conn txn opts]
   (go-try
-   (let [{txn* :subject did :did} (<? (cred/verify txn))
+   (let [{txn* :subject identity :did} (<? (cred/verify txn))
          parent-context (when (map? txn) ;; parent-context only relevant for verifiable credential
                           (ctx-util/txn-context txn))]
      (<? (transact! conn txn* (assoc opts :raw-txn txn
-                                          :did did
+                                          :did identity
+                                          :identity identity
                                           :context parent-context))))))
 
 (defn create-with-txn
