@@ -1,7 +1,7 @@
 (ns fluree.db.nameservice.remote
   (:require [fluree.db.nameservice :as nameservice]
             [fluree.db.method.remote :as remote]
-            [clojure.core.async :as async :refer [go go-loop]]
+            [clojure.core.async :as async :refer [<! go go-loop]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.json :as json]
@@ -10,21 +10,21 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn remote-lookup
-  [state server-state ledger-address]
+  [sys ledger-address]
   (go-try
-    (let [head-commit  (<? (remote/remote-read server-state ledger-address false))
+    (let [head-commit  (<? (remote/remote-read sys ledger-address false))
           head-address (get head-commit "address")]
       head-address)))
 
 (defn monitor-socket-messages
-  [{:keys [conn-state msg-in] :as _remote-ns} websocket]
+  [{:keys [state msg-in] :as _remote-ns} websocket]
   (go-loop []
-    (let [next-msg (async/<! msg-in)]
+    (let [next-msg (<! msg-in)]
       (if next-msg
         (let [[_ message] next-msg
               parsed-msg (json/parse message false)
               ledger     (get parsed-msg "ledger")
-              callback   (get-in @conn-state [:subscription ledger])]
+              callback   (get-in @state [:subscription ledger])]
           (if callback
             (try*
               (callback parsed-msg)
@@ -38,9 +38,9 @@
 
 (defn launch-subscription-socket
   "Returns chan with websocket after successful connection, or exception. "
-  [{:keys [server-state msg-in msg-out] :as remote-ns}]
+  [{:keys [remote-system msg-in msg-out] :as remote-ns}]
   (go
-    (let [ws (async/<! (remote/ws-connect server-state msg-in msg-out))]
+    (let [ws (<! (remote/ws-connect remote-system msg-in msg-out))]
       (if (util/exception? ws)
         (do
           (log/error "Error establishing websocket connection: " (ex-message ws))
@@ -51,7 +51,6 @@
           (log/info "Websocket connection established.")
           (monitor-socket-messages remote-ns ws)
           ws)))))
-
 
 (defn subscribe
   [ns-state ledger-alias callback]
@@ -66,9 +65,10 @@
   [ns-state ledger-alias]
   (swap! ns-state update :subscription dissoc ledger-alias))
 
-(defrecord RemoteNameService [conn-state server-state msg-in msg-out]
+(defrecord RemoteNameService [state remote-system msg-in msg-out]
   nameservice/iNameService
-  (lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
+  (lookup [_ ledger-address]
+    (remote-lookup remote-system ledger-address))
   (address [_ ledger-alias]
     (go ledger-alias))
   (alias [_ ledger-address]
@@ -79,20 +79,20 @@
 
   nameservice/Publication
   (-subscribe [_ ledger-alias callback]
-    (subscribe conn-state ledger-alias callback))
+    (subscribe state ledger-alias callback))
   (-unsubscribe [_ ledger-alias]
-    (unsubscribe conn-state ledger-alias)))
+    (unsubscribe state ledger-alias)))
 
 (defn initialize
-  [server-state conn-state]
+  [remote-system]
   (go-try
     (let [msg-in    (async/chan)
           msg-out   (async/chan)
-          remote-ns (map->RemoteNameService {:server-state server-state
-                                             :msg-in       msg-in
-                                             :msg-out      msg-out
-                                             :conn-state   (or conn-state (atom nil))})
-          websocket (async/<! (launch-subscription-socket remote-ns))]
+          remote-ns (map->RemoteNameService {:remote-system remote-system
+                                             :msg-in        msg-in
+                                             :msg-out       msg-out
+                                             :state         (atom nil)})
+          websocket (<! (launch-subscription-socket remote-ns))]
       (if (util/exception? websocket)
         (nameservice/-close remote-ns)
         remote-ns))))

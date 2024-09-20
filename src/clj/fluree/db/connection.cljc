@@ -201,7 +201,7 @@
     (boolean (<? (lookup-commit conn ledger-alias)))))
 
 (defn subscribe-ledger
-  "Initiates subscription requests for a ledger into all namespaces on a connection."
+  "Initiates subscription requests for a ledger into all subscribers on a connection."
   [conn ledger-alias]
   (let [nameservices (all-nameservices conn)
         callback     (fn [msg]
@@ -211,7 +211,7 @@
                              data         (get msg "data")]
                          (if (= "new-commit" action)
                            (notify-ledger conn data)
-                           (log/info "New subscritipn message with action: " action "received, ignored."))))]
+                           (log/info "New subscrition message with action: " action "received, ignored."))))]
     (go-try
       (loop [nameservices* nameservices]
         (when-let [ns (first nameservices*)]

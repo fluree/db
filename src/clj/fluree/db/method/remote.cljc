@@ -25,7 +25,7 @@
 
 (defn remote-read
   "Returns a core async channel with value of remote resource."
-  [server-state commit-key keywordize-keys?]
+  [{:keys [server-state]} commit-key keywordize-keys?]
   (log/debug "[remote conn] remote read initiated for: " commit-key)
   (let [server-host (pick-server server-state)]
     (xhttp/post-json (str server-host "/fluree/remoteResource")
@@ -33,7 +33,7 @@
                      {:keywordize-keys keywordize-keys?})))
 
 (defn monitor-messages
-  [conn msg-in msg-out]
+  [sys msg-in msg-out]
   (async/go-loop [next-msg (async/<! msg-in)]
     (if next-msg
       (let []
@@ -64,16 +64,16 @@
 
 
 (defn subscribed-ledger?
-  [{:keys [server-state] :as _conn} ledger-id]
+  [{:keys [server-state] :as _sys} ledger-id]
   (boolean
     (get-in @server-state [:subscriptions ledger-id])))
 
 (defn record-ledger-subscription
-  [{:keys [server-state] :as _conn} ledger-id]
+  [{:keys [server-state] :as _sys} ledger-id]
   (swap! server-state assoc-in [:subscriptions ledger-id] {:subscribed-at (util/current-time-millis)}))
 
 (defn remove-ledger-subscription
-  [{:keys [server-state] :as _conn} ledger-id]
+  [{:keys [server-state] :as _sys} ledger-id]
   (swap! server-state update :subscriptions dissoc ledger-id))
 
 (defn subscribe-ledger-msg
@@ -85,29 +85,41 @@
 ;; TODO - remote server will send all commits for all ledgers, but
 ;; TODO - locally, we'll only pay attention to those commits for ledgers
 (defn request-ledger-subscribe
-  [conn ledger-id]
-  #_(connection/-msg-out conn {:action :subscribe
+  [sys ledger-id]
+  #_(connection/-msg-out sys {:action :subscribe
                                :ledger ledger-id}))
 
 (defn request-ledger-unsubscribe
-  [conn ledger-id]
-  #_(connection/-msg-out conn {:action :unsubscribe
+  [sys ledger-id]
+  #_(connection/-msg-out sys {:action :unsubscribe
                                :ledger ledger-id}))
 
 (defn unsubscribe-ledger
-  [conn ledger-id]
+  [sys ledger-id]
   (log/debug "Subscriptions request for ledger: " ledger-id)
-  (if (subscribed-ledger? conn ledger-id)
+  (if (subscribed-ledger? sys ledger-id)
     (log/info "Subscription requested for ledger already exists: " ledger-id)
     (do
-      (remove-ledger-subscription conn ledger-id)
-      (request-ledger-unsubscribe conn ledger-id))))
+      (remove-ledger-subscription sys ledger-id)
+      (request-ledger-unsubscribe sys ledger-id))))
 
 (defn subscribe-ledger
-  [conn ledger-id]
+  [sys ledger-id]
   (log/debug "Subscriptions request for ledger: " ledger-id)
-  (if (subscribed-ledger? conn ledger-id)
+  (if (subscribed-ledger? sys ledger-id)
     (log/info "Subscription requested for ledger already exists: " ledger-id)
     (do
-      (record-ledger-subscription conn ledger-id)
-      (request-ledger-subscribe conn ledger-id))))
+      (record-ledger-subscription sys ledger-id)
+      (request-ledger-subscribe sys ledger-id))))
+
+(defrecord RemoteSystem [server-state])
+
+(defn initial-state
+  [servers]
+  {:servers      servers
+   :connected-to nil
+   :stats        {:connected-at nil}})
+
+(defn remote-system
+  [servers]
+  (-> servers initial-state atom ->RemoteSystem))
