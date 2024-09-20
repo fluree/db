@@ -2,6 +2,7 @@
   (:require [clojure.core.async :refer [go <!]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
@@ -88,3 +89,29 @@
                 {:status 400 :error :db/policy-exception}
                 policies*)
        (<! (wrap-policy db (json-ld/expand policies*) val-map))))))
+
+(defn policy-enforced-opts?
+  "Tests 'options' for a query or transaction to see if the options request
+  policy enforcement."
+  [opts]
+  (or (:did opts)
+      (:policyClass opts)
+      (:policy opts)))
+
+(defn policy-enforce-db
+  "Policy enforces a db based on the query/transaction options"
+  [db parsed-context opts]
+  (go-try
+   (let [{:keys [did policyClass policy policyValues]} opts]
+     (cond
+
+       did
+       (<? (wrap-identity-policy db (json-ld/expand-iri did parsed-context) policyValues))
+
+       policyClass
+       (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policyClass))]
+         (<? (wrap-class-policy db classes policyValues)))
+
+       policy
+       (let [expanded-policy (json-ld/expand policy parsed-context)]
+         (<? (wrap-policy db expanded-policy policyValues)))))))
