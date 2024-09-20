@@ -136,10 +136,10 @@
    (loop [[next-staged & r] staged
           results []]
      (if next-staged
-       (let [[txn author-did annotation] next-staged
+       (let [[txn author annotation] next-staged
              results* (if txn
                         (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
-                          (conj results [txn-id author-did annotation]))
+                          (conj results [txn-id author annotation]))
                         (conj results next-staged))]
          (recur r results*))
        results))))
