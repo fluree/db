@@ -106,7 +106,7 @@
      (cond
 
        did
-       (<? (wrap-identity-policy db (json-ld/expand-iri did parsed-context) policyValues))
+       (<? (wrap-identity-policy db did policyValues))
 
        policyClass
        (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policyClass))]
