@@ -329,25 +329,17 @@
                 {"@id" "?person", "person:handle" "?handle"}]
                (:where (sparql/->fql query)))
             "where pattern: single var, multiple values"))
-      (let [query "SELECT * WHERE {
-                            VALUES (?str ?date1 ?date2) {
-                              ( \"a\" \"2023-09-01\"^^xsd:date \"2023-09-30\"^^xsd:date )
-                              ( \"b\" \"2023-09-01\"^^xsd:date \"2023-09-30\"^^xsd:date )
-                              ( \"c\" \"2023-09-01\"^^xsd:date \"2023-09-30\"^^xsd:date )
-                             }
-                         }"]
-        (is (= [[:values
-                 [["?str" "?date1" "?date2"]
-                  [["a"
-                    {"@value" "2023-09-01", "@type" "xsd:date"}
-                    {"@value" "2023-09-30", "@type" "xsd:date"}]
-                   ["b"
-                    {"@value" "2023-09-01", "@type" "xsd:date"}
-                    {"@value" "2023-09-30", "@type" "xsd:date"}]
-                   ["c"
-                    {"@value" "2023-09-01", "@type" "xsd:date"}
-                    {"@value" "2023-09-30", "@type" "xsd:date"}]]]]]
-               (:where (sparql/->fql query)))
+      (let [query "SELECT ?claim
+                   WHERE {
+                     ?claim ci:claimDate ?date .
+                     FILTER (?date >= ?stateDate && ?date <= ?endDate)
+                   }
+                   VALUES (?state ?startDate ?endDate) { 
+                      ( \"New York\" \"2023-03-01\"^^xsd:date \"2023-03-31\"^^xsd:date ) 
+                  }"]
+        (is (= [["?state" "?startDate" "?endDate"]
+                [["New York" {"@value" "2023-03-01", "@type" "xsd:date"} {"@value" "2023-03-31", "@type" "xsd:date"}]]]
+               (:values (sparql/->fql query)))
             "multiple vars with multiple types"))
       (let [query "SELECT * WHERE {
                      VALUES (?color ?direction) {
