@@ -1,6 +1,6 @@
 (ns fluree.db.storage.remote
   (:require [fluree.db.storage :as storage]
-            [fluree.db.method.remote :as remote]))
+            [fluree.db.remote-system :as remote]))
 
 (defrecord RemoteResources [identifier method remote-system]
   storage/JsonArchive

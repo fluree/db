@@ -1,6 +1,6 @@
 (ns fluree.db.nameservice.remote
   (:require [fluree.db.nameservice :as nameservice]
-            [fluree.db.method.remote :as remote]
+            [fluree.db.remote-system :as remote]
             [clojure.core.async :as async :refer [<! go go-loop]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
