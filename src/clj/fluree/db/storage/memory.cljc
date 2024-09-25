@@ -50,9 +50,9 @@
     (go
       (get @contents path))))
 
-(defn create
+(defn open
   ([]
-   (create nil))
+   (open nil))
   ([identifier]
    (let [contents (atom {})]
      (->MemoryStore identifier contents))))

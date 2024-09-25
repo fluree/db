@@ -65,7 +65,7 @@
 
 (defmethod ig/init-key :fluree.storage/memory
   [_ _]
-  (memory-store/create))
+  (memory-store/open))
 
 #?(:clj
    (defmethod ig/init-key :fluree.storage/s3
