@@ -329,19 +329,31 @@
                 {"@id" "?person", "person:handle" "?handle"}]
                (:where (sparql/->fql query)))
             "where pattern: single var, multiple values"))
+      (let [query "SELECT ?claim
+                   WHERE {
+                     ?claim ci:claimDate ?date .
+                     FILTER (?date >= ?stateDate && ?date <= ?endDate)
+                   }
+                   VALUES (?state ?startDate ?endDate) { 
+                      ( \"New York\" \"2023-03-01\"^^xsd:date \"2023-03-31\"^^xsd:date ) 
+                  }"]
+        (is (= [["?state" "?startDate" "?endDate"]
+                [["New York" {"@value" "2023-03-01", "@type" "xsd:date"} {"@value" "2023-03-31", "@type" "xsd:date"}]]]
+               (:values (sparql/->fql query)))
+            "multiple vars with multiple types"))
       (let [query "SELECT * WHERE {
                      VALUES (?color ?direction) {
                      ( dm:red  \"north\" )
                      ( dm:blue  \"west\" )
                    }}"]
         (is (= [[:values
-                 [["?color" "?direction"]]
+                 [["?color" "?direction"]
                  [[{"@type" "@id",
                     "@value" "dm:red"}
                    "north"]
                   [{"@type" "@id",
                     "@value" "dm:blue"}
-                   "west"]]]]
+                   "west"]]]]]
                (:where (sparql/->fql query)))
             "multiple vars, multiple values")))
     (testing "clause"
