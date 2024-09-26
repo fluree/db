@@ -107,17 +107,16 @@
   ([ds query] (query-fql ds query nil))
   ([ds query override-opts]
    (go-try
-    ;; TODO - verify if both 'did' and 'issuer' opts are still needed upstream
      (let [{:keys [opts] :as query*} (-> query
                                          syntax/coerce-query
                                          (sanitize-query-options override-opts))
 
-          ;; TODO - remove restrict-db from here, restriction should happen
-          ;;      - upstream if needed
-          ds*      (if (dataset? ds)
-                     ds
-                     (<? (restrict-db ds query*)))
-          query**  (update query* :opts dissoc :meta :max-fuel ::track-fuel?)
+           ;; TODO - remove restrict-db from here, restriction should happen
+           ;;      - upstream if needed
+           ds*      (if (dataset? ds)
+                      ds
+                      (<? (restrict-db ds query*)))
+           query**  (update query* :opts dissoc :meta :max-fuel ::track-fuel?)
            max-fuel (:max-fuel opts)]
       (if (track-fuel? query*)
         (<? (track-query ds* max-fuel query**))
