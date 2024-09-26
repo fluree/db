@@ -633,10 +633,13 @@
   ;; GroupOrUnionGraphPattern ::= GroupGraphPattern ( <'UNION'> GroupGraphPattern )*
   [[_ group-pattern & union-patterns]] 
   (if union-patterns
-    (reduce (fn [a g]
-              [:union a (parse-term g)])
-            (parse-term group-pattern)
-            union-patterns)
+    (let [all-patterns (cons (parse-term group-pattern) (map parse-term union-patterns))]
+      (reduce (fn [a g]
+                (if (= (first a) :union)
+                  [:union [a] g]
+                  [:union a g]))
+              (first all-patterns)
+              (rest all-patterns)))
     (parse-term group-pattern)))
 
 (defmethod parse-term :GroupGraphPatternSub
