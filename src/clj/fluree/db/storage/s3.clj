@@ -99,7 +99,7 @@
 
 (defrecord S3Store [identifier client bucket prefix]
   storage/Addressable
-  (-location [_]
+  (location [_]
     (storage/build-location storage/fluree-namespace identifier method-name [bucket prefix]))
 
   storage/JsonArchive

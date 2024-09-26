@@ -1,13 +1,9 @@
 (ns fluree.db.storage
   (:refer-clojure :exclude [read list exists?])
-  (:require [clojure.core.async :as async]
-            [clojure.pprint :as pprint]
-            [clojure.string :as str]
-            [fluree.db.remote-system :as remote-system]
+  (:require [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
-            [fluree.json-ld :as json-ld])
-  #?(:clj (:import (java.io Writer))))
+            [fluree.json-ld :as json-ld]))
 
 (defn hashable?
   [x]
@@ -87,7 +83,7 @@
   (-> address parse-address :local))
 
 (defprotocol Addressable
-  (-location [section]))
+  (location [section]))
 
 (defprotocol JsonArchive
   (-read-json [store address keywordize?] "Returns value associated with `address`."))
@@ -118,84 +114,3 @@
    (-read-json store address false))
   ([store address keywordize?]
    (-read-json store address keywordize?)))
-
-(defrecord Catalog [])
-
-#?(:clj
-   (defmethod print-method Catalog [^Catalog clg, ^Writer w]
-     (.write w (str "#fluree/Catalog "))
-     (binding [*out* w]
-       (pr (->> clg keys vec))))
-   :cljs
-     (extend-type Catalog
-       IPrintWithWriter
-       (-pr-writer [clg w opts]
-         (-write w "#fluree/Catalog ")
-         (-write w (pr (->> clg keys vec))))))
-
-(defmethod pprint/simple-dispatch Catalog [^Catalog clg]
-  (pr clg))
-
-(defn section-entry
-  [section]
-  (let [loc (-location section)]
-    [loc section]))
-
-(defn with-remote-system
-  [remote-section remote-system]
-  (reduce (fn [sec address-identifier]
-            (assoc sec address-identifier remote-system))
-          remote-section (remote-system/address-identifiers remote-system)))
-
-(defn remote-systems->section
-  [remote-systems]
-  (reduce with-remote-system {} remote-systems))
-
-(defn catalog
-  ([local-stores remote-systems]
-   (let [default-location (-> local-stores first -location)]
-     (catalog local-stores remote-systems default-location)))
-  ([local-stores remote-systems default-location]
-   (let [remote-section (remote-systems->section remote-systems)]
-     (-> (->Catalog)
-         (into (map section-entry) local-stores)
-         (assoc ::default default-location, ::remote remote-section)))))
-
-(defn get-local-store
-  [clg location]
-  (let [location* (if (= location ::default)
-                    (get clg ::default)
-                    location)]
-    (get clg location*)))
-
-(defn get-remote-system
-  [clg location]
-  (when-let [identifier (get-identifier location)]
-    (-> clg ::remote (get identifier))))
-
-(defn locate-address
-  [clg address]
-  (let [[location _local-path] (split-address address)]
-    (or (get-local-store clg location)
-        (get-remote-system clg location))))
-
-(defn async-location-error
-  [address]
-  (let [ex (ex-info (str "Unrecognized storage location:" address)
-                    {:status 500, :error :db/unexpected-error})]
-    (doto (async/chan)
-      (async/put! ex))))
-
-(defn read-location-json
-  [clg address]
-  (if-let [store (locate-address clg address)]
-    (read-json store address)
-    (async-location-error address)))
-
-(defn content-write-location-json
-  ([clg path data]
-   (content-write-location-json clg ::default path data))
-  ([clg location path data]
-   (if-let [store (get-local-store clg location)]
-     (content-write-json store path data)
-     (async-location-error location))))
