@@ -77,7 +77,7 @@
                           path)]
     (assoc parsed :local local)))
 
-(defn parse-local-path
+(defn get-local-path
   [address]
   (-> address parse-address :local))
 

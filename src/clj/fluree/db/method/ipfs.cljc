@@ -89,7 +89,7 @@
                                (some #(when (re-matches #"^fluree:ipns:.+" %) %)))
          t                (get data "t")
          {:keys [ipns-address relative-address]} (address-parts my-ns-iri)
-         ipfs-cid         (storage/parse-local-path address)
+         ipfs-cid         (storage/get-local-path address)
          approx-file-size (count (json/stringify commit-map))
          current-dag-map  (<? (ipfs-dir/refresh-state ipfs-endpoint (str "/ipns/" ipns-address)))
          updated-dir-map  (<? (ipfs-dir/update-directory! current-dag-map ipfs-endpoint relative-address ipfs-cid approx-file-size))
