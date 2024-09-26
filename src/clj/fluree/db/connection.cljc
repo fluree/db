@@ -3,6 +3,7 @@
   (:require [clojure.core.async :as async :refer [<!]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
+            [fluree.db.cache :as cache]
             [fluree.db.constants :as const]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.did :as did]
@@ -53,7 +54,7 @@
    :stats (get @(:state conn) :stats)})
 
 (defrecord Connection [id state parallelism commit-store index-store primary-publisher
-                       secondary-publishers subscribers serializer cache defaults])
+                       secondary-publishers remote-systems serializer cache defaults])
 
 #?(:clj
    (defmethod print-method Connection [^Connection conn, ^Writer w]
@@ -71,13 +72,14 @@
   (pr conn))
 
 (defn connect
-  [{:keys [parallelism commit-store index-store cache serializer
-           primary-publisher secondary-publishers subscribers defaults]
+  [{:keys [parallelism commit-store index-store cache-max-mb serializer
+           primary-publisher secondary-publishers remote-systems defaults]
     :or   {serializer (json-serde)} :as _opts}]
   (let [id    (random-uuid)
-        state (blank-state)]
+        state (blank-state)
+        cache (cache/create-lru-cache cache-max-mb)]
     (->Connection id state parallelism commit-store index-store primary-publisher
-                  secondary-publishers subscribers serializer cache defaults)))
+                  secondary-publishers remote-systems serializer cache defaults)))
 
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held
