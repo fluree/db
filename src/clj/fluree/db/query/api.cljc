@@ -40,7 +40,6 @@
                             (update :identity #(or % (:did opts) (:issuer opts)))
                             (dissoc :did :issuer)
                             (cond->
-                                (or max-fuel meta)       (assoc ::track-fuel? true)
                                 (or identity did issuer) (assoc :identity (or identity did issuer)))))))
 
 (defn load-aliased-rule-dbs
@@ -79,12 +78,17 @@
                                     time-travel-db)]
        (assoc-in reasoned-db [:policy :cache] (atom {}))))))
 
+(defn track-fuel?
+  [sanitized-query]
+  (or (-> sanitized-query :opts :max-fuel)
+      (-> sanitized-query :opts :meta)))
+
 (defn track-query
   [ds max-fuel query]
   (go-try
-    (let [start #?(:clj (System/nanoTime)
-                   :cljs (util/current-time-millis))
-          fuel-tracker  (fuel/tracker max-fuel)]
+    (let [start        #?(:clj (System/nanoTime)
+                          :cljs (util/current-time-millis))
+          fuel-tracker (fuel/tracker max-fuel)]
       (try* (let [result (<? (fql/query ds fuel-tracker query))]
               {:status 200
                :result result
@@ -115,7 +119,7 @@
                      (<? (restrict-db ds query*)))
           query**  (update query* :opts dissoc :meta :max-fuel ::track-fuel?)
            max-fuel (:max-fuel opts)]
-      (if (::track-fuel? opts)
+      (if (track-fuel? query*)
         (<? (track-query ds* max-fuel query**))
         (<? (fql/query ds* query**)))))))
 
@@ -255,7 +259,7 @@
         (let [ds            (<? (load-dataset conn default-aliases named-aliases sanitized-query))
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel ::track-fuel?)
               max-fuel      (:max-fuel opts)]
-          (if (::track-fuel? opts)
+          (if (track-fuel? sanitized-query)
             (<? (track-query ds max-fuel trimmed-query))
             (<? (fql/query ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"
