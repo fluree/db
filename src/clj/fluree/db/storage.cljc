@@ -152,20 +152,32 @@
   (reduce with-remote-system {} remote-systems))
 
 (defn catalog
-  [local-stores remote-systems]
-  (let [remote-section (remote-systems->section remote-systems)]
-    (-> (->Catalog)
-        (into (map section-entry) local-stores)
-        (assoc ::remote remote-section))))
+  ([local-stores remote-systems]
+   (let [default-location (-> local-stores first -location)]
+     (catalog local-stores remote-systems default-location)))
+  ([local-stores remote-systems default-location]
+   (let [remote-section (remote-systems->section remote-systems)]
+     (-> (->Catalog)
+         (into (map section-entry) local-stores)
+         (assoc ::default default-location, ::remote remote-section)))))
 
 (defn get-local-store
-  [ctlg location]
-  (get ctlg location))
+  [clg location]
+  (let [location* (if (= location ::default)
+                    (get clg ::default)
+                    location)]
+    (get clg location*)))
 
 (defn get-remote-system
-  [ctlg location]
+  [clg location]
   (when-let [identifier (get-identifier location)]
-    (-> ctlg ::remote (get identifier))))
+    (-> clg ::remote (get identifier))))
+
+(defn locate-address
+  [clg address]
+  (let [[location _local-path] (split-address address)]
+    (or (get-local-store clg location)
+        (get-remote-system clg location))))
 
 (defn async-location-error
   [address]
@@ -174,20 +186,16 @@
     (doto (async/chan)
       (async/put! ex))))
 
-(defn locate-address
-  [ctlg address]
-  (let [[location _local-path] (split-address address)]
-    (or (get-local-store ctlg location)
-        (get-remote-system ctlg location))))
-
-(defn read-address-json
-  [ctlg address]
-  (if-let [store (locate-address ctlg address)]
+(defn read-location-json
+  [clg address]
+  (if-let [store (locate-address clg address)]
     (read-json store address)
     (async-location-error address)))
 
 (defn content-write-location-json
-  [clg location path data]
-  (if-let [store (get clg location)]
-    (content-write-json store path data)
-    (async-location-error location)))
+  ([clg path data]
+   (content-write-location-json clg ::default path data))
+  ([clg location path data]
+   (if-let [store (get-local-store clg location)]
+     (content-write-json store path data)
+     (async-location-error location))))
