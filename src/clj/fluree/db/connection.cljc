@@ -72,12 +72,11 @@
   (pr conn))
 
 (defn connect
-  [{:keys [parallelism commit-store index-store cache-max-mb serializer
+  [{:keys [parallelism commit-store index-store cache serializer
            primary-publisher secondary-publishers remote-systems defaults]
     :or   {serializer (json-serde)} :as _opts}]
   (let [id    (random-uuid)
-        state (blank-state)
-        cache (cache/create-lru-cache cache-max-mb)]
+        state (blank-state)]
     (->Connection id state parallelism commit-store index-store primary-publisher
                   secondary-publishers remote-systems serializer cache defaults)))
 

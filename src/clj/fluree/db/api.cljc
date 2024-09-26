@@ -43,12 +43,10 @@
                (reject res)
                (resolve res))))))))
 
-;; ledger operations
-
 (defn parse-connection-options
   [{:keys [method parallelism cache-max-mb remote-servers]
     :as   connect-opts
-    :or   { parallelism 4
+    :or   {parallelism  4
            cache-max-mb 100}}]
   (let [method* (cond
                   method         (keyword method)
