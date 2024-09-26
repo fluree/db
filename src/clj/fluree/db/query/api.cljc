@@ -31,9 +31,18 @@
     (let [context (ctx-util/extract query)]
       (<? (history/query db context query)))))
 
+(defn parse-opts
+  [opts]
+  (let [other-keys    (->> opts keys (remove #{:max-fuel :maxFuel}))
+        max-fuel-opts {:max-fuel (or (:max-fuel opts) (:maxFuel opts))}
+        merged-opts   (merge max-fuel-opts (select-keys opts other-keys))]
+    (if (or (:max-fuel merged-opts) (:meta merged-opts))
+      (assoc merged-opts ::track-fuel? true)
+      merged-opts)))
+
 (defn sanitize-query-options
   [opts did]
-  (cond-> (util/parse-opts opts)
+  (cond-> (parse-opts opts)
     did (assoc :did did :issuer did)))
 
 (defn load-aliased-rule-dbs
@@ -97,16 +106,18 @@
   ([ds query {:keys [did issuer] :as _opts}]
    (go-try
     ;; TODO - verify if both 'did' and 'issuer' opts are still needed upstream
-    (let [{:keys [t opts] :as query*} (update query :opts sanitize-query-options (or did issuer))
+     (let [{:keys [opts] :as query*} (-> query
+                                         syntax/coerce-query
+                                         (update :opts sanitize-query-options (or did issuer)))
 
           ;; TODO - remove restrict-db from here, restriction should happen
           ;;      - upstream if needed
           ds*      (if (dataset? ds)
                      ds
                      (<? (restrict-db ds query*)))
-          query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
-          max-fuel (:max-fuel opts)]
-      (if (::util/track-fuel? opts)
+          query**  (update query* :opts dissoc :meta :max-fuel ::track-fuel?)
+           max-fuel (:max-fuel opts)]
+      (if (::track-fuel? opts)
         (<? (track-query ds* max-fuel query**))
         (<? (fql/query ds* query**)))))))
 
@@ -235,18 +246,18 @@
 (defn query-connection-fql
   [conn query did]
   (go-try
-    (let [{:keys [t opts] :as sanitized-query} (-> query
+    (let [{:keys [opts] :as sanitized-query} (-> query
                                                    syntax/coerce-query
                                                    (update :opts sanitize-query-options did))
-          
+
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
         (let [ds            (<? (load-dataset conn default-aliases named-aliases sanitized-query))
-              trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel ::util/track-fuel?)
+              trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel ::track-fuel?)
               max-fuel      (:max-fuel opts)]
-          (if (::util/track-fuel? opts)
+          (if (::track-fuel? opts)
             (<? (track-query ds max-fuel trimmed-query))
             (<? (fql/query ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"
