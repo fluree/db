@@ -118,7 +118,7 @@
     ::parse-json        boolean?
     ::issuer            [:maybe string?]
     ::role              :any
-    ::did               :any
+    ::identity          :any
     ::opts              [:and
                          [:map-of :keyword :any]
                          [:map
@@ -132,7 +132,8 @@
                           [:defaultAllow {:optional true} ::default-allow?]
                           [:issuer {:optional true} ::issuer]
                           [:role {:optional true} ::role]
-                          [:did {:optional true} ::did]]]
+                          [:identity {:optional true} ::identity]
+                          [:did {:optional true} ::identity]]]
     ::function          ::v/function
     ::as-function       ::v/as-function
     ::wildcard          [:fn wildcard?]

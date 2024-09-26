@@ -95,7 +95,6 @@
   policy enforcement."
   [opts]
   (or (:identity opts)
-      (:did opts)
       (:policyClass opts)
       (:policy opts)))
 
@@ -103,11 +102,11 @@
   "Policy enforces a db based on the query/transaction options"
   [db parsed-context opts]
   (go-try
-   (let [{:keys [identity did policyClass policy policyValues]} opts]
+    (let [{:keys [identity policyClass policy policyValues]} opts]
      (cond
 
-       (or identity did)
-       (<? (wrap-identity-policy db did policyValues))
+       identity
+       (<? (wrap-identity-policy db identity policyValues))
 
        policyClass
        (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policyClass))]

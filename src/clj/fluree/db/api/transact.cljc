@@ -15,11 +15,14 @@
             [fluree.db.ledger :as ledger]))
 
 (defn parse-opts
-  [expanded-txn opts txn-context]
+  [expanded-txn override-opts txn-context]
   (let [txn-opts (some-> (util/get-first-value expanded-txn const/iri-opts)
                          util/keywordize-keys)
-        opts*    (merge txn-opts (util/keywordize-keys opts))]
-    (assoc opts* :context txn-context)))
+        opts*    (merge txn-opts (util/keywordize-keys override-opts))]
+    (-> opts*
+        (assoc :context txn-context)
+        (update :identity #(or % (:did opts*)))
+        (dissoc :did))))
 
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
@@ -28,8 +31,7 @@
   (go-try
     (let [track-fuel? (or (:maxFuel parsed-opts)
                           (:meta parsed-opts))
-          identity    (or (:identity parsed-opts)
-                          (:did parsed-opts))
+          identity    (:identity parsed-opts)
           policy-db   (if (policy/policy-enforced-opts? parsed-opts)
                         (let [parsed-context (:context parsed-opts)]
                           (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
@@ -87,7 +89,7 @@
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
-          cmt-opts    (dissoc parsed-opts :context :did :identity)] ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
+          cmt-opts    (dissoc parsed-opts :context :identity)] ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
       (<? (ledger/-commit! ledger db cmt-opts)))))
 
 (defn transact!
