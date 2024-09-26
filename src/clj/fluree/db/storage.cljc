@@ -3,6 +3,7 @@
   (:require [clojure.core.async :as async]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
+            [fluree.db.remote-system :as remote-system]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
             [fluree.json-ld :as json-ld])
@@ -67,6 +68,10 @@
             auxiliary  (-> components (subvec 2) not-empty)]
         (cond-> {:ns address-ns, :method method}
           auxiliary (assoc :auxiliary auxiliary))))))
+
+(defn get-identifier
+  [location]
+  (-> location parse-location :identifier))
 
 (defn parse-address
   [address]
@@ -136,23 +141,50 @@
   (let [loc (-location section)]
     [loc section]))
 
+(defn with-remote-system
+  [remote-section remote-system]
+  (reduce (fn [sec address-identifier]
+            (assoc sec address-identifier remote-system))
+          remote-section (remote-system/address-identifiers remote-system)))
+
+(defn remote-systems->section
+  [remote-systems]
+  (reduce with-remote-system {} remote-systems))
+
 (defn catalog
-  [& sections]
-  (into (->Catalog) (map section-entry) sections))
+  [local-stores remote-systems]
+  (let [remote-section (remote-systems->section remote-systems)]
+    (-> (->Catalog)
+        (into (map section-entry) local-stores)
+        (assoc ::remote remote-section))))
+
+(defn get-local-store
+  [ctlg location]
+  (get ctlg location))
+
+(defn get-remote-system
+  [ctlg location]
+  (when-let [identifier (get-identifier location)]
+    (-> ctlg ::remote (get identifier))))
 
 (defn async-location-error
-  [location]
-  (let [ex (ex-info (str "Unrecognized storage location:" location)
+  [address]
+  (let [ex (ex-info (str "Unrecognized storage location:" address)
                     {:status 500, :error :db/unexpected-error})]
     (doto (async/chan)
       (async/put! ex))))
 
+(defn locate-address
+  [ctlg address]
+  (let [[location _local-path] (split-address address)]
+    (or (get-local-store ctlg location)
+        (get-remote-system ctlg location))))
+
 (defn read-address-json
-  [clg address]
-  (let [[location local-path] (split-address address)]
-    (if-let [store (get clg location)]
-      (read-json store local-path)
-      (async-location-error location))))
+  [ctlg address]
+  (if-let [store (locate-address ctlg address)]
+    (read-json store address)
+    (async-location-error address)))
 
 (defn content-write-location-json
   [clg location path data]

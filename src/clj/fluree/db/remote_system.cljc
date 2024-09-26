@@ -158,7 +158,11 @@
                   :subscriptions 0}
    :subscription {}})
 
+(defn address-identifiers
+  [remote-system]
+  (:address-identifiers remote-system))
+
 (defn connect
-  [servers address-identifiers]
+  [servers identifiers]
   (let [system-state (-> servers initial-state atom)]
-    (->RemoteSystem system-state address-identifiers)))
+    (->RemoteSystem system-state identifiers)))
