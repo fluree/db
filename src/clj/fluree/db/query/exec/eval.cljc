@@ -330,8 +330,7 @@
         ;;
         ;;     {:keys [value datatype-iri]} (reduce compare-fn coll)]
         ;; (where/->typed-val value datatype-iri)))
-        value      (:value (reduce compare-fn coll))
-        _          (log/info "max value:" value)]
+        value      (:value (reduce compare-fn coll))]
     (where/->typed-val value)))
 
 (defn min
@@ -348,8 +347,7 @@
         ;;
         ;;     {:keys [value datatype-iri]} (reduce compare-fn coll)]
         ;; (where/->typed-val value datatype-iri)))
-        value      (:value (reduce compare-fn coll))
-        _          (log/info "min value:" value)]
+        value      (:value (reduce compare-fn coll))]
     (where/->typed-val value)))
 
 (defn regex
