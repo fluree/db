@@ -240,11 +240,11 @@
         (dataset db-map defaults)))))
 
 (defn query-connection-fql
-  [conn query did]
+  [conn query override-opts]
   (go-try
     (let [{:keys [opts] :as sanitized-query} (-> query
                                                  syntax/coerce-query
-                                                 (sanitize-query-options {:identity did}))
+                                                 (sanitize-query-options override-opts))
 
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
@@ -260,14 +260,14 @@
                         {:status 400, :error :db/invalid-query}))))))
 
 (defn query-connection-sparql
-  [conn query did]
+  [conn query override-opts]
   (go-try
     (let [fql (sparql/->fql query)]
-      (log/debug "query-connection SPARQL fql: " fql "did:" did)
-      (<? (query-connection-fql conn fql did)))))
+      (log/debug "query-connection SPARQL fql: " fql "override-opts:" override-opts)
+      (<? (query-connection-fql conn fql override-opts)))))
 
 (defn query-connection
-  [conn query {:keys [format did] :as opts :or {format :fql}}]
+  [conn query {:keys [format] :as override-opts :or {format :fql}}]
   (case format
-    :fql (query-connection-fql conn query did)
-    :sparql (query-connection-sparql conn query did)))
+    :fql (query-connection-fql conn query override-opts)
+    :sparql (query-connection-sparql conn query override-opts)))
