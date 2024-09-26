@@ -68,16 +68,6 @@
   (where/->typed-val
     (Math/sqrt (:value (variance coll)))))
 
-(defn max
-  [coll]
-  (where/->typed-val
-    (apply clojure.core/max (mapv :value coll))))
-
-(defn min
-  [coll]
-  (where/->typed-val
-    (apply clojure.core/min (mapv :value coll))))
-
 (defn ceil
   [{n :value}]
   (where/->typed-val (cond (= n (int n)) n
@@ -325,6 +315,42 @@
   (where/->typed-val
     (or (= a b)
         (pos? (compare* a a-dt b b-dt)))))
+
+(defn max
+  [coll]
+  (let [compare-fn (fn [a b]
+                     (if (pos? (compare* (:value a) (:datatype-iri a)
+                                         (:value b) (:datatype-iri b)))
+                       a
+                       b))
+        ;; I think we should also return the datatype-iri here, 
+        ;; but currently for date-like values, that is java.time.LocalDate 
+        ;; or java.time.OffsetDateTime, which ought actually to be returned 
+        ;; as xsd:date or xsd:dateTime, respectively.
+        ;;
+        ;;     {:keys [value datatype-iri]} (reduce compare-fn coll)]
+        ;; (where/->typed-val value datatype-iri)))
+        value      (:value (reduce compare-fn coll))
+        _          (log/info "max value:" value)]
+    (where/->typed-val value)))
+
+(defn min
+  [coll]
+  (let [compare-fn (fn [a b]
+                     (if (neg? (compare* (:value a) (:datatype-iri a)
+                                         (:value b) (:datatype-iri b)))
+                       a
+                       b))
+        ;; I think we should also return the datatype-iri here, 
+        ;; but currently for date-like values, that is java.time.LocalDate 
+        ;; or java.time.OffsetDateTime, which ought actually to be returned 
+        ;; as xsd:date or xsd:dateTime, respectively.
+        ;;
+        ;;     {:keys [value datatype-iri]} (reduce compare-fn coll)]
+        ;; (where/->typed-val value datatype-iri)))
+        value      (:value (reduce compare-fn coll))
+        _          (log/info "min value:" value)]
+    (where/->typed-val value)))
 
 (defn regex
   [{text :value} {pattern :value}]

@@ -36,6 +36,21 @@
               subject @(fluree/query db qry)]
           (is (= [[4]] subject)
               "aggregates bindings for all results")))
+      (testing "with min and implicit grouping"
+        (let [qry     {:context [test-utils/default-context
+                                 {:ex "http://example.org/ns/"}]
+                       :select  '[(min ?nums)]
+                       :where   '{:ex/favNums ?nums}}
+              subject @(fluree/query db qry)]
+          (is (= [[5]] subject)
+              "aggregates bindings for all results")))
+      (testing "with implicit grouping and comparable data types"
+        (let [qry     {:context test-utils/default-context
+                       :select  ['(max ?birthDate)]
+                       :where   '{:schema/birthDate ?birthDate}}
+              subject @(fluree/query db qry)]
+          (is (= [[(java.time.LocalDate/parse "2011-09-26")]] subject)
+              "aggregates bindings for all results")))
       (testing "with ordering"
         (let [qry {:context  [test-utils/default-context
                               {:ex "http://example.org/ns/"}]

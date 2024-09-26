@@ -95,7 +95,8 @@
     :schema/name  "Alice"
     :schema/email "alice@example.org"
     :schema/age   50
-    :ex/favNums   [42, 76, 9]}
+    :ex/favNums   [42, 76, 9]
+    :schema/birthDate { "@value" "1974-09-26" "@type" :xsd/date}}
    {:id           :ex/cam,
     :type         :ex/User,
     :schema/name  "Cam"
@@ -109,7 +110,8 @@
     :schema/email "liam@example.org"
     :schema/age   13
     :ex/favNums   [42, 11]
-    :ex/friend    [:ex/brian :ex/alice :ex/cam]}])
+    :ex/friend    [:ex/brian :ex/alice :ex/cam]
+    :schema/birthDate { "@value" "2011-09-26" "@type" :xsd/date }}])
 
 (def people-strings
   [{"@id"           "ex:brian",
