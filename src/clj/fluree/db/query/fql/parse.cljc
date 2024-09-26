@@ -436,7 +436,10 @@
 (defmethod parse-pattern :union
   [[_ & unions] vars context]
   (let [parsed (mapv (fn [clause]
-                       (parse-where-clause clause vars context))
+                       (if (and (vector? clause)
+                                (= (first clause) :query)) 
+                         (parse-pattern clause vars context)
+                         (parse-where-clause clause vars context)))
                      unions)]
     [(where/->pattern :union parsed)]))
 

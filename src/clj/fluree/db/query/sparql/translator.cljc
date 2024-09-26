@@ -631,11 +631,12 @@
 
 (defmethod parse-term :GroupOrUnionGraphPattern
   ;; GroupOrUnionGraphPattern ::= GroupGraphPattern ( <'UNION'> GroupGraphPattern )*
-  [[_ group-pattern & union-patterns :as term]]
+  [[_ group-pattern & union-patterns]] 
   (if union-patterns
-    (->> (mapv parse-term (rest term))
-         ;; this presumes that each GroupGraphPattern has the same number of patterns per group
-         (apply map (fn [& patterns] (conj [:union] (vec patterns)))))
+    (reduce (fn [a g]
+              [:union a (parse-term g)])
+            (parse-term group-pattern)
+            union-patterns)
     (parse-term group-pattern)))
 
 (defmethod parse-term :GroupGraphPatternSub
@@ -655,7 +656,11 @@
   ;; WhereClause ::= <'WHERE'?> WS GroupGraphPattern WS
   ;; <GroupGraphPattern> ::= WS <'{'> WS ( SubSelect | GroupGraphPatternSub ) WS <'}'> WS
   [[_ & patterns]]
-  [[:where (into [] (mapcat parse-term patterns))]])
+  (let [result (into [] (mapcat parse-term patterns))
+        ;; If first element of result is a keyword, wrap result in a vector
+        ;; Otherwise, return result
+        result* (if (keyword? (first result)) [result] result)]
+    [[:where result*]]))
 
 (defmethod parse-rule :ValuesClause
   ;; ValuesClause ::= ( <'VALUES'> WS DataBlock )? WS
