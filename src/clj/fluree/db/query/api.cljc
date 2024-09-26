@@ -31,19 +31,15 @@
     (let [context (ctx-util/extract query)]
       (<? (history/query db context query)))))
 
-(defn parse-opts
-  [opts]
-  (let [other-keys    (->> opts keys (remove #{:max-fuel :maxFuel}))
-        max-fuel-opts {:max-fuel (or (:max-fuel opts) (:maxFuel opts))}
-        merged-opts   (merge max-fuel-opts (select-keys opts other-keys))]
-    (if (or (:max-fuel merged-opts) (:meta merged-opts))
-      (assoc merged-opts ::track-fuel? true)
-      merged-opts)))
-
 (defn sanitize-query-options
-  [opts did]
-  (cond-> (parse-opts opts)
-    did (assoc :did did :issuer did)))
+  [query {:keys [identity did issuer] :as override-opts}]
+  (update query :opts (fn [{:keys [max-fuel meta] :as opts}]
+                        ;; ensure :max-fuel key is present
+                        (cond-> (assoc opts :max-fuel max-fuel)
+                          (or max-fuel meta)       (assoc ::track-fuel? true)
+                          (or identity did issuer) (assoc :identity identity
+                                                          :did identity
+                                                          :issuer identity)))))
 
 (defn load-aliased-rule-dbs
   [conn rule-sources]
@@ -103,12 +99,12 @@
   "Execute a query against a database source. Returns core async channel
   containing result or exception."
   ([ds query] (query-fql ds query nil))
-  ([ds query {:keys [did issuer] :as _opts}]
+  ([ds query override-opts]
    (go-try
     ;; TODO - verify if both 'did' and 'issuer' opts are still needed upstream
      (let [{:keys [opts] :as query*} (-> query
                                          syntax/coerce-query
-                                         (update :opts sanitize-query-options (or did issuer)))
+                                         (sanitize-query-options override-opts))
 
           ;; TODO - remove restrict-db from here, restriction should happen
           ;;      - upstream if needed
@@ -247,8 +243,8 @@
   [conn query did]
   (go-try
     (let [{:keys [opts] :as sanitized-query} (-> query
-                                                   syntax/coerce-query
-                                                   (update :opts sanitize-query-options did))
+                                                 syntax/coerce-query
+                                                 (sanitize-query-options {:identity did}))
 
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
