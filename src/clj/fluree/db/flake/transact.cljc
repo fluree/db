@@ -117,7 +117,7 @@
       allowed-db)))
 
 (defn stage
-  [db fuel-tracker context identity annotation raw-txn parsed-txn]
+  [db fuel-tracker context identity author annotation raw-txn parsed-txn]
   (go-try
     (when (policy.modify/deny-all? db)
       (throw (ex-info "Database policy denies all modifications."
@@ -125,7 +125,7 @@
     (let [tx-state   (->tx-state :db db
                                  :context context
                                  :txn raw-txn
-                                 :author identity
+                                 :author (or author identity)
                                  :annotation annotation)
           [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
           updated-db (<? (final-db db** new-flakes tx-state))]
