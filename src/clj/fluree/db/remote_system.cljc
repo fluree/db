@@ -1,6 +1,6 @@
 (ns fluree.db.remote-system
   (:require [clojure.string :as str]
-            [clojure.core.async :as async :refer [go]]
+            [clojure.core.async :as async :refer [<! go]]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
@@ -8,9 +8,6 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.util.xhttp :as xhttp]))
-
-(def message-codes {:subscribe-ledger   1
-                    :unsubscribe-ledger 2})
 
 (defn pick-server
   "Currently does just a round-robin selection if multiple servers are given.
@@ -35,6 +32,13 @@
                      {:resource commit-key}
                      {:keywordize-keys keywordize-keys?})))
 
+(defn remote-lookup
+  [system-state ledger-address]
+  (go-try
+    (let [head-commit  (<? (remote-read system-state ledger-address false))
+          head-address (get head-commit "address")]
+      head-address)))
+
 (defn close-websocket
   [websocket]
   (xhttp/close-websocket websocket))
@@ -56,56 +60,6 @@
               (log/warn "Exception establishing web socket: " (ex-message e))
               (async/go e)))))
 
-
-(defn subscribed-ledger?
-  [{:keys [system-state] :as _sys} ledger-id]
-  (boolean
-    (get-in @system-state [:subscriptions ledger-id])))
-
-(defn record-ledger-subscription
-  [{:keys [system-state] :as _sys} ledger-id]
-  (swap! system-state assoc-in [:subscriptions ledger-id] {:subscribed-at (util/current-time-millis)}))
-
-(defn remove-ledger-subscription
-  [{:keys [system-state] :as _sys} ledger-id]
-  (swap! system-state update :subscriptions dissoc ledger-id))
-
-(defn subscribe-ledger-msg
-  [ledger-id]
-  (json/stringify
-    [(:subscribe-ledger message-codes) ledger-id]))
-
-;; TODO - remote subscriptions only partially implemented, for now
-;; TODO - remote server will send all commits for all ledgers, but
-;; TODO - locally, we'll only pay attention to those commits for ledgers
-(defn request-ledger-subscribe
-  [sys ledger-id]
-  #_(connection/-msg-out sys {:action :subscribe
-                              :ledger ledger-id}))
-
-(defn request-ledger-unsubscribe
-  [sys ledger-id]
-  #_(connection/-msg-out sys {:action :unsubscribe
-                              :ledger ledger-id}))
-
-(defn unsubscribe-ledger
-  [sys ledger-id]
-  (log/debug "Subscriptions request for ledger: " ledger-id)
-  (if (subscribed-ledger? sys ledger-id)
-    (log/info "Subscription requested for ledger already exists: " ledger-id)
-    (do
-      (remove-ledger-subscription sys ledger-id)
-      (request-ledger-unsubscribe sys ledger-id))))
-
-(defn subscribe-ledger
-  [sys ledger-id]
-  (log/debug "Subscriptions request for ledger: " ledger-id)
-  (if (subscribed-ledger? sys ledger-id)
-    (log/info "Subscription requested for ledger already exists: " ledger-id)
-    (do
-      (record-ledger-subscription sys ledger-id)
-      (request-ledger-subscribe sys ledger-id))))
-
 (defn subscribe
   [current-state ledger-alias callback]
   (if-not (contains? (:subscription current-state) ledger-alias)
@@ -126,10 +80,7 @@
 (defrecord RemoteSystem [system-state address-identifiers]
   nameservice/iNameService
   (lookup [_ ledger-address]
-    (go-try
-      (let [head-commit  (<? (remote-read system-state ledger-address false))
-            head-address (get head-commit "address")]
-        head-address)))
+    (remote-lookup system-state ledger-address))
   (alias [_ ledger-address]
     ledger-address)
   (address [_ ledger-alias]
@@ -158,7 +109,7 @@
   [servers]
   {:servers      servers
    :connected-to nil
-   :stats        {:connected-at nil
+   :stats        {:connected-at  nil
                   :subscriptions 0}
    :subscription {}})
 
