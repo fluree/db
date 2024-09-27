@@ -30,6 +30,7 @@
   [db parsed-txn parsed-opts]
   (go-try
     (let [track-fuel? (or (:maxFuel parsed-opts)
+                          (:max-fuel parsed-opts)
                           (:meta parsed-opts))
           identity    (:identity parsed-opts)
           policy-db   (if (policy/policy-enforced-opts? parsed-opts)
@@ -94,22 +95,22 @@
 
 (defn transact!
   ([conn txn] (transact! conn txn nil))
-  ([conn txn opts]
+  ([conn txn override-opts]
    (go-try
      (let [expanded  (json-ld/expand (ctx-util/use-fluree-context txn))
            ledger-id (extract-ledger-id expanded)
-           opts*     (assoc opts :expanded? true
+           opts*     (assoc override-opts :expanded? true
                                  :context (or (ctx-util/txn-context txn)
                                               ;; parent context might come from a Verifiable Credential's context
-                                              (:context opts)))]
+                                              (:context override-opts)))]
        (<? (transact! conn ledger-id expanded opts*)))))
-  ([conn ledger-id txn opts]
+  ([conn ledger-id txn override-opts]
    (go-try
      (let [address (<? (nameservice/primary-address conn ledger-id nil))]
        (if-not (<? (nameservice/exists? conn address))
          (throw (ex-info "Ledger does not exist" {:ledger address}))
          (let [ledger (<? (jld-ledger/load conn address))]
-           (<? (transact-ledger! ledger txn opts))))))))
+           (<? (transact-ledger! ledger txn override-opts))))))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.
@@ -121,20 +122,19 @@
          parent-context (when (map? txn) ;; parent-context only relevant for verifiable credential
                           (ctx-util/txn-context txn))]
      (<? (transact! conn txn* (assoc opts :raw-txn txn
-                                          :did identity
                                           :identity identity
                                           :context parent-context))))))
 
 (defn create-with-txn
   ([conn txn] (create-with-txn conn txn nil))
-  ([conn txn {:keys [context] :as opts}]
+  ([conn txn {:keys [context] :as override-opts}]
    (go-try
     (let [expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
           txn-context (or (ctx-util/txn-context txn)
                           context) ;; parent context from credential if present
           ledger-id   (extract-ledger-id expanded)
           address     (<? (nameservice/primary-address conn ledger-id nil))
-          parsed-opts (parse-opts expanded opts txn-context)]
+          parsed-opts (parse-opts expanded override-opts txn-context)]
       (if (<? (nameservice/exists? conn address))
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
@@ -143,7 +143,7 @@
 
 (defn credential-create-with-txn!
   [conn txn]
-  (let [{txn* :subject did :did} (<? (cred/verify txn))
+  (let [{txn* :subject identity :did} (<? (cred/verify txn))
         parent-context (when (map? txn) ;; parent-context only relevant for verifiable credential
                          (ctx-util/txn-context txn))]
-    (create-with-txn conn txn* {:raw-txn txn, :did did :context parent-context})))
+    (create-with-txn conn txn* {:raw-txn txn, :identity identity :context parent-context})))
