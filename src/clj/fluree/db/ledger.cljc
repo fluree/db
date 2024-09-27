@@ -141,8 +141,8 @@
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
   [conn ledger-alias ledger-address primary-publisher secondary-publishers branch
-   commit-store index-store indexing-opts did latest-commit]
-  (let [branches {branch (branch/state-map ledger-alias branch commit-store index-store
+   commit-catalog index-catalog indexing-opts did latest-commit]
+  (let [branches {branch (branch/state-map ledger-alias branch commit-catalog index-catalog
                                            latest-commit indexing-opts)}]
     (map->Ledger {:conn                 conn
                   :id                   (random-uuid)
@@ -152,8 +152,8 @@
                   :address              ledger-address
                   :primary-publisher    primary-publisher
                   :secondary-publishers secondary-publishers
-                  :commit-store         commit-store
-                  :index-store          index-store
+                  :commit-catalog       commit-catalog
+                  :index-catalog        index-catalog
                   :cache                (atom {})
                   :reasoner             #{}})))
 
@@ -169,7 +169,7 @@
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
   [{:keys [conn alias primary-address ns-addresses primary-publisher
-           secondary-publishers subscribers commit-store index-store]}
+           secondary-publishers subscribers commit-catalog index-catalog]}
    {:keys [did branch indexing] :as opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias alias)
@@ -177,6 +177,6 @@
           init-time      (or (:fluree.db.json-ld.migrate.sid/time opts)
                              (util/current-time-iso))
           genesis-commit (<? (commit-storage/write-genesis-commit
-                               commit-store alias branch ns-addresses init-time))]
+                               commit-catalog alias branch ns-addresses init-time))]
       (instantiate conn ledger-alias* primary-address primary-publisher secondary-publishers
-                   branch commit-store index-store indexing did genesis-commit))))
+                   branch commit-catalog index-catalog indexing did genesis-commit))))

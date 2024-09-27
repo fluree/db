@@ -1,10 +1,10 @@
 (ns fluree.db.connection.system
   (:require [fluree.db.connection :as connection]
             [fluree.db.cache :as cache]
+            [fluree.db.storage :as storage]
             [fluree.db.remote-system :as remote]
             [fluree.db.storage.file :as file-store]
             [fluree.db.storage.memory :as memory-store]
-            [fluree.db.storage.remote :as remote-store]
             [fluree.db.storage.ipfs :as ipfs-store]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.nameservice.storage-backed :as storage-nameservice]
@@ -47,9 +47,9 @@
   [_ component]
   component)
 
-(defmethod ig/init-key :fluree.remote-system/http
-  [_ servers]
-  (remote/remote-system servers))
+;; (defmethod ig/init-key :fluree.remote-system/http
+;;   [_ servers]
+;;   (remote/connect servers))
 
 (defmethod ig/init-key :fluree.publication/remote-resources
   [_ {:keys [remote-system]}]
@@ -76,9 +76,9 @@
   [_ endpoint]
   (ipfs-store/open endpoint))
 
-(defmethod ig/init-key :fluree.storage/remote-resources
-  [_ {:keys [identifier method remote-system]}]
-  (remote-store/open identifier method remote-system))
+;; (defmethod ig/init-key :fluree.storage/remote-resources
+;;   [_ {:keys [identifier method remote-system]}]
+;;   (remote-store/open identifier method remote-system))
 
 #?(:cljs (defmethod ig/init-key :fluree.storage/localstorage
            [_ _]
@@ -104,9 +104,13 @@
   [_ _]
   (connection/blank-state))
 
+(defmethod ig/init-key :fluree/catalog
+  [_ {:keys [storage]}]
+  (storage/catalog [storage]))
+
 (defmethod ig/init-key :fluree.index/storage
-  [_ {:keys [storage serializer cache]}]
-  (index.storage/index-store storage serializer cache))
+  [_ {:keys [catalog serializer cache]}]
+  (index.storage/index-catalog catalog serializer cache))
 
 (defmethod ig/init-key :fluree/connection
   [_ config]
@@ -117,7 +121,8 @@
   {:fluree.serializer/json            {}
    :fluree/cache                      cache-max-mb
    :fluree.nameservice/storage-backed {:storage (ig/ref :fluree/byte-storage)}
-   :fluree.index/storage              {:storage    (ig/ref :fluree/content-storage)
+   :fluree/catalog                    {:storage (ig/ref :fluree/content-storage)}
+   :fluree.index/storage              {:catalog    (ig/ref :fluree/catalog)
                                        :serializer (ig/ref :fluree/serializer)
                                        :cache      (ig/ref :fluree/cache)}
    :fluree.connection/id              {}
@@ -125,8 +130,8 @@
    :fluree/connection                 {:id                   (ig/ref :fluree.connection/id)
                                        :state                (ig/ref :fluree.connection/state)
                                        :cache                (ig/ref :fluree/cache)
-                                       :commit-store         (ig/ref :fluree/content-storage)
-                                       :index-store          (ig/ref :fluree.index/storage)
+                                       :commit-catalog       (ig/ref :fluree/catalog)
+                                       :index-catalog        (ig/ref :fluree.index/storage)
                                        :serializer           (ig/ref :fluree/serializer)
                                        :primary-publisher    (ig/ref :fluree/nameservice)
                                        :secondary-publishers []

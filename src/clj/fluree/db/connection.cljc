@@ -3,7 +3,6 @@
   (:require [clojure.core.async :as async :refer [<!]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
-            [fluree.db.cache :as cache]
             [fluree.db.constants :as const]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.did :as did]
@@ -53,7 +52,7 @@
   {:id    (:id conn)
    :stats (get @(:state conn) :stats)})
 
-(defrecord Connection [id state parallelism commit-store index-store primary-publisher
+(defrecord Connection [id state parallelism commit-catalog index-catalog primary-publisher
                        secondary-publishers remote-systems serializer cache defaults])
 
 #?(:clj
@@ -72,12 +71,12 @@
   (pr conn))
 
 (defn connect
-  [{:keys [parallelism commit-store index-store cache serializer
+  [{:keys [parallelism commit-catalog index-catalog cache serializer
            primary-publisher secondary-publishers remote-systems defaults]
     :or   {serializer (json-serde)} :as _opts}]
   (let [id    (random-uuid)
         state (blank-state)]
-    (->Connection id state parallelism commit-store index-store primary-publisher
+    (->Connection id state parallelism commit-catalog index-catalog primary-publisher
                   secondary-publishers remote-systems serializer cache defaults)))
 
 (defn register-ledger
@@ -181,9 +180,9 @@
             (recur (rest nameservices*))))))))
 
 (defn read-file-address
-  [{:keys [commit-store] :as _conn} addr]
+  [{:keys [commit-catalog] :as _conn} addr]
   (go-try
-    (let [json-data (<? (storage/read-json commit-store addr))]
+    (let [json-data (<? (storage/read-catalog-json commit-catalog addr))]
       (assoc json-data "address" addr))))
 
 (defn read-latest-commit
@@ -248,7 +247,7 @@
      :indexing indexing*}))
 
 (defn create-ledger
-  [{:keys [primary-publisher secondary-publishers subscribers commit-store index-store]
+  [{:keys [primary-publisher secondary-publishers subscribers commit-catalog index-catalog]
     :as   conn}
    ledger-alias opts]
   (go-try
@@ -267,8 +266,8 @@
                                                :secondary-publishers secondary-publishers
                                                :subscribers          subscribers
                                                :ns-addresses         ns-addresses
-                                               :commit-store         commit-store
-                                               :index-store          index-store}
+                                               :commit-catalog         commit-catalog
+                                               :index-catalog          index-catalog}
                                               ledger-opts))]
           (when (util/exception? ledger)
             (release-ledger conn ledger-alias))
@@ -285,7 +284,7 @@
                    (nameservice/alias ns db-alias))))))
 
 (defn load-ledger*
-  [{:keys [commit-store index-store primary-publisher secondary-publishers] :as conn}
+  [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
    ledger-chan address]
   (go-try
     (let [commit-addr  (<? (lookup-commit conn address))
@@ -294,7 +293,7 @@
           _            (when-not commit-addr
                          (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
                                          {:status 400 :error :db/invalid-commit-address})))
-          [commit _]   (<? (commit-storage/read-commit-jsonld commit-store commit-addr))
+          [commit _]   (<? (commit-storage/read-commit-jsonld commit-catalog commit-addr))
           _            (when-not commit
                          (throw (ex-info (str "Unable to load. Commit file for ledger: " address
                                               " at location: " commit-addr " is not found.")
@@ -306,7 +305,7 @@
           {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 
           ledger   (ledger/instantiate conn ledger-alias address primary-publisher secondary-publishers
-                                       branch commit-store index-store did indexing commit)]
+                                       branch commit-catalog index-catalog did indexing commit)]
       (subscribe-ledger conn ledger-alias)
       (async/put! ledger-chan ledger)
       ledger)))
@@ -376,7 +375,7 @@
 (defn write-transaction
   [storage ledger-alias txn]
   (let [path (str/join "/" [ledger-alias "txn"])]
-    (storage/content-write-json storage path txn)))
+    (storage/content-write-catalog-json storage path txn)))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don' think the db should be handling any of it
@@ -455,7 +454,7 @@
     {:keys [branch t stats commit] :as staged-db}
     opts]
    (go-try
-     (let [{:keys [commit-store]} conn
+     (let [{:keys [commit-catalog]} conn
 
            {:keys [tag time message file-data? index-files-ch]
             :or   {time (util/current-time-iso)}}
@@ -471,9 +470,9 @@
            ;; TODO - we do not support multiple "transactions" in a single
            ;; commit (although other code assumes we do which needs cleaning)
            [[txn-id author annotation] :as _txns]
-           (<? (write-transactions! commit-store ledger-alias staged-txns))
+           (<? (write-transactions! commit-catalog ledger-alias staged-txns))
 
-           data-write-result (<? (commit-storage/write-jsonld commit-store ledger-alias db-jsonld))
+           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
            db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
            keypair           {:did did :private private}
 
@@ -493,7 +492,7 @@
                          :size       (:size stats)})
 
            {:keys [commit-map commit-jsonld write-result]}
-           (<? (write-commit commit-store ledger-alias keypair new-commit))
+           (<? (write-commit commit-catalog ledger-alias keypair new-commit))
 
            db  (formalize-commit staged-db commit-map)
            db* (ledger/update-commit! ledger branch db index-files-ch)]
