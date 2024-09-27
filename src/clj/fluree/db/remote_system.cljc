@@ -136,14 +136,14 @@
     (go ledger-alias))
 
   nameservice/Publication
-  (-subscribe [_ ledger-alias callback]
+  (subscribe [_ ledger-alias callback]
     (if (fn? callback)
       (swap! system-state subscribe ledger-alias callback)
       (throw (ex-info (str "Subscription request for " ledger-alias
                            " failed. Callback must be a function, provided: " (pr-str callback))
                       {:status 400
                        :error  :db/invalid-fn}))))
-  (-unsubscribe [_ ledger-alias]
+  (unsubscribe [_ ledger-alias]
     (swap! system-state unsubscribe ledger-alias))
 
   storage/JsonArchive

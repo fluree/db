@@ -215,7 +215,7 @@
     (go-try
       (loop [nameservices* nameservices]
         (when-let [ns (first nameservices*)]
-          (<? (nameservice/-subscribe ns ledger-alias callback))
+          (<? (nameservice/subscribe ns ledger-alias callback))
           (recur (rest nameservices*)))))))
 
 (defn unsubscribe-ledger
@@ -225,7 +225,7 @@
     (go-try
       (loop [nameservices* nameservices]
         (when-let [ns (first nameservices*)]
-          (<? (nameservice/-unsubscribe ns ledger-alias))
+          (<? (nameservice/unsubscribe ns ledger-alias))
           (recur (rest nameservices*)))))))
 
 (defn parse-did

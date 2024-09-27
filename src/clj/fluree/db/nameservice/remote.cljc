@@ -78,9 +78,9 @@
     (async/close! msg-out))
 
   nameservice/Publication
-  (-subscribe [_ ledger-alias callback]
+  (subscribe [_ ledger-alias callback]
     (subscribe state ledger-alias callback))
-  (-unsubscribe [_ ledger-alias]
+  (unsubscribe [_ ledger-alias]
     (unsubscribe state ledger-alias)))
 
 (defn initialize
