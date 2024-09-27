@@ -83,7 +83,10 @@
   (-> address parse-address :local))
 
 (defprotocol Addressable
-  (location [section]))
+  (location [store]))
+
+(defprotocol Identifiable
+  (identifiers [store]))
 
 (defprotocol JsonArchive
   (-read-json [store address keywordize?] "Returns value associated with `address`."))

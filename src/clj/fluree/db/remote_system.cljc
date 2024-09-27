@@ -148,7 +148,11 @@
 
   storage/JsonArchive
   (-read-json [_ address keywordize?]
-    (remote-read system-state address keywordize?)))
+    (remote-read system-state address keywordize?))
+
+  storage/Identifiable
+  (identifiers [_]
+    address-identifiers))
 
 (defn initial-state
   [servers]
@@ -164,5 +168,6 @@
 
 (defn connect
   [servers identifiers]
-  (let [system-state (-> servers initial-state atom)]
-    (->RemoteSystem system-state identifiers)))
+  (let [system-state   (-> servers initial-state atom)
+        identifier-set (set identifiers)]
+    (->RemoteSystem system-state identifier-set)))

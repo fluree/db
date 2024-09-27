@@ -102,6 +102,10 @@
   (location [_]
     (storage/build-location storage/fluree-namespace identifier method-name [bucket prefix]))
 
+  storage/Identifiable
+  (identifiers [_]
+    #{identifier})
+
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go-try
