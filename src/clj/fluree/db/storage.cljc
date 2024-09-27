@@ -123,17 +123,23 @@
 
 (defrecord Catalog [])
 
+(defn display-catalog
+  [clg]
+  (let [locations (-> clg (dissoc [::default ::read-only]) keys vec)
+        ro-ids    (-> clg ::read-only keys)]
+    {:content-stores locations, :read-only-archives ro-ids}))
+
 #?(:clj
    (defmethod print-method Catalog [^Catalog clg, ^Writer w]
      (.write w (str "#fluree/Catalog "))
      (binding [*out* w]
-       (pr (->> clg keys vec))))
+       (pr (display-catalog clg))))
    :cljs
      (extend-type Catalog
        IPrintWithWriter
        (-pr-writer [clg w _opts]
          (-write w "#fluree/Catalog ")
-         (-write w (pr (->> clg keys vec))))))
+         (-write w (pr (display-catalog clg))))))
 
 (defmethod pprint/simple-dispatch Catalog [^Catalog clg]
   (pr clg))
@@ -143,45 +149,45 @@
   (let [loc (location section)]
     [loc section]))
 
-(defn with-remote-system
-  [remote-section remote-system]
+(defn with-read-only-archive
+  [read-only-section read-only-archive]
   (reduce (fn [sec address-identifier]
-            (assoc sec address-identifier remote-system))
-          remote-section (identifiers remote-system)))
+            (assoc sec address-identifier read-only-archive))
+          read-only-section (identifiers read-only-archive)))
 
-(defn remote-systems->section
-  [remote-systems]
-  (reduce with-remote-system {} remote-systems))
+(defn read-only-archives->section
+  [read-only-archives]
+  (reduce with-read-only-archive {} read-only-archives))
 
 (defn catalog
-  ([local-stores]
-   (catalog local-stores []))
-  ([local-stores remote-systems]
-   (let [default-location (-> local-stores first location)]
-     (catalog local-stores remote-systems default-location)))
-  ([local-stores remote-systems default-location]
-   (let [remote-section (remote-systems->section remote-systems)]
+  ([content-stores]
+   (catalog content-stores []))
+  ([content-stores read-only-archives]
+   (let [default-location (-> content-stores first location)]
+     (catalog content-stores read-only-archives default-location)))
+  ([content-stores read-only-archives default-location]
+   (let [read-only-section (read-only-archives->section read-only-archives)]
      (-> (->Catalog)
-         (into (map section-entry) local-stores)
-         (assoc ::default default-location, ::remote remote-section)))))
+         (into (map section-entry) content-stores)
+         (assoc ::default default-location, ::read-only read-only-section)))))
 
-(defn get-local-store
+(defn get-content-store
   [clg location]
   (let [location* (if (= location ::default)
                     (get clg ::default)
                     location)]
     (get clg location*)))
 
-(defn get-remote-system
+(defn get-read-only-archive
   [clg location]
   (when-let [identifier (get-identifier location)]
-    (-> clg ::remote (get identifier))))
+    (-> clg ::read-only (get identifier))))
 
 (defn locate-address
   [clg address]
-  (let [[location _local-path] (split-address address)]
-    (or (get-local-store clg location)
-        (get-remote-system clg location))))
+  (let [[location _content-path] (split-address address)]
+    (or (get-content-store clg location)
+        (get-read-only-archive clg location))))
 
 (defn async-location-error
   [address]
@@ -202,6 +208,6 @@
   ([clg path data]
    (content-write-catalog-json clg ::default path data))
   ([clg location path data]
-   (if-let [store (get-local-store clg location)]
+   (if-let [store (get-content-store clg location)]
      (content-write-json store path data)
      (async-location-error location))))
