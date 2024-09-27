@@ -23,7 +23,7 @@
     "Publishes new commit to nameservice."))
 
 (defprotocol Publication
-  (subscribe [nameservice ledger-alias callback]
+  (subscribe [nameservice ledger-alias]
     "Creates a subscription to nameservice(s) for ledger events. Will call
     callback with event data as received.")
   (unsubscribe [nameservice ledger-alias]

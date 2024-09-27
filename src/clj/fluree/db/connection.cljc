@@ -1,6 +1,6 @@
 (ns fluree.db.connection
   (:refer-clojure :exclude [replicate])
-  (:require [clojure.core.async :as async :refer [<!]]
+  (:require [clojure.core.async :as async :refer [<! go-loop]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [fluree.db.constants :as const]
@@ -200,33 +200,40 @@
   (go-try
     (boolean (<? (lookup-commit conn ledger-alias)))))
 
+(defn all-publications
+  [{:keys [remote-systems] :as _conn}]
+  remote-systems)
+
+(defn subscribe-all
+  [conn ledger-alias]
+  (->> (all-publications conn)
+       (map (fn [pub]
+              (nameservice/subscribe pub ledger-alias)))
+       async/merge))
+
+;; TODO; Were subscribing to every remote system for every ledger we load.
+;; Perhaps we should ensure that a remote system manages a particular ledger
+;; before subscribing
 (defn subscribe-ledger
   "Initiates subscription requests for a ledger into all subscribers on a connection."
   [conn ledger-alias]
-  (let [nameservices (all-nameservices conn)
-        callback     (fn [msg]
-                       (log/info "Subscription message received: " msg)
-                       (let [action       (get msg "action")
-                             ledger-alias (get msg "ledger")
-                             data         (get msg "data")]
-                         (if (= "new-commit" action)
-                           (notify-ledger conn data)
-                           (log/info "New subscrition message with action: " action "received, ignored."))))]
-    (go-try
-      (loop [nameservices* nameservices]
-        (when-let [ns (first nameservices*)]
-          (<? (nameservice/subscribe ns ledger-alias callback))
-          (recur (rest nameservices*)))))))
+  (let [sub-ch (subscribe-all conn ledger-alias)]
+    (go-loop []
+      (when-let [msg (<! sub-ch)]
+        (log/info "Subscribed ledger:" ledger-alias "received subscription message:" msg)
+        (let [action (get msg "action")
+              data   (get msg "data")]
+          (if (= "new-commit" action)
+            (notify-ledger conn data)
+            (log/info "New subscrition message with action: " action "received, ignored.")))
+        (recur)))))
 
 (defn unsubscribe-ledger
   "Initiates unsubscription requests for a ledger into all namespaces on a connection."
   [conn ledger-alias]
-  (let [nameservices (all-nameservices conn)]
-    (go-try
-      (loop [nameservices* nameservices]
-        (when-let [ns (first nameservices*)]
-          (<? (nameservice/unsubscribe ns ledger-alias))
-          (recur (rest nameservices*)))))))
+  (map (fn [pub]
+         (nameservice/unsubscribe pub ledger-alias))
+       (all-publications conn)))
 
 (defn parse-did
   [conn did]
