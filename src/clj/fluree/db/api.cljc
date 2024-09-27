@@ -1,6 +1,5 @@
 (ns fluree.db.api
   (:require [fluree.db.connection.system :as system]
-            [fluree.db.connection.remote :as remote-conn]
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
@@ -76,7 +75,6 @@
       (let [{:keys [method] :as opts*} (parse-connection-options opts)
 
             config (case method
-                     :remote (<? (remote-conn/connect opts*))
                      :ipfs   (let [{:keys [server file-storage-path parallelism cache-max-mb defaults]} opts*]
                                (system/ipfs-config server file-storage-path parallelism cache-max-mb defaults))
                      :file   (if platform/BROWSER

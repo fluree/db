@@ -9,7 +9,6 @@
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.nameservice.storage-backed :as storage-nameservice]
             [fluree.db.nameservice.ipns :as ipns-nameservice]
-            [fluree.db.nameservice.remote :as remote-nameservice]
             [fluree.db.flake.index.storage :as index.storage]
             #?(:clj  [fluree.db.storage.s3 :as s3-store]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
@@ -46,14 +45,6 @@
 (defmethod ig/init-key :default
   [_ component]
   component)
-
-;; (defmethod ig/init-key :fluree.remote-system/http
-;;   [_ servers]
-;;   (remote/connect servers))
-
-(defmethod ig/init-key :fluree.publication/remote-resources
-  [_ {:keys [remote-system]}]
-  (remote-nameservice/initialize remote-system))
 
 (defmethod ig/init-key :fluree/cache
   [_ max-mb]
