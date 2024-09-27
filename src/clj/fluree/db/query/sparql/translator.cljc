@@ -631,13 +631,13 @@
 
 (defmethod parse-term :GroupOrUnionGraphPattern
   ;; GroupOrUnionGraphPattern ::= GroupGraphPattern ( <'UNION'> GroupGraphPattern )*
-  [[_ group-pattern & union-patterns]] 
+  [[_ group-pattern & union-patterns]]
   (if union-patterns
     (let [all-patterns (cons (parse-term group-pattern) (map parse-term union-patterns))]
       (reduce (fn [a g]
                 (if (= (first a) :union)
-                  [:union [a] g]
-                  [:union a g]))
+                  [:union [a] (vec g)]
+                  [:union (vec a) (vec g)]))
               (first all-patterns)
               (rest all-patterns)))
     (parse-term group-pattern)))
@@ -645,7 +645,13 @@
 (defmethod parse-term :GroupGraphPatternSub
   ;; GroupGraphPatternSub ::= WS TriplesBlock? ( GraphPatternNotTriples WS <'.'?> TriplesBlock? WS )* WS
   [[_ & patterns]]
-  (mapcat parse-term patterns))
+  (mapcat (fn [pattern]
+            (let [pattern (parse-term pattern)]
+              ;; don't flatten union patterns
+              (if (= :union (first pattern))
+                [pattern]
+                pattern)))
+          patterns))
 
 (declare translate)
 (defmethod parse-term :SubSelect

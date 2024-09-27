@@ -437,7 +437,7 @@
   [[_ & unions] vars context]
   (let [parsed (mapv (fn [clause]
                        (if (and (vector? clause)
-                                (= (first clause) :query)) 
+                                (= (first clause) :query))
                          (parse-pattern clause vars context)
                          (parse-where-clause clause vars context)))
                      unions)]
