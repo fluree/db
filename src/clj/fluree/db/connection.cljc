@@ -28,29 +28,19 @@
 
 (comment
  ;; state machine looks like this:
- {:ledger {"ledger-a" {:event-fn :main-system-event-fn ;; returns async-chan response once complete
-                       :subs     {:sub-id :sub-fn} ;; active subscriptions
-                       ;; map of branches, along with current/default branch
+ {:ledger {"ledger-a" {;; map of branches, along with current/default branch
                        :branches {}
-                       :branch   {}}}
-
-
-  :await  {:msg-id :async-res-ch} ;; map of msg-ids to response chans for messages awaiting responses
-  :stats  {}}) ;; any stats about the connection itself
+                       :branch   {}}}})
 
 (defn blank-state
   "Returns top-level state for connection"
   []
-  (atom
-   {:ledger {}
-    :await  {}
-    :stats  {}}))
+  (atom {:ledger {}}))
 
 (defn printer-map
   "Returns map of important data for print writer"
   [conn]
-  {:id    (:id conn)
-   :stats (get @(:state conn) :stats)})
+  {:id (:id conn)})
 
 (defrecord Connection [id state parallelism commit-catalog index-catalog primary-publisher
                        secondary-publishers remote-systems serializer cache defaults])
