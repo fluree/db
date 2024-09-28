@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [load])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [<! >! go]]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
@@ -19,6 +20,11 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defrecord AsyncDB [alias branch commit t db-chan]
+  dbproto/IFlureeDb
+  (-query [this query-map]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (dbproto/-query db query-map)))))
   where/Matcher
   (-match-id [_ fuel-tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
