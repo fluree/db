@@ -1,7 +1,7 @@
 (ns fluree.db.query.sparql.translator
-  (:require [fluree.db.constants :as const]
+  (:require #?(:cljs [cljs.tools.reader :refer [read-string]])
             [clojure.string :as str]
-            #?(:cljs [cljs.tools.reader :refer [read-string]])))
+            [fluree.db.constants :as const]))
 
 (defn rule?
   [x]
@@ -509,7 +509,7 @@
 (defmethod parse-term :InlineDataFull
   ;; InlineDataFull ::= ( NIL | VarList ) WS <'{'> WS ( ValueList WS | NIL )* <'}'>
   [[_ vars & data]]
-  [:values [(parse-term vars)] (mapv parse-term data)])
+  [:values [(parse-term vars) (mapv parse-term data)]])
 
 (defmethod parse-term :InlineDataOneVar
   ;; InlineDataOneVar ::= Var <'{'> WS DataBlockValue* <'}'>
