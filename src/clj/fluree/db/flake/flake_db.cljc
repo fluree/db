@@ -111,63 +111,14 @@
            :namespace-codes new-ns-codes
            :max-namespace-code max-namespace-code*)))
 
-(defn enrich-values
-  [id->node values]
-  (mapv (fn [{:keys [id type] :as v-map}]
-          (if id
-            (merge (get id->node id)
-                   (cond-> v-map
-                     (nil? type) (dissoc :type)))
-            v-map))
-        values))
-
-(defn enrich-node
-  [id->node node]
-  (reduce-kv
-   (fn [updated-node k v]
-     (assoc updated-node k (cond (= :id k) v
-                                 (:list (first v)) [{:list (enrich-values id->node (:list (first v)))}]
-                                 :else (enrich-values id->node v))))
-   {}
-   node))
-
-(defn enrich-assertion-values
-  "`asserts` is a json-ld flattened (ish) sequence of nodes. In order to properly generate
-  sids (or pids) for these nodes, we need the full node additional context for ref objects. This
-  function traverses the asserts and builds a map of node-id->node, then traverses the
-  asserts again and merges each ref object into the ref's node.
-
-  example input:
-  [{:id \"foo:bar\"
-    \"ex:key1\" {:id \"foo:ref-id\"}}
-  {:id \"foo:ref-id\"
-   :type \"some:type\"}]
-
-  example output:
-  [{:id \"foo:bar\"
-    \"ex:key1\" {:id \"foo:ref-id\"
-                 :type \"some:type\"}}
-  {:id \"foo:ref-id\"
-   :type \"some:type\"}]
-  "
-  [asserts]
-  (let [id->node (reduce (fn [id->node {:keys [id] :as node}] (assoc id->node id node))
-                         {}
-                         asserts)]
-    (mapv (partial enrich-node id->node)
-          asserts)))
 
 (defn db-assert
   [db-data]
-  (let [commit-assert (get db-data const/iri-assert)]
-    ;; TODO - any basic validation required
-    (enrich-assertion-values commit-assert)))
+  (get db-data const/iri-assert))
 
 (defn db-retract
   [db-data]
-  (let [commit-retract (get db-data const/iri-retract)]
-    ;; TODO - any basic validation required
-    commit-retract))
+  (get db-data const/iri-retract))
 
 (defn commit-error
   [message commit-data]

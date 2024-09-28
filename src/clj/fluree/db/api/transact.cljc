@@ -14,38 +14,39 @@
 
 (defn parse-opts
   [expanded-txn opts txn-context]
-  (-> (util/get-first-value expanded-txn const/iri-opts)
-      (merge opts) ;; override opts 'did', 'raw-txn' with credential's if present
-      (util/keywordize-keys)
-      (assoc :context txn-context)))
+  (let [txn-opts (some-> (util/get-first-value expanded-txn const/iri-opts)
+                         util/keywordize-keys)
+        opts*    (merge txn-opts (util/keywordize-keys opts))]
+    (assoc opts* :context txn-context)))
 
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
    internal Fluree triples format."
   [db parsed-txn parsed-opts]
   (go-try
-   (let [track-fuel? (or (:maxFuel parsed-opts)
-                         (:meta parsed-opts))
-         identity    (:did parsed-opts)
-         policy-db   (if identity
-                       (<? (policy/wrap-identity-policy db identity nil))
-                       db)]
-     (if track-fuel?
-       (let [start-time #?(:clj (System/nanoTime)
-                           :cljs (util/current-time-millis))
-             fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
-         (try*
-          (let [result (<? (tx/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
-            {:status 200
-             :result result
-             :time   (util/response-time-formatted start-time)
-             :fuel   (fuel/tally fuel-tracker)})
-          (catch* e
-                  (throw (ex-info "Error staging database"
-                                  {:time (util/response-time-formatted start-time)
-                                   :fuel (fuel/tally fuel-tracker)}
-                                  e)))))
-       (<? (tx/stage policy-db identity parsed-txn parsed-opts))))))
+    (let [track-fuel? (or (:maxFuel parsed-opts)
+                          (:meta parsed-opts))
+          identity    (:did parsed-opts)
+          policy-db   (if (policy/policy-enforced-opts? parsed-opts)
+                        (let [parsed-context (:context parsed-opts)]
+                          (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
+                        db)]
+      (if track-fuel?
+        (let [start-time #?(:clj (System/nanoTime)
+                            :cljs (util/current-time-millis))
+              fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
+          (try*
+            (let [result (<? (tx/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
+              {:status 200
+               :result result
+               :time   (util/response-time-formatted start-time)
+               :fuel   (fuel/tally fuel-tracker)})
+            (catch* e
+                    (throw (ex-info "Error staging database"
+                                    {:time (util/response-time-formatted start-time)
+                                     :fuel (fuel/tally fuel-tracker)}
+                                    e)))))
+        (<? (tx/stage policy-db identity parsed-txn parsed-opts))))))
 
 (defn stage
   [db txn opts]
@@ -67,17 +68,18 @@
 
 (defn transact!
   ([conn txn]
-   (transact! conn txn {:raw-txn txn}))
-  ([conn txn {:keys [context] :as opts}]
+   (transact! conn txn nil))
+  ([conn txn opts]
    (go-try
-     (let [expanded  (json-ld/expand (ctx-util/use-fluree-context txn))
-           ledger-id (extract-ledger-id expanded)
-           txn-context (or (ctx-util/txn-context txn)
-                           context) ; parent context might come from a
-                                    ; Verifiable Credential's context
+     (let [expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
+           context     (or (ctx-util/txn-context txn)
+                           ;; parent context might come from a Verifiable
+                           ;; Credential's context
+                           (:context opts))
+           ledger-id   (extract-ledger-id expanded)
            expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
-           triples     (q-parse/parse-txn expanded txn-context)
-           parsed-opts (parse-opts expanded opts txn-context)]
+           triples     (q-parse/parse-txn expanded context)
+           parsed-opts (parse-opts expanded opts context)]
        (<? (connection/transact! conn ledger-id triples parsed-opts))))))
 
 (defn credential-transact!

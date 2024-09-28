@@ -13,11 +13,10 @@
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.async :as async-util :refer [<? go-try]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.connection :as connection]
-            [fluree.db.reasoner :as reasoner]
-            [fluree.json-ld :as json-ld]))
+            [fluree.db.reasoner :as reasoner]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -47,52 +46,28 @@
          (recur (rest rule-sources) updated-rule-results))
        rule-results))))
 
-
-(defn policy-restricted?
-  [query-opts]
-  (or (:did query-opts)
-      (:policyClass query-opts)
-      (:policy query-opts)))
-
-(defn policy-enforce-db
-  [db {:keys [opts] :as sanitized-query}]
-  (go-try
-   (let [context (context/extract sanitized-query)
-         {:keys [did policyClass policy policyValues]} opts]
-     (cond
-
-       did
-       (<? (perm/wrap-identity-policy db (json-ld/expand-iri did context) policyValues))
-
-       policyClass
-       (let [classes (map #(json-ld/expand-iri % context) (util/sequential policyClass))]
-         (<? (perm/wrap-class-policy db classes policyValues)))
-
-       policy
-       (let [expanded-policy (json-ld/expand policy context)]
-         (<? (perm/wrap-policy db expanded-policy policyValues)))))))
-
 (defn restrict-db
   ([db sanitized-query]
    (restrict-db db sanitized-query nil))
   ([db {:keys [t opts] :as sanitized-query} conn]
    (go-try
-    (let [{:keys [reasoner-methods rule-sources]} opts
-          processed-rule-sources (when rule-sources
-                                   (<? (load-aliased-rule-dbs conn rule-sources)))
-          policy-db              (if (policy-restricted? opts)
-                                   (<? (policy-enforce-db db sanitized-query))
-                                   db)
-          time-travel-db         (-> (if t
-                                       (<? (time-travel/as-of policy-db t))
-                                       policy-db))
-          reasoned-db            (if reasoner-methods
-                                   (<? (reasoner/reason time-travel-db
-                                                        reasoner-methods
-                                                        processed-rule-sources
-                                                        opts))
-                                   time-travel-db)]
-      (assoc-in reasoned-db [:policy :cache] (atom {}))))))
+     (let [{:keys [reasoner-methods rule-sources]} opts
+           processed-rule-sources (when rule-sources
+                                    (<? (load-aliased-rule-dbs conn rule-sources)))
+           policy-db              (if (perm/policy-enforced-opts? opts)
+                                    (let [parsed-context (context/extract sanitized-query)]
+                                      (<? (perm/policy-enforce-db db parsed-context opts)))
+                                    db)
+           time-travel-db         (-> (if t
+                                        (<? (time-travel/as-of policy-db t))
+                                        policy-db))
+           reasoned-db            (if reasoner-methods
+                                    (<? (reasoner/reason time-travel-db
+                                                         reasoner-methods
+                                                         processed-rule-sources
+                                                         opts))
+                                    time-travel-db)]
+       (assoc-in reasoned-db [:policy :cache] (atom {}))))))
 
 (defn track-query
   [ds max-fuel query]
