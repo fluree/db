@@ -28,14 +28,16 @@
 
 (comment
  ;; state machine looks like this:
- {:ledger {"ledger-a" {;; map of branches, along with current/default branch
-                       :branches {}
-                       :branch   {}}}})
+  {:ledger        {"ledger-a" {;; map of branches, along with current/default branch
+                               :branches {}
+                               :branch   {}}}
+   :subscriptions {}})
 
 (defn blank-state
   "Returns top-level state for connection"
   []
-  (atom {:ledger {}}))
+  (atom {:ledger        {}
+         :subscriptions {}}))
 
 (defn printer-map
   "Returns map of important data for print writer"
@@ -115,8 +117,8 @@
                   "Are you sure it is a commit?: " commit-map)))))
 
 (defn all-nameservices
-  [{:keys [primary-publisher secondary-publishers subscribers] :as _conn}]
-  (cons primary-publisher (concat secondary-publishers subscribers)))
+  [{:keys [primary-publisher secondary-publishers remote-systems] :as _conn}]
+  (cons primary-publisher (concat secondary-publishers remote-systems)))
 
 (def fluree-address-prefix
   "fluree:")
@@ -195,35 +197,61 @@
   remote-systems)
 
 (defn subscribe-all
-  [conn ledger-alias]
-  (->> (all-publications conn)
+  [publications ledger-alias]
+  (->> publications
        (map (fn [pub]
               (nameservice/subscribe pub ledger-alias)))
        async/merge))
+
+(defn subscribed?
+  [current-state ledger-alias]
+  (contains? (:subscriptions current-state) ledger-alias))
+
+(defn get-subscription
+  [current-state ledger-alias]
+  (get-in current-state [:subscriptions ledger-alias]))
+
+(defn add-subscription
+  [current-state publications ledger-alias]
+  (if-not (subscribed? current-state ledger-alias)
+    (let [sub-ch (subscribe-all publications ledger-alias)]
+      (assoc-in current-state [:subscriptions ledger-alias] sub-ch))
+    current-state))
+
+(defn remove-subscription
+  [current-state ledger-alias]
+  (update current-state :subscriptions dissoc ledger-alias))
 
 ;; TODO; Were subscribing to every remote system for every ledger we load.
 ;; Perhaps we should ensure that a remote system manages a particular ledger
 ;; before subscribing
 (defn subscribe-ledger
-  "Initiates subscription requests for a ledger into all subscribers on a connection."
-  [conn ledger-alias]
-  (let [sub-ch (subscribe-all conn ledger-alias)]
-    (go-loop []
-      (when-let [msg (<! sub-ch)]
-        (log/info "Subscribed ledger:" ledger-alias "received subscription message:" msg)
-        (let [action (get msg "action")
-              data   (get msg "data")]
-          (if (= "new-commit" action)
-            (notify-ledger conn data)
-            (log/info "New subscrition message with action: " action "received, ignored.")))
-        (recur)))))
+  "Initiates subscription requests for a ledger into all remote systems on a
+  connection."
+  [{:keys [state] :as conn} ledger-alias]
+  (let [pubs                   (all-publications conn)
+        [prev-state new-state] (swap-vals! state add-subscription pubs ledger-alias)]
+    (when-not (subscribed? prev-state ledger-alias)
+      (let [sub-ch (get-subscription new-state ledger-alias)]
+        (go-loop []
+          (when-let [msg (<! sub-ch)]
+            (log/info "Subscribed ledger:" ledger-alias "received subscription message:" msg)
+            (let [action (get msg "action")
+                  data   (get msg "data")]
+              (if (= "new-commit" action)
+                (notify-ledger conn data)
+                (log/info "New subscrition message with action: " action "received, ignored.")))
+            (recur)))
+        :subscribed))))
 
 (defn unsubscribe-ledger
   "Initiates unsubscription requests for a ledger into all namespaces on a connection."
-  [conn ledger-alias]
-  (map (fn [pub]
-         (nameservice/unsubscribe pub ledger-alias))
-       (all-publications conn)))
+  [{:keys [state] :as conn} ledger-alias]
+  (->> (all-publications conn)
+       (map (fn [pub]
+              (nameservice/unsubscribe pub ledger-alias)))
+       dorun)
+  (swap! state remove-subscription ledger-alias))
 
 (defn parse-did
   [conn did]
