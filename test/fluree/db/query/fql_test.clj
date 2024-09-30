@@ -155,6 +155,38 @@
              @(fluree/query db q))
           "return results without repeated entries"))))
 
+(deftest ^:integration select-one-test
+  (let [conn   (test-utils/create-conn)
+        people (test-utils/load-people conn)
+        db     (fluree/db people)]
+    (testing "select-one"
+      (testing "with result"
+        (testing "with sequential select"
+          (is (= [9]
+                 @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                                    :selectOne '[?favNum]
+                                    :where '[{:id ?s :schema/name "Alice"}
+                                             {:id ?s :ex/favNums ?favNum}]
+                                    :order-by '?favNum}))))
+        (testing "with single select"
+          (is (= 9
+                 @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                                    :selectOne '?favNum
+                                    :where '[{:id ?s :schema/name "Alice"}
+                                             {:id ?s :ex/favNums ?favNum}]
+                                    :order-by '?favNum})))))
+      (testing "with no result"
+        (testing "with sequential select"
+          (is (= nil
+                 @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                                    :selectOne '[?s]
+                                    :where '{:id ?s :schema/name "Bob"}}))))
+        (testing "with single select"
+          (is (= nil
+                 @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                                    :selectOne '?s
+                                    :where '{:id ?s :schema/name "Bob"}}))))))))
+
 (deftest ^:integration values-test
   (testing "Queries with pre-specified values"
     (let [conn   (test-utils/create-conn)
