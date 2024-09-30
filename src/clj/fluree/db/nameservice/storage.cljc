@@ -1,4 +1,4 @@
-(ns fluree.db.nameservice.storage-backed
+(ns fluree.db.nameservice.storage
   (:require [clojure.core.async :refer [go]]
             [clojure.string :as str]
             [fluree.db.storage :as storage]

@@ -7,7 +7,7 @@
             [fluree.db.storage.memory :as memory-store]
             [fluree.db.storage.ipfs :as ipfs-store]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.nameservice.storage-backed :as storage-nameservice]
+            [fluree.db.nameservice.storage :as storage-nameservice]
             [fluree.db.nameservice.ipns :as ipns-nameservice]
             [fluree.db.flake.index.storage :as index.storage]
             #?(:clj  [fluree.db.storage.s3 :as s3-store]
@@ -36,7 +36,7 @@
 
 (derive :fluree.publication/remote-resources :fluree/publication)
 
-(derive :fluree.nameservice/storage-backed :fluree/nameservice)
+(derive :fluree.nameservice/storage :fluree/nameservice)
 
 (derive :fluree.nameservice/ipns :fluree/nameservice)
 
@@ -75,7 +75,7 @@
            [_ _]
            (localstorage-store/open)))
 
-(defmethod ig/init-key :fluree.nameservice/storage-backed
+(defmethod ig/init-key :fluree.nameservice/storage
   [_ {:keys [storage]}]
   (storage-nameservice/start storage))
 
@@ -111,7 +111,7 @@
   [parallelism cache-max-mb defaults]
   {:fluree.serializer/json            {}
    :fluree/cache                      cache-max-mb
-   :fluree.nameservice/storage-backed {:storage (ig/ref :fluree/byte-storage)}
+   :fluree.nameservice/storage {:storage (ig/ref :fluree/byte-storage)}
    :fluree/catalog                    {:storage (ig/ref :fluree/content-storage)}
    :fluree.index/storage              {:catalog    (ig/ref :fluree/catalog)
                                        :serializer (ig/ref :fluree/serializer)
@@ -150,11 +150,11 @@
   (-> (file-config file-storage-path parallelism cache-max-mb defaults)
       (assoc :fluree.storage/ipfs server
              :fluree.nameservice/ipns {:profile "self", :server server, :sync? false}
-             :fluree/nameservices [(ig/ref :fluree.nameservice/storage-backed)
+             :fluree/nameservices [(ig/ref :fluree.nameservice/storage)
                                    (ig/ref :fluree.nameservice/ipns)])
       (update :fluree.index/storage assoc :storage (ig/ref :fluree.storage/ipfs))
       (update :fluree/connection assoc :commit-store (ig/ref :fluree.storage/ipfs))
-      (update :fluree/connection assoc :primary-ns (ig/ref :fluree.nameservice/storage-backed))
+      (update :fluree/connection assoc :primary-ns (ig/ref :fluree.nameservice/storage))
       (update :fluree/connection assoc :aux-nses [(ig/ref :fluree.nameservice/ipns)])))
 
 (defn start
