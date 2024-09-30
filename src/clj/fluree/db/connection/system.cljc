@@ -76,8 +76,8 @@
            (localstorage-store/open)))
 
 (defmethod ig/init-key :fluree.nameservice/storage-backed
-  [_ {:keys [address-prefix storage]}]
-  (storage-nameservice/start address-prefix storage))
+  [_ {:keys [storage]}]
+  (storage-nameservice/start storage))
 
 (defmethod ig/init-key :fluree.nameservice/ipns
   [_ {:keys [server profile]}]
@@ -132,21 +132,18 @@
 (defn memory-config
   [parallelism cache-max-mb defaults]
   (-> (base-config parallelism cache-max-mb defaults)
-      (assoc :fluree.storage/memory {})
-      (assoc-in [:fluree.nameservice/storage-backed :address-prefix] "fluree:memory://")))
+      (assoc :fluree.storage/memory {})))
 
 (defn file-config
   [storage-path parallelism cache-max-mb defaults]
   (-> (base-config parallelism cache-max-mb defaults)
-      (assoc :fluree.storage/file storage-path)
-      (assoc-in [:fluree.nameservice/storage-backed :address-prefix] "fluree:file://")))
+      (assoc :fluree.storage/file storage-path)))
 
 #?(:clj
    (defn s3-config
      [endpoint bucket prefix parallelism cache-max-mb defaults]
      (-> (base-config parallelism cache-max-mb defaults)
-         (assoc :fluree.storage/s3 {:bucket bucket, :prefix prefix, :endpoint endpoint})
-         (assoc-in [:fluree.nameservice/storage-backed :address-prefix] "fluree:s3://"))))
+         (assoc :fluree.storage/s3 {:bucket bucket, :prefix prefix, :endpoint endpoint}))))
 
 (defn ipfs-config
   [server file-storage-path parallelism cache-max-mb defaults]

@@ -1,6 +1,7 @@
 (ns fluree.db.nameservice
   (:refer-clojure :exclude [alias])
   (:require [clojure.string :as str]
+            [fluree.db.storage :as storage]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -71,6 +72,10 @@
       [ns branch])
     [ns-address nil]))
 
+(defn absolute-address?
+  [address location]
+  (str/starts-with? address location))
+
 (defn resolve-address
   "Resolves a provided namespace address, which might be relative or absolute,
    into three parts returned as a map:
@@ -79,13 +84,12 @@
   - :address - absolute namespace address (including branch if provided)
   If 'branch' parameter is provided will always use it as the branch regardless
   of if a branch is specificed in the ns-address."
-  [base-address ns-address branch]
+  [location ns-address branch]
   (let [[ns-address* extracted-branch] (extract-branch ns-address)
-        branch*   (or branch extracted-branch)
-        absolute? (str/starts-with? ns-address base-address)
-        [ns-address** alias] (if absolute?
-                               [ns-address* (subs ns-address* (count base-address))]
-                               [(str base-address ns-address*) ns-address*])]
+        branch* (or branch extracted-branch)
+        [ns-address** alias] (if (absolute-address? ns-address location)
+                               [ns-address* (storage/get-local-path ns-address*)]
+                               [(storage/build-address location ns-address*) ns-address*])]
     {:alias   alias
      :branch  branch*
      :address (if branch*

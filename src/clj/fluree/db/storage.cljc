@@ -29,14 +29,16 @@
     (str "//" path)))
 
 (defn build-address
+  ([location path]
+   (let [path* (sanitize-path path)]
+     (str/join ":" [location path*])))
   ([ns method path]
    (build-address ns nil method path))
   ([ns identifier method path]
    (build-address ns identifier method path nil))
   ([ns identifier method path auxiliary]
-   (let [location (build-location ns identifier method auxiliary)
-         path*    (sanitize-path path)]
-     (str/join ":" [location path*]))))
+   (let [location (build-location ns identifier method auxiliary)]
+     (build-address location path))))
 
 (def fluree-namespace "fluree")
 

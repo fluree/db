@@ -91,10 +91,6 @@
                                                 {:status 400, :error :db/unsupported-operation}))))]
         (system/start config)))))
 
-(defn connect-file
-  [opts]
-  (connect (assoc opts :method :file)))
-
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.
   - server - (optional) IPFS http api server endpoint, defaults to http://127.0.0.1:5001/
