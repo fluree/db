@@ -8,7 +8,8 @@
             [fluree.db.query.exec.having :as having]
             [fluree.db.util.core :as util]
             [fluree.db.query.exec.select.subject :as subject]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.log :as log :include-macros true]
+            [clojure.walk :as walk]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -49,76 +50,42 @@
     (async/take 1 result-ch)
     (async/into [] result-ch)))
 
-(defn extract-subquery
-  [query-smt]
-  (when (and (sequential? query-smt)
-             (= :query (first query-smt)))
-    (second query-smt)))
+(defn execute*
+  ([ds fuel-tracker q error-ch]
+   (execute* ds fuel-tracker q error-ch nil))
+  ([ds fuel-tracker q error-ch initial-soln]
+   (->> (where/search ds q fuel-tracker error-ch initial-soln)
+        (group/combine q)
+        (having/filter q error-ch)
+        (select/modify q)
+        (order/arrange q)
+        (drop-offset q)
+        (take-limit q))))
 
 (defn execute
-  [ds fuel-tracker q error-ch initial-soln]
-  (->> (where/search ds q fuel-tracker error-ch initial-soln)
-       (group/combine q)
-       (having/filter q error-ch)
-       (select/modify q)
-       (order/arrange q)
-       (drop-offset q)
-       (take-limit q)
+  [ds fuel-tracker q error-ch]
+  (->> (execute* ds fuel-tracker q error-ch)
        (select/format ds q fuel-tracker error-ch)
        (collect-results q)))
 
-(defn execute-subquery
-  [ds fuel-tracker q error-ch initial-soln]
-  (->> (where/search ds q fuel-tracker error-ch initial-soln)
-       (group/combine q)
-       (having/filter q error-ch)
-       (select/modify q)
-       (order/arrange q)
-       (drop-offset q)
-       (take-limit q)
-       (select/subquery-format ds q fuel-tracker error-ch)))
+(defn subquery-executor
+  "Closes over a subquery to allow processing the whole query pipeline from within the
+  search."
+  [subquery]
+  (fn [ds fuel-tracker solution error-ch]
+    (->> (execute* ds fuel-tracker subquery error-ch (go solution))
+         (select/subquery-format ds subquery fuel-tracker error-ch))))
 
-(defn collect-subqueries
-  "With multiple subqueries each having its own solution channel,
-  merge them into a single solution."
-  [subquery-chans]
-  (when (seq subquery-chans)
-    (if (= 1 (count subquery-chans))
-      (first subquery-chans)
-      (let [out-ch (async/chan)]
-        (go
-          (let [all-solns (loop [chans subquery-chans
-                                 acc   []]
-                            (if-let [next-chan (first chans)]
-                              (let [solns (async/<! (async/into [] next-chan))]
-                                (recur (rest chans) (conj acc solns)))
-                              acc))
-                results   (util/cartesian-merge all-solns)]
-            (async/onto-chan! out-ch results)))
-        out-ch))))
-
-(defn query*
-  "Iterates over query :where to identify any subqueries,
-  and if they exist, executes them and collects them into initial-soln.
-
-  Recursive, in that subqueries can have subqueries.
-
-  Once subquery solution chans are identified, if any, the parent query is executed."
-  [ds fuel-tracker q error-ch subquery?]
-  (loop [[where-smt & r] (:where q)
-         where*           [] ;; where clause with subqueries removed
-         subquery-results []]
-    (if where-smt
-      (if-let [subquery (extract-subquery where-smt)]
-        (let [result-ch (query* ds fuel-tracker subquery error-ch true)] ;; might be multiple nested subqueries
-          (recur r where* (conj subquery-results result-ch)))
-        (recur r (conj where* where-smt) subquery-results))
-      ;; end of subqueries search... if result-chans extract as initial soln to where, else execute where
-      (let [q*            (assoc q :where (not-empty where*))
-            subquery-soln (collect-subqueries subquery-results)]
-        (if subquery?
-          (execute-subquery ds fuel-tracker q* error-ch subquery-soln)
-          (execute ds fuel-tracker q* error-ch subquery-soln))))))
+(defn prep-subqueries
+  "Takes a query and returns a query with all subqueries within replaced by a subquery
+  executor function."
+  [q]
+  (update q :where #(walk/postwalk (fn [x]
+                                     (if (= :query (where/pattern-type x))
+                                       (let [subquery (second x)]
+                                         (where/->pattern :query (subquery-executor subquery)))
+                                       x))
+                                   %)))
 
 (defn query
   "Execute the parsed query `q` against the database value `db`. Returns an async
@@ -127,7 +94,8 @@
   [ds fuel-tracker q]
   (go
     (let [error-ch  (async/chan)
-          result-ch (query* ds fuel-tracker q error-ch false)]
+          prepped-q (prep-subqueries q)
+          result-ch (execute ds fuel-tracker prepped-q error-ch)]
       (async/alt!
-       error-ch ([e] e)
-       result-ch ([result] result)))))
+        error-ch ([e] e)
+        result-ch ([result] result)))))

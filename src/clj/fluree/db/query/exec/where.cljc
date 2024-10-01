@@ -634,6 +634,12 @@
                     (async/<!))
         solution))))
 
+(defmethod match-pattern :query
+  [ds fuel-tracker solution pattern error-ch]
+  (let [subquery-fn (pattern-data pattern)
+        out-ch (async/chan 2 (map (fn [soln] (merge solution soln))))]
+    (async/pipe (subquery-fn ds fuel-tracker solution error-ch) out-ch)))
+
 (defmethod match-pattern :graph
   [ds fuel-tracker solution pattern error-ch]
   (let [[g clause] (pattern-data pattern)]

@@ -669,7 +669,7 @@
   (let [sub-query* (-> sub-query
                        syntax/coerce-subquery
                        (parse-analytical-query context))]
-    [[:query sub-query*]]))
+    [(where/->pattern :query sub-query*)]))
 
 (defn parse-query
   [q]
