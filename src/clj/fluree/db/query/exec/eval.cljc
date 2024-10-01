@@ -322,16 +322,8 @@
                      (if (pos? (compare* (:value a) (:datatype-iri a)
                                          (:value b) (:datatype-iri b)))
                        a
-                       b))
-        ;; I think we should also return the datatype-iri here, 
-        ;; but currently for date-like values, that is java.time.LocalDate 
-        ;; or java.time.OffsetDateTime, which ought actually to be returned 
-        ;; as xsd:date or xsd:dateTime, respectively.
-        ;;
-        ;;     {:keys [value datatype-iri]} (reduce compare-fn coll)]
-        ;; (where/->typed-val value datatype-iri)))
-        value      (:value (reduce compare-fn coll))]
-    (where/->typed-val value)))
+                       b))]
+    (reduce compare-fn coll)))
 
 (defn min
   [coll]
@@ -339,16 +331,8 @@
                      (if (neg? (compare* (:value a) (:datatype-iri a)
                                          (:value b) (:datatype-iri b)))
                        a
-                       b))
-        ;; I think we should also return the datatype-iri here, 
-        ;; but currently for date-like values, that is java.time.LocalDate 
-        ;; or java.time.OffsetDateTime, which ought actually to be returned 
-        ;; as xsd:date or xsd:dateTime, respectively.
-        ;;
-        ;;     {:keys [value datatype-iri]} (reduce compare-fn coll)]
-        ;; (where/->typed-val value datatype-iri)))
-        value      (:value (reduce compare-fn coll))]
-    (where/->typed-val value)))
+                       b))]
+    (reduce compare-fn coll)))
 
 (defn regex
   [{text :value} {pattern :value}]
