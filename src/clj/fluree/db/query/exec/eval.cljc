@@ -68,12 +68,6 @@
   (where/->typed-val
     (Math/sqrt (:value (variance coll)))))
 
-(defn ceil
-  [{n :value}]
-  (where/->typed-val (cond (= n (int n)) n
-                           (> n 0) (-> n int inc)
-                           (< n 0) (-> n int))))
-
 (defn count-distinct
   [coll]
   (where/->typed-val
@@ -82,12 +76,6 @@
 (defn -count
   [coll]
   (where/->typed-val (count coll)))
-
-(defn floor
-  [{n :value}]
-  (where/->typed-val (cond (= n (int n)) n
-                           (> n 0) (-> n int)
-                           (< n 0) (-> n int dec))))
 
 (def groupconcat clojure.core/concat)
 
@@ -114,6 +102,18 @@
       (if (nil? (:value res#))
         (coalesce ~@args)
         res#))))
+
+(defn ceil
+  [{n :value}]
+  (where/->typed-val (cond (= n (int n)) n
+                           (> n 0) (-> n int inc)
+                           (< n 0) (-> n int))))
+
+(defn floor
+  [{n :value}]
+  (where/->typed-val (cond (= n (int n)) n
+                           (> n 0) (-> n int)
+                           (< n 0) (-> n int dec))))
 
 (defn bound
   [{x :value}]
