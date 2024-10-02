@@ -116,9 +116,13 @@
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " commit-map)))))
 
+(defn local-nameservices
+  [{:keys [primary-publisher secondary-publishers] :as _conn}]
+  (cons primary-publisher secondary-publishers))
+
 (defn all-nameservices
-  [{:keys [primary-publisher secondary-publishers remote-systems] :as _conn}]
-  (cons primary-publisher (concat secondary-publishers remote-systems)))
+  [{:keys [remote-systems] :as conn}]
+  (concat (local-nameservices conn) remote-systems))
 
 (def fluree-address-prefix
   "fluree:")
@@ -159,17 +163,24 @@
    (go-try
      (first (<? (addresses conn ledger-alias))))))
 
-(defn lookup-commit
+(defn lookup-commit*
   "Returns commit address from first matching nameservice on a conn
    for a given ledger alias and branch"
+  [ledger-address nameservices]
+  (go-try
+    (loop [nses nameservices]
+      (when-let [nameservice (first nses)]
+        (if-let [commit-address (<? (nameservice/lookup nameservice ledger-address))]
+          commit-address
+          (recur (rest nses)))))))
+
+(defn lookup-commit
   [conn ledger-address]
-  (let [nameservices (all-nameservices conn)]
-    (go-try
-      (loop [nameservices* nameservices]
-        (when-let [ns (first nameservices*)]
-          (if-let [commit-address (<? (nameservice/lookup ns ledger-address))]
-            commit-address
-            (recur (rest nameservices*))))))))
+  (lookup-commit* ledger-address (all-nameservices conn)))
+
+(defn lookup-local-commit
+  [conn ledger-address]
+  (lookup-commit* ledger-address (local-nameservices conn)))
 
 (defn read-file-address
   [{:keys [commit-catalog] :as _conn} addr]
@@ -177,10 +188,10 @@
     (let [json-data (<? (storage/read-catalog-json commit-catalog addr))]
       (assoc json-data "address" addr))))
 
-(defn read-latest-commit
+(defn read-latest-local-commit
   [conn ledger-address]
   (go-try
-    (if-let [commit-addr (<? (lookup-commit conn ledger-address))]
+    (if-let [commit-addr (<? (lookup-local-commit conn ledger-address))]
       (<? (read-file-address conn commit-addr))
       (throw (ex-info (str "Unable to load. No commit exists for: " ledger-address)
                       {:status 400 :error :db/invalid-commit-address})))))
