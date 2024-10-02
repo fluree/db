@@ -194,7 +194,7 @@
     (if-let [commit-addr (<? (lookup-local-commit conn ledger-address))]
       (<? (read-file-address conn commit-addr))
       (throw (ex-info (str "Unable to load. No commit exists for: " ledger-address)
-                      {:status 400 :error :db/invalid-commit-address})))))
+                      {:status 404 :error :db/commit-not-found})))))
 
 (defn ledger-exists?
   "Checks nameservices on a connection and returns true if any nameservice
