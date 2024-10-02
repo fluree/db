@@ -24,6 +24,13 @@
                           :ssl (str/starts-with? chosen-server "https"))))))
       :connected-server))
 
+(defn clear-connected-server
+  [system-state]
+  (when-let [ws (:connected-socket @system-state)]
+    (xhttp/close-websocket ws))
+  (swap! system-state assoc :connected-server nil, :connected-at nil, :ssl nil,
+         :connected-socket nil)
+  :cleared)
 
 (defn launch-subscription-socket
   "Returns channel with websocket or exception."
@@ -38,7 +45,9 @@
                            (log/warn "Websocket connection closed!"))]
       (try*
         ;; will return chan with socket object or exception
-        (<? (xhttp/try-socket url msg-in msg-out timeout close-fn))
+        (let [ws (<? (xhttp/try-socket url msg-in msg-out timeout close-fn))]
+          (swap! system-state assoc :connected-socket ws)
+          ws)
         (catch* e
                 (let [msg (ex-message e)]
                   (log/warn "Error establishing web socket:" msg)
@@ -64,6 +73,16 @@
                                            {:resource ledger-address}
                                            {:keywordize-keys false}))]
       (get head-commit "address"))))
+
+(defn ensure-socket
+  [system-state msg-in msg-out]
+  (go
+    (if-not (:connected-socket @system-state)
+      (let [ws (<! (launch-subscription-socket system-state msg-in msg-out))]
+        (if (util/exception? ws)
+          (log/warn ws "Failed to connect to remote system for subscription")
+          :launched))
+      :connected)))
 
 (defn record-subscription
   [current-state ledger-alias sub-ch]
@@ -98,16 +117,22 @@
 
   nameservice/Publication
   (subscribe [_ ledger-alias]
-    (let [sub-ch                  (async/chan)
-          [prev-state next-state] (swap-vals! system-state record-subscription ledger-alias sub-ch)]
-      (if (not= prev-state next-state)
-        (do (async/sub pub ledger-alias sub-ch)
-            sub-ch)
-        ;; TODO; We currently allow only one subscription per ledger, but we could
-        ;; enable multiple subscriptions if necessary with multiple calls to
-        ;; `core.async/sub` on the publication
-        (do (log/debug "Subscription requested for ledger" ledger-alias "already exists")
-            (async/close! sub-ch)))))
+    (let [sub-ch (async/chan)]
+      (go
+        ;; TODO: Retry socket connection or propogate error on socket connection
+        ;;       failure
+        (when (<! (ensure-socket system-state msg-in msg-out))
+          (let [[prev-state next-state]
+                (swap-vals! system-state record-subscription ledger-alias sub-ch)]
+            (if (not= prev-state next-state)
+              (do (async/sub pub ledger-alias sub-ch)
+                  sub-ch)
+              ;; TODO; We currently allow only one subscription per ledger, but we could
+              ;; enable multiple subscriptions if necessary with multiple calls to
+              ;; `core.async/sub` on the publication
+              (do (log/debug "Subscription requested for ledger" ledger-alias "already exists")
+                  (async/close! sub-ch))))))
+      sub-ch))
   (unsubscribe [_ ledger-alias]
     (if-let [sub-ch (get-in @system-state [:subscription ledger-alias])]
       (do (log/debug "Unsubscribing from updates to ledger:" ledger-alias)
@@ -135,15 +160,9 @@
 
 (defn connect
   [servers identifiers]
-  (go-try
-    (let [system-state   (-> servers initial-state atom)
-          identifier-set (set identifiers)
-          msg-in         (async/chan 1 (map parse-message))
-          msg-in-pub     (async/pub msg-in get-ledger-id)
-          msg-out        (async/chan)
-          websocket      (<! (launch-subscription-socket system-state msg-in msg-out))]
-      (if (util/exception? websocket)
-        (do (async/close! msg-in)
-            (async/close! msg-out)
-            (throw websocket))
-        (->RemoteSystem system-state identifier-set msg-in msg-in-pub msg-out)))))
+  (let [system-state   (-> servers initial-state atom)
+        identifier-set (set identifiers)
+        msg-in         (async/chan 1 (map parse-message))
+        msg-in-pub     (async/pub msg-in get-ledger-id)
+        msg-out        (async/chan)]
+    (->RemoteSystem system-state identifier-set msg-in msg-in-pub msg-out)))
