@@ -24,9 +24,6 @@
                           :ssl (str/starts-with? chosen-server "https"))))))
       :connected-server))
 
-(defn close-websocket
-  [websocket]
-  (xhttp/close-websocket websocket))
 
 (defn launch-subscription-socket
   "Returns channel with websocket or exception."
