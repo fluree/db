@@ -532,36 +532,41 @@
           :db               db*}
          db*)))))
 
+(defn track-fuel?
+  [parsed-opts]
+  (or (:maxFuel parsed-opts)
+      (:meta parsed-opts)))
+
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
    internal Fluree triples format."
-  [db triples parsed-opts]
+  [db parsed-txn parsed-opts]
   (go-try
-   (let [track-fuel? (or (:maxFuel parsed-opts)
-                         (:meta parsed-opts))
-         identity    (:did parsed-opts)
-         policy-db   (if identity
-                       (<? (policy/wrap-identity-policy db identity nil))
-                       db)]
-     (if track-fuel?
-       (let [start-time #?(:clj (System/nanoTime)
-                           :cljs (util/current-time-millis))
-             fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
-         (try*
-          (let [result (<? (transact/stage policy-db fuel-tracker identity triples parsed-opts))]
-            {:status 200
-             :result result
-             :time   (util/response-time-formatted start-time)
-             :fuel   (fuel/tally fuel-tracker)})
-          (catch* e
-                  (throw (ex-info "Error staging database"
-                                  {:time (util/response-time-formatted start-time)
-                                   :fuel (fuel/tally fuel-tracker)}
-                                  e)))))
-       (<? (transact/stage policy-db identity triples parsed-opts))))))
+    (let [identity    (:did parsed-opts)
+          policy-db   (if (policy/policy-enforced-opts? parsed-opts)
+                        (let [parsed-context (:context parsed-opts)]
+                          (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
+                        db)]
+      (if (track-fuel? parsed-opts)
+        (let [start-time #?(:clj (System/nanoTime)
+                            :cljs (util/current-time-millis))
+              fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
+          (try*
+            (let [result (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
+              {:status 200
+               :result result
+               :time   (util/response-time-formatted start-time)
+               :fuel   (fuel/tally fuel-tracker)})
+            (catch* e
+                    (throw (ex-info "Error staging database"
+                                    {:time (util/response-time-formatted start-time)
+                                     :fuel (fuel/tally fuel-tracker)}
+                                    e)))))
+        (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
 
 (defn transact-ledger!
   [_conn ledger triples {:keys [branch] :as opts, :or {branch :main}}]
+  (log/info "transacting ledger:" opts)
   (go-try
     (let [db       (ledger/current-db ledger branch)
           staged   (<? (stage-triples db triples opts))
@@ -573,6 +578,7 @@
 
 (defn transact!
   [conn ledger-id triples opts]
+  (log/info "transacting:" opts)
   (go-try
     (let [ledger (<? (load-ledger conn ledger-id))]
       (<? (transact-ledger! conn ledger triples opts)))))
