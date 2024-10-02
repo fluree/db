@@ -13,15 +13,17 @@
   "Currently does just a round-robin selection if multiple servers are given.
   TODO - add re-tries with a different server if fails to connect. Consider keeping stats to select optimal server."
   [system-state]
-  (or (:connected-to @system-state)
-      (-> (swap! system-state (fn [{:keys [connected-to servers] :as ss}]
-                                (if connected-to
-                                  connected-to
-                                  (let [chosen-server (rand-nth servers)]
-                                    (assoc ss :connected-to chosen-server
-                                              :secure? (str/starts-with? chosen-server "https")
-                                              :connected-at (util/current-time-millis))))))
-          :connected-to)))
+  (-> system-state
+      (swap! (fn [current-state]
+               (if (:connected-to current-state)
+                 current-state
+                 (let [chosen-server (-> current-state :servers rand-nth)]
+                   (assoc current-state
+                          :connected-to chosen-server
+                          :connected-at (util/current-time-millis)
+                          :ssl (str/starts-with? chosen-server "https"))))))
+      :connected-to))
+
 
 (defn remote-read
   "Returns a core async channel with value of remote resource."
