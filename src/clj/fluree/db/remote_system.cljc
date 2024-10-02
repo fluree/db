@@ -28,16 +28,18 @@
   [system-state commit-key keywordize-keys?]
   (log/debug "Remote read initiated for: " commit-key)
   (let [server-host (pick-server system-state)]
-    (xhttp/post-json (str server-host "/fluree/remoteResource")
+    (xhttp/post-json (str server-host "/fluree/remote/resource")
                      {:resource commit-key}
                      {:keywordize-keys keywordize-keys?})))
 
 (defn remote-lookup
   [system-state ledger-address]
   (go-try
-    (let [head-commit  (<? (remote-read system-state ledger-address false))
-          head-address (get head-commit "address")]
-      head-address)))
+    (let [server-host (pick-server system-state)
+          head-commit (<? (xhttp/post-json (str server-host "/fluree/remote/latestCommit")
+                                           {:resource ledger-address}
+                                           {:keywordize-keys false}))]
+      (get head-commit "address"))))
 
 (defn close-websocket
   [websocket]
@@ -135,7 +137,6 @@
                     :error  :db/websocket-error}))
         (do
           (log/info "Websocket connection established.")
-          #_(monitor-socket-messages remote-ns ws)
           ws)))))
 
 (defn parse-message
