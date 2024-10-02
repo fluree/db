@@ -15,14 +15,14 @@
   [system-state]
   (-> system-state
       (swap! (fn [current-state]
-               (if (:connected-to current-state)
+               (if (:connected-server current-state)
                  current-state
                  (let [chosen-server (-> current-state :servers rand-nth)]
                    (assoc current-state
-                          :connected-to chosen-server
+                          :connected-server chosen-server
                           :connected-at (util/current-time-millis)
                           :ssl (str/starts-with? chosen-server "https"))))))
-      :connected-to))
+      :connected-server))
 
 (defn close-websocket
   [websocket]
@@ -122,11 +122,11 @@
 
 (defn initial-state
   [servers]
-  {:servers      servers
-   :connected-to nil
-   :connected-at nil
-   :ssl          nil
-   :subscription {}})
+  {:servers          servers
+   :connected-server nil
+   :connected-at     nil
+   :ssl              nil
+   :subscription     {}})
 
 (defn parse-message
   [msg]
