@@ -326,10 +326,7 @@
                                            (do
                                              (log/info "Abnormal websocket closure, attempting to re-establish connection.")
                                              (retry-socket url msg-in msg-out timeout close-fn))
-                                           (do (log/debug "Closing websocket message channels")
-                                               (async/close! msg-in)
-                                               (async/close! msg-out)
-                                               (close-fn))))
+                                           (close-fn)))
                       :headers         nil
                       :on-open         (fn [_]
                                          (log/debug "Websocket opened"))
