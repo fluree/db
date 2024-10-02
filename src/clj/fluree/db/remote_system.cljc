@@ -24,6 +24,31 @@
                           :ssl (str/starts-with? chosen-server "https"))))))
       :connected-to))
 
+(defn close-websocket
+  [websocket]
+  (xhttp/close-websocket websocket))
+
+(defn launch-subscription-socket
+  "Returns channel with websocket or exception."
+  [system-state msg-in msg-out]
+  (go
+    (let [current-server (pick-server system-state)
+          url            (-> current-server
+                             (str/replace-first "http" "ws")
+                             (str "/fluree/subscribe"))
+          timeout        10000
+          close-fn       (fn []
+                           (log/warn "Websocket connection closed!"))]
+      (try*
+        ;; will return chan with socket object or exception
+        (<? (xhttp/try-socket url msg-in msg-out timeout close-fn))
+        (catch* e
+                (let [msg (ex-message e)]
+                  (log/warn "Error establishing web socket:" msg)
+                  (clear-connected-server system-state)
+                  (ex-info (str "Error establishing websocket connection: " msg)
+                           {:status 400
+                            :error  :db/websocket-error})))))))
 
 (defn remote-read
   "Returns a core async channel with value of remote resource."
@@ -42,27 +67,6 @@
                                            {:resource ledger-address}
                                            {:keywordize-keys false}))]
       (get head-commit "address"))))
-
-(defn close-websocket
-  [websocket]
-  (xhttp/close-websocket websocket))
-
-(defn ws-connect
-  "Returns channel with websocket or exception."
-  [system-state msg-in msg-out]
-  (let [current-server (pick-server system-state)
-        url            (-> current-server
-                           (str/replace-first "http" "ws")
-                           (str "/fluree/subscribe"))
-        timeout        10000
-        close-fn       (fn []
-                         (log/warn "Websocket connection closed!"))]
-    (try*
-      ;; will return chan with socket object or exception
-      (xhttp/try-socket url msg-in msg-out timeout close-fn)
-      (catch* e
-              (log/warn "Exception establishing web socket: " (ex-message e))
-              (async/go e)))))
 
 (defn record-subscription
   [current-state ledger-alias sub-ch]
@@ -123,21 +127,6 @@
    :connected-at nil
    :ssl          nil
    :subscription {}})
-
-(defn launch-subscription-socket
-  "Returns chan with websocket after successful connection, or exception. "
-  [system-state msg-in msg-out]
-  (go
-    (let [ws (<! (ws-connect system-state msg-in msg-out))]
-      (if (util/exception? ws)
-        (do
-          (log/error "Error establishing websocket connection: " (ex-message ws))
-          (ex-info (str "Error establishing websocket connection: " (ex-message ws))
-                   {:status 400
-                    :error  :db/websocket-error}))
-        (do
-          (log/info "Websocket connection established.")
-          ws)))))
 
 (defn parse-message
   [msg]
