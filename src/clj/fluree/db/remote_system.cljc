@@ -68,16 +68,14 @@
   [current-state ledger-alias sub-ch]
   (if-not (contains? (:subscription current-state) ledger-alias)
     (-> current-state
-        (assoc-in [:subscription ledger-alias] sub-ch)
-        (update-in [:stats :subscriptions] inc))
+        (assoc-in [:subscription ledger-alias] sub-ch))
     current-state))
 
 (defn record-unsubscription
   [current-state ledger-alias]
   (if (contains? (:subscription current-state) ledger-alias)
     (-> current-state
-        (update :subscription dissoc ledger-alias)
-        (update-in [:stats :subscription] dec))
+        (update :subscription dissoc ledger-alias))
     current-state))
 
 (defrecord RemoteSystem [system-state address-identifiers msg-in pub msg-out]
@@ -122,8 +120,8 @@
   [servers]
   {:servers      servers
    :connected-to nil
-   :stats        {:connected-at  nil
-                  :subscriptions 0}
+   :connected-at nil
+   :ssl          nil
    :subscription {}})
 
 (defn launch-subscription-socket
