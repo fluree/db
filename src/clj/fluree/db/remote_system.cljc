@@ -121,8 +121,6 @@
     (remote-lookup system-state ledger-address))
   (alias [_ ledger-address]
     ledger-address)
-  (address [_ ledger-alias]
-    (go ledger-alias))
 
   nameservice/Publication
   (subscribe [_ ledger-alias]

@@ -11,16 +11,25 @@
   [ledger-alias]
   (str ledger-alias ".json"))
 
+(defn publishing-address
+  [store ledger-alias]
+  (-> store
+      storage/location
+      (storage/build-address ledger-alias)))
+
 (defrecord StorageBackedNameService [store]
   nameservice/Publisher
   (publish [_ commit-jsonld]
     (go-try
       (let [ledger-alias (get commit-jsonld "alias")
-            ns-address   (nameservice/full-address (storage/location store) ledger-alias)
+            ns-address   (publishing-address store ledger-alias)
             record       (nameservice/ns-record ns-address commit-jsonld)
             record-bytes (json/stringify-UTF8 record)
             filename     (local-filename ledger-alias)]
         (<? (storage/write-bytes store filename record-bytes)))))
+
+  (publishing-address [_ ledger-alias]
+    (go (publishing-address store ledger-alias)))
 
   nameservice/iNameService
   (lookup [_ ledger-address]
@@ -30,10 +39,6 @@
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (let [ns-record (json/parse record-bytes false)]
             (nameservice/commit-address-from-record ns-record nil))))))
-
-  (address [_ ledger-alias]
-    (go
-      (storage/build-address (storage/location store) ledger-alias)))
 
   (alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?

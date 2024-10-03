@@ -135,21 +135,21 @@
   [ledger-alias]
   (not (fluree-address? ledger-alias)))
 
-(defn addresses*
+(defn publishing-addresses
   "Retrieve address for each nameservices based on a relative ledger-alias.
   If ledger-alias is not relative, returns only the current ledger alias.
 
   TODO - if a single non-relative address is used, and the ledger exists,
   we should retrieve all stored ns addresses in the commit if possible and
   try to use all nameservices."
-  [ledger-alias nameservices]
+  [conn ledger-alias]
   (go-try
     (if (relative-ledger-alias? ledger-alias)
-      (loop [nameservices* nameservices
+      (loop [nameservices* (publishers conn)
              addresses     []]
         (let [ns (first nameservices*)]
           (if ns
-            (if-let [address (<? (nameservice/address ns ledger-alias))]
+            (if-let [address (<? (nameservice/publishing-address ns ledger-alias))]
               (recur (rest nameservices*) (conj addresses address))
               (recur (rest nameservices*) addresses))
             addresses)))
@@ -159,11 +159,7 @@
   "From a connection, lookup primary address from nameservice(s) for a given
   ledger alias"
   [{:keys [primary-publisher] :as _conn} ledger-alias]
-  (nameservice/address primary-publisher ledger-alias))
-
-(defn publishing-addresses
-  [conn ledger-alias]
-  (addresses* ledger-alias (publishers conn)))
+  (nameservice/publishing-address primary-publisher ledger-alias))
 
 (defn lookup-commit*
   "Returns commit address from first matching nameservice on a conn

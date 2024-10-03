@@ -14,15 +14,15 @@
   (alias [nameservice ledger-address]
     "Given a ledger address, returns ledger's default alias name else nil, if
     not avail")
-  (address [nameservice ledger-alias]
-    "Returns full nameservice address/iri which will get published in commit. If
-    'private', return nil.")
   (-close [nameservice]
     "Closes all resources for this nameservice"))
 
 (defprotocol Publisher
   (publish [nameservice commit-data]
-    "Publishes new commit to nameservice."))
+    "Publishes new commit to nameservice.")
+  (publishing-address [nameservice ledger-alias]
+    "Returns full nameservice address/iri which will get published in commit. If
+    'private', return nil."))
 
 (defprotocol Publication
   (subscribe [nameservice ledger-alias]
@@ -34,12 +34,8 @@
 (defn known-ledger?
   [nsv ledger-alias]
   (go-try
-    (let [addr (<? (address nsv ledger-alias))]
+    (let [addr (<? (publishing-address nsv ledger-alias))]
       (boolean (<? (lookup nsv addr))))))
-
-(defn full-address
-  [prefix ledger-alias]
-  (str prefix ledger-alias))
 
 (defn ns-record
   "Generates nameservice metadata map for JSON storage. For now, since we only

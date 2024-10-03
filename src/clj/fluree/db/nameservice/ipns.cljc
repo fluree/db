@@ -57,13 +57,14 @@
 
 (defrecord IpnsNameService [ipfs-endpoint ipns-key base-address?]
   nameservice/Publisher
-  (publish [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
+  (publish [_ commit-data]
+    (ipfs/push! ipfs-endpoint commit-data))
+  (publishing-address [_ ledger-alias]
+    (ipns-address ipfs-endpoint ipns-key ledger-alias))
 
   nameservice/iNameService
   (lookup [_ ledger-alias]
     (lookup-address ipfs-endpoint ipns-key ledger-alias))
-  (address [_ ledger-alias]
-    (ipns-address ipfs-endpoint ipns-key ledger-alias))
   (alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
       alias))
