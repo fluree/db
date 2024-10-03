@@ -166,7 +166,7 @@
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [{:keys [conn alias primary-address ns-addresses commit-catalog index-catalog]}
+  [{:keys [conn alias primary-address publish-addresses commit-catalog index-catalog]}
    {:keys [did branch indexing] :as opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias alias)
@@ -174,6 +174,6 @@
           init-time      (or (:fluree.db.json-ld.migrate.sid/time opts)
                              (util/current-time-iso))
           genesis-commit (<? (commit-storage/write-genesis-commit
-                               commit-catalog alias branch ns-addresses init-time))]
+                               commit-catalog alias branch publish-addresses init-time))]
       (instantiate conn ledger-alias* primary-address branch commit-catalog index-catalog
                    indexing did genesis-commit))))

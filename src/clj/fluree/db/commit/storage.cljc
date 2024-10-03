@@ -102,9 +102,9 @@
     (storage/content-write-catalog-json storage path jsonld)))
 
 (defn write-genesis-commit
-  [storage ledger-alias branch ns-addresses init-time]
+  [storage ledger-alias branch publish-addresses init-time]
   (go-try
-    (let [genesis-commit            (commit-data/blank-commit ledger-alias branch ns-addresses init-time)
+    (let [genesis-commit            (commit-data/blank-commit ledger-alias branch publish-addresses init-time)
           initial-context           (get genesis-commit "@context")
           initial-db-data           (-> genesis-commit
                                         (get "data")

@@ -291,12 +291,12 @@
                         {:status 400
                          :error  :db/ledger-exists}))
         (let [address      (<? (primary-address conn ledger-alias))
-              ns-addresses (<? (addresses conn ledger-alias))
+              publish-addresses (<? (addresses conn ledger-alias))
               ledger-opts  (parse-ledger-options conn opts)
               ledger       (<! (ledger/create {:conn           conn
                                                :alias          ledger-alias
                                                :address        address
-                                               :ns-addresses   ns-addresses
+                                               :publish-addresses   publish-addresses
                                                :commit-catalog commit-catalog
                                                :index-catalog  index-catalog}
                                               ledger-opts))]
