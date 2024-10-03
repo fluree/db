@@ -1,14 +1,10 @@
 (ns fluree.db.api.transact
   (:require [fluree.db.constants :as const]
-            [fluree.db.fuel :as fuel]
-            [fluree.db.json-ld.policy :as policy]
             [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.transact :as tx]
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [catch* try*]]
+            [fluree.db.util.core :as util]
             [fluree.db.util.context :as ctx-util]
-            [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.credential :as cred]))
 
@@ -19,35 +15,6 @@
         opts*    (merge txn-opts (util/keywordize-keys opts))]
     (assoc opts* :context txn-context)))
 
-(defn stage-triples
-  "Stages a new transaction that is already parsed into the
-   internal Fluree triples format."
-  [db parsed-txn parsed-opts]
-  (go-try
-    (let [track-fuel? (or (:maxFuel parsed-opts)
-                          (:meta parsed-opts))
-          identity    (:did parsed-opts)
-          policy-db   (if (policy/policy-enforced-opts? parsed-opts)
-                        (let [parsed-context (:context parsed-opts)]
-                          (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
-                        db)]
-      (if track-fuel?
-        (let [start-time #?(:clj (System/nanoTime)
-                            :cljs (util/current-time-millis))
-              fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
-          (try*
-            (let [result (<? (tx/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
-              {:status 200
-               :result result
-               :time   (util/response-time-formatted start-time)
-               :fuel   (fuel/tally fuel-tracker)})
-            (catch* e
-                    (throw (ex-info "Error staging database"
-                                    {:time (util/response-time-formatted start-time)
-                                     :fuel (fuel/tally fuel-tracker)}
-                                    e)))))
-        (<? (tx/stage policy-db identity parsed-txn parsed-opts))))))
-
 (defn stage
   [db txn opts]
   (go-try
@@ -56,7 +23,7 @@
          expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
          parsed-opts (parse-opts expanded opts txn-context)
          parsed-txn  (q-parse/parse-txn expanded txn-context)]
-     (<? (stage-triples db parsed-txn parsed-opts)))))
+     (<? (connection/stage-triples db parsed-txn parsed-opts)))))
 
 (defn extract-ledger-id
   "Extracts ledger-id from expanded json-ld transaction"
