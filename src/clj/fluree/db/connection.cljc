@@ -159,9 +159,8 @@
 (defn primary-address
   "From a connection, lookup primary address from nameservice(s) for a given
   ledger alias"
-  ([conn ledger-alias]
-   (go-try
-     (first (<? (addresses conn ledger-alias))))))
+  [{:keys [primary-publisher] :as _conn} ledger-alias]
+  (nameservice/address primary-publisher ledger-alias))
 
 (defn lookup-commit*
   "Returns commit address from first matching nameservice on a conn
