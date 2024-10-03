@@ -169,7 +169,7 @@
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
   [{:keys [conn alias primary-address ns-addresses primary-publisher
-           secondary-publishers subscribers commit-catalog index-catalog]}
+           secondary-publishers commit-catalog index-catalog]}
    {:keys [did branch indexing] :as opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias alias)
