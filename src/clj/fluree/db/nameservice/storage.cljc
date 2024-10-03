@@ -17,7 +17,7 @@
       storage/location
       (storage/build-address ledger-alias)))
 
-(defrecord StorageBackedNameService [store]
+(defrecord StorageNameService [store]
   nameservice/Publisher
   (publish [_ commit-jsonld]
     (go-try
@@ -52,4 +52,4 @@
 
 (defn start
   [store]
-  (->StorageBackedNameService store))
+  (->StorageNameService store))
