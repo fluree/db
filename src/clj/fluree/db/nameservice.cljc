@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [alias])
   (:require [clojure.string :as str]
             [fluree.db.storage :as storage]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -29,6 +30,12 @@
     callback with event data as received.")
   (unsubscribe [nameservice ledger-alias]
     "Unsubscribes to nameservice(s) for ledger events"))
+
+(defn known-ledger?
+  [nsv ledger-alias]
+  (go-try
+    (let [addr (<? (address nsv ledger-alias))]
+      (boolean (<? (lookup nsv addr))))))
 
 (defn full-address
   [prefix ledger-alias]

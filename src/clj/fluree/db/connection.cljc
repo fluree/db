@@ -116,13 +116,13 @@
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " commit-map)))))
 
-(defn local-nameservices
+(defn publishers
   [{:keys [primary-publisher secondary-publishers] :as _conn}]
   (cons primary-publisher secondary-publishers))
 
 (defn all-nameservices
   [{:keys [remote-systems] :as conn}]
-  (concat (local-nameservices conn) remote-systems))
+  (concat (publishers conn) remote-systems))
 
 (def fluree-address-prefix
   "fluree:")
@@ -135,25 +135,24 @@
   [ledger-alias]
   (not (fluree-address? ledger-alias)))
 
-(defn addresses
+(defn addresses*
   "Retrieve address for each nameservices based on a relative ledger-alias.
   If ledger-alias is not relative, returns only the current ledger alias.
 
   TODO - if a single non-relative address is used, and the ledger exists,
   we should retrieve all stored ns addresses in the commit if possible and
   try to use all nameservices."
-  [conn ledger-alias]
+  [ledger-alias nameservices]
   (go-try
     (if (relative-ledger-alias? ledger-alias)
-      (let [nameservices (all-nameservices conn)]
-        (loop [nameservices* nameservices
-               addresses     []]
-          (let [ns (first nameservices*)]
-            (if ns
-              (if-let [address (<? (nameservice/address ns ledger-alias))]
-                (recur (rest nameservices*) (conj addresses address))
-                (recur (rest nameservices*) addresses))
-              addresses))))
+      (loop [nameservices* nameservices
+             addresses     []]
+        (let [ns (first nameservices*)]
+          (if ns
+            (if-let [address (<? (nameservice/address ns ledger-alias))]
+              (recur (rest nameservices*) (conj addresses address))
+              (recur (rest nameservices*) addresses))
+            addresses)))
       [ledger-alias])))
 
 (defn primary-address
@@ -161,6 +160,10 @@
   ledger alias"
   [{:keys [primary-publisher] :as _conn} ledger-alias]
   (nameservice/address primary-publisher ledger-alias))
+
+(defn publishing-addresses
+  [conn ledger-alias]
+  (addresses* ledger-alias (publishers conn)))
 
 (defn lookup-commit*
   "Returns commit address from first matching nameservice on a conn
@@ -177,22 +180,22 @@
   [conn ledger-address]
   (lookup-commit* ledger-address (all-nameservices conn)))
 
-(defn lookup-local-commit
-  [conn ledger-address]
-  (lookup-commit* ledger-address (local-nameservices conn)))
-
 (defn read-file-address
   [{:keys [commit-catalog] :as _conn} addr]
   (go-try
     (let [json-data (<? (storage/read-catalog-json commit-catalog addr))]
       (assoc json-data "address" addr))))
 
-(defn read-latest-local-commit
+(defn lookup-publisher-commit
+  [conn ledger-address]
+  (lookup-commit* ledger-address (publishers conn)))
+
+(defn read-publisher-commit
   [conn ledger-address]
   (go-try
-    (if-let [commit-addr (<? (lookup-local-commit conn ledger-address))]
+    (if-let [commit-addr (<? (lookup-publisher-commit conn ledger-address))]
       (<? (read-file-address conn commit-addr))
-      (throw (ex-info (str "Unable to load. No commit exists for: " ledger-address)
+      (throw (ex-info (str "No published commits exists for: " ledger-address)
                       {:status 404 :error :db/commit-not-found})))))
 
 (defn ledger-exists?
@@ -290,16 +293,16 @@
         (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
                         {:status 400
                          :error  :db/ledger-exists}))
-        (let [address      (<? (primary-address conn ledger-alias))
-              publish-addresses (<? (addresses conn ledger-alias))
-              ledger-opts  (parse-ledger-options conn opts)
-              ledger       (<! (ledger/create {:conn           conn
-                                               :alias          ledger-alias
-                                               :address        address
-                                               :publish-addresses   publish-addresses
-                                               :commit-catalog commit-catalog
-                                               :index-catalog  index-catalog}
-                                              ledger-opts))]
+        (let [addr          (<? (primary-address conn ledger-alias))
+              publish-addrs (<? (publishing-addresses conn ledger-alias))
+              ledger-opts   (parse-ledger-options conn opts)
+              ledger        (<! (ledger/create {:conn              conn
+                                                :alias             ledger-alias
+                                                :address           addr
+                                                :publish-addresses publish-addrs
+                                                :commit-catalog    commit-catalog
+                                                :index-catalog     index-catalog}
+                                               ledger-opts))]
           (when (util/exception? ledger)
             (release-ledger conn ledger-alias))
           (async/put! ledger-chan ledger)
@@ -315,7 +318,7 @@
                    (nameservice/alias ns db-alias))))))
 
 (defn load-ledger*
-  [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
+  [{:keys [commit-catalog index-catalog] :as conn}
    ledger-chan address]
   (go-try
     (let [commit-addr  (<? (lookup-commit conn address))
