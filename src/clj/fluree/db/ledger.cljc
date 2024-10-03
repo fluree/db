@@ -127,8 +127,8 @@
                     " however, latest t is more current: " current-t)
           false)))))
 
-(defrecord Ledger [conn id address alias did state cache primary-publisher
-                   secondary-publishers commit-storage index-storage reasoner])
+(defrecord Ledger [conn id address alias did state cache commit-storage
+                   index-storage reasoner])
 
 (defn initial-state
   [branches current-branch]
@@ -140,8 +140,8 @@
 (defn instantiate
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [conn ledger-alias ledger-address primary-publisher secondary-publishers branch
-   commit-catalog index-catalog indexing-opts did latest-commit]
+  [conn ledger-alias ledger-address branch commit-catalog index-catalog
+   indexing-opts did latest-commit]
   (let [branches {branch (branch/state-map ledger-alias branch commit-catalog index-catalog
                                            latest-commit indexing-opts)}]
     (map->Ledger {:conn                 conn
@@ -150,8 +150,6 @@
                   :state                (atom (initial-state branches branch))
                   :alias                ledger-alias
                   :address              ledger-address
-                  :primary-publisher    primary-publisher
-                  :secondary-publishers secondary-publishers
                   :commit-catalog       commit-catalog
                   :index-catalog        index-catalog
                   :cache                (atom {})
@@ -168,8 +166,7 @@
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [{:keys [conn alias primary-address ns-addresses primary-publisher
-           secondary-publishers commit-catalog index-catalog]}
+  [{:keys [conn alias primary-address ns-addresses commit-catalog index-catalog]}
    {:keys [did branch indexing] :as opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias alias)
@@ -178,5 +175,5 @@
                              (util/current-time-iso))
           genesis-commit (<? (commit-storage/write-genesis-commit
                                commit-catalog alias branch ns-addresses init-time))]
-      (instantiate conn ledger-alias* primary-address primary-publisher secondary-publishers
-                   branch commit-catalog index-catalog indexing did genesis-commit))))
+      (instantiate conn ledger-alias* primary-address branch commit-catalog index-catalog
+                   indexing did genesis-commit))))

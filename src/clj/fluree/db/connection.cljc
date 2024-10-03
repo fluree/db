@@ -283,8 +283,7 @@
      :indexing indexing*}))
 
 (defn create-ledger
-  [{:keys [primary-publisher secondary-publishers subscribers commit-catalog index-catalog]
-    :as   conn}
+  [{:keys [commit-catalog index-catalog] :as conn}
    ledger-alias opts]
   (go-try
     (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
@@ -295,15 +294,12 @@
         (let [address      (<? (primary-address conn ledger-alias))
               ns-addresses (<? (addresses conn ledger-alias))
               ledger-opts  (parse-ledger-options conn opts)
-              ledger       (<! (ledger/create {:conn                 conn
-                                               :alias                ledger-alias
-                                               :address              address
-                                               :primary-publisher    primary-publisher
-                                               :secondary-publishers secondary-publishers
-                                               :subscribers          subscribers
-                                               :ns-addresses         ns-addresses
-                                               :commit-catalog         commit-catalog
-                                               :index-catalog          index-catalog}
+              ledger       (<! (ledger/create {:conn           conn
+                                               :alias          ledger-alias
+                                               :address        address
+                                               :ns-addresses   ns-addresses
+                                               :commit-catalog commit-catalog
+                                               :index-catalog  index-catalog}
                                               ledger-opts))]
           (when (util/exception? ledger)
             (release-ledger conn ledger-alias))
@@ -340,8 +336,8 @@
 
           {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 
-          ledger   (ledger/instantiate conn ledger-alias address primary-publisher secondary-publishers
-                                       branch commit-catalog index-catalog did indexing commit)]
+          ledger   (ledger/instantiate conn ledger-alias address branch commit-catalog
+                                       index-catalog did indexing commit)]
       (subscribe-ledger conn ledger-alias)
       (async/put! ledger-chan ledger)
       ledger)))
