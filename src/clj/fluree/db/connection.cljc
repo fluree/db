@@ -201,7 +201,7 @@
   [conn ledger-alias]
   (go-try
     (loop [[nsv & r] (publishers conn)
-           addrs #{}]
+           addrs     []]
       (if nsv
         (if (nameservice/published-ledger? nsv ledger-alias)
           (recur r (conj addrs (<? (nameservice/publishing-address nsv ledger-alias))))
@@ -233,6 +233,12 @@
   (go-try
     (or (<? (published-ledger? conn ledger-alias))
         (boolean (not-empty (<? (known-addresses conn ledger-alias)))))))
+
+(defn all-addresses
+  [conn ledger-alias]
+  (go-try
+    (into (<? (publishing-addresses conn ledger-alias))
+          (<? (known-addresses conn ledger-alias)))))
 
 (defn all-publications
   [{:keys [remote-systems] :as _conn}]
@@ -381,20 +387,28 @@
       ledger-chan
       (load-ledger* conn ledger-chan address))))
 
+(defn try-load-address
+  [conn ledger-chan alias addr]
+  (try* (<? (load-ledger* conn ledger-chan addr))
+        (catch* e
+                (log/debug e "Unable to load ledger alias" alias "at address:" addr))))
+
 (defn load-ledger-alias
   [conn alias]
   (go-try
     (let [[cached? ledger-chan] (register-ledger conn alias)]
       (if cached?
         (<? ledger-chan)
-        (let [address (<! (primary-address conn alias))]
-          (if (util/exception? address)
+        (loop [[addr & r] (<? (all-addresses conn alias))]
+          (if addr
+            (or (<? (try-load-address conn ledger-chan alias addr))
+                (recur r))
             (do (release-ledger conn alias)
-                (async/put! ledger-chan
-                            (ex-info (str "Load for " alias " failed due to failed address lookup.")
-                                     {:status 400 :error :db/invalid-address}
-                                     address)))
-            (<? (load-ledger* conn ledger-chan address))))))))
+                (let [ex (ex-info (str "Load for " alias " failed due to failed address lookup.")
+                                  {:status 404 :error :db/unknown-address}
+                                  addr)]
+                  (async/put! ledger-chan ex)
+                  (throw ex)))))))))
 
 (defn load-ledger
   [conn alias-or-address]
