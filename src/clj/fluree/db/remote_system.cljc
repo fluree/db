@@ -83,6 +83,20 @@
                                          ; found in the remote system
             (throw e)))))))
 
+(defn remote-addresses
+  [system-state ledger-alias]
+  (let [server-host (pick-server system-state)]
+    (go-try
+      (try*
+        (let [response (<? (xhttp/post-json (str server-host "/fluree/remote/addresses")
+                                            {:ledger ledger-alias}
+                                            {:keywordize-keys false}))]
+          (get response "addresses"))
+        (catch* e
+          (when-not (not-found-error? e) ; Return `nil` when the address isn't
+                                         ; found in the remote system
+            (throw e)))))))
+
 (defn ensure-socket
   [system-state msg-in msg-out]
   (go
@@ -147,7 +161,9 @@
           (async/close! sub-ch)
           (swap! system-state record-unsubscription ledger-alias)
           :unsubscribed)
-      (log/debug "Ledger" ledger-alias "not subscribed"))))
+      (log/debug "Ledger" ledger-alias "not subscribed")))
+  (known-addresses [_ ledger-alias]
+    (remote-addresses system-state ledger-alias)))
 
 (defn initial-state
   [servers]

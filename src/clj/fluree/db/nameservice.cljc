@@ -18,20 +18,21 @@
     "Closes all resources for this nameservice"))
 
 (defprotocol Publisher
-  (publish [nameservice commit-data]
-    "Publishes new commit to nameservice.")
-  (publishing-address [nameservice ledger-alias]
-    "Returns full nameservice address/iri which will get published in commit. If
-    'private', return nil."))
+  (publish [publisher commit-data]
+    "Publishes new commit.")
+  (publishing-address [publisher ledger-alias]
+    "Returns full publisher address/iri which will get published in commit. If
+    'private', return `nil`."))
 
 (defprotocol Publication
-  (subscribe [nameservice ledger-alias]
-    "Creates a subscription to nameservice(s) for ledger events. Will call
+  (subscribe [publication ledger-alias]
+    "Creates a subscription to publication for ledger events. Will call
     callback with event data as received.")
-  (unsubscribe [nameservice ledger-alias]
-    "Unsubscribes to nameservice(s) for ledger events"))
+  (unsubscribe [publication ledger-alias]
+    "Unsubscribes to publication for ledger events")
+  (known-addresses [publication ledger-alias]))
 
-(defn known-ledger?
+(defn published-ledger?
   [nsv ledger-alias]
   (go-try
     (let [addr (<? (publishing-address nsv ledger-alias))]

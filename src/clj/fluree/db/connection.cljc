@@ -120,6 +120,10 @@
   [{:keys [primary-publisher secondary-publishers] :as _conn}]
   (cons primary-publisher secondary-publishers))
 
+(defn publications
+  [conn]
+  (:remote-systems conn))
+
 (defn all-nameservices
   [{:keys [remote-systems] :as conn}]
   (concat (publishers conn) remote-systems))
@@ -168,9 +172,8 @@
   (go-try
     (loop [nses nameservices]
       (when-let [nameservice (first nses)]
-        (if-let [commit-address (<? (nameservice/lookup nameservice ledger-address))]
-          commit-address
-          (recur (rest nses)))))))
+        (or (<? (nameservice/lookup nameservice ledger-address))
+            (recur (rest nses)))))))
 
 (defn lookup-commit
   [conn ledger-address]
@@ -194,12 +197,42 @@
       (throw (ex-info (str "No published commits exists for: " ledger-address)
                       {:status 404 :error :db/commit-not-found})))))
 
+(defn published-addresses
+  [conn ledger-alias]
+  (go-try
+    (loop [[nsv & r] (publishers conn)
+           addrs #{}]
+      (if nsv
+        (if (nameservice/published-ledger? nsv ledger-alias)
+          (recur r (conj addrs (<? (nameservice/publishing-address nsv ledger-alias))))
+          (recur r addrs))
+        addrs))))
+
+(defn published-ledger?
+  [conn ledger-alias]
+  (go-try
+    (loop [[nsv & r] (publishers conn)]
+      (if nsv
+        (or (<? (nameservice/published-ledger? nsv ledger-alias))
+            (recur r))
+        false))))
+
+(defn known-addresses
+  [conn ledger-alias]
+  (go-try
+    (loop [[nsv & r] (publications conn)
+           addrs     []]
+      (if nsv
+        (recur r (into addrs (<? (nameservice/known-addresses nsv ledger-alias))))
+        addrs))))
+
 (defn ledger-exists?
   "Checks nameservices on a connection and returns true if any nameservice
   already has a ledger associated with the given alias."
   [conn ledger-alias]
   (go-try
-    (boolean (<? (lookup-commit conn ledger-alias)))))
+    (or (<? (published-ledger? conn ledger-alias))
+        (boolean (not-empty (<? (known-addresses conn ledger-alias)))))))
 
 (defn all-publications
   [{:keys [remote-systems] :as _conn}]
