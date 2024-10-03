@@ -203,7 +203,7 @@
     (loop [[nsv & r] (publishers conn)
            addrs     []]
       (if nsv
-        (if (nameservice/published-ledger? nsv ledger-alias)
+        (if (<? (nameservice/published-ledger? nsv ledger-alias))
           (recur r (conj addrs (<? (nameservice/publishing-address nsv ledger-alias))))
           (recur r addrs))
         addrs))))
