@@ -213,4 +213,54 @@
                                           {:ex "http://example.org/ns/"}]
                                 :select  {"?s" ["*"]}
                                 :where   [{:id "?s", :ex/favColor "?color"}
-                                          [:filter "(strStarts ?color \"B\")"]]}))))))
+                                          [:filter "(strStarts ?color \"B\")"]]}))))
+    (testing "data expression"
+      (is (= [["Brian" 50]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '[?name ?age]
+                                :where   '[{:type        :ex/User
+                                            :schema/age  ?age
+                                            :schema/name ?name}
+                                           [:filter [">" "?age" ["/" ["+" "?age" 47] 2]]]]}))
+          "string atoms")
+
+      (is (= [["Brian" 50]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '[?name ?age]
+                                :where   '[{:type        :ex/User
+                                            :schema/age  ?age
+                                            :schema/name ?name}
+                                           [:filter ["in" "?age" [50 2 3]]]]}))
+          "in expression")
+      (is (= [{:type         :ex/User
+               :schema/email "cam@example.org"
+               :ex/favNums   [5 10]
+               :schema/age   34
+               :ex/last      "Jones"
+               :schema/name  "Cam"
+               :id           :ex/cam
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
+               :ex/favColor  "Blue"}]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  {"?s" ["*"]}
+                                :where   [{:id "?s", :ex/favColor "?color"}
+                                          [:filter ["strStarts" "?color" "B"]]]}))
+          "no quoting necessary")
+      (is (= [{:type         :ex/User
+               :schema/email "cam@example.org"
+               :ex/favNums   [5 10]
+               :schema/age   34
+               :ex/last      "Jones"
+               :schema/name  "Cam"
+               :id           :ex/cam
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
+               :ex/favColor  "Blue"}]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  {"?s" ["*"]}
+                                :where   [{:id "?s", :ex/favColor "?color"}
+                                          [:filter ["strStarts" "?color" {"@value" "B" "@language" "en"}]]]}))
+          "with value maps"))))
