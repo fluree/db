@@ -68,16 +68,6 @@
   (where/->typed-val
     (Math/sqrt (:value (variance coll)))))
 
-(defn max
-  [coll]
-  (where/->typed-val
-    (apply clojure.core/max (mapv :value coll))))
-
-(defn min
-  [coll]
-  (where/->typed-val
-    (apply clojure.core/min (mapv :value coll))))
-
 (defn count-distinct
   [coll]
   (where/->typed-val
@@ -325,6 +315,24 @@
   (where/->typed-val
     (or (= a b)
         (pos? (compare* a a-dt b b-dt)))))
+
+(defn max
+  [coll]
+  (let [compare-fn (fn [a b]
+                     (if (pos? (compare* (:value a) (:datatype-iri a)
+                                         (:value b) (:datatype-iri b)))
+                       a
+                       b))]
+    (reduce compare-fn coll)))
+
+(defn min
+  [coll]
+  (let [compare-fn (fn [a b]
+                     (if (neg? (compare* (:value a) (:datatype-iri a)
+                                         (:value b) (:datatype-iri b)))
+                       a
+                       b))]
+    (reduce compare-fn coll)))
 
 (defn regex
   [{text :value} {pattern :value}]
