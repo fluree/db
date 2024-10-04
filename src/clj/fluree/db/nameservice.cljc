@@ -63,8 +63,7 @@
 
 (defn address-path
   [address]
-  (let [[_ _ path] (str/split address #":")]
-    (subs path 2)))
+  (storage/get-local-path address))
 
 (defn extract-branch
   "Splits a given namespace address into its nameservice and branch parts.

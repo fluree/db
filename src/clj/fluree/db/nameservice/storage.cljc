@@ -42,7 +42,7 @@
 
   (alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?
-    (-> (nameservice/address-path ledger-address)
+    (-> (storage/get-local-path ledger-address)
         (str/split #"/")
         (->> (drop-last 2) ; branch-name, head
              (str/join #"/"))))
