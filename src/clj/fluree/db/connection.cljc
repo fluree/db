@@ -636,3 +636,8 @@
   (go-try
     (let [ledger (<? (load-ledger conn ledger-id))]
       (<? (transact-ledger! conn ledger triples opts)))))
+
+(defn replicate-index-node
+  [conn address data]
+  (let [clg (-> conn :index-catalog :storage)]
+    (storage/write-catalog-bytes clg address data)))

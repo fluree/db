@@ -165,12 +165,14 @@
   ([content-stores]
    (catalog content-stores []))
   ([content-stores read-only-archives]
+   (catalog content-stores read-only-archives []))
+  ([content-stores read-only-archives byte-stores]
    (let [default-location (-> content-stores first location)]
-     (catalog content-stores read-only-archives default-location)))
-  ([content-stores read-only-archives default-location]
+     (catalog content-stores read-only-archives byte-stores default-location)))
+  ([content-stores read-only-archives byte-stores default-location]
    (let [read-only-section (read-only-archives->section read-only-archives)]
      (-> (->Catalog)
-         (into (map section-entry) content-stores)
+         (into (map section-entry) (concat content-stores byte-stores))
          (assoc ::default default-location, ::read-only read-only-section)))))
 
 (defn get-content-store
@@ -213,3 +215,12 @@
    (if-let [store (get-content-store clg location)]
      (content-write-json store path data)
      (async-location-error location))))
+
+;; TODO: Segregate content stores and byte stores if some catalog components
+;;       don't implement both protocols
+(defn write-catalog-bytes
+  [clg address data]
+  (if-let [store (locate-address clg address)]
+    (let [path (get-local-path address)]
+      (write-bytes store path data))
+    (async-location-error location)))
