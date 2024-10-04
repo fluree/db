@@ -1,6 +1,6 @@
 (ns fluree.db.connection
   (:refer-clojure :exclude [replicate])
-  (:require [clojure.core.async :as async :refer [<! go-loop]]
+  (:require [clojure.core.async :as async :refer [<! go go-loop]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [fluree.db.constants :as const]
@@ -234,10 +234,10 @@
     (or (<? (published-ledger? conn ledger-alias))
         (boolean (not-empty (<? (known-addresses conn ledger-alias)))))))
 
-(defn all-addresses
+(defn current-addresses
   [conn ledger-alias]
   (go-try
-    (into (<? (publishing-addresses conn ledger-alias))
+    (into (<? (published-addresses conn ledger-alias))
           (<? (known-addresses conn ledger-alias)))))
 
 (defn all-publications
@@ -389,9 +389,10 @@
 
 (defn try-load-address
   [conn ledger-chan alias addr]
-  (try* (<? (load-ledger* conn ledger-chan addr))
-        (catch* e
-                (log/debug e "Unable to load ledger alias" alias "at address:" addr))))
+  (go
+    (try* (<? (load-ledger* conn ledger-chan addr))
+          (catch* e
+                  (log/debug e "Unable to load ledger alias" alias "at address:" addr)))))
 
 (defn load-ledger-alias
   [conn alias]
@@ -399,10 +400,11 @@
     (let [[cached? ledger-chan] (register-ledger conn alias)]
       (if cached?
         (<? ledger-chan)
-        (loop [[addr & r] (<? (all-addresses conn alias))]
+        (loop [[addr & r] (<? (current-addresses conn alias))]
           (if addr
-            (or (<? (try-load-address conn ledger-chan alias addr))
-                (recur r))
+            (do (log/info "trying to load address:" addr)
+                (or (<? (try-load-address conn ledger-chan alias addr))
+                    (recur r)))
             (do (release-ledger conn alias)
                 (let [ex (ex-info (str "Load for " alias " failed due to failed address lookup.")
                                   {:status 404 :error :db/unknown-address}
