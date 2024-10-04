@@ -24,20 +24,23 @@
         (update :identity #(or % (:did opts*)))
         (dissoc :did))))
 
+(defn track-fuel?
+  [parsed-opts]
+  (or (:maxFuel parsed-opts)
+      (:max-fuel parsed-opts)
+      (:meta parsed-opts)))
+
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
    internal Fluree triples format."
   [db parsed-txn parsed-opts]
   (go-try
-    (let [track-fuel? (or (:maxFuel parsed-opts)
-                          (:max-fuel parsed-opts)
-                          (:meta parsed-opts))
-          identity    (:identity parsed-opts)
+    (let [identity    (:identity parsed-opts)
           policy-db   (if (policy/policy-enforced-opts? parsed-opts)
                         (let [parsed-context (:context parsed-opts)]
                           (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
                         db)]
-      (if track-fuel?
+      (if (track-fuel? parsed-opts)
         (let [start-time #?(:clj (System/nanoTime)
                             :cljs (util/current-time-millis))
               fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
@@ -86,12 +89,16 @@
                         txn
                         (q-parse/parse-txn expanded txn-context))
           parsed-opts (parse-opts expanded opts txn-context)
-          db          (<? (stage-triples (ledger/-db ledger) triples parsed-opts))
+          staged      (<? (stage-triples (ledger/-db ledger) triples parsed-opts))
+
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
-          cmt-opts    (dissoc parsed-opts :context :identity)] ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
-      (<? (ledger/-commit! ledger db cmt-opts)))))
+          ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
+          cmt-opts (dissoc parsed-opts :context :identity)]
+      (if (track-fuel? parsed-opts)
+        (assoc staged :result (<? (ledger/-commit! ledger (:result staged) cmt-opts)))
+        (<? (ledger/-commit! ledger staged cmt-opts))))))
 
 (defn transact!
   ([conn txn] (transact! conn txn nil))
