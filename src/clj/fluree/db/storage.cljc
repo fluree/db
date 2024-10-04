@@ -52,7 +52,8 @@
 
 (defn valid-identifier?
   [x]
-  (str/includes? x "/"))
+  (and (str/includes? x "/")
+       (not (str/includes? x ":"))))
 
 (defn parse-location
   [location]
