@@ -57,19 +57,21 @@
 
 (defn parse-location
   [location]
-  (let [components   (str/split location #":")
-        address-ns   (nth components 0)
-        id-or-method (nth components 1)]
-    (if (valid-identifier? id-or-method)
-      (let [identifier id-or-method
-            method     (nth components 2)
-            auxiliary  (-> components (subvec 3) not-empty)]
-        (cond-> {:ns address-ns :identifier identifier, :method method}
-          auxiliary (assoc :auxiliary auxiliary)))
-      (let [method     id-or-method
-            auxiliary  (-> components (subvec 2) not-empty)]
-        (cond-> {:ns address-ns, :method method}
-          auxiliary (assoc :auxiliary auxiliary))))))
+  (let [components (str/split location #":")
+        address-ns (nth components 0)]
+    (if (> (count components) 1)
+      (let [id-or-method (nth components 1)]
+        (if (valid-identifier? id-or-method)
+          (let [identifier id-or-method
+                method     (nth components 2)
+                auxiliary  (-> components (subvec 3) not-empty)]
+            (cond-> {:ns address-ns :identifier identifier, :method method}
+              auxiliary (assoc :auxiliary auxiliary)))
+          (let [method    id-or-method
+                auxiliary (-> components (subvec 2) not-empty)]
+            (cond-> {:ns address-ns, :method method}
+              auxiliary (assoc :auxiliary auxiliary)))))
+      {:ns address-ns})))
 
 (defn get-identifier
   [location]
