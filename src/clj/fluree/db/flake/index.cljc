@@ -7,7 +7,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.cache :as conn-cache]))
+            [fluree.db.cache :as cache]))
 
 (def comparators
   "Map of default index comparators for the four index types"
@@ -275,15 +275,15 @@
   (resolve [_ {:keys [id tempid tt-id] :as node}]
     (if (branch? node)
       (resolve node-resolver node)
-      (conn-cache/lru-lookup
+      (cache/lru-lookup
         cache
         [::t-range id tempid tt-id from-t to-t]
         (fn [_]
           (resolve-t-range node-resolver node novelty from-t to-t))))))
 
-(defn conn->t-range-resolver
-  [{:keys [lru-cache-atom] :as conn} novelty from-t to-t]
-  (->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom))
+(defn index-store->t-range-resolver
+  [{:keys [cache] :as idx-store} novelty from-t to-t]
+  (->CachedTRangeResolver idx-store novelty from-t to-t cache))
 
 (defn history-t-range
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
@@ -303,7 +303,7 @@
   (resolve [_ {:keys [id tempid tt-id] :as node}]
     (if (branch? node)
       (resolve node-resolver node)
-      (conn-cache/lru-lookup
+      (cache/lru-lookup
         lru-cache-atom
         [::history-t-range id tempid tt-id from-t to-t]
         (fn [_]

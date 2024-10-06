@@ -1,4 +1,4 @@
-(ns fluree.db.method.ipfs.core
+(ns fluree.db.method.ipfs
   (:refer-clojure :exclude [read])
   (:require [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.util.async :refer [<? go-try]]

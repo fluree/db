@@ -2,9 +2,8 @@
   (:require [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
-            [clojure.core.async :refer [<!]]
             [clojure.string :as str]))
 
 (def method-name "ipfs")
@@ -18,8 +17,20 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord IpfsStore [endpoint]
+  storage/JsonArchive
+  (-read-json [_ address keywordize?]
+    (go-try
+      (let [{:keys [ns method local]} (storage/parse-address address)
+            path                      (build-ipfs-path method local)]
+        (when-not (and (= "fluree" ns)
+                       (#{"ipfs" "ipns"} method))
+          (throw (ex-info (str "Invalid file type or method: " address)
+                          {:status 500 :error :db/invalid-address})))
+        (when-let [data (<? (ipfs/cat endpoint path false))]
+          (json/parse data keywordize?)))))
+
   storage/ContentAddressedStore
-  (write [_ path v]
+  (-content-write [_ path v]
     (go-try
       (let [content (if (string? v)
                       v
@@ -34,31 +45,7 @@
         {:path    hash
          :hash    hash
          :address (ipfs-address hash)
-         :size    size})))
-
-  (list [_ prefix]
-    (throw (ex-info "Unsupported operation IpfsStore method: list." {:prefix prefix})))
-
-  (exists? [_ address]
-    (go-try
-      (let [resp (<! (storage/read endpoint address))]
-        (if (util/exception? resp)
-          (if (= (-> resp ex-data :error) :xhttp/timeout)
-            false ; treat timeouts as non-existent
-            (throw resp))
-          (boolean resp)))))
-
-  (read [_ address]
-    (let [{:keys [ns method local]} (storage/parse-address address)
-          path                      (build-ipfs-path method local)]
-      (when-not (and (= "fluree" ns)
-                     (#{"ipfs" "ipns"} method))
-        (throw (ex-info (str "Invalid file type or method: " address)
-                        {:status 500 :error :db/invalid-address})))
-      (ipfs/cat endpoint path false)))
-
-  (delete [_ address]
-    (throw (ex-info "Unsupported operation IpfsStore method: delete." {:address address}))))
+         :size    size}))))
 
 (defn open
   [endpoint]

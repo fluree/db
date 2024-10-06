@@ -1,6 +1,6 @@
 (ns fluree.db.nameservice.remote
   (:require [fluree.db.nameservice :as nameservice]
-            [fluree.db.method.remote.core :as remote]
+            [fluree.db.method.remote :as remote]
             [clojure.core.async :as async :refer [go go-loop]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
@@ -12,7 +12,7 @@
 (defn remote-lookup
   [state server-state ledger-address]
   (go-try
-    (let [head-commit  (<? (remote/remote-read state server-state ledger-address false))
+    (let [head-commit  (<? (remote/remote-read server-state ledger-address false))
           head-address (get head-commit "address")]
       head-address)))
 
@@ -66,12 +66,9 @@
   [ns-state ledger-alias]
   (swap! ns-state update :subscription dissoc ledger-alias))
 
-(defrecord RemoteNameService
-  [conn-state server-state sync? msg-in msg-out]
+(defrecord RemoteNameService [conn-state server-state msg-in msg-out]
   nameservice/iNameService
-  (-lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
-  (-lookup [_ ledger-address opts] (remote-lookup conn-state server-state ledger-address)) ;; TODO - doesn't support branch yet
-  (-sync? [_] sync?)
+  (lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
   (-address [_ ledger-alias {:keys [branch]:as _opts}]
     (go (if (and branch (not= "main" branch))
           (str ledger-alias "(" branch ")")
@@ -83,8 +80,10 @@
     (async/close! msg-out))
 
   nameservice/Publication
-  (-subscribe [_ ledger-alias callback] (subscribe conn-state ledger-alias callback))
-  (-unsubscribe [_ ledger-alias] (unsubscribe conn-state ledger-alias)))
+  (-subscribe [_ ledger-alias callback]
+    (subscribe conn-state ledger-alias callback))
+  (-unsubscribe [_ ledger-alias]
+    (unsubscribe conn-state ledger-alias)))
 
 (defn initialize
   [server-state conn-state]
@@ -94,8 +93,7 @@
           remote-ns (map->RemoteNameService {:server-state server-state
                                              :msg-in       msg-in
                                              :msg-out      msg-out
-                                             :conn-state   (or conn-state (atom nil))
-                                             :sync?        true})
+                                             :conn-state   (or conn-state (atom nil))})
           websocket (async/<! (launch-subscription-socket remote-ns))]
       (if (util/exception? websocket)
         (nameservice/-close remote-ns)

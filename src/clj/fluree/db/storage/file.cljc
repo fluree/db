@@ -2,6 +2,7 @@
   (:require [fluree.crypto :as crypto]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
+            [fluree.db.util.json :as json]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.storage :as storage]
             [clojure.string :as str]))
@@ -22,8 +23,20 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord FileStore [root]
+  storage/JsonArchive
+  (-read-json [_ address keywordize?]
+    (go-try
+      (let [path (storage-path root address)]
+        (when-let [data (<? (fs/read-file path))]
+          (json/parse data keywordize?)))))
+
+  storage/EraseableStore
+  (delete [_ address]
+    (let [path (storage-path root address)]
+      (fs/delete-file path)))
+
   storage/ContentAddressedStore
-  (write [_ dir data]
+  (-content-write [_ dir data]
     (go-try
       (when (not (storage/hashable? data))
         (throw (ex-info "Must serialize data before writing to FileStore."
@@ -42,21 +55,6 @@
          :address (file-address path)
          :hash    hash
          :size    (count bytes)})))
-
-  (read [_ address]
-    (let [path (storage-path root address)]
-      (fs/read-file path)))
-
-  (list [_ prefix]
-    (fs/list-files (full-path root prefix)))
-
-  (delete [_ address]
-    (let [path (storage-path root address)]
-      (fs/delete-file path)))
-
-  (exists? [_ address]
-    (let [path (storage-path root address)]
-      (fs/exists? path)))
 
   storage/ByteStore
   (write-bytes [_ path bytes]

@@ -1,11 +1,8 @@
 (ns fluree.db.api
-  (:require [fluree.db.conn.ipfs :as ipfs-conn]
-            [fluree.db.conn.file :as file-conn]
-            [fluree.db.conn.memory :as memory-conn]
-            [fluree.db.conn.remote :as remote-conn]
+  (:require [fluree.db.connection.system :as system]
+            [fluree.db.connection.remote :as remote-conn]
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
-            #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
@@ -50,40 +47,55 @@
 
 ;; ledger operations
 
+(defn parse-connection-options
+  [{:keys [method parallelism cache-max-mb remote-servers]
+    :as   connect-opts
+    :or   { parallelism 4
+           cache-max-mb 100}}]
+  (let [method* (cond
+                  method         (keyword method)
+                  remote-servers :remote
+                  :else          (throw (ex-info (str "No Fluree connection method type specified in configuration: "
+                                                      connect-opts)
+                                                 {:status 500 :error :db/invalid-configuration})))]
+    (assoc connect-opts
+           :method method*
+           :parallelism parallelism
+           :cache-max-mb cache-max-mb)))
+
 (defn connect
   "Forms connection to ledger, enabling automatic pulls of new updates, event
   services, index service.
 
-  Multiple connections to same endpoint will share underlying network connection.
+  Multiple connections to same endpoint will share underlying network
+  connection.
 
   Options include:
-    - did - (optional) DId information to use, if storing blocks as verifiable credentials,
-            or issuing queries against a permissioned database.
-    - write - (optional) Function to use for all writes, if empty will store in memory until a commit is performed
-    - read - (optional) Function to use for reads of persisted blocks/data
-    - commit - (optional) Function to use to write commits. If persistence desired, this must be defined
-    - push - (optional) Function(s) in a vector that will attempt to push the commit to naming service(s)
-    "
-  [{:keys [method parallelism remote-servers] :as opts}]
+    - did - (optional) DId information to use, if storing blocks as verifiable
+            credentials, or issuing queries against a permissioned database."
+  [opts]
   ;; TODO - do some validation
   (promise-wrap
-    (let [opts* (assoc opts :parallelism (or parallelism 4))
+    (go-try
+      (let [{:keys [method] :as opts*} (parse-connection-options opts)
 
-          method* (cond
-                    method         (keyword method)
-                    remote-servers :remote
-                    :else          (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
-                                                   {:status 500 :error :db/invalid-configuration})))]
-      (case method*
-        :remote (remote-conn/connect opts*)
-        :ipfs   (ipfs-conn/connect opts*)
-        :file   (if platform/BROWSER
-                  (throw (ex-info "File connection not supported in the browser" opts))
-                  (file-conn/connect opts*))
-        :memory (memory-conn/connect opts*)
-        :s3     #?(:clj  (s3-conn/connect opts*)
-                   :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
-                                         {:status 400, :error :db/unsupported-operation})))))))
+            config (case method
+                     :remote (<? (remote-conn/connect opts*))
+                     :ipfs   (let [{:keys [server file-storage-path parallelism cache-max-mb defaults]} opts*]
+                               (system/ipfs-config server file-storage-path parallelism cache-max-mb defaults))
+                     :file   (if platform/BROWSER
+                               (throw (ex-info "File connection not supported in the browser" opts))
+                               (let [{:keys [storage-path parallelism cache-max-mb defaults]} opts*]
+                                 (system/file-config storage-path parallelism cache-max-mb defaults)))
+                     :memory (let [{:keys [parallelism cache-max-mb defaults]} opts*]
+                               (system/memory-config parallelism cache-max-mb defaults))
+                     :s3     #?(:clj
+                                (let [{:keys [endpoint bucket prefix parallelism cache-max-mb defaults]} opts*]
+                                  (system/s3-config endpoint bucket prefix parallelism cache-max-mb defaults))
+                                :cljs
+                                (throw (ex-info "S3 connections not yet supported in ClojureScript"
+                                                {:status 400, :error :db/unsupported-operation}))))]
+        (system/start config)))))
 
 (defn connect-file
   [opts]

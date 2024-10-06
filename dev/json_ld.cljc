@@ -1,5 +1,5 @@
 (ns json-ld
-  (:require [fluree.db.method.ipfs.core :as ipfs]
+  (:require [fluree.db.method.ipfs :as ipfs]
             [fluree.db.transact :as jld-tx]
             [fluree.db.flake.flake-db :as flake-db]
             [clojure.core.async :as async]

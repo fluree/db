@@ -44,8 +44,6 @@
 
 (def data-version 0)
 
-;; ================ Jsonld record support fns ================================
-
 (defn empty-all-novelty
   [db]
   (let [cleared (reduce (fn [db* idx]
@@ -316,12 +314,11 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
-;; ================ end Jsonld record support fns ============================
-
-(defrecord FlakeDB [conn alias branch commit t tt-id stats spot post opst tspo
-                    schema comparators staged novelty policy namespaces namespace-codes
-                    max-namespace-code reindex-min-bytes reindex-max-bytes max-old-indexes]
-  dbproto/IFlureeDb
+(defrecord FlakeDB [index-store conn alias branch commit t tt-id stats spot post
+                    opst tspo schema comparators staged novelty policy
+                    namespaces namespace-codes max-namespace-code
+                    reindex-min-bytes reindex-max-bytes max-old-indexes]
+                    dbproto/IFlureeDb
   (-query [this query-map] (fql/query this query-map))
   (-class-ids [this subject] (match/class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))
@@ -430,18 +427,16 @@
   [db]
   (select-keys db [:alias :branch :t :stats :policy]))
 
-#?(:cljs
-   (extend-type FlakeDB
-     IPrintWithWriter
-     (-pr-writer [db w _opts]
-       (-write w label)
-       (-write w (-> db display pr)))))
+#?(:cljs (extend-type FlakeDB
+           IPrintWithWriter
+           (-pr-writer [db w _opts]
+             (-write w label)
+             (-write w (-> db display pr))))
 
-#?(:clj
-   (defmethod print-method FlakeDB [^FlakeDB db, ^Writer w]
-     (.write w label)
-     (binding [*out* w]
-       (-> db display pr))))
+   :clj (defmethod print-method FlakeDB [^FlakeDB db, ^Writer w]
+          (.write w label)
+          (binding [*out* w]
+            (-> db display pr))))
 
 (defmethod pprint/simple-dispatch FlakeDB
   [db]
@@ -512,15 +507,16 @@
 (defn load
   ([conn ledger-alias branch commit-pair]
    (load conn ledger-alias branch commit-pair {}))
-  ([conn ledger-alias branch [commit-jsonld commit-map] indexing-opts]
+  ([{:keys [index-store] :as conn} ledger-alias branch [commit-jsonld commit-map] indexing-opts]
    (go-try
      (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
-                         (<? (index-storage/read-db-root conn address))
+                         (<? (index-storage/read-db-root index-store address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
-                           (assoc :conn conn
+                           (assoc :index-store index-store
+                                  :conn conn
                                   :alias ledger-alias
                                   :branch branch
                                   :commit commit-map

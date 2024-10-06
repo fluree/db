@@ -1,8 +1,8 @@
 (ns fluree.db.storage.memory
   (:require [clojure.core.async :as async :refer [go]]
-            [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.storage :as storage]))
+            [fluree.db.storage :as storage]
+            [fluree.db.util.json :as json]))
 
 (def method-name "memory")
 
@@ -11,8 +11,21 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord MemoryStore [contents]
+  storage/JsonArchive
+  (-read-json [_ address keywordize?]
+    (go
+      (let [path (:local (storage/parse-address address))]
+        (when-let [data (get @contents path)]
+          (json/parse data keywordize?)))))
+
+  storage/EraseableStore
+  (delete [_ address]
+    (go
+      (let [path (:local (storage/parse-address address))]
+        (swap! contents dissoc path))))
+
   storage/ContentAddressedStore
-  (write [_ _ v]
+  (-content-write [_ _ v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v
@@ -23,26 +36,6 @@
          :address (memory-address hash)
          :hash    hash
          :size    (count hashable)})))
-
-  (list [_ prefix]
-    (go
-      (filter #(when (string? %) (str/starts-with? % prefix))
-              (keys contents))))
-
-  (read [_ address]
-    (go
-      (let [path (:local (storage/parse-address address))]
-        (get @contents path))))
-
-  (delete [_ address]
-    (go
-      (let [path (:local (storage/parse-address address))]
-        (swap! contents dissoc path))))
-
-  (exists? [_ address]
-    (go
-      (let [path (:local (storage/parse-address address))]
-        (contains? @contents path))))
 
   storage/ByteStore
   (write-bytes [_ path bytes]
