@@ -35,14 +35,14 @@
   (-> commit-map commit-data/->json-ld json-ld/expand))
 
 (defn load-db
-  [alias branch commit-store index-store commit]
+  [alias branch commit-catalog index-catalog commit]
   (let [commit-jsonld (commit-map->commit-jsonld commit)]
-    (async-db/load alias branch commit-store index-store
+    (async-db/load alias branch commit-catalog index-catalog
                    commit-jsonld nil)))
 
 (defn update-index
   [{current-commit :commit, :as current-state}
-   {:keys [alias branch commit-store index-store], indexed-commit :commit, :as indexed-db}]
+   {:keys [alias branch commit-catalog index-catalog], indexed-commit :commit, :as indexed-db}]
   (if (same-t? current-commit indexed-commit)
     (if (newer-index? indexed-commit current-commit)
       (assoc current-state
@@ -53,7 +53,7 @@
       (if (newer-index? indexed-commit current-commit)
         (let [latest-index  (:index indexed-commit)
               latest-commit (assoc current-commit :index latest-index)
-              latest-db     (load-db alias branch commit-store index-store latest-commit)]
+              latest-db     (load-db alias branch commit-catalog index-catalog latest-commit)]
           (assoc current-state
                  :commit     latest-commit
                  :current-db latest-db))
@@ -65,9 +65,9 @@
           current-state))))
 
 (defn reload-with-index
-  [{:keys [commit-store index-store commit] :as _db} alias branch index]
+  [{:keys [commit-catalog index-catalog commit] :as _db} alias branch index]
   (let [indexed-commit (assoc commit :index index)]
-    (load-db alias branch commit-store index-store indexed-commit)))
+    (load-db alias branch commit-catalog index-catalog indexed-commit)))
 
 (defn use-latest-index
   [{db-commit :commit, :as db} idx-commit alias branch]
@@ -97,10 +97,10 @@
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
-  ([ledger-alias branch-name commit-store index-store commit-jsonld]
-   (state-map ledger-alias branch-name commit-store index-store commit-jsonld nil))
-  ([ledger-alias branch-name commit-store index-store commit-jsonld indexing-opts]
-   (let [initial-db   (async-db/load ledger-alias branch-name commit-store index-store
+  ([ledger-alias branch-name commit-catalog index-catalog commit-jsonld]
+   (state-map ledger-alias branch-name commit-catalog index-catalog commit-jsonld nil))
+  ([ledger-alias branch-name commit-catalog index-catalog commit-jsonld indexing-opts]
+   (let [initial-db   (async-db/load ledger-alias branch-name commit-catalog index-catalog
                                      commit-jsonld indexing-opts)
          commit-map   (commit-data/jsonld->clj commit-jsonld)
          state        (atom {:commit     commit-map
@@ -122,12 +122,12 @@
 
 (defn update-commit
   [{current-commit :commit, :as current-state}
-   {:keys [alias branch index-store commit-store], new-commit :commit, :as new-db}]
+   {:keys [alias branch index-catalog commit-catalog], new-commit :commit, :as new-db}]
   (if (next-commit? current-commit new-commit)
     (if (newer-index? current-commit new-commit)
       (let [latest-index  (:index current-commit)
             latest-commit (assoc new-commit :index latest-index)
-            latest-db     (load-db alias branch commit-store index-store latest-commit)]
+            latest-db     (load-db alias branch commit-catalog index-catalog latest-commit)]
         (assoc current-state
                :commit     latest-commit
                :current-db latest-db))

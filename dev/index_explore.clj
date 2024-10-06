@@ -20,7 +20,7 @@
 
 (defn read-index-file
   [address]
-  (let [local-path (storage/parse-local-path address)]
+  (let [local-path (storage/get-local-path address)]
     (-> data-directory
         (io/file local-path)
         slurp

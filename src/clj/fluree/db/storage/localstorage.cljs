@@ -9,25 +9,33 @@
 (def method-name "localstorage")
 
 (defn local-storage-address
-  [path]
-  (storage/build-fluree-address method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord LocalStorageStore []
+(defrecord LocalStorageStore [identifier]
+  storage/Addressable
+  (location [_]
+    (storage/build-location storage/fluree-namespace identifier method-name))
+
+  storage/Identifiable
+  (identifiers [_]
+    #{identifier})
+
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go
-      (let [path (:local (storage/parse-address address))]
+      (let [path (storage/get-local-path address)]
         (when-let [data (.getItem js/localStorage path)]
           (json/parse data keywordize?)))))
 
   storage/EraseableStore
   (delete [_ address]
     (go
-      (let [path (:local (storage/parse-address address))]
+      (let [path (storage/get-local-path address)]
         (.removeItem js/localStorage path))))
 
   storage/ContentAddressedStore
-  (-content-write [_ k v]
+  (-content-write-bytes [_ k v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v
@@ -35,13 +43,15 @@
             hash     (crypto/sha2-256 hashable)]
         (.setItem js/localStorage k v)
         {:path    k
-         :address (local-storage-address k)
+         :address (local-storage-address identifier k)
          :hash    hash
          :size    (count hashable)}))))
 
 (defn open
-  []
-  (if-not platform/BROWSER
-    (throw (ex-info "LocalStorageStore is only supported on the Browser platform."
-                    {}))
-    (->LocalStorageStore)))
+  ([]
+   (open nil))
+  ([identifier]
+   (if-not platform/BROWSER
+     (throw (ex-info "LocalStorageStore is only supported on the Browser platform."
+                     {}))
+     (->LocalStorageStore identifier))))

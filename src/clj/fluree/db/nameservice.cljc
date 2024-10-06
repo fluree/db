@@ -1,6 +1,8 @@
 (ns fluree.db.nameservice
   (:refer-clojure :exclude [alias])
   (:require [clojure.string :as str]
+            [fluree.db.storage :as storage]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -12,26 +14,29 @@
   (alias [nameservice ledger-address]
     "Given a ledger address, returns ledger's default alias name else nil, if
     not avail")
-  (address [nameservice ledger-alias]
-    "Returns full nameservice address/iri which will get published in commit. If
-    'private', return nil.")
   (-close [nameservice]
     "Closes all resources for this nameservice"))
 
 (defprotocol Publisher
-  (publish [nameservice commit-data]
-    "Publishes new commit to nameservice."))
+  (publish [publisher commit-data]
+    "Publishes new commit.")
+  (publishing-address [publisher ledger-alias]
+    "Returns full publisher address/iri which will get published in commit. If
+    'private', return `nil`."))
 
 (defprotocol Publication
-  (-subscribe [nameservice ledger-alias callback]
-    "Creates a subscription to nameservice(s) for ledger events. Will call
+  (subscribe [publication ledger-alias]
+    "Creates a subscription to publication for ledger events. Will call
     callback with event data as received.")
-  (-unsubscribe [nameservice ledger-alias]
-    "Unsubscribes to nameservice(s) for ledger events"))
+  (unsubscribe [publication ledger-alias]
+    "Unsubscribes to publication for ledger events")
+  (known-addresses [publication ledger-alias]))
 
-(defn full-address
-  [prefix ledger-alias]
-  (str prefix ledger-alias))
+(defn published-ledger?
+  [nsv ledger-alias]
+  (go-try
+    (let [addr (<? (publishing-address nsv ledger-alias))]
+      (boolean (<? (lookup nsv addr))))))
 
 (defn ns-record
   "Generates nameservice metadata map for JSON storage. For now, since we only
@@ -58,8 +63,7 @@
 
 (defn address-path
   [address]
-  (let [[_ _ path] (str/split address #":")]
-    (subs path 2)))
+  (storage/get-local-path address))
 
 (defn extract-branch
   "Splits a given namespace address into its nameservice and branch parts.
@@ -71,6 +75,10 @@
       [ns branch])
     [ns-address nil]))
 
+(defn absolute-address?
+  [address location]
+  (str/starts-with? address location))
+
 (defn resolve-address
   "Resolves a provided namespace address, which might be relative or absolute,
    into three parts returned as a map:
@@ -79,13 +87,12 @@
   - :address - absolute namespace address (including branch if provided)
   If 'branch' parameter is provided will always use it as the branch regardless
   of if a branch is specificed in the ns-address."
-  [base-address ns-address branch]
+  [location ns-address branch]
   (let [[ns-address* extracted-branch] (extract-branch ns-address)
-        branch*   (or branch extracted-branch)
-        absolute? (str/starts-with? ns-address base-address)
-        [ns-address** alias] (if absolute?
-                               [ns-address* (subs ns-address* (count base-address))]
-                               [(str base-address ns-address*) ns-address*])]
+        branch* (or branch extracted-branch)
+        [ns-address** alias] (if (absolute-address? ns-address location)
+                               [ns-address* (storage/get-local-path ns-address*)]
+                               [(storage/build-address location ns-address*) ns-address*])]
     {:alias   alias
      :branch  branch*
      :address (if branch*

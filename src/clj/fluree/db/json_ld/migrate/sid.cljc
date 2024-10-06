@@ -94,7 +94,7 @@
           staged-db          (-> (<? (flake.transact/final-db db all-flakes tx-state))
                                  :db-after
                                  (set-namespaces ns-mapping))
-          committed-db       (<? (ledger/commit! ledger staged-db
+          committed-db       (<? (connection/commit! ledger staged-db
                                                      {:time (get-first-value commit const/iri-time)}))]
       (if (async-db/db? committed-db)
         (<? (async-db/deref-async committed-db))

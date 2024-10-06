@@ -1,15 +1,12 @@
 (ns fluree.db.util.xhttp
   (:refer-clojure :exclude [get])
-  (:require #?@(:clj [[org.httpkit.sni-client :as sni-client]
-                      [org.httpkit.client :as http]
+  (:require #?@(:clj [[org.httpkit.client :as http]
                       [byte-streams :as bs]
                       [hato.websocket :as ws]])
             #?@(:cljs [["axios" :as axios]
                        ["ws" :as NodeWebSocket]])
             [clojure.core.async :as async]
-            [clojure.string :as str]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.platform :as platform]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true])
   (:import #?@(:clj  ((org.httpkit.client TimeoutException)

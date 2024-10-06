@@ -1,6 +1,5 @@
 (ns fluree.db.api
   (:require [fluree.db.connection.system :as system]
-            [fluree.db.connection.remote :as remote-conn]
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
@@ -43,12 +42,10 @@
                (reject res)
                (resolve res))))))))
 
-;; ledger operations
-
 (defn parse-connection-options
   [{:keys [method parallelism cache-max-mb remote-servers]
     :as   connect-opts
-    :or   { parallelism 4
+    :or   {parallelism  4
            cache-max-mb 100}}]
   (let [method* (cond
                   method         (keyword method)
@@ -78,7 +75,6 @@
       (let [{:keys [method] :as opts*} (parse-connection-options opts)
 
             config (case method
-                     :remote (<? (remote-conn/connect opts*))
                      :ipfs   (let [{:keys [server file-storage-path parallelism cache-max-mb defaults]} opts*]
                                (system/ipfs-config server file-storage-path parallelism cache-max-mb defaults))
                      :file   (if platform/BROWSER
@@ -94,10 +90,6 @@
                                 (throw (ex-info "S3 connections not yet supported in ClojureScript"
                                                 {:status 400, :error :db/unsupported-operation}))))]
         (system/start config)))))
-
-(defn connect-file
-  [opts]
-  (connect (assoc opts :method :file)))
 
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.
@@ -203,10 +195,10 @@
   distributed rules."
   ([ledger db]
    (promise-wrap
-     (ledger/commit! ledger db)))
+     (connection/commit! ledger db)))
   ([ledger db opts]
    (promise-wrap
-     (ledger/commit! ledger db opts))))
+     (connection/commit! ledger db opts))))
 
 (defn transact!
   ([conn txn] (transact! conn txn nil))

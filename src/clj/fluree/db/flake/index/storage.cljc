@@ -17,7 +17,7 @@
 
 (defrecord IndexStore [storage serializer cache])
 
-(defn index-store
+(defn index-catalog
   [storage serializer cache]
   (->IndexStore storage serializer cache))
 
@@ -40,33 +40,33 @@
   [storage ledger-alias index-type serialized-data]
   (let [index-name (name index-type)
         path       (str/join "/" [ledger-alias "index" index-name])]
-    (storage/content-write-json storage path serialized-data)))
+    (storage/content-write-catalog-json storage path serialized-data)))
 
 (defn write-leaf
   "Serializes and writes the index leaf node `leaf` to storage."
-  [{:keys [storage serializer] :as _index-store} ledger-alias idx-type leaf]
+  [{:keys [storage serializer] :as _index-catalog} ledger-alias idx-type leaf]
   (let [serialized (serdeproto/-serialize-leaf serializer leaf)]
     (write-index-file storage ledger-alias idx-type serialized)))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key.
   Returns two-tuple of response output and raw bytes written."
-  [{:keys [storage serializer] :as _index-store} ledger-alias idx-type data]
+  [{:keys [storage serializer] :as _index-catalog} ledger-alias idx-type data]
   (let [serialized (serdeproto/-serialize-branch serializer data)]
     (write-index-file storage ledger-alias idx-type serialized)))
 
 (defn write-branch
   "Writes the child attributes index branch node `branch` to storage."
-  [index-store ledger-alias idx-type {:keys [children] :as _branch}]
+  [index-catalog ledger-alias idx-type {:keys [children] :as _branch}]
   (let [child-vals (->> children
                         (map val)
                         (mapv child-data))
         data       {:children child-vals}]
-    (write-branch-data index-store ledger-alias idx-type data)))
+    (write-branch-data index-catalog ledger-alias idx-type data)))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
-  [{:keys [storage serializer] :as _index-store} ledger-alias branch t garbage]
+  [{:keys [storage serializer] :as _index-catalog} ledger-alias branch t garbage]
   (let [data       {:alias   ledger-alias
                     :branch  branch
                     :t       t
@@ -75,7 +75,7 @@
     (write-index-file storage ledger-alias :garbage serialized)))
 
 (defn write-db-root
-  [{:keys [storage serializer] :as _index-store} db garbage-addr]
+  [{:keys [storage serializer] :as _index-catalog} db garbage-addr]
   (let [{:keys [alias schema t stats spot post opst tspo commit namespace-codes
                 reindex-min-bytes reindex-max-bytes max-old-indexes]}
         db
@@ -105,13 +105,13 @@
 (defn read-branch
   [{:keys [storage serializer] :as _idx-store} branch-address]
   (go-try
-    (when-let [data (<? (storage/read-json storage branch-address true))]
+    (when-let [data (<? (storage/read-catalog-json storage branch-address true))]
       (serdeproto/-deserialize-branch serializer data))))
 
 (defn read-leaf
   [{:keys [storage serializer] :as _idx-store} leaf-address]
   (go-try
-    (when-let [data (<? (storage/read-json storage leaf-address true))]
+    (when-let [data (<? (storage/read-catalog-json storage leaf-address true))]
       (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
@@ -145,7 +145,7 @@
   "Returns garbage file data for a given index t."
   [{:keys [storage serializer] :as _idx-store} garbage-address]
   (go-try
-    (when-let [data (<? (storage/read-json storage garbage-address true))]
+    (when-let [data (<? (storage/read-catalog-json storage garbage-address true))]
       (serdeproto/-deserialize-garbage serializer data))))
 
 (defn delete-garbage-item
@@ -164,7 +164,7 @@
   "Returns all data for a db index root of a given t."
   [{:keys [storage serializer] :as _idx-store} idx-address]
   (go-try
-    (if-let [data (<? (storage/read-json storage idx-address true))]
+    (if-let [data (<? (storage/read-catalog-json storage idx-address true))]
       (let [{:keys [t] :as root-data}
             (serdeproto/-deserialize-db-root serializer data)]
         (-> root-data

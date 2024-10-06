@@ -271,7 +271,7 @@
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
-  [alias branch ns-addresses init-time]
+  [alias branch publish-addresses init-time]
   (let [commit-json  (->json-ld {:alias  alias
                                  :v      0
                                  :branch (if branch
@@ -284,7 +284,7 @@
                                  :ns     (mapv #(if (map? %)
                                                   %
                                                   {:id %})
-                                               ns-addresses)})
+                                               publish-addresses)})
         db-json      (get commit-json "data")
         dbid         (db-json->db-id db-json)
         commit-json* (assoc-in commit-json ["data" "id"] dbid)

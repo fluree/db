@@ -248,7 +248,7 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
   indexes and returns updated db"
-  [{:keys [commit-store] :as db} commit-jsonld commit-data-jsonld]
+  [{:keys [commit-catalog] :as db} commit-jsonld commit-data-jsonld]
   (go-try
     (let [t-new            (db-t commit-data-jsonld)
           assert           (db-assert commit-data-jsonld)
@@ -265,7 +265,7 @@
           commit-id          (:id commit-metadata)
           commit-sid         (iri/encode-iri db* commit-id)
           [prev-commit _]    (when-let [prev-addr (:address previous)]
-                               (<? (commit-storage/read-commit-jsonld commit-store prev-addr)))
+                               (<? (commit-storage/read-commit-jsonld commit-catalog prev-addr)))
           db-sid             (iri/encode-iri db* (:id data))
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new commit-sid db-sid)
@@ -298,7 +298,7 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
-(defrecord FlakeDB [index-store commit-store alias branch commit t tt-id stats
+(defrecord FlakeDB [index-catalog commit-catalog alias branch commit t tt-id stats
                     spot post opst tspo schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code
                     reindex-min-bytes reindex-max-bytes max-old-indexes]
@@ -490,18 +490,18 @@
                     :max-old-indexes max-old-indexes)))
 
 (defn load
-  ([ledger-alias commit-store index-store branch commit-pair]
-   (load ledger-alias commit-store index-store branch commit-pair {}))
-  ([ledger-alias commit-store index-store branch [commit-jsonld commit-map] indexing-opts]
+  ([ledger-alias commit-catalog index-catalog branch commit-pair]
+   (load ledger-alias commit-catalog index-catalog branch commit-pair {}))
+  ([ledger-alias commit-catalog index-catalog branch [commit-jsonld commit-map] indexing-opts]
    (go-try
      (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
-                         (<? (index-storage/read-db-root index-store address))
+                         (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
-                           (assoc :index-store index-store
-                                  :commit-store commit-store
+                           (assoc :index-catalog index-catalog
+                                  :commit-catalog commit-catalog
                                   :alias ledger-alias
                                   :branch branch
                                   :commit commit-map
@@ -521,7 +521,7 @@
            index-t     (:t indexed-db*)]
        (if (= commit-t index-t)
          indexed-db*
-         (<? (load-novelty commit-store indexed-db* index-t commit-jsonld)))))))
+         (<? (load-novelty commit-catalog indexed-db* index-t commit-jsonld)))))))
 
 (defn get-s-iri
   "Returns a compact IRI from a subject id (sid)."
