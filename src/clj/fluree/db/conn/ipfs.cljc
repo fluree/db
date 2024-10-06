@@ -10,7 +10,8 @@
             [clojure.core.async :as async :refer [chan]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.nameservice.ipns :as ns-ipns]
-            [fluree.db.nameservice.filesystem :as ns-filesystem]
+            [fluree.db.nameservice.storage-backed :as storage-ns]
+            [fluree.db.storage.file :as file-storage]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.storage :as storage])
   #?(:clj (:import (java.io Writer))))
@@ -95,8 +96,8 @@
 
 (defn default-file-nameservice
   [{:keys [path base-address sync?]}]
-  (ns-filesystem/initialize path {:base-address base-address
-                                  :sync? sync?}))
+  (let [ns-store (file-storage/open path)]
+    (storage-ns/start base-address ns-store sync?)))
 
 (defn connect
   "Creates a new IPFS connection.

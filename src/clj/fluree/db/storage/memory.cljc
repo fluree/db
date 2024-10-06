@@ -42,7 +42,16 @@
   (exists? [_ address]
     (go
       (let [path (:local (storage/parse-address address))]
-        (contains? @contents path)))))
+        (contains? @contents path))))
+
+  storage/ByteStore
+  (write-bytes [_ path bytes]
+    (go
+      (swap! contents assoc path bytes)))
+
+  (read-bytes [_ path]
+    (go
+      (get @contents path))))
 
 (defn create
   []

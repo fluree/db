@@ -12,7 +12,7 @@
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
-            [fluree.db.nameservice.filesystem :as ns-filesystem]
+            [fluree.db.nameservice.storage-backed :as storage-ns]
             [fluree.db.storage :as storage]
             [fluree.db.storage.file :as file-storage])
   #?(:clj (:import (java.io Writer))))
@@ -97,11 +97,6 @@
      (binding [*out* w]
        (pr (connection/printer-map conn)))))
 
-(defn default-file-nameservice
-  "Returns file nameservice or will throw if storage-path generates an exception."
-  [path]
-  (ns-filesystem/initialize path))
-
 (defn default-lru-cache
   [cache-max-mb]
   (let [cache-size (conn-cache/memory->cache-size cache-max-mb)]
@@ -116,12 +111,13 @@
   (go
     (let [conn-id         (str (random-uuid))
           state           (connection/blank-state)
-          nameservices*   (util/sequential
-                           (or nameservices (default-file-nameservice storage-path)))
           lru-cache-atom* (or lru-cache-atom
                               (default-lru-cache cache-max-mb))
           store*          (or store
-                              (file-storage/open storage-path))]
+                              (file-storage/open storage-path))
+          nameservices*   (-> nameservices
+                              (or (storage-ns/start "fluree:file://" store* true))
+                              util/sequential)]
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id              conn-id
                             :store           store*

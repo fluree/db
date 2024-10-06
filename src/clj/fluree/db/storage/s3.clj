@@ -36,11 +36,20 @@
   (exists? [_ address]
     (s3/s3-key-exists? client bucket prefix address))
 
+  ;; TODO: Implement `list` and `delete` methods. We should never throw
+  ;; exceptions for protocol implementations
   (list [_ prefix]
     (throw (ex-info "Unsupported operation S3Store method: list." {:prefix prefix})))
 
   (delete [_ address]
-    (throw (ex-info "Unsupported operation S3Store method: delete." {:prefix prefix}))))
+    (throw (ex-info "Unsupported operation S3Store method: delete." {:prefix prefix})))
+
+  storage/ByteStore
+  (write-bytes [_ path bytes]
+    (s3/write-s3-data client bucket prefix path bytes))
+
+  (read-bytes [_ path]
+    (s3/read-s3-data client bucket prefix path)))
 
 (defn open
   ([bucket prefix]

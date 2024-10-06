@@ -19,7 +19,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.api :as query-api]
             [fluree.db.query.range :as query-range]
-            [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.connection :refer [notify-ledger]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]

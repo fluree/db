@@ -1,5 +1,5 @@
 (ns fluree.db.nameservice.remote
-  (:require [fluree.db.nameservice.proto :as ns-proto]
+  (:require [fluree.db.nameservice :as nameservice]
             [fluree.db.method.remote.core :as remote]
             [clojure.core.async :as async :refer [go go-loop]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
@@ -68,7 +68,7 @@
 
 (defrecord RemoteNameService
   [conn-state server-state sync? msg-in msg-out]
-  ns-proto/iNameService
+  nameservice/iNameService
   (-lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
   (-lookup [_ ledger-address opts] (remote-lookup conn-state server-state ledger-address)) ;; TODO - doesn't support branch yet
   (-sync? [_] sync?)
@@ -82,7 +82,7 @@
     (async/close! msg-in)
     (async/close! msg-out))
 
-  ns-proto/Publication
+  nameservice/Publication
   (-subscribe [_ ledger-alias callback] (subscribe conn-state ledger-alias callback))
   (-unsubscribe [_ ledger-alias] (unsubscribe conn-state ledger-alias)))
 
@@ -98,5 +98,5 @@
                                              :sync?        true})
           websocket (async/<! (launch-subscription-socket remote-ns))]
       (if (util/exception? websocket)
-        (ns-proto/-close remote-ns)
+        (nameservice/-close remote-ns)
         remote-ns))))
