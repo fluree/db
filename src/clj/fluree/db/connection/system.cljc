@@ -31,9 +31,9 @@
 #?(:cljs (derive :fluree.storage/localstorage :fluree/content-storage))
 #?(:cljs (derive :fluree.storage/localstorage :fluree/json-archive))
 
-(derive :fluree.storage/remote-resource :fluree/json-archive)
+(derive :fluree.storage/remote-resources :fluree/json-archive)
 
-(derive :fluree.publication/remote-resource :fluree/publication)
+(derive :fluree.publication/remote-resources :fluree/publication)
 
 (derive :fluree.nameservice/storage-backed :fluree/nameservice)
 
@@ -66,17 +66,17 @@
   [_ endpoint]
   (ipfs-store/open endpoint))
 
-(defmethod ig/init-key :fluree.storage/remote-resource
+(defmethod ig/init-key :fluree.storage/remote-resources
   [_ servers]
-  (remote-store/resource servers))
+  (remote-store/open servers))
 
 #?(:cljs (defmethod ig/init-key :fluree.storage/localstorage
            [_ _]
            (localstorage-store/open)))
 
 (defmethod ig/init-key :fluree.nameservice/storage-backed
-  [_ {:keys [address-prefix store]}]
-  (storage-nameservice/start address-prefix store))
+  [_ {:keys [address-prefix storage]}]
+  (storage-nameservice/start address-prefix storage))
 
 (defmethod ig/init-key :fluree.nameservice/ipns
   [_ {:keys [server profile]}]
@@ -106,22 +106,22 @@
   [parallelism cache-max-mb defaults]
   {:fluree.serializer/json            {}
    :fluree/cache                      cache-max-mb
-   :fluree.nameservice/storage-backed {:store (ig/ref :fluree/byte-storage)}
+   :fluree.nameservice/storage-backed {:storage (ig/ref :fluree/byte-storage)}
    :fluree.index/storage              {:storage    (ig/ref :fluree/content-storage)
                                        :serializer (ig/ref :fluree/serializer)
                                        :cache      (ig/ref :fluree/cache)}
    :fluree.connection/id              {}
    :fluree.connection/state           {}
-   :fluree/connection                 {:id          (ig/ref :fluree.connection/id)
-                                       :state       (ig/ref :fluree.connection/state)
-                                       :cache       (ig/ref :fluree/cache)
-                                       :store       (ig/ref :fluree/content-storage)
-                                       :index-store (ig/ref :fluree.index/storage)
-                                       :serializer  (ig/ref :fluree/serializer)
-                                       :primary-ns  (ig/ref :fluree/nameservice)
-                                       :aux-nses    []
-                                       :parallelism parallelism
-                                       :defaults    defaults}})
+   :fluree/connection                 {:id                   (ig/ref :fluree.connection/id)
+                                       :state                (ig/ref :fluree.connection/state)
+                                       :cache                (ig/ref :fluree/cache)
+                                       :commit-store         (ig/ref :fluree/content-storage)
+                                       :index-store          (ig/ref :fluree.index/storage)
+                                       :serializer           (ig/ref :fluree/serializer)
+                                       :primary-publisher    (ig/ref :fluree/nameservice)
+                                       :secondary-publishers []
+                                       :parallelism          parallelism
+                                       :defaults             defaults}})
 
 (defn memory-config
   [parallelism cache-max-mb defaults]
@@ -150,7 +150,7 @@
              :fluree/nameservices [(ig/ref :fluree.nameservice/storage-backed)
                                    (ig/ref :fluree.nameservice/ipns)])
       (update :fluree.index/storage assoc :storage (ig/ref :fluree.storage/ipfs))
-      (update :fluree/connection assoc :store (ig/ref :fluree.storage/ipfs))
+      (update :fluree/connection assoc :commit-store (ig/ref :fluree.storage/ipfs))
       (update :fluree/connection assoc :primary-ns (ig/ref :fluree.nameservice/storage-backed))
       (update :fluree/connection assoc :aux-nses [(ig/ref :fluree.nameservice/ipns)])))
 

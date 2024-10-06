@@ -3,7 +3,6 @@
   (:require [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
-            [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]))
 
 (defn hashable?

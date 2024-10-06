@@ -11,8 +11,7 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.cache :as cache]
-            [fluree.db.storage :as storage]
-            [fluree.db.connection :as connection]))
+            [fluree.db.storage :as storage]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

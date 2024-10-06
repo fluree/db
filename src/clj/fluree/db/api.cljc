@@ -1,6 +1,7 @@
 (ns fluree.db.api
   (:require [fluree.db.connection.system :as system]
             [fluree.db.connection.remote :as remote-conn]
+            [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
@@ -10,12 +11,9 @@
             [fluree.db.api.transact :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
-            [fluree.db.nameservice :as nameservice]
-            [fluree.db.connection :refer [notify-ledger]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.json-ld.policy :as policy])
@@ -119,7 +117,7 @@
   "Returns true if the argument is a full ledger address, false if it is just an
   alias."
   [ledger-alias-or-address]
-  (jld-ledger/fluree-address? ledger-alias-or-address))
+  (connection/fluree-address? ledger-alias-or-address))
 
 (defn create
   "Creates a new json-ld ledger. A connection (conn)
@@ -145,21 +143,20 @@
    (promise-wrap
     (do
       (log/info "Creating ledger" ledger-alias)
-      (jld-ledger/create conn ledger-alias opts)))))
+      (connection/create-ledger conn ledger-alias opts)))))
 
 (defn alias->address
   "Returns a core.async channel with the connection-specific address of the
   given ledger-alias."
   [conn ledger-alias]
-  (log/debug "Looking up address for ledger alias" ledger-alias)
-  (nameservice/primary-address conn ledger-alias nil))
+  (connection/primary-address conn ledger-alias))
 
 (defn load
   "Loads an existing ledger by its alias (which will be converted to a
   connection-specific address first)."
   [conn alias-or-address]
   (promise-wrap
-    (jld-ledger/load conn alias-or-address)))
+    (connection/load-ledger conn alias-or-address)))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
@@ -171,7 +168,7 @@
                       ledger-alias-or-address
                       (<! (alias->address conn ledger-alias-or-address)))]
         (log/debug "exists? - ledger address:" address)
-        (<! (nameservice/exists? conn address))))))
+        (<! (connection/ledger-exists? conn address))))))
 
 (defn notify
   "Notifies the connection with a new commit map (parsed JSON commit with string keys).
@@ -206,10 +203,10 @@
   distributed rules."
   ([ledger db]
    (promise-wrap
-     (ledger/-commit! ledger db)))
+     (ledger/commit! ledger db)))
   ([ledger db opts]
    (promise-wrap
-     (ledger/-commit! ledger db opts))))
+     (ledger/commit! ledger db opts))))
 
 (defn transact!
   ([conn txn] (transact! conn txn nil))
@@ -230,8 +227,8 @@
 
 (defn status
   "Returns current status of ledger branch."
-  ([ledger] (ledger/-status ledger))
-  ([ledger branch] (ledger/-status ledger branch)))
+  ([ledger] (ledger/status ledger))
+  ([ledger branch] (ledger/status ledger branch)))
 
 
 ;; db operations
@@ -240,7 +237,7 @@
   "Retrieves latest db, or optionally a db at a moment in time
   and/or permissioned to a specific identity."
   ([ledger]
-   (ledger/-db ledger)))
+   (ledger/current-db ledger)))
 
 (defn wrap-policy
   "Restricts the provided db with the provided json-ld
@@ -348,25 +345,25 @@
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   ([ledger query]
-   (let [latest-db (ledger/-db ledger)
+   (let [latest-db (ledger/current-db ledger)
          res-chan  (query-api/history latest-db query)]
      (promise-wrap res-chan)))
   ([ledger query {:keys [policy identity policyClass policyValues] :as _opts}]
    (promise-wrap
-    (let [latest-db (ledger/-db ledger)
-          context (context/extract query)
-          policy-db (cond
-                      identity
-                      (<? (policy/wrap-identity-policy latest-db (json-ld/expand identity context) policyValues))
+     (let [latest-db (ledger/current-db ledger)
+           context   (context/extract query)
+           policy-db (cond
+                       identity
+                       (<? (policy/wrap-identity-policy latest-db (json-ld/expand identity context) policyValues))
 
-                      policy
-                      (<? (policy/wrap-policy latest-db (json-ld/expand policy context) policyValues))
+                       policy
+                       (<? (policy/wrap-policy latest-db (json-ld/expand policy context) policyValues))
 
-                      policyClass
-                      (<? (policy/wrap-class-policy latest-db (json-ld/expand policyClass context) policyValues))
+                       policyClass
+                       (<? (policy/wrap-class-policy latest-db (json-ld/expand policyClass context) policyValues))
 
-                      :else
-                      latest-db)]
+                       :else
+                       latest-db)]
       (query-api/history policy-db query)))))
 
 (defn credential-history
@@ -380,7 +377,7 @@
   ([ledger cred-query {:keys [policyValues] :as _opts}]
    (promise-wrap
     (go-try
-     (let [latest-db (ledger/-db ledger)
+     (let [latest-db (ledger/current-db ledger)
            {query :subject, identity :did} (<? (cred/verify cred-query))]
        (log/debug "Credential history query with identity: " identity " and query: " query)
        (cond

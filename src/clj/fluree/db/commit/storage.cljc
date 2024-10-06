@@ -1,12 +1,13 @@
-(ns fluree.db.json-ld.reify
-  (:require [fluree.db.connection :as connection]
+(ns fluree.db.commit.storage
+  (:require [clojure.string :as str]
             [fluree.db.constants :as const]
+            [fluree.db.storage :as storage]
+            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
-            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.core :refer [get-first get-first-id get-first-value]]
+            [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
-;; generates a db/ledger from persisted data
 #?(:clj (set! *warn-on-reflection* true))
 
 ;; TODO - validate commit signatures
@@ -31,10 +32,18 @@
       [credential-subject commit-data])
     [commit-data nil]))
 
-(defn read-commit
-  [conn commit-address]
+(defn read-data-jsonld
+  [storage address]
   (go-try
-    (let [commit-data   (<? (connection/-c-read conn commit-address))
+    (let [jsonld (<? (storage/read-json storage address)) ]
+      (-> jsonld
+          (assoc "f:address" address)
+          json-ld/expand))))
+
+(defn read-commit-jsonld
+  [storage commit-address]
+  (go-try
+    (let [commit-data   (<? (storage/read-json storage commit-address))
           addr-key-path (if (contains? commit-data "credentialSubject")
                           ["credentialSubject" "address"]
                           ["address"])]
@@ -48,22 +57,23 @@
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of `from-t` and increment from there."
-  [conn latest-commit-tuple from-t]
+  [storage latest-commit from-t]
   (go-try
-    (loop [[commit proof] latest-commit-tuple
-           last-t        nil
-           commit-tuples (list)]
+    (loop [[commit proof] (verify-commit latest-commit)
+           last-t         nil
+           commit-tuples  (list)]
       (let [dbid             (get-first-id commit const/iri-data)
             db-address       (-> commit
                                  (get-first const/iri-data)
                                  (get-first-value const/iri-address))
+            db-data-jsonld   (<? (read-data-jsonld storage db-address))
             prev-commit-addr (-> commit
                                  (get-first const/iri-previous)
                                  (get-first-value const/iri-address))
             commit-t         (-> commit
                                  (get-first const/iri-data)
                                  (get-first-value const/iri-fluree-t))
-            commit-tuples*   (conj commit-tuples [commit proof])]
+            commit-tuples*   (conj commit-tuples [commit proof db-data-jsonld])]
         (when (or (nil? commit-t)
                   (and last-t (not= (dec last-t) commit-t)))
           (throw (ex-info (str "Commit t values are inconsistent. Last commit t was: " last-t
@@ -83,5 +93,25 @@
                                           (str commit))})))
         (if (= from-t commit-t)
           commit-tuples*
-          (let [commit-tuple (<? (read-commit conn prev-commit-addr))]
-            (recur commit-tuple commit-t commit-tuples*)))))))
+          (let [verified-commit (<? (read-commit-jsonld storage prev-commit-addr))]
+            (recur verified-commit commit-t commit-tuples*)))))))
+
+(defn write-jsonld
+  [storage ledger-alias jsonld]
+  (let [path (str/join "/" [ledger-alias "commit"])]
+    (storage/content-write-json storage path jsonld)))
+
+(defn write-genesis-commit
+  [storage ledger-alias branch ns-addresses init-time]
+  (go-try
+    (let [genesis-commit            (commit-data/blank-commit ledger-alias branch ns-addresses init-time)
+          initial-context           (get genesis-commit "@context")
+          initial-db-data           (-> genesis-commit
+                                        (get "data")
+                                        (assoc "@context" initial-context))
+          {db-address :address}     (<? (write-jsonld storage ledger-alias initial-db-data))
+          genesis-commit*           (assoc-in genesis-commit ["data" "address"] db-address)
+          {commit-address :address} (<? (write-jsonld storage ledger-alias genesis-commit*))]
+      (-> genesis-commit*
+          (assoc "address" commit-address)
+          json-ld/expand))))
