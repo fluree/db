@@ -268,14 +268,18 @@
                        [var f]))))
         binds))
 
+(defn higher-order-pattern?
+  "A non-node where pattern."
+  [pattern]
+  (and (sequential? pattern) (keyword? (first pattern))))
+
 (defn parse-where-clause
   [clause vars context]
-  ;; a single non-node where pattern is already sequential, so we need to specially handle it
-  (let [clause* (if (and (sequential? clause) (keyword? (first clause)))
+  ;; a single higher-order where pattern is already sequential, so we need to check if it needs wrapping
+  (let [clause* (if (higher-order-pattern? clause)
                   [clause]
                   (util/sequential clause))]
     (->> clause*
-         util/sequential
          (mapcat (fn [pattern]
                    (parse-pattern pattern vars context)))
          where/->where-clause)))
