@@ -72,8 +72,8 @@
   "Closes over a subquery to allow processing the whole query pipeline from within the
   search."
   [subquery]
-  (fn [ds fuel-tracker solution error-ch]
-    (->> (execute* ds fuel-tracker subquery error-ch (go solution))
+  (fn [ds fuel-tracker error-ch]
+    (->> (execute* ds fuel-tracker subquery error-ch (go {}))
          (select/subquery-format ds subquery fuel-tracker error-ch))))
 
 (defn prep-subqueries
