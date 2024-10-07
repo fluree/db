@@ -270,11 +270,15 @@
 
 (defn parse-where-clause
   [clause vars context]
-  (->> clause
-       util/sequential
-       (mapcat (fn [pattern]
-                 (parse-pattern pattern vars context)))
-       where/->where-clause))
+  ;; a single non-node where pattern is already sequential, so we need to specially handle it
+  (let [clause* (if (and (sequential? clause) (keyword? (first clause)))
+                  [clause]
+                  (util/sequential clause))]
+    (->> clause*
+         util/sequential
+         (mapcat (fn [pattern]
+                   (parse-pattern pattern vars context)))
+         where/->where-clause)))
 
 (defn parse-variable-attributes
   [var attrs vars context]
@@ -435,18 +439,14 @@
 
 (defmethod parse-pattern :union
   [[_ & unions] vars context]
-  (let [parsed (mapv (fn [clause]
-                       (if (and (vector? clause) (keyword? (first clause)))
-                         (parse-pattern clause vars context)
-                         (parse-where-clause clause vars context)))
+  (let [parsed (mapv (fn [clause] (parse-where-clause clause vars context))
                      unions)]
     [(where/->pattern :union parsed)]))
 
 (defmethod parse-pattern :optional
   [[_ & optionals] vars context]
   (into []
-        (comp (map (fn [clause]
-                     (parse-where-clause clause vars context)))
+        (comp (map (fn [clause] (parse-where-clause clause vars context)))
               (map (partial where/->pattern :optional)))
         optionals))
 
