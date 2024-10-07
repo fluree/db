@@ -268,13 +268,21 @@
                        [var f]))))
         binds))
 
+(defn higher-order-pattern?
+  "A non-node where pattern."
+  [pattern]
+  (and (sequential? pattern) (keyword? (first pattern))))
+
 (defn parse-where-clause
   [clause vars context]
-  (->> clause
-       util/sequential
-       (mapcat (fn [pattern]
-                 (parse-pattern pattern vars context)))
-       where/->where-clause))
+  ;; a single higher-order where pattern is already sequential, so we need to check if it needs wrapping
+  (let [clause* (if (higher-order-pattern? clause)
+                  [clause]
+                  (util/sequential clause))]
+    (->> clause*
+         (mapcat (fn [pattern]
+                   (parse-pattern pattern vars context)))
+         where/->where-clause)))
 
 (defn parse-variable-attributes
   [var attrs vars context]
@@ -435,16 +443,14 @@
 
 (defmethod parse-pattern :union
   [[_ & unions] vars context]
-  (let [parsed (mapv (fn [clause]
-                       (parse-where-clause clause vars context))
+  (let [parsed (mapv (fn [clause] (parse-where-clause clause vars context))
                      unions)]
     [(where/->pattern :union parsed)]))
 
 (defmethod parse-pattern :optional
   [[_ & optionals] vars context]
   (into []
-        (comp (map (fn [clause]
-                     (parse-where-clause clause vars context)))
+        (comp (map (fn [clause] (parse-where-clause clause vars context)))
               (map (partial where/->pattern :optional)))
         optionals))
 
