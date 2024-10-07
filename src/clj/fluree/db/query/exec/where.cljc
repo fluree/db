@@ -589,10 +589,15 @@
   dataset `ds` extending from `solution` that also match all the patterns in the
   parsed where clause collection `clause`."
   [ds fuel-tracker solution clause error-ch]
-  (let [initial-ch (async/to-chan! [solution])]
+  (let [initial-ch (async/to-chan! [solution])
+        {subquery-patterns true
+         other-patterns false}
+        (group-by (fn [pattern] (and (sequential? pattern) (= :query (first pattern)))) clause)]
     (reduce (fn [solution-ch pattern]
               (with-constraint ds fuel-tracker pattern error-ch solution-ch))
-            initial-ch clause)))
+            initial-ch
+            ;; process subqueries before other patterns
+            (into (vec subquery-patterns) other-patterns))))
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
