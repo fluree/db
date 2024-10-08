@@ -30,7 +30,7 @@
                        "select"   ["?x", "?score", "?vec"]
                        "where"    [["graph"
                                     "##Flatrank-DotProduct"
-                                    {"fidx:compare"  {"@value" [0.7, 0.6]
+                                    {"fidx:search"   {"@value" [0.7, 0.6]
                                                       "@type"  const/iri-vector}
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10,
@@ -49,7 +49,7 @@
                        "select"   ["?x", "?score", "?vec"],
                        "where"    [["graph"
                                     "##Flatrank-Cosine"
-                                    {"fidx:compare"  {"@value" [0.7, 0.6]
+                                    {"fidx:search"   {"@value" [0.7, 0.6]
                                                       "@type"  const/iri-vector}
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10,
@@ -68,7 +68,7 @@
                        "select"   ["?x", "?score", "?vec"],
                        "where"    [["graph"
                                     "##Flatrank-Distance"
-                                    {"fidx:compare"  {"@value" [0.7, 0.6]
+                                    {"fidx:search"   {"@value" [0.7, 0.6]
                                                       "@type"  const/iri-vector}
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10,
@@ -107,7 +107,7 @@
                        "select"   ["?x", "?title", "?score", "?vec"]
                        "where"    [["graph"
                                     "##Flatrank-DotProduct"
-                                    {"fidx:compare"  {"@value" [0.7, 0.6]
+                                    {"fidx:search"   {"@value" [0.7, 0.6]
                                                       "@type"  const/iri-vector}
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10,
@@ -147,7 +147,7 @@
                        "select"   ["?x", "?targetVec", "?score", "?vec"]
                        "where"    [["graph"
                                     "##Flatrank-DotProduct"
-                                    {"fidx:compare"  "?targetVec"
+                                    {"fidx:search"   "?targetVec"
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10,
                                      "fidx:result"   {"@id"         "?x"
@@ -175,7 +175,7 @@
                                     "ex:xVec" "?targetVec"}
                                    ["graph"
                                     "##Flatrank-Cosine"
-                                    {"fidx:compare"  "?targetVec"
+                                    {"fidx:search"   "?targetVec"
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10
                                      "fidx:result"   {"@id"        "?x"

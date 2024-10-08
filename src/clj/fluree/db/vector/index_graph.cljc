@@ -11,7 +11,7 @@
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
-(def iri-compare (str iri/f-idx-ns "compare"))
+(def iri-search (str iri/f-idx-ns "search"))
 (def iri-property (str iri/f-idx-ns "property"))
 (def iri-limit (str iri/f-idx-ns "limit"))
 (def iri-id (str iri/f-idx-ns "id"))
@@ -71,8 +71,8 @@
        (fn [acc triple]
          (let [p-iri (prop-iri triple)]
            (cond
-             (= iri-compare p-iri)
-             (assoc acc ::compare (obj-val triple solution))
+             (= iri-search p-iri)
+             (assoc acc ::search (obj-val triple solution))
 
              (= iri-property p-iri)
              (assoc acc ::property (obj-iri triple))
@@ -107,13 +107,13 @@
     (query-range/index-range db :post = [pid])))
 
 (defn score-vectors
-  [{::keys [compare metric]} novelty]
+  [{::keys [search metric]} novelty]
   (try*
     (let [score-fn (get-in metrics [metric ::score-fn])]
       (reduce
        (fn [acc flake]
          (let [vec   (flake/o flake)
-               score (score-fn vec compare)]
+               score (score-fn vec search)]
            (if score
              (conj acc {:id    (flake/s flake)
                         :score score
