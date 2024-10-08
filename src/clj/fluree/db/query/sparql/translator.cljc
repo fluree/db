@@ -1,7 +1,7 @@
 (ns fluree.db.query.sparql.translator
-  (:require [fluree.db.constants :as const]
+  (:require #?(:cljs [cljs.tools.reader :refer [read-string]])
             [clojure.string :as str]
-            #?(:cljs [cljs.tools.reader :refer [read-string]])))
+            [fluree.db.constants :as const]))
 
 (defn rule?
   [x]
@@ -509,7 +509,7 @@
 (defmethod parse-term :InlineDataFull
   ;; InlineDataFull ::= ( NIL | VarList ) WS <'{'> WS ( ValueList WS | NIL )* <'}'>
   [[_ vars & data]]
-  [:values [(parse-term vars)] (mapv parse-term data)])
+  [:values [(parse-term vars) (mapv parse-term data)]])
 
 (defmethod parse-term :InlineDataOneVar
   ;; InlineDataOneVar ::= Var <'{'> WS DataBlockValue* <'}'>
@@ -631,17 +631,27 @@
 
 (defmethod parse-term :GroupOrUnionGraphPattern
   ;; GroupOrUnionGraphPattern ::= GroupGraphPattern ( <'UNION'> GroupGraphPattern )*
-  [[_ group-pattern & union-patterns :as term]]
+  [[_ group-pattern & union-patterns]]
   (if union-patterns
-    (->> (mapv parse-term (rest term))
-         ;; this presumes that each GroupGraphPattern has the same number of patterns per group
-         (apply map (fn [& patterns] (conj [:union] (vec patterns)))))
+    (let [all-patterns (cons (parse-term group-pattern) (map parse-term union-patterns))]
+      (reduce (fn [a g]
+                (if (= (first a) :union)
+                  [:union [a] (vec g)]
+                  [:union (vec a) (vec g)]))
+              (first all-patterns)
+              (rest all-patterns)))
     (parse-term group-pattern)))
 
 (defmethod parse-term :GroupGraphPatternSub
   ;; GroupGraphPatternSub ::= WS TriplesBlock? ( GraphPatternNotTriples WS <'.'?> TriplesBlock? WS )* WS
   [[_ & patterns]]
-  (mapcat parse-term patterns))
+  (mapcat (fn [pattern]
+            (let [pattern (parse-term pattern)]
+              ;; don't flatten union patterns
+              (if (= :union (first pattern))
+                [pattern]
+                pattern)))
+          patterns))
 
 (declare translate)
 (defmethod parse-term :SubSelect
@@ -655,7 +665,11 @@
   ;; WhereClause ::= <'WHERE'?> WS GroupGraphPattern WS
   ;; <GroupGraphPattern> ::= WS <'{'> WS ( SubSelect | GroupGraphPatternSub ) WS <'}'> WS
   [[_ & patterns]]
-  [[:where (into [] (mapcat parse-term patterns))]])
+  (let [result (into [] (mapcat parse-term patterns))
+        ;; If first element of result is a keyword, wrap result in a vector
+        ;; Otherwise, return result
+        result* (if (keyword? (first result)) [result] result)]
+    [[:where result*]]))
 
 (defmethod parse-rule :ValuesClause
   ;; ValuesClause ::= ( <'VALUES'> WS DataBlock )? WS

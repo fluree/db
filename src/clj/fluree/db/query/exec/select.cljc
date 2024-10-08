@@ -166,7 +166,7 @@
   (let [selectors           (or (:select q)
                                 (:select-one q)
                                 (:select-distinct q))
-        modifying-selectors (filter #(satisfies? SolutionModifier %) selectors)
+        modifying-selectors (filter #(satisfies? SolutionModifier %) (util/sequential selectors))
         mods-xf             (map (fn [solution]
                                    (reduce
                                      (fn [sol sel]

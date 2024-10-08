@@ -16,38 +16,39 @@
 
 (defn parse-opts
   [expanded-txn opts txn-context]
-  (-> (util/get-first-value expanded-txn const/iri-opts)
-      (merge opts) ;; override opts 'did', 'raw-txn' with credential's if present
-      (util/keywordize-keys)
-      (assoc :context txn-context)))
+  (let [txn-opts (some-> (util/get-first-value expanded-txn const/iri-opts)
+                         util/keywordize-keys)
+        opts*    (merge txn-opts (util/keywordize-keys opts))]
+    (assoc opts* :context txn-context)))
 
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
    internal Fluree triples format."
   [db parsed-txn parsed-opts]
   (go-try
-   (let [track-fuel? (or (:maxFuel parsed-opts)
-                         (:meta parsed-opts))
-         identity    (:did parsed-opts)
-         policy-db   (if identity
-                       (<? (policy/wrap-identity-policy db identity nil))
-                       db)]
-     (if track-fuel?
-       (let [start-time #?(:clj (System/nanoTime)
-                           :cljs (util/current-time-millis))
-             fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
-         (try*
-          (let [result (<? (tx/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
-            {:status 200
-             :result result
-             :time   (util/response-time-formatted start-time)
-             :fuel   (fuel/tally fuel-tracker)})
-          (catch* e
-                  (throw (ex-info "Error staging database"
-                                  {:time (util/response-time-formatted start-time)
-                                   :fuel (fuel/tally fuel-tracker)}
-                                  e)))))
-       (<? (tx/stage policy-db identity parsed-txn parsed-opts))))))
+    (let [track-fuel? (or (:maxFuel parsed-opts)
+                          (:meta parsed-opts))
+          identity    (:did parsed-opts)
+          policy-db   (if (policy/policy-enforced-opts? parsed-opts)
+                        (let [parsed-context (:context parsed-opts)]
+                          (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
+                        db)]
+      (if track-fuel?
+        (let [start-time #?(:clj (System/nanoTime)
+                            :cljs (util/current-time-millis))
+              fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
+          (try*
+            (let [result (<? (tx/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
+              {:status 200
+               :result result
+               :time   (util/response-time-formatted start-time)
+               :fuel   (fuel/tally fuel-tracker)})
+            (catch* e
+                    (throw (ex-info "Error staging database"
+                                    {:time (util/response-time-formatted start-time)
+                                     :fuel (fuel/tally fuel-tracker)}
+                                    e)))))
+        (<? (tx/stage policy-db identity parsed-txn parsed-opts))))))
 
 (defn stage
   [db txn opts]
@@ -70,36 +71,42 @@
 (defn transact-ledger!
   [ledger txn {:keys [expanded? context triples?] :as opts}]
   (go-try
-   (let [txn-context (or (ctx-util/txn-context txn)
-                         context) ;; parent context might come from a Verifiable Credential's context
-         expanded    (if expanded?
-                       txn
-                       (json-ld/expand (ctx-util/use-fluree-context txn)))
-         triples     (if triples?
-                       txn
-                       (q-parse/parse-txn expanded txn-context))
-         parsed-opts (parse-opts expanded opts txn-context)
-         db          (<? (stage-triples (ledger/-db ledger) triples parsed-opts))
-         ;; commit API takes a did-map and parsed context as opts
-         ;; whereas stage API takes a did IRI and unparsed context.
-         ;; Dissoc them until deciding at a later point if they can carry through.
-         cmt-opts    (dissoc parsed-opts :context :did)] ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
-     (<? (ledger/-commit! ledger db cmt-opts)))))
+    (let [expanded    (if expanded?
+                        txn
+                        (json-ld/expand (ctx-util/use-fluree-context txn)))
+          txn-context (if expanded?
+                        context
+                        (or (ctx-util/txn-context txn)
+                            context)) ;; parent context might come from a Verifiable Credential's context
+          triples     (if triples?
+                        txn
+                        (q-parse/parse-txn expanded txn-context))
+          parsed-opts (parse-opts expanded opts txn-context)
+          db          (<? (stage-triples (ledger/-db ledger) triples parsed-opts))
+          ;; commit API takes a did-map and parsed context as opts
+          ;; whereas stage API takes a did IRI and unparsed context.
+          ;; Dissoc them until deciding at a later point if they can carry through.
+          cmt-opts    (dissoc parsed-opts :context :did)] ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
+      (<? (ledger/-commit! ledger db cmt-opts)))))
 
 (defn transact!
-  ([conn txn] (transact! conn txn {:raw-txn txn}))
+  ([conn txn] (transact! conn txn nil))
   ([conn txn opts]
    (go-try
-    (let [expanded  (json-ld/expand (ctx-util/use-fluree-context txn))
-          ledger-id (extract-ledger-id expanded)]
-      (<? (transact! conn ledger-id txn opts)))))
+     (let [expanded  (json-ld/expand (ctx-util/use-fluree-context txn))
+           ledger-id (extract-ledger-id expanded)
+           opts*     (assoc opts :expanded? true
+                                 :context (or (ctx-util/txn-context txn)
+                                              ;; parent context might come from a Verifiable Credential's context
+                                              (:context opts)))]
+       (<? (transact! conn ledger-id expanded opts*)))))
   ([conn ledger-id txn opts]
    (go-try
-    (let [address     (<? (nameservice/primary-address conn ledger-id nil))]
-      (if-not (<? (nameservice/exists? conn address))
-        (throw (ex-info "Ledger does not exist" {:ledger address}))
-        (let [ledger   (<? (jld-ledger/load conn address))]
-          (<? (transact-ledger! ledger txn opts))))))))
+     (let [address (<? (nameservice/primary-address conn ledger-id nil))]
+       (if-not (<? (nameservice/exists? conn address))
+         (throw (ex-info "Ledger does not exist" {:ledger address}))
+         (let [ledger (<? (jld-ledger/load conn address))]
+           (<? (transact-ledger! ledger txn opts))))))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.

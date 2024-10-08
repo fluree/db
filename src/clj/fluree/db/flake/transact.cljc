@@ -119,6 +119,9 @@
 (defn stage
   [db fuel-tracker context identity annotation raw-txn parsed-txn]
   (go-try
+    (when (policy.modify/deny-all? db)
+      (throw (ex-info "Database policy denies all modifications."
+                      {:status 403 :error :db/policy-exception})))
     (let [tx-state   (->tx-state :db db
                                  :context context
                                  :txn raw-txn

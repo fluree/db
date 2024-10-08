@@ -42,3 +42,8 @@
              (recur r))
            ;; no more flakes, all passed so return final db
            db-after))))))
+
+(defn deny-all?
+  "Returns true if policy allows no modification."
+  [{:keys [policy] :as _db}]
+  (empty? (get policy const/iri-modify)))
