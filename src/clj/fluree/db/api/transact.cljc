@@ -18,10 +18,10 @@
   [expanded-txn override-opts txn-context]
   (let [txn-opts (some-> (util/get-first-value expanded-txn const/iri-opts)
                          util/keywordize-keys)
-        opts*    (merge txn-opts (util/keywordize-keys override-opts))]
-    (-> opts*
+        opts     (merge txn-opts (util/keywordize-keys override-opts))]
+    (-> opts
         (assoc :context txn-context)
-        (update :identity #(or % (:did opts*)))
+        (update :identity #(or % (:did opts)))
         (dissoc :did))))
 
 (defn track-fuel?
