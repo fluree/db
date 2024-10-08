@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [load vswap!])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [go]]
+            [clojure.string :as str]
             [clojure.set :refer [map-invert]]
             [fluree.db.connection :as connection]
             [fluree.db.datatype :as datatype]

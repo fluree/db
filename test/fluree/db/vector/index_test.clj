@@ -48,7 +48,7 @@
                                    "fidx" iri/f-idx-ns},
                        "select"   ["?x", "?score", "?vec"],
                        "where"    [["graph"
-                                    "##Cosine"
+                                    "##Flatrank-Cosine"
                                     {"fidx:compare"  {"@value" [0.7, 0.6]
                                                       "@type"  const/iri-vector}
                                      "fidx:property" {"@id" "ex:xVec"}
