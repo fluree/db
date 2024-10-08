@@ -3,6 +3,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
             [fluree.db.util.docs :as docs]
+            [camel-snake-kebab.core :as csk]
             [clojure.edn :as edn]
             [malli.core :as m]
             [malli.transform :as mt]))
@@ -199,8 +200,9 @@
 
 (def fql-transformer
   (mt/transformer
-   {:name     :fql
-    :decoders (mt/-json-decoders)}))
+    {:name     :fql
+     :decoders (mt/-json-decoders)}
+    (mt/key-transformer {:decode csk/->kebab-case-keyword})))
 
 (def coerce-query*
   (m/coercer ::query fql-transformer {:registry registry}))
