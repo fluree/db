@@ -26,8 +26,7 @@
 
 (defn track-fuel?
   [parsed-opts]
-  (or (:maxFuel parsed-opts)
-      (:max-fuel parsed-opts)
+  (or (:max-fuel parsed-opts)
       (:meta parsed-opts)))
 
 (defn stage-triples

@@ -582,23 +582,11 @@
   (let [depth      (or (:depth q) 0)
         select-key (some (fn [k]
                            (when (contains? q k) k))
-                         [:select :selectOne :select-one
-                          :selectDistinct :select-distinct])
+                         [:select :select-one :select-distinct])
         select     (-> q
                        (get select-key)
                        (parse-select-clause context depth))]
-    (case select-key
-      (:select
-       :select-one
-       :select-distinct) (assoc q select-key select)
-
-      :selectOne (-> q
-                     (dissoc :selectOne)
-                     (assoc :select-one select))
-
-      :selectDistinct (-> q
-                          (dissoc :selectDistinct)
-                          (assoc :select-distinct select)))))
+    (assoc q select-key select)))
 
 (defn ensure-vector
   [x]
@@ -608,15 +596,13 @@
 
 (defn parse-grouping
   [q]
-  (some->> (or (:groupBy q)
-               (:group-by q))
+  (some->> (:group-by q)
            ensure-vector
            (mapv parse-var-name)))
 
 (defn parse-ordering
   [q]
-  (some->> (or (:order-by q)
-               (:orderBy q))
+  (some->> (:order-by q)
            ensure-vector
            (mapv (fn [ord]
                    (if-let [v (parse-var-name ord)]
