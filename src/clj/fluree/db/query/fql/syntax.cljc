@@ -121,6 +121,26 @@
                          [:did {:optional true} ::identity]
                          [:default-allow? {:optional true} ::default-allow?]
                          [:parse-json {:optional true} ::parse-json]]
+    ::stage-opts        [:map
+                         [:meta {:optional true} :boolean]
+                         [:max-fuel {:optional true} ::max-fuel]
+                         [:identity {:optional true} ::identity]
+                         [:did {:optional true} ::identity]
+                         [:context {:optional true} ::context]
+                         [:raw-txn {:optional true} :any]
+                         [:author {:optional true} ::identity]]
+    ::commit-opts       [:map
+                         [:identity {:optional true} ::identity]
+                         [:context {:optional true} ::context]
+                         [:raw-txn {:optional true} :any]
+                         [:author {:optional true} ::identity]
+                         [:private {:optional true} :string]
+                         [:message {:optional true} :string]
+                         [:tag {:optional true} :string]
+                         [:file-data? {:optional true} :boolean]
+                         [:index-files-ch {:optional true} :any]
+                         [:time {:optional true} :string]]
+    ::txn-opts          [:and ::stage-opts ::commit-opts]
     ::function          ::v/function
     ::as-function       ::v/as-function
     ::wildcard          [:fn wildcard?]
@@ -244,15 +264,17 @@
 (def parse-selector
   (m/parser ::selector {:registry registry}))
 
-(def coerce-modification*
-  (m/coercer ::modification fql-transformer {:registry registry}))
 
-(defn coerce-modification
-  [mdfn]
+
+(def coerce-txn-opts*
+  (m/coercer ::txn-opts fql-transformer {:registry registry}))
+
+(defn coerce-txn-opts
+  [opts]
   (try*
-   (coerce-modification* mdfn)
-   (catch* e
-     (throw (ex-info "Invalid Ledger Modification"
-                     {:status  400
-                      :error   :db/invalid-query
-                      :reasons (humanize-error e)})))))
+    (coerce-txn-opts* opts)
+    (catch* e
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-txn})
+          throw))))

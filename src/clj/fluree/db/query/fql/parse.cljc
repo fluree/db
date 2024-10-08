@@ -621,7 +621,7 @@
 
 (defn parse-fuel
   [{:keys [opts] :as q}]
-  (if-let [max-fuel (or (:max-fuel opts) (:maxFuel opts))]
+  (if-let [max-fuel (:max-fuel opts)]
     (assoc q :fuel max-fuel)
     q))
 

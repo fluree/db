@@ -12,13 +12,14 @@
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.ledger :as ledger]))
+            [fluree.db.ledger :as ledger]
+            [fluree.db.query.fql.syntax :as syntax]))
 
 (defn parse-opts
   [expanded-txn override-opts txn-context]
   (let [txn-opts (some-> (util/get-first-value expanded-txn const/iri-opts)
-                         util/keywordize-keys)
-        opts     (merge txn-opts (util/keywordize-keys override-opts))]
+                         (syntax/coerce-txn-opts))
+        opts     (merge txn-opts (some-> override-opts syntax/coerce-txn-opts))]
     (-> opts
         (assoc :context txn-context)
         (update :identity #(or % (:did opts)))
@@ -42,7 +43,7 @@
       (if (track-fuel? parsed-opts)
         (let [start-time #?(:clj (System/nanoTime)
                             :cljs (util/current-time-millis))
-              fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
+              fuel-tracker       (fuel/tracker (:max-fuel parsed-opts))]
           (try*
             (let [result (<? (tx/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
               {:status 200
