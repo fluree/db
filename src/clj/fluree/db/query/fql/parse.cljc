@@ -477,7 +477,7 @@
         graph-iri    (when (string? graph*)
                        (json-ld/expand-iri graph* context))
         index-graph? (when graph-iri
-                       (where/index-graph? graph-iri))
+                       (where/virtual-graph? graph-iri))
         where*       (parse-where-clause where vars context)]
     (if index-graph?
       [(where/->pattern :index-graph [graph-iri where*])]

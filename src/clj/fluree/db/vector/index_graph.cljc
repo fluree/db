@@ -11,15 +11,16 @@
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
-(def iri-compare (str iri/f-idx-flatrank-ns "compare"))
-(def iri-property (str iri/f-idx-flatrank-ns "property"))
-(def iri-limit (str iri/f-idx-flatrank-ns "limit"))
-(def iri-id (str iri/f-idx-flatrank-ns "id"))
-(def iri-score (str iri/f-idx-flatrank-ns "score"))
-(def iri-vector (str iri/f-idx-flatrank-ns "vector"))
+(def iri-compare (str iri/f-idx-ns "compare"))
+(def iri-property (str iri/f-idx-ns "property"))
+(def iri-limit (str iri/f-idx-ns "limit"))
+(def iri-id (str iri/f-idx-ns "id"))
+(def iri-score (str iri/f-idx-ns "score"))
+(def iri-result (str iri/f-idx-ns "result"))
+(def iri-vector (str iri/f-idx-ns "vector"))
 (def iri-xsd-float "http://www.w3.org/2001/XMLSchema#float")
 
-(def metric-re (re-pattern (str iri/f-idx-flatrank-ns "(.*)")))
+(def flatrank-vg-re (re-pattern "##Flatrank-(.*)"))
 
 (def result-sort (fn [a b] (compare (get a :score) (get b :score))))
 (def reverse-result-sort (fn [a b] (compare (get b :score) (get a :score))))
@@ -57,7 +58,7 @@
   "Takes the graph alias as a string and extracts the metric name from the
   end of the IRI"
   [graph-alias]
-  (some-> (re-find metric-re graph-alias)
+  (some-> (re-find flatrank-vg-re graph-alias)
           second
           str/lower-case
           keyword))
@@ -79,7 +80,7 @@
              (= iri-limit p-iri)
              (assoc acc ::limit (obj-val triple solution))
 
-             (= iri-id p-iri)
+             (= iri-result p-iri)
              (assoc-in acc [::result ::id] (obj-var triple))
 
              (= iri-score p-iri)

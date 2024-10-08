@@ -181,10 +181,10 @@
   [match]
   (select-keys match [::iri ::val ::datatype-iri ::sids]))
 
-(defn index-graph?
-  "Returns true if named graph alias is a virtual index (vector index) graph."
+(defn virtual-graph?
+  "Returns true if named graph alias is a virtual graph (e.g. vector index)."
   [graph-alias]
-  (str/starts-with? graph-alias iri/f-idx-flatrank-ns))
+  (str/starts-with? graph-alias "##"))
 
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
@@ -604,11 +604,18 @@
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
-  (let [alias-ds (-activate-alias ds alias)]
-    (if (index-graph? alias)
-      (let [graph-pattern (->pattern :index-graph [alias clause])]
-        (match-pattern alias-ds fuel-tracker solution graph-pattern error-ch))
-      (match-clause alias-ds fuel-tracker solution clause error-ch))))
+  (try*
+    (let [alias-ds (-activate-alias ds alias)]
+      (if (virtual-graph? alias)
+        (let [graph-pattern (->pattern :index-graph [alias clause])]
+          (match-pattern alias-ds fuel-tracker solution graph-pattern error-ch))
+        (match-clause alias-ds fuel-tracker solution clause error-ch)))
+    (catch* e
+            (if (ex-data e)
+              (async/offer! error-ch e)
+              (async/offer! error-ch (ex-info (str "Error activating alias: " alias)
+                                              {:status 400
+                                               :error :db/invalid-query} e))))))
 
 (defmethod match-pattern :exists
   [ds fuel-tracker solution pattern error-ch]

@@ -25,18 +25,18 @@
                                   "@type"  const/iri-vector}]}]})]
 
       (testing "dot product scoring"
-        (let [query   {"@context" {"ex"     "http://example.org/ns/"
-                                   "idx-fr" iri/f-idx-flatrank-ns}
+        (let [query   {"@context" {"ex"   "http://example.org/ns/"
+                                   "fidx" iri/f-idx-ns}
                        "select"   ["?x", "?score", "?vec"]
                        "where"    [["graph"
-                                    "idx-fr:DotProduct"
-                                    {"idx-fr:compare"  {"@value" [0.7, 0.6]
-                                                        "@type"  const/iri-vector}
-                                     "idx-fr:property" {"@id" "ex:xVec"}
-                                     "idx-fr:limit"    10,
-                                     "idx-fr:result"   {"idx-fr:id"     "?x"
-                                                        "idx-fr:score"  "?score"
-                                                        "idx-fr:vector" "?vec"}}]]}
+                                    "##Flatrank-DotProduct"
+                                    {"fidx:compare"  {"@value" [0.7, 0.6]
+                                                      "@type"  const/iri-vector}
+                                     "fidx:property" {"@id" "ex:xVec"}
+                                     "fidx:limit"    10,
+                                     "fidx:result"   {"@id"         "?x"
+                                                      "fidx:score"  "?score"
+                                                      "fidx:vector" "?vec"}}]]}
               results @(fluree/query db query)]
           (is (= [["ex:homer" 0.72 [0.6, 0.5]]
                   ["ex:bart" 0.68 [0.2, 0.9]]
@@ -44,18 +44,18 @@
                  results))))
 
       (testing "cosine similarity scoring"
-        (let [query   {"@context" {"ex"     "http://example.org/ns/"
-                                   "idx-fr" iri/f-idx-flatrank-ns},
+        (let [query   {"@context" {"ex"   "http://example.org/ns/"
+                                   "fidx" iri/f-idx-ns},
                        "select"   ["?x", "?score", "?vec"],
                        "where"    [["graph"
-                                    "idx-fr:Cosine"
-                                    {"idx-fr:compare"  {"@value" [0.7, 0.6]
-                                                        "@type"  const/iri-vector}
-                                     "idx-fr:property" {"@id" "ex:xVec"}
-                                     "idx-fr:limit"    10,
-                                     "idx-fr:result"   {"idx-fr:id"     "?x"
-                                                        "idx-fr:score"  "?score",
-                                                        "idx-fr:vector" "?vec"}}]]}
+                                    "##Cosine"
+                                    {"fidx:compare"  {"@value" [0.7, 0.6]
+                                                      "@type"  const/iri-vector}
+                                     "fidx:property" {"@id" "ex:xVec"}
+                                     "fidx:limit"    10,
+                                     "fidx:result"   {"@id"         "?x"
+                                                      "fidx:score"  "?score",
+                                                      "fidx:vector" "?vec"}}]]}
               results @(fluree/query db query)]
           (is (= [["ex:homer" 0.9999035633345558 [0.6 0.5]]
                   ["ex:bart" 0.8 [0.2 0.9]]
@@ -63,18 +63,18 @@
                  results))))
 
       (testing "euclidean distance similarity scoring"
-        (let [query   {"@context" {"ex"     "http://example.org/ns/"
-                                   "idx-fr" iri/f-idx-flatrank-ns},
+        (let [query   {"@context" {"ex"   "http://example.org/ns/"
+                                   "fidx" iri/f-idx-ns},
                        "select"   ["?x", "?score", "?vec"],
                        "where"    [["graph"
-                                    "idx-fr:Distance"
-                                    {"idx-fr:compare"  {"@value" [0.7, 0.6]
-                                                        "@type"  const/iri-vector}
-                                     "idx-fr:property" {"@id" "ex:xVec"}
-                                     "idx-fr:limit"    10,
-                                     "idx-fr:result"   {"idx-fr:id"     "?x"
-                                                        "idx-fr:score"  "?score",
-                                                        "idx-fr:vector" "?vec"}}]]}
+                                    "##Flatrank-Distance"
+                                    {"fidx:compare"  {"@value" [0.7, 0.6]
+                                                      "@type"  const/iri-vector}
+                                     "fidx:property" {"@id" "ex:xVec"}
+                                     "fidx:limit"    10,
+                                     "fidx:result"   {"@id"         "?x"
+                                                      "fidx:score"  "?score",
+                                                      "fidx:vector" "?vec"}}]]}
               results @(fluree/query db query)]
           (is (= [["ex:homer" 0.14142135623730956 [0.6 0.5]]
                   ["ex:bart" 0.5830951894845299 [0.2 0.9]]
@@ -102,18 +102,18 @@
                                    "@type"  const/iri-vector}]}]})]
 
       (testing "dot product scoring"
-        (let [query   {"@context" {"ex"     "http://example.org/ns/"
-                                   "idx-fr" iri/f-idx-flatrank-ns}
+        (let [query   {"@context" {"ex"   "http://example.org/ns/"
+                                   "fidx" iri/f-idx-ns}
                        "select"   ["?x", "?title", "?score", "?vec"]
                        "where"    [["graph"
-                                    "idx-fr:DotProduct"
-                                    {"idx-fr:compare"  {"@value" [0.7, 0.6]
-                                                        "@type"  const/iri-vector}
-                                     "idx-fr:property" {"@id" "ex:xVec"}
-                                     "idx-fr:limit"    10,
-                                     "idx-fr:result"   {"idx-fr:id"     "?x"
-                                                        "idx-fr:score"  "?score"
-                                                        "idx-fr:vector" "?vec"}}]
+                                    "##Flatrank-DotProduct"
+                                    {"fidx:compare"  {"@value" [0.7, 0.6]
+                                                      "@type"  const/iri-vector}
+                                     "fidx:property" {"@id" "ex:xVec"}
+                                     "fidx:limit"    10,
+                                     "fidx:result"   {"@id"         "?x"
+                                                      "fidx:score"  "?score"
+                                                      "fidx:vector" "?vec"}}]
                                    {"@id"      "?x"
                                     "ex:title" "?title"}]}
               results @(fluree/query db query)]
@@ -142,17 +142,17 @@
                                  "@type"  const/iri-vector}}]})]
 
       (testing "multiple values bindings for target vectors"
-        (let [query   {"@context" {"ex"     "http://example.org/ns/"
-                                   "idx-fr" iri/f-idx-flatrank-ns}
+        (let [query   {"@context" {"ex"   "http://example.org/ns/"
+                                   "fidx" iri/f-idx-ns}
                        "select"   ["?x", "?targetVec", "?score", "?vec"]
                        "where"    [["graph"
-                                    "idx-fr:DotProduct"
-                                    {"idx-fr:compare"  "?targetVec"
-                                     "idx-fr:property" {"@id" "ex:xVec"}
-                                     "idx-fr:limit"    10,
-                                     "idx-fr:result"   {"idx-fr:id"     "?x"
-                                                        "idx-fr:score"  "?score"
-                                                        "idx-fr:vector" "?vec"}}]]
+                                    "##Flatrank-DotProduct"
+                                    {"fidx:compare"  "?targetVec"
+                                     "fidx:property" {"@id" "ex:xVec"}
+                                     "fidx:limit"    10,
+                                     "fidx:result"   {"@id"         "?x"
+                                                      "fidx:score"  "?score"
+                                                      "fidx:vector" "?vec"}}]]
                        "values"   ["?targetVec" [{"@value" [0.7, 0.6]
                                                   "@type"  const/iri-vector}
                                                  {"@value" [0.1, 0.8]
@@ -168,18 +168,18 @@
               "results repeated for each vector, but with different scores/order")))
 
       (testing "comparison vector pulled from result set"
-        (let [query   {"@context" {"ex"     "http://example.org/ns/"
-                                   "idx-fr" iri/f-idx-flatrank-ns}
+        (let [query   {"@context" {"ex"   "http://example.org/ns/"
+                                   "fidx" iri/f-idx-ns}
                        "select"   ["?targetSubj" "?x", "?score"]
                        "where"    [{"@id"     "?targetSubj"
                                     "ex:xVec" "?targetVec"}
                                    ["graph"
-                                    "idx-fr:Cosine"
-                                    {"idx-fr:compare"  "?targetVec"
-                                     "idx-fr:property" {"@id" "ex:xVec"}
-                                     "idx-fr:limit"    10
-                                     "idx-fr:result"   {"idx-fr:id"    "?x"
-                                                        "idx-fr:score" "?score"}}]
+                                    "##Flatrank-Cosine"
+                                    {"fidx:compare"  "?targetVec"
+                                     "fidx:property" {"@id" "ex:xVec"}
+                                     "fidx:limit"    10
+                                     "fidx:result"   {"@id"        "?x"
+                                                      "fidx:score" "?score"}}]
                                    ["filter" "(not= ?targetSubj ?x)"]]}
               results @(fluree/query db query)]
           (is (= [["ex:bart" "ex:homer" 0.7211047102874315]

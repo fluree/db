@@ -366,6 +366,10 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
+(defn virtual-graph?
+  [graph-alias]
+  (str/starts-with? graph-alias "##"))
+
 ;; ================ end Jsonld record support fns ============================
 
 (defrecord FlakeDB [conn alias branch commit t tt-id stats spot post opst tspo
@@ -397,7 +401,7 @@
       (= alias alias')
       db
 
-      (iri/f-idx-flatrank-ns alias')
+      (virtual-graph? alias')
       db
 
       :else
