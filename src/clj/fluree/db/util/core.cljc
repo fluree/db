@@ -499,6 +499,13 @@
            unwrap-list
            (keep get-id)))
 
+(defn get-graph
+  [jsonld]
+  (cond
+    (contains? jsonld :graph)   (:graph jsonld)
+    (contains? jsonld "@graph") (get jsonld "@graph")
+    :else                       jsonld))
+
 (defn parse-opts
   [opts]
   (let [other-keys    (->> opts keys (remove #{:max-fuel :maxFuel}))
