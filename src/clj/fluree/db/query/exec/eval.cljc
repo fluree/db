@@ -269,9 +269,9 @@
   [{val-a :value dt-a :datatype-iri}
    {val-b :value dt-b :datatype-iri}]
   (let [dt-a  (or dt-a (datatype/infer-iri val-a))
-        val-a (or (datatype/coerce val-a dt-a) val-a)
+        val-a (or (and (some? val-a) (datatype/coerce val-a dt-a)) val-a)
         dt-b  (or dt-b (datatype/infer-iri val-b))
-        val-b (or (datatype/coerce val-b dt-b) val-b)]
+        val-b (or (and (some? val-b) (datatype/coerce val-b dt-b)) val-b)]
     (cond
       ;; can compare across types
       (or (and (contains? numeric-datatypes dt-a)
