@@ -93,8 +93,8 @@
           tx-state           (flake.transact/->tx-state
                                :db db
                                :txn (get-first-value commit const/iri-txn)
-                               :author-did (let [author (get-first-value commit const/iri-author)]
-                                             (when-not (str/blank? author) author))
+                               :author (let [author (get-first-value commit const/iri-author)]
+                                         (when-not (str/blank? author) author))
                                :annotation (get-first-value commit const/iri-annotation))
           staged-db          (-> (<? (flake.transact/final-db db all-flakes tx-state))
                                  :db-after
