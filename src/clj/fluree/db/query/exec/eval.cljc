@@ -266,7 +266,8 @@
 (defmethod to-odt LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC)))
 
 (defn compare*
-  [val-a dt-a val-b dt-b]
+  [{val-a :value dt-a :datatype-iri}
+   {val-b :value dt-b :datatype-iri}]
   (let [dt-a  (or dt-a (datatype/infer-iri val-a))
         val-a (or (datatype/coerce val-a dt-a) val-a)
         dt-b  (or dt-b (datatype/infer-iri val-b))
@@ -296,34 +297,29 @@
                        :error  :db/invalid-query})))))
 
 (defn less-than
-  [{a :value a-dt :datatype-iri}
-   {b :value b-dt :datatype-iri}]
-  (where/->typed-val (neg? (compare* a a-dt b b-dt))))
+  [a b]
+  (where/->typed-val (neg? (compare* a b))))
 
 (defn less-than-or-equal
-  [{a :value a-dt :datatype-iri}
-   {b :value b-dt :datatype-iri}]
+  [a b]
   (where/->typed-val
     (or (= a b)
-        (neg? (compare* a a-dt b b-dt)))))
+        (neg? (compare* a b)))))
 
 (defn greater-than
-  [{a :value a-dt :datatype-iri}
-   {b :value b-dt :datatype-iri}]
-  (where/->typed-val (pos? (compare* a a-dt b b-dt))))
+  [a b]
+  (where/->typed-val (pos? (compare* a b))))
 
 (defn greater-than-or-equal
-  [{a :value a-dt :datatype-iri}
-   {b :value b-dt :datatype-iri}]
+  [a b]
   (where/->typed-val
     (or (= a b)
-        (pos? (compare* a a-dt b b-dt)))))
+        (pos? (compare* a b)))))
 
 (defn max
   [coll]
   (let [compare-fn (fn [a b]
-                     (if (pos? (compare* (:value a) (:datatype-iri a)
-                                         (:value b) (:datatype-iri b)))
+                     (if (pos? (compare* a b))
                        a
                        b))]
     (reduce compare-fn coll)))
@@ -331,8 +327,7 @@
 (defn min
   [coll]
   (let [compare-fn (fn [a b]
-                     (if (neg? (compare* (:value a) (:datatype-iri a)
-                                         (:value b) (:datatype-iri b)))
+                     (if (neg? (compare* a b))
                        a
                        b))]
     (reduce compare-fn coll)))
