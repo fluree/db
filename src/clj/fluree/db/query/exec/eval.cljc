@@ -267,8 +267,10 @@
 
 (defn compare*
   [val-a dt-a val-b dt-b]
-  (let [dt-a (or dt-a (datatype/infer-iri val-a))
-        dt-b (or dt-b (datatype/infer-iri val-b))]
+  (let [dt-a  (or dt-a (datatype/infer-iri val-a))
+        val-a (or (datatype/coerce val-a dt-a) val-a)
+        dt-b  (or dt-b (datatype/infer-iri val-b))
+        val-b (or (datatype/coerce val-b dt-b) val-b)]
     (cond
       ;; can compare across types
       (or (and (contains? numeric-datatypes dt-a)

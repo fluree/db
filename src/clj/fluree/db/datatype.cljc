@@ -411,18 +411,23 @@
   [value required-type]
   (uc/case required-type
     (const/$xsd:string
-     const/$rdf:langString)
+      const/iri-string
+      const/$rdf:langString
+      const/iri-lang-string)
     (when (string? value)
       value)
 
-    const/$xsd:boolean
+    (const/$xsd:boolean
+      const/iri-xsd-boolean)
     (coerce-boolean value)
 
-    const/$xsd:date
+    (const/$xsd:date
+      const/iri-xsd-date)
     (when (string? value)
       (parse-iso8601-date value))
 
-    const/$xsd:dateTime
+    (const/$xsd:dateTime
+      const/iri-xsd-dateTime)
     (cond (string? value)
           (parse-iso8601-datetime value)
           ;; these values don't need coercion
@@ -432,47 +437,76 @@
 
 
 
-    const/$xsd:time
+    (const/$xsd:time
+      const/iri-xsd-time)
     (when (string? value)
       (parse-iso8601-time value))
 
-    const/$xsd:decimal
+    (const/$xsd:decimal
+      const/iri-xsd-decimal)
     (coerce-decimal value)
 
-    const/$xsd:double
+    (const/$xsd:double
+      const/iri-xsd-double)
     (coerce-double value)
 
-    const/$xsd:float
+    (const/$xsd:float
+      const/iri-xsd-float)
     (coerce-float value)
 
     ;; ·maxInclusive· to be 2147483647 and ·minInclusive· to be -2147483648
     ;; https://www.w3.org/TR/xmlschema-2/#int
-    (const/$xsd:int const/$xsd:unsignedShort) ;; unsigned short will be outside of 'Short' value range
+    (const/$xsd:int
+      const/iri-xsd-int
+      const/$xsd:unsignedShort ;; unsigned short will be outside of 'Short' value range
+      const/iri-xsd-unsignedShort)
     (-> value coerce-integer (check-signed required-type))
 
     ;; xsd:integer and parent of long and others - different from xsd:int which is 32-bit
-    (const/$xsd:integer const/$xsd:long
-     const/$xsd:nonNegativeInteger const/$xsd:unsignedLong
-     const/$xsd:positiveInteger const/$xsd:unsignedInt ;; unsigned int can be outside of xsd:int max range
-     const/$xsd:nonPositiveInteger const/$xsd:negativeInteger)
+    (const/$xsd:integer
+      const/iri-xsd-integer
+      const/$xsd:long
+      const/iri-long
+      const/$xsd:nonNegativeInteger
+      const/iri-xsd-nonNegativeInteger
+      const/$xsd:unsignedLong
+      const/iri-xsd-unsignedLong
+      const/$xsd:positiveInteger
+      const/iri-xsd-positiveInteger
+      const/$xsd:unsignedInt ;; unsigned int can be outside of xsd:int max range
+      const/iri-xsd-unsignedInt
+      const/$xsd:nonPositiveInteger
+      const/iri-xsd-nonPositiveInteger
+      const/$xsd:negativeInteger
+      const/iri-xsd-negativeInteger)
     (-> value coerce-long (check-signed required-type))
 
-    const/$xsd:short
+    (const/$xsd:short
+      const/iri-xsd-short)
     (-> value coerce-short (check-signed required-type))
 
-    (const/$xsd:byte const/$xsd:unsignedByte)
+    (const/$xsd:byte
+      const/iri-xsd-byte
+      const/$xsd:unsignedByte
+      const/iri-xsd-unsignedByte)
     (-> value coerce-byte (check-signed required-type))
 
-    const/$xsd:normalizedString
+    (const/$xsd:normalizedString
+      const/iri-xsd-normalizedString)
     (coerce-normalized-string value)
 
-    (const/$xsd:token const/$xsd:language)
+    (const/$xsd:token
+      const/iri-xsd-token
+      const/$xsd:language
+      const/iri-xsd-language)
     (coerce-token value)
 
-    const/$rdf:json
+    (const/$rdf:json
+      const/iri-rdf-json)
     (coerce-json value)
 
-    const/$fluree:vector
+    (const/$fluree:vector
+      const/iri-vector)
     (coerce-dense-vector value)
 
     ;; else
