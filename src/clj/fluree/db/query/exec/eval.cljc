@@ -699,8 +699,8 @@
     ;; value map
     (map? x)
     (let [{:keys [id value type language]}
-          (-> (json-ld/expand {"f:v-map" x} ctx)
-              (util/get-first "f:v-map"))]
+          (-> (json-ld/expand {const/iri-data x} ctx)
+              (util/get-first const/iri-data))]
       (if id
         (where/->typed-val id const/iri-id)
         (where/->typed-val value type language)))
