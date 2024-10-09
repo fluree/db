@@ -584,6 +584,11 @@
                           solution-ch)
     out-ch))
 
+(defn subquery?
+  [pattern]
+  (and (sequential? pattern)
+       (= :query (first pattern))))
+
 (defn match-clause
   "Returns a channel that will eventually contain all match solutions in the
   dataset `ds` extending from `solution` that also match all the patterns in the
@@ -591,8 +596,7 @@
   [ds fuel-tracker solution clause error-ch]
   (let [initial-ch (async/to-chan! [solution])
         {subquery-patterns true
-         other-patterns false}
-        (group-by (fn [pattern] (and (sequential? pattern) (= :query (first pattern)))) clause)]
+         other-patterns false} (group-by subquery? clause)]
     (reduce (fn [solution-ch pattern]
               (with-constraint ds fuel-tracker pattern error-ch solution-ch))
             initial-ch
