@@ -494,14 +494,3 @@
   (some->> (get json-ld k)
            unwrap-list
            (keep get-id)))
-
-(defn cartesian-merge
-  "Like a cartesian product, but performs a map
-  merge across all possilble combinations
-  of collections."
-  [colls]
-  (if (empty? colls)
-    '(())
-    (for [more (cartesian-merge (rest colls))
-          x    (first colls)]
-      (merge x more))))
