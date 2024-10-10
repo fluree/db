@@ -12,7 +12,7 @@
   (s3/s3-address bucket prefix k))
 
 (defrecord S3Store [client bucket prefix]
-  storage/Store
+  storage/ContentAddressedStore
   (write [_ dir data]
     (go
       (let [hash     (crypto/sha2-256 data)

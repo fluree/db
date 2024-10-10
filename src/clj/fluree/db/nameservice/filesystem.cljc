@@ -36,13 +36,6 @@ changes from different branches into existing metadata map"
   (let [[_ _ path] (str/split address #":")]
     (subs path 2)))
 
-(defn list-files-in-path
-  "Lists all files in the given directory path"
-  [path]
-  (let [directory (io/file path)
-        files (file-seq directory)]
-    files))
-
 (defn file-path
   "Returns fully formed file path where a ns record would be stored."
   [local-path alias]
@@ -55,7 +48,7 @@ changes from different branches into existing metadata map"
        fs/read-file))
 
 (defn address
-  [base-address ledger-alias {:keys [branch] :as _opts}]
+  [base-address ledger-alias _opts]
   (when base-address
     (str base-address ledger-alias)))
 
@@ -155,7 +148,7 @@ changes from different branches into existing metadata map"
     (let [ns-address (str "fluree:file://" alias)
           ns-record  (ns-record ns-address {"address" commit-address "alias" alias, "branch" "main"})]
       (let [successful? (async/<! (write-ns-record ns-record local-path alias))]
-        (if (util/exception? successful?)
+        (when (util/exception? successful?)
           (log/error successful?
                      (str "Unable to update legacy nameservice file for ledger: " alias
                           "with exception: " (ex-message successful?)))
@@ -199,10 +192,10 @@ changes from different branches into existing metadata map"
   address. If no nameservice record is found, throws an error."
   [ledger-address local-path base-address {:keys [branch] :as _opts}]
   (go-try
-    (let [{:keys [alias branch* address]} (resolve-address base-address ledger-address branch)
+    (let [{:keys [alias branch]} (resolve-address base-address ledger-address branch)
           ns-record (<? (retrieve-ns-record local-path alias))]
       (if ns-record
-        (or (commit-address-from-record ns-record branch*)
+        (or (commit-address-from-record ns-record branch)
             (throw (ex-info (str "No nameservice record found for ledger alias: " ledger-address)
                             {:status 404 :error :db/ledger-not-found})))
         ;; Note, below is for leagacy conversion only, will get removed in v3 GA
@@ -211,14 +204,13 @@ changes from different branches into existing metadata map"
 
 (defrecord FileNameService
   [local-path sync? base-address]
-  ns-proto/iNameService
-  (-lookup [_ ledger-address] (lookup ledger-address local-path base-address nil))
-  (-lookup [_ ledger-address opts] (lookup ledger-address local-path base-address opts))
+  ns-proto/Publisher
   (-push [_ commit-data] (push! local-path base-address commit-data))
-  (-subscribe [nameservice ledger-alias callback] (throw (ex-info "Unsupported FileNameService op: subscribe" {})))
-  (-unsubscribe [nameservice ledger-alias] (throw (ex-info "Unsupported FileNameService op: unsubscribe" {})))
+
+  ns-proto/iNameService
+  (-lookup [_ ledger-alias] (lookup ledger-alias local-path base-address nil))
+  (-lookup [_ ledger-alias opts] (lookup ledger-alias local-path base-address opts))
   (-sync? [_] sync?)
-  (-ledgers [nameservice opts] (throw (ex-info "Unsupported FileNameService op: ledgers" {})))
   (-address [_ ledger-alias opts]
     (go (address base-address ledger-alias opts)))
   (-alias [_ ledger-address]
@@ -227,7 +219,7 @@ changes from different branches into existing metadata map"
         (str/split #"/")
         (->> (drop-last 2) ; branch-name, head
              (str/join #"/"))))
-  (-close [nameservice] true))
+  (-close [_] true))
 
 
 (defn initialize

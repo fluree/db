@@ -18,7 +18,7 @@
   (storage/build-fluree-address method-name path))
 
 (defrecord IpfsStore [endpoint]
-  storage/Store
+  storage/ContentAddressedStore
   (write [_ path v]
     (go-try
       (let [content (if (string? v)
