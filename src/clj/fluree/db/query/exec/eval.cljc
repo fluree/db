@@ -4,12 +4,13 @@
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
             [fluree.db.vector.scoring :as score]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
             [clojure.set :as set]
             [clojure.string :as str]
-            [clojure.walk :refer [postwalk]]
+            [clojure.walk :as walk :refer [postwalk]]
             [fluree.db.datatype :as datatype]
             [fluree.crypto :as crypto]
             [fluree.db.constants :as const]
@@ -68,12 +69,6 @@
   (where/->typed-val
     (Math/sqrt (:value (variance coll)))))
 
-(defn ceil
-  [{n :value}]
-  (where/->typed-val (cond (= n (int n)) n
-                           (> n 0) (-> n int inc)
-                           (< n 0) (-> n int))))
-
 (defn count-distinct
   [coll]
   (where/->typed-val
@@ -82,12 +77,6 @@
 (defn -count
   [coll]
   (where/->typed-val (count coll)))
-
-(defn floor
-  [{n :value}]
-  (where/->typed-val (cond (= n (int n)) n
-                           (> n 0) (-> n int)
-                           (< n 0) (-> n int dec))))
 
 (def groupconcat clojure.core/concat)
 
@@ -114,6 +103,18 @@
       (if (nil? (:value res#))
         (coalesce ~@args)
         res#))))
+
+(defn ceil
+  [{n :value}]
+  (where/->typed-val (cond (= n (int n)) n
+                           (> n 0) (-> n int inc)
+                           (< n 0) (-> n int))))
+
+(defn floor
+  [{n :value}]
+  (where/->typed-val (cond (= n (int n)) n
+                           (> n 0) (-> n int)
+                           (< n 0) (-> n int dec))))
 
 (defn bound
   [{x :value}]
@@ -322,16 +323,8 @@
                      (if (pos? (compare* (:value a) (:datatype-iri a)
                                          (:value b) (:datatype-iri b)))
                        a
-                       b))
-        ;; I think we should also return the datatype-iri here, 
-        ;; but currently for date-like values, that is java.time.LocalDate 
-        ;; or java.time.OffsetDateTime, which ought actually to be returned 
-        ;; as xsd:date or xsd:dateTime, respectively.
-        ;;
-        ;;     {:keys [value datatype-iri]} (reduce compare-fn coll)]
-        ;; (where/->typed-val value datatype-iri)))
-        value      (:value (reduce compare-fn coll))]
-    (where/->typed-val value)))
+                       b))]
+    (reduce compare-fn coll)))
 
 (defn min
   [coll]
@@ -339,16 +332,8 @@
                      (if (neg? (compare* (:value a) (:datatype-iri a)
                                          (:value b) (:datatype-iri b)))
                        a
-                       b))
-        ;; I think we should also return the datatype-iri here, 
-        ;; but currently for date-like values, that is java.time.LocalDate 
-        ;; or java.time.OffsetDateTime, which ought actually to be returned 
-        ;; as xsd:date or xsd:dateTime, respectively.
-        ;;
-        ;;     {:keys [value datatype-iri]} (reduce compare-fn coll)]
-        ;; (where/->typed-val value datatype-iri)))
-        value      (:value (reduce compare-fn coll))]
-    (where/->typed-val value)))
+                       b))]
+    (reduce compare-fn coll)))
 
 (defn regex
   [{text :value} {pattern :value}]
@@ -701,21 +686,37 @@
                         {:status 400, :error :db/invalid-query}))))))
 
 (defn coerce
-  [code allow-aggregates?]
-  (postwalk (fn [x]
-              (cond (where/variable? x)
-                    x
+  [allow-aggregates? ctx x]
+  (cond
+    ;; set literal (for "in")
+    (vector? x)
+    (mapv (partial coerce allow-aggregates? ctx) x)
 
-                    (symbol? x)
-                    (qualify x allow-aggregates?)
+    ;; function expression
+    (sequential? x)
+    (map (partial coerce allow-aggregates? ctx) x)
 
-                    ;; literal
-                    (not (sequential? x))
-                    (where/->TypedValue x (datatype/infer-iri x) nil)
+    ;; value map
+    (map? x)
+    (let [{:keys [id value type language]}
+          (-> (json-ld/expand {"f:v-map" x} ctx)
+              (util/get-first "f:v-map"))]
+      (if id
+        (where/->typed-val id const/iri-id)
+        (where/->typed-val value type language)))
 
-                    :else
-                    x))
-            code))
+    (where/variable? x)
+    x
+
+    (symbol? x)
+    (qualify x allow-aggregates?)
+
+    ;; simple literal
+    (not (sequential? x))
+    (where/->typed-val x)
+
+    :else
+    x))
 
 (defn mch->typed-val
   [{::where/keys [val iri datatype-iri meta]}]
@@ -734,7 +735,7 @@
 
 (defn compile*
   [code ctx allow-aggregates?]
-  (let [qualified-code (coerce code allow-aggregates?)
+  (let [qualified-code (coerce allow-aggregates? ctx code)
         vars           (variables qualified-code)
         soln-sym       'solution
         bdg            (bind-variables soln-sym vars ctx)]

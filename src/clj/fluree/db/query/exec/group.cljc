@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -49,7 +50,7 @@
 
 (defn implicit-grouping
   [select]
-  (when (some select/implicit-grouping? select)
+  (when (some select/implicit-grouping? (util/sequential select))
     [nil]))
 
 (defmethod select/display ::grouping

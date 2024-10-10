@@ -494,12 +494,3 @@
   (some->> (get json-ld k)
            unwrap-list
            (keep get-id)))
-
-(defn parse-opts
-  [opts]
-  (let [other-keys    (->> opts keys (remove #{:max-fuel :maxFuel}))
-        max-fuel-opts {:max-fuel (or (:max-fuel opts) (:maxFuel opts))}
-        merged-opts   (merge max-fuel-opts (select-keys opts other-keys))]
-    (if (or (:max-fuel merged-opts) (:meta merged-opts))
-      (assoc merged-opts ::track-fuel? true)
-      merged-opts)))
