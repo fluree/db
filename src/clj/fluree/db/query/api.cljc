@@ -35,7 +35,7 @@
   [query {:keys [identity did issuer] :as override-opts}]
   (update query :opts (fn [{:keys [max-fuel meta] :as opts}]
                         ;; ensure :max-fuel key is present
-                        (-> (merge override-opts opts)
+                        (-> (merge opts override-opts)
                             (assoc :max-fuel max-fuel)
                             ;; get rid of :did, :issuer opts
                             (update :identity #(or % (:did opts) (:issuer opts)))
