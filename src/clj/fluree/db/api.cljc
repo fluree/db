@@ -331,7 +331,7 @@
                                               (cred/verify-jws cred-query)
                                               (<? (cred/verify cred-query)))]
         (log/debug "Credential query connection with identity: " identity " and query: " query)
-        @(query-connection conn query (assoc opts :did identity)))))))
+        @(query-connection conn query (assoc opts :identity identity)))))))
 
 (defn history
   "Return the change history over a specified time range. Optionally include the commit
