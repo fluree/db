@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [load vswap!])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [go]]
+            [clojure.string :as str]
             [clojure.set :refer [map-invert]]
             [fluree.db.connection :as connection]
             [fluree.db.datatype :as datatype]
@@ -25,6 +26,7 @@
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.fql :as fql]
             [fluree.db.flake.index.storage :as index-storage]
+            [fluree.db.vector.index-graph :as index-graph]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
@@ -316,6 +318,10 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
+(defn virtual-graph?
+  [graph-alias]
+  (str/starts-with? graph-alias "##"))
+
 ;; ================ end Jsonld record support fns ============================
 
 (defrecord FlakeDB [conn alias branch commit t tt-id stats spot post opst tspo
@@ -343,11 +349,23 @@
     (match/match-class db fuel-tracker solution s-mch error-ch))
 
   (-activate-alias [db alias']
-    (when (= alias alias')
-      db))
+    (cond
+      (= alias alias')
+      db
+
+      (virtual-graph? alias')
+      db
+
+      :else
+      (throw (ex-info (str "Unknown graph alias: " alias')
+                      {:status 400 :error :db/invalid-query}))))
 
   (-aliases [_]
     [alias])
+
+  where/Searcher
+  (-search [s fuel-tracker solution index-alias search-graph error-ch]
+    (index-graph/search s fuel-tracker solution index-alias search-graph error-ch))
 
   transact/Transactable
   (-stage-txn [db fuel-tracker context identity author annotation raw-txn parsed-txn]

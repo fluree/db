@@ -181,6 +181,11 @@
   [match]
   (select-keys match [::iri ::val ::datatype-iri ::sids]))
 
+(defn virtual-graph?
+  "Returns true if named graph alias is a virtual graph (e.g. vector index)."
+  [graph-alias]
+  (str/starts-with? graph-alias "##"))
+
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]
@@ -275,6 +280,9 @@
   (-match-class [s fuel-tracker solution triple error-ch])
   (-activate-alias [s alias])
   (-aliases [s]))
+
+(defprotocol Searcher
+  (-search [s fuel-tracker solution graph-alias search-graph error-ch]))
 
 (defn matcher?
   [x]
@@ -605,9 +613,18 @@
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
-  (-> ds
-      (-activate-alias alias)
-      (match-clause fuel-tracker solution clause error-ch)))
+  (try*
+    (let [alias-ds (-activate-alias ds alias)]
+      (if (virtual-graph? alias)
+        (let [graph-pattern (->pattern :index-graph [alias clause])]
+          (match-pattern alias-ds fuel-tracker solution graph-pattern error-ch))
+        (match-clause alias-ds fuel-tracker solution clause error-ch)))
+    (catch* e
+            (if (ex-data e)
+              (async/offer! error-ch e)
+              (async/offer! error-ch (ex-info (str "Error activating alias: " alias)
+                                              {:status 400
+                                               :error :db/invalid-query} e))))))
 
 (defmethod match-pattern :exists
   [ds fuel-tracker solution pattern error-ch]
@@ -652,7 +669,7 @@
 (defmethod match-pattern :graph
   [ds fuel-tracker solution pattern error-ch]
   (let [[g clause] (pattern-data pattern)]
-    (if-let [v (::var g)]
+    (if-let [v (get-variable g)]
       (if-let [v-match (get solution v)]
         (let [alias (or (get-iri v-match)
                         (get-value v-match))]
@@ -668,6 +685,11 @@
                                 alias-ch)
           out-ch))
       (match-alias ds g fuel-tracker solution clause error-ch))))
+
+(defmethod match-pattern :index-graph
+  [ds fuel-tracker solution pattern error-ch]
+  (let [[g clause] (pattern-data pattern)]
+    (-search ds fuel-tracker solution g clause error-ch)))
 
 (defmethod match-pattern :union
   [db fuel-tracker solution pattern error-ch]
