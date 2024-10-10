@@ -214,11 +214,41 @@
                       {:status 400
                        :error  :db/invalid-query})))))
 
+(defn parse-code-data
+  [x]
+  (cond
+    ;; special handling for "in" expressions
+    (and (vector? x)
+         (= "in" (first x)))
+    (let [[f v set] x]
+      (list (parse-code-data f)
+            (parse-code-data v)
+            ;; need to preserve vector as set literal notation
+            (mapv parse-code-data set)))
+
+    (sequential? x)
+    (map parse-code-data x)
+
+    (v/variable? x)
+    (parse-var-name x)
+
+    (and (symbol? x)
+         (contains? eval/allowed-symbols x))
+    x
+
+    (string? x)
+    (if (contains? eval/allowed-symbols (symbol x))
+      (symbol x)
+      x)
+
+    :else
+    x))
+
 (defn parse-code
   [x]
-  (if (list? x)
-    x
-    (safe-read x)))
+  (cond (list? x)   x
+        (vector? x) (parse-code-data x)
+        :else       (safe-read x)))
 
 (defn parse-filter-function
   "Evals and returns filter function."
@@ -563,6 +593,9 @@
                                   (parse-select-as-fn s context)
                                   (parse-select-aggregate s context))
                      :list-fn (if (= 'as (first s))
+                                (parse-select-as-fn s context)
+                                (parse-select-aggregate s context))
+                     :data-fn (if (= "as" (first s))
                                 (parse-select-as-fn s context)
                                 (parse-select-aggregate s context)))
         :select-map (parse-select-map s depth context)))))
