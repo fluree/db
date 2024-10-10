@@ -68,6 +68,7 @@
        (select/format ds q fuel-tracker error-ch)
        (collect-results q)))
 
+;; TODO: refactor namespace heirarchy so this isn't necessary
 (defn subquery-executor
   "Closes over a subquery to allow processing the whole query pipeline from within the
   search."
