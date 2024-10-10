@@ -266,9 +266,12 @@
 (defmethod to-odt LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC)))
 
 (defn compare*
-  [val-a dt-a val-b dt-b]
-  (let [dt-a (or dt-a (datatype/infer-iri val-a))
-        dt-b (or dt-b (datatype/infer-iri val-b))]
+  [{val-a :value dt-a :datatype-iri}
+   {val-b :value dt-b :datatype-iri}]
+  (let [dt-a  (or dt-a (datatype/infer-iri val-a))
+        val-a (or (and (some? val-a) (datatype/coerce val-a dt-a)) val-a)
+        dt-b  (or dt-b (datatype/infer-iri val-b))
+        val-b (or (and (some? val-b) (datatype/coerce val-b dt-b)) val-b)]
     (cond
       ;; can compare across types
       (or (and (contains? numeric-datatypes dt-a)
@@ -294,34 +297,29 @@
                        :error  :db/invalid-query})))))
 
 (defn less-than
-  [{a :value a-dt :datatype-iri}
-   {b :value b-dt :datatype-iri}]
-  (where/->typed-val (neg? (compare* a a-dt b b-dt))))
+  [a b]
+  (where/->typed-val (neg? (compare* a b))))
 
 (defn less-than-or-equal
-  [{a :value a-dt :datatype-iri}
-   {b :value b-dt :datatype-iri}]
+  [a b]
   (where/->typed-val
     (or (= a b)
-        (neg? (compare* a a-dt b b-dt)))))
+        (neg? (compare* a b)))))
 
 (defn greater-than
-  [{a :value a-dt :datatype-iri}
-   {b :value b-dt :datatype-iri}]
-  (where/->typed-val (pos? (compare* a a-dt b b-dt))))
+  [a b]
+  (where/->typed-val (pos? (compare* a b))))
 
 (defn greater-than-or-equal
-  [{a :value a-dt :datatype-iri}
-   {b :value b-dt :datatype-iri}]
+  [a b]
   (where/->typed-val
     (or (= a b)
-        (pos? (compare* a a-dt b b-dt)))))
+        (pos? (compare* a b)))))
 
 (defn max
   [coll]
   (let [compare-fn (fn [a b]
-                     (if (pos? (compare* (:value a) (:datatype-iri a)
-                                         (:value b) (:datatype-iri b)))
+                     (if (pos? (compare* a b))
                        a
                        b))]
     (reduce compare-fn coll)))
@@ -329,8 +327,7 @@
 (defn min
   [coll]
   (let [compare-fn (fn [a b]
-                     (if (neg? (compare* (:value a) (:datatype-iri a)
-                                         (:value b) (:datatype-iri b)))
+                     (if (neg? (compare* a b))
                        a
                        b))]
     (reduce compare-fn coll)))
@@ -699,8 +696,8 @@
     ;; value map
     (map? x)
     (let [{:keys [id value type language]}
-          (-> (json-ld/expand {"f:v-map" x} ctx)
-              (util/get-first "f:v-map"))]
+          (-> (json-ld/expand {const/iri-data x} ctx)
+              (util/get-first const/iri-data))]
       (if id
         (where/->typed-val id const/iri-id)
         (where/->typed-val value type language)))
