@@ -35,13 +35,11 @@
   [query {:keys [identity did issuer] :as override-opts}]
   (update query :opts (fn [{:keys [max-fuel meta] :as opts}]
                         ;; ensure :max-fuel key is present
-                        (-> (merge opts override-opts)
-                            (assoc :max-fuel max-fuel)
+                        (-> (assoc opts :max-fuel max-fuel)
+                            (merge opts override-opts)
                             ;; get rid of :did, :issuer opts
                             (update :identity #(or % (:did opts) (:issuer opts)))
-                            (dissoc :did :issuer)
-                            (cond->
-                                (or identity did issuer) (assoc :identity (or identity did issuer)))))))
+                            (dissoc :did :issuer)))))
 
 (defn load-aliased-rule-dbs
   [conn rule-sources]
