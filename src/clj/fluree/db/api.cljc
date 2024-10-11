@@ -342,32 +342,32 @@
                                               (cred/verify-jws cred-query)
                                               (<? (cred/verify cred-query)))]
         (log/debug "Credential query connection with identity: " identity " and query: " query)
-        @(query-connection conn query (assoc opts :did identity)))))))
+        @(query-connection conn query (assoc opts :identity identity)))))))
 
 (defn history
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   ([ledger query]
-   (let [latest-db (ledger/-db ledger)
-         res-chan  (query-api/history latest-db query)]
-     (promise-wrap res-chan)))
+   (promise-wrap
+     (query-api/history (ledger/-db ledger) query)))
   ([ledger query {:keys [policy identity policyClass policyValues] :as _opts}]
    (promise-wrap
-    (let [latest-db (ledger/-db ledger)
-          context (context/extract query)
-          policy-db (cond
-                      identity
-                      (<? (policy/wrap-identity-policy latest-db (json-ld/expand identity context) policyValues))
+     (go-try
+       (let [latest-db (ledger/-db ledger)
+             context (context/extract query)
+             policy-db (cond
+                         identity
+                         (<? (policy/wrap-identity-policy latest-db identity policyValues))
 
-                      policy
-                      (<? (policy/wrap-policy latest-db (json-ld/expand policy context) policyValues))
+                         policy
+                         (<? (policy/wrap-policy latest-db (json-ld/expand policy context) policyValues))
 
-                      policyClass
-                      (<? (policy/wrap-class-policy latest-db (json-ld/expand policyClass context) policyValues))
+                         policyClass
+                         (<? (policy/wrap-class-policy latest-db (json-ld/expand policyClass context) policyValues))
 
-                      :else
-                      latest-db)]
-      (query-api/history policy-db query)))))
+                         :else
+                         latest-db)]
+         (<? (query-api/history policy-db query)))))))
 
 (defn credential-history
   "Issues a policy-enforced history query to the specified ledger as a
