@@ -3,6 +3,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
             [fluree.db.util.docs :as docs]
+            [camel-snake-kebab.core :as csk]
             [clojure.edn :as edn]
             [malli.core :as m]
             [malli.transform :as mt]))
@@ -26,8 +27,7 @@
   (log/trace "one-select-key-present? q:" q)
   (if (map? q)
     (let [skeys (->> q keys
-                     (map #{:select :selectOne :select-one :selectDistinct
-                            :select-distinct})
+                     (map #{:select :select-one :select-distinct})
                      (remove nil?))]
       (log/trace "one-select-key-present? skeys:" skeys)
       (= 1 (count skeys)))
@@ -40,19 +40,15 @@
    [:where {:optional true} ::where]
    [:t {:optional true} ::t]
    [:context {:optional true} ::context]
-   [:orderBy {:optional true} ::order-by]
    [:order-by {:optional true} ::order-by]
-   [:groupBy {:optional true} ::group-by]
    [:group-by {:optional true} ::group-by]
    [:having {:optional true} ::function]
    [:values {:optional true} ::values]
    [:limit {:optional true} ::limit]
    [:offset {:optional true} ::offset]
-   [:maxFuel {:optional true} ::max-fuel]
    [:max-fuel {:optional true} ::max-fuel]
    [:depth {:optional true} ::depth]
    [:opts {:optional true} ::opts]
-   [:prettyPrint {:optional true} ::pretty-print]
    [:pretty-print {:optional true} ::pretty-print]])
 
 (defn wrap-query-map-schema
@@ -76,9 +72,7 @@
   [extra-kvs]
   (-> common-query-schema
       (into [[:select {:optional true} ::select]
-             [:selectOne {:optional true} ::select]
              [:select-one {:optional true} ::select]
-             [:selectDistinct {:optional true} ::select]
              [:select-distinct {:optional true} ::select]])
       (into extra-kvs)
       wrap-query-map-schema))
@@ -87,9 +81,7 @@
   [extra-kvs]
   (-> common-query-schema
       (into [[:select {:optional true} ::subquery-select]
-             [:selectOne {:optional true} ::subquery-select]
              [:select-one {:optional true} ::subquery-select]
-             [:selectDistinct {:optional true} ::subquery-select]
              [:select-distinct {:optional true} ::subquery-select]])
       (into extra-kvs)
       wrap-query-map-schema))
@@ -118,21 +110,37 @@
     ::parse-json        boolean?
     ::issuer            [:maybe string?]
     ::role              :any
-    ::did               :any
-    ::opts              [:and
-                         [:map-of :keyword :any]
-                         [:map
-                          [:maxFuel {:optional true} ::max-fuel]
-                          [:max-fuel {:optional true} ::max-fuel]
-                          [:parseJSON {:optional true} ::parse-json]
-                          [:parse-json {:optional true} ::parse-json]
-                          [:prettyPrint {:optional true} ::pretty-print]
-                          [:pretty-print {:optional true} ::pretty-print]
-                          [:default-allow? {:optional true} ::default-allow?]
-                          [:defaultAllow {:optional true} ::default-allow?]
-                          [:issuer {:optional true} ::issuer]
-                          [:role {:optional true} ::role]
-                          [:did {:optional true} ::did]]]
+    ::identity          :any
+    ::opts              [:map
+                         [:max-fuel {:optional true} ::max-fuel]
+                         [:issuer {:optional true} ::issuer]
+                         [:role {:optional true} ::role]
+                         [:identity {:optional true} ::identity]
+                         ;; deprecated
+                         [:pretty-print {:optional true} ::pretty-print]
+                         [:did {:optional true} ::identity]
+                         [:default-allow? {:optional true} ::default-allow?]
+                         [:parse-json {:optional true} ::parse-json]]
+    ::stage-opts        [:map
+                         [:meta {:optional true} :boolean]
+                         [:max-fuel {:optional true} ::max-fuel]
+                         [:identity {:optional true} ::identity]
+                         [:did {:optional true} ::identity]
+                         [:context {:optional true} ::context]
+                         [:raw-txn {:optional true} :any]
+                         [:author {:optional true} ::identity]]
+    ::commit-opts       [:map
+                         [:identity {:optional true} ::identity]
+                         [:context {:optional true} ::context]
+                         [:raw-txn {:optional true} :any]
+                         [:author {:optional true} ::identity]
+                         [:private {:optional true} :string]
+                         [:message {:optional true} :string]
+                         [:tag {:optional true} :string]
+                         [:file-data? {:optional true} :boolean]
+                         [:index-files-ch {:optional true} :any]
+                         [:time {:optional true} :string]]
+    ::txn-opts          [:and ::stage-opts ::commit-opts]
     ::function          ::v/function
     ::as-function       ::v/as-function
     ::wildcard          [:fn wildcard?]
@@ -198,8 +206,9 @@
 
 (def fql-transformer
   (mt/transformer
-   {:name     :fql
-    :decoders (mt/-json-decoders)}))
+    {:name     :fql
+     :decoders (mt/-json-decoders)}
+    (mt/key-transformer {:decode csk/->kebab-case-keyword})))
 
 (def coerce-query*
   (m/coercer ::query fql-transformer {:registry registry}))
@@ -255,15 +264,17 @@
 (def parse-selector
   (m/parser ::selector {:registry registry}))
 
-(def coerce-modification*
-  (m/coercer ::modification fql-transformer {:registry registry}))
 
-(defn coerce-modification
-  [mdfn]
+
+(def coerce-txn-opts*
+  (m/coercer ::txn-opts fql-transformer {:registry registry}))
+
+(defn coerce-txn-opts
+  [opts]
   (try*
-   (coerce-modification* mdfn)
-   (catch* e
-     (throw (ex-info "Invalid Ledger Modification"
-                     {:status  400
-                      :error   :db/invalid-query
-                      :reasons (humanize-error e)})))))
+    (coerce-txn-opts* opts)
+    (catch* e
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-txn})
+          throw))))
