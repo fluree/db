@@ -117,6 +117,24 @@
                                            [:bind ?nameLength "(strLen ?name)"]
                                            [:filter "(> 4 ?nameLength)"]]}))))
 
+    (testing "filtering literal value-maps"
+      (is (= ["Cam"]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '?name
+                                :where   '[{:type        :ex/User
+                                            :schema/name ?name}
+                                           [:bind ?nameLength "(strLen ?name)"]
+                                           [:filter "(> {\"@value\" 4 :type :xsd/int} ?nameLength)"]]})))
+      (is (= ["Cam"]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '?name
+                                :where   '[{:type        :ex/User
+                                            :schema/name ?name}
+                                           [:bind ?nameLength "(strLen ?name)"]
+                                           [:filter "(in ?nameLength [2 3 {\"@value\" 4 :type :xsd/int}])"]]}))))
+
     (testing "filtering variables bound to iris"
       (let [db-dads @(fluree/stage
                        db

@@ -99,13 +99,13 @@
     (context/stringify parsed-context)))
 
 (defn- enrich-commit-opts
-  [ledger {:keys [context did private message tag file-data? index-files-ch time] :as _opts}]
+  [ledger {:keys [context identity private message tag file-data? index-files-ch time] :as _opts}]
   (let [context*      (parse-commit-context context)
         private*      (or private
-                          (:private did)
+                          (:private identity)
                           (-> ledger :did :private))
-        did*          (or (some-> private* did/private->did)
-                          did
+        identity*     (or (some-> private* did/private->did)
+                          identity
                           (:did ledger))
         ctx-used-atom (atom {})
         compact-fn    (json-ld/compact-fn context* ctx-used-atom)]
@@ -116,7 +116,7 @@
       :file-data? file-data? ;; if true, return the db as well as the written files (for consensus)
       :context context*
       :private private*
-      :did did*}
+      :did identity*}
 
      :commit-data-helpers
      {:compact-fn compact-fn
@@ -136,10 +136,10 @@
    (loop [[next-staged & r] staged
           results []]
      (if next-staged
-       (let [[txn author-did annotation] next-staged
+       (let [[txn author annotation] next-staged
              results* (if txn
                         (let [{txn-id :address} (<? (connection/-txn-write conn alias txn))]
-                          (conj results [txn-id author-did annotation]))
+                          (conj results [txn-id author annotation]))
                         (conj results next-staged))]
          (recur r results*))
        results))))

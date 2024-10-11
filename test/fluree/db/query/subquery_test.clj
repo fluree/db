@@ -63,15 +63,15 @@
           people (test-utils/load-people conn)
           db     (fluree/db people)]
 
-      (testing " calculate average in subquery and use it in parent query as filter"
+      (testing "calculate average in subquery and use it in parent query as filter"
         (let [qry {:context  [test-utils/default-context
                               {:ex "http://example.org/ns/"}]
                    :select   '[?iri ?favNums]
-                   :where    ['{:id         ?iri
+                   :where    '[{:id ?iri
                                 :ex/favNums ?favNums}
-                              [:filter "(> ?favNums ?avgFavNum)"]
-                              [:query {:where  '{:ex/favNums ?favN}
-                                       :select '[(as (avg ?favN) ?avgFavNum)]}]]
+                               [:filter "(> ?favNums ?avgFavNum)"]
+                               [:query {:where {:ex/favNums ?favN}
+                                        :select [(as (avg ?favN) ?avgFavNum)]}]]
                    :order-by '[?iri ?favNums]}]
           (is (= [[:ex/alice 42] [:ex/alice 76] [:ex/liam 42]]
                  @(fluree/query db qry))))))))
@@ -121,3 +121,22 @@
                                                                           ["query" {"select" ["?email"]
                                                                                     "where"  {"schema:email" "?email"}}]]}]]
                                   "orderBy"  ["?name" "?email" "?age"]})))))))
+
+(deftest ^:integration subquery-unions
+  (testing "Subquery within a union statement"
+    (let [conn   (test-utils/create-conn)
+          people (test-utils/load-people conn)
+          db     (fluree/db people)]
+
+      (testing "calculate average in subquery and use it in parent query as filter"
+        (let [qry {:context  [test-utils/default-context
+                              {:ex "http://example.org/ns/"}]
+                   :select   '[?person ?avgFavNum]
+                   :where    [[:union
+                               [:query {:where  '{:id :ex/alice :ex/favNums ?favN}
+                                        :select '[(as (str "Alice") ?person) (as (avg ?favN) ?avgFavNum)]}]
+                               [:query {:where  '{:id :ex/cam :ex/favNums ?favN}
+                                        :select '[(as (str "Cam") ?person) (as (avg ?favN) ?avgFavNum)]}]]]
+                   :order-by '[?iri ?favNums]}]
+          (is (= [["Alice" 42.33333333333333] ["Cam" 7.5]]
+                 @(fluree/query db qry))))))))
