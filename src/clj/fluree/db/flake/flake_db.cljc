@@ -331,8 +331,8 @@
     [alias])
 
   transact/Transactable
-  (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn]
-    (flake.transact/stage db fuel-tracker context identity annotation raw-txn parsed-txn))
+  (-stage-txn [db fuel-tracker context identity author annotation raw-txn parsed-txn]
+    (flake.transact/stage db fuel-tracker context identity author annotation raw-txn parsed-txn))
   (-merge-commit [db commit-jsonld commit-data-jsonld]
     (merge-commit db commit-jsonld commit-data-jsonld))
 

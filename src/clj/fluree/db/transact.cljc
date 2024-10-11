@@ -7,7 +7,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol Transactable
-  (-stage-txn [db fuel-tracker context identity annotation raw-txn parsed-txn])
+  (-stage-txn [db fuel-tracker context identity author annotation raw-txn parsed-txn])
   (-merge-commit [db commit-jsonld commit-data-jsonld]))
 
 (defn nested-nodes?
@@ -48,7 +48,7 @@
    (stage db nil identity txn parsed-opts))
   ([db fuel-tracker identity parsed-txn parsed-opts]
    (go-try
-     (let [{:keys [context raw-txn]} parsed-opts
+     (let [{:keys [context raw-txn author]} parsed-opts
 
            annotation (extract-annotation context parsed-txn parsed-opts)]
-       (<? (-stage-txn db fuel-tracker context identity annotation raw-txn parsed-txn))))))
+       (<? (-stage-txn db fuel-tracker context identity author annotation raw-txn parsed-txn))))))
