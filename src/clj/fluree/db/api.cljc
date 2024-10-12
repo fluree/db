@@ -337,25 +337,27 @@
   that produced the changes."
   ([ledger query]
    (promise-wrap
-     (query-api/history (ledger/-db ledger) query)))
-  ([ledger query {:keys [policy identity policyClass policyValues] :as _opts}]
+    (query-api/history (ledger/-db ledger) query)))
+  ([ledger query override-opts]
    (promise-wrap
-     (go-try
-       (let [latest-db (ledger/-db ledger)
-             context (context/extract query)
-             policy-db (cond
-                         identity
-                         (<? (policy/wrap-identity-policy latest-db identity policyValues))
+    (go-try
+      (let [latest-db (ledger/-db ledger)
+            context   (context/extract query)
+            {:keys [opts] :as sanitized-query} (query-api/sanitize-query-options query override-opts)
+            {:keys [policy identity policy-class policy-values]} opts
+            policy-db (cond
+                        identity
+                        (<? (policy/wrap-identity-policy latest-db identity policy-values))
 
-                         policy
-                         (<? (policy/wrap-policy latest-db (json-ld/expand policy context) policyValues))
+                        policy
+                        (<? (policy/wrap-policy latest-db (json-ld/expand policy context) policy-values))
 
-                         policyClass
-                         (<? (policy/wrap-class-policy latest-db (json-ld/expand policyClass context) policyValues))
+                        policy-class
+                        (<? (policy/wrap-class-policy latest-db (json-ld/expand policy-class context) policy-values))
 
-                         :else
-                         latest-db)]
-         (<? (query-api/history policy-db query)))))))
+                        :else
+                        latest-db)]
+        (<? (query-api/history policy-db sanitized-query)))))))
 
 (defn credential-history
   "Issues a policy-enforced history query to the specified ledger as a
@@ -365,24 +367,26 @@
   signing identity, which is then used by `wrap-identity-policy` to extract
   the policy classes and apply the policies to the query."
   ([ledger cred-query] (credential-history ledger cred-query {}))
-  ([ledger cred-query {:keys [policyValues] :as _opts}]
+  ([ledger cred-query override-opts]
    (promise-wrap
     (go-try
-     (let [latest-db (ledger/-db ledger)
-           {query :subject, identity :did} (<? (cred/verify cred-query))]
-       (log/debug "Credential history query with identity: " identity " and query: " query)
-       (cond
-         (and query identity)
-         (let [policy-db (<? (policy/wrap-identity-policy latest-db identity policyValues))]
-           (<? (query-api/history policy-db query)))
+      (let [latest-db (ledger/-db ledger)
+            {query :subject, identity :did} (<? (cred/verify cred-query))]
+        (log/debug "Credential history query with identity: " identity " and query: " query)
+        (cond
+          (and query identity)
+          (let [{:keys [opts] :as sanitized-query} (query-api/sanitize-query-options query (assoc override-opts :identity identity))
+                {:keys [identity policy-values]} opts
+                policy-db (<? (policy/wrap-identity-policy latest-db identity policy-values))]
+            (<? (query-api/history policy-db sanitized-query)))
 
-         identity
-         (throw (ex-info "Query not present in credential"
-                         {:status 400 :error :db/invalid-credential}))
+          identity
+          (throw (ex-info "Query not present in credential"
+                          {:status 400 :error :db/invalid-credential}))
 
-         :else
-         (throw (ex-info "Invalid credential"
-                         {:status 400 :error :db/invalid-credential}))))))))
+          :else
+          (throw (ex-info "Invalid credential"
+                          {:status 400 :error :db/invalid-credential}))))))))
 
 (defn range
   "Performs a range scan against the specified index using test functions
