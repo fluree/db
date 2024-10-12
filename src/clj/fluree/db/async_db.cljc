@@ -105,10 +105,10 @@
         (<? (subject/-iri-visible? db iri)))))
 
   transact/Transactable
-  (-stage-txn [_ fuel-tracker context identity annotation raw-txn parsed-txn]
+  (-stage-txn [_ fuel-tracker context identity author annotation raw-txn parsed-txn]
     (go-try
       (let [db (<? db-chan)]
-        (<? (transact/-stage-txn db fuel-tracker context identity annotation raw-txn parsed-txn)))))
+        (<? (transact/-stage-txn db fuel-tracker context identity author annotation raw-txn parsed-txn)))))
   (-merge-commit [_ commit-jsonld commit-data-jsonld]
     (go-try
       (let [db (<? db-chan)]

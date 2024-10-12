@@ -588,7 +588,7 @@
 
 (defn track-fuel?
   [parsed-opts]
-  (or (:maxFuel parsed-opts)
+  (or (:max-fuel parsed-opts)
       (:meta parsed-opts)))
 
 (defn stage-triples
@@ -596,7 +596,7 @@
    internal Fluree triples format."
   [db parsed-txn parsed-opts]
   (go-try
-    (let [identity    (:did parsed-opts)
+    (let [identity    (:identity parsed-opts)
           policy-db   (if (policy/policy-enforced-opts? parsed-opts)
                         (let [parsed-context (:context parsed-opts)]
                           (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
@@ -604,7 +604,7 @@
       (if (track-fuel? parsed-opts)
         (let [start-time #?(:clj (System/nanoTime)
                             :cljs (util/current-time-millis))
-              fuel-tracker       (fuel/tracker (:maxFuel parsed-opts))]
+              fuel-tracker       (fuel/tracker (:max-fuel parsed-opts))]
           (try*
             (let [result (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
               {:status 200
@@ -619,23 +619,25 @@
         (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
 
 (defn transact-ledger!
-  [_conn ledger triples {:keys [branch] :as opts, :or {branch :main}}]
-  (log/info "transacting ledger:" opts)
+  [_conn ledger triples {:keys [branch] :as parsed-opts, :or {branch :main}}]
+  (log/info "transacting ledger:" parsed-opts)
   (go-try
     (let [db       (ledger/current-db ledger branch)
-          staged   (<? (stage-triples db triples opts))
+          staged   (<? (stage-triples db triples parsed-opts))
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
-          cmt-opts (dissoc opts :context :did)]
-      (<? (commit! ledger staged cmt-opts)))))
+          cmt-opts (dissoc parsed-opts :context :identity)]
+      (if (track-fuel? parsed-opts)
+        (assoc staged :result (<? (commit! ledger (:result staged) cmt-opts)))
+        (<? (commit! ledger staged cmt-opts))))))
 
 (defn transact!
-  [conn ledger-id triples opts]
-  (log/info "transacting:" opts)
+  [conn ledger-id triples parsed-opts]
+  (log/info "transacting:" parsed-opts)
   (go-try
     (let [ledger (<? (load-ledger conn ledger-id))]
-      (<? (transact-ledger! conn ledger triples opts)))))
+      (<? (transact-ledger! conn ledger triples parsed-opts)))))
 
 (defn replicate-index-node
   [conn address data]

@@ -505,23 +505,3 @@
     (contains? jsonld :graph)   (:graph jsonld)
     (contains? jsonld "@graph") (get jsonld "@graph")
     :else                       jsonld))
-
-(defn parse-opts
-  [opts]
-  (let [other-keys    (->> opts keys (remove #{:max-fuel :maxFuel}))
-        max-fuel-opts {:max-fuel (or (:max-fuel opts) (:maxFuel opts))}
-        merged-opts   (merge max-fuel-opts (select-keys opts other-keys))]
-    (if (or (:max-fuel merged-opts) (:meta merged-opts))
-      (assoc merged-opts ::track-fuel? true)
-      merged-opts)))
-
-(defn cartesian-merge
-  "Like a cartesian product, but performs a map
-  merge across all possilble combinations
-  of collections."
-  [colls]
-  (if (empty? colls)
-    '(())
-    (for [more (cartesian-merge (rest colls))
-          x    (first colls)]
-      (merge x more))))

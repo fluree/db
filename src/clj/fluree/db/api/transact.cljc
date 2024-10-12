@@ -6,14 +6,24 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.context :as ctx-util]
             [fluree.json-ld :as json-ld]
-            [fluree.db.json-ld.credential :as cred]))
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.ledger :as ledger]
+            [fluree.db.query.fql.syntax :as syntax]))
 
 (defn parse-opts
-  [expanded-txn opts txn-context]
+  [expanded-txn override-opts txn-context]
   (let [txn-opts (some-> (util/get-first-value expanded-txn const/iri-opts)
-                         util/keywordize-keys)
-        opts*    (merge txn-opts (util/keywordize-keys opts))]
-    (assoc opts* :context txn-context)))
+                         (syntax/coerce-txn-opts))
+        opts     (merge txn-opts (some-> override-opts syntax/coerce-txn-opts))]
+    (-> opts
+        (assoc :context txn-context)
+        (update :identity #(or % (:did opts)))
+        (dissoc :did))))
+
+(defn track-fuel?
+  [parsed-opts]
+  (or (:max-fuel parsed-opts)
+      (:meta parsed-opts)))
 
 (defn stage
   [db txn opts]
@@ -36,17 +46,16 @@
 (defn transact!
   ([conn txn]
    (transact! conn txn nil))
-  ([conn txn opts]
+  ([conn txn override-opts]
    (go-try
      (let [expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
            context     (or (ctx-util/txn-context txn)
                            ;; parent context might come from a Verifiable
                            ;; Credential's context
-                           (:context opts))
+                           (:context override-opts))
            ledger-id   (extract-ledger-id expanded)
-           expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
            triples     (q-parse/parse-txn expanded context)
-           parsed-opts (parse-opts expanded opts context)]
+           parsed-opts (parse-opts expanded override-opts context)]
        (<? (connection/transact! conn ledger-id triples parsed-opts))))))
 
 (defn credential-transact!
@@ -55,24 +64,24 @@
   Will throw if signature cannot be extracted."
   [conn txn opts]
   (go-try
-   (let [{txn* :subject did :did} (<? (cred/verify txn))
+   (let [{txn* :subject identity :did} (<? (cred/verify txn))
          parent-context (when (map? txn) ;; parent-context only relevant for verifiable credential
                           (ctx-util/txn-context txn))]
      (<? (transact! conn txn* (assoc opts :raw-txn txn
-                                          :did did
+                                          :identity identity
                                           :context parent-context))))))
 
 (defn create-with-txn
   ([conn txn]
    (create-with-txn conn txn nil))
-  ([conn txn {:keys [context] :as opts}]
+  ([conn txn {:keys [context] :as override-opts}]
    (go-try
-     (let [expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
-           ledger-id   (extract-ledger-id expanded)
-           address     (<? (connection/primary-address conn ledger-id))
-           txn-context (or (ctx-util/txn-context txn)
-                           context) ;; parent context from credential if present
-           parsed-opts (parse-opts expanded opts txn-context)]
+    (let [expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
+          txn-context (or (ctx-util/txn-context txn)
+                          context) ;; parent context from credential if present
+          ledger-id   (extract-ledger-id expanded)
+          address     (<? (connection/primary-address conn ledger-id))
+          parsed-opts (parse-opts expanded override-opts txn-context)]
       (if (<? (connection/ledger-exists? conn address))
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
@@ -87,7 +96,7 @@
 
 (defn credential-create-with-txn!
   [conn txn]
-  (let [{txn* :subject did :did} (<? (cred/verify txn))
+  (let [{txn* :subject identity :did} (<? (cred/verify txn))
         parent-context (when (map? txn) ;; parent-context only relevant for verifiable credential
                          (ctx-util/txn-context txn))]
-    (create-with-txn conn txn* {:raw-txn txn, :did did :context parent-context})))
+    (create-with-txn conn txn* {:raw-txn txn, :identity identity :context parent-context})))

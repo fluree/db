@@ -371,6 +371,18 @@
                                                        {:foo  "http://foo.com/"
                                                         :bar  "http://bar.com/"
                                                         :quux "http://quux.com/"}])))))))
+    (testing "fuel tracking works on transactions"
+      (let [txn {"@context" ["https://ns.flur.ee"
+                             {:f "https://ns.flur.ee/ledger#"}]
+                 "ledger"   ledger-name
+                 "insert"   [{:context    [context
+                                           {:ex "http://example.org/ns/"}
+                                           {:quux "http://quux.com/"}]
+                              :id         :ex/alice
+                              :quux/corge "grault"}]}
+            committed  @(fluree/transact! conn txn {:meta true})]
+        (is (= [:fuel :result :status :time]
+               (sort (keys committed))))))
 
     (testing "Throws on invalid txn"
       (let [txn {"@context" ["https://ns.flur.ee" "" {:quux "http://quux.com/"}]

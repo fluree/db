@@ -37,7 +37,7 @@
   "Generates a state map for transaction processing. When optional
   reasoned-from-IRI is provided, will mark any new flakes as reasoned from the
   provided value in the flake's metadata (.-m) as :reasoned key."
-  [& {:keys [db context txn author-did annotation reasoned-from-iri]}]
+  [& {:keys [db context txn author annotation reasoned-from-iri]}]
   (let [{:keys [policy], db-t :t} db
 
         commit-t  (-> db :commit commit-data/t)
@@ -47,7 +47,7 @@
      :context       context
      :txn           txn
      :annotation    annotation
-     :author-did    author-did
+     :author        author
      :policy        policy
      :stage-update? (= t db-t) ; if a previously staged db is getting updated again before committed
      :t             t
@@ -94,14 +94,14 @@
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
-  [db new-flakes {:keys [stage-update? policy t txn author-did annotation db-before context] :as _tx-state}]
+  [db new-flakes {:keys [stage-update? policy t txn author annotation db-before context] :as _tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
           mods         (<? (modified-subjects (policy/root db) add))
           db-after     (-> db
-                           (update :staged conj [txn author-did annotation])
+                           (update :staged conj [txn author annotation])
                            (assoc :t t
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
@@ -117,7 +117,7 @@
       allowed-db)))
 
 (defn stage
-  [db fuel-tracker context identity annotation raw-txn parsed-txn]
+  [db fuel-tracker context identity author annotation raw-txn parsed-txn]
   (go-try
     (when (policy.modify/deny-all? db)
       (throw (ex-info "Database policy denies all modifications."
@@ -125,7 +125,7 @@
     (let [tx-state   (->tx-state :db db
                                  :context context
                                  :txn raw-txn
-                                 :author-did identity
+                                 :author (or author identity)
                                  :annotation annotation)
           [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
           updated-db (<? (final-db db** new-flakes tx-state))]
