@@ -95,23 +95,23 @@
   policy enforcement."
   [opts]
   (or (:identity opts)
-      (:policyClass opts)
+      (:policy-class opts)
       (:policy opts)))
 
 (defn policy-enforce-db
   "Policy enforces a db based on the query/transaction options"
   [db parsed-context opts]
   (go-try
-    (let [{:keys [identity policyClass policy policyValues]} opts]
-     (cond
+    (let [{:keys [identity policy-class policy policy-values]} opts]
+      (cond
 
-       identity
-       (<? (wrap-identity-policy db identity policyValues))
+        identity
+        (<? (wrap-identity-policy db identity policy-values))
 
-       policyClass
-       (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policyClass))]
-         (<? (wrap-class-policy db classes policyValues)))
+        policy-class
+        (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
+          (<? (wrap-class-policy db classes policy-values)))
 
-       policy
-       (let [expanded-policy (json-ld/expand policy parsed-context)]
-         (<? (wrap-policy db expanded-policy policyValues)))))))
+        policy
+        (let [expanded-policy (json-ld/expand policy parsed-context)]
+          (<? (wrap-policy db expanded-policy policy-values)))))))
