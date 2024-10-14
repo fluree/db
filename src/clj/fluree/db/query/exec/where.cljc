@@ -592,15 +592,24 @@
                           solution-ch)
     out-ch))
 
+(defn subquery?
+  [pattern]
+  (and (sequential? pattern)
+       (= :query (first pattern))))
+
 (defn match-clause
   "Returns a channel that will eventually contain all match solutions in the
   dataset `ds` extending from `solution` that also match all the patterns in the
   parsed where clause collection `clause`."
   [ds fuel-tracker solution clause error-ch]
-  (let [initial-ch (async/to-chan! [solution])]
+  (let [initial-ch (async/to-chan! [solution])
+        {subquery-patterns true
+         other-patterns false} (group-by subquery? clause)]
     (reduce (fn [solution-ch pattern]
               (with-constraint ds fuel-tracker pattern error-ch solution-ch))
-            initial-ch clause)))
+            initial-ch
+            ;; process subqueries before other patterns
+            (into (vec subquery-patterns) other-patterns))))
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
@@ -650,6 +659,12 @@
                     (async/pipe minus-ch)
                     (async/<!))
         solution))))
+
+(defmethod match-pattern :query
+  [ds fuel-tracker solution pattern error-ch]
+  (let [subquery-fn (pattern-data pattern)
+        out-ch (async/chan 2 (map (fn [soln] (merge solution soln))))]
+    (async/pipe (subquery-fn ds fuel-tracker error-ch) out-ch)))
 
 (defmethod match-pattern :graph
   [ds fuel-tracker solution pattern error-ch]
