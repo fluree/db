@@ -444,6 +444,10 @@
       (get-first k)
       get-value))
 
+(defn get-values
+  [json-ld k]
+  (mapv get-value (get json-ld k)))
+
 (defn get-id
   [json-ld]
   (or (:id json-ld)
@@ -494,3 +498,10 @@
   (some->> (get json-ld k)
            unwrap-list
            (keep get-id)))
+
+(defn get-graph
+  [jsonld]
+  (cond
+    (contains? jsonld :graph)   (:graph jsonld)
+    (contains? jsonld "@graph") (get jsonld "@graph")
+    :else                       jsonld))

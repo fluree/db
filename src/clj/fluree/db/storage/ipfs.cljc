@@ -13,10 +13,16 @@
   (str/join "/" ["" method local]))
 
 (defn ipfs-address
-  [path]
-  (storage/build-fluree-address method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord IpfsStore [endpoint]
+(defrecord IpfsStore [identifier endpoint]
+  storage/Addressable
+  (location [_]
+    (storage/build-location storage/fluree-namespace identifier method-name))
+  storage/Identifiable
+  (identifiers [_]
+    #{identifier})
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go-try
@@ -30,7 +36,7 @@
           (json/parse data keywordize?)))))
 
   storage/ContentAddressedStore
-  (-content-write [_ path v]
+  (-content-write-bytes [_ path v]
     (go-try
       (let [content (if (string? v)
                       v
@@ -44,9 +50,11 @@
               {:status 500 :error :db/push-ipfs :result res})))
         {:path    hash
          :hash    hash
-         :address (ipfs-address hash)
+         :address (ipfs-address identifier hash)
          :size    size}))))
 
 (defn open
-  [endpoint]
-  (->IpfsStore endpoint))
+  ([endpoint]
+   (open nil endpoint))
+  ([identifier endpoint]
+   (->IpfsStore identifier endpoint)))

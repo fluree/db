@@ -769,11 +769,13 @@
         bound-vars    (-> where where/bound-variables (into vars))
         delete-clause (-> txn
                           (util/get-first-value const/iri-delete)
-                          (json-ld/expand context))
+                          (json-ld/expand context)
+                          util/get-graph)
         delete        (->> delete-clause util/sequential (parse-triples bound-vars context))
         insert-clause (-> txn
                           (util/get-first-value const/iri-insert)
-                          (json-ld/expand context))
+                          (json-ld/expand context)
+                          util/get-graph)
         insert        (->> insert-clause util/sequential (parse-triples bound-vars context))
         annotation    (util/get-first-value txn const/iri-annotation)]
     (when (and (empty? insert) (empty? delete))

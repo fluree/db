@@ -7,25 +7,33 @@
 (def method-name "memory")
 
 (defn memory-address
-  [path]
-  (storage/build-fluree-address method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord MemoryStore [contents]
+(defrecord MemoryStore [identifier contents]
+  storage/Addressable
+  (location [_]
+    (storage/build-location storage/fluree-namespace identifier method-name))
+
+  storage/Identifiable
+  (identifiers [_]
+    #{identifier})
+
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go
-      (let [path (:local (storage/parse-address address))]
+      (let [path (storage/get-local-path address)]
         (when-let [data (get @contents path)]
           (json/parse data keywordize?)))))
 
   storage/EraseableStore
   (delete [_ address]
     (go
-      (let [path (:local (storage/parse-address address))]
+      (let [path (storage/get-local-path address)]
         (swap! contents dissoc path))))
 
   storage/ContentAddressedStore
-  (-content-write [_ _ v]
+  (-content-write-bytes [_ _ v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v
@@ -33,7 +41,7 @@
             hash     (crypto/sha2-256 hashable)]
         (swap! contents assoc hash v)
         {:path    hash
-         :address (memory-address hash)
+         :address (memory-address identifier hash)
          :hash    hash
          :size    (count hashable)})))
 
@@ -46,7 +54,9 @@
     (go
       (get @contents path))))
 
-(defn create
-  []
-  (let [contents (atom {})]
-    (->MemoryStore contents)))
+(defn open
+  ([]
+   (open nil))
+  ([identifier]
+   (let [contents (atom {})]
+     (->MemoryStore identifier contents))))

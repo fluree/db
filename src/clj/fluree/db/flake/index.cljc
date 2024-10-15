@@ -281,7 +281,7 @@
         (fn [_]
           (resolve-t-range node-resolver node novelty from-t to-t))))))
 
-(defn index-store->t-range-resolver
+(defn index-catalog->t-range-resolver
   [{:keys [cache] :as idx-store} novelty from-t to-t]
   (->CachedTRangeResolver idx-store novelty from-t to-t cache))
 

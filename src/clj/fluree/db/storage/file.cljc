@@ -15,14 +15,22 @@
 
 (defn storage-path
   [root address]
-  (let [relative-path (:local (storage/parse-address address))]
+  (let [relative-path (storage/get-local-path address)]
     (full-path root relative-path)))
 
 (defn file-address
-  [path]
-  (storage/build-fluree-address method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord FileStore [root]
+(defrecord FileStore [identifier root]
+  storage/Addressable
+  (location [_]
+    (storage/build-location storage/fluree-namespace identifier method-name))
+
+  storage/Identifiable
+  (identifiers [_]
+    #{identifier})
+
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go-try
@@ -36,7 +44,7 @@
       (fs/delete-file path)))
 
   storage/ContentAddressedStore
-  (-content-write [_ dir data]
+  (-content-write-bytes [_ dir data]
     (go-try
       (when (not (storage/hashable? data))
         (throw (ex-info "Must serialize data before writing to FileStore."
@@ -52,7 +60,7 @@
                        data)]
         (<? (fs/write-file absolute bytes))
         {:path    path
-         :address (file-address path)
+         :address (file-address identifier path)
          :hash    hash
          :size    (count bytes)})))
 
@@ -68,5 +76,7 @@
         fs/read-file)))
 
 (defn open
-  [root-path]
-  (->FileStore root-path))
+  ([root-path]
+   (open nil root-path))
+  ([identifier root-path]
+   (->FileStore identifier root-path)))

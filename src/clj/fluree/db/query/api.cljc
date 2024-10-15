@@ -187,8 +187,7 @@
   (go-try
     (try*
       (let [[alias explicit-t] (extract-query-string-t alias)
-            address      (<? (connection/primary-address conn alias))
-            ledger       (<? (connection/load-ledger conn address))
+            ledger       (<? (connection/load-ledger-alias conn alias))
             db           (ledger/current-db ledger)
             t*           (or explicit-t t)
             query*       (assoc sanitized-query :t t*)]

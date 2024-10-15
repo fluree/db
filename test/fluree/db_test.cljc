@@ -727,7 +727,7 @@
                                                             test-utils/default-context
                                                             {:ex "http://example.org/ns/"}]
                                                 "insert"   test-utils/people}
-                                           {:maxFuel 1})]
+                                           {:max-fuel 1})]
                (is (re-find #"Fuel limit exceeded"
                             (-> response ex-cause ex-message))))))
          (testing "queries"
