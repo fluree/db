@@ -19,6 +19,18 @@
           (is (= [["Alice" 3] ["Brian" 1] ["Cam" 2] ["Liam" 2]]
                  subject)
               "aggregates bindings within each group")))
+      (testing "with data function syntax"
+        (let [qry     {:context  [test-utils/default-str-context
+                                  {"ex" "http://example.org/ns/"}]
+                       :select   ["?upperName" ["expr" ["count" "?favNums"]]]
+                       :where    [{"schema:name" "?name"
+                                   "ex:favNums"  "?favNums"}
+                                  ["bind" "?upperName" ["expr" ["ucase" "?name"]]]]
+                       :group-by "?upperName"}
+              subject @(fluree/query db qry)]
+          (is (= [["ALICE" 3] ["BRIAN" 1] ["CAM" 2] ["LIAM" 2]]
+                 subject)
+              "aggregates bindings within each group")))
       (testing "with singular function selector"
         (let [qry     {:context  [test-utils/default-context
                                   {:ex "http://example.org/ns/"}]
