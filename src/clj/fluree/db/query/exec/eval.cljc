@@ -351,66 +351,78 @@
        :cljs (js/Date.))
     const/iri-xsd-dateTime))
 
-(defn year
+(defn ->localdatetime
   [{datetime :value}]
+  (cond (instance? OffsetDateTime datetime)
+        (.toLocalDateTime ^OffsetDateTime datetime)
+        (string? datetime)
+        (let [datetime* (datatype/coerce datetime const/iri-xsd-dateTime)]
+          (if (instance? OffsetDateTime datetime)
+            (.toLocalDateTime ^OffsetDateTime datetime*)
+            datetime*))
+        :else
+        datetime))
+
+(defn year
+  [datetime]
   (where/->typed-val
-    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
-                         (.toLocalDateTime ^OffsetDateTime datetime)
-                         datetime)]
-               (.getYear ^LocalDateTime ldt))
-       :cljs (.getFullYear datetime))))
+    #?(:clj  (.getYear ^LocalDateTime (->localdatetime datetime))
+       :cljs (.getFullYear (if (string? datetime)
+                             (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                             datetime)))))
 
 (defn month
-  [{datetime :value}]
+  [datetime]
   (where/->typed-val
-    #?(:clj (let [ldt (if (instance? OffsetDateTime datetime)
-                        (.toLocalDateTime ^OffsetDateTime datetime)
-                        datetime)]
-              (.getMonthValue ^LocalDateTime ldt))
-       :cljs (.getMonth datetime))))
+    #?(:clj  (.getMonthValue ^LocalDateTime (->localdatetime datetime))
+       :cljs (.getMonth (if (string? datetime)
+                          (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                          datetime)))))
 
 (defn day
-  [{datetime :value}]
+  [datetime]
   (where/->typed-val
-    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
-                         (.toLocalDateTime ^OffsetDateTime datetime)
-                         datetime)]
-               (.getDayOfMonth ^LocalDateTime ldt))
-       :cljs (.getDate datetime))))
+    #?(:clj  (.getDayOfMonth ^LocalDateTime (->localdatetime datetime))
+       :cljs (.getDate (if (string? datetime)
+                          (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                          datetime)))))
 
 (defn hours
-  [{datetime :value}]
+  [datetime]
   (where/->typed-val
-    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
-                         (.toLocalDateTime ^OffsetDateTime datetime)
-                         datetime)]
-               (.getHour ^LocalDateTime ldt))
-       :cljs (.getHours datetime))))
+    #?(:clj  (.getHour ^LocalDateTime (->localdatetime datetime))
+       :cljs (.getHours (if (string? datetime)
+                          (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                          datetime)))))
 
 (defn minutes
-  [{datetime :value}]
+  [datetime]
   (where/->typed-val
-    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
-                         (.toLocalDateTime ^OffsetDateTime datetime)
-                         datetime)]
-               (.getMinute ^LocalDateTime ldt))
-       :cljs (.getMinutes datetime))))
+    #?(:clj  (.getMinute ^LocalDateTime (->localdatetime datetime))
+       :cljs (.getMinutes (if (string? datetime)
+                            (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                            datetime)))))
 
 (defn seconds
-  [{datetime :value}]
+  [datetime]
   (where/->typed-val
-    #?(:clj  (let [ldt (if (instance? OffsetDateTime datetime)
-                         (.toLocalDateTime ^OffsetDateTime datetime)
-                         datetime)]
-               (.getSecond ^LocalDateTime ldt))
-       :cljs (.getSeconds datetime))))
+    #?(:clj  (.getSecond ^LocalDateTime (->localdatetime datetime))
+       :cljs (.getSeconds (if (string? datetime)
+                            (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                            datetime)))))
 
 (defn tz
-  [{datetime :value}]
+  [{datetime :value dt :datatype-iri}]
   (where/->typed-val
-    #?(:clj  (when (instance? OffsetDateTime datetime)
-               (.toString (.getOffset ^OffsetDateTime datetime)))
-       :cljs (.getTimeZoneOffset ^js/Date datetime))))
+    #?(:clj  (cond (instance? OffsetDateTime datetime)
+                   (.toString (.getOffset ^OffsetDateTime datetime))
+                   (string? datetime)
+                   (let [datetime* (datatype/coerce datetime dt)]
+                     (when (instance? OffsetDateTime datetime*)
+                       (.toString (.getOffset ^OffsetDateTime datetime)))))
+       :cljs (.getTimeZoneOffset ^js/Date (if (string? datetime)
+                                            (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                                            datetime)))))
 
 (defn sha256
   [{x :value}]
