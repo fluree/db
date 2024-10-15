@@ -71,20 +71,20 @@
   ns-proto/iNameService
   (-lookup [_ ledger-address] (remote-lookup conn-state server-state ledger-address))
   (-lookup [_ ledger-address opts] (remote-lookup conn-state server-state ledger-address)) ;; TODO - doesn't support branch yet
-  (-push [_ commit-data] (throw (ex-info "Unsupported RemoteNameService op: push" {})))
-  (-subscribe [nameservice ledger-alias callback] (subscribe conn-state ledger-alias callback))
-  (-unsubscribe [nameservice ledger-alias] (unsubscribe conn-state ledger-alias))
   (-sync? [_] sync?)
-  (-ledgers [nameservice opts] (throw (ex-info "Unsupported RemoteNameService op: ledgers" {})))
   (-address [_ ledger-alias {:keys [branch]:as _opts}]
     (go (if (and branch (not= "main" branch))
           (str ledger-alias "(" branch ")")
           ledger-alias)))
   (-alias [_ ledger-address]
     ledger-address)
-  (-close [nameservice]
+  (-close [_]
     (async/close! msg-in)
-    (async/close! msg-out)))
+    (async/close! msg-out))
+
+  ns-proto/Publication
+  (-subscribe [_ ledger-alias callback] (subscribe conn-state ledger-alias callback))
+  (-unsubscribe [_ ledger-alias] (unsubscribe conn-state ledger-alias)))
 
 (defn initialize
   [server-state conn-state]
