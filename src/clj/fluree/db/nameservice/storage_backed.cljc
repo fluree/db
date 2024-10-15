@@ -10,9 +10,9 @@
   [ledger-alias]
   (str ledger-alias ".json"))
 
-(defrecord StorageBackedNameService [address-prefix store sync?]
+(defrecord StorageBackedNameService [address-prefix store]
   nameservice/Publisher
-  (-push [_ commit-jsonld]
+  (publish [_ commit-jsonld]
     (go-try
       (let [ledger-alias (get commit-jsonld "alias")
             ns-address   (nameservice/full-address address-prefix ledger-alias)
@@ -22,7 +22,7 @@
         (<? (storage/write-bytes store filename record-bytes)))))
 
   nameservice/iNameService
-  (-lookup [_ ledger-address]
+  (lookup [_ ledger-address]
     (go-try
       (let [{:keys [alias _branch]} (nameservice/resolve-address address-prefix ledger-address nil)
             filename                (local-filename alias)]
@@ -34,12 +34,9 @@
     (go
       (str address-prefix ledger-alias)))
 
-  (-sync? [_]
-    sync?)
-
   (-close [_]
     true))
 
 (defn start
-  [address-prefix store sync?]
-  (->StorageBackedNameService address-prefix store sync?))
+  [address-prefix store]
+  (->StorageBackedNameService address-prefix store))

@@ -20,9 +20,10 @@
       :index (:address prev-index))))
 
 (defn trace-idx-roots
-  [conn commit]
+  [index-store commit]
   (go-try
-   (loop [next-idx-root (<! (storage/read-db-root conn (-> commit :index :address)))
+    (loop [next-idx-root (<! (storage/read-db-root index-store
+                                                   (-> commit :index :address)))
           garbage       []]
      (if (or (nil? next-idx-root) ;; no more idx-roots
              (util/exception? next-idx-root)) ;; if idx-root already deleted, will be exception
@@ -32,7 +33,7 @@
              garbage*      (if garbage-meta
                              (conj garbage garbage-meta)
                              garbage)]
-         (recur (<! (storage/read-db-root conn prev-idx-addr))
+         (recur (<! (storage/read-db-root index-store prev-idx-addr))
                 garbage*))))))
 
 (defn clean-garbage-record
@@ -43,9 +44,9 @@
    :branch 'main',
    :garbage ['fluree:file://.../index/segment/1.json', ...]
    :t 1}"
-  [conn {:keys [address index t] :as _garbage-map}]
+  [index-store {:keys [address index t] :as _garbage-map}]
   (go
-    (let [{:keys [alias branch garbage]} (<! (storage/read-garbage conn address))]
+    (let [{:keys [alias branch garbage]} (<! (storage/read-garbage index-store address))]
       (log/info "Removing" (count garbage) "unused index segments (garbage) from ledger"
                 alias "branch" branch "from index-t of" t)
 
@@ -55,13 +56,13 @@
         ;; this might happen if the server shutdown in the middle of a garbage
         ;; exceptions are logged downstream, so just swallow exception here
         ;; and keep rocessing.
-        (<! (storage/delete-garbage-item conn garbage-item)))
+        (<! (storage/delete-garbage-item index-store garbage-item)))
 
       ;; delete main garbage record
-      (<! (storage/delete-garbage-item conn address))
+      (<! (storage/delete-garbage-item index-store address))
 
       ;; then delete the parent index root
-      (<! (storage/delete-garbage-item conn index)))))
+      (<! (storage/delete-garbage-item index-store index)))))
 
 (defn clean-garbage
   "Cleans up garbage data for old indexes, but retains
@@ -74,10 +75,10 @@
   expected timeframe. The frequency of new indexes being created is
   dependent on the frequency and size of updates that is ledger-specific
   against the ledger's 'reindex-min-bytes' setting."
-  [{:keys [conn commit] :as _db} max-indexes]
+  [{:keys [index-store commit] :as _db} max-indexes]
   (go
     (if (nat-int? max-indexes)
-      (let [all-garbage (<? (trace-idx-roots conn commit))
+      (let [all-garbage (<? (trace-idx-roots index-store commit))
             to-clean    (->> all-garbage
                              (drop max-indexes)
                              (sort-by :t)) ;; clean oldest 't' value first
@@ -88,7 +89,7 @@
             (log/info "Starting garbage collection of oldest"
                       (count to-clean) "indexes.")
             (doseq [next-garbage to-clean]
-              (<! (clean-garbage-record conn next-garbage)))
+              (<! (clean-garbage-record index-store next-garbage)))
             (log/info "Finished garbage collection of oldest"
                       (count to-clean) "indexes in"
                       (- (util/current-time-millis) start-time) "ms.")

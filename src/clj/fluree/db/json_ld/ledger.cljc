@@ -8,17 +8,6 @@
 ;; methods to link/trace back a ledger and return flakes
 #?(:clj (set! *warn-on-reflection* true))
 
-(def class+property-iris #{const/iri-class
-                           "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
-                           "http://www.w3.org/2002/07/owl#Class"
-                           "http://www.w3.org/2002/07/owl#ObjectProperty"
-                           "http://www.w3.org/2002/07/owl#DatatypeProperty"})
-
-
-(defn class-or-property?
-  [{:keys [type] :as _node}]
-  (some class+property-iris (util/sequential type)))
-
 (def ^:const predefined-properties
   (merge datatype/default-data-types
          {"http://www.w3.org/1999/02/22-rdf-syntax-ns#Property" const/$rdf:Property
@@ -88,22 +77,14 @@
           "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint" const/sh_qualifiedValueShapesDisjoint
           }))
 
+(def class+property-iris #{const/iri-class
+                           "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
+                           "http://www.w3.org/2002/07/owl#Class"
+                           "http://www.w3.org/2002/07/owl#ObjectProperty"
+                           "http://www.w3.org/2002/07/owl#DatatypeProperty"})
+
 (def class-or-property-sid
   (into #{} (map predefined-properties class+property-iris)))
-
-(def predefined-sids
-  (set/map-invert predefined-properties))
-
-(defn predefined-sids-compact
-  "Allows predefined sids to be mapped to values based on supplied compacting function
-  generated from a context"
-  [compact-fn]
-  (reduce-kv
-    (fn [acc sid iri]
-      (let [compacted-iri (json-ld/compact iri compact-fn)]
-        (assoc acc sid compacted-iri)))
-    {}
-    predefined-sids))
 
 (def predicate-refs
   "The following predicates have objects that are refs to other predicates."

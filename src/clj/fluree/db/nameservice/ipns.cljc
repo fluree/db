@@ -2,7 +2,7 @@
   (:require [clojure.string :as str]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.method.ipfs.core :as ipfs]
+            [fluree.db.method.ipfs :as ipfs]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.util.log :as log]))
@@ -30,7 +30,7 @@
 
 (defn lookup-address
   "Given IPNS address, performs lookup and returns latest ledger address."
-  [ipfs-endpoint ipns-profile ledger-name opts]
+  [ipfs-endpoint ipns-profile ledger-name]
   (go-try
     (let [ipns-address (if-let [[proto address ledger] (address-parts ledger-name)]
                          address
@@ -42,7 +42,7 @@
 
 (defn ipns-address
   "Returns IPNS address for a given ipns profile and ledger alias."
-  [ipfs-endpoint ipns-profile ledger-alias opts]
+  [ipfs-endpoint ipns-profile ledger-alias _branch]
   (go-try
     (log/debug "Getting address for ledger alias:" ledger-alias)
     (let [base-address (<? (ipfs-keys/address ipfs-endpoint ipns-profile))]
@@ -55,17 +55,15 @@
                                "Therefore, unable to get address for ledger: " ledger-alias)
                           {:status 400 :error :db/ipns-profile})))))))
 
-(defrecord IpnsNameService
-  [ipfs-endpoint ipns-key base-address sync?]
+(defrecord IpnsNameService [ipfs-endpoint ipns-key base-address?]
   nameservice/Publisher
-  (-push [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
+  (publish [_ commit-data] (ipfs/push! ipfs-endpoint commit-data))
 
   nameservice/iNameService
-  (-lookup [_ ledger-alias] (lookup-address ipfs-endpoint ipns-key ledger-alias nil))
-  (-lookup [_ ledger-alias opts] (lookup-address ipfs-endpoint ipns-key ledger-alias opts))
-  (-sync? [_] sync?)
-  (-address [_ ledger-alias opts]
-    (ipns-address ipfs-endpoint ipns-key ledger-alias opts))
+  (lookup [_ ledger-alias]
+    (lookup-address ipfs-endpoint ipns-key ledger-alias))
+  (-address [_ ledger-alias branch]
+    (ipns-address ipfs-endpoint ipns-key ledger-alias branch))
   (-alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
       alias))
@@ -81,5 +79,4 @@
                         {:status 400 :error :db/ipfs-keys})))
       (map->IpnsNameService {:ipfs-endpoint ipfs-endpoint
                              :ipns-key      ipns-key
-                             :base-address  base-address
-                             :sync?         false}))))
+                             :base-address  base-address}))))
