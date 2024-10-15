@@ -269,9 +269,6 @@
         dt-b  (or dt-b (datatype/infer-iri val-b))
         val-b (or (and (some? val-b) (datatype/coerce val-b dt-b)) val-b)]
     (cond
-      (= dt-a dt-b)
-      (compare val-a val-b)
-
       ;; can compare across types
       (or (and (contains? comparable-numeric-datatypes dt-a)
                (contains? comparable-numeric-datatypes dt-b))
@@ -283,6 +280,10 @@
       (and (contains? comparable-time-datatypes dt-a)
            (contains? comparable-time-datatypes dt-b))
       (compare (to-odt val-a) (to-odt val-b))
+
+      ;; same types compare
+      (= dt-a dt-b)
+      (compare val-a val-b)
 
       :else
       (throw (ex-info (str "Incomparable datatypes: " dt-a " and " dt-b)
