@@ -23,8 +23,7 @@
              (with-open [out (io/output-stream (io/file path))]
                (.write out val))
              (catch Exception e
-               (log/error (str "Unable to create storage directory: " path
-                               " with error: " (.getMessage e) "."))
+               (log/error e "Unable to create storage directory:" path ".")
                (log/error (str "Fatal Error, shutting down!"))
                (System/exit 1))))
          (catch Exception e (throw e))))
@@ -39,8 +38,7 @@
                (try
                  (fs/writeFileSync path val)
                  (catch :default e
-                   (log/error (str "Unable to write file to path " path
-                                   " with error: " ^String (.-message e) "."))
+                   (log/error e "Unable to write file to path" path ".")
                    (log/error (str "Fatal Error, shutting down! "
                                    {"errno"   ^String (.-errno e)
                                     "syscall" ^String (.-syscall e)
@@ -48,8 +46,7 @@
                                     "path"    (.-path e)}))
                    (js/process.exit 1)))
                (catch :default e
-                 (log/error (str "Unable to create storage directory: " path
-                                 " with error: " ^String (.-message e) "."))
+                 (log/error e "Unable to create storage directory:" path ".")
                  (log/error (str "Fatal Error, shutting down!"))
                  (js/process.exit 1)))
              (throw (ex-info "Error writing file."

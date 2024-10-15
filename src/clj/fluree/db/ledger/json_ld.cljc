@@ -13,8 +13,7 @@
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
-            [fluree.db.nameservice.proto :as ns-proto]
-            [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.connection :as connection :refer [register-ledger release-ledger]]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.json-ld :as json-ld]
@@ -380,7 +379,7 @@
   [conn db-alias commit-map]
   (or (get-first-value commit-map const/iri-alias)
       (->> (connection/-nameservices conn)
-           (some #(ns-proto/-alias % db-alias)))))
+           (some #(nameservice/-alias % db-alias)))))
 
 ;; TODO - once we have a different delimiter than `/` for branch/t-value this can simplified
 (defn address->alias

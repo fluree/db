@@ -47,4 +47,5 @@
 
 (defprotocol ByteStore
   "ByteStore is used by consensus to replicate files across servers"
-  (write-bytes [store address bytes] "Async writes bytes to store based on address."))
+  (write-bytes [store path bytes] "Async writes bytes to path in store.")
+  (read-bytes [store path] "Async read bytes from path in store."))

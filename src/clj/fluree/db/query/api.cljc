@@ -16,9 +16,8 @@
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.reasoner :as reasoner]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -28,7 +27,7 @@
   details included."
   [db query]
   (go-try
-    (let [context (ctx-util/extract query)]
+    (let [context (context/extract query)]
       (<? (history/query db context query)))))
 
 (defn sanitize-query-options
