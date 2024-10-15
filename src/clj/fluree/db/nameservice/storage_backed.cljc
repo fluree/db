@@ -1,5 +1,6 @@
 (ns fluree.db.nameservice.storage-backed
   (:require [clojure.core.async :refer [go]]
+            [clojure.string :as str]
             [fluree.db.storage :as storage]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
@@ -30,9 +31,16 @@
           (let [ns-record (json/parse record-bytes false)]
             (nameservice/commit-address-from-record ns-record nil))))))
 
-  (-address [_ ledger-alias _branch]
+  (address [_ ledger-alias]
     (go
       (str address-prefix ledger-alias)))
+
+  (alias [_ ledger-address]
+    ;; TODO: need to validate that the branch doesn't have a slash?
+    (-> (nameservice/address-path ledger-address)
+        (str/split #"/")
+        (->> (drop-last 2) ; branch-name, head
+             (str/join #"/"))))
 
   (-close [_]
     true))

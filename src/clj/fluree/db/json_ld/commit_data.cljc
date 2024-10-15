@@ -245,12 +245,6 @@
   [commit commit-id]
   (assoc commit :id commit-id))
 
-(defn update-commit-address
-  "Once a commit address is known, which might be after the commit is written
-  if IPFS, add the final address into the commit map."
-  [commit commit-address]
-  (assoc commit :address commit-address))
-
 (defn commit-json->commit-id
   [jld]
   (let [b32-hash (-> jld

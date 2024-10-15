@@ -109,14 +109,10 @@
     (go-try
       (let [db (<? db-chan)]
         (<? (transact/-stage-txn db fuel-tracker context identity author annotation raw-txn parsed-txn)))))
-  (-merge-commit [_ new-commit]
+  (-merge-commit [_ commit-jsonld commit-data-jsonld]
     (go-try
       (let [db (<? db-chan)]
-        (<? (transact/-merge-commit db new-commit)))))
-  (-merge-commit [_ new-commit proof]
-    (go-try
-      (let [db (<? db-chan)]
-        (<? (transact/-merge-commit db new-commit proof)))))
+        (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld)))))
 
   indexer/Indexable
   (index [_ changes-ch]
@@ -192,18 +188,18 @@
   [db]
   (select-keys db [:alias :branch :t]))
 
-#?(:cljs
+#?(:clj
+   (defmethod print-method AsyncDB [^AsyncDB db, ^Writer w]
+     (.write w label)
+     (binding [*out* w]
+       (-> db display pr)))
+
+   :cljs
    (extend-type AsyncDB
      IPrintWithWriter
      (-pr-writer [db w _opts]
        (-write w label)
        (-write w (-> db display pr)))))
-
-#?(:clj
-   (defmethod print-method AsyncDB [^AsyncDB db, ^Writer w]
-     (.write w label)
-     (binding [*out* w]
-       (-> db display pr))))
 
 (defmethod pprint/simple-dispatch AsyncDB
   [db]
@@ -221,11 +217,12 @@
   (:db-chan async-db))
 
 (defn load
-  [conn ledger-alias branch commit-jsonld indexing-opts]
+  [ledger-alias branch commit-store index-store commit-jsonld indexing-opts]
   (let [commit-map (commit-data/jsonld->clj commit-jsonld)
         t          (-> commit-map :data :t)
         async-db   (->AsyncDB ledger-alias branch commit-map t (async/promise-chan))]
     (go
-      (let [db (<! (flake-db/load conn ledger-alias branch [commit-jsonld commit-map] indexing-opts))]
+      (let [db (<! (flake-db/load ledger-alias commit-store index-store branch
+                                  [commit-jsonld commit-map] indexing-opts))]
         (deliver! async-db db)))
     async-db))

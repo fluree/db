@@ -3,9 +3,7 @@
   that are directly exposed"
   (:require [clojure.string :as str]
             [fluree.db.util.context :as context]
-            [fluree.json-ld :as json-ld]
             [fluree.db.fuel :as fuel]
-            [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.dataset :as dataset :refer [dataset?]]
@@ -17,7 +15,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.nameservice :as nameservice]
+            [fluree.db.connection :as connection]
             [fluree.db.reasoner :as reasoner]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -48,7 +46,7 @@
      (if-let [rule-source (first rule-sources)]
        (let [updated-rule-results (into rule-results
                                     (if (string? rule-source)
-                                      (ledger/-db (<? (jld-ledger/load conn rule-source)))
+                                      (ledger/current-db (<? (connection/load-ledger conn rule-source)))
                                       rule-source))]
          (recur (rest rule-sources) updated-rule-results))
        rule-results))))
@@ -187,18 +185,18 @@
 (defn load-alias
   [conn alias {:keys [t] :as sanitized-query}]
   (go-try
-   (try*
-     (let [[alias explicit-t] (extract-query-string-t alias)
-           address (<? (nameservice/primary-address conn alias nil))
-           ledger  (<? (jld-ledger/load conn address))
-           db      (ledger/-db ledger)
-           t*      (or explicit-t t)
-           query*  (assoc sanitized-query :t t*)]
-       (<? (restrict-db db query* conn)))
-     (catch* e
-             (throw (contextualize-ledger-400-error
-                     (str "Error loading ledger " alias ": ")
-                     e))))))
+    (try*
+      (let [[alias explicit-t] (extract-query-string-t alias)
+            address      (<? (connection/primary-address conn alias))
+            ledger       (<? (connection/load-ledger conn address))
+            db           (ledger/current-db ledger)
+            t*           (or explicit-t t)
+            query*       (assoc sanitized-query :t t*)]
+        (<? (restrict-db db query* conn)))
+      (catch* e
+              (throw (contextualize-ledger-400-error
+                       (str "Error loading ledger " alias ": ")
+                       e))))))
 
 (defn load-aliases
   [conn aliases sanitized-query]

@@ -4,8 +4,7 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.transact :as tx]
-            [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.nameservice :as nameservice]
+            [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.context :as ctx-util]
@@ -89,7 +88,7 @@
                         txn
                         (q-parse/parse-txn expanded txn-context))
           parsed-opts (parse-opts expanded opts txn-context)
-          staged      (<? (stage-triples (ledger/-db ledger) triples parsed-opts))
+          staged      (<? (stage-triples (ledger/current-db ledger) triples parsed-opts))
 
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
@@ -97,11 +96,12 @@
           ;; possible keys at f.d.ledger.json-ld/enrich-commit-opts
           cmt-opts (dissoc parsed-opts :context :identity)]
       (if (track-fuel? parsed-opts)
-        (assoc staged :result (<? (ledger/-commit! ledger (:result staged) cmt-opts)))
-        (<? (ledger/-commit! ledger staged cmt-opts))))))
+        (assoc staged :result (<? (ledger/commit! ledger (:result staged) cmt-opts)))
+        (<? (ledger/commit! ledger staged cmt-opts))))))
 
 (defn transact!
-  ([conn txn] (transact! conn txn nil))
+  ([conn txn]
+   (transact! conn txn nil))
   ([conn txn override-opts]
    (go-try
      (let [expanded  (json-ld/expand (ctx-util/use-fluree-context txn))
@@ -113,10 +113,10 @@
        (<? (transact! conn ledger-id expanded opts*)))))
   ([conn ledger-id txn override-opts]
    (go-try
-     (let [address (<? (nameservice/primary-address conn ledger-id nil))]
-       (if-not (<? (nameservice/exists? conn address))
+     (let [address (<? (connection/primary-address conn ledger-id))]
+       (if-not (<? (connection/ledger-exists? conn address))
          (throw (ex-info "Ledger does not exist" {:ledger address}))
-         (let [ledger (<? (jld-ledger/load conn address))]
+         (let [ledger (<? (connection/load-ledger conn address))]
            (<? (transact-ledger! ledger txn override-opts))))))))
 
 (defn credential-transact!
@@ -140,12 +140,12 @@
           txn-context (or (ctx-util/txn-context txn)
                           context) ;; parent context from credential if present
           ledger-id   (extract-ledger-id expanded)
-          address     (<? (nameservice/primary-address conn ledger-id nil))
+          address     (<? (connection/primary-address conn ledger-id))
           parsed-opts (parse-opts expanded override-opts txn-context)]
-      (if (<? (nameservice/exists? conn address))
+      (if (<? (connection/ledger-exists? conn address))
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
-        (let [ledger (<? (jld-ledger/create conn ledger-id parsed-opts))]
+        (let [ledger (<? (connection/create-ledger conn ledger-id parsed-opts))]
           (<? (transact-ledger! ledger expanded (assoc parsed-opts :expanded? true)))))))))
 
 (defn credential-create-with-txn!
