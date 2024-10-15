@@ -15,7 +15,8 @@
             [fluree.crypto :as crypto]
             [fluree.db.constants :as const]
             [clojure.math :as math])
-  #?(:clj (:import (java.time LocalDate LocalDateTime OffsetDateTime ZoneId ZoneOffset))))
+  #?(:clj (:import (java.time LocalDateTime OffsetDateTime LocalDate OffsetTime LocalTime
+                              ZoneId ZoneOffset))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -256,10 +257,14 @@
   #{const/iri-xsd-dateTime
     const/iri-xsd-date})
 
-(defmulti to-odt type)
-(defmethod to-odt OffsetDateTime [^OffsetDateTime datetime] datetime)
-(defmethod to-odt LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC)))
-(defmethod to-odt LocalDate [^LocalDate date] (.atStartOfDay date))
+(defmulti ->offset-date-time type)
+(defmethod ->offset-date-time OffsetDateTime [^OffsetDateTime datetime] datetime)
+(defmethod ->offset-date-time LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC)))
+(defmethod ->offset-date-time LocalDate [^LocalDate date] (.atStartOfDay date))
+
+(defmulti ->offset-time type)
+(defmethod ->offset-time OffsetTime [^OffsetTime time] time)
+(defmethod ->offset-time LocalTime [^LocalTime time] (.atOffset time (ZoneOffset/UTC)))
 
 (defn compare*
   [{val-a :value dt-a :datatype-iri}
@@ -279,7 +284,7 @@
       ;; datetimes need to be converted to OffsetDateTimes for proper comparison
       (and (contains? comparable-time-datatypes dt-a)
            (contains? comparable-time-datatypes dt-b))
-      (compare (to-odt val-a) (to-odt val-b))
+      (compare (->offset-date-time val-a) (->offset-date-time val-b))
 
       ;; same types compare
       (= dt-a dt-b)
@@ -372,7 +377,7 @@
 (defn year
   [datetime]
   (where/->typed-val
-    #?(:clj  (.getYear ^OffsetDateTime (to-odt (:value datetime)))
+    #?(:clj  (.getYear ^OffsetDateTime (->offset-date-time (:value datetime)))
        :cljs (.getFullYear (if (string? datetime)
                              (datatype/coerce (:value datetime) (:datatype-iri datetime))
                              datetime)))))
@@ -380,7 +385,7 @@
 (defn month
   [datetime]
   (where/->typed-val
-    #?(:clj  (.getMonthValue ^OffsetDateTime (to-odt (:value datetime)))
+    #?(:clj  (.getMonthValue ^OffsetDateTime (->offset-date-time (:value datetime)))
        :cljs (.getMonth (if (string? datetime)
                           (datatype/coerce (:value datetime) (:datatype-iri datetime))
                           datetime)))))
@@ -388,39 +393,57 @@
 (defn day
   [datetime]
   (where/->typed-val
-    #?(:clj  (.getDayOfMonth ^OffsetDateTime (to-odt (:value datetime)))
+    #?(:clj  (.getDayOfMonth ^OffsetDateTime (->offset-date-time (:value datetime)))
        :cljs (.getDate (if (string? datetime)
                           (datatype/coerce (:value datetime) (:datatype-iri datetime))
                           datetime)))))
 
 (defn hours
-  [datetime]
+  [x]
   (where/->typed-val
-    #?(:clj  (.getHour ^OffsetDateTime (to-odt (:value datetime)))
-       :cljs (.getHours (if (string? datetime)
-                          (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                          datetime)))))
+    #?(:clj
+       (condp contains? (:datatype-iri x)
+         #{const/iri-xsd-dateTime const/iri-xsd-date}
+         (.getHour ^OffsetDateTime (->offset-date-time (:value x)))
+         const/iri-xsd-time
+         (.getHour ^OffsetTime (->offset-time (:value x))))
+       :cljs
+       (.getHours (if (string? x)
+                    (datatype/coerce (:value x) (:datatype-iri x))
+                    datetime)))))
 
 (defn minutes
-  [datetime]
+  [x]
   (where/->typed-val
-    #?(:clj  (.getMinute ^OffsetDateTime (to-odt (:value datetime)))
-       :cljs (.getMinutes (if (string? datetime)
-                            (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                            datetime)))))
+    #?(:clj  (condp contains? (:datatype-iri x)
+               #{const/iri-xsd-dateTime const/iri-xsd-date}
+               (.getMinute ^OffsetDateTime (->offset-date-time (:value x)))
+               #{const/iri-xsd-time}
+               (.getMinute ^OffsetTime (->offset-time (:value x))))
+       :cljs (.getMinutes (if (string? x)
+                            (datatype/coerce (:value x) (:datatype-iri x))
+                            x)))))
 
 (defn seconds
-  [datetime]
+  [x]
   (where/->typed-val
-    #?(:clj  (.getSecond ^OffsetDateTime (to-odt (:value datetime)))
-       :cljs (.getSeconds (if (string? datetime)
-                            (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                            datetime)))))
+    #?(:clj (condp contains? (:datatype-iri x)
+              #{const/iri-xsd-dateTime const/iri-xsd-date}
+              (.getSecond ^OffsetDateTime (->offset-date-time (:value x)))
+              #{const/iri-xsd-time}
+              (.getSecond ^OffsetTime (->offset-time (:value x))))
+       :cljs (.getSeconds (if (string? x)
+                            (datatype/coerce (:value x) (:datatype-iri x))
+                            x)))))
 
 (defn tz
-  [{datetime :value dt :datatype-iri}]
+  [x]
   (where/->typed-val
-    #?(:clj (.toString (.getOffset ^OffsetDateTime (to-odt datetime)))
+    #?(:clj (condp contains? (:datatype-iri x)
+              #{const/iri-xsd-dateTime const/iri-xsd-date}
+              (.toString (.getOffset ^OffsetDateTime (->offset-date-time (:value x))))
+              #{const/iri-xsd-time}
+              (.toString (.getOffset ^OffsetTime (->offset-time (:value x)))))
        :cljs (.getTimeZoneOffset ^js/Date (if (string? datetime)
                                             (datatype/coerce (:value datetime) (:datatype-iri datetime))
                                             datetime)))))
