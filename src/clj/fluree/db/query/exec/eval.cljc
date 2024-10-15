@@ -15,7 +15,7 @@
             [fluree.crypto :as crypto]
             [fluree.db.constants :as const]
             [clojure.math :as math])
-  #?(:clj (:import (java.time LocalDateTime OffsetDateTime ZoneId ZoneOffset))))
+  #?(:clj (:import (java.time LocalDate LocalDateTime OffsetDateTime ZoneId ZoneOffset))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -227,7 +227,7 @@
   []
   (where/->typed-val (iri/new-blank-node-id) const/iri-id))
 
-(def numeric-datatypes
+(def comparable-numeric-datatypes
   #{const/iri-xsd-decimal
     const/iri-xsd-double
     const/iri-xsd-integer
@@ -244,26 +244,22 @@
     const/iri-xsd-negativeInteger
     const/iri-xsd-nonNegativeInteger})
 
-(def string-datatypes
-  #{const/iri-string
+(def comparable-string-datatypes
+  #{const/iri-id
+    const/iri-anyURI
+    const/iri-string
     const/iri-xsd-normalizedString
     const/iri-lang-string
     const/iri-xsd-token})
 
-(def comparable-datatypes
-  (set/union
-    numeric-datatypes
-    string-datatypes
-    #{const/iri-xsd-boolean
-      const/iri-anyURI
-      const/iri-id
-      const/iri-xsd-dateTime
-      const/iri-xsd-date
-      const/iri-xsd-time}))
+(def comparable-time-datatypes
+  #{const/iri-xsd-dateTime
+    const/iri-xsd-date})
 
 (defmulti to-odt type)
 (defmethod to-odt OffsetDateTime [^OffsetDateTime datetime] datetime)
 (defmethod to-odt LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC)))
+(defmethod to-odt LocalDate [^LocalDate date] (.atStartOfDay date))
 
 (defn compare*
   [{val-a :value dt-a :datatype-iri}
@@ -273,21 +269,20 @@
         dt-b  (or dt-b (datatype/infer-iri val-b))
         val-b (or (and (some? val-b) (datatype/coerce val-b dt-b)) val-b)]
     (cond
+      (= dt-a dt-b)
+      (compare val-a val-b)
+
       ;; can compare across types
-      (or (and (contains? numeric-datatypes dt-a)
-               (contains? numeric-datatypes dt-b))
-          (and (contains? string-datatypes dt-a)
-               (contains? string-datatypes dt-b)))
+      (or (and (contains? comparable-numeric-datatypes dt-a)
+               (contains? comparable-numeric-datatypes dt-b))
+          (and (contains? comparable-string-datatypes dt-a)
+               (contains? comparable-string-datatypes dt-b)))
       (compare val-a val-b)
 
       ;; datetimes need to be converted to OffsetDateTimes for proper comparison
-      (= dt-a dt-b const/iri-xsd-dateTime)
+      (and (contains? comparable-time-datatypes dt-a)
+           (contains? comparable-time-datatypes dt-b))
       (compare (to-odt val-a) (to-odt val-b))
-
-      ;; can compare with same type
-      (and (= dt-a dt-b)
-           (contains? comparable-datatypes dt-a))
-      (compare val-a val-b)
 
       :else
       (throw (ex-info (str "Incomparable datatypes: " dt-a " and " dt-b)
@@ -295,6 +290,28 @@
                        :b      val-b :b-dt dt-b
                        :status 400
                        :error  :db/invalid-query})))))
+
+(defn typed-equal
+  ([x]  (where/->typed-val true))
+  ([x y] (where/->typed-val (zero? (compare* x y))))
+  ([x y & more]
+   (reduce (fn [result [a b]]
+             (if (:value result)
+               (where/->typed-val (zero? (compare* a b)))
+               (reduced result)))
+           (where/->typed-val (zero? (compare* x y)))
+           (partition 2 1 (into [y] more)))))
+
+(defn typed-not-equal
+  ([x]  (where/->typed-val false))
+  ([x y] (where/->typed-val (not (zero? (compare* x y)))))
+  ([x y & more]
+   (reduce (fn [result [a b]]
+             (if (:value result)
+               (where/->typed-val (not (zero? (compare* a b))))
+               (reduced result)))
+           (where/->typed-val (not (zero? (compare* x y))))
+           (partition 2 1 (into [y] more)))))
 
 (defn less-than
   [a b]
@@ -503,13 +520,13 @@
   [{num :value} {div :value}]
   (where/->typed-val (quot num div)))
 
-(defn equal
+(defn untyped-equal
   ([{x :value}]  (where/->typed-val true))
   ([{x :value} {y :value}] (where/->typed-val (= x y)))
   ([{x :value} {y :value} & more]
    (where/->typed-val (apply = x y (mapv :value more)))))
 
-(defn not-equal
+(defn untyped-not-equal
   ([{x :value}]  (where/->typed-val false))
   ([{x :value} {y :value}] (where/->typed-val (not= x y)))
   ([{x :value} {y :value} & more]
@@ -556,7 +573,7 @@
     -              fluree.db.query.exec.eval/minus
     *              fluree.db.query.exec.eval/multiply
     /              fluree.db.query.exec.eval/divide
-    =              fluree.db.query.exec.eval/equal
+    =              fluree.db.query.exec.eval/untyped-equal
     <              fluree.db.query.exec.eval/less-than
     <=             fluree.db.query.exec.eval/less-than-or-equal
     >              fluree.db.query.exec.eval/greater-than
@@ -574,6 +591,7 @@
     count-distinct fluree.db.query.exec.eval/count-distinct
     count          fluree.db.query.exec.eval/-count
     datatype       fluree.db.query.exec.eval/datatype
+    equal          fluree.db.query.exec.eval/typed-equal
     floor          fluree.db.query.exec.eval/floor
     groupconcat    fluree.db.query.exec.eval/groupconcat
     if             fluree.db.query.exec.eval/-if
@@ -586,7 +604,8 @@
     median         fluree.db.query.exec.eval/median
     nil?           fluree.db.query.exec.eval/-nil?
     not            fluree.db.query.exec.eval/-not
-    not=           fluree.db.query.exec.eval/not-equal
+    not=           fluree.db.query.exec.eval/untyped-not-equal
+    not-equal      fluree.db.query.exec.eval/typed-not-equal
     now            fluree.db.query.exec.eval/now
     or             fluree.db.query.exec.eval/-or
     quot           fluree.db.query.exec.eval/quotient
@@ -634,7 +653,7 @@
      median max min rand sample sample1 stddev str sum variance})
 
 (def allowed-scalar-fns
-  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if
+  '#{&& || ! > < >= <= = equal not-equal + - * / quot and bound coalesce if
      nil? as not not= or re-find re-pattern in
 
      ;; string fns
