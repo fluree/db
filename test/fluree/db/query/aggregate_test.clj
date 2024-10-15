@@ -22,10 +22,10 @@
       (testing "with data function syntax"
         (let [qry     {:context  [test-utils/default-str-context
                                   {"ex" "http://example.org/ns/"}]
-                       :select   ["?upperName" ["count" "?favNums"]]
+                       :select   ["?upperName" ["expr" ["count" "?favNums"]]]
                        :where    [{"schema:name" "?name"
                                    "ex:favNums"  "?favNums"}
-                                  ["bind" "?upperName" ["ucase" "?name"]]]
+                                  ["bind" "?upperName" ["expr" ["ucase" "?name"]]]]
                        :group-by "?upperName"}
               subject @(fluree/query db qry)]
           (is (= [["ALICE" 3] ["BRIAN" 1] ["CAM" 2] ["LIAM" 2]]

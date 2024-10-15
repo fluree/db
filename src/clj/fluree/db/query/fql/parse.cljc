@@ -247,7 +247,7 @@
 (defn parse-code
   [x]
   (cond (list? x)   x
-        (vector? x) (parse-code-data x)
+        (vector? x) (parse-code-data (second x))
         :else       (safe-read x)))
 
 (defn parse-filter-function

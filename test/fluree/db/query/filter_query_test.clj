@@ -222,7 +222,7 @@
                                 :where   '[{:type        :ex/User
                                             :schema/age  ?age
                                             :schema/name ?name}
-                                           [:filter [">" "?age" ["/" ["+" "?age" 47] 2]]]]}))
+                                           [:filter ["expr" [">" "?age" ["/" ["+" "?age" 47] 2]]]]]}))
           "string atoms")
 
       (is (= [["Brian" 50]]
@@ -232,7 +232,7 @@
                                 :where   '[{:type        :ex/User
                                             :schema/age  ?age
                                             :schema/name ?name}
-                                           [:filter ["in" "?age" [50 2 3]]]]}))
+                                           [:filter ["expr" ["in" "?age" [50 2 3]]]]]}))
           "in expression")
       (is (= [{:type         :ex/User
                :schema/email "cam@example.org"
@@ -247,7 +247,7 @@
                                           {:ex "http://example.org/ns/"}]
                                 :select  {"?s" ["*"]}
                                 :where   [{:id "?s", :ex/favColor "?color"}
-                                          [:filter ["strStarts" "?color" "B"]]]}))
+                                          [:filter ["expr" ["strStarts" "?color" "B"]]]]}))
           "no quoting necessary")
       (is (= [{:type         :ex/User
                :schema/email "cam@example.org"
@@ -262,5 +262,5 @@
                                           {:ex "http://example.org/ns/"}]
                                 :select  {"?s" ["*"]}
                                 :where   [{:id "?s", :ex/favColor "?color"}
-                                          [:filter ["strStarts" "?color" {"@value" "B" "@language" "en"}]]]}))
+                                          [:filter ["expr" ["strStarts" "?color" {"@value" "B" "@language" "en"}]]]]}))
           "with value maps"))))
