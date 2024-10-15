@@ -257,14 +257,22 @@
   #{const/iri-xsd-dateTime
     const/iri-xsd-date})
 
-(defmulti ->offset-date-time type)
+(defmulti ->offset-date-time #(when-let [t (#{OffsetDateTime LocalDateTime LocalDate} (type %))] t))
 (defmethod ->offset-date-time OffsetDateTime [^OffsetDateTime datetime] datetime)
 (defmethod ->offset-date-time LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC)))
-(defmethod ->offset-date-time LocalDate [^LocalDate date] (.atStartOfDay date))
+(defmethod ->offset-date-time LocalDate [^LocalDate date] (.atOffset (.atStartOfDay date) (ZoneOffset/UTC)))
+(defmethod ->offset-date-time :default [x] (throw (ex-info "Cannot convert value to OffsetDateTime."
+                                                           {:value x
+                                                            :status 400
+                                                            :error :db/invalid-fn-call})))
 
-(defmulti ->offset-time type)
+(defmulti ->offset-time #(when-let [t (#{OffsetTime LocalTime} (type %))] t))
 (defmethod ->offset-time OffsetTime [^OffsetTime time] time)
 (defmethod ->offset-time LocalTime [^LocalTime time] (.atOffset time (ZoneOffset/UTC)))
+(defmethod ->offset-time :default [x] (throw (ex-info "Cannot convert value to OffsetTime."
+                                                      {:value x
+                                                       :status 400
+                                                       :error :db/invalid-fn-call})))
 
 (defn compare*
   [{val-a :value dt-a :datatype-iri}
@@ -405,7 +413,7 @@
        (condp contains? (:datatype-iri x)
          #{const/iri-xsd-dateTime const/iri-xsd-date}
          (.getHour ^OffsetDateTime (->offset-date-time (:value x)))
-         const/iri-xsd-time
+         #{const/iri-xsd-time}
          (.getHour ^OffsetTime (->offset-time (:value x))))
        :cljs
        (.getHours (if (string? x)

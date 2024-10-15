@@ -2,7 +2,9 @@
   (:require [clojure.test :as t :refer [deftest testing is]]
             [fluree.db.query.exec.eval :as fun]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype])
+  (:import [java.time OffsetDateTime LocalDateTime LocalDate LocalTime OffsetTime]))
 
 (deftest equality
   (testing "type-indifferent equal"
@@ -148,3 +150,177 @@
                (fun/typed-not-equal (where/->typed-val 1)
                                     (where/->typed-val 2)
                                     (where/->typed-val 1))))))))
+
+(deftest time-fns
+  (testing "polymorphic time functions"
+    (testing "year"
+      (is (= (where/->typed-val 2024)
+             (fun/year (where/->typed-val (datatype/coerce "2024-01-14T00:00:00" const/iri-xsd-dateTime)
+                                          const/iri-xsd-dateTime)))
+          "LocalDateTime")
+      (is (= (where/->typed-val 2024)
+             (fun/year (where/->typed-val (datatype/coerce "2024-01-14T00:00:00+05:00" const/iri-xsd-dateTime)
+                                          const/iri-xsd-dateTime)))
+          "OffsetDateTime")
+      (is (= (where/->typed-val 2024)
+             (fun/year (where/->typed-val (datatype/coerce "2024-01-14" const/iri-xsd-date)
+                                          const/iri-xsd-date)))
+          "LocalDate")
+      (is (= "Cannot convert value to OffsetDateTime."
+             (try
+               (fun/year (where/->typed-val (datatype/coerce "10:43:44" const/iri-xsd-time)
+                                            const/iri-xsd-time))
+               (catch Exception e
+                 (ex-message e))))
+          "LocalTime")
+      (is (= "Cannot convert value to OffsetDateTime."
+             (try
+               (fun/year (where/->typed-val (datatype/coerce "10:43:44Z" const/iri-xsd-time)
+                                            const/iri-xsd-time))
+               (catch Exception e
+                 (ex-message e))))
+          "OffsetTime"))
+
+    (testing "month"
+      (is (= (where/->typed-val 1)
+             (fun/month (where/->typed-val (datatype/coerce "2024-01-14T00:00:00" const/iri-xsd-dateTime)
+                                           const/iri-xsd-dateTime)))
+          "LocalDateTime")
+      (is (= (where/->typed-val 1)
+             (fun/month (where/->typed-val (datatype/coerce "2024-01-14T00:00:00+05:00" const/iri-xsd-dateTime)
+                                           const/iri-xsd-dateTime)))
+          "OffsetDateTime")
+      (is (= (where/->typed-val 1)
+             (fun/month (where/->typed-val (datatype/coerce "2024-01-14" const/iri-xsd-date)
+                                           const/iri-xsd-date)))
+          "LocalDate")
+      (is (= "Cannot convert value to OffsetDateTime."
+             (try
+               (fun/month (where/->typed-val (datatype/coerce "10:43:44" const/iri-xsd-time)
+                                             const/iri-xsd-time))
+               (catch Exception e
+                 (ex-message e))))
+          "LocalTime")
+      (is (= "Cannot convert value to OffsetDateTime."
+             (try
+               (fun/month (where/->typed-val (datatype/coerce "10:43:44Z" const/iri-xsd-time)
+                                             const/iri-xsd-time))
+               (catch Exception e
+                 (ex-message e))))
+          "OffsetTime"))
+
+    (testing "day"
+      (is (= (where/->typed-val 14)
+             (fun/day (where/->typed-val (datatype/coerce "2024-01-14T00:00:00" const/iri-xsd-dateTime)
+                                         const/iri-xsd-dateTime)))
+          "LocalDateTime")
+      (is (= (where/->typed-val 14)
+             (fun/day (where/->typed-val (datatype/coerce "2024-01-14T00:00:00+05:00" const/iri-xsd-dateTime)
+                                         const/iri-xsd-dateTime)))
+          "OffsetDateTime")
+      (is (= (where/->typed-val 14)
+             (fun/day (where/->typed-val (datatype/coerce "2024-01-14" const/iri-xsd-date)
+                                         const/iri-xsd-date)))
+          "LocalDate")
+      (is (= "Cannot convert value to OffsetDateTime."
+             (try
+               (fun/day (where/->typed-val (datatype/coerce "10:43:44" const/iri-xsd-time)
+                                           const/iri-xsd-time))
+               (catch Exception e
+                 (ex-message e))))
+          "LocalTime")
+      (is (= "Cannot convert value to OffsetDateTime."
+             (try
+               (fun/day (where/->typed-val (datatype/coerce "10:43:44Z" const/iri-xsd-time)
+                                           const/iri-xsd-time))
+               (catch Exception e
+                 (ex-message e))))
+          "OffsetTime"))
+
+    (testing "hours"
+      (is (= (where/->typed-val 1)
+             (fun/hours (where/->typed-val (datatype/coerce "2024-01-14T01:10:20" const/iri-xsd-dateTime)
+                                           const/iri-xsd-dateTime)))
+          "LocalDateTime")
+      (is (= (where/->typed-val 1)
+             (fun/hours (where/->typed-val (datatype/coerce "2024-01-14T01:10:20+05:00" const/iri-xsd-dateTime)
+                                           const/iri-xsd-dateTime)))
+          "OffsetDateTime")
+      (is (= (where/->typed-val 0)
+             (fun/hours (where/->typed-val (datatype/coerce "2024-01-14" const/iri-xsd-date)
+                                           const/iri-xsd-date)))
+          "LocalDate")
+      (is (= (where/->typed-val 10)
+             (fun/hours (where/->typed-val (datatype/coerce "10:43:44" const/iri-xsd-time)
+                                           const/iri-xsd-time)))
+          "LocalTime")
+      (is (= (where/->typed-val 10)
+             (fun/hours (where/->typed-val (datatype/coerce "10:43:44Z" const/iri-xsd-time)
+                                           const/iri-xsd-time)))
+          "OffsetTime"))
+
+    (testing "minutes"
+      (is (= (where/->typed-val 10)
+             (fun/minutes (where/->typed-val (datatype/coerce "2024-01-14T01:10:20" const/iri-xsd-dateTime)
+                                             const/iri-xsd-dateTime)))
+          "LocalDateTime")
+      (is (= (where/->typed-val 10)
+             (fun/minutes (where/->typed-val (datatype/coerce "2024-01-14T01:10:20+05:00" const/iri-xsd-dateTime)
+                                             const/iri-xsd-dateTime)))
+          "OffsetDateTime")
+      (is (= (where/->typed-val 0)
+             (fun/minutes (where/->typed-val (datatype/coerce "2024-01-14" const/iri-xsd-date)
+                                             const/iri-xsd-date)))
+          "LocalDate")
+      (is (= (where/->typed-val 43)
+             (fun/minutes (where/->typed-val (datatype/coerce "10:43:44" const/iri-xsd-time)
+                                             const/iri-xsd-time)))
+          "LocalTime")
+      (is (= (where/->typed-val 43)
+             (fun/minutes (where/->typed-val (datatype/coerce "10:43:44Z" const/iri-xsd-time)
+                                             const/iri-xsd-time)))
+          "OffsetTime"))
+
+    (testing "seconds"
+      (is (= (where/->typed-val 20)
+             (fun/seconds (where/->typed-val (datatype/coerce "2024-01-14T01:10:20" const/iri-xsd-dateTime)
+                                             const/iri-xsd-dateTime)))
+          "LocalDateTime")
+      (is (= (where/->typed-val 20)
+             (fun/seconds (where/->typed-val (datatype/coerce "2024-01-14T01:10:20+05:00" const/iri-xsd-dateTime)
+                                             const/iri-xsd-dateTime)))
+          "OffsetDateTime")
+      (is (= (where/->typed-val 0)
+             (fun/seconds (where/->typed-val (datatype/coerce "2024-01-14" const/iri-xsd-date)
+                                             const/iri-xsd-date)))
+          "LocalDate")
+      (is (= (where/->typed-val 44)
+             (fun/seconds (where/->typed-val (datatype/coerce "10:43:44" const/iri-xsd-time)
+                                             const/iri-xsd-time)))
+          "LocalTime")
+      (is (= (where/->typed-val 44)
+             (fun/seconds (where/->typed-val (datatype/coerce "10:43:44Z" const/iri-xsd-time)
+                                             const/iri-xsd-time)))
+          "OffsetTime"))
+
+    (testing "tz"
+      (is (= (where/->typed-val "Z")
+             (fun/tz (where/->typed-val (datatype/coerce "2024-01-14T01:10:20" const/iri-xsd-dateTime)
+                                        const/iri-xsd-dateTime)))
+          "LocalDateTime")
+      (is (= (where/->typed-val "+05:00")
+             (fun/tz (where/->typed-val (datatype/coerce "2024-01-14T01:10:20+05:00" const/iri-xsd-dateTime)
+                                        const/iri-xsd-dateTime)))
+          "OffsetDateTime")
+      (is (= (where/->typed-val "Z")
+             (fun/tz (where/->typed-val (datatype/coerce "2024-01-14" const/iri-xsd-date)
+                                        const/iri-xsd-date)))
+          "LocalDate")
+      (is (= (where/->typed-val "Z")
+             (fun/tz (where/->typed-val (datatype/coerce "10:43:44" const/iri-xsd-time)
+                                        const/iri-xsd-time)))
+          "LocalTime")
+      (is (= (where/->typed-val "Z")
+             (fun/tz (where/->typed-val (datatype/coerce "10:43:44Z" const/iri-xsd-time)
+                                        const/iri-xsd-time)))
+          "OffsetTime"))))
