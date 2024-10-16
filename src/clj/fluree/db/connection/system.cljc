@@ -10,7 +10,7 @@
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.nameservice.storage :as storage-nameservice]
             [fluree.db.nameservice.ipns :as ipns-nameservice]
-            [fluree.db.flake.index.storage :as index.storage]
+            [fluree.db.flake.index.storage :as index-storage]
             #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
             [fluree.db.util.core :as util :refer [get-id get-first get-first-value get-values]]
@@ -115,6 +115,14 @@
         identifiers (get-values config conn-vocab/address-identifiers)]
     (remote-system/connect urls identifiers)))
 
+(defmethod ig/init-key :fluree/commit-catalog
+  [_ {:keys [content-stores read-only-archives]}]
+  (storage/catalog content-stores read-only-archives))
+
+(defmethod ig/init-key :fluree/index-catalog
+  [_ {:keys [content-stores read-only-archives serializer cache]}]
+  (let [catalog (storage/catalog content-stores read-only-archives)]
+    (index-storage/index-catalog catalog serializer cache)))
 
 (defmethod ig/init-key :fluree.nameservice/storage
   [_ {:keys [storage]}]
@@ -139,10 +147,6 @@
 (defmethod ig/init-key :fluree/catalog
   [_ {:keys [storage]}]
   (storage/catalog [storage]))
-
-(defmethod ig/init-key :fluree.index/storage
-  [_ {:keys [catalog serializer cache]}]
-  (index.storage/index-catalog catalog serializer cache))
 
 (defmethod ig/init-key :fluree/connection
   [_ config]
