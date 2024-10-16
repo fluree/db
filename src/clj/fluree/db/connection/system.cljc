@@ -16,81 +16,81 @@
             [fluree.db.util.core :as util :refer [get-id get-first get-first-value get-values]]
             [integrant.core :as ig]))
 
-(derive :fluree.storage/file :fluree/content-storage)
-(derive :fluree.storage/file :fluree/byte-storage)
-(derive :fluree.storage/file :fluree/json-archive)
+(derive :fluree.db.storage/file :fluree.db/content-storage)
+(derive :fluree.db.storage/file :fluree.db/byte-storage)
+(derive :fluree.db.storage/file :fluree.db/json-archive)
 
-(derive :fluree.storage/memory :fluree/content-storage)
-(derive :fluree.storage/memory :fluree/byte-storage)
-(derive :fluree.storage/memory :fluree/json-archive)
+(derive :fluree.db.storage/memory :fluree.db/content-storage)
+(derive :fluree.db.storage/memory :fluree.db/byte-storage)
+(derive :fluree.db.storage/memory :fluree.db/json-archive)
 
-#?(:clj (derive :fluree.storage/s3 :fluree/content-storage))
-#?(:clj (derive :fluree.storage/s3 :fluree/byte-storage))
-#?(:clj (derive :fluree.storage/s3 :fluree/json-archive))
+#?(:clj (derive :fluree.db.storage/s3 :fluree.db/content-storage))
+#?(:clj (derive :fluree.db.storage/s3 :fluree.db/byte-storage))
+#?(:clj (derive :fluree.db.storage/s3 :fluree.db/json-archive))
 
-(derive :fluree.storage/ipfs :fluree/content-storage)
-(derive :fluree.storage/ipfs :fluree/json-archive)
+(derive :fluree.db.storage/ipfs :fluree.db/content-storage)
+(derive :fluree.db.storage/ipfs :fluree.db/json-archive)
 
-#?(:cljs (derive :fluree.storage/localstorage :fluree/content-storage))
-#?(:cljs (derive :fluree.storage/localstorage :fluree/json-archive))
+#?(:cljs (derive :fluree.db.storage/localstorage :fluree.db/content-storage))
+#?(:cljs (derive :fluree.db.storage/localstorage :fluree.db/json-archive))
 
-(derive :fluree/remote-system :fluree/json-archive)
-(derive :fluree/remote-system :fluree/nameservice)
-(derive :fluree/remote-system :fluree/publication)
+(derive :fluree.db/remote-system :fluree.db/json-archive)
+(derive :fluree.db/remote-system :fluree.db/nameservice)
+(derive :fluree.db/remote-system :fluree.db/publication)
 
-(derive :fluree.publication/remote-resources :fluree/publication)
+(derive :fluree.db.publication/remote-resources :fluree.db/publication)
 
-(derive :fluree.nameservice/storage :fluree/publisher)
-(derive :fluree.nameservice/storage :fluree/nameservice)
+(derive :fluree.db.nameservice/storage :fluree.db/publisher)
+(derive :fluree.db.nameservice/storage :fluree.db/nameservice)
 
-(derive :fluree.nameservice/ipns :fluree/publisher)
-(derive :fluree.nameservice/ipns :fluree/nameservice)
+(derive :fluree.db.nameservice/ipns :fluree.db/publisher)
+(derive :fluree.db.nameservice/ipns :fluree.db/nameservice)
 
-(derive :fluree.serializer/json :fluree/serializer)
+(derive :fluree.db.serializer/json :fluree.db/serializer)
 
 (defmethod ig/init-key :default
   [_ component]
   component)
 
-(defmethod ig/expand-key :fluree/connection
+(defmethod ig/expand-key :fluree.db/connection
   [k config]
   (let [cache-max-mb   (get-first-value config conn-vocab/cache-max-mb)
         commit-storage (get-first config conn-vocab/commit-storage)
         index-storage  (get-first config conn-vocab/index-storage)
         remote-systems (get config conn-vocab/remote-systems)
         config*        (-> config
-                           (assoc :cache (ig/ref :fluree/cache)
-                                  :commit-catalog (ig/ref :fluree/commit-catalog)
-                                  :index-catalog (ig/ref :fluree/index-catalog)
-                                  :serializer (ig/ref :fluree/serializer))
+                           (assoc :cache (ig/ref :fluree.db/cache)
+                                  :commit-catalog (ig/ref :fluree.db/commit-catalog)
+                                  :index-catalog (ig/ref :fluree.db/index-catalog)
+                                  :serializer (ig/ref :fluree.db/serializer))
                            (dissoc conn-vocab/cache-max-mb conn-vocab/commit-storage
                                    conn-vocab/index-storage))]
-    {:fluree/cache          cache-max-mb
-     :fluree/commit-catalog {:content-stores     [commit-storage]
+    {:fluree.db/cache          cache-max-mb
+     :fluree.db/commit-catalog {:content-stores     [commit-storage]
                              :read-only-archives remote-systems}
-     :fluree/index-catalog  {:content-stores     [index-storage]
+     :fluree.db/index-catalog  {:content-stores     [index-storage]
                              :read-only-archives remote-systems
-                             :cache              (ig/ref :fluree/cache)
-                             :serializer         (ig/ref :fluree/serializer)}
+                             :cache              (ig/ref :fluree.db/cache)
+                             :serializer         (ig/ref :fluree.db/serializer)}
      k                      config*}))
 
-(defmethod ig/init-key :fluree/cache
+(defmethod ig/init-key :fluree.db/cache
   [_ max-mb]
   (-> max-mb cache/memory->cache-size cache/create-lru-cache atom))
 
-(defmethod ig/init-key :fluree.storage/file
+(defmethod ig/init-key :fluree.db.storage/file
   [_ config]
   (let [identifier (get-first-value config conn-vocab/address-identifier)
         root-path  (get-first-value config conn-vocab/file-path)]
     (file-storage/open identifier root-path)))
 
-(defmethod ig/init-key :fluree.storage/memory
+(defmethod ig/init-key :fluree.db.storage/memory
   [_ config]
   (let [identifier (get-first-value config conn-vocab/address-identifier)]
     (memory-storage/open identifier)))
 
 #?(:clj
-   (defmethod ig/init-key :fluree.storage/s3
+   (defmethod ig/init-key :fluree.db.storage/s3
      [_ config]
      (let [identifier  (get-first-value config conn-vocab/address-identifier)
            s3-bucket   (get-first-value config conn-vocab/s3-bucket)
@@ -98,48 +98,48 @@
            s3-endpoint (get-first-value config conn-vocab/s3-endpoint)]
        (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint))))
 
-(defmethod ig/init-key :fluree.storage/ipfs
+(defmethod ig/init-key :fluree.db.storage/ipfs
   [_ config]
   (let [identifier    (get-first-value config conn-vocab/address-identifier)
         ipfs-endpoint (get-first-value config conn-vocab/ipfs-endpoint)]
     (ipfs-storage/open identifier ipfs-endpoint)))
 
 #?(:cljs
-   (defmethod ig/init-key :fluree.storage/localstorage
+   (defmethod ig/init-key :fluree.db.storage/localstorage
      [_ _]
      (localstorage-store/open)))
 
-(defmethod ig/init-key :fluree/remote-system
+(defmethod ig/init-key :fluree.db/remote-system
   [_ config]
   (let [urls        (get-values config conn-vocab/server-urls)
         identifiers (get-values config conn-vocab/address-identifiers)]
     (remote-system/connect urls identifiers)))
 
-(defmethod ig/init-key :fluree/commit-catalog
+(defmethod ig/init-key :fluree.db/commit-catalog
   [_ {:keys [content-stores read-only-archives]}]
   (storage/catalog content-stores read-only-archives))
 
-(defmethod ig/init-key :fluree/index-catalog
+(defmethod ig/init-key :fluree.db/index-catalog
   [_ {:keys [content-stores read-only-archives serializer cache]}]
   (let [catalog (storage/catalog content-stores read-only-archives)]
     (index-storage/index-catalog catalog serializer cache)))
 
-(defmethod ig/init-key :fluree.nameservice/storage
+(defmethod ig/init-key :fluree.db.nameservice/storage
   [_ config]
   (let [storage (get-first config conn-vocab/storage)]
     (storage-nameservice/start storage)))
 
-(defmethod ig/init-key :fluree.nameservice/ipns
+(defmethod ig/init-key :fluree.db.nameservice/ipns
   [_ config]
   (let [endpoint (get-first-value config conn-vocab/ipfs-endpoint)
         ipns-key (get-first-value config conn-vocab/ipns-key)]
     (ipns-nameservice/initialize endpoint ipns-key)))
 
-(defmethod ig/init-key :fluree.serializer/json
+(defmethod ig/init-key :fluree.db.serializer/json
   [_ _]
   (json-serde))
 
-(defmethod ig/init-key :fluree/connection
+(defmethod ig/init-key :fluree.db/connection
   [_ {:keys [cache commit-catalog index-catalog serializer] :as config}]
   (let [parallelism          (get-first-value config conn-vocab/parallelism)
         primary-publisher    (get-first config conn-vocab/primary-publisher)
@@ -165,4 +165,4 @@
 
 (defn initialize
   [config]
-  (-> config ig/init :fluree/connection))
+  (-> config ig/init :fluree.db/connection))
