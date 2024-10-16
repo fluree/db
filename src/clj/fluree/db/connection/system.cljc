@@ -4,14 +4,14 @@
             [fluree.db.cache :as cache]
             [fluree.db.storage :as storage]
             [fluree.db.remote-system :as remote]
-            [fluree.db.storage.file :as file-store]
-            [fluree.db.storage.memory :as memory-store]
-            [fluree.db.storage.ipfs :as ipfs-store]
+            [fluree.db.storage.file :as file-storage]
+            [fluree.db.storage.memory :as memory-storage]
+            [fluree.db.storage.ipfs :as ipfs-storage]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.nameservice.storage :as storage-nameservice]
             [fluree.db.nameservice.ipns :as ipns-nameservice]
             [fluree.db.flake.index.storage :as index.storage]
-            #?(:clj  [fluree.db.storage.s3 :as s3-store]
+            #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
             [fluree.db.util.core :as util :refer [get-id get-first get-first-value get-values]]
             [integrant.core :as ig]))
@@ -79,25 +79,30 @@
   (-> max-mb cache/memory->cache-size cache/create-lru-cache atom))
 
 (defmethod ig/init-key :fluree.storage/file
-  [_ storage-path]
-  (file-store/open storage-path))
+  [_ config]
+  (let [identifier (get-first-value config conn-vocab/address-identifier)
+        root-path  (get-first-value config conn-vocab/file-path)]
+    (file-storage/open identifier root-path)))
 
 (defmethod ig/init-key :fluree.storage/memory
-  [_ _]
-  (memory-store/open))
+  [_ config]
+  (let [identifier (get-first-value config conn-vocab/address-identifier)]
+    (memory-storage/open identifier)))
 
 #?(:clj
    (defmethod ig/init-key :fluree.storage/s3
-     [_ {:keys [bucket prefix endpoint]}]
-     (s3-store/open bucket prefix endpoint)))
+     [_ config]
+     (let [identifier  (get-first-value config conn-vocab/address-identifier)
+           s3-bucket   (get-first-value config conn-vocab/s3-bucket)
+           s3-prefix   (get-first-value config conn-vocab/s3-prefix)
+           s3-endpoint (get-first-value config conn-vocab/s3-endpoint)]
+       (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint))))
 
 (defmethod ig/init-key :fluree.storage/ipfs
-  [_ endpoint]
-  (ipfs-store/open endpoint))
-
-;; (defmethod ig/init-key :fluree.storage/remote-resources
-;;   [_ {:keys [identifier method remote-system]}]
-;;   (remote-store/open identifier method remote-system))
+  [_ config]
+  (let [identifier    (get-first-value config conn-vocab/address-identifier)
+        ipfs-endpoint (get-first-value config conn-vocab/ipfs-endpoint)]
+    (ipfs-storage/open identifier ipfs-endpoint)))
 
 #?(:cljs (defmethod ig/init-key :fluree.storage/localstorage
            [_ _]
