@@ -3,7 +3,7 @@
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.cache :as cache]
             [fluree.db.storage :as storage]
-            [fluree.db.remote-system :as remote]
+            [fluree.db.remote-system :as remote-system]
             [fluree.db.storage.file :as file-storage]
             [fluree.db.storage.memory :as memory-storage]
             [fluree.db.storage.ipfs :as ipfs-storage]
@@ -104,9 +104,17 @@
         ipfs-endpoint (get-first-value config conn-vocab/ipfs-endpoint)]
     (ipfs-storage/open identifier ipfs-endpoint)))
 
-#?(:cljs (defmethod ig/init-key :fluree.storage/localstorage
-           [_ _]
-           (localstorage-store/open)))
+#?(:cljs
+   (defmethod ig/init-key :fluree.storage/localstorage
+     [_ _]
+     (localstorage-store/open)))
+
+(defmethod ig/init-key :fluree/remote-system
+  [_ config]
+  (let [urls        (get-values config conn-vocab/server-urls)
+        identifiers (get-values config conn-vocab/address-identifiers)]
+    (remote-system/connect urls identifiers)))
+
 
 (defmethod ig/init-key :fluree.nameservice/storage
   [_ {:keys [storage]}]
