@@ -125,12 +125,15 @@
     (index-storage/index-catalog catalog serializer cache)))
 
 (defmethod ig/init-key :fluree.nameservice/storage
-  [_ {:keys [storage]}]
-  (storage-nameservice/start storage))
+  [_ config]
+  (let [storage (get-first config conn-vocab/storage)]
+    (storage-nameservice/start storage)))
 
 (defmethod ig/init-key :fluree.nameservice/ipns
-  [_ {:keys [server profile]}]
-  (ipns-nameservice/initialize server profile))
+  [_ config]
+  (let [endpoint (get-first-value config conn-vocab/ipfs-endpoint)
+        ipns-key (get-first-value config conn-vocab/ipns-key)]
+    (ipns-nameservice/initialize endpoint ipns-key)))
 
 (defmethod ig/init-key :fluree.serializer/json
   [_ _]
