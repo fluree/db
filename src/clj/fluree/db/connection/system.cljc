@@ -139,72 +139,30 @@
   [_ _]
   (json-serde))
 
-(defmethod ig/init-key :fluree.connection/id
-  [_ _]
-  (str (random-uuid)))
-
-(defmethod ig/init-key :fluree.connection/state
-  [_ _]
-  (connection/blank-state))
-
-(defmethod ig/init-key :fluree/catalog
-  [_ {:keys [storage]}]
-  (storage/catalog [storage]))
-
 (defmethod ig/init-key :fluree/connection
-  [_ config]
-  (connection/connect config))
+  [_ {:keys [cache commit-catalog index-catalog serializer] :as config}]
+  (let [parallelism          (get-first-value config conn-vocab/parallelism)
+        primary-publisher    (get-first config conn-vocab/primary-publisher)
+        secondary-publishers (get config conn-vocab/secondary-publishers)
+        remote-systems       (get config conn-vocab/remote-systems)
+        ledger-defaults      (get-first config conn-vocab/ledger-defaults)
+        index-options        (get-first ledger-defaults conn-vocab/index-options)
+        reindex-min-bytes    (get-first index-options conn-vocab/reindex-min-bytes)
+        reindex-max-bytes    (get-first index-options conn-vocab/reindex-max-bytes)
+        max-old-indexes      (get-first index-options conn-vocab/max-old-indexes)
+        ledger-defaults*     {:index-options {:reindex-min-bytes reindex-min-bytes
+                                              :reindex-max-bytes reindex-max-bytes
+                                              :max-old-indexes   max-old-indexes}}]
+    (connection/connect {:parallelism          parallelism
+                         :cache                cache
+                         :commit-catalog       commit-catalog
+                         :index-catalog        index-catalog
+                         :primary-publisher    primary-publisher
+                         :secondary-publishers secondary-publishers
+                         :remote-systems       remote-systems
+                         :serializer           serializer
+                         :defaults             ledger-defaults*})))
 
-(defn base-config
-  [parallelism cache-max-mb defaults]
-  {:fluree.serializer/json            {}
-   :fluree/cache                      cache-max-mb
-   :fluree.nameservice/storage {:storage (ig/ref :fluree/byte-storage)}
-   :fluree/catalog                    {:storage (ig/ref :fluree/content-storage)}
-   :fluree.index/storage              {:catalog    (ig/ref :fluree/catalog)
-                                       :serializer (ig/ref :fluree/serializer)
-                                       :cache      (ig/ref :fluree/cache)}
-   :fluree.connection/id              {}
-   :fluree.connection/state           {}
-   :fluree/connection                 {:id                   (ig/ref :fluree.connection/id)
-                                       :state                (ig/ref :fluree.connection/state)
-                                       :cache                (ig/ref :fluree/cache)
-                                       :commit-catalog       (ig/ref :fluree/catalog)
-                                       :index-catalog        (ig/ref :fluree.index/storage)
-                                       :serializer           (ig/ref :fluree/serializer)
-                                       :primary-publisher    (ig/ref :fluree/nameservice)
-                                       :secondary-publishers []
-                                       :parallelism          parallelism
-                                       :defaults             defaults}})
-
-(defn memory-config
-  [parallelism cache-max-mb defaults]
-  (-> (base-config parallelism cache-max-mb defaults)
-      (assoc :fluree.storage/memory {})))
-
-(defn file-config
-  [storage-path parallelism cache-max-mb defaults]
-  (-> (base-config parallelism cache-max-mb defaults)
-      (assoc :fluree.storage/file storage-path)))
-
-#?(:clj
-   (defn s3-config
-     [endpoint bucket prefix parallelism cache-max-mb defaults]
-     (-> (base-config parallelism cache-max-mb defaults)
-         (assoc :fluree.storage/s3 {:bucket bucket, :prefix prefix, :endpoint endpoint}))))
-
-(defn ipfs-config
-  [server file-storage-path parallelism cache-max-mb defaults]
-  (-> (file-config file-storage-path parallelism cache-max-mb defaults)
-      (assoc :fluree.storage/ipfs server
-             :fluree.nameservice/ipns {:profile "self", :server server, :sync? false}
-             :fluree/nameservices [(ig/ref :fluree.nameservice/storage)
-                                   (ig/ref :fluree.nameservice/ipns)])
-      (update :fluree.index/storage assoc :storage (ig/ref :fluree.storage/ipfs))
-      (update :fluree/connection assoc :commit-store (ig/ref :fluree.storage/ipfs))
-      (update :fluree/connection assoc :primary-ns (ig/ref :fluree.nameservice/storage))
-      (update :fluree/connection assoc :aux-nses [(ig/ref :fluree.nameservice/ipns)])))
-
-(defn start
+(defn initialize
   [config]
   (-> config ig/init :fluree/connection))
