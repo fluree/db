@@ -52,18 +52,17 @@
   [_ component]
   component)
 
-(defmethod ig/expand-key :fluree.db/connection
+(defmethod ig/expand-key :fluree/connection
   [k config]
   (let [cache-max-mb   (get-first-value config conn-vocab/cache-max-mb)
         commit-storage (get-first config conn-vocab/commit-storage)
         index-storage  (get-first config conn-vocab/index-storage)
         remote-systems (get config conn-vocab/remote-systems)
-        serializer     (json-serde)
         config*        (-> config
-                           (assoc :cache (ig/ref :fluree.server/cache)
-                                  :commit-catalog (ig/ref :fluree.server/commit-catalog)
-                                  :index-catalog (ig/ref :fluree.server/index-catalog)
-                                  :serializer serializer)
+                           (assoc :cache (ig/ref :fluree/cache)
+                                  :commit-catalog (ig/ref :fluree/commit-catalog)
+                                  :index-catalog (ig/ref :fluree/index-catalog)
+                                  :serializer (ig/ref :fluree/serializer))
                            (dissoc conn-vocab/cache-max-mb conn-vocab/commit-storage
                                    conn-vocab/index-storage))]
     {:fluree/cache          cache-max-mb
@@ -71,8 +70,8 @@
                              :read-only-archives remote-systems}
      :fluree/index-catalog  {:content-stores     [index-storage]
                              :read-only-archives remote-systems
-                             :cache              (ig/ref :fluree.server/cache)
-                             :serializer         serializer}
+                             :cache              (ig/ref :fluree/cache)
+                             :serializer         (ig/ref :fluree/serializer)}
      k                      config*}))
 
 (defmethod ig/init-key :fluree/cache
