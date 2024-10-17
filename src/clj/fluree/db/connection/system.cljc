@@ -145,9 +145,9 @@
         remote-systems       (get config conn-vocab/remote-systems)
         ledger-defaults      (get-first config conn-vocab/ledger-defaults)
         index-options        (get-first ledger-defaults conn-vocab/index-options)
-        reindex-min-bytes    (get-first index-options conn-vocab/reindex-min-bytes)
-        reindex-max-bytes    (get-first index-options conn-vocab/reindex-max-bytes)
-        max-old-indexes      (get-first index-options conn-vocab/max-old-indexes)
+        reindex-min-bytes    (get-first-value index-options conn-vocab/reindex-min-bytes)
+        reindex-max-bytes    (get-first-value index-options conn-vocab/reindex-max-bytes)
+        max-old-indexes      (get-first-value index-options conn-vocab/max-old-indexes)
         ledger-defaults*     {:index-options {:reindex-min-bytes reindex-min-bytes
                                               :reindex-max-bytes reindex-max-bytes
                                               :max-old-indexes   max-old-indexes}}]
