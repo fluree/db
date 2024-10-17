@@ -38,8 +38,6 @@
 (derive :fluree.db/remote-system :fluree.db/nameservice)
 (derive :fluree.db/remote-system :fluree.db/publication)
 
-(derive :fluree.db.publication/remote-resources :fluree.db/publication)
-
 (derive :fluree.db.nameservice/storage :fluree.db/publisher)
 (derive :fluree.db.nameservice/storage :fluree.db/nameservice)
 

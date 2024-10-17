@@ -12,9 +12,6 @@
 (def connection-type
   (system-iri "Connection"))
 
-(def consensus-type
-  (system-iri "Consensus"))
-
 (def storage-type
   (system-iri "Storage"))
 
