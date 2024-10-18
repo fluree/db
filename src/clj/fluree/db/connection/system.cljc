@@ -163,4 +163,11 @@
 
 (defn initialize
   [config]
-  (-> config ig/init :fluree.db/connection))
+  (let [system-map (ig/init config)]
+    (-> system-map
+        :fluree.db/connection
+        (assoc ::map system-map))))
+
+(defn terminate
+  [conn]
+  (-> conn ::map ig/halt!))
