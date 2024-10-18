@@ -13,6 +13,7 @@
         nano-id/nano-id                     {:mvn/version "1.1.0"}
         integrant/integrant                 {:mvn/version "0.10.0"}
         camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}
+        com.widdindustries/time-literals    {:mvn/version "0.1.10"}
         com.fluree/json-ld                  {:git/url "https://github.com/fluree/json-ld.git"
                                              :git/sha "73a990a4b803d0b4cfbbbe4dc16275b39a3add4e"}
 

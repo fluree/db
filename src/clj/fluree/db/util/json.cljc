@@ -4,6 +4,7 @@
             #?(:clj [cheshire.generate :refer [add-encoder encode-seq remove-encoder]])
             #?(:cljs [goog.object :as gobject])
             [fluree.db.util.bytes :as butil]
+            #?(:cljs [fluree.db.util.core :as util])
             [fluree.db.util.log :as log]
             [fluree.db.flake :as flake])
   #?(:clj
@@ -31,7 +32,7 @@
 ;;https://purelyfunctional.tv/mini-guide/json-serialization-api-clojure/
 #?(:cljs
    (defn clj->js'
-     ([x] (clj->js' x {:keyword-fn cutil/keyword->str}))
+     ([x] (clj->js' x {:keyword-fn util/keyword->str}))
      ([x options]
       (let [{:keys [keyword-fn]} options]
         (letfn [(keyfn [k] (key->js k thisfn))
