@@ -595,9 +595,9 @@
                      :list-fn (if (= 'as (first s))
                                 (parse-select-as-fn s context)
                                 (parse-select-aggregate s context))
-                     :data-fn (if (= "as" (first s))
-                                (parse-select-as-fn s context)
-                                (parse-select-aggregate s context)))
+                     :vector-fn (if (= "as" (first s))
+                                  (parse-select-as-fn s context)
+                                  (parse-select-aggregate s context)))
         :select-map (parse-select-map s depth context)))))
 
 (defn parse-select-clause
