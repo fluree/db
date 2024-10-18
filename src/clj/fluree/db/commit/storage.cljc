@@ -113,5 +113,4 @@
           genesis-commit*           (assoc-in genesis-commit ["data" "address"] db-address)
           {commit-address :address} (<? (write-jsonld storage ledger-alias genesis-commit*))]
       (-> genesis-commit*
-          (assoc "address" commit-address)
-          json-ld/expand))))
+          (assoc "address" commit-address)))))
