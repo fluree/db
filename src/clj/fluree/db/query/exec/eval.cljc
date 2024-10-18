@@ -1,6 +1,6 @@
 (ns fluree.db.query.exec.eval
   (:refer-clojure :exclude [compile rand concat replace max min
-                            #?(:clj ratio? :cljs uuid)])
+                            #?(:clj ratio?) #?@(:cljs [uuid -count divide])])
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
             [fluree.db.vector.scoring :as score]
@@ -55,11 +55,11 @@
 
 (defn variance
   [coll]
-  (let [mean (avg (mapv :value coll))
+  (let [mean (avg coll)
         sum  (sum (for [x coll
-                        :let [delta (- x mean)]]
+                        :let [delta (- (:value x) (:value mean))]]
                     (* delta delta)))
-        res  (/ sum (count coll))]
+        res  (/ (:value sum) (count coll))]
     (where/->typed-val
       (if (ratio? res)
         (double res)
@@ -257,22 +257,23 @@
   #{const/iri-xsd-dateTime
     const/iri-xsd-date})
 
-(defmulti ->offset-date-time #(when-let [t (#{OffsetDateTime LocalDateTime LocalDate} (type %))] t))
-(defmethod ->offset-date-time OffsetDateTime [^OffsetDateTime datetime] datetime)
-(defmethod ->offset-date-time LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC)))
-(defmethod ->offset-date-time LocalDate [^LocalDate date] (.atOffset (.atStartOfDay date) (ZoneOffset/UTC)))
-(defmethod ->offset-date-time :default [x] (throw (ex-info "Cannot convert value to OffsetDateTime."
-                                                           {:value x
-                                                            :status 400
-                                                            :error :db/invalid-fn-call})))
 
-(defmulti ->offset-time #(when-let [t (#{OffsetTime LocalTime} (type %))] t))
-(defmethod ->offset-time OffsetTime [^OffsetTime time] time)
-(defmethod ->offset-time LocalTime [^LocalTime time] (.atOffset time (ZoneOffset/UTC)))
-(defmethod ->offset-time :default [x] (throw (ex-info "Cannot convert value to OffsetTime."
-                                                      {:value x
-                                                       :status 400
-                                                       :error :db/invalid-fn-call})))
+#?(:clj (defmulti ->offset-date-time #(when-let [t (#{OffsetDateTime LocalDateTime LocalDate} (type %))] t)))
+#?(:clj (defmethod ->offset-date-time OffsetDateTime [^OffsetDateTime datetime] datetime))
+#?(:clj (defmethod ->offset-date-time LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC))))
+#?(:clj (defmethod ->offset-date-time LocalDate [^LocalDate date] (.atOffset (.atStartOfDay date) (ZoneOffset/UTC))))
+#?(:clj (defmethod ->offset-date-time :default [x] (throw (ex-info "Cannot convert value to OffsetDateTime."
+                                                                   {:value x
+                                                                    :status 400
+                                                                    :error :db/invalid-fn-call}))))
+
+#?(:clj (defmulti ->offset-time #(when-let [t (#{OffsetTime LocalTime} (type %))] t)))
+#?(:clj (defmethod ->offset-time OffsetTime [^OffsetTime time] time))
+#?(:clj (defmethod ->offset-time LocalTime [^LocalTime time] (.atOffset time (ZoneOffset/UTC))))
+#?(:clj (defmethod ->offset-time :default [x] (throw (ex-info "Cannot convert value to OffsetTime."
+                                                              {:value x
+                                                               :status 400
+                                                               :error :db/invalid-fn-call}))))
 
 (defn compare*
   [{val-a :value dt-a :datatype-iri}
@@ -292,7 +293,8 @@
       ;; datetimes need to be converted to OffsetDateTimes for proper comparison
       (and (contains? comparable-time-datatypes dt-a)
            (contains? comparable-time-datatypes dt-b))
-      (compare (->offset-date-time val-a) (->offset-date-time val-b))
+      #?(:clj (compare (->offset-date-time val-a) (->offset-date-time val-b))
+         :cljs (comapre val-a val-b))
 
       ;; same types compare
       (= dt-a dt-b)

@@ -4,7 +4,9 @@
                       [byte-streams :as bs]
                       [hato.websocket :as ws]])
             #?@(:cljs [["axios" :as axios]
-                       ["ws" :as NodeWebSocket]])
+                       ["ws" :as NodeWebSocket]
+                       [fluree.db.platform :as platform]
+                       [clojure.string :as str]])
             [clojure.core.async :as async]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
