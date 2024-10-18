@@ -431,8 +431,10 @@
     (cond (string? value)
           (parse-iso8601-datetime value)
           ;; these values don't need coercion
-          (or (instance? OffsetDateTime value)
-              (instance? LocalDateTime value))
+          #?(:clj
+             (or (instance? OffsetDateTime value)
+                 (instance? LocalDateTime value))
+             :cljs (instance? js/Date value))
           value)
 
 
