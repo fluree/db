@@ -1,5 +1,6 @@
 (ns fluree.db.datatype
   (:require [fluree.db.constants :as const]
+            [time-literals.read-write :as time-literals]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
@@ -14,6 +15,8 @@
                    (java.time.format DateTimeFormatter))))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(time-literals/print-time-literals-clj!)
 
 (def default-data-types
   {const/iri-id                     const/$id
@@ -423,8 +426,13 @@
 
     (const/$xsd:date
       const/iri-xsd-date)
-    (when (string? value)
-      (parse-iso8601-date value))
+    (cond (string? value)
+          (parse-iso8601-date value)
+          #?(:clj
+             (instance? LocalDate value)
+             :cljs
+             (instance? js/Date value))
+          value)
 
     (const/$xsd:dateTime
       const/iri-xsd-dateTime)
@@ -441,8 +449,14 @@
 
     (const/$xsd:time
       const/iri-xsd-time)
-    (when (string? value)
-      (parse-iso8601-time value))
+    (cond (string? value)
+          (parse-iso8601-time value)
+          #?(:clj
+             (or (instance? OffsetTime value)
+                 (instance? LocalTime value))
+             :cljs
+             (instance? js/Date value))
+          value)
 
     (const/$xsd:decimal
       const/iri-xsd-decimal)
