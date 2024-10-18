@@ -7,7 +7,9 @@
             [clojure.string :as str]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake]))
+            [fluree.db.flake :as flake]
+            [fluree.db.nameservice :as nameservice]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -163,6 +165,16 @@
     (subs ledger-alias 1)
     ledger-alias))
 
+(defn publish-commit
+  "Publishes commit to all nameservices registered with the ledger."
+  [{:keys [primary-publisher secondary-publishers] :as _conn} commit-jsonld]
+  (go-try
+    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
+      (dorun (map (fn [ns]
+                    (nameservice/publish ns commit-jsonld)))
+             secondary-publishers)
+      result)))
+
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
@@ -175,5 +187,8 @@
                              (util/current-time-iso))
           genesis-commit (<? (commit-storage/write-genesis-commit
                                commit-catalog alias branch publish-addresses init-time))]
+      ;; create ns-record
+      (<? (publish-commit conn genesis-commit))
+
       (instantiate conn ledger-alias* primary-address branch commit-catalog index-catalog
-                   indexing did genesis-commit))))
+                   indexing did (json-ld/expand genesis-commit)))))
