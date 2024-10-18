@@ -1,0 +1,47 @@
+{
+  "@context": {
+    "@base": "https://ns.flur.ee/config/connection/",
+    "@vocab": "https://ns.flur.ee/system#",
+    "profiles": {
+      "@container": [ "@graph", "@index" ]
+    }
+  },
+  "@id": "file",
+  "@graph": [
+    {
+      "@id": "fileStorage",
+      "@type": "Storage",
+      "filePath": "data"
+    },
+    {
+      "@id": "connection",
+      "@type": "Connection",
+      "parallelism": 4,
+      "cacheMaxMb": 1000,
+      "commitStorage": {
+        "@id": "fileStorage"
+      },
+      "indexStorage": {
+        "@id": "fileStorage"
+      },
+      "primaryPublisher": {
+        "@type": "Publisher",
+        "storage": {
+          "@id": "fileStorage"
+        }
+      }
+    }
+  ],
+  "profiles": {
+    "dev": [
+      {
+        "@id": "connection",
+        "cacheMaxMb": 200
+      },
+      {
+        "@id": "consensus",
+        "maxPendingTxns": 16
+      }
+    ]
+  }
+}
