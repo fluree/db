@@ -472,7 +472,7 @@
 
 (defn unwrap-list
   "If values are contained in a @list, unwraps them.
-  @list can look like:
+  the @list can look like:
   {ex:someProperty [{@list [ex:val1 ex:val2]}]}
   or in single-cardinality form:
   {ex:someProperty {@list [ex:val1 ex:val2]}}
