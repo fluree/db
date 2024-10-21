@@ -102,8 +102,8 @@
   them. This function will halt but not error if a cycle is detected. It is also not
   stack safe."
   ([db shape-sid]
-   (build-shape-node db shape-sid #{shape-sid}))
-  ([db shape-sid built-nodes]
+   (build-shape-node db shape-sid #{shape-sid} 0))
+  ([db shape-sid built-nodes depth]
    (go-try
      (let [flakes (<? (query-range/index-range db :spot = [shape-sid]))]
        (if (seq flakes)
@@ -113,9 +113,11 @@
              (recur r (update node (flake/p f) (fnil conj [])
                               (if (flake/ref-flake? f)
                                 (let [ref (flake/o f)]
-                                  (if (contains? built-nodes ref)
+                                  (if (or (contains? built-nodes ref)
+                                          (>= depth 10))
+                                    ;; cycle or depth limit reached (depth limit is currently arbitrary)
                                     ref
-                                    (<? (build-shape-node db ref (conj built-nodes ref)))))
+                                    (<? (build-shape-node db ref (conj built-nodes ref) (inc depth)))))
                                 (flake/o f))))
              node))
          shape-sid)))))
