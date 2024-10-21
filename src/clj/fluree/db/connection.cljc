@@ -496,16 +496,6 @@
        :commit-jsonld commit-jsonld*
        :write-result  commit-res})))
 
-(defn publish-commit
-  "Publishes commit to all nameservices registered with the ledger."
-  [{:keys [primary-publisher secondary-publishers] :as _conn} commit-jsonld]
-  (go-try
-    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
-      (dorun (map (fn [ns]
-                    (nameservice/publish ns commit-jsonld)))
-             secondary-publishers)
-      result)))
-
 (defn formalize-commit
   [{prev-commit :commit :as staged-db} new-commit]
   (let [max-ns-code (-> staged-db :namespace-codes iri/get-max-namespace-code)]
@@ -578,7 +568,7 @@
 
        (log/debug "Committing t" t "at" time)
 
-       (<? (publish-commit conn commit-jsonld))
+       (<? (ledger/publish-commit conn commit-jsonld))
 
        (if file-data?
          {:data-file-meta   data-write-result
