@@ -260,52 +260,58 @@
             (recur r results))
           (not-empty results))))))
 
+(defn get-id [x]
+  (if (map? x)
+    (get x const/$id)
+    x))
+
 (defn target-node-target?
   "If a subject is the same as the targetNode target, it is targeted."
   [shape s-flakes]
   (let [sid        (some-> s-flakes first flake/s)
-        target-sids (->> (get shape const/sh_targetNode) (into #{}))]
+        target-sids (->> (get shape const/sh_targetNode) (into #{} (map get-id)))]
     (contains? target-sids sid)))
 
 (defn target-class-target?
   "If a subject has the targeted @type, then it is a targetClass target."
   [shape s-flakes]
-  (let [target-class (first (get shape const/sh_targetClass))]
+  (let [target-classes (->> (get shape const/sh_targetClass)
+                            (into #{} (map get-id)))]
     (some (fn [f]
             (and (flake/class-flake? f)
-                 (= (flake/o f) target-class)))
+                 (contains? target-classes (flake/o f))))
           s-flakes)))
 
 (defn target-subjects-of-target?
   "If a subject has the targeted predicate, then it is a targetSubjectsOf target."
   [shape s-flakes]
-  (let [target-pid (first (get shape const/sh_targetSubjectsOf))]
-    (some (fn [f] (= (flake/p f) target-pid))
+  (let [target-pids (->> (get shape const/sh_targetSubjectsOf) (into #{} (map get-id)))]
+    (some (fn [f] (contains? target-pids (flake/p f)))
           s-flakes)))
 
 (defn implicit-target?
   "If a sh:NodeShape has a class it implicitly targets nodes of that type."
   ;; https://www.w3.org/TR/shacl/#implicit-targetClass
   [shape s-flakes]
-  (let [shape-classes (-> (get shape const/$rdf:type) (set) (disj const/sh_NodeShape))]
+  (let [shape-classes (-> (into #{} (map get-id) (get shape const/$rdf:type)) (disj const/sh_NodeShape))]
     (some (fn [f] (and (flake/class-flake? f)
                        (contains? shape-classes (flake/o f))))
           s-flakes)))
 
 (defn target-objects-of-target?
   [shape]
-  (first (get shape const/sh_targetObjectsOf)))
+  (seq (get shape const/sh_targetObjectsOf)))
 
 (defn target-objects-of-focus-nodes
   "Returns the objects of any targeted predicate, plus the subject if it is referred to by
   the targeted predicate."
   [db shape s-flakes]
   (go-try
-    (let [target-pid (first (get shape const/sh_targetObjectsOf))]
+    (let [target-pids       (->> (get shape const/sh_targetObjectsOf) (into #{} (map get-id)))]
       (let [sid             (some-> s-flakes first flake/s)
             referring-pids  (not-empty (<? (query-range/index-range db :opst = [[sid const/$id]]
                                                                     {:flake-xf (map flake/p)})))
-            p-flakes        (filterv (fn [f] (= (flake/p f) target-pid)) s-flakes)
+            p-flakes        (filterv (fn [f] (contains? target-pids (flake/p f))) s-flakes)
             focus-nodes     (mapv object-node p-flakes)]
         ;; TODO: we assume that these objects are sids, but that assumption may not hold
         (cond-> (mapv flake/o p-flakes)
