@@ -419,7 +419,7 @@
        :cljs
        (.getHours (if (string? x)
                     (datatype/coerce (:value x) (:datatype-iri x))
-                    datetime)))))
+                    x)))))
 
 (defn minutes
   [x]
@@ -454,9 +454,9 @@
               (.toString (.getOffset ^OffsetDateTime (->offset-date-time (:value x))))
               #{const/iri-xsd-time}
               (.toString (.getOffset ^OffsetTime (->offset-time (:value x)))))
-       :cljs (.getTimeZoneOffset ^js/Date (if (string? datetime)
-                                            (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                                            datetime)))))
+       :cljs (.getTimeZoneOffset ^js/Date (if (string? x)
+                                            (datatype/coerce (:value x) (:datatype-iri x))
+                                            x)))))
 
 (defn sha256
   [{x :value}]
