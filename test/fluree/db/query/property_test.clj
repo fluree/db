@@ -213,7 +213,7 @@
 
 (deftest ^:integration nested-properties
   (with-tmp-dir storage-path
-    (let [conn      @(fluree/connect {:method :file, :storage-path storage-path})
+    (let [conn      @(fluree/connect-file {:storage-path storage-path})
           ledger-id "bugproperty-iri"
           context   [test-utils/default-str-context
                      {"ex"  "http://example.com/"

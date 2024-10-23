@@ -70,7 +70,7 @@
    (deftest load-from-file-test
      (testing "can load a file ledger with single cardinality predicates"
        (with-tmp-dir storage-path
-                     (let [conn         @(fluree/connect {:method :file, :storage-path storage-path})
+                     (let [conn         @(fluree/connect-file {:storage-path storage-path})
                            ledger-alias "load-from-file-test-single-card"
                            ledger       @(fluree/create conn ledger-alias)
                            db           @(fluree/stage
@@ -112,7 +112,7 @@
 
      (testing "can load a file ledger with multi-cardinality predicates"
        (with-tmp-dir storage-path
-                     (let [conn         @(fluree/connect {:method :file, :storage-path storage-path})
+                     (let [conn         @(fluree/connect-file {:storage-path storage-path})
                            ledger-alias "load-from-file-test-multi-card"
                            ledger       @(fluree/create conn ledger-alias)
                            db           @(fluree/stage
@@ -161,7 +161,7 @@
 
      (testing "query returns the correct results from a loaded ledger"
        (with-tmp-dir storage-path
-                     (let [conn         @(fluree/connect {:method :file, :storage-path storage-path})
+                     (let [conn         @(fluree/connect-file {:storage-path storage-path})
                            ledger-alias "load-from-file-query"
                            ledger       @(fluree/create conn ledger-alias)
                            db           @(fluree/stage
@@ -189,8 +189,7 @@
 
      (testing "can load a ledger with `list` values"
        (with-tmp-dir storage-path
-                     (let [conn         @(fluree/connect {:method       :file
-                                                          :storage-path storage-path})
+                     (let [conn         @(fluree/connect-file {:storage-path storage-path})
                            ledger-alias "load-lists-test"
                            ledger       @(fluree/create conn ledger-alias
                                                         {:reindex-min-bytes 0}) ; force reindex on every commit
@@ -228,8 +227,7 @@
 
        (testing "can load with policies"
          (with-tmp-dir storage-path
-                       (let [conn         @(fluree/connect {:method       :file
-                                                            :storage-path storage-path})
+                       (let [conn         @(fluree/connect-file {:storage-path storage-path})
                              ledger-alias "load-policy-test"
                              ledger       @(fluree/create conn ledger-alias)
                              db           @(fluree/stage
@@ -303,8 +301,7 @@
 
      (testing "Can load a ledger with time values"
        (with-tmp-dir storage-path
-                     (let [conn      @(fluree/connect {:method       :file
-                                                       :storage-path storage-path})
+                     (let [conn      @(fluree/connect-file {:storage-path storage-path})
                            ledger    @(fluree/create conn "index/datetimes")
                            db        @(fluree/stage
                                        (fluree/db ledger)

@@ -89,6 +89,28 @@
                          ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"] ledger-defaults))]
      (connect memory-config))))
 
+(defn connect-file
+  ([]
+   (connect-file {}))
+  ([{:keys [storage-path parallelism cache-max-mb ledger-defaults],
+     :or   {storage-path "data", parallelism 4, cache-max-mb 1000}}]
+   (let [file-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+                                          "@vocab" "https://ns.flur.ee/system#"}
+                              "@id"      "file"
+                              "@graph"   [{"@id"      "fileStorage"
+                                           "@type"    "Storage"
+                                           "filePath" storage-path}
+                                          {"@id"              "connection"
+                                           "@type"            "Connection"
+                                           "parallelism"      parallelism
+                                           "cacheMaxMb"       cache-max-mb
+                                           "commitStorage"    {"@id" "fileStorage"}
+                                           "indexStorage"     {"@id" "fileStorage"}
+                                           "primaryPublisher" {"@type"   "Publisher"
+                                                               "storage" {"@id" "fileStorage"}}}]}
+                       ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"] ledger-defaults))]
+     (connect file-config))))
+
 (defn address?
   "Returns true if the argument is a full ledger address, false if it is just an
   alias."

@@ -356,13 +356,13 @@
 
 (deftest ^:integration load-with-new-connection
   (with-tmp-dir storage-path
-    (let [conn0     @(fluree/connect {:method :file :storage-path storage-path})
+    (let [conn0     @(fluree/connect-file {:storage-path storage-path})
           ledger-id "new3"
           ledger    @(fluree/create-with-txn conn0 {"@context" {"ex" {"ex" "http://example.org/ns/"}}
                                                     "ledger"   ledger-id
                                                     "insert"   {"ex:createdAt" "now"}})
 
-          conn1 @(fluree/connect {:method :file, :storage-path storage-path})]
+          conn1 @(fluree/connect-file {:storage-path storage-path})]
       (is (= [{"ex:createdAt" "now"}]
              @(fluree/query-connection conn1 {"@context" {"ex" {"ex" "http://example.org/ns/"}}
                                               :from      ledger-id

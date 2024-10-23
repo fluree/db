@@ -818,10 +818,9 @@
     (testing "history commit details on a loaded file ledger"
       (with-tmp-dir storage-path
                     (let [ledger-name   "loaded-history-file"
-                          conn          @(fluree/connect {:method       :file
-                                                          :storage-path storage-path
-                                                          :defaults     {:did (did/private->did-map
-                                                                               test-utils/default-private-key)}})
+                          conn          @(fluree/connect-file {:storage-path    storage-path
+                                                               :ledger-defaults {:identity (did/private->did-map
+                                                                                             test-utils/default-private-key)}})
                           context       [test-utils/default-context {:ex "http://example.org/ns/"}]
 
                           a             @(fluree/create-with-txn conn {"@context" ["https://ns.flur.ee"
