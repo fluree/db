@@ -78,6 +78,15 @@
 (def ledger-defaults
   (system-iri "ledgerDefaults"))
 
+(def identity
+  (system-iri "identity"))
+
+(def public-key
+  (system-iri "publicKey"))
+
+(def private-key
+  (system-iri "privateKey"))
+
 (def index-options
   (system-iri "indexOptions"))
 

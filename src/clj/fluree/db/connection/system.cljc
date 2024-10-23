@@ -144,11 +144,18 @@
         secondary-publishers (get config conn-vocab/secondary-publishers)
         remote-systems       (get config conn-vocab/remote-systems)
         ledger-defaults      (get-first config conn-vocab/ledger-defaults)
+        identity             (get-first ledger-defaults conn-vocab/identity)
+        did                  (get-id identity)
+        public-key           (get-first-value identity conn-vocab/public-key)
+        private-key          (get-first-value identity conn-vocab/private-key)
         index-options        (get-first ledger-defaults conn-vocab/index-options)
         reindex-min-bytes    (get-first-value index-options conn-vocab/reindex-min-bytes)
         reindex-max-bytes    (get-first-value index-options conn-vocab/reindex-max-bytes)
         max-old-indexes      (get-first-value index-options conn-vocab/max-old-indexes)
-        ledger-defaults*     {:index-options {:reindex-min-bytes reindex-min-bytes
+        ledger-defaults*     {:identity      {:id      did
+                                              :public  public-key
+                                              :private private-key}
+                              :index-options {:reindex-min-bytes reindex-min-bytes
                                               :reindex-max-bytes reindex-max-bytes
                                               :max-old-indexes   max-old-indexes}}]
     (connection/connect {:parallelism          parallelism
