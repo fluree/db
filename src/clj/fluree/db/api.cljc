@@ -56,7 +56,15 @@
   ;; TODO - do some validation
   (promise-wrap
     (go-try
-      (system/initialize config))))
+      (let [system-map (system/initialize config)]
+        (-> system-map
+            :fluree.db/connection
+            (assoc ::system-map system-map))))))
+
+(defn disconnect
+  [conn]
+  (go-try
+    (-> conn ::system-map system/terminate)))
 
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.

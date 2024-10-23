@@ -1,5 +1,6 @@
 (ns fluree.db.connection.system
   (:require [fluree.db.connection :as connection]
+            [fluree.db.connection.config :as config]
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.cache :as cache]
             [fluree.db.storage :as storage]
@@ -45,6 +46,35 @@
 (derive :fluree.db.nameservice/ipns :fluree.db/nameservice)
 
 (derive :fluree.db.serializer/json :fluree.db/serializer)
+
+
+(defn reference?
+  [node]
+  (and (map? node)
+       (contains? node :id)
+       (-> node (dissoc :idx :id) empty?)))
+
+(defn convert-reference
+  [node]
+  (if (reference? node)
+    (let [id (get-id node)]
+      (ig/ref id))
+    node))
+
+(defn convert-node-references
+  [node]
+  (reduce-kv (fn [m k v]
+               (let [v* (if (coll? v)
+                          (mapv convert-reference v)
+                          (convert-reference v))]
+                 (assoc m k v*)))
+             {} node))
+
+(defn convert-references
+  [cfg]
+  (reduce-kv (fn [m id node]
+               (assoc m id (convert-node-references node)))
+             {} cfg))
 
 (defmethod ig/init-key :default
   [_ component]
@@ -179,11 +209,8 @@
 
 (defn initialize
   [config]
-  (let [system-map (ig/init config)]
-    (-> system-map
-        :fluree.db/connection
-        (assoc ::map system-map))))
+  (-> config convert-references ig/expand ig/init))
 
 (defn terminate
-  [conn]
-  (-> conn ::map ig/halt!))
+  [sys]
+  (ig/halt! sys))
