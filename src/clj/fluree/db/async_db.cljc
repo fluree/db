@@ -19,6 +19,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+#?(:cljs (declare ->AsyncDB))
 (defrecord AsyncDB [alias branch commit t db-chan]
   dbproto/IFlureeDb
   (-query [this query-map]
