@@ -144,7 +144,7 @@
 
 (deftest ^:integration subjects-as-predicates
   (testing "predicate iri-cache loookups"
-    (let [conn    @(fluree/connect {:method :memory})
+    (let [conn    @(fluree/connect-memory)
           ledger  @(fluree/create conn "propertypathstest")
           db0     (fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/"}]

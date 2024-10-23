@@ -761,7 +761,7 @@
                 (done))))))
 
        :clj
-       (let [conn @(fluree/connect {:method :memory})
+       (let [conn @(fluree/connect-memory)
              db   (-> conn
                       (fluree/create "people")
                       deref

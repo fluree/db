@@ -339,7 +339,7 @@
 #?(:clj
    (deftest load-from-memory-test
      (testing "can load a memory ledger with single cardinality predicates"
-       (let [conn         @(fluree/connect {:method :memory})
+       (let [conn         @(fluree/connect-memory)
              ledger-alias "load-from-memory-test-single-card"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
@@ -379,7 +379,7 @@
          (is (= target-t (:t loaded-db)))))
 
      (testing "can load a memory ledger with multi-cardinality predicates"
-       (let [conn         @(fluree/connect {:method :memory})
+       (let [conn         @(fluree/connect-memory)
              ledger-alias "load-from-memory-test-multi-card"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
@@ -427,7 +427,7 @@
          (is (= target-t (:t loaded-db)))))
 
      (testing "query returns the correct results from a loaded ledger"
-       (let [conn         @(fluree/connect {:method :memory})
+       (let [conn         @(fluree/connect-memory)
              ledger-alias "load-from-memory-query"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
@@ -454,7 +454,7 @@
          (is (= res1 res2))))
 
      (testing "can load a ledger with `list` values"
-       (let [conn         @(fluree/connect {:method :memory})
+       (let [conn         @(fluree/connect-memory)
              ledger-alias "load-lists-test"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
@@ -490,7 +490,7 @@
                                                  :where   '{:id ?s, :type :ex/User}}))))))
 
        (testing "can load with policies"
-         (let [conn         @(fluree/connect {:method :memory})
+         (let [conn         @(fluree/connect-memory)
                ledger-alias "load-policy-test"
                ledger       @(fluree/create conn ledger-alias)
                db           @(fluree/stage
@@ -611,7 +611,7 @@
                       "sh:property"    {"sh:path" {"id" "schema:age"}, "sh:datatype" {"id" "xsd:string"}}}]
                     @(fluree/query (fluree/db loaded2) property-query)))))))
      (testing "can load after deletion of entire subjects"
-       (let [conn              @(fluree/connect {:method :memory})
+       (let [conn              @(fluree/connect-memory)
              ledger-alias      "tx/delete"
              ledger            @(fluree/create conn ledger-alias)
              db1               @(fluree/stage
@@ -838,7 +838,7 @@
 
 #?(:clj
    (deftest transaction-test
-     (let [conn      @(fluree/connect {:method :memory})
+     (let [conn      @(fluree/connect-memory)
            ledger-id "update-syntax"
            ledger    @(fluree/create conn ledger-id)
            db0       (fluree/db ledger)

@@ -167,7 +167,7 @@
             "Jane's age should now be updated to 31 (from 30).")))))
 
 (deftest transaction-functions
-  (let [conn   @(fluree/connect {:method :memory})
+  (let [conn   @(fluree/connect-memory)
         ledger @(fluree/create conn "functions")
         db1    (fluree/db ledger)]
 
@@ -564,7 +564,7 @@
             "query parse error")))))
 
 (deftest ^:integration subject-object-scan-deletions
-  (let [conn      @(fluree/connect {:method :memory})
+  (let [conn      @(fluree/connect-memory)
         ledger-id "test/love"
         ledger    @(fluree/create conn ledger-id)
         context   {"id"     "@id",

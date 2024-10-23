@@ -4,7 +4,7 @@
              [fluree.db.test-utils :as test-utils]))
 
 (deftest values
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
 
         context ["https://flur.ee"
                  test-utils/default-str-context

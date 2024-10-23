@@ -1426,7 +1426,7 @@ WORLD!")
                  (ex-message db-ref-value))))))))
 
 (deftest language-constraints
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "validation-report")
         context ["https://ns.flur.ee" test-utils/default-str-context
                  {"ex" "http://example.com/ns/"}]
@@ -1690,7 +1690,7 @@ WORLD!")
                  (ex-message db-num-email))))))))
 
 (deftest ^:integration property-paths
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "propertypathstest")
         context [test-utils/default-str-context {"ex" "http://example.com/"}]
         db0     (fluree/db ledger)]
@@ -1919,7 +1919,7 @@ WORLD!")
                (ex-message invalid-princess)))))))
 
 (deftest ^:integration shacl-class-test
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "classtest")
         context test-utils/default-str-context
         db0     (fluree/db ledger)
@@ -2030,7 +2030,7 @@ WORLD!")
 
 (deftest ^:integration shacl-in-test
   (testing "value nodes"
-    (let [conn    @(fluree/connect {:method :memory})
+    (let [conn    @(fluree/connect-memory)
           ledger  @(fluree/create conn "shacl-in-test")
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db0     (fluree/db ledger)
@@ -2063,7 +2063,7 @@ WORLD!")
       (is (= "Subject ex:YellowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-3 - value \"yellow\" is not in [\"cyan\" \"magenta\"]."
              (ex-message db2)))))
   (testing "node refs"
-    (let [conn    @(fluree/connect {:method :memory})
+    (let [conn    @(fluree/connect-memory)
           ledger  @(fluree/create conn "shacl-in-test")
           db0     (fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
@@ -2120,7 +2120,7 @@ WORLD!")
                  first
                  (update "ex:color" (partial sort-by #(get % "id"))))))))
   (testing "mixed values and refs"
-    (let [conn    @(fluree/connect {:method :memory})
+    (let [conn    @(fluree/connect-memory)
           ledger  @(fluree/create conn "shacl-in-test")
           db0     (fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
@@ -2157,7 +2157,7 @@ WORLD!")
              (ex-message db2))))))
 
 (deftest ^:integration shacl-targetobjectsof-test
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "shacl-target-objects-of-test")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)]
@@ -2419,7 +2419,7 @@ WORLD!")
 
 (deftest ^:integration shape-based-constraints
   (testing "sh:node"
-    (let [conn    @(fluree/connect {:method :memory})
+    (let [conn    @(fluree/connect-memory)
           ledger  @(fluree/create conn "shape-constaints")
           db0     (fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
@@ -2469,7 +2469,7 @@ WORLD!")
              (ex-message invalid-person)))))
 
   (testing "sh:qualifiedValueShape property shape"
-    (let [conn        @(fluree/connect {:method :memory})
+    (let [conn        @(fluree/connect-memory)
           ledger      @(fluree/create conn "shape-constaints")
           db0         (fluree/db ledger)
           context     [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
@@ -2526,7 +2526,7 @@ WORLD!")
       (is (= "Subject ex:InvalidKid path [\"ex:parent\"] violates constraint sh:qualifiedValueShape of shape _:fdb-9 - values [\"ex:Bob\" \"ex:Zorba\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times."
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShape node shape"
-    (let [conn   @(fluree/connect {:method :memory})
+    (let [conn   @(fluree/connect-memory)
           ledger @(fluree/create conn "shape-constaints")
           db0    (fluree/db ledger)
 
@@ -2589,7 +2589,7 @@ WORLD!")
       (is (= "Subject ex:InvalidKid path [\"ex:parent\"] violates constraint sh:qualifiedValueShape of shape _:fdb-14 - values [\"ex:Bob\" \"ex:Zorba\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times."
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
-    (let [conn   @(fluree/connect {:method :memory})
+    (let [conn   @(fluree/connect-memory)
           ledger @(fluree/create conn "shape-constraints")
           db0    (fluree/db ledger)
 
@@ -2679,7 +2679,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
              (ex-message invalid-hand))))))
 
 (deftest ^:integration post-processing-validation
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "post-processing")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)]
@@ -2812,7 +2812,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                (ex-message invalid-person)))))))
 
 (deftest validation-report
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "validation-report")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)]
@@ -2894,7 +2894,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                      (get "sh:resultMessage")))))))))
 
 (deftest target-subjects-of
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "validation-report")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)
@@ -2918,7 +2918,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                (:status (ex-data db2))))))))
 
 (deftest target-node
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "validation-report")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)
@@ -2942,7 +2942,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                (:status (ex-data db2))))))))
 
 (deftest alternative-path
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "validation-report")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)

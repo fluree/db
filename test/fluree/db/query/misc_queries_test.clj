@@ -305,7 +305,7 @@
                                         :where   '{:id :ex/UserShape, :sh/targetClass ?class}})))))))
 
 (deftest ^:integration type-handling
-  (let [conn   @(fluree/connect {:method :memory})
+  (let [conn   @(fluree/connect-memory)
         ledger @(fluree/create conn "type-handling")
         db0    (fluree/db ledger)
         db1    @(fluree/stage db0 {"@context" ["https://ns.flur.ee"

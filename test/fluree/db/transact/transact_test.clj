@@ -158,7 +158,7 @@
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
              @(fluree/query db query)))))
   (testing "iri value maps are handled correctly"
-    (let [conn @(fluree/connect {:method :memory})
+    (let [conn @(fluree/connect-memory)
           ledger @(fluree/create conn "any-iri")
           db0 (fluree/db ledger)
 
@@ -393,7 +393,7 @@
 
 (deftest ^:integration base-and-vocab-test
   (testing "@base & @vocab work w/ stage"
-    (let [conn        @(fluree/connect {:method :memory})
+    (let [conn        @(fluree/connect-memory)
           ctx         {"@base"  "http://example.org/"
                        "@vocab" "http://example.org/terms/"
                        "f"      "https://ns.flur.ee/ledger#"}
@@ -415,7 +415,7 @@
                                  "where"    '{"@id"   ?m
                                               "@type" "http://example.org/terms/SeaMonster"}})))))
   (testing "@base & @vocab work w/ stage"
-    (let [conn        @(fluree/connect {:method :memory})
+    (let [conn        @(fluree/connect-memory)
           ctx         ["https://ns.flur.ee"
                        {"@base"  "http://example.org/"
                         "@vocab" "http://example.org/terms/"}]
@@ -438,7 +438,7 @@
 
 (deftest json-objects
   (testing "Allow transacting `json` values"
-    (let [conn   @(fluree/connect {:method :memory})
+    (let [conn   @(fluree/connect-memory)
           ledger @(fluree/create conn "jsonpls")
           db0    (fluree/db ledger)
           db1    @(fluree/stage
@@ -476,7 +476,7 @@
           "comes out as data from select clause"))))
 
 (deftest ^:integration no-where-solutions
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "insert-delete")
         context {"ex"     "http://example.org/ns/"
                  "schema" "http://schema.org/"}
@@ -499,7 +499,7 @@
                                "selectOne" {"ex:andrew" ["*"]}})))))
 
 (deftest ^:integration shacl-datatype-coercion
-  (let [conn      @(fluree/connect {:method :memory})
+  (let [conn      @(fluree/connect-memory)
         context   {"ex"     "http://example.org/",
                    "f"      "https://ns.flur.ee/ledger#",
                    "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",

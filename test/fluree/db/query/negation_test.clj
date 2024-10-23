@@ -6,7 +6,7 @@
 (deftest negation
   (testing "queries with negation"
     (testing "on an existing ledger containing data about people"
-      (let [conn    @(fluree/connect {:method :memory})
+      (let [conn    @(fluree/connect-memory)
             ledger  @(fluree/create conn "negation-test")
             context ["https://flur.ee"
                      test-utils/default-str-context

@@ -42,22 +42,6 @@
                (reject res)
                (resolve res))))))))
 
-(defn parse-connection-options
-  [{:keys [method parallelism cache-max-mb remote-servers]
-    :as   connect-opts
-    :or   {parallelism  4
-           cache-max-mb 100}}]
-  (let [method* (cond
-                  method         (keyword method)
-                  remote-servers :remote
-                  :else          (throw (ex-info (str "No Fluree connection method type specified in configuration: "
-                                                      connect-opts)
-                                                 {:status 500 :error :db/invalid-configuration})))]
-    (assoc connect-opts
-           :method method*
-           :parallelism parallelism
-           :cache-max-mb cache-max-mb)))
-
 (defn connect
   "Forms connection to ledger, enabling automatic pulls of new updates, event
   services, index service.
@@ -68,28 +52,11 @@
   Options include:
     - did - (optional) DId information to use, if storing blocks as verifiable
             credentials, or issuing queries against a permissioned database."
-  [opts]
+  [config]
   ;; TODO - do some validation
   (promise-wrap
     (go-try
-      (let [{:keys [method] :as opts*} (parse-connection-options opts)
-
-            config (case method
-                     :ipfs   (let [{:keys [server file-storage-path parallelism cache-max-mb defaults]} opts*]
-                               (system/ipfs-config server file-storage-path parallelism cache-max-mb defaults))
-                     :file   (if platform/BROWSER
-                               (throw (ex-info "File connection not supported in the browser" opts))
-                               (let [{:keys [storage-path parallelism cache-max-mb defaults]} opts*]
-                                 (system/file-config storage-path parallelism cache-max-mb defaults)))
-                     :memory (let [{:keys [parallelism cache-max-mb defaults]} opts*]
-                               (system/memory-config parallelism cache-max-mb defaults))
-                     :s3     #?(:clj
-                                (let [{:keys [endpoint bucket prefix parallelism cache-max-mb defaults]} opts*]
-                                  (system/s3-config endpoint bucket prefix parallelism cache-max-mb defaults))
-                                :cljs
-                                (throw (ex-info "S3 connections not yet supported in ClojureScript"
-                                                {:status 400, :error :db/unsupported-operation}))))]
-        (system/start config)))))
+      (system/initialize config))))
 
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.
@@ -102,8 +69,25 @@
 (defn connect-memory
   "Forms an in-memory connection using default settings.
   - did - (optional) DId information to use, if storing blocks as verifiable credentials"
-  [opts]
-  (connect (assoc opts :method :memory)))
+  ([]
+   (connect-memory {}))
+  ([{:keys [parallelism cache-max-mb ledger-defaults],
+     :or   {parallelism 4, cache-max-mb 1000}}]
+   (let [memory-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+                                            "@vocab" "https://ns.flur.ee/system#"}
+                                "@id"      "memory"
+                                "@graph"   [{"@id"   "memoryStorage"
+                                             "@type" "Storage"}
+                                            {"@id"              "connection"
+                                             "@type"            "Connection"
+                                             "parallelism"      parallelism
+                                             "cacheMaxMb"       cache-max-mb
+                                             "commitStorage"    {"@id" "memoryStorage"}
+                                             "indexStorage"     {"@id" "memoryStorage"}
+                                             "primaryPublisher" {"@type"   "Publisher"
+                                                                 "storage" {"@id" "memoryStorage"}}}]}
+                         ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"] ledger-defaults))]
+     (connect memory-config))))
 
 (defn address?
   "Returns true if the argument is a full ledger address, false if it is just an

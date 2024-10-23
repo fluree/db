@@ -423,7 +423,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                  (ex-message db-greeting-incorrect))))))))
 
 (deftest ^:integration shacl-and-tests
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "shacl-and")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
@@ -467,7 +467,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                (ex-message db2)))))))
 
 (deftest ^:integration shacl-or-tests
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "shacl-or")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
@@ -511,7 +511,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                (ex-message db2)))))))
 
 (deftest ^:integration shacl-xone-tests
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "shacl-or")
         context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
