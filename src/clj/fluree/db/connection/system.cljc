@@ -137,27 +137,36 @@
   [_ _]
   (json-serde))
 
+(defn parse-identity
+  [ledger-defaults]
+  (when-let [identity (get-first ledger-defaults conn-vocab/identity)]
+    {:id      (get-id identity)
+     :public  (get-first-value identity conn-vocab/public-key)
+     :private (get-first-value identity conn-vocab/private-key)}))
+
+(defn parse-index-options
+  [ledger-defaults]
+  (when-let [index-options (get-first ledger-defaults conn-vocab/index-options)]
+    {:reindex-min-bytes (get-first-value index-options conn-vocab/reindex-min-bytes)
+     :reindex-max-bytes (get-first-value index-options conn-vocab/reindex-max-bytes)
+     :max-old-indexes   (get-first-value index-options conn-vocab/max-old-indexes)}))
+
+(defn parse-ledger-defaults
+  [config]
+  (when-let [ledger-defaults (get-first config conn-vocab/ledger-defaults)]
+    (let [identity      (parse-identity ledger-defaults)
+          index-options (parse-index-options ledger-defaults)]
+      (cond-> nil
+        identity      (assoc :identity identity)
+        index-options (assoc :index-options index-options)))))
+
 (defmethod ig/init-key :fluree.db/connection
   [_ {:keys [cache commit-catalog index-catalog serializer] :as config}]
   (let [parallelism          (get-first-value config conn-vocab/parallelism)
         primary-publisher    (get-first config conn-vocab/primary-publisher)
         secondary-publishers (get config conn-vocab/secondary-publishers)
         remote-systems       (get config conn-vocab/remote-systems)
-        ledger-defaults      (get-first config conn-vocab/ledger-defaults)
-        identity             (get-first ledger-defaults conn-vocab/identity)
-        did                  (get-id identity)
-        public-key           (get-first-value identity conn-vocab/public-key)
-        private-key          (get-first-value identity conn-vocab/private-key)
-        index-options        (get-first ledger-defaults conn-vocab/index-options)
-        reindex-min-bytes    (get-first-value index-options conn-vocab/reindex-min-bytes)
-        reindex-max-bytes    (get-first-value index-options conn-vocab/reindex-max-bytes)
-        max-old-indexes      (get-first-value index-options conn-vocab/max-old-indexes)
-        ledger-defaults*     {:identity      {:id      did
-                                              :public  public-key
-                                              :private private-key}
-                              :index-options {:reindex-min-bytes reindex-min-bytes
-                                              :reindex-max-bytes reindex-max-bytes
-                                              :max-old-indexes   max-old-indexes}}]
+        ledger-defaults      (parse-ledger-defaults config)]
     (connection/connect {:parallelism          parallelism
                          :cache                cache
                          :commit-catalog       commit-catalog
@@ -166,7 +175,7 @@
                          :secondary-publishers secondary-publishers
                          :remote-systems       remote-systems
                          :serializer           serializer
-                         :defaults             ledger-defaults*})))
+                         :defaults             ledger-defaults})))
 
 (defn initialize
   [config]
