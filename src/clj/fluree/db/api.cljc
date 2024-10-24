@@ -1,5 +1,6 @@
 (ns fluree.db.api
-  (:require [fluree.db.connection.system :as system]
+  (:require [fluree.db.connection.config :as config]
+            [fluree.db.connection.system :as system]
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
@@ -56,10 +57,13 @@
   ;; TODO - do some validation
   (promise-wrap
     (go-try
-      (let [system-map (system/initialize config)]
-        (-> system-map
-            :fluree.db/connection
-            (assoc ::system-map system-map))))))
+      (let [system-map (-> config config/parse system/initialize)
+            conn       (reduce-kv (fn [x k v]
+                                    (if (isa? k :fluree.db/connection)
+                                      (reduced v)
+                                      x))
+                                  nil system-map)]
+        (assoc conn ::system-map system-map)))))
 
 (defn disconnect
   [conn]
