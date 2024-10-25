@@ -146,7 +146,7 @@
    (create-conn {}))
   ([{:keys [did]
      :or   {did (did/private->did-map default-private-key)}}]
-   (let [conn-p (fluree/connect-memory {:defaults {:did did}})]
+   (let [conn-p (fluree/connect-memory {:defaults {:identity did}})]
      #?(:clj @conn-p :cljs (go (<p! conn-p))))))
 
 (defn load-movies

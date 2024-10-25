@@ -1,5 +1,7 @@
 (ns fluree.db.api
-  (:require [fluree.db.connection.config :as config]
+  (:require [camel-snake-kebab.core :refer [->camelCaseString]]
+            [clojure.walk :refer [postwalk]]
+            [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.util.context :as context]
@@ -78,6 +80,18 @@
   [opts]
   (connect (assoc opts :method :ipfs)))
 
+(defn camelize-key
+  [[k v]]
+  [(->camelCaseString k) v])
+
+(defn camel-string-keys
+  [m]
+  (postwalk (fn [x]
+              (if (map? x)
+                (into {} (map camelize-key) x)
+                x))
+            m))
+
 (defn connect-memory
   "Forms an in-memory connection using default settings.
   - did - (optional) DId information to use, if storing blocks as verifiable credentials"
@@ -98,7 +112,8 @@
                                              "indexStorage"     {"@id" "memoryStorage"}
                                              "primaryPublisher" {"@type"   "Publisher"
                                                                  "storage" {"@id" "memoryStorage"}}}]}
-                         ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"] ledger-defaults))]
+                         ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"]
+                                                   (camel-string-keys ledger-defaults)))]
      (connect memory-config))))
 
 (defn connect-file
@@ -120,7 +135,8 @@
                                            "indexStorage"     {"@id" "fileStorage"}
                                            "primaryPublisher" {"@type"   "Publisher"
                                                                "storage" {"@id" "fileStorage"}}}]}
-                       ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"] ledger-defaults))]
+                       ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"]
+                                                 (camel-string-keys ledger-defaults)))]
      (connect file-config))))
 
 (defn address?

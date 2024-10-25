@@ -247,8 +247,7 @@
       (let [shacl   (-> "movies2-schema.json" io/resource json/read-value)
             movies  (-> "movies2.json" io/resource json/read-value)
             ;; TODO: Once :method :memory supports indexing, switch to that.
-            conn    @(fluree/connect {:method       :file
-                                      :storage-path storage-path})
+            conn    @(fluree/connect-file {:storage-path storage-path})
             ledger  @(fluree/create conn "movies2")
             db      (fluree/db ledger)
             db0     @(fluree/stage db {"@context" ["https://ns.flur.ee"
