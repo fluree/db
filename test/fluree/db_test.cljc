@@ -30,7 +30,7 @@
                  ledger-alias    "testledger"
                  before-creation (<p! (fluree/exists? conn ledger-alias))
                  ledger          (<p! (fluree/create conn ledger-alias))
-                 after-creation  (<p! (fluree/exists? conn ledger-alias 100))]
+                 after-creation  (<p! (fluree/exists? conn ledger-alias))]
              (is (false? before-creation))
              (is (true? after-creation))
              (done)))))))

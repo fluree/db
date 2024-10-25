@@ -48,7 +48,8 @@
 (defn split-address
   "Splits `address` into the fully qualified storage method and local path."
   [address]
-  (str/split address #":(?!.*:)" 2))
+  (let [components (str/split address #":")]
+    [(str/join ":" (butlast components)) (last components)]))
 
 (defn valid-identifier?
   [x]
