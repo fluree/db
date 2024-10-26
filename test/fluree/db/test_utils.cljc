@@ -1,5 +1,6 @@
 (ns fluree.db.test-utils
   (:require [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]
+            [clojure.string :as str]
             [fluree.db.did :as did]
             [fluree.db.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -271,6 +272,13 @@
       (log/warn "commit-id? falsey result from:" s))
     result))
 
+(defn blank-node-id?
+  [s]
+  (let [result (and (string? s) (str/starts-with? s "_:fdb-"))]
+    (when-not result
+      (log/warn "blank-node-id? falsey result from:" s))
+    result))
+
 (defn pred-match?
   "Does a deep compare of expected and actual map values but any predicate fns
   in expected are run with the equivalent value from actual and the result is
@@ -300,3 +308,18 @@
         deterministic-new-blank-node-id (fn [] (str "_:fdb-" (swap! counter inc)))]
     (with-redefs [fluree.db.json-ld.iri/new-blank-node-id deterministic-new-blank-node-id]
       (f))))
+
+(defn error-status
+  [ex]
+  (-> ex ex-data :status))
+
+(defn error-type
+  [ex]
+  (-> ex ex-data :error))
+
+(defn shacl-error?
+  [x]
+  (and (= (error-type x)
+          :shacl/violation)
+       (= (error-status x)
+          422)))
