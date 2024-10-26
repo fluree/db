@@ -5,8 +5,6 @@
             [fluree.db.constants :as const])
   (:import [java.time OffsetDateTime]))
 
-(use-fixtures :each test-utils/deterministic-blank-node-fixture)
-
 (defn const-now
   []
   {:value (OffsetDateTime/parse "2024-06-13T19:53:57.000Z")
@@ -448,21 +446,21 @@
                                                       "ex:strLang"      "?strLang"
                                                       "ex:bnode"        "?bnode"}]
                                          "values"   ["?s" [{"@value" "ex:rdf-term-fns" "@type" "@id"}]]}))]
-          (is (= {"ex:str"          ["1" "Abcdefg"]
-                  "ex:uuid"         {"id" "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"}
-                  "ex:struuid"      "34bdb25f-9fae-419b-9c50-203b5f306e47",
-                  "ex:isBlank"      false
-                  "ex:isNotBlank"   false
-                  "ex:isNumeric"    true
-                  "ex:isNotNumeric" false
-                  "ex:lang"         "es"
-                  "ex:datatype"     {"id" "rdf:langString"}
-                  "ex:IRI"          {"id" "ex:Abcdefg"}
-                  "ex:isIRI"        true
-                  "ex:isLiteral"    true
-                  "ex:strLang"      "Abcdefg"
-                  "ex:strdt"        "Abcdefg"
-                  "ex:bnode"        {"id" "_:fdb-12"}}
+          (is (test-utils/pred-match? {"ex:str"          ["1" "Abcdefg"]
+                                       "ex:uuid"         {"id" "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"}
+                                       "ex:struuid"      "34bdb25f-9fae-419b-9c50-203b5f306e47",
+                                       "ex:isBlank"      false
+                                       "ex:isNotBlank"   false
+                                       "ex:isNumeric"    true
+                                       "ex:isNotNumeric" false
+                                       "ex:lang"         "es"
+                                       "ex:datatype"     {"id" "rdf:langString"}
+                                       "ex:IRI"          {"id" "ex:Abcdefg"}
+                                       "ex:isIRI"        true
+                                       "ex:isLiteral"    true
+                                       "ex:strLang"      "Abcdefg"
+                                       "ex:strdt"        "Abcdefg"
+                                       "ex:bnode"        {"id" test-utils/blank-node-id?}}
                  @(fluree/query @updated {"@context"  [test-utils/default-str-context
                                                        {"ex" "http://example.com/"}]
                                           "selectOne" {"ex:rdf-term-fns" ["ex:isIRI" "ex:isURI" "ex:isLiteral"

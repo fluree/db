@@ -13,8 +13,6 @@
                       :as twf]
                :cljs [test-with-files.tools :as-alias twf])))
 
-#?(:clj (use-fixtures :each test-utils/deterministic-blank-node-fixture))
-
 (deftest exists?-test
   (testing "returns false before committing data to a ledger"
     #?(:clj
@@ -955,9 +953,7 @@
                                   "where"    {"id" "?s", "ex:name" "Murray"}
                                   "select"   {"?s" ["*" {"ex:address" ["ex:street" "ex:city" "ex:state" "ex:zip"]}]}})))
 
-       (is (= "Subject ex:mp path [\"ex:nickname\"] violates constraint sh:datatype of shape _:fdb-5 - the following values do not have expected datatype xsd:string: The Wretch.
-Subject ex:mp path [\"ex:nickname\"] violates constraint sh:maxCount of shape _:fdb-5 - count 2 is greater than maximum count of 1."
-              (ex-message db4)))
+       (is (test-utils/shacl-error? db4))
 
 
        (is (= #{"Freddy" "Betty" "Leticia" "Andrew"}

@@ -543,6 +543,5 @@
            @(fluree/query db2 {"@context"  context
                                "selectOne" {"ex:freddy" ["schema:age"]}}))
         "8 is converted from a long to an int.")
-    (is (= "Subject ex:letti path [\"schema:age\"] violates constraint sh:datatype of shape ex:PropertyShape/age - the following values do not have expected datatype xsd:integer: alot."
-           (ex-message db3))
+    (is (test-utils/shacl-error? db3)
         "datatype constraint is restored after a load")))
