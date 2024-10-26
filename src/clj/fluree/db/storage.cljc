@@ -130,7 +130,7 @@
 
 (defn display-catalog
   [clg]
-  (let [locations (-> clg (dissoc [::default ::read-only]) keys vec)
+  (let [locations (-> clg (dissoc ::default ::read-only) keys vec)
         ro-ids    (-> clg ::read-only keys)]
     {:content-stores locations, :read-only-archives ro-ids}))
 
