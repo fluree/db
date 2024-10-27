@@ -274,7 +274,7 @@
 
 (defn blank-node-id?
   [s]
-  (let [result (and (string? s) (str/starts-with? s "_:fdb-"))]
+  (let [result (and (string? s) (str/starts-with? s "_:"))]
     (when-not result
       (log/warn "blank-node-id? falsey result from:" s))
     result))
