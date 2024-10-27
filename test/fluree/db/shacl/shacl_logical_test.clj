@@ -1,11 +1,7 @@
 (ns fluree.db.shacl.shacl-logical-test
-  (:require [clojure.string :as str]
-            [clojure.test :refer :all]
+  (:require [clojure.test :refer :all]
             [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]))
-
-(use-fixtures :each test-utils/deterministic-blank-node-fixture)
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration shacl-not-test
   (testing "shacl basic not constraint works"
@@ -55,7 +51,7 @@
                                    :type               [:ex/User],
                                    :schema/companyName "WrongCo"
                                    :schema/callSign    "j-rock"}})]
-          (is (= {:status 400,
+          (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
                   {:type        :sh/ValidationReport,

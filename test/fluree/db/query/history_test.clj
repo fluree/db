@@ -1,5 +1,5 @@
 (ns fluree.db.query.history-test
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.crypto :as crypto]
             [fluree.db.did :as did]
             [fluree.db.api :as fluree]
@@ -7,8 +7,6 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [test-with-files.tools :refer [with-tmp-dir]]))
-
-(use-fixtures :each test-utils/deterministic-blank-node-fixture)
 
 (deftest ^:integration history-query-test
   (let [ts-primeval (util/current-time-iso)
@@ -1098,35 +1096,35 @@
                                       :t       {:from 1 :to :latest}}))))
 
       (testing ":data returns just the asserts and retracts"
-        (is (= [{"f:data" {"f:t"       1
-                           "f:assert"  [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
-                                         "f:policyClass" {"id" "ex:RootPolicy"}}
-                                        {"type"        "ex:Yeti",
-                                         "schema:age"  55,
-                                         "schema:name" "Betty",
-                                         "id"          "ex:betty"}
-                                        {"id"       "ex:defaultAllowViewModify"
-                                         "type"     ["f:AccessPolicy" "ex:RootPolicy"],
-                                         "f:action" [{"id" "f:modify"} {"id" "f:view"}],
-                                         "f:query"  {}}
-                                        {"id"          "ex:freddy"
-                                         "type"        "ex:Yeti",
-                                         "schema:age"  1002,
-                                         "schema:name" "Freddy",}
-                                        {"id"          "ex:letty"
-                                         "type"        "ex:Yeti",
-                                         "schema:age"  38,
-                                         "schema:name" "Leticia"}]
-                           "f:retract" []}}
-                {"f:data" {"f:t"       2
-                           "f:assert"  [{"ex:foo" 3, "id" "_:fdb-4"}],
-                           "f:retract" []}}
-                {"f:data" {"f:t"       3
-                           "f:assert"  [{"ex:foo" 5, "id" "_:fdb-6"}],
-                           "f:retract" []}}]
-               @(fluree/history ledger {:context context
-                                        :data    true
-                                        :t       {:from 1 :to :latest}}))))
+        (is (pred-match? [{"f:data" {"f:t"       1
+                                     "f:assert"  [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                                                   "f:policyClass" {"id" "ex:RootPolicy"}}
+                                                  {"type"        "ex:Yeti",
+                                                   "schema:age"  55,
+                                                   "schema:name" "Betty",
+                                                   "id"          "ex:betty"}
+                                                  {"id"       "ex:defaultAllowViewModify"
+                                                   "type"     ["f:AccessPolicy" "ex:RootPolicy"],
+                                                   "f:action" [{"id" "f:modify"} {"id" "f:view"}],
+                                                   "f:query"  {}}
+                                                  {"id"          "ex:freddy"
+                                                   "type"        "ex:Yeti",
+                                                   "schema:age"  1002,
+                                                   "schema:name" "Freddy",}
+                                                  {"id"          "ex:letty"
+                                                   "type"        "ex:Yeti",
+                                                   "schema:age"  38,
+                                                   "schema:name" "Leticia"}]
+                                     "f:retract" []}}
+                          {"f:data" {"f:t"       2
+                                     "f:assert"  [{"ex:foo" 3, "id" test-utils/blank-node-id?}],
+                                     "f:retract" []}}
+                          {"f:data" {"f:t"       3
+                                     "f:assert"  [{"ex:foo" 5, "id" test-utils/blank-node-id?}],
+                                     "f:retract" []}}]
+                         @(fluree/history ledger {:context context
+                                                  :data    true
+                                                  :t       {:from 1 :to :latest}}))))
 
       (testing ":commit :data :and txn can be composed together"
         (is (pred-match?
@@ -1184,7 +1182,7 @@
                             "f:t"        2,
                             "id"         test-utils/db-id?}},
                "f:data"   {"f:t"       2
-                           "f:assert"  [{"ex:foo" 3, "id" "_:fdb-4"}],
+                           "f:assert"  [{"ex:foo" 3, "id" test-utils/blank-node-id?}],
                            "f:retract" []}}
               {"f:txn"    jws2
                "f:commit" {"f:alias"    "authortest",
@@ -1204,7 +1202,7 @@
                             "f:t"        3,
                             "id"         test-utils/db-id?}},
                "f:data"   {"f:t"       3
-                           "f:assert"  [{"ex:foo" 5, "id" "_:fdb-6"}],
+                           "f:assert"  [{"ex:foo" 5, "id" test-utils/blank-node-id?}],
                            "f:retract" []}}]
              @(fluree/history ledger {:context context
                                       :txn     true
@@ -1331,8 +1329,7 @@
 
         db0           (fluree/db ledger)]
     (testing "valid annotations"
-      (with-redefs [fluree.db.util.core/current-time-iso    (fn [] "1970-01-01T00:12:00.00000Z")
-                    fluree.db.json-ld.iri/new-blank-node-id (fn [] (str "_:fdb-" (swap! bnode-counter inc)))]
+      (with-redefs [fluree.db.util.core/current-time-iso    (fn [] "1970-01-01T00:12:00.00000Z")]
         (let [db1 (->> @(fluree/stage db0 {"@context" context
                                            "insert"   [{"@id"         "ex:betty"
                                                         "@type"       "ex:Yeti"
@@ -1359,13 +1356,13 @@
                        (fluree/commit! ledger)
                        (deref))]
           (testing "annotations in commit-details"
-            (is (= [{}
-                    {"f:annotation" {"id" "_:fdb-3" "ex:data" "ok" "ex:originator" "opts"}}
-                    {"f:annotation" {"id" "_:fdb-5" "ex:data" "ok" "ex:originator" "txn"}}]
-                   (->> @(fluree/history ledger {:context        context
-                                                 :commit-details true
-                                                 :t              {:from 1 :to :latest}})
-                        (mapv (fn [c] (-> c (get "f:commit") (select-keys ["f:txn" "f:annotation"]))))))))))
+            (is (pred-match? [{}
+                              {"f:annotation" {"id" test-utils/blank-node-id? "ex:data" "ok" "ex:originator" "opts"}}
+                              {"f:annotation" {"id" test-utils/blank-node-id? "ex:data" "ok" "ex:originator" "txn"}}]
+                             (->> @(fluree/history ledger {:context        context
+                                                           :commit-details true
+                                                           :t              {:from 1 :to :latest}})
+                                  (mapv (fn [c] (-> c (get "f:commit") (select-keys ["f:txn" "f:annotation"]))))))))))
 
       (testing "invalid annotations"
         (testing "only single annotation subject permitted"
