@@ -80,15 +80,19 @@
   [opts]
   (connect (assoc opts :method :ipfs)))
 
-(defn camelize-key
+(defn convert-config-key
   [[k v]]
-  [(->camelCaseString k) v])
+  (if (#{:id :type} k)
+    [(str "@" (name k)) v]
+    (if (#{:public :private} k)
+      [(-> k name (str "Key")) v]
+      [(->camelCaseString k) v])))
 
-(defn camel-string-keys
+(defn convert-keys
   [m]
   (postwalk (fn [x]
               (if (map? x)
-                (into {} (map camelize-key) x)
+                (into {} (map convert-config-key) x)
                 x))
             m))
 
@@ -113,7 +117,7 @@
                                              "primaryPublisher" {"@type"   "Publisher"
                                                                  "storage" {"@id" "memoryStorage"}}}]}
                          ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"]
-                                                   (camel-string-keys ledger-defaults)))]
+                                                   (convert-keys ledger-defaults)))]
      (connect memory-config))))
 
 (defn connect-file
@@ -136,7 +140,7 @@
                                            "primaryPublisher" {"@type"   "Publisher"
                                                                "storage" {"@id" "fileStorage"}}}]}
                        ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"]
-                                                 (camel-string-keys ledger-defaults)))]
+                                                 (convert-keys ledger-defaults)))]
      (connect file-config))))
 
 (defn address?

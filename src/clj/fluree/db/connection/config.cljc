@@ -75,6 +75,13 @@
       (storage-nameservice? node)  (derive id :fluree.db.nameservice/storage))
     node))
 
+(def component-exclusions
+  #{conn-vocab/identity})
+
+(defn exclude-component?
+  [k]
+  (contains? component-exclusions k))
+
 (defn subject-node?
   [x]
   (and (map? x)
@@ -125,16 +132,18 @@
          children    []
          flat-node   {}]
     (if k
-      (if (sequential? v)
-        (let [[flat-sequence child-nodes] (flatten-sequence v)]
-          (recur r
-                 (into children child-nodes)
-                 (assoc flat-node k flat-sequence)))
-        (if (and (subject-node? v)
-                 (not (ref-node? v)))
-          (let [[ref-node child-node] (split-subject-node v)]
-            (recur r (conj children child-node) (assoc flat-node k ref-node)))
-          (recur r children (assoc flat-node k v))))
+      (if (exclude-component? k)
+        (recur r children (assoc flat-node k v))
+        (if (sequential? v)
+          (let [[flat-sequence child-nodes] (flatten-sequence v)]
+            (recur r
+                   (into children child-nodes)
+                   (assoc flat-node k flat-sequence)))
+          (if (and (subject-node? v)
+                   (not (ref-node? v)))
+            (let [[ref-node child-node] (split-subject-node v)]
+              (recur r (conj children child-node) (assoc flat-node k ref-node)))
+            (recur r children (assoc flat-node k v)))))
       [flat-node children])))
 
 (defn flatten-nodes
@@ -189,10 +198,12 @@
   [node]
   (into {}
         (map (fn [[k v]]
-               (let [v* (if (coll? v)
-                          (map keywordize-node-id v)
-                          (keywordize-node-id v))]
-                 [k v*])))
+               (if (exclude-component? k)
+                 [k v]
+                 (let [v* (if (coll? v)
+                            (map keywordize-node-id v)
+                            (keywordize-node-id v))]
+                   [k v*]))))
         node))
 
 (defn keywordize-node-ids
