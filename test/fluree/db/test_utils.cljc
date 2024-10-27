@@ -296,9 +296,10 @@
                 (set (concat (keys actual) (keys expected))))
 
         (and (coll? expected) (coll? actual))
-        (every? (fn [[e a]]
-                  (pred-match? e a))
-                (zipmap expected actual))
+        (and (= (count expected) (count actual))
+             (every? (fn [[e a]]
+                       (pred-match? e a))
+                     (zipmap expected actual)))
 
         :else false)))
 

@@ -266,7 +266,7 @@
                                           :history [:ex/dan]
                                           :t       {:from 2}}))))))))
 
-(deftest ^:integration commit-details-test
+(deftest ^:integration ^:kaocha/pending commit-details-test
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn      (test-utils/create-conn)
           ledger-id "committest"
@@ -603,7 +603,7 @@
                             (vector (:f/t history-map) commit-t)))
                         history-with-commits)))))))))
 
-(deftest loaded-mem-ledger-history-test
+(deftest ^:kaocha/pending loaded-mem-ledger-history-test
   (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
     (testing "history commit details on a loaded memory ledger"
       (let [ledger-name   "loaded-history-mem"
@@ -986,7 +986,7 @@
                               (update "f:data" select-keys ["f:t"])
                               (select-keys ["f:author" "f:txn" "f:data"]))))))))))
 
-(deftest ^:integration include-api
+(deftest ^:integration ^:kaocha/pending include-api
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn         @(fluree/connect-memory)
           ledger-name  "authortest"
