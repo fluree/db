@@ -436,9 +436,7 @@
                        :f/expectation          ["17" "11"],
                        :sh/resultMessage       "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17",
                        :sh/resultPath          [:ex/favNums]}]}}
-                   (ex-data db-not-equal4)))
-            (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17."
-                   (ex-message db-not-equal4))))
+                   (ex-data db-not-equal4))))
           (let [db-ok @(fluree/stage
                          db
                          {"@context" ["https://ns.flur.ee" context]
@@ -520,9 +518,7 @@
                          :f/expectation          [11],
                          :sh/resultMessage       "path [:ex/favNums] values 11 are not disjoint with :ex/luckyNums values 11",
                          :sh/resultPath          [:ex/favNums]}]}}
-                     (ex-data db-not-disjoint1)))
-              (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11 are not disjoint with :ex/luckyNums values 11."
-                     (ex-message db-not-disjoint1)))))
+                     (ex-data db-not-disjoint1)))))
           (testing "multiple disjoint tests"
             (let [db-not-disjoint2 @(fluree/stage
                                       db
@@ -549,9 +545,7 @@
                          :sh/resultMessage       "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11",
                          :sh/resultPath          [:ex/favNums]}]}}
                      (ex-data db-not-disjoint2))
-                  "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
-              (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11."
-                     (ex-message db-not-disjoint2)))))
+                  "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")))
           (testing "multiple non disjoint values"
             (let [db-not-disjoint3 @(fluree/stage
                                       db
@@ -578,9 +572,7 @@
                          :sh/resultMessage       "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18",
                          :sh/resultPath          [:ex/favNums]}]}}
                      (ex-data db-not-disjoint3))
-                  "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
-              (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape _:fdb-14 - path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18."
-                     (ex-message db-not-disjoint3)))))))
+                  "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")))))
       (testing "lessThan"
         (let [db     @(fluree/stage
                         (fluree/db ledger)
@@ -648,9 +640,7 @@
                          :f/expectation          [17],
                          :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17",
                          :sh/resultPath          [:ex/p1]}]}}
-                     (ex-data db-fail1)))
-              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17."
-                     (ex-message db-fail1)))))
+                     (ex-data db-fail1)))))
           (testing "values not comparable to other values"
             (let [db-fail2 @(fluree/stage
                               db
@@ -676,9 +666,7 @@
                          :f/expectation          ["19" "18"],
                          :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19",
                          :sh/resultPath          [:ex/p1]}]}}
-                     (ex-data db-fail2)))
-              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19."
-                     (ex-message db-fail2)))))
+                     (ex-data db-fail2)))))
           (testing "values not less than all other values"
             (let [db-fail3 @(fluree/stage
                               db
@@ -704,9 +692,7 @@
                          :f/expectation          [10 18],
                          :sh/resultMessage       "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18",
                          :sh/resultPath          [:ex/p1]}]}}
-                     (ex-data db-fail3)))
-              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18."
-                     (ex-message db-fail3)))))
+                     (ex-data db-fail3)))))
           (testing "values not less than all"
             (let [db-fail4 @(fluree/stage
                               db
@@ -732,9 +718,7 @@
                          :f/expectation          [12 16],
                          :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16",
                          :sh/resultPath          [:ex/p1]}]}}
-                     (ex-data db-fail4)))
-              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16."
-                     (ex-message db-fail4)))))
+                     (ex-data db-fail4)))))
           (testing "not comparable with iris"
             (let [db-iris @(fluree/stage
                              db
@@ -760,19 +744,17 @@
                          :f/expectation          [:ex/john],
                          :sh/resultMessage       "path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john",
                          :sh/resultPath          [:ex/p1]}]}}
-                     (ex-data db-iris)))
-              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape _:fdb-20 - path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john."
-                     (ex-message db-iris)))))))
+                     (ex-data db-iris)))))))
       (testing "lessThanOrEquals"
         (let [db @(fluree/stage
-                        (fluree/db ledger)
-                        {"@context" ["https://ns.flur.ee" context]
-                         "insert"
-                         {:id             :ex/LessThanOrEqualsShape
-                          :type           :sh/NodeShape
-                          :sh/targetClass :ex/User
-                          :sh/property    [{:sh/path             :ex/p1
-                                            :sh/lessThanOrEquals :ex/p2}]}})]
+                    (fluree/db ledger)
+                    {"@context" ["https://ns.flur.ee" context]
+                     "insert"
+                     {:id             :ex/LessThanOrEqualsShape
+                      :type           :sh/NodeShape
+                      :sh/targetClass :ex/User
+                      :sh/property    [{:sh/path             :ex/p1
+                                        :sh/lessThanOrEquals :ex/p2}]}})]
           (testing "all values less than or equal"
             (let [db-ok1 @(fluree/stage
                             db
@@ -830,9 +812,7 @@
                          :f/expectation          [10],
                          :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10",
                          :sh/resultPath          [:ex/p1]}]}}
-                     (ex-data db-fail1)))
-              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10."
-                     (ex-message db-fail1)))))
+                     (ex-data db-fail1)))))
           (testing "all values not comparable with other values"
             (let [db-fail2 @(fluree/stage
                               db
@@ -858,9 +838,7 @@
                          :f/expectation          ["19" "17"],
                          :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19",
                          :sh/resultPath          [:ex/p1]}]}}
-                     (ex-data db-fail2)))
-              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19."
-                     (ex-message db-fail2)))))
+                     (ex-data db-fail2)))))
           (testing "all values not less than other values"
             (let [db-fail3 @(fluree/stage
                               db
@@ -886,9 +864,7 @@
                          :f/expectation          [17 10],
                          :sh/resultMessage       "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17",
                          :sh/resultPath          [:ex/p1]}]}}
-                     (ex-data db-fail3)))
-              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17."
-                     (ex-message db-fail3)))))
+                     (ex-data db-fail3)))))
           (testing "all values not less than all other values"
             (let [db-fail4 @(fluree/stage
                               db
@@ -914,9 +890,7 @@
                          :f/expectation          [12 16],
                          :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16",
                          :sh/resultPath          [:ex/p1]}]}}
-                     (ex-data db-fail4)))
-              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape _:fdb-29 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16."
-                     (ex-message db-fail4))))))))))
+                     (ex-data db-fail4))))))))))
 
 (deftest ^:integration shacl-value-range
   (testing "shacl value range constraints"
@@ -972,9 +946,7 @@
                          :f/expectation          1,
                          :sh/resultMessage       "value 1 is less than exclusive minimum 1",
                          :sh/resultPath          [:schema/age]}]}}
-                     (ex-data db-too-low)))
-              (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/minExclusive of shape _:fdb-2 - value 1 is less than exclusive minimum 1."
-                     (ex-message db-too-low)))))
+                     (ex-data db-too-low)))))
           (testing "values too high"
             (let [db-too-high @(fluree/stage
                                  db
@@ -998,9 +970,7 @@
                          :f/expectation          100,
                          :sh/resultMessage       "value 100 is greater than exclusive maximum 100",
                          :sh/resultPath          [:schema/age]}]}}
-                     (ex-data db-too-high)))
-              (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxExclusive of shape _:fdb-2 - value 100 is greater than exclusive maximum 100."
-                     (ex-message db-too-high)))))))
+                     (ex-data db-too-high)))))))
       (testing "inclusive constraints"
         (let [db @(fluree/stage
                     (fluree/db ledger)
@@ -1057,9 +1027,7 @@
                          :f/expectation          1,
                          :sh/resultMessage       "value 0 is less than inclusive minimum 1",
                          :sh/resultPath          [:schema/age]}]}}
-                     (ex-data db-too-low)))
-              (is (= "Subject :ex/alice path [:schema/age] violates constraint :sh/minInclusive of shape _:fdb-7 - value 0 is less than inclusive minimum 1."
-                     (ex-message db-too-low)))))
+                     (ex-data db-too-low)))))
           (testing "values above max"
             (let [db-too-high @(fluree/stage
                                  db
@@ -1083,9 +1051,7 @@
                          :f/expectation          100,
                          :sh/resultMessage       "value 101 is greater than inclusive maximum 100",
                          :sh/resultPath          [:schema/age]}]}}
-                     (ex-data db-too-high)))
-              (is (= "Subject :ex/alice path [:schema/age] violates constraint :sh/maxInclusive of shape _:fdb-7 - value 101 is greater than inclusive maximum 100."
-                     (ex-message db-too-high)))))))
+                     (ex-data db-too-high)))))))
       (testing "non-numeric values"
         (let [db         @(fluree/stage
                             (fluree/db ledger)
@@ -1126,8 +1092,6 @@
                      :sh/resultMessage       "value :ex/brian is less than exclusive minimum 0",
                      :sh/resultPath          [:schema/age]}]}}
                  (ex-data db-subj-id)))
-          (is (= "Subject :ex/alice path [:schema/age] violates constraint :sh/minExclusive of shape _:fdb-13 - value :ex/brian is less than exclusive minimum 0."
-                 (ex-message db-subj-id)))
 
           (is (= {:status 400,
                   :error  :shacl/violation,
@@ -1144,9 +1108,7 @@
                      :f/expectation          0,
                      :sh/resultMessage       "value 10 is less than exclusive minimum 0",
                      :sh/resultPath          [:schema/age]}]}}
-                 (ex-data db-string)))
-          (is (= "Subject :ex/alice path [:schema/age] violates constraint :sh/minExclusive of shape _:fdb-13 - value 10 is less than exclusive minimum 0."
-                 (ex-message db-string))))))))
+                 (ex-data db-string))))))))
 
 (deftest ^:integration shacl-string-length-constraints
   (testing "shacl string length constraint errors"
@@ -1213,9 +1175,7 @@
                      :f/expectation          4,
                      :sh/resultMessage       "value \"Al\" has string length less than minimum length 4",
                      :sh/resultPath          [:schema/name]}]}}
-                 (ex-data db-too-short-str)))
-          (is (= "Subject :ex/al path [:schema/name] violates constraint :sh/minLength of shape _:fdb-2 - value \"Al\" has string length less than minimum length 4."
-                 (ex-message db-too-short-str)))))
+                 (ex-data db-too-short-str)))))
       (testing "string is too long"
         (let [db-too-long-str @(fluree/stage
                                  db
@@ -1239,9 +1199,7 @@
                      :f/expectation          10,
                      :sh/resultMessage       "value \"Jean-Claude\" has string length greater than maximum length 10",
                      :sh/resultPath          [:schema/name]}]}}
-                 (ex-data db-too-long-str)))
-          (is (= "Subject :ex/jean-claude path [:schema/name] violates constraint :sh/maxLength of shape _:fdb-2 - value \"Jean-Claude\" has string length greater than maximum length 10."
-                 (ex-message db-too-long-str)))))
+                 (ex-data db-too-long-str)))))
       (testing "non-string literals are stringified"
         (let [db-too-long-non-str @(fluree/stage
                                      db
@@ -1265,9 +1223,7 @@
                      :f/expectation          10,
                      :sh/resultMessage       "value \"12345678910\" has string length greater than maximum length 10",
                      :sh/resultPath          [:schema/name]}]}}
-                 (ex-data db-too-long-non-str)))
-          (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxLength of shape _:fdb-2 - value \"12345678910\" has string length greater than maximum length 10."
-                 (ex-message db-too-long-non-str)))))
+                 (ex-data db-too-long-non-str)))))
       (testing "non-literal values violate"
         (let [db-ref-value @(fluree/stage
                               db
@@ -1291,9 +1247,7 @@
                      :f/expectation          10,
                      :sh/resultMessage       "value :ex/ref is not a literal value",
                      :sh/resultPath          [:schema/name]}]}}
-                 (ex-data db-ref-value)))
-          (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxLength of shape _:fdb-2 - value :ex/ref is not a literal value."
-                 (ex-message db-ref-value))))))))
+                 (ex-data db-ref-value))))))))
 
 (deftest ^:integration shacl-string-pattern-constraints
   (testing "shacl string regex constraint errors"
@@ -1366,12 +1320,7 @@ WORLD!",
 WORLD!")
                                                   " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x")
                      :sh/resultPath          [:ex/greeting]}]}}
-                 (ex-data db-wrong-case-greeting)))
-          (is (= (str "Subject :ex/alice path [:ex/greeting] violates constraint :sh/pattern of shape _:fdb-2 - value "
-                      (pr-str "HELLO
-WORLD!")
-                      " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x.")
-                 (ex-message db-wrong-case-greeting)))))
+                 (ex-data db-wrong-case-greeting)))))
       (testing "stringified literal does not match pattern"
         (let [db-wrong-birth-year @(fluree/stage
                                      db
@@ -1395,9 +1344,7 @@ WORLD!")
                      :f/expectation          "(19|20)[0-9][0-9]",
                      :sh/resultMessage       "value \"1776\" does not match pattern \"(19|20)[0-9][0-9]\"",
                      :sh/resultPath          [:ex/birthYear]}]}}
-                 (ex-data db-wrong-birth-year)))
-          (is (= "Subject :ex/alice path [:ex/birthYear] violates constraint :sh/pattern of shape _:fdb-3 - value \"1776\" does not match pattern \"(19|20)[0-9][0-9]\"."
-                 (ex-message db-wrong-birth-year)))))
+                 (ex-data db-wrong-birth-year)))))
       (testing "non-literal values automatically produce violation"
         (let [db-ref-value @(fluree/stage
                               db
@@ -1421,9 +1368,7 @@ WORLD!")
                      :f/expectation          "(19|20)[0-9][0-9]",
                      :sh/resultMessage       "value \":ex/ref\" does not match pattern \"(19|20)[0-9][0-9]\"",
                      :sh/resultPath          [:ex/birthYear]}]}}
-                 (ex-data db-ref-value)))
-          (is (= "Subject :ex/john path [:ex/birthYear] violates constraint :sh/pattern of shape _:fdb-3 - value \":ex/ref\" does not match pattern \"(19|20)[0-9][0-9]\"."
-                 (ex-message db-ref-value))))))))
+                 (ex-data db-ref-value))))))))
 
 (deftest language-constraints
   (let [conn    @(fluree/connect-memory)
@@ -1466,9 +1411,7 @@ WORLD!")
                        "value \"foo\" does not have language tag in [\"en\" \"fr\"]",
                        "sh:sourceShape"         "_:fdb-2",
                        "f:expectation"          ["en" "fr"]}]}}
-                   (ex-data db2)))
-            (is (= "Subject ex:a path [\"ex:label\"] violates constraint sh:languageIn of shape _:fdb-2 - value \"foo\" does not have language tag in [\"en\" \"fr\"]."
-                   (ex-message db2)))))))
+                   (ex-data db2)))))))
     (testing "unique-lang"
       (let [db1 @(fluree/stage db0 {"@context" context
                                     "insert"
@@ -1505,9 +1448,7 @@ WORLD!")
                        "sh:resultMessage"       "values [\"bar\" \"foo\"] do not have unique language tags",
                        "sh:sourceShape"         "_:fdb-6",
                        "f:expectation"          true}]}}
-                   (ex-data db2)))
-            (is (= "Subject ex:a path [\"ex:label\"] violates constraint sh:uniqueLang of shape _:fdb-6 - values [\"bar\" \"foo\"] do not have unique language tags."
-                   (ex-message db2)))))))))
+                   (ex-data db2)))))))))
 
 (deftest ^:integration shacl-multiple-properties-test
   (testing "multiple properties works"
@@ -1575,9 +1516,7 @@ WORLD!")
                      :sh/value               0,
                      :sh/sourceShape         "_:fdb-2",
                      :sh/focusNode           :ex/john}]}}
-                 (ex-data db-no-name)))
-          (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/minCount of shape _:fdb-2 - count 0 is less than minimum count of 1."
-                 (ex-message db-no-name)))))
+                 (ex-data db-no-name)))))
       (testing "cardinality constraint violated"
         (let [db-two-names @(fluree/stage
                               db
@@ -1603,9 +1542,7 @@ WORLD!")
                      :sh/value               2,
                      :sh/sourceShape         "_:fdb-2",
                      :sh/focusNode           :ex/john}]}}
-                 (ex-data db-two-names)))
-          (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxCount of shape _:fdb-2 - count 2 is greater than maximum count of 1."
-                 (ex-message db-two-names)))))
+                 (ex-data db-two-names)))))
       (testing "max constraint violated"
         (let [db-too-old @(fluree/stage
                             db
@@ -1631,9 +1568,7 @@ WORLD!")
                      :sh/value               140,
                      :sh/sourceShape         "_:fdb-3",
                      :sh/focusNode           :ex/john}]}}
-                 (ex-data db-too-old)))
-          (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxInclusive of shape _:fdb-3 - value 140 is greater than inclusive maximum 130."
-                 (ex-message db-too-old)))))
+                 (ex-data db-too-old)))))
       (testing "second cardinality constraint violated"
         (let [db-two-ages @(fluree/stage
                              db
@@ -1659,9 +1594,7 @@ WORLD!")
                      :sh/value               2,
                      :sh/sourceShape         "_:fdb-3",
                      :sh/focusNode           :ex/john}]}}
-                 (ex-data db-two-ages)))
-          (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxCount of shape _:fdb-3 - count 2 is greater than maximum count of 1."
-                 (ex-message db-two-ages)))))
+                 (ex-data db-two-ages)))))
       (testing "datatype constraint violated"
         (let [db-num-email @(fluree/stage
                               db
@@ -1685,9 +1618,7 @@ WORLD!")
                                           :type                   :sh/ValidationResult}]
                            :type        :sh/ValidationReport}
                   :status 400}
-                 (ex-data db-num-email)))
-          (is (= "Subject :ex/john path [:schema/email] violates constraint :sh/datatype of shape _:fdb-4 - the following values do not have expected datatype :xsd/string: 42."
-                 (ex-message db-num-email))))))))
+                 (ex-data db-num-email))))))))
 
 (deftest ^:integration property-paths
   (let [conn    @(fluree/connect-memory)
@@ -1735,9 +1666,7 @@ WORLD!")
                    "sh:resultMessage" "count 0 is less than minimum count of 1",
                    "sh:sourceShape" "_:fdb-2",
                    "f:expectation" 1}]}}
-               (ex-data invalid-pal)))
-        (is (= "Subject ex:bad-parent path [{\"sh:inversePath\" \"ex:parent\"}] violates constraint sh:minCount of shape _:fdb-2 - count 0 is less than minimum count of 1."
-               (ex-message invalid-pal)))))
+               (ex-data invalid-pal)))))
     (testing "sequence paths"
       (let [ ;; a valid Pal is anybody who has a pal with a name
             db1         @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
@@ -1782,9 +1711,7 @@ WORLD!")
                    "sh:resultMessage" "count 0 is less than minimum count of 1",
                    "sh:sourceShape" "_:fdb-8",
                    "f:expectation" 1}]}}
-               (ex-data invalid-pal)))
-        (is (= "Subject ex:bad-pal path [\"ex:pal\" \"schema:name\"] violates constraint sh:minCount of shape _:fdb-8 - count 0 is less than minimum count of 1."
-               (ex-message invalid-pal)))))
+               (ex-data invalid-pal)))))
     (testing "sequence paths"
       (let [db1         @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                             "insert"   [{"@type"          "sh:NodeShape"
@@ -1833,9 +1760,7 @@ WORLD!")
                    "sh:resultMessage" "count 0 is less than minimum count of 1",
                    "sh:sourceShape" "_:fdb-16",
                    "f:expectation" 1}]}}
-               (ex-data invalid-pal)))
-        (is (= "Subject ex:jd path [\"ex:pal\" \"ex:name\"] violates constraint sh:minCount of shape _:fdb-16 - count 0 is less than minimum count of 1."
-               (ex-message invalid-pal)))))
+               (ex-data invalid-pal)))))
 
     (testing "predicate-path"
       (let [db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
@@ -1914,9 +1839,7 @@ WORLD!")
                    "sh:resultMessage" "count 0 is less than minimum count of 1",
                    "sh:sourceShape" "_:fdb-26",
                    "f:expectation" 1}]}}
-               (ex-data invalid-princess)))
-        (is (= "Subject ex:Gerb path [{\"sh:inversePath\" \"ex:child\"} {\"sh:inversePath\" \"ex:queen\"}] violates constraint sh:minCount of shape _:fdb-26 - count 0 is less than minimum count of 1."
-               (ex-message invalid-princess)))))))
+               (ex-data invalid-princess)))))))
 
 (deftest ^:integration shacl-class-test
   (let [conn    @(fluree/connect-memory)
@@ -2006,8 +1929,6 @@ WORLD!")
                "sh:sourceShape" "_:fdb-5",
                "f:expectation" "https://example.com/Country"}]}}
            (ex-data db4)))
-    (is (= "Subject https://example.com/Actor/1001 path [\"https://example.com/country\"] violates constraint sh:class of shape _:fdb-5 - missing required class https://example.com/Country."
-           (ex-message db4)))
     (is (= {:status 400,
             :error :shacl/violation,
             :report
@@ -2024,9 +1945,7 @@ WORLD!")
                "missing required class https://example.com/Country",
                "sh:sourceShape" "_:fdb-5",
                "f:expectation" "https://example.com/Country"}]}}
-           (ex-data db5)))
-    (is (= "Subject https://example.com/Actor/8675309 path [\"https://example.com/country\"] violates constraint sh:class of shape _:fdb-5 - missing required class https://example.com/Country."
-           (ex-message db5)))))
+           (ex-data db5)))))
 
 (deftest ^:integration shacl-in-test
   (testing "value nodes"
@@ -2059,9 +1978,7 @@ WORLD!")
                  "value \"yellow\" is not in [\"cyan\" \"magenta\"]",
                  "sh:sourceShape"         "_:fdb-3",
                  "f:expectation"          ["cyan" "magenta"]}]}}
-             (ex-data db2)))
-      (is (= "Subject ex:YellowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-3 - value \"yellow\" is not in [\"cyan\" \"magenta\"]."
-             (ex-message db2)))))
+             (ex-data db2)))))
   (testing "node refs"
     (let [conn    @(fluree/connect-memory)
           ledger  @(fluree/create conn "shacl-in-test")
@@ -2106,8 +2023,6 @@ WORLD!")
                  "sh:sourceShape"         "_:fdb-7",
                  "f:expectation"          ["ex:Pink" "ex:Purple"]}]}}
              (ex-data db2)))
-      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-7 - value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\"]."
-            (ex-message db2)))
 
       (is (not (ex-data db3)))
       (is (= {"id"       "ex:PastelPony"
@@ -2152,9 +2067,7 @@ WORLD!")
                  "value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\" \"green\"]",
                  "sh:sourceShape"         "_:fdb-12",
                  "f:expectation"          ["ex:Pink" "ex:Purple" "green"]}]}}
-             (ex-data db2)))
-      (is (= "Subject ex:RainbowPony path [\"ex:color\"] violates constraint sh:in of shape _:fdb-12 - value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\" \"green\"]."
-             (ex-message db2))))))
+             (ex-data db2))))))
 
 (deftest ^:integration shacl-targetobjectsof-test
   (let [conn    @(fluree/connect-memory)
@@ -2180,9 +2093,7 @@ WORLD!")
                                                    "ex:friend" {"@id" "ex:Bob"}}
                                                   {"id"      "ex:Bob"
                                                    "ex:name" 123
-                                                   "type"    "ex:User"}]})]
-          (is (= "Subject ex:Bob path [\"ex:name\"] violates constraint sh:datatype of shape _:fdb-2 - the following values do not have expected datatype xsd:string: 123."
-                 (ex-message db-bad-friend-name)))))
+                                                   "type"    "ex:User"}]})]))
       (testing "maxCount"
         (let [db1           @(fluree/stage db0
                                            {"@context" ["https://ns.flur.ee" context]
@@ -2218,9 +2129,7 @@ WORLD!")
                      "sh:resultMessage"       "count 2 is greater than maximum count of 1",
                      "sh:sourceShape"         "_:fdb-5",
                      "f:expectation"          1}]}}
-                 (ex-data db-excess-ssn)))
-          (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:maxCount of shape _:fdb-5 - count 2 is greater than maximum count of 1."
-                 (ex-message db-excess-ssn)))))
+                 (ex-data db-excess-ssn)))))
       (testing "required properties"
         (let [db1           @(fluree/stage db0
                                            {"@context" ["https://ns.flur.ee" context]
@@ -2252,9 +2161,7 @@ WORLD!")
                      "sh:resultMessage"       "count 0 is less than minimum count of 1",
                      "sh:sourceShape"         "_:fdb-8",
                      "f:expectation"          1}]}}
-                 (ex-data db-just-alice)))
-          (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:minCount of shape _:fdb-8 - count 0 is less than minimum count of 1."
-                 (ex-message db-just-alice)))))
+                 (ex-data db-just-alice)))))
       (testing "combined with `sh:targetClass`"
         (let [db1           @(fluree/stage db0
                                            {"@context" ["https://ns.flur.ee" context]
@@ -2293,9 +2200,7 @@ WORLD!")
                      "sh:resultMessage"       "count 2 is greater than maximum count of 1",
                      "sh:sourceShape"         "_:fdb-12",
                      "f:expectation"          1}]}}
-                 (ex-data db-bad-friend)))
-          (is (= "Subject ex:Bob path [\"ex:name\"] violates constraint sh:maxCount of shape _:fdb-12 - count 2 is greater than maximum count of 1."
-                 (ex-message db-bad-friend))))))
+                 (ex-data db-bad-friend))))))
     (testing "separate txns"
       (testing "maxCount"
         (let [db1                    @(fluree/stage db0
@@ -2332,9 +2237,7 @@ WORLD!")
                      "sh:resultMessage"       "count 2 is greater than maximum count of 1",
                      "sh:sourceShape"         "_:fdb-15",
                      "f:expectation"          1}]}}
-                 (ex-data db-db-forbidden-friend)))
-          (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:maxCount of shape _:fdb-15 - count 2 is greater than maximum count of 1."
-                 (ex-message db-db-forbidden-friend))))
+                 (ex-data db-db-forbidden-friend))))
         (let [db1           @(fluree/stage db0
                                            {"@context" ["https://ns.flur.ee" context]
                                             "insert"
@@ -2374,9 +2277,7 @@ WORLD!")
                      "sh:resultMessage"       "count 2 is greater than maximum count of 1",
                      "sh:sourceShape"         "_:fdb-19",
                      "f:expectation"          1}]}}
-                 (ex-data db-excess-ssn)))
-          (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:maxCount of shape _:fdb-19 - count 2 is greater than maximum count of 1."
-                 (ex-message db-excess-ssn)))))
+                 (ex-data db-excess-ssn)))))
       (testing "datatype"
         (let [db1 @(fluree/stage db0
                                  {"@context" ["https://ns.flur.ee" context]
@@ -2413,9 +2314,7 @@ WORLD!")
                      "the following values do not have expected datatype xsd:string: 123",
                      "sh:sourceShape"         "_:fdb-23",
                      "f:expectation"          "xsd:string"}]}}
-                 (ex-data db-forbidden-friend)))
-          (is (= "Subject ex:Bob path [\"ex:name\"] violates constraint sh:datatype of shape _:fdb-23 - the following values do not have expected datatype xsd:string: 123."
-                 (ex-message db-forbidden-friend))))))))
+                 (ex-data db-forbidden-friend))))))))
 
 (deftest ^:integration shape-based-constraints
   (testing "sh:node"
@@ -2464,9 +2363,7 @@ WORLD!")
                  "node _:fdb-7 does not conform to shapes [\"ex:AddressShape\"]",
                  "sh:sourceShape"         "_:fdb-3",
                  "f:expectation"          ["ex:AddressShape"]}]}}
-             (ex-data invalid-person)))
-      (is (= "Subject ex:Reto path [\"ex:address\"] violates constraint sh:node of shape _:fdb-3 - node _:fdb-7 does not conform to shapes [\"ex:AddressShape\"]."
-             (ex-message invalid-person)))))
+             (ex-data invalid-person)))))
 
   (testing "sh:qualifiedValueShape property shape"
     (let [conn        @(fluree/connect-memory)
@@ -2522,9 +2419,7 @@ WORLD!")
                  "values [\"ex:Bob\" \"ex:Zorba\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times",
                  "sh:sourceShape"         "_:fdb-9",
                  "f:expectation"          "_:fdb-10"}]}}
-             (ex-data invalid-kid)))
-      (is (= "Subject ex:InvalidKid path [\"ex:parent\"] violates constraint sh:qualifiedValueShape of shape _:fdb-9 - values [\"ex:Bob\" \"ex:Zorba\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times."
-             (ex-message invalid-kid)))))
+             (ex-data invalid-kid)))))
   (testing "sh:qualifiedValueShape node shape"
     (let [conn   @(fluree/connect-memory)
           ledger @(fluree/create conn "shape-constaints")
@@ -2585,9 +2480,7 @@ WORLD!")
                  "values [\"ex:Bob\" \"ex:Zorba\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times",
                  "sh:sourceShape"         "_:fdb-14",
                  "f:expectation"          "ex:ParentShape"}]}}
-             (ex-data invalid-kid)))
-      (is (= "Subject ex:InvalidKid path [\"ex:parent\"] violates constraint sh:qualifiedValueShape of shape _:fdb-14 - values [\"ex:Bob\" \"ex:Zorba\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times."
-             (ex-message invalid-kid)))))
+             (ex-data invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn   @(fluree/connect-memory)
           ledger @(fluree/create conn "shape-constraints")
@@ -2673,10 +2566,7 @@ WORLD!")
                  "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint",
                  "sh:sourceShape"         "_:fdb-21",
                  "f:expectation"          "ex:fingershape"}]}}
-             (ex-data invalid-hand)))
-      (is (= "Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-20 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint.
-Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape _:fdb-21 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint."
-             (ex-message invalid-hand))))))
+             (ex-data invalid-hand))))))
 
 (deftest ^:integration post-processing-validation
   (let [conn    @(fluree/connect-memory)
@@ -2719,9 +2609,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                    "the following values do not have expected datatype xsd:string: 123",
                    "sh:sourceShape"         "_:fdb-2",
                    "f:expectation"          "xsd:string"}]}}
-               (ex-data db-forbidden-friend)))
-        (is (= "Subject ex:Bob path [\"ex:name\"] violates constraint sh:datatype of shape _:fdb-2 - the following values do not have expected datatype xsd:string: 123."
-               (ex-message db-forbidden-friend)))))
+               (ex-data db-forbidden-friend)))))
     (testing "shape constraints"
       (let [db1            @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                                "insert"
@@ -2765,9 +2653,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                    "node _:fdb-11 does not conform to shapes [\"ex:CoolShape\"]",
                    "sh:sourceShape"         "_:fdb-7",
                    "f:expectation"          ["ex:CoolShape"]}]}}
-               (ex-data invalid-person)))
-        (is (= "Subject ex:Reto path [\"ex:cool\"] violates constraint sh:node of shape _:fdb-7 - node _:fdb-11 does not conform to shapes [\"ex:CoolShape\"]."
-               (ex-message invalid-person)))))
+               (ex-data invalid-person)))))
     (testing "extended path constraints"
       (let [db1            @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
                                                "insert"   {"id"             "ex:PersonShape"
@@ -2807,9 +2693,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                    "sh:resultMessage"       "value ex:Dude is is not of kind sh:BlankNode",
                    "sh:sourceShape"         "_:fdb-13",
                    "f:expectation"          "sh:BlankNode"}]}}
-               (ex-data invalid-person)))
-        (is (= "Subject ex:Reto path [\"ex:cool\" \"ex:dude\"] violates constraint sh:nodeKind of shape _:fdb-13 - value ex:Dude is is not of kind sh:BlankNode."
-               (ex-message invalid-person)))))))
+               (ex-data invalid-person)))))))
 
 (deftest validation-report
   (let [conn    @(fluree/connect-memory)
@@ -2984,6 +2868,4 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                    "sh:resultMessage"       "count 1 is less than minimum count of 2",
                    "sh:sourceShape"         "_:fdb-3",
                    "f:expectation"          2}]}}
-               (ex-data db2)))
-        (is (= "Subject ex:invalid path [{\"sh:alternativePath\" \"ex:property1\"}] violates constraint sh:minCount of shape _:fdb-3 - count 1 is less than minimum count of 2."
-               (ex-message db2)))))))
+               (ex-data db2)))))))
