@@ -1,11 +1,7 @@
 (ns fluree.db.shacl.shacl-basic-test
-  (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]))
-
-(use-fixtures :each test-utils/deterministic-blank-node-fixture)
+            [fluree.db.test-utils :as test-utils :refer [pred-match?]]))
 
 (deftest ^:integration using-pre-defined-types-as-classes
   (testing "Class not used as class initially can still be used as one."
@@ -39,25 +35,25 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                          (fluree/db ledger)
-                          {"@context" ["https://ns.flur.ee" context]
-                           "insert"
-                           {:id             :ex/UserShape
-                            :type           [:sh/NodeShape]
-                            :sh/targetClass :ex/User
-                            :sh/property    [{:sh/path     :schema/name
-                                              :sh/minCount 1
-                                              :sh/maxCount 1
-                                              :sh/datatype :xsd/string}]}})]
+                        (fluree/db ledger)
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         {:id             :ex/UserShape
+                          :type           [:sh/NodeShape]
+                          :sh/targetClass :ex/User
+                          :sh/property    [{:sh/path     :schema/name
+                                            :sh/minCount 1
+                                            :sh/maxCount 1
+                                            :sh/datatype :xsd/string}]}})]
       (testing "cardinality ok"
         (let [db-ok @(fluree/stage
-                              db
-                              {"@context" ["https://ns.flur.ee" context]
-                               "insert"
-                               {:id              :ex/john
-                                :type            :ex/User
-                                :schema/name     "John"
-                                :schema/callSign "j-rock"}})]
+                       db
+                       {"@context" ["https://ns.flur.ee" context]
+                        "insert"
+                        {:id              :ex/john
+                         :type            :ex/User
+                         :schema/name     "John"
+                         :schema/callSign "j-rock"}})]
           (is (= [{:id              :ex/john,
                    :type            :ex/User,
                    :schema/name     "John",
@@ -66,30 +62,28 @@
               "basic rdf:type query response not correct")))
       (testing "cardinality less than"
         (let [db-no-names @(fluree/stage
-                              db
-                              {"@context" ["https://ns.flur.ee" context]
-                               "insert"
-                               {:id              :ex/john
-                                :type            :ex/User
-                                :schema/callSign "j-rock"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/john,
-                     :sh/constraintComponent :sh/minCount,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/value               0,
-                     :f/expectation          1,
-                     :sh/resultMessage       "count 0 is less than minimum count of 1",
-                     :sh/resultPath          [:schema/name]}]}}
-                 (ex-data db-no-names)))
-          (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/minCount of shape _:fdb-2 - count 0 is less than minimum count of 1."
-                 (ex-message db-no-names)))))
+                             db
+                             {"@context" ["https://ns.flur.ee" context]
+                              "insert"
+                              {:id              :ex/john
+                               :type            :ex/User
+                               :schema/callSign "j-rock"}})]
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/john,
+                               :sh/constraintComponent :sh/minCount,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               0,
+                               :f/expectation          1,
+                               :sh/resultMessage       "count 0 is less than minimum count of 1",
+                               :sh/resultPath          [:schema/name]}]}}
+                           (ex-data db-no-names)))))
       (testing "cardinality greater than"
         (let [db-two-names @(fluree/stage
                               db
@@ -99,24 +93,22 @@
                                 :type            :ex/User
                                 :schema/name     ["John", "Johnny"]
                                 :schema/callSign "j-rock"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/john,
-                     :sh/constraintComponent :sh/maxCount,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/value               2,
-                     :f/expectation          1,
-                     :sh/resultMessage       "count 2 is greater than maximum count of 1",
-                     :sh/resultPath          [:schema/name]}]}}
-                 (ex-data db-two-names)))
-          (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxCount of shape _:fdb-2 - count 2 is greater than maximum count of 1."
-                 (ex-message db-two-names))))))))
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/john,
+                               :sh/constraintComponent :sh/maxCount,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               2,
+                               :f/expectation          1,
+                               :sh/resultMessage       "count 2 is greater than maximum count of 1",
+                               :sh/resultPath          [:schema/name]}]}}
+                           (ex-data db-two-names))))))))
 
 (deftest ^:integration shacl-datatype-constraints
   (testing "shacl datatype errors"
@@ -157,24 +149,22 @@
                                :type        :ex/User
                                ;; need to specify type inline in order to avoid coercion
                                :schema/name {:type :xsd/integer :value 42}}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/john,
-                     :sh/constraintComponent :sh/datatype,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/value               [:xsd/integer],
-                     :f/expectation          :xsd/string,
-                     :sh/resultMessage       "the following values do not have expected datatype :xsd/string: 42",
-                     :sh/resultPath          [:schema/name]}]}}
-                 (ex-data db-int-name)))
-          (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/datatype of shape _:fdb-2 - the following values do not have expected datatype :xsd/string: 42."
-                 (ex-message db-int-name)))))
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/john,
+                               :sh/constraintComponent :sh/datatype,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               [:xsd/integer],
+                               :f/expectation          :xsd/string,
+                               :sh/resultMessage       "the following values do not have expected datatype :xsd/string: 42",
+                               :sh/resultPath          [:schema/name]}]}}
+                           (ex-data db-int-name)))))
       (testing "incorrect ref type"
         (let [db-bool-name @(fluree/stage
                               db
@@ -183,25 +173,23 @@
                                {:id          :ex/john
                                 :type        :ex/User
                                 :schema/name {:id :ex/john}}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/john,
-                     :sh/constraintComponent :sh/datatype,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/value               [:id],
-                     :f/expectation          :xsd/string,
-                     :sh/resultMessage       "the following values do not have expected datatype :xsd/string: :ex/john",
-                     :sh/resultPath          [:schema/name]}]}}
-                 (ex-data db-bool-name))
-              "Exception, because :schema/name is a boolean and not a string.")
-          (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/datatype of shape _:fdb-2 - the following values do not have expected datatype :xsd/string: :ex/john."
-                 (ex-message db-bool-name))))))))
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/john,
+                               :sh/constraintComponent :sh/datatype,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               [:id],
+                               :f/expectation          :xsd/string,
+                               :sh/resultMessage       "the following values do not have expected datatype :xsd/string: :ex/john",
+                               :sh/resultPath          [:schema/name]}]}}
+                           (ex-data db-bool-name))
+              "Exception, because :schema/name is a boolean and not a string."))))))
 
 (deftest ^:integration shacl-closed-shape
   (testing "shacl closed shape"
@@ -244,7 +232,7 @@
                                  :type         :ex/User
                                  :schema/name  "John"
                                  :schema/email "john@flur.ee"}})]
-          (is (= {:status 400,
+          (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
                   {:type        :sh/ValidationReport,
@@ -290,24 +278,22 @@
                                 :type         :ex/User
                                 :schema/name  "John"
                                 :ex/firstName "Jack"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/john,
-                     :sh/constraintComponent :sh/equals,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/value               ["John"],
-                     :f/expectation          ["Jack"],
-                     :sh/resultMessage       "path [:schema/name] values John do not equal :ex/firstName values Jack",
-                     :sh/resultPath          [:schema/name]}]}}
-                 (ex-data db-not-equal)))
-          (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/equals of shape _:fdb-2 - path [:schema/name] values John do not equal :ex/firstName values Jack."
-                 (ex-message db-not-equal)))
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/john,
+                               :sh/constraintComponent :sh/equals,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               ["John"],
+                               :f/expectation          ["Jack"],
+                               :sh/resultMessage       "path [:schema/name] values John do not equal :ex/firstName values Jack",
+                               :sh/resultPath          [:schema/name]}]}}
+                           (ex-data db-not-equal)))
           (let [db-ok @(fluree/stage
                          db
                          {"@context" ["https://ns.flur.ee" context]
@@ -340,24 +326,22 @@
                                    :schema/name  "Brian"
                                    :ex/favNums   [11 17]
                                    :ex/luckyNums [13 18]}})]
-            (is (= {:status 400,
-                    :error  :shacl/violation,
-                    :report
-                    {:type        :sh/ValidationReport,
-                     :sh/conforms false,
-                     :sh/result
-                     [{:type                   :sh/ValidationResult,
-                       :sh/resultSeverity      :sh/Violation
-                       :sh/focusNode           :ex/brian,
-                       :sh/constraintComponent :sh/equals,
-                       :sh/sourceShape         "_:fdb-6",
-                       :sh/value               [11 17],
-                       :f/expectation          [13 18],
-                       :sh/resultMessage       "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 13, 18",
-                       :sh/resultPath          [:ex/favNums]}]}}
-                   (ex-data db-not-equal1)))
-            (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 13, 18."
-                   (ex-message db-not-equal1))))
+            (is (pred-match? {:status 422,
+                              :error  :shacl/violation,
+                              :report
+                              {:type        :sh/ValidationReport,
+                               :sh/conforms false,
+                               :sh/result
+                               [{:type                   :sh/ValidationResult,
+                                 :sh/resultSeverity      :sh/Violation
+                                 :sh/focusNode           :ex/brian,
+                                 :sh/constraintComponent :sh/equals,
+                                 :sh/sourceShape         test-utils/blank-node-id?,
+                                 :sh/value               [11 17],
+                                 :f/expectation          [13 18],
+                                 :sh/resultMessage       "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 13, 18",
+                                 :sh/resultPath          [:ex/favNums]}]}}
+                             (ex-data db-not-equal1))))
           (let [db-not-equal2 @(fluree/stage
                                  db
                                  {"@context" ["https://ns.flur.ee" context]
@@ -367,24 +351,22 @@
                                    :schema/name  "Brian"
                                    :ex/favNums   [11 17]
                                    :ex/luckyNums [11]}})]
-            (is (= {:status 400,
-                    :error  :shacl/violation,
-                    :report
-                    {:type        :sh/ValidationReport,
-                     :sh/conforms false,
-                     :sh/result
-                     [{:type                   :sh/ValidationResult,
-                       :sh/resultSeverity      :sh/Violation
-                       :sh/focusNode           :ex/brian,
-                       :sh/constraintComponent :sh/equals,
-                       :sh/sourceShape         "_:fdb-6",
-                       :sh/value               [11 17],
-                       :f/expectation          [11],
-                       :sh/resultMessage       "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11",
-                       :sh/resultPath          [:ex/favNums]}]}}
-                   (ex-data db-not-equal2)))
-            (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11."
-                   (ex-message db-not-equal2))))
+            (is (pred-match? {:status 422,
+                              :error  :shacl/violation,
+                              :report
+                              {:type        :sh/ValidationReport,
+                               :sh/conforms false,
+                               :sh/result
+                               [{:type                   :sh/ValidationResult,
+                                 :sh/resultSeverity      :sh/Violation
+                                 :sh/focusNode           :ex/brian,
+                                 :sh/constraintComponent :sh/equals,
+                                 :sh/sourceShape         test-utils/blank-node-id?,
+                                 :sh/value               [11 17],
+                                 :f/expectation          [11],
+                                 :sh/resultMessage       "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11",
+                                 :sh/resultPath          [:ex/favNums]}]}}
+                             (ex-data db-not-equal2))))
           (let [db-not-equal3 @(fluree/stage
                                  db
                                  {"@context" ["https://ns.flur.ee" context]
@@ -394,24 +376,22 @@
                                    :schema/name  "Brian"
                                    :ex/favNums   [11 17]
                                    :ex/luckyNums [11 17 18]}})]
-            (is (= {:status 400,
-                    :error  :shacl/violation,
-                    :report
-                    {:type        :sh/ValidationReport,
-                     :sh/conforms false,
-                     :sh/result
-                     [{:type                   :sh/ValidationResult,
-                       :sh/resultSeverity      :sh/Violation
-                       :sh/focusNode           :ex/brian,
-                       :sh/constraintComponent :sh/equals,
-                       :sh/sourceShape         "_:fdb-6",
-                       :sh/value               [11 17],
-                       :f/expectation          [17 11 18],
-                       :sh/resultMessage       "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17, 18",
-                       :sh/resultPath          [:ex/favNums]}]}}
-                   (ex-data db-not-equal3)))
-            (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape _:fdb-6 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17, 18."
-                   (ex-message db-not-equal3))))
+            (is (pred-match? {:status 422,
+                              :error  :shacl/violation,
+                              :report
+                              {:type        :sh/ValidationReport,
+                               :sh/conforms false,
+                               :sh/result
+                               [{:type                   :sh/ValidationResult,
+                                 :sh/resultSeverity      :sh/Violation
+                                 :sh/focusNode           :ex/brian,
+                                 :sh/constraintComponent :sh/equals,
+                                 :sh/sourceShape         test-utils/blank-node-id?,
+                                 :sh/value               [11 17],
+                                 :f/expectation          [17 11 18],
+                                 :sh/resultMessage       "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17, 18",
+                                 :sh/resultPath          [:ex/favNums]}]}}
+                             (ex-data db-not-equal3))))
           (let [db-not-equal4 @(fluree/stage
                                  db
                                  {"@context" ["https://ns.flur.ee" context]
@@ -421,21 +401,21 @@
                                    :schema/name  "Brian"
                                    :ex/favNums   [11 17]
                                    :ex/luckyNums ["11" "17"]}})]
-            (is (= {:status 400,
-                    :error  :shacl/violation,
-                    :report
-                    {:type        :sh/ValidationReport,
-                     :sh/conforms false,
-                     :sh/result
-                     [{:type                   :sh/ValidationResult,
-                       :sh/resultSeverity      :sh/Violation
-                       :sh/focusNode           :ex/brian,
-                       :sh/constraintComponent :sh/equals,
-                       :sh/sourceShape         "_:fdb-6",
-                       :sh/value               [11 17],
-                       :f/expectation          ["17" "11"],
-                       :sh/resultMessage       "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17",
-                       :sh/resultPath          [:ex/favNums]}]}}
+            (is (pred-match? {:status 422,
+                              :error  :shacl/violation,
+                              :report
+                              {:type        :sh/ValidationReport,
+                               :sh/conforms false,
+                               :sh/result
+                               [{:type                   :sh/ValidationResult,
+                                 :sh/resultSeverity      :sh/Violation
+                                 :sh/focusNode           :ex/brian,
+                                 :sh/constraintComponent :sh/equals,
+                                 :sh/sourceShape         test-utils/blank-node-id?,
+                                 :sh/value               [11 17],
+                                 :f/expectation          ["17" "11"],
+                                 :sh/resultMessage       "path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17",
+                                 :sh/resultPath          [:ex/favNums]}]}}
                    (ex-data db-not-equal4))))
           (let [db-ok @(fluree/stage
                          db
@@ -503,21 +483,21 @@
                                         :schema/name  "Brian"
                                         :ex/favNums   11
                                         :ex/luckyNums 11}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/brian,
-                         :sh/constraintComponent :sh/disjoint,
-                         :sh/sourceShape         "_:fdb-14",
-                         :sh/value               [11],
-                         :f/expectation          [11],
-                         :sh/resultMessage       "path [:ex/favNums] values 11 are not disjoint with :ex/luckyNums values 11",
-                         :sh/resultPath          [:ex/favNums]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/brian,
+                                   :sh/constraintComponent :sh/disjoint,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [11],
+                                   :f/expectation          [11],
+                                   :sh/resultMessage       "path [:ex/favNums] values 11 are not disjoint with :ex/luckyNums values 11",
+                                   :sh/resultPath          [:ex/favNums]}]}}
                      (ex-data db-not-disjoint1)))))
           (testing "multiple disjoint tests"
             (let [db-not-disjoint2 @(fluree/stage
@@ -529,21 +509,21 @@
                                         :schema/name  "Brian"
                                         :ex/favNums   [11 17 31]
                                         :ex/luckyNums 11}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/brian,
-                         :sh/constraintComponent :sh/disjoint,
-                         :sh/sourceShape         "_:fdb-14",
-                         :sh/value               [11 17 31],
-                         :f/expectation          [11],
-                         :sh/resultMessage       "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11",
-                         :sh/resultPath          [:ex/favNums]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/brian,
+                                   :sh/constraintComponent :sh/disjoint,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [11 17 31],
+                                   :f/expectation          [11],
+                                   :sh/resultMessage       "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11",
+                                   :sh/resultPath          [:ex/favNums]}]}}
                      (ex-data db-not-disjoint2))
                   "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")))
           (testing "multiple non disjoint values"
@@ -556,21 +536,21 @@
                                         :schema/name  "Brian"
                                         :ex/favNums   [11 17 31]
                                         :ex/luckyNums [13 18 11]}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/brian,
-                         :sh/constraintComponent :sh/disjoint,
-                         :sh/sourceShape         "_:fdb-14",
-                         :sh/value               [11 17 31],
-                         :f/expectation          [13 11 18],
-                         :sh/resultMessage       "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18",
-                         :sh/resultPath          [:ex/favNums]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/brian,
+                                   :sh/constraintComponent :sh/disjoint,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [11 17 31],
+                                   :f/expectation          [13 11 18],
+                                   :sh/resultMessage       "path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18",
+                                   :sh/resultPath          [:ex/favNums]}]}}
                      (ex-data db-not-disjoint3))
                   "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")))))
       (testing "lessThan"
@@ -625,21 +605,21 @@
                                 :schema/name "Alice"
                                 :ex/p1       [11 17]
                                 :ex/p2       17}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/lessThan,
-                         :sh/sourceShape         "_:fdb-20",
-                         :sh/value               [11 17],
-                         :f/expectation          [17],
-                         :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17",
-                         :sh/resultPath          [:ex/p1]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/lessThan,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [11 17],
+                                   :f/expectation          [17],
+                                   :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17",
+                                   :sh/resultPath          [:ex/p1]}]}}
                      (ex-data db-fail1)))))
           (testing "values not comparable to other values"
             (let [db-fail2 @(fluree/stage
@@ -651,21 +631,21 @@
                                 :schema/name "Alice"
                                 :ex/p1       [11 17]
                                 :ex/p2       ["18" "19"]}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/lessThan,
-                         :sh/sourceShape         "_:fdb-20",
-                         :sh/value               [11 17],
-                         :f/expectation          ["19" "18"],
-                         :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19",
-                         :sh/resultPath          [:ex/p1]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/lessThan,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [11 17],
+                                   :f/expectation          ["19" "18"],
+                                   :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19",
+                                   :sh/resultPath          [:ex/p1]}]}}
                      (ex-data db-fail2)))))
           (testing "values not less than all other values"
             (let [db-fail3 @(fluree/stage
@@ -677,21 +657,21 @@
                                 :schema/name "Alice"
                                 :ex/p1       [12 17]
                                 :ex/p2       [10 18]}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/lessThan,
-                         :sh/sourceShape         "_:fdb-20",
-                         :sh/value               [12 17],
-                         :f/expectation          [10 18],
-                         :sh/resultMessage       "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18",
-                         :sh/resultPath          [:ex/p1]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/lessThan,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [12 17],
+                                   :f/expectation          [10 18],
+                                   :sh/resultMessage       "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18",
+                                   :sh/resultPath          [:ex/p1]}]}}
                      (ex-data db-fail3)))))
           (testing "values not less than all"
             (let [db-fail4 @(fluree/stage
@@ -703,21 +683,21 @@
                                 :schema/name "Alice"
                                 :ex/p1       [11 17]
                                 :ex/p2       [12 16]}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/lessThan,
-                         :sh/sourceShape         "_:fdb-20",
-                         :sh/value               [11 17],
-                         :f/expectation          [12 16],
-                         :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16",
-                         :sh/resultPath          [:ex/p1]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/lessThan,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [11 17],
+                                   :f/expectation          [12 16],
+                                   :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16",
+                                   :sh/resultPath          [:ex/p1]}]}}
                      (ex-data db-fail4)))))
           (testing "not comparable with iris"
             (let [db-iris @(fluree/stage
@@ -729,21 +709,21 @@
                                :schema/name "Alice"
                                :ex/p1       :ex/brian
                                :ex/p2       :ex/john}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/lessThan,
-                         :sh/sourceShape         "_:fdb-20",
-                         :sh/value               [:ex/brian],
-                         :f/expectation          [:ex/john],
-                         :sh/resultMessage       "path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john",
-                         :sh/resultPath          [:ex/p1]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/lessThan,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [:ex/brian],
+                                   :f/expectation          [:ex/john],
+                                   :sh/resultMessage       "path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john",
+                                   :sh/resultPath          [:ex/p1]}]}}
                      (ex-data db-iris)))))))
       (testing "lessThanOrEquals"
         (let [db @(fluree/stage
@@ -797,21 +777,21 @@
                                 :schema/name "Alice"
                                 :ex/p1       [11 17]
                                 :ex/p2       10}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/lessThanOrEquals,
-                         :sh/sourceShape         "_:fdb-29",
-                         :sh/value               [11 17],
-                         :f/expectation          [10],
-                         :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10",
-                         :sh/resultPath          [:ex/p1]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/lessThanOrEquals,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [11 17],
+                                   :f/expectation          [10],
+                                   :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10",
+                                   :sh/resultPath          [:ex/p1]}]}}
                      (ex-data db-fail1)))))
           (testing "all values not comparable with other values"
             (let [db-fail2 @(fluree/stage
@@ -823,21 +803,21 @@
                                 :schema/name "Alice"
                                 :ex/p1       [11 17]
                                 :ex/p2       ["17" "19"]}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/lessThanOrEquals,
-                         :sh/sourceShape         "_:fdb-29",
-                         :sh/value               [11 17],
-                         :f/expectation          ["19" "17"],
-                         :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19",
-                         :sh/resultPath          [:ex/p1]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/lessThanOrEquals,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [11 17],
+                                   :f/expectation          ["19" "17"],
+                                   :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19",
+                                   :sh/resultPath          [:ex/p1]}]}}
                      (ex-data db-fail2)))))
           (testing "all values not less than other values"
             (let [db-fail3 @(fluree/stage
@@ -849,21 +829,21 @@
                                 :schema/name "Alice"
                                 :ex/p1       [12 17]
                                 :ex/p2       [10 17]}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/lessThanOrEquals,
-                         :sh/sourceShape         "_:fdb-29",
-                         :sh/value               [12 17],
-                         :f/expectation          [17 10],
-                         :sh/resultMessage       "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17",
-                         :sh/resultPath          [:ex/p1]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/lessThanOrEquals,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [12 17],
+                                   :f/expectation          [17 10],
+                                   :sh/resultMessage       "path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17",
+                                   :sh/resultPath          [:ex/p1]}]}}
                      (ex-data db-fail3)))))
           (testing "all values not less than all other values"
             (let [db-fail4 @(fluree/stage
@@ -875,21 +855,21 @@
                                 :schema/name "Alice"
                                 :ex/p1       [11 17]
                                 :ex/p2       [12 16]}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/lessThanOrEquals,
-                         :sh/sourceShape         "_:fdb-29",
-                         :sh/value               [11 17],
-                         :f/expectation          [12 16],
-                         :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16",
-                         :sh/resultPath          [:ex/p1]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/lessThanOrEquals,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               [11 17],
+                                   :f/expectation          [12 16],
+                                   :sh/resultMessage       "path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16",
+                                   :sh/resultPath          [:ex/p1]}]}}
                      (ex-data db-fail4))))))))))
 
 (deftest ^:integration shacl-value-range
@@ -931,21 +911,21 @@
                                  {:id         :ex/john
                                   :type       :ex/User
                                   :schema/age 1}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/john,
-                         :sh/constraintComponent :sh/minExclusive,
-                         :sh/sourceShape         "_:fdb-2",
-                         :sh/value               1,
-                         :f/expectation          1,
-                         :sh/resultMessage       "value 1 is less than exclusive minimum 1",
-                         :sh/resultPath          [:schema/age]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/john,
+                                   :sh/constraintComponent :sh/minExclusive,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               1,
+                                   :f/expectation          1,
+                                   :sh/resultMessage       "value 1 is less than exclusive minimum 1",
+                                   :sh/resultPath          [:schema/age]}]}}
                      (ex-data db-too-low)))))
           (testing "values too high"
             (let [db-too-high @(fluree/stage
@@ -955,21 +935,21 @@
                                   {:id         :ex/john
                                    :type       :ex/User
                                    :schema/age 100}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/john,
-                         :sh/constraintComponent :sh/maxExclusive,
-                         :sh/sourceShape         "_:fdb-2",
-                         :sh/value               100,
-                         :f/expectation          100,
-                         :sh/resultMessage       "value 100 is greater than exclusive maximum 100",
-                         :sh/resultPath          [:schema/age]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/john,
+                                   :sh/constraintComponent :sh/maxExclusive,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               100,
+                                   :f/expectation          100,
+                                   :sh/resultMessage       "value 100 is greater than exclusive maximum 100",
+                                   :sh/resultPath          [:schema/age]}]}}
                      (ex-data db-too-high)))))))
       (testing "inclusive constraints"
         (let [db @(fluree/stage
@@ -984,19 +964,19 @@
                                         :sh/maxInclusive 100}]}})]
           (testing "values at limit"
             (let [db-ok  @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id         :ex/brian
-                             :type       :ex/User
-                             :schema/age 1}})
+                            db
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id         :ex/brian
+                              :type       :ex/User
+                              :schema/age 1}})
                   db-ok2 @(fluree/stage
-                                 db-ok
-                                 {"@context" ["https://ns.flur.ee" context]
-                                  "insert"
-                                  {:id         :ex/alice
-                                   :type       :ex/User
-                                   :schema/age 100}})]
+                            db-ok
+                            {"@context" ["https://ns.flur.ee" context]
+                             "insert"
+                             {:id         :ex/alice
+                              :type       :ex/User
+                              :schema/age 100}})]
               (is (= [{:id         :ex/alice
                        :type       :ex/User
                        :schema/age 100}
@@ -1006,27 +986,27 @@
                      @(fluree/query db-ok2 user-query)))))
           (testing "values below min"
             (let [db-too-low @(fluree/stage
-                                 db
-                                 {"@context" ["https://ns.flur.ee" context]
-                                  "insert"
-                                  {:id         :ex/alice
-                                   :type       :ex/User
-                                   :schema/age 0}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/minInclusive,
-                         :sh/sourceShape         "_:fdb-7",
-                         :sh/value               0,
-                         :f/expectation          1,
-                         :sh/resultMessage       "value 0 is less than inclusive minimum 1",
-                         :sh/resultPath          [:schema/age]}]}}
+                                db
+                                {"@context" ["https://ns.flur.ee" context]
+                                 "insert"
+                                 {:id         :ex/alice
+                                  :type       :ex/User
+                                  :schema/age 0}})]
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/minInclusive,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               0,
+                                   :f/expectation          1,
+                                   :sh/resultMessage       "value 0 is less than inclusive minimum 1",
+                                   :sh/resultPath          [:schema/age]}]}}
                      (ex-data db-too-low)))))
           (testing "values above max"
             (let [db-too-high @(fluree/stage
@@ -1036,21 +1016,21 @@
                                   {:id         :ex/alice
                                    :type       :ex/User
                                    :schema/age 101}})]
-              (is (= {:status 400,
-                      :error  :shacl/violation,
-                      :report
-                      {:type        :sh/ValidationReport,
-                       :sh/conforms false,
-                       :sh/result
-                       [{:type                   :sh/ValidationResult,
-                         :sh/resultSeverity      :sh/Violation
-                         :sh/focusNode           :ex/alice,
-                         :sh/constraintComponent :sh/maxInclusive,
-                         :sh/sourceShape         "_:fdb-7",
-                         :sh/value               101,
-                         :f/expectation          100,
-                         :sh/resultMessage       "value 101 is greater than inclusive maximum 100",
-                         :sh/resultPath          [:schema/age]}]}}
+              (is (pred-match? {:status 422,
+                                :error  :shacl/violation,
+                                :report
+                                {:type        :sh/ValidationReport,
+                                 :sh/conforms false,
+                                 :sh/result
+                                 [{:type                   :sh/ValidationResult,
+                                   :sh/resultSeverity      :sh/Violation
+                                   :sh/focusNode           :ex/alice,
+                                   :sh/constraintComponent :sh/maxInclusive,
+                                   :sh/sourceShape         test-utils/blank-node-id?,
+                                   :sh/value               101,
+                                   :f/expectation          100,
+                                   :sh/resultMessage       "value 101 is greater than inclusive maximum 100",
+                                   :sh/resultPath          [:schema/age]}]}}
                      (ex-data db-too-high)))))))
       (testing "non-numeric values"
         (let [db         @(fluree/stage
@@ -1076,38 +1056,38 @@
                              {:id         :ex/alice
                               :type       :ex/User
                               :schema/age "10"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/alice,
-                     :sh/constraintComponent :sh/minExclusive,
-                     :sh/sourceShape         "_:fdb-13",
-                     :sh/value               :ex/brian,
-                     :f/expectation          0,
-                     :sh/resultMessage       "value :ex/brian is less than exclusive minimum 0",
-                     :sh/resultPath          [:schema/age]}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/alice,
+                               :sh/constraintComponent :sh/minExclusive,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               :ex/brian,
+                               :f/expectation          0,
+                               :sh/resultMessage       "value :ex/brian is less than exclusive minimum 0",
+                               :sh/resultPath          [:schema/age]}]}}
                  (ex-data db-subj-id)))
 
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/alice,
-                     :sh/constraintComponent :sh/minExclusive,
-                     :sh/sourceShape         "_:fdb-13",
-                     :sh/value               "10",
-                     :f/expectation          0,
-                     :sh/resultMessage       "value 10 is less than exclusive minimum 0",
-                     :sh/resultPath          [:schema/age]}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/alice,
+                               :sh/constraintComponent :sh/minExclusive,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               "10",
+                               :f/expectation          0,
+                               :sh/resultMessage       "value 10 is less than exclusive minimum 0",
+                               :sh/resultPath          [:schema/age]}]}}
                  (ex-data db-string))))))))
 
 (deftest ^:integration shacl-string-length-constraints
@@ -1160,21 +1140,21 @@
                                    {:id          :ex/al
                                     :type        :ex/User
                                     :schema/name "Al"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/al,
-                     :sh/constraintComponent :sh/minLength,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/value               "Al",
-                     :f/expectation          4,
-                     :sh/resultMessage       "value \"Al\" has string length less than minimum length 4",
-                     :sh/resultPath          [:schema/name]}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/al,
+                               :sh/constraintComponent :sh/minLength,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               "Al",
+                               :f/expectation          4,
+                               :sh/resultMessage       "value \"Al\" has string length less than minimum length 4",
+                               :sh/resultPath          [:schema/name]}]}}
                  (ex-data db-too-short-str)))))
       (testing "string is too long"
         (let [db-too-long-str @(fluree/stage
@@ -1184,21 +1164,21 @@
                                   {:id          :ex/jean-claude
                                    :type        :ex/User
                                    :schema/name "Jean-Claude"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/jean-claude,
-                     :sh/constraintComponent :sh/maxLength,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/value               "Jean-Claude",
-                     :f/expectation          10,
-                     :sh/resultMessage       "value \"Jean-Claude\" has string length greater than maximum length 10",
-                     :sh/resultPath          [:schema/name]}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/jean-claude,
+                               :sh/constraintComponent :sh/maxLength,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               "Jean-Claude",
+                               :f/expectation          10,
+                               :sh/resultMessage       "value \"Jean-Claude\" has string length greater than maximum length 10",
+                               :sh/resultPath          [:schema/name]}]}}
                  (ex-data db-too-long-str)))))
       (testing "non-string literals are stringified"
         (let [db-too-long-non-str @(fluree/stage
@@ -1208,21 +1188,21 @@
                                       {:id          :ex/john
                                        :type        :ex/User
                                        :schema/name 12345678910}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/john,
-                     :sh/constraintComponent :sh/maxLength,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/value               12345678910,
-                     :f/expectation          10,
-                     :sh/resultMessage       "value \"12345678910\" has string length greater than maximum length 10",
-                     :sh/resultPath          [:schema/name]}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/john,
+                               :sh/constraintComponent :sh/maxLength,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               12345678910,
+                               :f/expectation          10,
+                               :sh/resultMessage       "value \"12345678910\" has string length greater than maximum length 10",
+                               :sh/resultPath          [:schema/name]}]}}
                  (ex-data db-too-long-non-str)))))
       (testing "non-literal values violate"
         (let [db-ref-value @(fluree/stage
@@ -1232,21 +1212,21 @@
                                {:id          :ex/john
                                 :type        :ex/User
                                 :schema/name :ex/ref}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/john,
-                     :sh/constraintComponent :sh/maxLength,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/value               #fluree/SID [101 "ref"],
-                     :f/expectation          10,
-                     :sh/resultMessage       "value :ex/ref is not a literal value",
-                     :sh/resultPath          [:schema/name]}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/john,
+                               :sh/constraintComponent :sh/maxLength,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               #fluree/SID [101 "ref"],
+                               :f/expectation          10,
+                               :sh/resultMessage       "value :ex/ref is not a literal value",
+                               :sh/resultPath          [:schema/name]}]}}
                  (ex-data db-ref-value))))))))
 
 (deftest ^:integration shacl-string-pattern-constraints
@@ -1301,25 +1281,25 @@
                                          {:id          :ex/alice
                                           :type        :ex/User
                                           :ex/greeting "HELLO\nWORLD!"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/alice,
-                     :sh/constraintComponent :sh/pattern,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/value               "HELLO
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/alice,
+                               :sh/constraintComponent :sh/pattern,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               "HELLO
 WORLD!",
-                     :f/expectation          "hello   (.*?)world",
-                     :sh/resultMessage       (str "value "
-                                                  (pr-str "HELLO
+                               :f/expectation          "hello   (.*?)world",
+                               :sh/resultMessage       (str "value "
+                                                            (pr-str "HELLO
 WORLD!")
-                                                  " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x")
-                     :sh/resultPath          [:ex/greeting]}]}}
+                                                            " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x")
+                               :sh/resultPath          [:ex/greeting]}]}}
                  (ex-data db-wrong-case-greeting)))))
       (testing "stringified literal does not match pattern"
         (let [db-wrong-birth-year @(fluree/stage
@@ -1329,21 +1309,21 @@ WORLD!")
                                       {:id           :ex/alice
                                        :type         :ex/User
                                        :ex/birthYear 1776}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/focusNode           :ex/alice,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/constraintComponent :sh/pattern,
-                     :sh/sourceShape         "_:fdb-3",
-                     :sh/value               1776,
-                     :f/expectation          "(19|20)[0-9][0-9]",
-                     :sh/resultMessage       "value \"1776\" does not match pattern \"(19|20)[0-9][0-9]\"",
-                     :sh/resultPath          [:ex/birthYear]}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/focusNode           :ex/alice,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/constraintComponent :sh/pattern,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               1776,
+                               :f/expectation          "(19|20)[0-9][0-9]",
+                               :sh/resultMessage       "value \"1776\" does not match pattern \"(19|20)[0-9][0-9]\"",
+                               :sh/resultPath          [:ex/birthYear]}]}}
                  (ex-data db-wrong-birth-year)))))
       (testing "non-literal values automatically produce violation"
         (let [db-ref-value @(fluree/stage
@@ -1353,21 +1333,21 @@ WORLD!")
                                {:id           :ex/john
                                 :type         :ex/User
                                 :ex/birthYear :ex/ref}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation
-                     :sh/focusNode           :ex/john,
-                     :sh/constraintComponent :sh/pattern,
-                     :sh/sourceShape         "_:fdb-3",
-                     :sh/value               #fluree/SID [101 "ref"],
-                     :f/expectation          "(19|20)[0-9][0-9]",
-                     :sh/resultMessage       "value \":ex/ref\" does not match pattern \"(19|20)[0-9][0-9]\"",
-                     :sh/resultPath          [:ex/birthYear]}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:type                   :sh/ValidationResult,
+                               :sh/resultSeverity      :sh/Violation
+                               :sh/focusNode           :ex/john,
+                               :sh/constraintComponent :sh/pattern,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/value               #fluree/SID [101 "ref"],
+                               :f/expectation          "(19|20)[0-9][0-9]",
+                               :sh/resultMessage       "value \":ex/ref\" does not match pattern \"(19|20)[0-9][0-9]\"",
+                               :sh/resultPath          [:ex/birthYear]}]}}
                  (ex-data db-ref-value))))))))
 
 (deftest language-constraints
@@ -1395,22 +1375,22 @@ WORLD!")
                                         "insert"
                                         {"@id"      "ex:a"
                                          "ex:label" {"@value" "foo" "@language" "cz"}}})]
-            (is (= {:status 400,
-                    :error  :shacl/violation,
-                    :report
-                    {"type"        "sh:ValidationReport",
-                     "sh:conforms" false,
-                     "sh:result"
-                     [{"sh:constraintComponent" "sh:languageIn",
-                       "sh:focusNode"           "ex:a",
-                       "sh:resultSeverity"      "sh:Violation",
-                       "sh:value"               "foo",
-                       "sh:resultPath"          ["ex:label"],
-                       "type"                   "sh:ValidationResult",
-                       "sh:resultMessage"
-                       "value \"foo\" does not have language tag in [\"en\" \"fr\"]",
-                       "sh:sourceShape"         "_:fdb-2",
-                       "f:expectation"          ["en" "fr"]}]}}
+            (is (pred-match? {:status 422,
+                              :error  :shacl/violation,
+                              :report
+                              {"type"        "sh:ValidationReport",
+                               "sh:conforms" false,
+                               "sh:result"
+                               [{"sh:constraintComponent" "sh:languageIn",
+                                 "sh:focusNode"           "ex:a",
+                                 "sh:resultSeverity"      "sh:Violation",
+                                 "sh:value"               "foo",
+                                 "sh:resultPath"          ["ex:label"],
+                                 "type"                   "sh:ValidationResult",
+                                 "sh:resultMessage"
+                                 "value \"foo\" does not have language tag in [\"en\" \"fr\"]",
+                                 "sh:sourceShape"         test-utils/blank-node-id?,
+                                 "f:expectation"          ["en" "fr"]}]}}
                    (ex-data db2)))))))
     (testing "unique-lang"
       (let [db1 @(fluree/stage db0 {"@context" context
@@ -1433,21 +1413,21 @@ WORLD!")
                                         {"@id"      "ex:a"
                                          "ex:label" [{"@value" "foo" "@language" "en"}
                                                      {"@value" "bar" "@language" "en"}]}})]
-            (is (= {:status 400,
-                    :error  :shacl/violation,
-                    :report
-                    {"type"        "sh:ValidationReport",
-                     "sh:conforms" false,
-                     "sh:result"
-                     [{"sh:constraintComponent" "sh:uniqueLang",
-                       "sh:focusNode"           "ex:a",
-                       "sh:resultSeverity"      "sh:Violation",
-                       "sh:value"               false,
-                       "sh:resultPath"          ["ex:label"],
-                       "type"                   "sh:ValidationResult",
-                       "sh:resultMessage"       "values [\"bar\" \"foo\"] do not have unique language tags",
-                       "sh:sourceShape"         "_:fdb-6",
-                       "f:expectation"          true}]}}
+            (is (pred-match? {:status 422,
+                              :error  :shacl/violation,
+                              :report
+                              {"type"        "sh:ValidationReport",
+                               "sh:conforms" false,
+                               "sh:result"
+                               [{"sh:constraintComponent" "sh:uniqueLang",
+                                 "sh:focusNode"           "ex:a",
+                                 "sh:resultSeverity"      "sh:Violation",
+                                 "sh:value"               false,
+                                 "sh:resultPath"          ["ex:label"],
+                                 "type"                   "sh:ValidationResult",
+                                 "sh:resultMessage"       "values [\"bar\" \"foo\"] do not have unique language tags",
+                                 "sh:sourceShape"         test-utils/blank-node-id?,
+                                 "f:expectation"          true}]}}
                    (ex-data db2)))))))))
 
 (deftest ^:integration shacl-multiple-properties-test
@@ -1501,21 +1481,21 @@ WORLD!")
                               :type         :ex/User
                               :schema/age   40
                               :schema/email "john@example.org"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:sh/constraintComponent :sh/minCount,
-                     :type                   :sh/ValidationResult,
-                     :sh/resultMessage       "count 0 is less than minimum count of 1",
-                     :sh/resultPath          [:schema/name],
-                     :f/expectation          1,
-                     :sh/resultSeverity      :sh/Violation,
-                     :sh/value               0,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/focusNode           :ex/john}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:sh/constraintComponent :sh/minCount,
+                               :type                   :sh/ValidationResult,
+                               :sh/resultMessage       "count 0 is less than minimum count of 1",
+                               :sh/resultPath          [:schema/name],
+                               :f/expectation          1,
+                               :sh/resultSeverity      :sh/Violation,
+                               :sh/value               0,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/focusNode           :ex/john}]}}
                  (ex-data db-no-name)))))
       (testing "cardinality constraint violated"
         (let [db-two-names @(fluree/stage
@@ -1527,21 +1507,21 @@ WORLD!")
                                 :schema/name  ["John" "Billy"]
                                 :schema/age   40
                                 :schema/email "john@example.org"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:sh/constraintComponent :sh/maxCount,
-                     :type                   :sh/ValidationResult,
-                     :sh/resultMessage       "count 2 is greater than maximum count of 1",
-                     :sh/resultPath          [:schema/name],
-                     :f/expectation          1,
-                     :sh/resultSeverity      :sh/Violation,
-                     :sh/value               2,
-                     :sh/sourceShape         "_:fdb-2",
-                     :sh/focusNode           :ex/john}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:sh/constraintComponent :sh/maxCount,
+                               :type                   :sh/ValidationResult,
+                               :sh/resultMessage       "count 2 is greater than maximum count of 1",
+                               :sh/resultPath          [:schema/name],
+                               :f/expectation          1,
+                               :sh/resultSeverity      :sh/Violation,
+                               :sh/value               2,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/focusNode           :ex/john}]}}
                  (ex-data db-two-names)))))
       (testing "max constraint violated"
         (let [db-too-old @(fluree/stage
@@ -1553,21 +1533,21 @@ WORLD!")
                               :schema/name  "John"
                               :schema/age   140
                               :schema/email "john@example.org"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:sh/constraintComponent :sh/maxInclusive,
-                     :type                   :sh/ValidationResult,
-                     :sh/resultMessage       "value 140 is greater than inclusive maximum 130",
-                     :sh/resultPath          [:schema/age],
-                     :f/expectation          130,
-                     :sh/resultSeverity      :sh/Violation,
-                     :sh/value               140,
-                     :sh/sourceShape         "_:fdb-3",
-                     :sh/focusNode           :ex/john}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:sh/constraintComponent :sh/maxInclusive,
+                               :type                   :sh/ValidationResult,
+                               :sh/resultMessage       "value 140 is greater than inclusive maximum 130",
+                               :sh/resultPath          [:schema/age],
+                               :f/expectation          130,
+                               :sh/resultSeverity      :sh/Violation,
+                               :sh/value               140,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/focusNode           :ex/john}]}}
                  (ex-data db-too-old)))))
       (testing "second cardinality constraint violated"
         (let [db-two-ages @(fluree/stage
@@ -1579,21 +1559,21 @@ WORLD!")
                                :schema/name  "John"
                                :schema/age   [40 21]
                                :schema/email "john@example.org"}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:sh/constraintComponent :sh/maxCount,
-                     :type                   :sh/ValidationResult,
-                     :sh/resultMessage       "count 2 is greater than maximum count of 1",
-                     :sh/resultPath          [:schema/age],
-                     :f/expectation          1,
-                     :sh/resultSeverity      :sh/Violation,
-                     :sh/value               2,
-                     :sh/sourceShape         "_:fdb-3",
-                     :sh/focusNode           :ex/john}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {:type        :sh/ValidationReport,
+                             :sh/conforms false,
+                             :sh/result
+                             [{:sh/constraintComponent :sh/maxCount,
+                               :type                   :sh/ValidationResult,
+                               :sh/resultMessage       "count 2 is greater than maximum count of 1",
+                               :sh/resultPath          [:schema/age],
+                               :f/expectation          1,
+                               :sh/resultSeverity      :sh/Violation,
+                               :sh/value               2,
+                               :sh/sourceShape         test-utils/blank-node-id?,
+                               :sh/focusNode           :ex/john}]}}
                  (ex-data db-two-ages)))))
       (testing "datatype constraint violated"
         (let [db-num-email @(fluree/stage
@@ -1605,19 +1585,19 @@ WORLD!")
                                 :schema/name  "John"
                                 :schema/age   40
                                 :schema/email 42}})]
-          (is (= {:error  :shacl/violation
-                  :report {:sh/conforms false
-                           :sh/result   [{:f/expectation          :xsd/string
-                                          :sh/constraintComponent :sh/datatype
-                                          :sh/focusNode           :ex/john
-                                          :sh/resultMessage       "the following values do not have expected datatype :xsd/string: 42"
-                                          :sh/resultPath          [:schema/email]
-                                          :sh/resultSeverity      :sh/Violation
-                                          :sh/sourceShape         "_:fdb-4"
-                                          :sh/value               [:xsd/integer]
-                                          :type                   :sh/ValidationResult}]
-                           :type        :sh/ValidationReport}
-                  :status 400}
+          (is (pred-match? {:error  :shacl/violation
+                            :report {:sh/conforms false
+                                     :sh/result   [{:f/expectation          :xsd/string
+                                                    :sh/constraintComponent :sh/datatype
+                                                    :sh/focusNode           :ex/john
+                                                    :sh/resultMessage       "the following values do not have expected datatype :xsd/string: 42"
+                                                    :sh/resultPath          [:schema/email]
+                                                    :sh/resultSeverity      :sh/Violation
+                                                    :sh/sourceShape         test-utils/blank-node-id?
+                                                    :sh/value               [:xsd/integer]
+                                                    :type                   :sh/ValidationResult}]
+                                     :type        :sh/ValidationReport}
+                            :status 422}
                  (ex-data db-num-email))))))))
 
 (deftest ^:integration property-paths
@@ -1651,21 +1631,21 @@ WORLD!")
                @(fluree/query valid-parent {"@context" context
                                             "select"   {"ex:Luke" ["*" {"ex:parent" ["*"]}]}})))
 
-        (is (= {:status 400,
-                :error :shacl/violation,
-                :report
-                {"type" "sh:ValidationReport",
-                 "sh:conforms" false,
-                 "sh:result"
-                 [{"sh:constraintComponent" "sh:minCount",
-                   "sh:focusNode" "ex:bad-parent",
-                   "sh:resultSeverity" "sh:Violation",
-                   "sh:value" 0,
-                   "sh:resultPath" [{"sh:inversePath" "ex:parent"}],
-                   "type" "sh:ValidationResult",
-                   "sh:resultMessage" "count 0 is less than minimum count of 1",
-                   "sh:sourceShape" "_:fdb-2",
-                   "f:expectation" 1}]}}
+        (is (pred-match? {:status 422,
+                          :error  :shacl/violation,
+                          :report
+                          {"type"        "sh:ValidationReport",
+                           "sh:conforms" false,
+                           "sh:result"
+                           [{"sh:constraintComponent" "sh:minCount",
+                             "sh:focusNode"           "ex:bad-parent",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               0,
+                             "sh:resultPath"          [{"sh:inversePath" "ex:parent"}],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"       "count 0 is less than minimum count of 1",
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          1}]}}
                (ex-data invalid-pal)))))
     (testing "sequence paths"
       (let [ ;; a valid Pal is anybody who has a pal with a name
@@ -1696,101 +1676,101 @@ WORLD!")
                                              "select"   {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})
                    first
                    (update "ex:pal" set))))
-        (is (= {:status 400,
-                :error :shacl/violation,
-                :report
-                {"type" "sh:ValidationReport",
-                 "sh:conforms" false,
-                 "sh:result"
-                 [{"sh:constraintComponent" "sh:minCount",
-                   "sh:focusNode" "ex:bad-pal",
-                   "sh:resultSeverity" "sh:Violation",
-                   "sh:value" 0,
-                   "sh:resultPath" ["ex:pal" "schema:name"],
-                   "type" "sh:ValidationResult",
-                   "sh:resultMessage" "count 0 is less than minimum count of 1",
-                   "sh:sourceShape" "_:fdb-8",
-                   "f:expectation" 1}]}}
+        (is (pred-match? {:status 422,
+                          :error  :shacl/violation,
+                          :report
+                          {"type"        "sh:ValidationReport",
+                           "sh:conforms" false,
+                           "sh:result"
+                           [{"sh:constraintComponent" "sh:minCount",
+                             "sh:focusNode"           "ex:bad-pal",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               0,
+                             "sh:resultPath"          ["ex:pal" "schema:name"],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"       "count 0 is less than minimum count of 1",
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          1}]}}
                (ex-data invalid-pal)))))
     (testing "sequence paths"
-      (let [db1         @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
-                                            "insert"   [{"@type"          "sh:NodeShape"
-                                                         "sh:targetClass" {"@id" "ex:Pal"}
-                                                         "sh:property"
-                                                         [{"sh:path"
-                                                           {"@list" [{"id" "ex:pal"} {"id" "ex:name"}]}
-                                                           "sh:minCount" 1}]}]})
-            valid-pal   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                            "insert"   {"id"      "ex:jd"
-                                                        "type"    "ex:Pal"
-                                                        "ex:name" "J.D."
-                                                        "ex:pal"  [{"ex:name" "Turk"}
-                                                                   {"ex:name" "Rowdy"}]}})
+      (let [db1       @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+                                          "insert"   [{"@type"          "sh:NodeShape"
+                                                       "sh:targetClass" {"@id" "ex:Pal"}
+                                                       "sh:property"
+                                                       [{"sh:path"
+                                                         {"@list" [{"id" "ex:pal"} {"id" "ex:name"}]}
+                                                         "sh:minCount" 1}]}]})
+            valid-pal @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                          "insert"   {"id"      "ex:jd"
+                                                      "type"    "ex:Pal"
+                                                      "ex:name" "J.D."
+                                                      "ex:pal"  [{"ex:name" "Turk"}
+                                                                 {"ex:name" "Rowdy"}]}})
 
 
             invalid-pal @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
                                             "insert"   {"id"      "ex:jd"
                                                         "type"    "ex:Pal"
                                                         "ex:name" "J.D."
-                                                        "ex:pal"  [{"id" "ex:not-pal"
+                                                        "ex:pal"  [{"id"          "ex:not-pal"
                                                                     "ex:not-name" "noname"}
-                                                                   {"id" "ex:turk"
+                                                                   {"id"      "ex:turk"
                                                                     "ex:name" "Turk"}
-                                                                   {"id" "ex:rowdy"
+                                                                   {"id"      "ex:rowdy"
                                                                     "ex:name" "Rowdy"}]}})]
 
-        (is (= [{"id" "ex:jd",
-                 "type" "ex:Pal",
+        (is (= [{"id"      "ex:jd",
+                 "type"    "ex:Pal",
                  "ex:name" "J.D.",
-                 "ex:pal" [{"ex:name" "Turk"} {"ex:name" "Rowdy"}]}]
+                 "ex:pal"  [{"ex:name" "Turk"} {"ex:name" "Rowdy"}]}]
                @(fluree/query valid-pal {"@context" context
                                          "select"   {"ex:jd" ["*" {"ex:pal" ["ex:name"]}]}})))
-        (is (= {:status 400,
-                :error :shacl/violation,
-                :report
-                {"type" "sh:ValidationReport",
-                 "sh:conforms" false,
-                 "sh:result"
-                 [{"sh:constraintComponent" "sh:minCount",
-                   "sh:focusNode" "ex:jd",
-                   "sh:resultSeverity" "sh:Violation",
-                   "sh:value" 0,
-                   "sh:resultPath" ["ex:pal" "ex:name"],
-                   "type" "sh:ValidationResult",
-                   "sh:resultMessage" "count 0 is less than minimum count of 1",
-                   "sh:sourceShape" "_:fdb-16",
-                   "f:expectation" 1}]}}
+        (is (pred-match? {:status 422,
+                          :error  :shacl/violation,
+                          :report
+                          {"type"        "sh:ValidationReport",
+                           "sh:conforms" false,
+                           "sh:result"
+                           [{"sh:constraintComponent" "sh:minCount",
+                             "sh:focusNode"           "ex:jd",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               0,
+                             "sh:resultPath"          ["ex:pal" "ex:name"],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"       "count 0 is less than minimum count of 1",
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          1}]}}
                (ex-data invalid-pal)))))
 
     (testing "predicate-path"
-      (let [db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
-                                    "insert" [{"@type" "sh:NodeShape"
-                                               "sh:targetClass" {"@id" "ex:Named"}
-                                               "sh:property"
-                                               [{"sh:path"
-                                                 {"@list" [{"id" "ex:name"}]}
-                                                 "sh:datatype" {"id" "xsd:string"}}]}]})
-            valid-named   @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
-                                              "insert"   {"id"      "ex:good-pal"
-                                                          "type"    "ex:Named"
-                                                          "ex:name" {"@value" 123
-                                                                     "@type" "xsd:integer"}}})]
-        (is (= {:status 400,
-                :error :shacl/violation,
-                :report
-                {"type" "sh:ValidationReport",
-                 "sh:conforms" false,
-                 "sh:result"
-                 [{"sh:constraintComponent" "sh:datatype",
-                   "sh:focusNode" "ex:good-pal",
-                   "sh:resultSeverity" "sh:Violation",
-                   "sh:value" ["xsd:integer"],
-                   "sh:resultPath" ["ex:name"],
-                   "type" "sh:ValidationResult",
-                   "sh:resultMessage"
-                   "the following values do not have expected datatype xsd:string: 123",
-                   "sh:sourceShape" "_:fdb-23",
-                   "f:expectation" "xsd:string"}]}}
+      (let [db1         @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+                                            "insert"   [{"@type"          "sh:NodeShape"
+                                                         "sh:targetClass" {"@id" "ex:Named"}
+                                                         "sh:property"
+                                                         [{"sh:path"
+                                                           {"@list" [{"id" "ex:name"}]}
+                                                           "sh:datatype" {"id" "xsd:string"}}]}]})
+            valid-named @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+                                            "insert"   {"id"      "ex:good-pal"
+                                                        "type"    "ex:Named"
+                                                        "ex:name" {"@value" 123
+                                                                   "@type"  "xsd:integer"}}})]
+        (is (pred-match? {:status 422,
+                          :error  :shacl/violation,
+                          :report
+                          {"type"        "sh:ValidationReport",
+                           "sh:conforms" false,
+                           "sh:result"
+                           [{"sh:constraintComponent" "sh:datatype",
+                             "sh:focusNode"           "ex:good-pal",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               ["xsd:integer"],
+                             "sh:resultPath"          ["ex:name"],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"
+                             "the following values do not have expected datatype xsd:string: 123",
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          "xsd:string"}]}}
                (ex-data valid-named)))))
     (testing "inverse sequence path"
       (let [ ;; a valid Princess is anybody who is the child of someone's queen
@@ -1823,22 +1803,22 @@ WORLD!")
                @(fluree/query valid-princess {"@context" context
                                               "select"   {"ex:Mork" ["*"]}})))
 
-        (is (= {:status 400,
-                :error :shacl/violation,
-                :report
-                {"type" "sh:ValidationReport",
-                 "sh:conforms" false,
-                 "sh:result"
-                 [{"sh:constraintComponent" "sh:minCount",
-                   "sh:focusNode" "ex:Gerb",
-                   "sh:resultSeverity" "sh:Violation",
-                   "sh:value" 0,
-                   "sh:resultPath"
-                   [{"sh:inversePath" "ex:child"} {"sh:inversePath" "ex:queen"}],
-                   "type" "sh:ValidationResult",
-                   "sh:resultMessage" "count 0 is less than minimum count of 1",
-                   "sh:sourceShape" "_:fdb-26",
-                   "f:expectation" 1}]}}
+        (is (pred-match? {:status 422,
+                          :error  :shacl/violation,
+                          :report
+                          {"type"        "sh:ValidationReport",
+                           "sh:conforms" false,
+                           "sh:result"
+                           [{"sh:constraintComponent" "sh:minCount",
+                             "sh:focusNode"           "ex:Gerb",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               0,
+                             "sh:resultPath"
+                             [{"sh:inversePath" "ex:child"} {"sh:inversePath" "ex:queen"}],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"       "count 0 is less than minimum count of 1",
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          1}]}}
                (ex-data invalid-princess)))))))
 
 (deftest ^:integration shacl-class-test
@@ -1912,39 +1892,39 @@ WORLD!")
                                                  "@type"                       "https://example.com/Actor"
                                                  "https://example.com/name"    "Rindsey Rohan"}]})]
         (is (not (ex-data db3)))))
-    (is (= {:status 400,
-            :error :shacl/violation,
-            :report
-            {"type" "sh:ValidationReport",
-             "sh:conforms" false,
-             "sh:result"
-             [{"sh:constraintComponent" "sh:class",
-               "sh:focusNode" "https://example.com/Actor/1001",
-               "sh:resultSeverity" "sh:Violation",
-               "sh:value" ["https://example.com/FakeCountry"],
-               "sh:resultPath" ["https://example.com/country"],
-               "type" "sh:ValidationResult",
-               "sh:resultMessage"
-               "missing required class https://example.com/Country",
-               "sh:sourceShape" "_:fdb-5",
-               "f:expectation" "https://example.com/Country"}]}}
+    (is (pred-match? {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {"type"        "sh:ValidationReport",
+                       "sh:conforms" false,
+                       "sh:result"
+                       [{"sh:constraintComponent" "sh:class",
+                         "sh:focusNode"           "https://example.com/Actor/1001",
+                         "sh:resultSeverity"      "sh:Violation",
+                         "sh:value"               ["https://example.com/FakeCountry"],
+                         "sh:resultPath"          ["https://example.com/country"],
+                         "type"                   "sh:ValidationResult",
+                         "sh:resultMessage"
+                         "missing required class https://example.com/Country",
+                         "sh:sourceShape"         test-utils/blank-node-id?,
+                         "f:expectation"          "https://example.com/Country"}]}}
            (ex-data db4)))
-    (is (= {:status 400,
-            :error :shacl/violation,
-            :report
-            {"type" "sh:ValidationReport",
-             "sh:conforms" false,
-             "sh:result"
-             [{"sh:constraintComponent" "sh:class",
-               "sh:focusNode" "https://example.com/Actor/8675309",
-               "sh:resultSeverity" "sh:Violation",
-               "sh:value" ["https://example.com/FakeCountry"],
-               "sh:resultPath" ["https://example.com/country"],
-               "type" "sh:ValidationResult",
-               "sh:resultMessage"
-               "missing required class https://example.com/Country",
-               "sh:sourceShape" "_:fdb-5",
-               "f:expectation" "https://example.com/Country"}]}}
+    (is (pred-match? {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {"type"        "sh:ValidationReport",
+                       "sh:conforms" false,
+                       "sh:result"
+                       [{"sh:constraintComponent" "sh:class",
+                         "sh:focusNode"           "https://example.com/Actor/8675309",
+                         "sh:resultSeverity"      "sh:Violation",
+                         "sh:value"               ["https://example.com/FakeCountry"],
+                         "sh:resultPath"          ["https://example.com/country"],
+                         "type"                   "sh:ValidationResult",
+                         "sh:resultMessage"
+                         "missing required class https://example.com/Country",
+                         "sh:sourceShape"         test-utils/blank-node-id?,
+                         "f:expectation"          "https://example.com/Country"}]}}
            (ex-data db5)))))
 
 (deftest ^:integration shacl-in-test
@@ -1962,22 +1942,22 @@ WORLD!")
                                       "insert"   {"id"       "ex:YellowPony"
                                                   "type"     "ex:Pony"
                                                   "ex:color" "yellow"}})]
-      (is (= {:status 400,
-              :error  :shacl/violation,
-              :report
-              {"type"        "sh:ValidationReport",
-               "sh:conforms" false,
-               "sh:result"
-               [{"sh:constraintComponent" "sh:in",
-                 "sh:focusNode"           "ex:YellowPony",
-                 "sh:resultSeverity"      "sh:Violation",
-                 "sh:value"               "yellow",
-                 "sh:resultPath"          ["ex:color"],
-                 "type"                   "sh:ValidationResult",
-                 "sh:resultMessage"
-                 "value \"yellow\" is not in [\"cyan\" \"magenta\"]",
-                 "sh:sourceShape"         "_:fdb-3",
-                 "f:expectation"          ["cyan" "magenta"]}]}}
+      (is (pred-match? {:status 422,
+                        :error  :shacl/violation,
+                        :report
+                        {"type"        "sh:ValidationReport",
+                         "sh:conforms" false,
+                         "sh:result"
+                         [{"sh:constraintComponent" "sh:in",
+                           "sh:focusNode"           "ex:YellowPony",
+                           "sh:resultSeverity"      "sh:Violation",
+                           "sh:value"               "yellow",
+                           "sh:resultPath"          ["ex:color"],
+                           "type"                   "sh:ValidationResult",
+                           "sh:resultMessage"
+                           "value \"yellow\" is not in [\"cyan\" \"magenta\"]",
+                           "sh:sourceShape"         test-utils/blank-node-id?,
+                           "f:expectation"          ["cyan" "magenta"]}]}}
              (ex-data db2)))))
   (testing "node refs"
     (let [conn    @(fluree/connect-memory)
@@ -2006,22 +1986,22 @@ WORLD!")
                                                    "type"     "ex:Pony"
                                                    "ex:color" [{"id" "ex:Pink"}
                                                                {"id" "ex:Purple"}]}]})]
-      (is (= {:status 400,
-              :error  :shacl/violation,
-              :report
-              {"type"        "sh:ValidationReport",
-               "sh:conforms" false,
-               "sh:result"
-               [{"sh:constraintComponent" "sh:in",
-                 "sh:focusNode"           "ex:RainbowPony",
-                 "sh:resultSeverity"      "sh:Violation",
-                 "sh:value"               "ex:Green"
-                 "sh:resultPath"          ["ex:color"],
-                 "type"                   "sh:ValidationResult",
-                 "sh:resultMessage"
-                 "value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\"]",
-                 "sh:sourceShape"         "_:fdb-7",
-                 "f:expectation"          ["ex:Pink" "ex:Purple"]}]}}
+      (is (pred-match? {:status 422,
+                        :error  :shacl/violation,
+                        :report
+                        {"type"        "sh:ValidationReport",
+                         "sh:conforms" false,
+                         "sh:result"
+                         [{"sh:constraintComponent" "sh:in",
+                           "sh:focusNode"           "ex:RainbowPony",
+                           "sh:resultSeverity"      "sh:Violation",
+                           "sh:value"               "ex:Green"
+                           "sh:resultPath"          ["ex:color"],
+                           "type"                   "sh:ValidationResult",
+                           "sh:resultMessage"
+                           "value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\"]",
+                           "sh:sourceShape"         test-utils/blank-node-id?,
+                           "f:expectation"          ["ex:Pink" "ex:Purple"]}]}}
              (ex-data db2)))
 
       (is (not (ex-data db3)))
@@ -2051,22 +2031,22 @@ WORLD!")
                                                   "type"     "ex:Pony"
                                                   "ex:color" [{"id" "ex:Pink"}
                                                               {"id" "ex:Green"}]}})]
-      (is (= {:status 400,
-              :error  :shacl/violation,
-              :report
-              {"type"        "sh:ValidationReport",
-               "sh:conforms" false,
-               "sh:result"
-               [{"sh:constraintComponent" "sh:in",
-                 "sh:focusNode"           "ex:RainbowPony",
-                 "sh:resultSeverity"      "sh:Violation",
-                 "sh:value"               "ex:Green",
-                 "sh:resultPath"          ["ex:color"],
-                 "type"                   "sh:ValidationResult",
-                 "sh:resultMessage"
-                 "value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\" \"green\"]",
-                 "sh:sourceShape"         "_:fdb-12",
-                 "f:expectation"          ["ex:Pink" "ex:Purple" "green"]}]}}
+      (is (pred-match? {:status 422,
+                        :error  :shacl/violation,
+                        :report
+                        {"type"        "sh:ValidationReport",
+                         "sh:conforms" false,
+                         "sh:result"
+                         [{"sh:constraintComponent" "sh:in",
+                           "sh:focusNode"           "ex:RainbowPony",
+                           "sh:resultSeverity"      "sh:Violation",
+                           "sh:value"               "ex:Green",
+                           "sh:resultPath"          ["ex:color"],
+                           "type"                   "sh:ValidationResult",
+                           "sh:resultMessage"
+                           "value \"ex:Green\" is not in [\"ex:Pink\" \"ex:Purple\" \"green\"]",
+                           "sh:sourceShape"         test-utils/blank-node-id?,
+                           "f:expectation"          ["ex:Pink" "ex:Purple" "green"]}]}}
              (ex-data db2))))))
 
 (deftest ^:integration shacl-targetobjectsof-test
@@ -2114,21 +2094,21 @@ WORLD!")
                                               "ex:ssn" ["111-11-1111"
                                                         "222-22-2222"]
                                               "type"   "ex:User"}]})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {"type"        "sh:ValidationReport",
-                   "sh:conforms" false,
-                   "sh:result"
-                   [{"sh:constraintComponent" "sh:maxCount",
-                     "sh:focusNode"           "ex:Bob",
-                     "sh:resultSeverity"      "sh:Violation",
-                     "sh:value"               2,
-                     "sh:resultPath"          ["ex:ssn"],
-                     "type"                   "sh:ValidationResult",
-                     "sh:resultMessage"       "count 2 is greater than maximum count of 1",
-                     "sh:sourceShape"         "_:fdb-5",
-                     "f:expectation"          1}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {"type"        "sh:ValidationReport",
+                             "sh:conforms" false,
+                             "sh:result"
+                             [{"sh:constraintComponent" "sh:maxCount",
+                               "sh:focusNode"           "ex:Bob",
+                               "sh:resultSeverity"      "sh:Violation",
+                               "sh:value"               2,
+                               "sh:resultPath"          ["ex:ssn"],
+                               "type"                   "sh:ValidationResult",
+                               "sh:resultMessage"       "count 2 is greater than maximum count of 1",
+                               "sh:sourceShape"         test-utils/blank-node-id?,
+                               "f:expectation"          1}]}}
                  (ex-data db-excess-ssn)))))
       (testing "required properties"
         (let [db1           @(fluree/stage db0
@@ -2146,21 +2126,21 @@ WORLD!")
                                               "ex:name"   "Alice"
                                               "type"      "ex:User"
                                               "ex:friend" {"@id" "ex:Bob"}}]})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {"type"        "sh:ValidationReport",
-                   "sh:conforms" false,
-                   "sh:result"
-                   [{"sh:constraintComponent" "sh:minCount",
-                     "sh:focusNode"           "ex:Bob",
-                     "sh:resultSeverity"      "sh:Violation",
-                     "sh:value"               0,
-                     "sh:resultPath"          ["ex:ssn"],
-                     "type"                   "sh:ValidationResult",
-                     "sh:resultMessage"       "count 0 is less than minimum count of 1",
-                     "sh:sourceShape"         "_:fdb-8",
-                     "f:expectation"          1}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {"type"        "sh:ValidationReport",
+                             "sh:conforms" false,
+                             "sh:result"
+                             [{"sh:constraintComponent" "sh:minCount",
+                               "sh:focusNode"           "ex:Bob",
+                               "sh:resultSeverity"      "sh:Violation",
+                               "sh:value"               0,
+                               "sh:resultPath"          ["ex:ssn"],
+                               "type"                   "sh:ValidationResult",
+                               "sh:resultMessage"       "count 0 is less than minimum count of 1",
+                               "sh:sourceShape"         test-utils/blank-node-id?,
+                               "f:expectation"          1}]}}
                  (ex-data db-just-alice)))))
       (testing "combined with `sh:targetClass`"
         (let [db1           @(fluree/stage db0
@@ -2185,21 +2165,21 @@ WORLD!")
                                                              "ex:name" ["Bob" "Robert"]
                                                              "ex:ssn"  "111-11-1111"
                                                              "type"    "ex:User"}]})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {"type"        "sh:ValidationReport",
-                   "sh:conforms" false,
-                   "sh:result"
-                   [{"sh:constraintComponent" "sh:maxCount",
-                     "sh:focusNode"           "ex:Bob",
-                     "sh:resultSeverity"      "sh:Violation",
-                     "sh:value"               2,
-                     "sh:resultPath"          ["ex:name"],
-                     "type"                   "sh:ValidationResult",
-                     "sh:resultMessage"       "count 2 is greater than maximum count of 1",
-                     "sh:sourceShape"         "_:fdb-12",
-                     "f:expectation"          1}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {"type"        "sh:ValidationReport",
+                             "sh:conforms" false,
+                             "sh:result"
+                             [{"sh:constraintComponent" "sh:maxCount",
+                               "sh:focusNode"           "ex:Bob",
+                               "sh:resultSeverity"      "sh:Violation",
+                               "sh:value"               2,
+                               "sh:resultPath"          ["ex:name"],
+                               "type"                   "sh:ValidationResult",
+                               "sh:resultMessage"       "count 2 is greater than maximum count of 1",
+                               "sh:sourceShape"         test-utils/blank-node-id?,
+                               "f:expectation"          1}]}}
                  (ex-data db-bad-friend))))))
     (testing "separate txns"
       (testing "maxCount"
@@ -2222,21 +2202,21 @@ WORLD!")
                                                       "type"      "ex:User"
                                                       "ex:friend" {"@id" "ex:Bob"}}})]
 
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {"type"        "sh:ValidationReport",
-                   "sh:conforms" false,
-                   "sh:result"
-                   [{"sh:constraintComponent" "sh:maxCount",
-                     "sh:focusNode"           "ex:Bob",
-                     "sh:resultSeverity"      "sh:Violation",
-                     "sh:value"               2,
-                     "sh:resultPath"          ["ex:ssn"],
-                     "type"                   "sh:ValidationResult",
-                     "sh:resultMessage"       "count 2 is greater than maximum count of 1",
-                     "sh:sourceShape"         "_:fdb-15",
-                     "f:expectation"          1}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {"type"        "sh:ValidationReport",
+                             "sh:conforms" false,
+                             "sh:result"
+                             [{"sh:constraintComponent" "sh:maxCount",
+                               "sh:focusNode"           "ex:Bob",
+                               "sh:resultSeverity"      "sh:Violation",
+                               "sh:value"               2,
+                               "sh:resultPath"          ["ex:ssn"],
+                               "type"                   "sh:ValidationResult",
+                               "sh:resultMessage"       "count 2 is greater than maximum count of 1",
+                               "sh:sourceShape"         test-utils/blank-node-id?,
+                               "f:expectation"          1}]}}
                  (ex-data db-db-forbidden-friend))))
         (let [db1           @(fluree/stage db0
                                            {"@context" ["https://ns.flur.ee" context]
@@ -2262,21 +2242,21 @@ WORLD!")
                                             {"id"     "ex:Bob"
                                              "ex:ssn" ["111-11-1111"
                                                        "222-22-2222"]}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {"type"        "sh:ValidationReport",
-                   "sh:conforms" false,
-                   "sh:result"
-                   [{"sh:constraintComponent" "sh:maxCount",
-                     "sh:focusNode"           "ex:Bob",
-                     "sh:resultSeverity"      "sh:Violation",
-                     "sh:value"               2,
-                     "sh:resultPath"          ["ex:ssn"],
-                     "type"                   "sh:ValidationResult",
-                     "sh:resultMessage"       "count 2 is greater than maximum count of 1",
-                     "sh:sourceShape"         "_:fdb-19",
-                     "f:expectation"          1}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {"type"        "sh:ValidationReport",
+                             "sh:conforms" false,
+                             "sh:result"
+                             [{"sh:constraintComponent" "sh:maxCount",
+                               "sh:focusNode"           "ex:Bob",
+                               "sh:resultSeverity"      "sh:Violation",
+                               "sh:value"               2,
+                               "sh:resultPath"          ["ex:ssn"],
+                               "type"                   "sh:ValidationResult",
+                               "sh:resultMessage"       "count 2 is greater than maximum count of 1",
+                               "sh:sourceShape"         test-utils/blank-node-id?,
+                               "f:expectation"          1}]}}
                  (ex-data db-excess-ssn)))))
       (testing "datatype"
         (let [db1 @(fluree/stage db0
@@ -2298,22 +2278,22 @@ WORLD!")
                                                   {"id"        "ex:Alice"
                                                    "type"      "ex:User"
                                                    "ex:friend" {"@id" "ex:Bob"}}})]
-          (is (= {:status 400,
-                  :error  :shacl/violation,
-                  :report
-                  {"type"        "sh:ValidationReport",
-                   "sh:conforms" false,
-                   "sh:result"
-                   [{"sh:constraintComponent" "sh:datatype",
-                     "sh:focusNode"           "ex:Bob",
-                     "sh:resultSeverity"      "sh:Violation",
-                     "sh:value"               ["xsd:integer"],
-                     "sh:resultPath"          ["ex:name"],
-                     "type"                   "sh:ValidationResult",
-                     "sh:resultMessage"
-                     "the following values do not have expected datatype xsd:string: 123",
-                     "sh:sourceShape"         "_:fdb-23",
-                     "f:expectation"          "xsd:string"}]}}
+          (is (pred-match? {:status 422,
+                            :error  :shacl/violation,
+                            :report
+                            {"type"        "sh:ValidationReport",
+                             "sh:conforms" false,
+                             "sh:result"
+                             [{"sh:constraintComponent" "sh:datatype",
+                               "sh:focusNode"           "ex:Bob",
+                               "sh:resultSeverity"      "sh:Violation",
+                               "sh:value"               ["xsd:integer"],
+                               "sh:resultPath"          ["ex:name"],
+                               "type"                   "sh:ValidationResult",
+                               "sh:resultMessage"
+                               "the following values do not have expected datatype xsd:string: 123",
+                               "sh:sourceShape"         test-utils/blank-node-id?,
+                               "f:expectation"          "xsd:string"}]}}
                  (ex-data db-forbidden-friend))))))))
 
 (deftest ^:integration shape-based-constraints
@@ -2347,22 +2327,21 @@ WORLD!")
                "ex:address" {"ex:postalCode" "12345"}}]
              @(fluree/query valid-person {"@context" context
                                           "select"   {"ex:Bob" ["*" {"ex:address" ["ex:postalCode"]}]}})))
-      (is (= {:status 400,
-              :error  :shacl/violation,
-              :report
-              {"type"        "sh:ValidationReport",
-               "sh:conforms" false,
-               "sh:result"
-               [{"sh:constraintComponent" "sh:node",
-                 "sh:focusNode"           "ex:Reto",
-                 "sh:resultSeverity"      "sh:Violation",
-                 "sh:value"               "_:fdb-7",
-                 "sh:resultPath"          ["ex:address"],
-                 "type"                   "sh:ValidationResult",
-                 "sh:resultMessage"
-                 "node _:fdb-7 does not conform to shapes [\"ex:AddressShape\"]",
-                 "sh:sourceShape"         "_:fdb-3",
-                 "f:expectation"          ["ex:AddressShape"]}]}}
+      (is (pred-match? {:status 422,
+                        :error  :shacl/violation,
+                        :report
+                        {"type"        "sh:ValidationReport",
+                         "sh:conforms" false,
+                         "sh:result"
+                         [{"sh:constraintComponent" "sh:node",
+                           "sh:focusNode"           "ex:Reto",
+                           "sh:resultSeverity"      "sh:Violation",
+                           "sh:value"               test-utils/blank-node-id?,
+                           "sh:resultPath"          ["ex:address"],
+                           "type"                   "sh:ValidationResult",
+                           "sh:resultMessage"       string?,
+                           "sh:sourceShape"         test-utils/blank-node-id?,
+                           "f:expectation"          ["ex:AddressShape"]}]}}
              (ex-data invalid-person)))))
 
   (testing "sh:qualifiedValueShape property shape"
@@ -2403,22 +2382,21 @@ WORLD!")
                                            "select"   {"ex:ValidKid" ["*"]}})
                  first
                  (update "ex:parent" (partial sort-by #(get % "id"))))))
-      (is (= {:status 400,
-              :error  :shacl/violation,
-              :report
-              {"type"        "sh:ValidationReport",
-               "sh:conforms" false,
-               "sh:result"
-               [{"sh:constraintComponent" "sh:qualifiedValueShape",
-                 "sh:focusNode"           "ex:InvalidKid",
-                 "sh:resultSeverity"      "sh:Violation",
-                 "sh:value"               ["ex:Bob" "ex:Zorba"],
-                 "sh:resultPath"          ["ex:parent"],
-                 "type"                   "sh:ValidationResult",
-                 "sh:resultMessage"
-                 "values [\"ex:Bob\" \"ex:Zorba\"] conformed to _:fdb-10 less than sh:qualifiedMinCount 1 times",
-                 "sh:sourceShape"         "_:fdb-9",
-                 "f:expectation"          "_:fdb-10"}]}}
+      (is (pred-match? {:status 422,
+                        :error  :shacl/violation,
+                        :report
+                        {"type"        "sh:ValidationReport",
+                         "sh:conforms" false,
+                         "sh:result"
+                         [{"sh:constraintComponent" "sh:qualifiedValueShape",
+                           "sh:focusNode"           "ex:InvalidKid",
+                           "sh:resultSeverity"      "sh:Violation",
+                           "sh:value"               ["ex:Bob" "ex:Zorba"],
+                           "sh:resultPath"          ["ex:parent"],
+                           "type"                   "sh:ValidationResult",
+                           "sh:resultMessage"       string?,
+                           "sh:sourceShape"         test-utils/blank-node-id?,
+                           "f:expectation"          test-utils/blank-node-id?}]}}
              (ex-data invalid-kid)))))
   (testing "sh:qualifiedValueShape node shape"
     (let [conn   @(fluree/connect-memory)
@@ -2464,22 +2442,22 @@ WORLD!")
                             {"id" "ex:Mom"}]}]
              @(fluree/query valid-kid {"@context" context
                                        "select"   {"ex:ValidKid" ["*"]}})))
-      (is (= {:status 400,
-              :error  :shacl/violation,
-              :report
-              {"type"        "sh:ValidationReport",
-               "sh:conforms" false,
-               "sh:result"
-               [{"sh:constraintComponent" "sh:qualifiedValueShape",
-                 "sh:focusNode"           "ex:InvalidKid",
-                 "sh:resultSeverity"      "sh:Violation",
-                 "sh:value"               ["ex:Bob" "ex:Zorba"],
-                 "sh:resultPath"          ["ex:parent"],
-                 "type"                   "sh:ValidationResult",
-                 "sh:resultMessage"
-                 "values [\"ex:Bob\" \"ex:Zorba\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times",
-                 "sh:sourceShape"         "_:fdb-14",
-                 "f:expectation"          "ex:ParentShape"}]}}
+      (is (pred-match? {:status 422,
+                        :error  :shacl/violation,
+                        :report
+                        {"type"        "sh:ValidationReport",
+                         "sh:conforms" false,
+                         "sh:result"
+                         [{"sh:constraintComponent" "sh:qualifiedValueShape",
+                           "sh:focusNode"           "ex:InvalidKid",
+                           "sh:resultSeverity"      "sh:Violation",
+                           "sh:value"               ["ex:Bob" "ex:Zorba"],
+                           "sh:resultPath"          ["ex:parent"],
+                           "type"                   "sh:ValidationResult",
+                           "sh:resultMessage"
+                           "values [\"ex:Bob\" \"ex:Zorba\"] conformed to ex:ParentShape less than sh:qualifiedMinCount 1 times",
+                           "sh:sourceShape"         test-utils/blank-node-id?,
+                           "f:expectation"          "ex:ParentShape"}]}}
              (ex-data invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn   @(fluree/connect-memory)
@@ -2540,32 +2518,32 @@ WORLD!")
                 {"ex:name" "Thumb"}]}]
              @(fluree/query valid-hand {"@context" context
                                         "select"   {"ex:ValidHand" ["*" {"ex:digit" ["ex:name"]}]}})))
-      (is (= {:status 400,
-              :error  :shacl/violation,
-              :report
-              {"type"        "sh:ValidationReport",
-               "sh:conforms" false,
-               "sh:result"
-               [{"sh:constraintComponent" "sh:qualifiedValueShape",
-                 "sh:focusNode"           "ex:InvalidHand",
-                 "sh:resultSeverity"      "sh:Violation",
-                 "sh:value"               "ex:finger4andthumb",
-                 "sh:resultPath"          ["ex:digit"],
-                 "type"                   "sh:ValidationResult",
-                 "sh:resultMessage"
-                 "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint",
-                 "sh:sourceShape"         "_:fdb-20",
-                 "f:expectation"          "ex:thumbshape"}
-                {"sh:constraintComponent" "sh:qualifiedValueShape",
-                 "sh:focusNode"           "ex:InvalidHand",
-                 "sh:resultSeverity"      "sh:Violation",
-                 "sh:value"               "ex:finger4andthumb",
-                 "sh:resultPath"          ["ex:digit"],
-                 "type"                   "sh:ValidationResult",
-                 "sh:resultMessage"
-                 "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint",
-                 "sh:sourceShape"         "_:fdb-21",
-                 "f:expectation"          "ex:fingershape"}]}}
+      (is (pred-match? {:status 422,
+                        :error  :shacl/violation,
+                        :report
+                        {"type"        "sh:ValidationReport",
+                         "sh:conforms" false,
+                         "sh:result"
+                         [{"sh:constraintComponent" "sh:qualifiedValueShape",
+                           "sh:focusNode"           "ex:InvalidHand",
+                           "sh:resultSeverity"      "sh:Violation",
+                           "sh:value"               "ex:finger4andthumb",
+                           "sh:resultPath"          ["ex:digit"],
+                           "type"                   "sh:ValidationResult",
+                           "sh:resultMessage"
+                           "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint",
+                           "sh:sourceShape"         test-utils/blank-node-id?,
+                           "f:expectation"          "ex:thumbshape"}
+                          {"sh:constraintComponent" "sh:qualifiedValueShape",
+                           "sh:focusNode"           "ex:InvalidHand",
+                           "sh:resultSeverity"      "sh:Violation",
+                           "sh:value"               "ex:finger4andthumb",
+                           "sh:resultPath"          ["ex:digit"],
+                           "type"                   "sh:ValidationResult",
+                           "sh:resultMessage"
+                           "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint",
+                           "sh:sourceShape"         test-utils/blank-node-id?,
+                           "f:expectation"          "ex:fingershape"}]}}
              (ex-data invalid-hand))))))
 
 (deftest ^:integration post-processing-validation
@@ -2593,22 +2571,22 @@ WORLD!")
                                                 {"id"        "ex:Alice"
                                                  "type"      "ex:User"
                                                  "ex:friend" {"@id" "ex:Bob"}}})]
-        (is (= {:status 400,
-                :error  :shacl/violation,
-                :report
-                {"type"        "sh:ValidationReport",
-                 "sh:conforms" false,
-                 "sh:result"
-                 [{"sh:constraintComponent" "sh:datatype",
-                   "sh:focusNode"           "ex:Bob",
-                   "sh:resultSeverity"      "sh:Violation",
-                   "sh:value"               ["xsd:integer"],
-                   "sh:resultPath"          ["ex:name"],
-                   "type"                   "sh:ValidationResult",
-                   "sh:resultMessage"
-                   "the following values do not have expected datatype xsd:string: 123",
-                   "sh:sourceShape"         "_:fdb-2",
-                   "f:expectation"          "xsd:string"}]}}
+        (is (pred-match? {:status 422,
+                          :error  :shacl/violation,
+                          :report
+                          {"type"        "sh:ValidationReport",
+                           "sh:conforms" false,
+                           "sh:result"
+                           [{"sh:constraintComponent" "sh:datatype",
+                             "sh:focusNode"           "ex:Bob",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               ["xsd:integer"],
+                             "sh:resultPath"          ["ex:name"],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"
+                             "the following values do not have expected datatype xsd:string: 123",
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          "xsd:string"}]}}
                (ex-data db-forbidden-friend)))))
     (testing "shape constraints"
       (let [db1            @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
@@ -2637,22 +2615,21 @@ WORLD!")
                  "ex:cool" {"ex:isCool" true}}]
                @(fluree/query valid-person {"@context" context
                                             "select"   {"ex:Bob" ["*" {"ex:cool" ["ex:isCool"]}]}})))
-        (is (= {:status 400,
-                :error  :shacl/violation,
-                :report
-                {"type"        "sh:ValidationReport",
-                 "sh:conforms" false,
-                 "sh:result"
-                 [{"sh:constraintComponent" "sh:node",
-                   "sh:focusNode"           "ex:Reto",
-                   "sh:resultSeverity"      "sh:Violation",
-                   "sh:value"               "_:fdb-11",
-                   "sh:resultPath"          ["ex:cool"],
-                   "type"                   "sh:ValidationResult",
-                   "sh:resultMessage"
-                   "node _:fdb-11 does not conform to shapes [\"ex:CoolShape\"]",
-                   "sh:sourceShape"         "_:fdb-7",
-                   "f:expectation"          ["ex:CoolShape"]}]}}
+        (is (pred-match? {:status 422,
+                          :error  :shacl/violation,
+                          :report
+                          {"type"        "sh:ValidationReport",
+                           "sh:conforms" false,
+                           "sh:result"
+                           [{"sh:constraintComponent" "sh:node",
+                             "sh:focusNode"           "ex:Reto",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               test-utils/blank-node-id?,
+                             "sh:resultPath"          ["ex:cool"],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"       string?,
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          ["ex:CoolShape"]}]}}
                (ex-data invalid-person)))))
     (testing "extended path constraints"
       (let [db1            @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
@@ -2678,21 +2655,21 @@ WORLD!")
                  "ex:cool" {"ex:dude" {"ex:isBlank" true}}}]
                @(fluree/query valid-person {"@context" context
                                             "select"   {"ex:Bob" ["*" {"ex:cool" [{"ex:dude" ["ex:isBlank"]}]}]}})))
-        (is (= {:status 400,
-                :error  :shacl/violation,
-                :report
-                {"type"        "sh:ValidationReport",
-                 "sh:conforms" false,
-                 "sh:result"
-                 [{"sh:constraintComponent" "sh:nodeKind",
-                   "sh:focusNode"           "ex:Reto",
-                   "sh:resultSeverity"      "sh:Violation",
-                   "sh:value"               "ex:Dude",
-                   "sh:resultPath"          ["ex:cool" "ex:dude"],
-                   "type"                   "sh:ValidationResult",
-                   "sh:resultMessage"       "value ex:Dude is is not of kind sh:BlankNode",
-                   "sh:sourceShape"         "_:fdb-13",
-                   "f:expectation"          "sh:BlankNode"}]}}
+        (is (pred-match? {:status 422,
+                          :error  :shacl/violation,
+                          :report
+                          {"type"        "sh:ValidationReport",
+                           "sh:conforms" false,
+                           "sh:result"
+                           [{"sh:constraintComponent" "sh:nodeKind",
+                             "sh:focusNode"           "ex:Reto",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               "ex:Dude",
+                             "sh:resultPath"          ["ex:cool" "ex:dude"],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"       "value ex:Dude is is not of kind sh:BlankNode",
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          "sh:BlankNode"}]}}
                (ex-data invalid-person)))))))
 
 (deftest validation-report
@@ -2798,7 +2775,7 @@ WORLD!")
       (let [db2 @(fluree/stage db1 {"@context" context
                                     "insert" {"id" "ex:invalid"
                                               "ex:myProperty" ["A" "B"]}})]
-        (is (= 400
+        (is (= 422
                (:status (ex-data db2))))))))
 
 (deftest target-node
@@ -2822,7 +2799,7 @@ WORLD!")
       (let [db2 @(fluree/stage db1 {"@context" context
                                     "insert"   {"id"        "ex:nodeB"
                                                 "ex:letter" ["A" "B"]}})]
-        (is (= 400
+        (is (= 422
                (:status (ex-data db2))))))))
 
 (deftest alternative-path
@@ -2853,19 +2830,19 @@ WORLD!")
                                      "type"         "ex:Alt"
                                      "ex:property1" "One"
                                      "ex:property3" "Three"}})]
-        (is (= {:status 400,
-                :error  :shacl/violation,
-                :report
-                {"type"        "sh:ValidationReport",
-                 "sh:conforms" false,
-                 "sh:result"
-                 [{"sh:constraintComponent" "sh:minCount",
-                   "sh:focusNode"           "ex:invalid",
-                   "sh:resultSeverity"      "sh:Violation",
-                   "sh:value"               1,
-                   "sh:resultPath"          [{"sh:alternativePath" "ex:property1"}],
-                   "type"                   "sh:ValidationResult",
-                   "sh:resultMessage"       "count 1 is less than minimum count of 2",
-                   "sh:sourceShape"         "_:fdb-3",
-                   "f:expectation"          2}]}}
+        (is (pred-match? {:status 422,
+                          :error  :shacl/violation,
+                          :report
+                          {"type"        "sh:ValidationReport",
+                           "sh:conforms" false,
+                           "sh:result"
+                           [{"sh:constraintComponent" "sh:minCount",
+                             "sh:focusNode"           "ex:invalid",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               1,
+                             "sh:resultPath"          [{"sh:alternativePath" "ex:property1"}],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"       "count 1 is less than minimum count of 2",
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          2}]}}
                (ex-data db2)))))))
