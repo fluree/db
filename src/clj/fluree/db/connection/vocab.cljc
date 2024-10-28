@@ -1,4 +1,5 @@
-(ns fluree.db.connection.vocab)
+(ns fluree.db.connection.vocab
+  (:refer-clojure :exclude [identity]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

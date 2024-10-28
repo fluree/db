@@ -6,6 +6,8 @@ test("expect all flureenjs functions to be defined", () => {
   expect(Object.keys(flureenjs).sort()).toStrictEqual([
     "commit",
     "connect",
+    "connectFile",
+    "connectMemory",
     "create",
     "db",
     "exists",
@@ -31,10 +33,9 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
     ex: "http://example.org/ns/"
   };
 
-  const conn = await flureenjs.connect({
-    method: "memory",
+  const conn = await flureenjs.connectMemory({
     defaults: {
-      did: {
+      identity: {
         id: "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
         public:
           "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",

@@ -21,7 +21,7 @@
 
 (defn ^:export connect
   [opts]
-  (fluree/connect (js->clj opts :keywordize-keys true)))
+  (fluree/connect (js->clj opts :keywordize-keys false)))
 
 (defn ^:export create
   ([conn] (fluree/create conn))
