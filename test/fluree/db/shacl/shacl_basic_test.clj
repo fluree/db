@@ -2075,7 +2075,8 @@ WORLD!")
                                                    "ex:friend" {"@id" "ex:Bob"}}
                                                   {"id"      "ex:Bob"
                                                    "ex:name" 123
-                                                   "type"    "ex:User"}]})]))
+                                                   "type"    "ex:User"}]})]
+          (is (test-utils/shacl-error? db-bad-friend-name))))
       (testing "maxCount"
         (let [db1           @(fluree/stage db0
                                            {"@context" ["https://ns.flur.ee" context]
