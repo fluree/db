@@ -147,7 +147,7 @@
    (create-conn {}))
   ([{:keys [did]
      :or   {did (did/private->did-map default-private-key)}}]
-   (let [conn-p (fluree/connect-memory {:defaults {:identity did}})]
+   (let [conn-p (fluree/connect-memory {:ledger-defaults {:identity did}})]
      #?(:clj @conn-p :cljs (go (<p! conn-p))))))
 
 (defn load-movies
@@ -302,13 +302,6 @@
                      (zipmap expected actual)))
 
         :else false)))
-
-(defn deterministic-blank-node-fixture
-  [f]
-  (let [counter (atom 0)
-        deterministic-new-blank-node-id (fn [] (str "_:fdb-" (swap! counter inc)))]
-    (with-redefs [fluree.db.json-ld.iri/new-blank-node-id deterministic-new-blank-node-id]
-      (f))))
 
 (defn error-status
   [ex]

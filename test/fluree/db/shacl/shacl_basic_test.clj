@@ -1719,12 +1719,14 @@ WORLD!")
                                                                    {"id"      "ex:rowdy"
                                                                     "ex:name" "Rowdy"}]}})]
 
-        (is (= [{"id"      "ex:jd",
-                 "type"    "ex:Pal",
-                 "ex:name" "J.D.",
-                 "ex:pal"  [{"ex:name" "Turk"} {"ex:name" "Rowdy"}]}]
-               @(fluree/query valid-pal {"@context" context
-                                         "select"   {"ex:jd" ["*" {"ex:pal" ["ex:name"]}]}})))
+        (is (= {"id"      "ex:jd",
+                "type"    "ex:Pal",
+                "ex:name" "J.D.",
+                "ex:pal"  #{{"ex:name" "Turk"} {"ex:name" "Rowdy"}}}
+               (-> @(fluree/query valid-pal {"@context" context
+                                             "select"   {"ex:jd" ["*" {"ex:pal" ["ex:name"]}]}})
+                   first
+                   (update "ex:pal" set))))
         (is (pred-match? {:status 422,
                           :error  :shacl/violation,
                           :report
