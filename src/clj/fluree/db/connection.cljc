@@ -313,7 +313,7 @@
   [conn {:keys [did branch indexing]
          :or   {branch :main}}]
   (let [did*           (parse-identity conn did)
-        ledger-default (-> conn :ledger-defaults :indexing)
+        ledger-default (-> conn :defaults :indexing)
         indexing*      (merge ledger-default indexing)]
     {:did      did*
      :branch   branch

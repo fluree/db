@@ -75,8 +75,8 @@
 (def server-urls
   (system-iri "serverUrls"))
 
-(def ledger-defaults
-  (system-iri "ledgerDefaults"))
+(def defaults
+  (system-iri "defaults"))
 
 (def identity
   (system-iri "identity"))

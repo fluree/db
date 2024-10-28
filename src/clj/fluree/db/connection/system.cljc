@@ -168,24 +168,24 @@
   (json-serde))
 
 (defn parse-identity
-  [ledger-defaults]
-  (when-let [identity (get-first ledger-defaults conn-vocab/identity)]
+  [defaults]
+  (when-let [identity (get-first defaults conn-vocab/identity)]
     {:id      (get-id identity)
      :public  (get-first-value identity conn-vocab/public-key)
      :private (get-first-value identity conn-vocab/private-key)}))
 
 (defn parse-index-options
-  [ledger-defaults]
-  (when-let [index-options (get-first ledger-defaults conn-vocab/index-options)]
+  [defaults]
+  (when-let [index-options (get-first defaults conn-vocab/index-options)]
     {:reindex-min-bytes (get-first-value index-options conn-vocab/reindex-min-bytes)
      :reindex-max-bytes (get-first-value index-options conn-vocab/reindex-max-bytes)
      :max-old-indexes   (get-first-value index-options conn-vocab/max-old-indexes)}))
 
-(defn parse-ledger-defaults
+(defn parse-defaults
   [config]
-  (when-let [ledger-defaults (get-first config conn-vocab/ledger-defaults)]
-    (let [identity      (parse-identity ledger-defaults)
-          index-options (parse-index-options ledger-defaults)]
+  (when-let [defaults (get-first config conn-vocab/defaults)]
+    (let [identity      (parse-identity defaults)
+          index-options (parse-index-options defaults)]
       (cond-> nil
         identity      (assoc :identity identity)
         index-options (assoc :index-options index-options)))))
@@ -196,7 +196,7 @@
         primary-publisher    (get-first config conn-vocab/primary-publisher)
         secondary-publishers (get config conn-vocab/secondary-publishers)
         remote-systems       (get config conn-vocab/remote-systems)
-        ledger-defaults      (parse-ledger-defaults config)]
+        defaults      (parse-defaults config)]
     (connection/connect {:parallelism          parallelism
                          :cache                cache
                          :commit-catalog       commit-catalog
@@ -205,7 +205,7 @@
                          :secondary-publishers secondary-publishers
                          :remote-systems       remote-systems
                          :serializer           serializer
-                         :defaults             ledger-defaults})))
+                         :defaults             defaults})))
 
 (defn initialize
   [config]

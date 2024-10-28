@@ -101,7 +101,7 @@
   - did - (optional) DId information to use, if storing blocks as verifiable credentials"
   ([]
    (connect-memory {}))
-  ([{:keys [parallelism cache-max-mb ledger-defaults],
+  ([{:keys [parallelism cache-max-mb defaults],
      :or   {parallelism 4, cache-max-mb 1000}}]
    (let [memory-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
                                             "@vocab" "https://ns.flur.ee/system#"}
@@ -116,14 +116,13 @@
                                              "indexStorage"     {"@id" "memoryStorage"}
                                              "primaryPublisher" {"@type"   "Publisher"
                                                                  "storage" {"@id" "memoryStorage"}}}]}
-                         ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"]
-                                                   (convert-keys ledger-defaults)))]
+                         defaults (assoc-in ["@graph" 1 "defaults"] (convert-keys defaults)))]
      (connect memory-config))))
 
 (defn connect-file
   ([]
    (connect-file {}))
-  ([{:keys [storage-path parallelism cache-max-mb ledger-defaults],
+  ([{:keys [storage-path parallelism cache-max-mb defaults],
      :or   {storage-path "data", parallelism 4, cache-max-mb 1000}}]
    (let [file-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
                                           "@vocab" "https://ns.flur.ee/system#"}
@@ -139,8 +138,7 @@
                                            "indexStorage"     {"@id" "fileStorage"}
                                            "primaryPublisher" {"@type"   "Publisher"
                                                                "storage" {"@id" "fileStorage"}}}]}
-                       ledger-defaults (assoc-in ["@graph" 1 "ledgerDefaults"]
-                                                 (convert-keys ledger-defaults)))]
+                       defaults (assoc-in ["@graph" 1 "defaults"] (convert-keys defaults)))]
      (connect file-config))))
 
 (defn address?
