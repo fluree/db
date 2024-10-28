@@ -49,9 +49,6 @@
 (def ipns-key
   (system-iri "ipnsKey"))
 
-(def ipfs-endpoint
-  (system-iri "ipfsEndpoint"))
-
 (def parallelism
   (system-iri "parallelism"))
 
