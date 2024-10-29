@@ -203,21 +203,29 @@
     (doto (async/chan)
       (async/put! ex))))
 
-(defn read-catalog-json
-  ([clg address]
-   (read-catalog-json clg address false))
-  ([clg address keywordize?]
-   (if-let [store (locate-address clg address)]
-     (read-json store address keywordize?)
-     (async-location-error address))))
+(extend-type Catalog
+  JsonArchive
+  (-read-json [clg address keywordize?]
+    (if-let [store (locate-address clg address)]
+     (-read-json store address keywordize?)
+     (async-location-error address)))
+
+  ContentAddressedStore
+  (-content-write-bytes [clg k v]
+    (let [store (get-content-store clg ::default)]
+      (-content-write-bytes store k v)))
+
+  EraseableStore
+  (delete [clg address]
+    (if-let [store (locate-address clg address)]
+      (delete store address)
+      (async-location-error location))))
 
 (defn content-write-catalog-json
-  ([clg path data]
-   (content-write-catalog-json clg ::default path data))
-  ([clg location path data]
-   (if-let [store (get-content-store clg location)]
-     (content-write-json store path data)
-     (async-location-error location))))
+  [clg location path data]
+  (if-let [store (get-content-store clg location)]
+    (content-write-json store path data)
+    (async-location-error location)))
 
 ;; TODO: Segregate content stores and byte stores if some catalog components
 ;;       don't implement both protocols
