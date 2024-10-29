@@ -227,3 +227,9 @@
     (let [path (get-local-path address)]
       (write-bytes store path data))
     (async-location-error location)))
+
+(defn delete-catalog
+  [clg address]
+  (if-let [store (locate-address clg address)]
+    (delete store address)
+    (async-location-error location)))
