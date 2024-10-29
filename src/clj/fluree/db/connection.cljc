@@ -301,6 +301,16 @@
        dorun)
   (swap! state remove-subscription ledger-alias))
 
+(defn publish-commit
+  "Publishes commit to all nameservices registered with the ledger."
+  [{:keys [primary-publisher secondary-publishers] :as _conn} commit-jsonld]
+  (go-try
+    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
+      (dorun (map (fn [ns]
+                    (nameservice/publish ns commit-jsonld)))
+             secondary-publishers)
+      result)))
+
 (defn parse-identity
   [conn identity]
   (if identity
@@ -328,18 +338,19 @@
         (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
                         {:status 400
                          :error  :db/ledger-exists}))
-        (let [addr          (<? (primary-address conn ledger-alias))
-              publish-addrs (<? (publishing-addresses conn ledger-alias))
-              ledger-opts   (parse-ledger-options conn opts)
-              ledger        (<! (ledger/create {:conn              conn
-                                                :alias             ledger-alias
-                                                :address           addr
-                                                :publish-addresses publish-addrs
-                                                :commit-catalog    commit-catalog
-                                                :index-catalog     index-catalog}
-                                               ledger-opts))]
+        (let [{:keys [did branch indexing]} (parse-ledger-options conn opts)
+
+              addr           (<? (primary-address conn ledger-alias))
+              publish-addrs  (<? (publishing-addresses conn ledger-alias))
+              init-time      (util/current-time-iso)
+              genesis-commit (<? (commit-storage/write-genesis-commit
+                                   commit-catalog ledger-alias branch publish-addrs init-time))
+
+              ledger (ledger/instantiate conn ledger-alias addr branch commit-catalog index-catalog indexing did
+                                         (json-ld/expand genesis-commit))]
           (when (util/exception? ledger)
             (release-ledger conn ledger-alias))
+          (<? (publish-commit conn genesis-commit))
           (async/put! ledger-chan ledger)
           ledger)))))
 
@@ -568,7 +579,7 @@
 
        (log/debug "Committing t" t "at" time)
 
-       (<? (ledger/publish-commit conn commit-jsonld))
+       (<? (publish-commit conn commit-jsonld))
 
        (if file-data?
          {:data-file-meta   data-write-result

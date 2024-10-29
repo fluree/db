@@ -13,7 +13,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-id get-first-id get-first-value]]
             [fluree.db.util.log :as log]
-            [fluree.db.commit.storage :as commit-storage]))
+            [fluree.db.commit.storage :as commit-storage]
+            [fluree.json-ld :as json-ld]))
 
 (defrecord NamespaceMapping [mapping]
   iri/IRICodec
@@ -124,7 +125,7 @@
   along the way and rewriting the commit chain to use the newer commit structure."
   ([conn ledger-alias indexing-opts]
    (migrate conn ledger-alias indexing-opts false nil))
-  ([{:keys [store] :as conn} ledger-alias indexing-opts force changes-ch]
+  ([{:keys [store commit-catalog index-catalog] :as conn} ledger-alias indexing-opts force changes-ch]
    (go-try
      (let [ledger-address       (<? (connection/primary-address conn ledger-alias))
            last-commit-addr     (<? (connection/lookup-commit conn ledger-address))
@@ -142,11 +143,16 @@
                first-commit      (ffirst all-commit-tuples)
                branch            (or (keyword (get-first-value first-commit const/iri-branch))
                                      :main)
-               ledger            (<? (ledger/create conn {:alias    ledger-alias
-                                                          :did      nil
-                                                          :branch   branch
-                                                          :indexing indexing-opts
-                                                          ::time    (get-first-value first-commit const/iri-time)}))
+               publish-addrs     (<? (connection/publishing-addresses conn ledger-alias))
+               init-time         (get-first-value first-commit const/iri-time)
+               genesis-commit    (-> (<? (commit-storage/write-genesis-commit
+                                           commit-catalog ledger-alias branch publish-addrs init-time))
+                                     (json-ld/expand))
+
+               ledger  (ledger/instantiate conn ledger-alias ledger-address branch
+                                           commit-catalog index-catalog indexing-opts nil genesis-commit)
+
+
                tuples-chans      (map (fn [commit-tuple]
                                         [commit-tuple (when changes-ch (async/chan))])
                                       all-commit-tuples)
