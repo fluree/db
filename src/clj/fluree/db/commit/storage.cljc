@@ -35,7 +35,7 @@
 (defn read-data-jsonld
   [storage address]
   (go-try
-    (let [jsonld (<? (storage/read-catalog-json storage address)) ]
+    (let [jsonld (<? (storage/read-json storage address)) ]
       (-> jsonld
           (assoc "f:address" address)
           json-ld/expand))))
@@ -43,7 +43,7 @@
 (defn read-commit-jsonld
   [storage commit-address]
   (go-try
-    (let [commit-data   (<? (storage/read-catalog-json storage commit-address))
+    (let [commit-data   (<? (storage/read-json storage commit-address))
           addr-key-path (if (contains? commit-data "credentialSubject")
                           ["credentialSubject" "address"]
                           ["address"])]
@@ -99,7 +99,7 @@
 (defn write-jsonld
   [storage ledger-alias jsonld]
   (let [path (str/join "/" [ledger-alias "commit"])]
-    (storage/content-write-catalog-json storage path jsonld)))
+    (storage/content-write-json storage path jsonld)))
 
 (defn write-genesis-commit
   [storage ledger-alias branch publish-addresses init-time]
