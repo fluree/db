@@ -182,7 +182,7 @@
 (defn read-file-address
   [{:keys [commit-catalog] :as _conn} addr]
   (go-try
-    (let [json-data (<? (storage/read-catalog-json commit-catalog addr))]
+    (let [json-data (<? (storage/read-json commit-catalog addr))]
       (assoc json-data "address" addr))))
 
 (defn lookup-publisher-commit
@@ -454,7 +454,7 @@
 (defn write-transaction
   [storage ledger-alias txn]
   (let [path (str/join "/" [ledger-alias "txn"])]
-    (storage/content-write-catalog-json storage path txn)))
+    (storage/content-write-json storage path txn)))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don' think the db should be handling any of it

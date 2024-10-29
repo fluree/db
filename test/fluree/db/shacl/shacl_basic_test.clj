@@ -2847,3 +2847,89 @@ WORLD!")
                              "sh:sourceShape"         test-utils/blank-node-id?,
                              "f:expectation"          2}]}}
                (ex-data db2)))))))
+
+(deftest multiple-and-encumbered-targets
+  (let [conn   @(fluree/connect {:method :memory})
+        ledger @(fluree/create conn "encumbered-targets")
+        db0    (fluree/db ledger)]
+    (testing "targetClass"
+      (testing "with multiple targets"
+        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
+                                      "insert"
+                                      [{"@type" "sh:NodeShape",
+                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                        "sh:maxCount" 1,
+                                                        "sh:path" {"@id" "ex:term"}}],
+                                        "sh:targetClass" [{"@id" "ex:Assertion"} {"@id" "ex:Fact"}]}]})]
+          (is (not (nil? @(fluree/stage db1 {"@type" "ex:Assertion" "ex:term" 123}))))
+          (is (not (nil? @(fluree/stage db1 {"@type" "ex:Fact" "ex:term" 123}))))))
+      (testing "with extra data"
+        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
+                                      "insert"
+                                      [{"@type" "sh:NodeShape",
+                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                        "sh:maxCount" 1,
+                                                        "sh:path" {"@id" "ex:term"}}],
+                                        "sh:targetClass" {"@id" "ex:Assertion" "ex:extra" "data"}}]})]
+          (is (not (nil? @(fluree/stage db1 {"@type" "ex:Assertion" "ex:term" 123})))))))
+    (testing "targetNode"
+      (testing "with multiple targets"
+        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
+                                      "insert"
+                                      [{"@type" "sh:NodeShape",
+                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                        "sh:maxCount" 1,
+                                                        "sh:path" {"@id" "ex:term"}}],
+                                        "sh:targetNode" [{"@id" "ex:foo"}
+                                                         {"@id" "ex:bar"}]}]})]
+          (is (not (nil? @(fluree/stage db1 {"@id" "ex:foo" "ex:term" 123}))))
+          (is (not (nil? @(fluree/stage db1 {"@id" "ex:bar" "ex:term" 123}))))))
+      (testing "with extra data"
+        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
+                                      "insert"
+                                      [{"@type" "sh:NodeShape",
+                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                        "sh:maxCount" 1,
+                                                        "sh:path" {"@id" "ex:term"}}],
+                                        "sh:targetNode" {"@id" "ex:foo" "ex:extra" "data"}}]})]
+          (is (not (nil? @(fluree/stage db1 {"@id" "ex:foo" "ex:term" 123})))))))
+    (testing "targetObjectsOf"
+      (testing "with multiple targets"
+        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
+                                      "insert"
+                                      [{"@type" "sh:NodeShape",
+                                        "sh:datatype" {"@id" "xsd:string"},
+                                        "sh:targetObjectsOf" [{"@id" "ex:foo"}
+                                                              {"@id" "ex:bar"}]}]})]
+          (is (not (nil? @(fluree/stage db1 {"@id" "ex:me" "ex:foo" 123}))))
+          (is (not (nil? @(fluree/stage db1 {"@id" "ex:me" "ex:bar" 123}))))))
+      (testing "with extra data"
+        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
+                                      "insert"
+                                      [{"@type" "sh:NodeShape",
+                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                        "sh:maxCount" 1,
+                                                        "sh:path" {"@id" "ex:term"}}],
+                                        "sh:targetObjectsOf" {"@id" "ex:foo" "@type" "rdf:Property"}}]})]
+          (is (not (nil? @(fluree/stage db1 {"@id" "ex:foo" "ex:term" 123})))))))
+    (testing "targetSubjectsof"
+      (testing "with multiple targets"
+        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
+                                      "insert"
+                                      [{"@type" "sh:NodeShape",
+                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                        "sh:maxCount" 1,
+                                                        "sh:path" {"@id" "ex:term"}}],
+                                        "sh:targetSubjectsOf" [{"@id" "ex:foo"}
+                                                               {"@id" "ex:bar"}]}]})]
+          (is (not (nil? @(fluree/stage db1 {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123}))))
+          (is (not (nil? @(fluree/stage db1 {"@id" "ex:me" "ex:bar" "bar" "ex:term" 123}))))))
+      (testing "with extra data"
+        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
+                                      "insert"
+                                      [{"@type" "sh:NodeShape",
+                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                        "sh:maxCount" 1,
+                                                        "sh:path" {"@id" "ex:term"}}],
+                                        "sh:targetSubjectsOf" {"@id" "ex:foo" "ex:extra" "data"}}]})]
+          (is (not (nil? @(fluree/stage db1 {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123})))))))))

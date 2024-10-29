@@ -40,7 +40,7 @@
   [storage ledger-alias index-type serialized-data]
   (let [index-name (name index-type)
         path       (str/join "/" [ledger-alias "index" index-name])]
-    (storage/content-write-catalog-json storage path serialized-data)))
+    (storage/content-write-json storage path serialized-data)))
 
 (defn write-leaf
   "Serializes and writes the index leaf node `leaf` to storage."
@@ -105,13 +105,13 @@
 (defn read-branch
   [{:keys [storage serializer] :as _idx-store} branch-address]
   (go-try
-    (when-let [data (<? (storage/read-catalog-json storage branch-address true))]
+    (when-let [data (<? (storage/read-json storage branch-address true))]
       (serdeproto/-deserialize-branch serializer data))))
 
 (defn read-leaf
   [{:keys [storage serializer] :as _idx-store} leaf-address]
   (go-try
-    (when-let [data (<? (storage/read-catalog-json storage leaf-address true))]
+    (when-let [data (<? (storage/read-json storage leaf-address true))]
       (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
@@ -145,7 +145,7 @@
   "Returns garbage file data for a given index t."
   [{:keys [storage serializer] :as _idx-store} garbage-address]
   (go-try
-    (when-let [data (<? (storage/read-catalog-json storage garbage-address true))]
+    (when-let [data (<? (storage/read-json storage garbage-address true))]
       (serdeproto/-deserialize-garbage serializer data))))
 
 (defn delete-garbage-item
@@ -164,7 +164,7 @@
   "Returns all data for a db index root of a given t."
   [{:keys [storage serializer] :as _idx-store} idx-address]
   (go-try
-    (if-let [data (<? (storage/read-catalog-json storage idx-address true))]
+    (if-let [data (<? (storage/read-json storage idx-address true))]
       (let [{:keys [t] :as root-data}
             (serdeproto/-deserialize-db-root serializer data)]
         (-> root-data
