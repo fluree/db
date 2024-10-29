@@ -1667,15 +1667,13 @@ WORLD!")
                                                         "type"        "ex:Pal"
                                                         "schema:name" "Darth Vader"
                                                         "ex:pal"      {"ex:evil" "has no name"}}})]
-        (is (= {"id"          "ex:good-pal"
-                "type"        "ex:Pal"
-                "schema:name" "J.D."
-                "ex:pal"      #{{"schema:name" "Rowdy"}
-                                {"schema:name" "Turk"}}}
-               (-> @(fluree/query valid-pal {"@context" context
-                                             "select"   {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})
-                   first
-                   (update "ex:pal" set))))
+        (is (pred-match? [{"id"          "ex:good-pal"
+                           "type"        "ex:Pal"
+                           "schema:name" "J.D."
+                           "ex:pal"      (test-utils/set-matcher [{"schema:name" "Rowdy"}
+                                                                  {"schema:name" "Turk"}])}]
+                         @(fluree/query valid-pal {"@context" context
+                                                   "select"   {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})))
         (is (pred-match? {:status 422,
                           :error  :shacl/violation,
                           :report
@@ -1719,14 +1717,13 @@ WORLD!")
                                                                    {"id"      "ex:rowdy"
                                                                     "ex:name" "Rowdy"}]}})]
 
-        (is (= {"id"      "ex:jd",
-                "type"    "ex:Pal",
-                "ex:name" "J.D.",
-                "ex:pal"  #{{"ex:name" "Turk"} {"ex:name" "Rowdy"}}}
-               (-> @(fluree/query valid-pal {"@context" context
-                                             "select"   {"ex:jd" ["*" {"ex:pal" ["ex:name"]}]}})
-                   first
-                   (update "ex:pal" set))))
+        (is (pred-match? [{"id"      "ex:jd",
+                           "type"    "ex:Pal",
+                           "ex:name" "J.D.",
+                           "ex:pal"  (test-utils/set-matcher[{"ex:name" "Rowdy"}
+                                                             {"ex:name" "Turk"}])}]
+                         @(fluree/query valid-pal {"@context" context
+                                                   "select"   {"ex:jd" ["*" {"ex:pal" ["ex:name"]}]}})))
         (is (pred-match? {:status 422,
                           :error  :shacl/violation,
                           :report
@@ -2527,26 +2524,27 @@ WORLD!")
                         {"type"        "sh:ValidationReport",
                          "sh:conforms" false,
                          "sh:result"
-                         [{"sh:constraintComponent" "sh:qualifiedValueShape",
-                           "sh:focusNode"           "ex:InvalidHand",
-                           "sh:resultSeverity"      "sh:Violation",
-                           "sh:value"               "ex:finger4andthumb",
-                           "sh:resultPath"          ["ex:digit"],
-                           "type"                   "sh:ValidationResult",
-                           "sh:resultMessage"
-                           "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint",
-                           "sh:sourceShape"         test-utils/blank-node-id?,
-                           "f:expectation"          "ex:thumbshape"}
-                          {"sh:constraintComponent" "sh:qualifiedValueShape",
-                           "sh:focusNode"           "ex:InvalidHand",
-                           "sh:resultSeverity"      "sh:Violation",
-                           "sh:value"               "ex:finger4andthumb",
-                           "sh:resultPath"          ["ex:digit"],
-                           "type"                   "sh:ValidationResult",
-                           "sh:resultMessage"
-                           "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint",
-                           "sh:sourceShape"         test-utils/blank-node-id?,
-                           "f:expectation"          "ex:fingershape"}]}}
+                         (test-utils/set-matcher
+                           [{"sh:constraintComponent" "sh:qualifiedValueShape",
+                             "sh:focusNode"           "ex:InvalidHand",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               "ex:finger4andthumb",
+                             "sh:resultPath"          ["ex:digit"],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"
+                             "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint",
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          "ex:thumbshape"}
+                            {"sh:constraintComponent" "sh:qualifiedValueShape",
+                             "sh:focusNode"           "ex:InvalidHand",
+                             "sh:resultSeverity"      "sh:Violation",
+                             "sh:value"               "ex:finger4andthumb",
+                             "sh:resultPath"          ["ex:digit"],
+                             "type"                   "sh:ValidationResult",
+                             "sh:resultMessage"
+                             "value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint",
+                             "sh:sourceShape"         test-utils/blank-node-id?,
+                             "f:expectation"          "ex:fingershape"}])}}
              (ex-data invalid-hand))))))
 
 (deftest ^:integration post-processing-validation

@@ -303,6 +303,24 @@
 
         :else false)))
 
+(defn set-matcher
+  [expected]
+  (fn [actual]
+    (loop [[e & er]  expected
+           actual*   actual]
+      (if e
+        (let [[result remaining] (loop [[a & ar]  actual*
+                                        a-checked []]
+                                   (if a
+                                     (if (pred-match? e a)
+                                       [true (into a-checked ar)]
+                                       (recur ar (conj a-checked a)))
+                                     [false]))]
+          (if result
+            (recur er remaining)
+            false))
+        true))))
+
 (defn error-status
   [ex]
   (-> ex ex-data :status))
