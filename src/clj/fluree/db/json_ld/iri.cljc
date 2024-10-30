@@ -1,9 +1,6 @@
 (ns fluree.db.json-ld.iri
   (:require [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [fluree.db.util.bytes :as bytes]
-            [fluree.json-ld :as json-ld]
-            [clojure.pprint :as pprint]
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]
             [nano-id.core :refer [nano-id]]

@@ -2,6 +2,7 @@
   (:require [fluree.crypto :as crypto]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
+            [fluree.db.util.json :as json]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.storage :as storage]
             [clojure.string :as str]))
@@ -14,16 +15,36 @@
 
 (defn storage-path
   [root address]
-  (let [relative-path (:local (storage/parse-address address))]
+  (let [relative-path (storage/get-local-path address)]
     (full-path root relative-path)))
 
 (defn file-address
-  [path]
-  (storage/build-fluree-address method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord FileStore [root]
-  storage/Store
-  (write [_ dir data]
+(defrecord FileStore [identifier root]
+  storage/Addressable
+  (location [_]
+    (storage/build-location storage/fluree-namespace identifier method-name))
+
+  storage/Identifiable
+  (identifiers [_]
+    #{identifier})
+
+  storage/JsonArchive
+  (-read-json [_ address keywordize?]
+    (go-try
+      (let [path (storage-path root address)]
+        (when-let [data (<? (fs/read-file path))]
+          (json/parse data keywordize?)))))
+
+  storage/EraseableStore
+  (delete [_ address]
+    (let [path (storage-path root address)]
+      (fs/delete-file path)))
+
+  storage/ContentAddressedStore
+  (-content-write-bytes [_ dir data]
     (go-try
       (when (not (storage/hashable? data))
         (throw (ex-info "Must serialize data before writing to FileStore."
@@ -39,25 +60,23 @@
                        data)]
         (<? (fs/write-file absolute bytes))
         {:path    path
-         :address (file-address path)
+         :address (file-address identifier path)
          :hash    hash
          :size    (count bytes)})))
 
-  (read [_ address]
-    (let [path (storage-path root address)]
-      (fs/read-file path)))
+  storage/ByteStore
+  (write-bytes [_ path bytes]
+    (-> root
+        (full-path path)
+        (fs/write-file bytes)))
 
-  (list [_ prefix]
-    (fs/list-files (full-path root prefix)))
-
-  (delete [_ address]
-    (let [path (storage-path root address)]
-      (fs/delete-file path)))
-
-  (exists? [_ address]
-    (let [path (storage-path root address)]
-      (fs/exists? path))))
+  (read-bytes [_ path]
+    (-> root
+        (full-path path)
+        fs/read-file)))
 
 (defn open
-  [root-path]
-  (->FileStore root-path))
+  ([root-path]
+   (open nil root-path))
+  ([identifier root-path]
+   (->FileStore identifier root-path)))

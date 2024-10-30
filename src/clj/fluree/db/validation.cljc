@@ -248,7 +248,8 @@
     ::subject              ::iri
     ::function             [:orn
                             [:string-fn [:and :string [:re #"^\(.+\)$"]]]
-                            [:list-fn [:and list? [:cat :symbol [:* any?]]]]]
+                            [:list-fn [:and list? [:cat :symbol [:* any?]]]]
+                            [:vector-fn [:and vector? [:cat [:enum :expr] [:* any?]]]]]
     ::as-function          [:orn {:error/message "subquery aggregates must be bound to a variable with 'as' e.g. '(as (sum ?x) ?x-sum)"}
                             [:string-fn [:and :string [:re #"^\(as .+\)$"]]]
                             [:list-fn [:and list? [:cat :symbol [:* any?]]]]]

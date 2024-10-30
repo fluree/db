@@ -444,6 +444,10 @@
       (get-first k)
       get-value))
 
+(defn get-values
+  [json-ld k]
+  (mapv get-value (get json-ld k)))
+
 (defn get-id
   [json-ld]
   (or (:id json-ld)
@@ -468,7 +472,7 @@
 
 (defn unwrap-list
   "If values are contained in a @list, unwraps them.
-  @list can look like:
+  the @list can look like:
   {ex:someProperty [{@list [ex:val1 ex:val2]}]}
   or in single-cardinality form:
   {ex:someProperty {@list [ex:val1 ex:val2]}}
@@ -494,3 +498,10 @@
   (some->> (get json-ld k)
            unwrap-list
            (keep get-id)))
+
+(defn get-graph
+  [jsonld]
+  (cond
+    (contains? jsonld :graph)   (:graph jsonld)
+    (contains? jsonld "@graph") (get jsonld "@graph")
+    :else                       jsonld))

@@ -1,29 +1,19 @@
 (ns fluree.db.json-ld.api
   {:deprecated "3.0"
    :superseded-by "fluree.db"}
-  (:require [fluree.db.conn.ipfs :as ipfs-conn]
-            [fluree.db.conn.file :as file-conn]
-            [fluree.db.conn.memory :as memory-conn]
-            [fluree.db.conn.remote :as remote-conn]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.flake.flake-db :as flake-db]
-            #?(:clj [fluree.db.conn.s3 :as s3-conn])
+  (:require [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger :as ledger]
             [fluree.db.util.log :as log]
             [fluree.db.query.api :as query-api]
             [fluree.db.query.range :as query-range]
-            [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.connection :refer [notify-ledger]]
+            [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
-            [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy :as policy])
   (:refer-clojure :exclude [merge load range exists?]))
 
@@ -73,25 +63,9 @@
     "
   [{:keys [method parallelism remote-servers] :as opts}]
   ;; TODO - do some validation
-  (log/warn "DEPRECATED function `connect` superseded by `fluree.db.api/connect`")
-  (promise-wrap
-    (let [opts* (assoc opts :parallelism (or parallelism 4))
-
-          method* (cond
-                    method         (keyword method)
-                    remote-servers :remote
-                    :else          (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
-                                                   {:status 500 :error :db/invalid-configuration})))]
-      (case method*
-        :remote (remote-conn/connect opts*)
-        :ipfs   (ipfs-conn/connect opts*)
-        :file   (if platform/BROWSER
-                  (throw (ex-info "File connection not supported in the browser" opts))
-                  (file-conn/connect opts*))
-        :memory (memory-conn/connect opts*)
-        :s3     #?(:clj  (s3-conn/connect opts*)
-                   :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
-                                         {:status 400, :error :db/unsupported-operation})))))))
+  (log/error "DEPRECATED function `connect` superseded by `fluree.db.api/connect`")
+  (throw (ex-info "DEPRECATED function `connect` superseded by `fluree.db.api/connect`"
+                  {:status 400, :error :db/deprecated-api})))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/connect-file"}
@@ -127,7 +101,7 @@
   alias."
   [ledger-alias-or-address]
   (log/warn "DEPRECATED function `address?` superseded by `fluree.db.api/address?`")
-  (jld-ledger/fluree-address? ledger-alias-or-address))
+  (connection/fluree-address? ledger-alias-or-address))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/create"}
@@ -156,7 +130,7 @@
    (promise-wrap
     (do
       (log/info "Creating ledger" ledger-alias)
-      (jld-ledger/create conn ledger-alias opts)))))
+      (connection/create-ledger conn ledger-alias opts)))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/alias->address"}
@@ -166,7 +140,7 @@
   [conn ledger-alias]
   (log/warn "DEPRECATED function `alias->address` superseded by `fluree.db.api/alias->address`")
   (log/debug "Looking up address for ledger alias" ledger-alias)
-  (nameservice/primary-address conn ledger-alias nil))
+  (connection/primary-address conn ledger-alias))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/load"}
@@ -176,7 +150,7 @@
   [conn alias-or-address]
   (log/warn "DEPRECATED function `load` superseded by `fluree.db.api/load`")
   (promise-wrap
-    (jld-ledger/load conn alias-or-address)))
+    (connection/load-ledger conn alias-or-address)))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/exists?"}
@@ -191,7 +165,7 @@
                       ledger-alias-or-address
                       (<! (alias->address conn ledger-alias-or-address)))]
         (log/debug "exists? - ledger address:" address)
-        (<! (nameservice/exists? conn address))))))
+        (<! (connection/ledger-exists? conn address))))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/notify"}
@@ -263,11 +237,11 @@
   distributed rules."
   ([ledger db]
    (promise-wrap
-     (ledger/-commit! ledger db)))
+     (connection/commit! ledger db)))
   ([ledger db opts]
    (log/warn "DEPRECATED function `commit!` superseded by `fluree.db.api/commit!`")
    (promise-wrap
-     (ledger/-commit! ledger db opts))))
+     (connection/commit! ledger db opts))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/transact!"}
@@ -289,10 +263,10 @@
         :superseded-by "fluree.db/status"}
   status
   "Returns current status of ledger branch."
-  ([ledger] (ledger/-status ledger))
+  ([ledger] (ledger/status ledger))
   ([ledger branch]
    (log/warn "DEPRECATED function `status` superseded by `fluree.db.api/status`")
-   (ledger/-status ledger branch)))
+   (ledger/status ledger branch)))
 
 
 (defn ^{:deprecated    "3.0"
@@ -341,7 +315,7 @@
    (if opts
      (throw (ex-info "DB opts not yet implemented"
                      {:status 500 :error :db/unexpected-error}))
-     (ledger/-db ledger))))
+     (ledger/current-db ledger))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/wrap-policy"}
@@ -453,13 +427,13 @@
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   ([ledger query]
-   (let [latest-db (ledger/-db ledger)
+   (let [latest-db (ledger/current-db ledger)
          res-chan  (query-api/history latest-db query)]
      (promise-wrap res-chan)))
   ([ledger query {:keys [policy identity values-map] :as _opts}]
    (log/warn "DEPRECATED function `history` superseded by `fluree.db.api/history`")
    (promise-wrap
-     (let [latest-db (ledger/-db ledger)
+     (let [latest-db (ledger/current-db ledger)
            policy-db (if identity
                        (<? (policy/wrap-identity-policy latest-db identity values-map))
                        (<? (policy/wrap-policy latest-db policy values-map)))]
@@ -479,7 +453,7 @@
    (log/warn "DEPRECATED function `credential-history` superseded by `fluree.db.api/credential-history`")
    (promise-wrap
     (go-try
-      (let [latest-db                       (ledger/-db ledger)
+      (let [latest-db                       (ledger/current-db ledger)
             {query :subject, identity :did} (<? (cred/verify cred-query))]
        (log/debug "Credential history query with identity: " identity " and query: " query)
        (cond

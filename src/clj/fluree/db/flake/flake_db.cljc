@@ -4,7 +4,6 @@
             [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]
-            [fluree.db.connection :as connection]
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
@@ -19,8 +18,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.flake.transact :as flake.transact]
-            [fluree.db.util.core :as util :refer [get-first get-first-value
-                                                  get-first-id vswap!]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value get-first-id]]
             [fluree.db.flake.index :as index]
             [fluree.db.indexer :as indexer]
             [fluree.db.flake.index.novelty :as novelty]
@@ -31,22 +29,19 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
             [fluree.db.json-ld.policy.rules :as policy-rules]
-            [fluree.db.json-ld.reify :as reify]
+            [fluree.db.commit.storage :as commit-storage]
             [fluree.db.transact :as transact]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serde-json]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.util.log :as log])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (def data-version 0)
-
-;; ================ Jsonld record support fns ================================
 
 (defn empty-all-novelty
   [db]
@@ -102,13 +97,6 @@
                  :tspo tspo)
           (assoc-in [:stats :indexed] index-t)))
     db))
-
-(defn read-db
-  [conn db-address]
-  (go-try
-    (let [file-data (<? (connection/-c-read conn db-address))
-          db        (assoc file-data "f:address" db-address)]
-      (json-ld/expand db))))
 
 (defn with-namespaces
   [{:keys [namespaces max-namespace-code] :as db} new-namespaces]
@@ -262,30 +250,24 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
   indexes and returns updated db"
-  [conn db [commit _proof]]
+  [{:keys [commit-catalog] :as db} commit-jsonld commit-data-jsonld]
   (go-try
-    (let [db-address         (-> commit
-                                 (get-first const/iri-data)
-                                 (get-first-value const/iri-address))
-          db-data            (<? (read-db conn db-address))
-          t-new              (db-t db-data)
-          assert             (db-assert db-data)
-          nses               (map :value
-                                  (get db-data const/iri-namespaces))
-          _                  (log/trace "merge-commit new namespaces:" nses)
-          _                  (log/trace "db max-namespace-code:"
-                                        (:max-namespace-code db))
-          db*                (with-namespaces db nses)
-          asserted-flakes    (create-flakes true db* t-new assert)
-          retract            (db-retract db-data)
-          retracted-flakes   (create-flakes false db* t-new retract)
+    (let [t-new            (db-t commit-data-jsonld)
+          assert           (db-assert commit-data-jsonld)
+          nses             (map :value
+                                (get commit-data-jsonld const/iri-namespaces))
+          db*              (with-namespaces db nses)
+          asserted-flakes  (create-flakes true db* t-new assert)
+          retract          (db-retract commit-data-jsonld)
+          retracted-flakes (create-flakes false db* t-new retract)
 
           {:keys [previous issuer message data] :as commit-metadata}
-          (commit-data/json-ld->map commit db*)
+          (commit-data/json-ld->map commit-jsonld db*)
 
           commit-id          (:id commit-metadata)
           commit-sid         (iri/encode-iri db* commit-id)
-          [prev-commit _] (some->> previous :address (reify/read-commit conn) <?)
+          [prev-commit _]    (when-let [prev-addr (:address previous)]
+                               (<? (commit-storage/read-commit-jsonld commit-catalog prev-addr)))
           db-sid             (iri/encode-iri db* (:id data))
           metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
                                                                  t-new commit-sid db-sid)
@@ -309,7 +291,7 @@
                                  (into asserted-flakes)
                                  (cond-> prev-commit-flakes (into prev-commit-flakes)
                                          prev-db-flakes (into prev-db-flakes)
-                                         issuer-flakes (into issuer-flakes)
+                                         issuer-flakes  (into issuer-flakes)
                                          message-flakes (into message-flakes)))]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
@@ -322,11 +304,10 @@
   [graph-alias]
   (str/starts-with? graph-alias "##"))
 
-;; ================ end Jsonld record support fns ============================
-
-(defrecord FlakeDB [conn alias branch commit t tt-id stats spot post opst tspo
-                    schema comparators staged novelty policy namespaces namespace-codes
-                    max-namespace-code reindex-min-bytes reindex-max-bytes max-old-indexes]
+(defrecord FlakeDB [index-catalog commit-catalog alias branch commit t tt-id stats
+                    spot post opst tspo schema comparators staged novelty policy
+                    namespaces namespace-codes max-namespace-code
+                    reindex-min-bytes reindex-max-bytes max-old-indexes]
   dbproto/IFlureeDb
   (-query [this query-map] (fql/query this query-map))
   (-class-ids [this subject] (match/class-ids this subject))
@@ -370,8 +351,8 @@
   transact/Transactable
   (-stage-txn [db fuel-tracker context identity author annotation raw-txn parsed-txn]
     (flake.transact/stage db fuel-tracker context identity author annotation raw-txn parsed-txn))
-  (-merge-commit [db new-commit proof] (merge-commit conn db [new-commit proof]))
-  (-merge-commit [db new-commit] (merge-commit conn db [new-commit]))
+  (-merge-commit [db commit-jsonld commit-data-jsonld]
+    (merge-commit db commit-jsonld commit-data-jsonld))
 
   subject/SubjectFormatter
   (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
@@ -448,18 +429,16 @@
   [db]
   (select-keys db [:alias :branch :t :stats :policy]))
 
-#?(:cljs
-   (extend-type FlakeDB
-     IPrintWithWriter
-     (-pr-writer [db w _opts]
-       (-write w label)
-       (-write w (-> db display pr)))))
+#?(:cljs (extend-type FlakeDB
+           IPrintWithWriter
+           (-pr-writer [db w _opts]
+             (-write w label)
+             (-write w (-> db display pr))))
 
-#?(:clj
-   (defmethod print-method FlakeDB [^FlakeDB db, ^Writer w]
-     (.write w label)
-     (binding [*out* w]
-       (-> db display pr))))
+   :clj (defmethod print-method FlakeDB [^FlakeDB db, ^Writer w]
+          (.write w label)
+          (binding [*out* w]
+            (-> db display pr))))
 
 (defmethod pprint/simple-dispatch FlakeDB
   [db]
@@ -490,12 +469,13 @@
      :schema          (vocab/base-schema)}))
 
 (defn load-novelty
-  [conn indexed-db index-t commit-jsonld]
+  [commit-storage indexed-db index-t commit-jsonld]
   (go-try
-    (loop [[commit-tuple & r] (<? (reify/trace-commits conn [commit-jsonld nil] (inc index-t)))
+    (loop [[commit-tuple & r] (<? (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t)))
            db indexed-db]
       (if commit-tuple
-        (let [new-db (<? (merge-commit conn db commit-tuple))]
+        (let [[commit-jsonld _commit-proof commit-data-jsonld] commit-tuple
+              new-db (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld))]
           (recur r new-db))
         db))))
 
@@ -528,17 +508,18 @@
                     :max-old-indexes max-old-indexes)))
 
 (defn load
-  ([conn ledger-alias branch commit-pair]
-   (load conn ledger-alias branch commit-pair {}))
-  ([conn ledger-alias branch [commit-jsonld commit-map] indexing-opts]
+  ([ledger-alias commit-catalog index-catalog branch commit-pair]
+   (load ledger-alias commit-catalog index-catalog branch commit-pair {}))
+  ([ledger-alias commit-catalog index-catalog branch [commit-jsonld commit-map] indexing-opts]
    (go-try
      (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
-                         (<? (index-storage/read-db-root conn address))
+                         (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
-                           (assoc :conn conn
+                           (assoc :index-catalog index-catalog
+                                  :commit-catalog commit-catalog
                                   :alias ledger-alias
                                   :branch branch
                                   :commit commit-map
@@ -558,7 +539,7 @@
            index-t     (:t indexed-db*)]
        (if (= commit-t index-t)
          indexed-db*
-         (<? (load-novelty conn indexed-db* index-t commit-jsonld)))))))
+         (<? (load-novelty commit-catalog indexed-db* index-t commit-jsonld)))))))
 
 (defn get-s-iri
   "Returns a compact IRI from a subject id (sid)."
@@ -605,7 +586,7 @@
   {"@list" (->> objs (sort-by :i) (map #(dissoc % :i)))})
 
 (defn- subject-block
-  [s-flakes db ^clojure.lang.Volatile ctx compact-fn]
+  [s-flakes db compact-fn]
   (loop [[p-flakes & r] (partition-by flake/p s-flakes)
          acc nil]
     (let [fflake (first p-flakes)
@@ -639,43 +620,41 @@
   :retract - retraction flakes
   :refs-ctx - context that must be included with final context, for refs (@id) values
   :flakes - all considered flakes, for any downstream processes that need it"
-  [{:keys [reasoner] :as db} {:keys [compact-fn id-key type-key] :as _opts}]
+  [{:keys [reasoner] :as db} {:keys [compact-fn id-key] :as _opts}]
   (when-let [flakes (cond-> (commit-flakes db)
                       reasoner flake.reasoner/non-reasoned-flakes)]
     (log/trace "generate-commit flakes:" flakes)
-    (let [ctx (volatile! {})]
-      (loop [[s-flakes & r] (partition-by flake/s flakes)
-             assert  []
-             retract []]
-        (if s-flakes
-          (let [sid   (flake/s (first s-flakes))
-                s-iri (get-s-iri db sid compact-fn)
-                [assert* retract*]
-                (if (and (= 1 (count s-flakes))
-                         (= const/$rdfs:Class (->> s-flakes first flake/o))
-                         (= const/$rdf:type (->> s-flakes first flake/p)))
-                  ;; we don't output auto-generated rdfs:Class definitions for classes
-                  ;; (they are implied when used in rdf:type statements)
-                  [assert retract]
-                  (let [{assert-flakes  true
-                         retract-flakes false}
-                        (group-by flake/op s-flakes)
+    (loop [[s-flakes & r] (partition-by flake/s flakes)
+           assert  []
+           retract []]
+      (if s-flakes
+        (let [sid   (flake/s (first s-flakes))
+              s-iri (get-s-iri db sid compact-fn)
+              [assert* retract*]
+              (if (and (= 1 (count s-flakes))
+                       (= const/$rdfs:Class (->> s-flakes first flake/o))
+                       (= const/$rdf:type (->> s-flakes first flake/p)))
+                ;; we don't output auto-generated rdfs:Class definitions for classes
+                ;; (they are implied when used in rdf:type statements)
+                [assert retract]
+                (let [{assert-flakes  true
+                       retract-flakes false}
+                      (group-by flake/op s-flakes)
 
-                        s-assert  (when assert-flakes
-                                    (-> (subject-block assert-flakes db ctx compact-fn)
-                                        (assoc id-key s-iri)))
-                        s-retract (when retract-flakes
-                                    (-> (subject-block retract-flakes db ctx compact-fn)
-                                        (assoc id-key s-iri)))]
-                    [(cond-> assert
-                       s-assert (conj s-assert))
-                     (cond-> retract
-                       s-retract (conj s-retract))]))]
-            (recur r assert* retract*))
-          {:refs-ctx (dissoc @ctx type-key) ; @type will be marked as @type: @id, which is implied
-           :assert   assert
-           :retract  retract
-           :flakes   flakes})))))
+                      s-assert  (when assert-flakes
+                                  (-> (subject-block assert-flakes db compact-fn)
+                                      (assoc id-key s-iri)))
+                      s-retract (when retract-flakes
+                                  (-> (subject-block retract-flakes db compact-fn)
+                                      (assoc id-key s-iri)))]
+                  [(cond-> assert
+                     s-assert (conj s-assert))
+                   (cond-> retract
+                     s-retract (conj s-retract))]))]
+          (recur r assert* retract*))
+        {:assert   assert
+         :retract  retract
+         :flakes   flakes}))))
 
 (defn new-namespaces
   [{:keys [max-namespace-code namespace-codes] :as _db}]

@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async :refer [go >! <!]]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
+            [fluree.db.storage :as storage]
             [fluree.db.flake.format :as jld-format]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index :as index]
@@ -9,8 +10,7 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.connection :as connection]))
+            [fluree.db.json-ld.iri :as iri]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -19,8 +19,8 @@
   {:id :ex/foo :ex/x 1 :ex/y 2}"
   [db cache context compact error-ch s-flakes]
   (jld-format/format-subject-flakes db cache context compact
-                                {:wildcard? true, :depth 0}
-                                0 nil error-ch s-flakes))
+                                    {:wildcard? true, :depth 0}
+                                    0 nil error-ch s-flakes))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
@@ -159,7 +159,7 @@
 
 (defn commit-t-flakes->json-ld
   "Build a commit maps given a set of all flakes with the same t."
-  [db context {:keys [commit data txn] :as include} compact cache error-ch t-flakes]
+  [{:keys [commit-catalog] :as db} context {:keys [commit data txn] :as include} compact cache error-ch t-flakes]
   (go
     (try*
      (let [{commit-wrapper-flakes :commit-wrapper
@@ -218,7 +218,7 @@
                    (let [txn-key     (json-ld/compact const/iri-txn compact)
                          txn-address (get commit-wrapper txn-key)
                          raw-txn     (when txn-address
-                                       (<? (connection/-txn-read (:conn db) txn-address)))]
+                                       (<? (storage/read-json commit-catalog txn-address)))]
                      (assoc {} txn-key raw-txn))
                    {})
            commit (-> (assoc commit-key commit-wrapper)

@@ -1,18 +1,39 @@
 (ns fluree.db.storage.memory
   (:require [clojure.core.async :as async :refer [go]]
-            [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.storage :as storage]))
+            [fluree.db.storage :as storage]
+            [fluree.db.util.json :as json]))
 
 (def method-name "memory")
 
 (defn memory-address
-  [path]
-  (storage/build-fluree-address method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord MemoryStore [contents]
-  storage/Store
-  (write [_ _ v]
+(defrecord MemoryStore [identifier contents]
+  storage/Addressable
+  (location [_]
+    (storage/build-location storage/fluree-namespace identifier method-name))
+
+  storage/Identifiable
+  (identifiers [_]
+    #{identifier})
+
+  storage/JsonArchive
+  (-read-json [_ address keywordize?]
+    (go
+      (let [path (storage/get-local-path address)]
+        (when-let [data (get @contents path)]
+          (json/parse data keywordize?)))))
+
+  storage/EraseableStore
+  (delete [_ address]
+    (go
+      (let [path (storage/get-local-path address)]
+        (swap! contents dissoc path))))
+
+  storage/ContentAddressedStore
+  (-content-write-bytes [_ _ v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v
@@ -20,31 +41,22 @@
             hash     (crypto/sha2-256 hashable)]
         (swap! contents assoc hash v)
         {:path    hash
-         :address (memory-address hash)
+         :address (memory-address identifier hash)
          :hash    hash
          :size    (count hashable)})))
 
-  (list [_ prefix]
+  storage/ByteStore
+  (write-bytes [_ path bytes]
     (go
-      (filter #(when (string? %) (str/starts-with? % prefix))
-              (keys contents))))
+      (swap! contents assoc path bytes)))
 
-  (read [_ address]
+  (read-bytes [_ path]
     (go
-      (let [path (:local (storage/parse-address address))]
-        (get @contents path))))
+      (get @contents path))))
 
-  (delete [_ address]
-    (go
-      (let [path (:local (storage/parse-address address))]
-        (swap! contents dissoc path))))
-
-  (exists? [_ address]
-    (go
-      (let [path (:local (storage/parse-address address))]
-        (contains? @contents path)))))
-
-(defn create
-  []
-  (let [contents (atom {})]
-    (->MemoryStore contents)))
+(defn open
+  ([]
+   (open nil))
+  ([identifier]
+   (let [contents (atom {})]
+     (->MemoryStore identifier contents))))

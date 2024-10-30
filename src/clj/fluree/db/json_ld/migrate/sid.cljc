@@ -2,19 +2,18 @@
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.db.async-db :as async-db]
-            [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
             [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.json-ld.reify :as reify]
-            [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.ledger :as ledger]
+            [fluree.db.connection :as connection]
             [fluree.db.query.exec.update :as update]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.core :as util :refer [get-first get-id get-first-id get-first-value]]
+            [fluree.db.util.log :as log]
+            [fluree.db.commit.storage :as commit-storage]))
 
 (defrecord NamespaceMapping [mapping]
   iri/IRICodec
@@ -40,15 +39,11 @@
 (defn migrate-commit
   "Turns the data from the commit into flakes and re-generates the commit to include all
   the necessary information."
-  [ledger db [commit _proof]]
+  [ledger db [commit _proof db-data]]
   (go-try
-    (let [db-address         (-> commit
-                                 (get-first const/iri-data)
-                                 (get-first-value const/iri-address))
-
-          db-data            (<? (flake-db/read-db (:conn db) db-address))
+    (let [commit-id          (get-id commit)
           t-new              (flake-db/db-t db-data)
-          _ (log/info "Migrating commit " db-address " at t " t-new)
+          _ (log/info "Migrating commit " commit-id " at t " t-new)
 
           ;; the ns-mapping has all the parts of the db necessary for create-flakes to encode iris properly
           ns-mapping         (db->namespace-mapping db)
@@ -99,7 +94,7 @@
           staged-db          (-> (<? (flake.transact/final-db db all-flakes tx-state))
                                  :db-after
                                  (set-namespaces ns-mapping))
-          committed-db       (<? (jld-ledger/commit! ledger staged-db
+          committed-db       (<? (connection/commit! ledger staged-db
                                                      {:time (get-first-value commit const/iri-time)}))]
       (if (async-db/db? committed-db)
         (<? (async-db/deref-async committed-db))
@@ -110,7 +105,7 @@
   [ledger branch tuples-chans]
   (go-try
     (loop [[[commit-tuple ch] & r] tuples-chans
-           db (let [current-db (jld-ledger/current-db ledger)]
+           db (let [current-db (ledger/current-db ledger)]
                 (if (async-db/db? current-db)
                   (<? (async-db/deref-async current-db))
                   current-db))]
@@ -129,34 +124,34 @@
   along the way and rewriting the commit chain to use the newer commit structure."
   ([conn ledger-alias indexing-opts]
    (migrate conn ledger-alias indexing-opts false nil))
-  ([conn ledger-alias indexing-opts force changes-ch]
+  ([{:keys [store] :as conn} ledger-alias indexing-opts force changes-ch]
    (go-try
-     (let [ledger-address    (<? (nameservice/primary-address conn ledger-alias nil))
-           last-commit-addr  (<? (nameservice/lookup-commit conn ledger-address))
-           last-commit-tuple (<? (reify/read-commit conn last-commit-addr))
-           last-commit       (first last-commit-tuple)
-           version           (get-first-value last-commit const/iri-v)]
+     (let [ledger-address       (<? (connection/primary-address conn ledger-alias))
+           last-commit-addr     (<? (connection/lookup-commit conn ledger-address))
+           last-verified-commit (<? (commit-storage/read-commit-jsonld store last-commit-addr))
+           last-commit          (first last-verified-commit)
+           version              (get-first-value last-commit const/iri-v)]
        (if (and (= version commit-data/commit-version) (not force))
          (log/info :migrate/sid "ledger" ledger-alias "already migrated. Version:" version)
-         (let [last-data-stats (-> last-commit
-                                   (get-first const/iri-data)
-                                   (update-keys {const/iri-t :t const/iri-size :size const/iri-flakes :flakes})
-                                   (select-keys [:t :size :flakes])
-                                   (update-vals (comp :value first)))
-               all-commit-tuples (<? (reify/trace-commits conn last-commit-tuple 1))
-               first-commit (ffirst all-commit-tuples)
-               branch (or (keyword (get-first-value first-commit const/iri-branch))
-                          :main)
-               ledger (<? (jld-ledger/create* conn ledger-alias
-                                              {:did nil
-                                               :branch branch
-                                               :indexing indexing-opts
-                                               ::time (get-first-value first-commit const/iri-time)}))
-               tuples-chans (map (fn [commit-tuple]
-                                   [commit-tuple (when changes-ch (async/chan))])
-                                 all-commit-tuples)
-               _ (log/info :migrate/sid "ledger" ledger-alias "before stats:" last-data-stats)
-               indexed-db (<? (migrate-commits ledger branch tuples-chans))]
+         (let [last-data-stats   (-> last-commit
+                                     (get-first const/iri-data)
+                                     (update-keys {const/iri-t :t const/iri-size :size const/iri-flakes :flakes})
+                                     (select-keys [:t :size :flakes])
+                                     (update-vals (comp :value first)))
+               all-commit-tuples (<? (commit-storage/trace-commits store last-commit 1))
+               first-commit      (ffirst all-commit-tuples)
+               branch            (or (keyword (get-first-value first-commit const/iri-branch))
+                                     :main)
+               ledger            (<? (ledger/create conn {:alias    ledger-alias
+                                                          :did      nil
+                                                          :branch   branch
+                                                          :indexing indexing-opts
+                                                          ::time    (get-first-value first-commit const/iri-time)}))
+               tuples-chans      (map (fn [commit-tuple]
+                                        [commit-tuple (when changes-ch (async/chan))])
+                                      all-commit-tuples)
+               _                 (log/info :migrate/sid "ledger" ledger-alias "before stats:" last-data-stats)
+               indexed-db        (<? (migrate-commits ledger branch tuples-chans))]
            (log/info :migrate/sid "ledger" ledger-alias "after stats:" (:stats indexed-db))
            (when changes-ch
              (-> (map second tuples-chans)

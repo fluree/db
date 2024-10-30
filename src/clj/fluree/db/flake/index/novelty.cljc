@@ -293,7 +293,7 @@
 
 (defn write-node
   "Writes `node` to storage, and puts any errors onto the `error-ch`"
-  [db idx node updated-ids changes-ch error-ch]
+  [{:keys [index-catalog alias] :as _db} idx node updated-ids changes-ch error-ch]
   (go
     (let [node         (dissoc node ::old-id)
           t            (:t node)
@@ -301,13 +301,13 @@
       (try*
         (if (index/leaf? node)
           (do (log/debug "Writing index leaf:" display-node)
-              (let [write-response (<? (storage/write-leaf db idx node))]
+              (let [write-response (<? (storage/write-leaf index-catalog alias idx node))]
                 (<! (notify-new-index-file write-response :leaf t changes-ch))
                 (update-node-id node write-response)))
 
           (do (log/debug "Writing index branch:" display-node)
               (let [node*          (update-child-ids updated-ids node)
-                    write-response (<? (storage/write-branch db idx node*))]
+                    write-response (<? (storage/write-branch index-catalog alias idx node*))]
                 (<! (notify-new-index-file write-response :branch t changes-ch))
                 (update-node-id node* write-response))))
 
@@ -336,12 +336,12 @@
       (assoc stats :root (index/unresolve last-node)))))
 
 (defn refresh-index
-  [{:keys [conn] :as db} changes-ch error-ch {::keys [idx t novelty root]}]
+  [{:keys [index-catalog] :as db} changes-ch error-ch {::keys [idx t novelty root]}]
   (let [refresh-xf (comp (map preserve-id)
                          (integrate-novelty t novelty))
         novel?     (fn [node]
                      (seq (index/novelty-subrange node t novelty)))]
-    (->> (index/tree-chan conn root novel? 1 refresh-xf error-ch)
+    (->> (index/tree-chan index-catalog root novel? 1 refresh-xf error-ch)
          (write-resolved-nodes db idx changes-ch error-ch))))
 
 (defn extract-root
@@ -392,15 +392,16 @@
 
                 refresh-ch
                 ([{:keys [garbage], refreshed-db :db, :as _status}]
-                 (let [refreshed-db* (assoc-in refreshed-db [:stats :indexed] t)
+                 (let [{:keys [index-catalog alias branch] :as refreshed-db*}
+                       (assoc-in refreshed-db [:stats :indexed] t)
                        ;; TODO - ideally issue garbage/root writes to RAFT together
                        ;;        as a tx, currently requires waiting for both
                        ;;        through raft sync
                        garbage-res   (when (seq garbage)
-                                       (let [write-res (<? (storage/write-garbage refreshed-db* garbage))]
+                                       (let [write-res (<? (storage/write-garbage index-catalog alias branch t garbage))]
                                          (<! (notify-new-index-file write-res :garbage t changes-ch))
                                          write-res))
-                       db-root-res   (<? (storage/write-db-root refreshed-db* (:address garbage-res)))
+                       db-root-res   (<? (storage/write-db-root index-catalog refreshed-db* (:address garbage-res)))
                        _             (<! (notify-new-index-file db-root-res :root t changes-ch))
 
                        index-address (:address db-root-res)

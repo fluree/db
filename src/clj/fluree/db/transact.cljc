@@ -8,7 +8,7 @@
 
 (defprotocol Transactable
   (-stage-txn [db fuel-tracker context identity author annotation raw-txn parsed-txn])
-  (-merge-commit [db commit] [db commit proof]))
+  (-merge-commit [db commit-jsonld commit-data-jsonld]))
 
 (defn nested-nodes?
   "Returns truthy if the provided node has any nested nodes."

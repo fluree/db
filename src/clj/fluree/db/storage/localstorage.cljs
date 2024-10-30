@@ -1,20 +1,41 @@
 (ns fluree.db.storage.localstorage
   (:refer-clojure :exclude [read list])
   (:require [clojure.core.async :as async :refer [go]]
-            [clojure.string :as str]
             [fluree.crypto :as crypto]
+            [fluree.db.util.json :as json]
             [fluree.db.platform :as platform]
             [fluree.db.storage :as storage]))
 
 (def method-name "localstorage")
 
 (defn local-storage-address
-  [path]
-  (storage/build-fluree-address method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord LocalStorageStore []
-  storage/Store
-  (write [_ k v]
+(defrecord LocalStorageStore [identifier]
+  storage/Addressable
+  (location [_]
+    (storage/build-location storage/fluree-namespace identifier method-name))
+
+  storage/Identifiable
+  (identifiers [_]
+    #{identifier})
+
+  storage/JsonArchive
+  (-read-json [_ address keywordize?]
+    (go
+      (let [path (storage/get-local-path address)]
+        (when-let [data (.getItem js/localStorage path)]
+          (json/parse data keywordize?)))))
+
+  storage/EraseableStore
+  (delete [_ address]
+    (go
+      (let [path (storage/get-local-path address)]
+        (.removeItem js/localStorage path))))
+
+  storage/ContentAddressedStore
+  (-content-write-bytes [_ k v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v
@@ -22,33 +43,15 @@
             hash     (crypto/sha2-256 hashable)]
         (.setItem js/localStorage k v)
         {:path    k
-         :address (local-storage-address k)
+         :address (local-storage-address identifier k)
          :hash    hash
-         :size    (count hashable)})))
-
-  (list [_ prefix]
-    (go
-      (->> (js/Object.keys js/localstorage)
-           (filter #(str/starts-with? % prefix)))))
-
-  (read [_ address]
-    (go
-      (let [path (:local (storage/parse-address address))]
-        (.getItem js/localStorage path))))
-
-  (delete [_ address]
-    (go
-      (let [path (:local (storage/parse-address address))]
-        (.removeItem js/localStorage path))))
-
-  (exists? [store address]
-    (go
-      (let [path (:local (storage/parse-address address))]
-        (boolean (storage/read store path))))))
+         :size    (count hashable)}))))
 
 (defn open
-  [config]
-  (if-not platform/BROWSER
-    (throw (ex-info "LocalStorageStore is only supported on the Browser platform."
-                    {:config config}))
-    (->LocalStorageStore)))
+  ([]
+   (open nil))
+  ([identifier]
+   (if-not platform/BROWSER
+     (throw (ex-info "LocalStorageStore is only supported on the Browser platform."
+                     {}))
+     (->LocalStorageStore identifier))))

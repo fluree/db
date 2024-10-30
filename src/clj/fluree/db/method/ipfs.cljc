@@ -1,4 +1,4 @@
-(ns fluree.db.method.ipfs.core
+(ns fluree.db.method.ipfs
   (:refer-clojure :exclude [read])
   (:require [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.util.async :refer [<? go-try]]
@@ -89,7 +89,7 @@
                                (some #(when (re-matches #"^fluree:ipns:.+" %) %)))
          t                (get data "t")
          {:keys [ipns-address relative-address]} (address-parts my-ns-iri)
-         {ipfs-cid :local} (storage/parse-address address)
+         ipfs-cid         (storage/get-local-path address)
          approx-file-size (count (json/stringify commit-map))
          current-dag-map  (<? (ipfs-dir/refresh-state ipfs-endpoint (str "/ipns/" ipns-address)))
          updated-dir-map  (<? (ipfs-dir/update-directory! current-dag-map ipfs-endpoint relative-address ipfs-cid approx-file-size))

@@ -566,18 +566,26 @@
 
 (defn ->typed-val
   ([value] (->TypedValue value (datatype/infer-iri value) nil))
-  ([value dt-iri] (->TypedValue value dt-iri nil))
-  ([value dt-iri lang] (->TypedValue value dt-iri lang)))
+  ([value dt-iri]
+   (->TypedValue (when (some? value) (datatype/coerce value dt-iri)) dt-iri nil))
+  ([value dt-iri lang]
+   (->TypedValue (when (some? value) (datatype/coerce value dt-iri)) dt-iri lang)))
 
 (defmethod match-pattern :filter
   [_ds _fuel-tracker solution pattern error-ch]
   (go
     (let [f (pattern-data pattern)]
       (try*
+        (def solution solution)
         (let [result (f solution)]
           (when result
             solution))
         (catch* e (>! error-ch (filter-exception e solution f)))))))
+
+(comment
+  solution
+  {?s #:fluree.db.query.exec.where{:var ?s, :sids {"non-serializable-values" #fluree/SID [101 "2"]}, :iri "ex:2"},
+   ?date #:fluree.db.query.exec.where{:var ?date, :t 1, :meta nil, :val #time/date "2022-12-12", :datatype-iri "http://www.w3.org/2001/XMLSchema#date"}})
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the

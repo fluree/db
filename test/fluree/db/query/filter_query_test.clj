@@ -213,4 +213,70 @@
                                           {:ex "http://example.org/ns/"}]
                                 :select  {"?s" ["*"]}
                                 :where   [{:id "?s", :ex/favColor "?color"}
-                                          [:filter "(strStarts ?color \"B\")"]]}))))))
+                                          [:filter "(strStarts ?color \"B\")"]]}))))
+    (testing "data expression"
+      (is (= [["Brian" 50]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '[?name ?age]
+                                :where   '[{:type        :ex/User
+                                            :schema/age  ?age
+                                            :schema/name ?name}
+                                           [:filter ["expr" [">" "?age" ["/" ["+" "?age" 47] 2]]]]]}))
+          "string atoms")
+
+      (is (= [["Brian" 50]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '[?name ?age]
+                                :where   '[{:type        :ex/User
+                                            :schema/age  ?age
+                                            :schema/name ?name}
+                                           [:filter ["expr" ["in" "?age" [50 2 3]]]]]}))
+          "in expression")
+      (is (= [{:type         :ex/User
+               :schema/email "cam@example.org"
+               :ex/favNums   [5 10]
+               :schema/age   34
+               :ex/last      "Jones"
+               :schema/name  "Cam"
+               :id           :ex/cam
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
+               :ex/favColor  "Blue"}]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  {"?s" ["*"]}
+                                :where   [{:id "?s", :ex/favColor "?color"}
+                                          [:filter ["expr" ["strStarts" "?color" "B"]]]]}))
+          "no quoting necessary")
+      (is (= [{:type         :ex/User
+               :schema/email "cam@example.org"
+               :ex/favNums   [5 10]
+               :schema/age   34
+               :ex/last      "Jones"
+               :schema/name  "Cam"
+               :id           :ex/cam
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
+               :ex/favColor  "Blue"}]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  {"?s" ["*"]}
+                                :where   [{:id "?s", :ex/favColor "?color"}
+                                          [:filter ["expr" ["strStarts" "?color" {"@value" "B" "@language" "en"}]]]]}))
+          "with value maps"))))
+
+(deftest non-serializable-value-literals
+  (let [conn @(fluree/connect {:method :memory})
+        db   @(fluree/create-with-txn conn {"@context" test-utils/default-str-context
+                                            "ledger" "non-serializable-values"
+                                            "insert" [{"@id" "ex:1"
+                                                       "ex:start" {"@value" "2023-12-12" "@type" "xsd:date"}}
+                                                      {"@id" "ex:2"
+                                                       "ex:start" {"@value" "2022-12-12" "@type" "xsd:date"}}
+                                                      {"@id" "ex:3"
+                                                       "ex:start" {"@value" "2023-08-12" "@type" "xsd:date"}}]})]
+    (is (= ["ex:3"]
+           @(fluree/query db {:context test-utils/default-str-context
+                              :select "?s",
+                              :where [{"@id" "?s", "ex:start" "?date"}
+                                      [:filter "(and (>= ?date {\"@value\" \"2023-08-01\", \"@type\" \"xsd:date\"}) (<= ?date {\"@value\" \"2023-08-31\", \"@type\" \"xsd:date\"}))"]]})))))

@@ -245,12 +245,6 @@
   [commit commit-id]
   (assoc commit :id commit-id))
 
-(defn update-commit-address
-  "Once a commit address is known, which might be after the commit is written
-  if IPFS, add the final address into the commit map."
-  [commit commit-address]
-  (assoc commit :address commit-address))
-
 (defn commit-json->commit-id
   [jld]
   (let [b32-hash (-> jld
@@ -277,7 +271,7 @@
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
-  [alias branch ns-addresses init-time]
+  [alias branch publish-addresses init-time]
   (let [commit-json  (->json-ld {:alias  alias
                                  :v      0
                                  :branch (if branch
@@ -290,7 +284,7 @@
                                  :ns     (mapv #(if (map? %)
                                                   %
                                                   {:id %})
-                                               ns-addresses)})
+                                               publish-addresses)})
         db-json      (get commit-json "data")
         dbid         (db-json->db-id db-json)
         commit-json* (assoc-in commit-json ["data" "id"] dbid)
