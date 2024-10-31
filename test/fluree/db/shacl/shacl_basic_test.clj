@@ -2849,7 +2849,7 @@ WORLD!")
                (ex-data db2)))))))
 
 (deftest multiple-and-encumbered-targets
-  (let [conn   @(fluree/connect {:method :memory})
+  (let [conn   @(fluree/connect-memory)
         ledger @(fluree/create conn "encumbered-targets")
         db0    (fluree/db ledger)]
     (testing "targetClass"
