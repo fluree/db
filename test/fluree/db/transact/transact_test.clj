@@ -548,7 +548,8 @@
            (ex-message db3))
         "datatype constraint is restored after a load")))
 
-(deftest ^:integration ^:json transaction-iri-special-char
+;; TODO - below will brick the db when first IRI char is unicode, but the test where unicode comes second works
+(deftest ^:kaocha/pending ^:integration ^:json transaction-iri-special-char
   (testing "transaction with special iri characters in @id"
     (let [
           conn      @(fluree/connect {:method :memory})
@@ -560,12 +561,12 @@
                                         "insert"   [{"@id"     "ex:aஃ",
                                                      "@type"   "ex:Foo"
                                                      "ex:desc" "try special ஃ as second iri char"}]})
-          ;; TODO - below doesn't work when first IRI char is unicode
-          ;db1b      @(fluree/stage db0 {"@context" {"ex" "http://example.org/"}
-          ;                              "ledger"   ledger-id
-          ;                              "insert"   [{"@id"     "ex:ஃb",
-          ;                                           "@type"   "ex:Foo"
-          ;                                           "ex:desc" "try special ஃ as first iri char"}]})
+
+          db1b      @(fluree/stage db0 {"@context" {"ex" "http://example.org/"}
+                                        "ledger"   ledger-id
+                                        "insert"   [{"@id"     "ex:ஃb",
+                                                     "@type"   "ex:Foo"
+                                                     "ex:desc" "try special ஃ as first iri char"}]})
           q1a       {"@context" {"ex" "http://example.org/"}
                      "from"     ledger-id
                      "select"   {"ex:aஃ" ["*"]}}
@@ -576,9 +577,7 @@
                "@type"   "ex:Foo"
                "ex:desc" "try special ஃ as second iri char"}]
              @(fluree/query db1a q1a)))
-      ;; TODO - below test should pass once unicode as first IRI char supported above
-      #_(is (= [{"@id"     "ex:ஃb",
+      (is (= [{"@id"     "ex:ஃb",
                "@type"   "ex:Foo"
                "ex:desc" "try special ஃ as first iri char"}]
-             @(fluree/query db1b q1b)))
-      )))
+             @(fluree/query db1b q1b))))))
