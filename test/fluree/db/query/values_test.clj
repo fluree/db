@@ -134,4 +134,10 @@
                                    "where" [{"@id" "?s" "ex:greeting" "?greet"}
                                             ["values"
                                              ["?greet" [{"@value" "Здраво" "@language" "sb"}]]]]}))
-            "language tag")))))
+            "language tag"))
+      (testing "with empty solution"
+        (is (= [["ex:liam" "Liam"] ["ex:cam" "Cam"]]
+               @(fluree/query db1 {"@context" context
+                                   "where" [["values" ["?name" ["Liam" "Cam"]]]
+                                            {"@id" "?s" "schema:name" "?name"}]
+                                   "select" ["?s" "?name"]})))))))
