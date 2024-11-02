@@ -323,11 +323,11 @@
   (-match-id [db fuel-tracker solution s-mch error-ch]
     (match/match-id db fuel-tracker solution s-mch error-ch))
 
-  (-match-triple [db fuel-tracker solution s-mch error-ch]
-    (match/match-triple db fuel-tracker solution s-mch error-ch))
+  (-match-triple [db fuel-tracker solution triple-mch error-ch]
+    (match/match-triple db fuel-tracker solution triple-mch error-ch))
 
-  (-match-class [db fuel-tracker solution s-mch error-ch]
-    (match/match-class db fuel-tracker solution s-mch error-ch))
+  (-match-class [db fuel-tracker solution class-mch error-ch]
+    (match/match-class db fuel-tracker solution class-mch error-ch))
 
   (-activate-alias [db alias']
     (cond

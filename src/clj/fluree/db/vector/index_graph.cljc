@@ -5,7 +5,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
             [clojure.core.async :as async]
-            [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.async :refer [<?]]
             [fluree.db.query.range :as query-range]
             [fluree.db.vector.scoring :as vector.score]
             [fluree.db.util.core :refer [try* catch*]]
@@ -33,10 +33,14 @@
    :distance   {::score-fn vector.score/euclidian-distance
                 ::sort-fn  result-sort}})
 
+(defn- subj-var
+  [triple]
+  (-> triple (nth 0) where/get-variable))
+
 (defn- prop-iri
   "Returns property IRI value from triple"
   [triple]
-  (-> triple (nth 1) ::where/iri))
+  (-> triple (nth 1) where/get-iri))
 
 (defn- obj-val
   [triple solution]
@@ -48,11 +52,11 @@
 
 (defn- obj-var
   [triple]
-  (-> triple (nth 2) ::where/var))
+  (-> triple (nth 2) where/get-variable))
 
 (defn- obj-iri
   [triple]
-  (-> triple (nth 2) ::where/iri))
+  (-> triple (nth 2) where/get-iri))
 
 (defn extract-metric
   "Takes the graph alias as a string and extracts the metric name from the
