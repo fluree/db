@@ -344,6 +344,9 @@
   (-aliases [_]
     [alias])
 
+  (-finalize [_ _ solution-ch]
+    solution-ch)
+
   where/Searcher
   (-search [s fuel-tracker solution index-alias search-graph error-ch]
     (index-graph/search s fuel-tracker solution index-alias search-graph error-ch))

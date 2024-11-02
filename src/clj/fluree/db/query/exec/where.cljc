@@ -279,7 +279,8 @@
   (-match-triple [s fuel-tracker solution triple error-ch])
   (-match-class [s fuel-tracker solution triple error-ch])
   (-activate-alias [s alias])
-  (-aliases [s]))
+  (-aliases [s])
+  (-finalize [s error-ch solution-ch]))
 
 (defprotocol Searcher
   (-search [s fuel-tracker solution graph-alias search-graph error-ch]))
@@ -612,12 +613,13 @@
   [ds fuel-tracker solution clause error-ch]
   (let [initial-ch (async/to-chan! [solution])
         {subquery-patterns true
-         other-patterns false} (group-by subquery? clause)]
-    (reduce (fn [solution-ch pattern]
-              (with-constraint ds fuel-tracker pattern error-ch solution-ch))
-            initial-ch
-            ;; process subqueries before other patterns
-            (into (vec subquery-patterns) other-patterns))))
+         other-patterns false} (group-by subquery? clause)
+        result-ch (reduce (fn [solution-ch pattern]
+                            (with-constraint ds fuel-tracker pattern error-ch solution-ch))
+                          initial-ch
+                          ;; process subqueries before other patterns
+                          (into (vec subquery-patterns) other-patterns))]
+    (-finalize ds error-ch result-ch)))
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
