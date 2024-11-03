@@ -77,6 +77,10 @@
   [solution]
   (::flat-rank solution))
 
+(defn clear-search-params
+  [solution]
+  (dissoc solution ::flat-rank))
+
 (defn format-result
   [f score]
   {:id    (flake/s f)
@@ -142,7 +146,7 @@
     (go (match-search-triple solution triple)))
 
   (-finalize [_ error-ch solution-ch]
-    (let [out-ch (async/chan)]
+    (let [out-ch (async/chan 1 (map clear-search-params))]
       (async/pipeline-async 2
                             out-ch
                             (fn [solution ch]
@@ -185,7 +189,7 @@
     (go (match-search-triple solution triple)))
 
   (-finalize [_ error-ch solution-ch]
-    (let [out-ch (async/chan)]
+    (let [out-ch (async/chan 1 (map clear-search-params))]
       (async/pipeline-async 2
                             out-ch
                             (fn [solution ch]
@@ -228,7 +232,7 @@
     (go (match-search-triple solution triple)))
 
   (-finalize [_ error-ch solution-ch]
-    (let [out-ch (async/chan)]
+    (let [out-ch (async/chan 1 (map clear-search-params))]
       (async/pipeline-async 2
                             out-ch
                             (fn [solution ch]
