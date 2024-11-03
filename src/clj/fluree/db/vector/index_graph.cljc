@@ -22,8 +22,13 @@
 
 (def flatrank-vg-re (re-pattern "##Flatrank-(.*)"))
 
-(def result-sort (fn [a b] (compare (get a :score) (get b :score))))
-(def reverse-result-sort (fn [a b] (compare (get b :score) (get a :score))))
+(defn result-sort
+  [a b]
+  (compare (:score a) (:score b)))
+
+(defn reverse-result-sort
+  [a b]
+  (compare (:score b) (:score a)))
 
 (def metrics
   {:dotproduct {::score-fn vector.score/dotproduct
