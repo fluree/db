@@ -282,9 +282,6 @@
   (-aliases [s])
   (-finalize [s error-ch solution-ch]))
 
-(defprotocol Searcher
-  (-search [s fuel-tracker solution graph-alias search-graph error-ch]))
-
 (defn matcher?
   [x]
   (satisfies? Matcher x))
@@ -625,10 +622,7 @@
   [ds alias fuel-tracker solution clause error-ch]
   (try*
     (let [alias-ds (-activate-alias ds alias)]
-      (if (virtual-graph? alias)
-        (let [graph-pattern (->pattern :index-graph [alias clause])]
-          (match-pattern alias-ds fuel-tracker solution graph-pattern error-ch))
-        (match-clause alias-ds fuel-tracker solution clause error-ch)))
+      (match-clause alias-ds fuel-tracker solution clause error-ch))
     (catch* e
             (if (ex-data e)
               (async/offer! error-ch e)
@@ -695,11 +689,6 @@
                                 alias-ch)
           out-ch))
       (match-alias ds g fuel-tracker solution clause error-ch))))
-
-(defmethod match-pattern :index-graph
-  [ds fuel-tracker solution pattern error-ch]
-  (let [[g clause] (pattern-data pattern)]
-    (-search ds fuel-tracker solution g clause error-ch)))
 
 (defmethod match-pattern :union
   [db fuel-tracker solution pattern error-ch]
