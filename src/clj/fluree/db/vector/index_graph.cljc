@@ -5,12 +5,11 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.async :refer [<?]]
             [fluree.db.query.range :as query-range]
             [fluree.db.vector.scoring :as vector.score]
             [fluree.db.util.core :refer [try* catch*]]
-            [fluree.db.util.log :as log]
-            [fluree.db.vector.index-graph :as index-graph]))
+            [fluree.db.util.log :as log]))
 
 (def iri-search (str iri/f-idx-ns "search"))
 (def iri-property (str iri/f-idx-ns "property"))

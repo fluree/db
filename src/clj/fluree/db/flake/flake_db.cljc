@@ -369,8 +369,8 @@
       (let [epoch-datetime (util/str->epoch-ms datetime)
             current-time   (util/current-time-millis)
             [start end]    (if (< epoch-datetime current-time)
-                          [epoch-datetime current-time]
-                          [current-time epoch-datetime])
+                             [epoch-datetime current-time]
+                             [current-time epoch-datetime])
             flakes         (-> db
                                policy/root
                                (query-range/index-range
