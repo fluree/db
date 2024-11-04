@@ -620,9 +620,9 @@
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
-  (-> ds
-      (-activate-alias alias)
-      (match-clause fuel-tracker solution clause error-ch)))
+  (if-let [graph (-activate-alias ds alias)]
+    (match-clause graph fuel-tracker solution clause error-ch)
+    nil-channel))
 
 (defmethod match-pattern :exists
   [ds fuel-tracker solution pattern error-ch]
