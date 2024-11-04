@@ -99,15 +99,16 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-          mods         (<? (modified-subjects (policy/root db) add))
+          mods-ch      (modified-subjects (policy/root db) add) ;; kick off mods in background
           db-after     (-> db
                            (update :staged conj [txn author annotation])
                            (assoc :t t
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
-                           (commit-data/add-tt-id)
-                           (vocab/hydrate-schema add mods))]
-      {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
+                           (commit-data/add-tt-id))
+          mods         (<? mods-ch)
+          db-after*    (vocab/hydrate-schema db-after add mods)]
+      {:add add :remove remove :db-after db-after* :db-before db-before :mods mods :context context})))
 
 (defn validate-db-update
   [{:keys [db-after db-before mods context] :as staged-map}]
