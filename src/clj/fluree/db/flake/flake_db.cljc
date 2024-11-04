@@ -300,10 +300,6 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
-(defn virtual-graph?
-  [graph-alias]
-  (str/starts-with? graph-alias "##"))
-
 (defrecord FlakeDB [index-catalog commit-catalog alias branch commit t tt-id stats
                     spot post opst tspo schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code
@@ -331,8 +327,8 @@
 
   (-activate-alias [db alias']
     (cond
-      (= alias alias')        db
-      (virtual-graph? alias') (index-graph db alias')))
+      (= alias alias')              db
+      (where/virtual-graph? alias') (index-graph db alias')))
 
   (-aliases [_]
     [alias])
