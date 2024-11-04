@@ -85,7 +85,7 @@
   (-aliases [ds]
     (names ds))
 
-  (-finalize [_ _ solution-ch]
+  (-finalize [_ _ _ solution-ch]
     solution-ch)
 
 

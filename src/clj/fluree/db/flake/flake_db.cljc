@@ -337,7 +337,7 @@
   (-aliases [_]
     [alias])
 
-  (-finalize [_ _ solution-ch]
+  (-finalize [_ _ _ solution-ch]
     solution-ch)
 
   transact/Transactable

@@ -145,7 +145,7 @@
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (go (match-search-triple solution triple)))
 
-  (-finalize [_ error-ch solution-ch]
+  (-finalize [_ _ error-ch solution-ch]
     (let [out-ch (async/chan 1 (map clear-search-params))]
       (async/pipeline-async 2
                             out-ch
@@ -188,7 +188,7 @@
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (go (match-search-triple solution triple)))
 
-  (-finalize [_ error-ch solution-ch]
+  (-finalize [_ _ error-ch solution-ch]
     (let [out-ch (async/chan 1 (map clear-search-params))]
       (async/pipeline-async 2
                             out-ch
@@ -231,7 +231,7 @@
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (go (match-search-triple solution triple)))
 
-  (-finalize [_ error-ch solution-ch]
+  (-finalize [_ _ error-ch solution-ch]
     (let [out-ch (async/chan 1 (map clear-search-params))]
       (async/pipeline-async 2
                             out-ch

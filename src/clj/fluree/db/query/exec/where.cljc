@@ -280,7 +280,7 @@
   (-match-class [s fuel-tracker solution triple error-ch])
   (-activate-alias [s alias])
   (-aliases [s])
-  (-finalize [s error-ch solution-ch]))
+  (-finalize [s fuel-tracker error-ch solution-ch]))
 
 (defn matcher?
   [x]
@@ -616,7 +616,7 @@
                           initial-ch
                           ;; process subqueries before other patterns
                           (into (vec subquery-patterns) other-patterns))]
-    (-finalize ds error-ch result-ch)))
+    (-finalize ds fuel-tracker error-ch result-ch)))
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
