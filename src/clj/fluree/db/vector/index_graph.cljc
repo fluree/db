@@ -1,14 +1,13 @@
 (ns fluree.db.vector.index-graph
   (:require [camel-snake-kebab.core :refer [->kebab-case-keyword]]
-            [clojure.core.async :as async :refer [<! >! go]]
-            [clojure.string :as str]
+            [clojure.core.async :as async :refer [>! go]]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.query.range :as query-range]
-            [fluree.db.vector.scoring :as vector.score]
+            [fluree.db.vector.scoring :refer [dot-product cosine-similarity euclidian-distance]]
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
@@ -98,27 +97,10 @@
    :score score
    :vec   (flake/o f)})
 
-(defn rank
-  [db search-params score-fn sort-fn error-ch]
-  (go
-    (try*
-      (let [{::keys [property search limit]} search-params
-
-            pid       (iri/encode-iri db property)
-            score-opt {:flake-xf (comp (map (partial score-fn search))
-                                       (remove nil?))}
-
-            ;; For now, pulling all matching values from full index
-            ;; once hitting the actual vector index, we'll only need
-            ;; to pull matches out of novelty (if that)
-            results (<? (query-range/index-range db :post = [pid] score-opt))
-            sorted  (sort sort-fn results)]
-        (if limit
-          (take limit sorted)
-          sorted))
-      (catch* e
-              (log/error e "Error ranking vectors")
-              (>! error-ch e)))))
+(defn score-flake
+  [score-fn v f]
+  (when-let [score (score-fn (flake/o f) v)]
+    (format-result f score)))
 
 (defn process-results
   [db solution parsed-search search-results]
@@ -138,18 +120,31 @@
                                               (where/match-value (:vec result) const/iri-vector)))))
          search-results)))
 
-(defn dot-product-score
-  [v f]
-  (when-let [score (vector.score/dot-product (flake/o f) v)]
-    (format-result f score)))
-
-(defn dot-product-rank
-  [db solution error-ch out-ch]
+(defn rank
+  [db score-fn sort-fn solution error-ch out-ch]
   (go
-    (let [search-params (get-search-params solution)]
-      (->> (<! (rank db search-params dot-product-score reverse-result-sort error-ch))
-           (process-results db solution search-params)
-           (async/onto-chan! out-ch)))))
+    (try*
+      (let [{::keys [property search limit] :as search-params}
+            (get-search-params solution)
+
+            pid       (iri/encode-iri db property)
+            score-opt {:flake-xf (comp (map (partial score-flake score-fn search))
+                                       (remove nil?))}
+
+            ;; For now, pulling all matching values from full index
+            ;; once hitting the actual vector index, we'll only need
+            ;; to pull matches out of novelty (if that)
+            results (<? (query-range/index-range db :post = [pid] score-opt))
+            sorted  (sort sort-fn results)
+            limited (if limit
+                      (take limit sorted)
+                      sorted)]
+        (->> limited
+             (process-results db solution search-params)
+             (async/onto-chan! out-ch)))
+      (catch* e
+              (log/error e "Error ranking vectors")
+              (>! error-ch e)))))
 
 (defrecord DotProductGraph [db]
   where/Matcher
@@ -157,7 +152,7 @@
     (go (match-search-triple solution triple)))
 
   (-finalize [_ _ error-ch solution-ch]
-    (finalize (partial dot-product-rank db) error-ch solution-ch))
+    (finalize (partial rank db dot-product reverse-result-sort) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
@@ -175,26 +170,13 @@
   [db]
   (->DotProductGraph db))
 
-(defn cosine-score
-  [v f]
-  (when-let [score (vector.score/cosine-similarity (flake/o f) v)]
-    (format-result f score)))
-
-(defn cosine-rank
-  [db solution error-ch out-ch]
-  (go
-    (let [search-params (get-search-params solution)]
-      (->> (<! (rank db search-params cosine-score reverse-result-sort error-ch))
-           (process-results db solution search-params)
-           (async/onto-chan! out-ch)))))
-
 (defrecord CosineGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (go (match-search-triple solution triple)))
 
   (-finalize [_ _ error-ch solution-ch]
-    (finalize (partial cosine-rank db) error-ch solution-ch))
+    (finalize (partial rank db cosine-similarity reverse-result-sort) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
@@ -212,26 +194,13 @@
   [db]
   (->CosineGraph db))
 
-(defn euclidean-score
-  [v f]
-  (when-let [score (vector.score/euclidian-distance (flake/o f) v)]
-    (format-result f score)))
-
-(defn euclidean-rank
-  [db solution error-ch out-ch]
-  (go
-    (let [search-params (get-search-params solution)]
-      (->> (<! (rank db search-params euclidean-score result-sort error-ch))
-           (process-results db solution search-params)
-           (async/onto-chan! out-ch)))))
-
 (defrecord EuclideanGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (go (match-search-triple solution triple)))
 
   (-finalize [_ _ error-ch solution-ch]
-    (finalize (partial euclidean-rank db) error-ch solution-ch))
+    (finalize (partial rank db euclidian-distance result-sort) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
