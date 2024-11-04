@@ -82,6 +82,16 @@
   [solution]
   (dissoc solution ::flat-rank))
 
+(defn finalize
+  [rank-af error-ch solution-ch]
+  (let [out-ch (async/chan 1 (map clear-search-params))]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [solution ch]
+                            (rank-af solution error-ch ch))
+                          solution-ch)
+    out-ch))
+
 (defn format-result
   [f score]
   {:id    (flake/s f)
@@ -147,13 +157,7 @@
     (go (match-search-triple solution triple)))
 
   (-finalize [_ _ error-ch solution-ch]
-    (let [out-ch (async/chan 1 (map clear-search-params))]
-      (async/pipeline-async 2
-                            out-ch
-                            (fn [solution ch]
-                              (dot-product-rank db solution error-ch ch))
-                            solution-ch)
-      out-ch))
+    (finalize (partial dot-product-rank db) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
@@ -190,13 +194,7 @@
     (go (match-search-triple solution triple)))
 
   (-finalize [_ _ error-ch solution-ch]
-    (let [out-ch (async/chan 1 (map clear-search-params))]
-      (async/pipeline-async 2
-                            out-ch
-                            (fn [solution ch]
-                              (cosine-rank db solution error-ch ch))
-                            solution-ch)
-      out-ch))
+    (finalize (partial cosine-rank db) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
@@ -233,13 +231,7 @@
     (go (match-search-triple solution triple)))
 
   (-finalize [_ _ error-ch solution-ch]
-    (let [out-ch (async/chan 1 (map clear-search-params))]
-      (async/pipeline-async 2
-                            out-ch
-                            (fn [solution ch]
-                              (euclidean-rank db solution error-ch ch))
-                            solution-ch)
-      out-ch))
+    (finalize (partial euclidean-rank db) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
