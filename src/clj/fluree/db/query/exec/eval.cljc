@@ -565,10 +565,10 @@
   [{x :value}]
   (where/->typed-val (nil? x)))
 
-(defn dotproduct
+(defn dot-product
   [{v1 :value} {v2 :value}]
   (where/->typed-val
-    (score/dotproduct v1 v2)))
+    (score/dot-product v1 v2)))
 
 (defn cosine-similarity
   [{v1 :value} {v2 :value}]
@@ -659,7 +659,7 @@
     max            fluree.db.query.exec.eval/max
     min            fluree.db.query.exec.eval/min
 
-    dotproduct         fluree.db.query.exec.eval/dotproduct
+    dot-product         fluree.db.query.exec.eval/dot-product
     cosine-similarity  fluree.db.query.exec.eval/cosine-similarity
     euclidian-distance fluree.db.query.exec.eval/euclidean-distance})
 
@@ -689,7 +689,7 @@
      str-lang str-dt bnode
 
      ;; vector scoring fns
-     dotproduct cosine-similarity euclidian-distance})
+     dot-product cosine-similarity euclidian-distance})
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))

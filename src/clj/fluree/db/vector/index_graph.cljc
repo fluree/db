@@ -1,5 +1,6 @@
 (ns fluree.db.vector.index-graph
-  (:require [clojure.core.async :as async :refer [<! >! go]]
+  (:require [camel-snake-kebab.core :refer [->kebab-case-keyword]]
+            [clojure.core.async :as async :refer [<! >! go]]
             [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -129,7 +130,7 @@
 
 (defn dot-product-score
   [v f]
-  (when-let [score (vector.score/dotproduct (flake/o f) v)]
+  (when-let [score (vector.score/dot-product (flake/o f) v)]
     (format-result f score)))
 
 (defn dot-product-rank
@@ -262,8 +263,7 @@
   [graph-alias]
   (some-> (re-find flatrank-vg-re graph-alias)
           second
-          str/lower-case
-          keyword))
+          ->kebab-case-keyword))
 
 (defn index-graph
   [db graph-alias]
@@ -272,7 +272,7 @@
       (= metric :cosine)
       (cosine-graph db)
 
-      (= metric :dotproduct)
+      (= metric :dot-product)
       (dot-product-graph db)
 
       (= metric :distance)

@@ -29,7 +29,7 @@
                                                 "@type"  const/iri-vector}]]
                      "where"    [{"@id"     "?x"
                                   "ex:xVec" "?vec"}
-                                 ["bind" "?score" "(dotproduct ?vec ?targetVec)"]]}
+                                 ["bind" "?score" "(dot-product ?vec ?targetVec)"]]}
             results @(fluree/query db query)]
         (is (= [["ex:bart" 0.61 [0.1, 0.9]]
                 ["ex:homer" 0.72 [0.6, 0.5]]]
@@ -43,7 +43,7 @@
                      "where"    [{"@id"     "?x"
                                   "ex:age"  36
                                   "ex:xVec" "?vec"}
-                                 ["bind" "?score" "(dotproduct ?vec ?targetVec)"]]}
+                                 ["bind" "?score" "(dot-product ?vec ?targetVec)"]]}
             results @(fluree/query db query)]
         (is (= [["ex:homer" 0.72 [0.6, 0.5]]]
                results))))
@@ -55,7 +55,7 @@
                                                 "@type"  const/iri-vector}]]
                      "where"    [{"@id"     "?x"
                                   "ex:xVec" "?vec"}
-                                 ["bind" "?score" "(dotproduct ?vec ?targetVec)"]
+                                 ["bind" "?score" "(dot-product ?vec ?targetVec)"]
                                  ["filter" "(> ?score 0.7)"]]}
             results @(fluree/query db query)]
         (is (= [["ex:homer" 0.72]]
@@ -85,7 +85,7 @@
                                                   "@type"  const/iri-vector}]]
                        "where"    [{"@id"     "?x"
                                     "ex:xVec" "?vec"}
-                                   ["bind" "?score" "(dotproduct ?vec ?targetVec)"]]
+                                   ["bind" "?score" "(dot-product ?vec ?targetVec)"]]
                        "orderBy"  "?score"}
               results @(fluree/query db query)]
           (is (= [["ex:bart" 0.61 [0.1, 0.9]]
@@ -149,7 +149,7 @@
                                                   "@type"  const/iri-vector}]]
                        "where"    [{"@id"     "?x"
                                     "ex:xVec" "?vec"}
-                                   ["bind" "?score" "(dotproduct ?vec ?targetVec)"]]
+                                   ["bind" "?score" "(dot-product ?vec ?targetVec)"]]
                        "orderBy"  "?score"}
               results @(fluree/query db query)]
           (is (= [["ex:lucy" nil "Not a Vector"]
