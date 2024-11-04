@@ -18,11 +18,14 @@
                          {:id             :ex/UserShape
                           :type           [:sh/NodeShape]
                           :sh/targetClass :ex/User
-                          :sh/not         [{:sh/path     :schema/companyName
+                          :sh/not         [{:id          :ex/pshape1
+                                            :sh/path     :schema/companyName
                                             :sh/minCount 1}
-                                           {:sh/path   :schema/name
+                                           {:id        :ex/pshape2
+                                            :sh/path   :schema/name
                                             :sh/equals :schema/callSign}]
-                          :sh/property    [{:sh/path     :schema/callSign
+                          :sh/property    [{:id          :ex/pshape3
+                                            :sh/path     :schema/callSign
                                             :sh/minCount 1
                                             :sh/maxCount 1
                                             :sh/datatype :xsd/string}]}})]
@@ -63,9 +66,9 @@
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-2"}]}}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape1"}]}}
                  (ex-data db-company-name)))
-          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-2."
+          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1."
                  (ex-message db-company-name)))))
       (testing "conforms to minCount"
         (let [db-two-names @(fluree/stage
@@ -76,7 +79,7 @@
                                 :type               [:ex/User],
                                 :schema/companyName ["John", "Johnny"]
                                 :schema/callSign    "j-rock"}})]
-          (is (= {:status 400,
+          (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
                   {:type        :sh/ValidationReport,
@@ -88,9 +91,9 @@
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-2"}]}}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape1"}]}}
                  (ex-data db-two-names)))
-          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-2."
+          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1."
                  (ex-message db-two-names)))))
       (testing "conforms to equals"
         (let [db-callsign-name @(fluree/stage
@@ -101,7 +104,7 @@
                                     :type            [:ex/User]
                                     :schema/name     "Johnny Boy"
                                     :schema/callSign "Johnny Boy"}})]
-          (is (= {:status 400,
+          (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
                   {:type        :sh/ValidationReport,
@@ -113,9 +116,9 @@
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-3"}]}}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape2"}]}}
                  (ex-data db-callsign-name)))
-          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-3."
+          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape2."
                  (ex-message db-callsign-name)))))))
 
   (testing "shacl not w/ value ranges works"
@@ -132,16 +135,17 @@
                          {:id             :ex/UserShape
                           :type           [:sh/NodeShape]
                           :sh/targetClass :ex/User
-                          :sh/not         [{:sh/path         :schema/age
+                          :sh/not         [{:id              :ex/pshape1
+                                            :sh/path         :schema/age
                                             :sh/minInclusive 130}
-                                           {:sh/path         :schema/favNums
+                                           {:id              :ex/pshape2
+                                            :sh/path         :schema/favNums
                                             :sh/maxExclusive 9000}]
-                          :sh/property    [{:sh/path     :schema/age
+                          :sh/property    [{:id          :ex/pshape3
+                                            :sh/path     :schema/age
                                             :sh/minCount 1
                                             :sh/maxCount 1
                                             :sh/datatype :xsd/integer}]}})
-
-
 
           db-two-probs @(fluree/stage
                           db
@@ -183,7 +187,7 @@
                               :schema/companyName "WrongCo"
                               :schema/callSign    "j-rock"
                               :schema/age         131}})]
-          (is (= {:status 400,
+          (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
                   {:type        :sh/ValidationReport,
@@ -195,17 +199,17 @@
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-10"}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape1"}
                     {:type                   :sh/ValidationResult,
                      :sh/resultSeverity      :sh/Violation,
                      :sh/focusNode           :ex/john,
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-11"}]}}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape2"}]}}
                  (ex-data db-too-old)))
-          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-10.
-Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-11."
+          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1.
+Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape2."
                  (ex-message db-too-old)))))
       (testing "conforms to max exclusive"
         (let [db-too-low @(fluree/stage
@@ -218,7 +222,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                               :schema/callSign    "j-rock"
                               :schema/age         27
                               :schema/favNums     [4 8 15 16 23 42]}})]
-          (is (= {:status 400,
+          (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
                   {:type        :sh/ValidationReport,
@@ -230,13 +234,13 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-11"}]}}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape2"}]}}
                  (ex-data db-too-low)))
-          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-11."
+          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape2."
                  (ex-message db-too-low)))))
       (testing "conforms to min and max exclusive"
         (let []
-          (is (= {:status 400,
+          (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
                   {:type        :sh/ValidationReport,
@@ -248,17 +252,17 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-10"}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape1"}
                     {:type                   :sh/ValidationResult,
                      :sh/resultSeverity      :sh/Violation,
                      :sh/focusNode           :ex/john,
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-11"}]}}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape2"}]}}
                  (ex-data db-two-probs)))
-          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-10.
-Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-11."
+          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1.
+Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape2."
                  (ex-message db-two-probs)))))))
 
   (testing "shacl not w/ string constraints works"
@@ -275,11 +279,14 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                          {:id             :ex/UserShape
                           :type           [:sh/NodeShape]
                           :sh/targetClass :ex/User
-                          :sh/not         [{:sh/path      :ex/tag
+                          :sh/not         [{:id           :ex/pshape1
+                                            :sh/path      :ex/tag
                                             :sh/minLength 4}
-                                           {:sh/path      :schema/name
+                                           {:id           :ex/pshape2
+                                            :sh/path      :schema/name
                                             :sh/maxLength 10}
-                                           {:sh/path    :ex/greeting
+                                           {:id         :ex/pshape3
+                                            :sh/path    :ex/greeting
                                             :sh/pattern "hello.*"}]}})]
       (testing "no constraint violations"
         (let [db-ok @(fluree/stage
@@ -305,7 +312,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                                     {:id          :ex/john,
                                      :type        [:ex/User],
                                      :schema/name "John"}})]
-          (is (= {:status 400,
+          (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
                   {:type        :sh/ValidationReport,
@@ -317,25 +324,25 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-18"}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape1"}
                     {:type                   :sh/ValidationResult,
                      :sh/resultSeverity      :sh/Violation,
                      :sh/focusNode           :ex/john,
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-19"}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape2"}
                     {:type                   :sh/ValidationResult,
                      :sh/resultSeverity      :sh/Violation,
                      :sh/focusNode           :ex/john,
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-20"}]}}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape3"}]}}
                  (ex-data db-name-too-short)))
-          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-18.
-Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-19.
-Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-20."
+          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1.
+Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape2.
+Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape3."
                  (ex-message db-name-too-short)))))
       (testing "tag conforms"
         (let [db-tag-too-long @(fluree/stage
@@ -345,7 +352,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                                   {:id     :ex/john,
                                    :type   [:ex/User],
                                    :ex/tag 12345}})]
-          (is (= {:status 400,
+          (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
                   {:type        :sh/ValidationReport,
@@ -357,25 +364,25 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-18"}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape1"}
                     {:type                   :sh/ValidationResult,
                      :sh/resultSeverity      :sh/Violation,
                      :sh/focusNode           :ex/john,
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-19"}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape2"}
                     {:type                   :sh/ValidationResult,
                      :sh/resultSeverity      :sh/Violation,
                      :sh/focusNode           :ex/john,
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-20"}]}}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape3"}]}}
                  (ex-data db-tag-too-long)))
-          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-18.
-Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-19.
-Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-20."
+          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1.
+Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape2.
+Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape3."
                  (ex-message db-tag-too-long)))))
       (testing "greeting conforms"
         (let [db-greeting-incorrect @(fluree/stage
@@ -385,7 +392,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                                         {:id          :ex/john,
                                          :type        [:ex/User],
                                          :ex/greeting "hello!"}})]
-          (is (= {:status 400,
+          (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
                   {:type        :sh/ValidationReport,
@@ -397,25 +404,25 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-18"}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape1"}
                     {:type                   :sh/ValidationResult,
                      :sh/resultSeverity      :sh/Violation,
                      :sh/focusNode           :ex/john,
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-19"}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape2"}
                     {:type                   :sh/ValidationResult,
                      :sh/resultSeverity      :sh/Violation,
                      :sh/focusNode           :ex/john,
                      :sh/constraintComponent :sh/not,
                      :sh/sourceShape         :ex/UserShape,
                      :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape _:fdb-20"}]}}
+                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape3"}]}}
                  (ex-data db-greeting-incorrect)))
-          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-18.
-Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-19.
-Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape _:fdb-20."
+          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1.
+Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape2.
+Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape3."
                  (ex-message db-greeting-incorrect))))))))
 
 (deftest ^:integration shacl-and-tests
@@ -428,13 +435,17 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                                     {"@id" "ex:andShape"
                                      "@type" "sh:NodeShape"
                                      "sh:targetNode" {"@id" "ex:a"}
-                                     "sh:and" [{"sh:path" {"@id" "ex:width"}
+                                     "sh:and" [{"id" "ex:pshape1"
+                                                "sh:path" {"@id" "ex:width"}
                                                 "sh:minCount" 1}
-                                               {"sh:path" {"@id" "ex:width"}
+                                               {"id" "ex:pshape2"
+                                                "sh:path" {"@id" "ex:width"}
                                                 "sh:datatype" {"@id" "xsd:integer"}}
-                                               {"sh:path" {"@id" "ex:height"}
+                                               {"id" "ex:pshape3"
+                                                "sh:path" {"@id" "ex:height"}
                                                 "sh:minCount" 1}
-                                               {"sh:path" {"@id" "ex:height"}
+                                               {"id" "ex:pshape4"
+                                                "sh:path" {"@id" "ex:height"}
                                                 "sh:datatype" {"@id" "xsd:integer"}}]}})]
     (testing "conforms to all shapes"
       (let [db2 @(fluree/stage db1 {"@context" context
@@ -444,7 +455,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
     (testing "conforms to only two shapes"
       (let [db2 @(fluree/stage db1 {"@context" context
                                     "insert" {"@id" "ex:a" "ex:height" 3}})]
-        (is (= {:status 400,
+        (is (= {:status 422,
                 :error :shacl/violation,
                 :report
                 {"type" "sh:ValidationReport",
@@ -457,9 +468,9 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                    "sh:sourceShape" "ex:andShape",
                    "sh:value" "ex:a",
                    "sh:resultMessage"
-                   "ex:a failed to conform to all sh:and shapes: [\"_:fdb-2\" \"_:fdb-3\" \"_:fdb-4\" \"_:fdb-5\"]"}]}}
+                   "ex:a failed to conform to all sh:and shapes: [\"ex:pshape1\" \"ex:pshape2\" \"ex:pshape3\" \"ex:pshape4\"]"}]}}
                (ex-data db2)))
-        (is (= "Subject ex:a violates constraint sh:and of shape ex:andShape - ex:a failed to conform to all sh:and shapes: [\"_:fdb-2\" \"_:fdb-3\" \"_:fdb-4\" \"_:fdb-5\"]."
+        (is (= "Subject ex:a violates constraint sh:and of shape ex:andShape - ex:a failed to conform to all sh:and shapes: [\"ex:pshape1\" \"ex:pshape2\" \"ex:pshape3\" \"ex:pshape4\"]."
                (ex-message db2)))))))
 
 (deftest ^:integration shacl-or-tests
@@ -472,24 +483,27 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                                     {"@id" "ex:orShape"
                                      "@type" "sh:NodeShape"
                                      "sh:targetClass" {"@id" "ex:Dimensional"}
-                                     "sh:or" [{"sh:path" {"@id" "ex:height"}
+                                     "sh:or" [{"id" "ex:pshape1"
+                                               "sh:path" {"@id" "ex:height"}
                                                "sh:minCount" 1
                                                "sh:datatype" {"@id" "xsd:integer"}}
-                                              {"sh:path" {"@id" "ex:width"}
+                                              {"id" "ex:pshape2"
+                                               "sh:path" {"@id" "ex:width"}
                                                "sh:minCount" 1
                                                "sh:datatype" {"@id" "xsd:integer"}}
-                                              {"sh:path" {"@id" "ex:depth"}
+                                              {"id" "ex:pshape3"
+                                               "sh:path" {"@id" "ex:depth"}
                                                "sh:minCount" 1
                                                "sh:datatype" {"@id" "xsd:integer"}}]}})]
     (testing "conforms to one shape"
       (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert" {"@type" "ex:Dimensional" "ex:height" 8}})]
+                                    "insert" {"@id" "ex:1" "@type" "ex:Dimensional" "ex:height" 8}})]
         (is (nil? (ex-data db2)))))
 
     (testing "conforms to no shapes"
       (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert" {"@type" "ex:Dimensional" "ex:bigness" "yup it's big"}})]
-        (is (= {:status 400,
+                                    "insert" {"@id" "ex:2" "@type" "ex:Dimensional" "ex:bigness" "yup it's big"}})]
+        (is (= {:status 422,
                 :error :shacl/violation,
                 :report
                 {"type" "sh:ValidationReport",
@@ -497,13 +511,13 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                  "sh:result"
                  [{"type" "sh:ValidationResult",
                    "sh:resultSeverity" "sh:Violation",
-                   "sh:focusNode" "_:fdb-8",
+                   "sh:focusNode" "ex:2",
                    "sh:constraintComponent" "sh:or",
                    "sh:sourceShape" "ex:orShape",
-                   "sh:value" "_:fdb-8",
-                   "sh:resultMessage" "_:fdb-8 failed to conform to any of the following shapes: [\"_:fdb-2\" \"_:fdb-3\" \"_:fdb-4\"]"}]}}
+                   "sh:value" "ex:2",
+                   "sh:resultMessage" "ex:2 failed to conform to any of the following shapes: [\"ex:pshape1\" \"ex:pshape2\" \"ex:pshape3\"]"}]}}
                (ex-data db2)))
-        (is (= "Subject _:fdb-8 violates constraint sh:or of shape ex:orShape - _:fdb-8 failed to conform to any of the following shapes: [\"_:fdb-2\" \"_:fdb-3\" \"_:fdb-4\"]."
+        (is (= "Subject ex:2 violates constraint sh:or of shape ex:orShape - ex:2 failed to conform to any of the following shapes: [\"ex:pshape1\" \"ex:pshape2\" \"ex:pshape3\"]."
                (ex-message db2)))))))
 
 (deftest ^:integration shacl-xone-tests
@@ -535,7 +549,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
     (testing "conforms to no shapes"
       (let [db2 @(fluree/stage db1 {"@context" context
                                     "insert"   {"@id" "ex:Named" "ex:nickname" "Father G"}})]
-        (is (= {:status 400,
+        (is (= {:status 422,
                 :error :shacl/violation,
                 :report
                 {"type" "sh:ValidationReport",
@@ -558,7 +572,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                                                 "ex:fullName"  "George Washington"
                                                 "ex:firstName" "George"
                                                 "ex:lastName"  "Washington"}})]
-        (is (= {:status 400,
+        (is (= {:status 422,
                 :error :shacl/violation,
                 :report
                 {"type" "sh:ValidationReport",
