@@ -120,6 +120,12 @@
                                               (where/match-value (:vec result) const/iri-vector)))))
          search-results)))
 
+(defn limit-results
+  [limit results]
+  (if limit
+    (take limit results)
+    results))
+
 (defn rank
   [db score-fn sort-fn solution error-ch out-ch]
   (go
@@ -130,23 +136,20 @@
             pid       (iri/encode-iri db property)
             score-opt {:flake-xf (comp (map (partial score-flake score-fn search))
                                        (remove nil?))}
-
-            ;; For now, pulling all matching values from full index
-            ;; once hitting the actual vector index, we'll only need
-            ;; to pull matches out of novelty (if that)
-            results (<? (query-range/index-range db :post = [pid] score-opt))
-            sorted  (sort sort-fn results)
-            limited (if limit
-                      (take limit sorted)
-                      sorted)]
-        (->> limited
+            ;; For now, pulling all matching values from full index once hitting
+            ;; the actual vector index, we'll only need to pull matches out of
+            ;; novelty (if that)
+            vectors   (<? (query-range/index-range db :post = [pid] score-opt))]
+        (->> vectors
+             (sort sort-fn)
+             (limit-results limit)
              (process-results db solution search-params)
              (async/onto-chan! out-ch)))
       (catch* e
               (log/error e "Error ranking vectors")
               (>! error-ch e)))))
 
-(defrecord DotProductGraph [db]
+(defrecord DotProductFlatRankGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (go (match-search-triple solution triple)))
@@ -166,11 +169,11 @@
   (-aliases [_]
     (where/-aliases db)))
 
-(defn dot-product-graph
+(defn dot-product-flat-rank-graph
   [db]
-  (->DotProductGraph db))
+  (->DotProductFlatRankGraph db))
 
-(defrecord CosineGraph [db]
+(defrecord CosineFlatRankGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (go (match-search-triple solution triple)))
@@ -190,11 +193,11 @@
   (-aliases [_]
     (where/-aliases db)))
 
-(defn cosine-graph
+(defn cosine-flat-rank-graph
   [db]
-  (->CosineGraph db))
+  (->CosineFlatRankGraph db))
 
-(defrecord EuclideanGraph [db]
+(defrecord EuclideanFlatRankGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (go (match-search-triple solution triple)))
@@ -214,9 +217,9 @@
   (-aliases [_]
     (where/-aliases db)))
 
-(defn euclidean-graph
+(defn euclidean-flat-rank-graph
   [db]
-  (->EuclideanGraph db))
+  (->EuclideanFlatRankGraph db))
 
 (defn extract-metric
   "Takes the graph alias as a string and extracts the metric name from the
@@ -231,10 +234,10 @@
   (let [metric (extract-metric graph-alias)]
     (cond
       (= metric :cosine)
-      (cosine-graph db)
+      (cosine-flat-rank-graph db)
 
       (= metric :dot-product)
-      (dot-product-graph db)
+      (dot-product-flat-rank-graph db)
 
       (= metric :distance)
-      (euclidean-graph db))))
+      (euclidean-flat-rank-graph db))))
