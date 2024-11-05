@@ -78,7 +78,7 @@
 (defn add-flakes
   [leaf flakes]
   (let [new-leaf (-> leaf
-                     (update :flakes flake/conj-all flakes)
+                     (update :flakes into flakes)
                      (update :size (fn [size]
                                      (->> flakes
                                           (map flake/size-flake)
@@ -245,7 +245,7 @@
   transactions `from-t` and `to-t`."
   ([{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
    (let [latest       (if (> to-t leaf-t)
-                        (flake/conj-all flakes (novelty-subrange leaf to-t novelty))
+                        (into flakes (novelty-subrange leaf to-t novelty))
                         flakes)
          stale-flakes (stale-by from-t latest)
          subsequent   (filter-after to-t latest)
@@ -289,7 +289,7 @@
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
   [{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
   (let [latest       (if (> to-t leaf-t)
-                       (flake/conj-all flakes (novelty-subrange leaf to-t novelty))
+                       (into flakes (novelty-subrange leaf to-t novelty))
                        flakes)
         ;; flakes that happen after to-t
         subsequent   (filter-after to-t latest)
