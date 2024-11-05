@@ -140,3 +140,17 @@
                    :order-by '[?iri ?favNums]}]
           (is (= [["Alice" 42.33333333333333] ["Cam" 7.5]]
                  @(fluree/query db qry))))))))
+
+(deftest ^:integration subquery-values
+  (testing "Subquery with inline values"
+    (let [conn   @(fluree/connect-memory nil)
+          people (test-utils/load-people conn)
+          db     (fluree/db people)]
+      (testing "inline values filters subquery results"
+        (is (= [[:ex/alice] [:ex/liam]]
+               @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                                  :select  '[?person]
+                                  :where   [[:query {:values          '[?name ["Alice" "Liam"]]
+                                                     :where           '[{:id ?person :schema/name ?name}
+                                                                        {:id ?person :ex/favNums ?num}]
+                                                     :select-distinct '[?person]}]]})))))))
