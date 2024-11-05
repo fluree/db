@@ -1078,10 +1078,7 @@
   (let [message (->> (mapv explain-result results)
                      (str/join "\n"))
         report  (validation-report context results)]
-    (throw (ex-info message
-                    {:status 400
-                     :error  :shacl/violation
-                     :report report}))))
+    (throw (ex-info message {:status 422, :error :shacl/violation, :report report}))))
 
 (defn all-node-shape-ids
   "Returns the sids of all subjects with an @type of sh:NodeShape."

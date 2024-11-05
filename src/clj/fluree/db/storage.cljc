@@ -130,8 +130,8 @@
 
 (defn display-catalog
   [clg]
-  (let [locations (-> clg (dissoc [::default ::read-only]) keys vec)
-        ro-ids    (-> clg ::read-only keys)]
+  (let [locations (-> clg (dissoc ::default ::read-only) keys vec)
+        ro-ids    (-> clg ::read-only keys vec)]
     {:content-stores locations, :read-only-archives ro-ids}))
 
 #?(:clj
@@ -140,11 +140,11 @@
      (binding [*out* w]
        (pr (display-catalog clg))))
    :cljs
-     (extend-type Catalog
-       IPrintWithWriter
-       (-pr-writer [clg w _opts]
-         (-write w "#fluree/Catalog ")
-         (-write w (pr (display-catalog clg))))))
+   (extend-type Catalog
+     IPrintWithWriter
+     (-pr-writer [clg w _opts]
+       (-write w "#fluree/Catalog ")
+       (-write w (pr (display-catalog clg))))))
 
 (defmethod pprint/simple-dispatch Catalog [^Catalog clg]
   (pr clg))
@@ -207,8 +207,8 @@
   JsonArchive
   (-read-json [clg address keywordize?]
     (if-let [store (locate-address clg address)]
-     (-read-json store address keywordize?)
-     (async-location-error address)))
+      (-read-json store address keywordize?)
+      (async-location-error address)))
 
   ContentAddressedStore
   (-content-write-bytes [clg k v]

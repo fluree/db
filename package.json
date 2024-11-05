@@ -2,6 +2,7 @@
   "dependencies": {
     "@cljs-oss/module-deps": "^1.1.1",
     "@fluree/sjcl": "^1.0.8-3",
+    "@js-joda/core": "3.2.0",
     "@peculiar/webcrypto": "^1.4.5",
     "axios": "^1.5.1",
     "bufferutil": "^4.0.7",

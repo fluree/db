@@ -24,6 +24,8 @@
    :compiler-options {:optimizations :simple}
    :exports          {:commit            fluree.sdk.node/commit
                       :connect           fluree.sdk.node/connect
+                      :connectMemory     fluree.sdk.node/connectMemory
+                      :connectFile       fluree.sdk.node/connectFile
                       :create            fluree.sdk.node/create
                       :db                fluree.sdk.node/db
                       :exists            fluree.sdk.node/exists
