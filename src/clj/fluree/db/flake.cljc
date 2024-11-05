@@ -502,6 +502,8 @@
     (persistent! added)))
 
 (defn remove
+  "Removes all flakes in the sorted-set where
+  applying function f to the element returns truthy."
   [f ss]
   (loop [trans (transient ss)
          items (seq ss)]

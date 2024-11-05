@@ -228,9 +228,8 @@
   the transaction `from-t` because `flakes` contains another flake with the same
   subject and predicate and a t-value later than that flake but on or before
   `from-t`."
-  [from-t flakes]
+  [flakes]
   (->> flakes
-       (flake/remove (partial after-t? from-t))
        (flake/partition-by fact-content)
        (mapcat (fn [flakes]
                  ;; if the last flake pertaining to a unique
@@ -245,47 +244,48 @@
 (defn t-range
   "Returns a sorted set of flakes that are not out of date between the
   transactions `from-t` and `to-t`."
-  ([{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty from-t to-t]
+  ([{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty to-t]
    (let [latest       (if (> to-t leaf-t)
                         (into flakes (novelty-subrange leaf to-t novelty-t novelty))
                         flakes)
-         stale-flakes (stale-by from-t latest)
+         stale-flakes (stale-by latest)
          subsequent   (filter-after to-t latest)
          out-of-range (concat stale-flakes subsequent)]
-     (flake/disj-all latest out-of-range))))
+     (if (seq out-of-range)
+       (flake/disj-all latest out-of-range)
+       latest))))
 
 (defn resolve-t-range
-  [resolver node novelty-t novelty from-t to-t]
+  [resolver node novelty-t novelty to-t]
   (go-try
     (let [resolved (<? (resolve resolver node))
-          flakes   (t-range resolved novelty-t novelty from-t to-t)]
+          flakes   (t-range resolved novelty-t novelty to-t)]
       (-> resolved
           (dissoc :t)
-          (assoc :from-t from-t
-                 :to-t   to-t
+          (assoc :to-t   to-t
                  :flakes  flakes)))))
 
-(defrecord TRangeResolver [node-resolver novelty-t novelty from-t to-t]
+(defrecord TRangeResolver [node-resolver novelty-t novelty to-t]
   Resolver
   (resolve [_ node]
     (if (branch? node)
       (resolve node-resolver node)
-      (resolve-t-range node-resolver node novelty-t novelty from-t to-t))))
+      (resolve-t-range node-resolver node novelty-t novelty to-t))))
 
-(defrecord CachedTRangeResolver [node-resolver novelty-t novelty from-t to-t cache]
+(defrecord CachedTRangeResolver [node-resolver novelty-t novelty to-t cache]
   Resolver
   (resolve [_ {:keys [id tempid tt-id] :as node}]
     (if (branch? node)
       (resolve node-resolver node)
       (cache/lru-lookup
         cache
-        [::t-range id tempid tt-id from-t to-t]
+        [::t-range id tempid tt-id to-t]
         (fn [_]
-          (resolve-t-range node-resolver node novelty-t novelty from-t to-t))))))
+          (resolve-t-range node-resolver node novelty-t novelty to-t))))))
 
 (defn index-catalog->t-range-resolver
-  [{:keys [cache] :as idx-store} novelty-t novelty from-t to-t]
-  (->CachedTRangeResolver idx-store novelty-t novelty from-t to-t cache))
+  [{:keys [cache] :as idx-store} novelty-t novelty to-t]
+  (->CachedTRangeResolver idx-store novelty-t novelty to-t cache))
 
 (defn history-t-range
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
