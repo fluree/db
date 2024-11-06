@@ -224,13 +224,21 @@
   (juxt flake/s flake/p flake/o flake/dt meta-hash))
 
 (defn remove-stale-flakes
+  "Removes all flake retractions, along with the flakes they retract, from the sorted set.
+
+  Approach is to iterate through the flakes in reverse order, and for each retraction, find the
+  corresponding assertion and remove both from the set.
+
+  Note, with 'spo' not consisting of full uniqueness (e.g. lang, datatype, or duplicate @list value),
+  the 'next flake' is from a retraction is not guaranteed to be the corresponding assertion, however
+  it should be very close. For this reason, a scan over the remaining flakes using `some` is done below."
   [flakes]
   (loop [to-check (reverse flakes)
          flakes*  (transient flakes)]
-    (if-let [next-flake (peek to-check)]
+    (if-let [next-flake (first to-check)]
       (if (flake/op next-flake)
-        (recur (pop to-check) flakes*)
-        (let [r            (pop to-check)
+        (recur (rest to-check) flakes*)
+        (let [r            (rest to-check)
               cmp          (fact-content next-flake)
               assert-flake (some #(when (= cmp (fact-content %)) %) r)]
           (recur r (-> flakes*
