@@ -223,41 +223,43 @@
   "Function to extract the content being asserted or retracted by a flake."
   (juxt flake/s flake/p flake/o flake/dt meta-hash))
 
-(defn stale-by
-  "Returns a vector of flakes from the sorted set `flakes` that are out of date by
-  the transaction `from-t` because `flakes` contains another flake with the same
-  subject and predicate and a t-value later than that flake but on or before
-  `from-t`."
+(defn remove-stale-flakes
+  "Removes all flake retractions, along with the flakes they retract, from the sorted set.
+
+  Approach is to iterate through the flakes in reverse order, and for each retraction, find the
+  corresponding assertion and remove both from the set.
+
+  Note, with 'spo' not consisting of full uniqueness (e.g. lang, datatype, or duplicate @list value),
+  the 'next flake' is from a retraction is not guaranteed to be the corresponding assertion, however
+  it should be very close. For this reason, a scan over the remaining flakes using `some` is done below."
   [flakes]
-  (->> flakes
-       (flake/partition-by fact-content)
-       (mapcat (fn [flakes]
-                 ;; if the last flake pertaining to a unique
-                 ;; fact is an assert, then every flake before
-                 ;; that is stale. If that item is a retract,
-                 ;; then all the flakes are stale.
-                 (let [last-flake (flake/last flakes)]
-                   (if (flake/op last-flake)
-                     (disj flakes last-flake)
-                     flakes))))))
+  (loop [to-check (reverse flakes)
+         flakes*  (transient flakes)]
+    (if-let [next-flake (first to-check)]
+      (if (flake/op next-flake)
+        (recur (rest to-check) flakes*)
+        (let [r            (rest to-check)
+              cmp          (fact-content next-flake)
+              assert-flake (some #(when (= cmp (fact-content %)) %) r)]
+          (recur r (-> flakes*
+                       (disj! next-flake)
+                       (disj! assert-flake)))))
+      (persistent! flakes*))))
 
 (defn t-range
   "Returns a sorted set of flakes that are not out of date between the
   transactions `from-t` and `to-t`."
   ([{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty to-t]
-   (let [latest       (cond
-                        (> to-t leaf-t)
-                        (into flakes (novelty-subrange leaf to-t novelty-t novelty))
+   (let [latest (cond
+                  (> to-t leaf-t)
+                  (into flakes (novelty-subrange leaf to-t novelty-t novelty))
 
-                        (= to-t leaf-t)
-                        flakes
+                  (= to-t leaf-t)
+                  flakes
 
-                        (< to-t leaf-t)
-                        (flake/disj-all flakes (filter-after to-t flakes)))
-         stale-flakes (stale-by latest)]
-     (if (seq stale-flakes)
-       (flake/disj-all latest stale-flakes)
-       latest))))
+                  (< to-t leaf-t)
+                  (flake/disj-all flakes (filter-after to-t flakes)))]
+     (remove-stale-flakes latest))))
 
 (defn resolve-t-range
   [resolver node novelty-t novelty to-t]
