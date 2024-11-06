@@ -36,7 +36,7 @@
                           cat
                           (map flake/s)
                           (distinct))
-        resolver    (index/index-catalog->t-range-resolver (:index-catalog conn) novelty t t)]
+        resolver    (index/index-catalog->t-range-resolver (:index-catalog conn) t novelty t t)]
     (index/tree-chan resolver idx-root first-flake last-flake any? 10 query-xf error-ch)))
 
 (defn flakes-xf

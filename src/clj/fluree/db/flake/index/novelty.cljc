@@ -142,7 +142,7 @@
 (defn update-leaf
   [leaf t novelty]
   (if-let [new-flakes (-> leaf
-                          (index/novelty-subrange t novelty)
+                          (index/novelty-subrange t t novelty)
                           not-empty)]
     (let [new-leaves (-> leaf
                          (dissoc :id)
@@ -340,7 +340,7 @@
   (let [refresh-xf (comp (map preserve-id)
                          (integrate-novelty t novelty))
         novel?     (fn [node]
-                     (seq (index/novelty-subrange node t novelty)))]
+                     (seq (index/novelty-subrange node t t novelty)))]
     (->> (index/tree-chan index-catalog root novel? 1 refresh-xf error-ch)
          (write-resolved-nodes db idx changes-ch error-ch))))
 
