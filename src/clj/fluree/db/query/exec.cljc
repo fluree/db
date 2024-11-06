@@ -74,7 +74,7 @@
   search."
   [subquery]
   (fn [ds fuel-tracker error-ch]
-    (->> (execute* ds fuel-tracker subquery error-ch (go {}))
+    (->> (execute* ds fuel-tracker subquery error-ch)
          (select/subquery-format ds subquery fuel-tracker error-ch))))
 
 (defn prep-subqueries
