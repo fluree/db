@@ -236,7 +236,7 @@
   [data-db focus-node path]
   (go-try
     (loop [[segment & segments] path
-           focus-nodes [(sid-node focus-node)]
+           focus-nodes [focus-node]
            value-nodes []]
       (if segment
         (let [vns (loop [[[sid :as f-node] & r] focus-nodes
@@ -314,9 +314,8 @@
                                                                     {:flake-xf (map flake/p)})))
             p-flakes        (filterv (fn [f] (contains? target-pids (flake/p f))) s-flakes)
             focus-nodes     (mapv object-node p-flakes)]
-        ;; TODO: we assume that these objects are sids, but that assumption may not hold
-        (cond-> (mapv flake/o p-flakes)
-          referring-pids (conj sid))))))
+        (cond-> focus-nodes
+          referring-pids (conj (sid-node sid)))))))
 
 (defn resolve-focus-nodes
   "Evaluate the target declarations of a NodeShape to see if the provided s-flakes contain
@@ -328,7 +327,7 @@
                 (target-class-target? shape s-flakes)
                 (target-subjects-of-target? shape s-flakes)
                 (implicit-target? shape s-flakes))
-            [sid]
+            [(sid-node sid)]
 
              (target-objects-of-target? shape)
              (<? (target-objects-of-focus-nodes data-db shape s-flakes))
@@ -340,13 +339,18 @@
   "Validate the focus nodes that are targeted by the target declaration, or the provided nodes."
   ([{:keys [data-db] :as v-ctx} shape s-flakes]
    (go-try
-     (loop [[focus-node & r] (<? (resolve-focus-nodes data-db shape s-flakes))
+     (loop [[[s _dt :as focus-node] & r] (<? (resolve-focus-nodes data-db shape s-flakes))
             results          []]
        (if focus-node
-         (let [value-nodes (if (= (some-> s-flakes first flake/s) focus-node)
-                             (mapv object-node s-flakes)
-                             (<? (query-range/index-range data-db :spot = [focus-node]
-                                                          {:flake-xf (map object-node)})))]
+         (let [value-nodes (cond (= (some-> s-flakes first flake/s) s)
+                                 (mapv object-node s-flakes)
+
+                                 (iri/sid? s)
+                                 (<? (query-range/index-range data-db :spot = [s]
+                                                              {:flake-xf (map object-node)}))
+
+                                 :else ;; focus node is value node (targetObjectsOf)
+                                 [focus-node])]
            (if-let [results* (<? (validate-node-shape v-ctx shape focus-node value-nodes))]
              (recur r (into results results*))
              (recur r results)))
@@ -363,7 +367,7 @@
          [message]  const/sh_message
          expect     constraint}
         shape]
-    (cond-> {:subject (display focus-node)
+    (cond-> {:subject (display (first focus-node))
              :constraint (display constraint)
              :severity (or (display severity) (json-ld/compact const/iri_Violation context))
              :shape (display id)}
@@ -659,7 +663,7 @@
     (let [{expect constraint} shape
 
           [equals]       expect
-          equals-flakes  (<? (query-range/index-range data-db :spot = [focus-node equals]))
+          equals-flakes  (<? (query-range/index-range data-db :spot = [(first focus-node) equals]))
           equals-objects (into #{} (map flake/o) equals-flakes)
           focus-objects  (into #{} (map first) value-nodes)]
       (when (not= equals-objects focus-objects)
@@ -680,7 +684,7 @@
     (let [{expect constraint} shape
 
           [disjoint]       expect
-          disjoint-flakes  (<? (query-range/index-range data-db :spot = [focus-node disjoint]))
+          disjoint-flakes  (<? (query-range/index-range data-db :spot = [(first focus-node) disjoint]))
           disjoint-objects (into #{} (map flake/o) disjoint-flakes)
           focus-objects    (into #{} (map first) value-nodes)]
       (when (not-empty (set/intersection focus-objects disjoint-objects))
@@ -701,7 +705,7 @@
     (let [{expect constraint} shape
 
           [less-than]       expect
-          less-than-flakes  (<? (query-range/index-range data-db :spot = [focus-node less-than]))
+          less-than-flakes  (<? (query-range/index-range data-db :spot = [(first focus-node) less-than]))
           less-than-objects (into #{} (map flake/o) less-than-flakes)
           focus-objects     (into #{} (map first) value-nodes)
 
@@ -731,7 +735,7 @@
     (let [{expect constraint} shape
 
           [less-than]       expect
-          less-than-flakes  (<? (query-range/index-range data-db :spot = [focus-node less-than]))
+          less-than-flakes  (<? (query-range/index-range data-db :spot = [(first focus-node) less-than]))
           less-than-objects (into #{} (map flake/o) less-than-flakes)
           focus-objects     (into #{} (map first) value-nodes)
 
@@ -769,9 +773,9 @@
             (recur r (conj results (-> result
                                        (dissoc :expect)
                                        (assoc
-                                         :value (display focus-node)
+                                         :value (display (first focus-node))
                                          :message (or (:message result)
-                                                      (str (display focus-node) " conforms to shape "
+                                                      (str (display (first focus-node)) " conforms to shape "
                                                            (display (get not-shape const/$id))))))))))
         (not-empty results)))))
 
@@ -792,9 +796,9 @@
             (let [result (base-result v-ctx shape constraint focus-node)]
               [(-> result
                    (dissoc :expect)
-                   (assoc :value (display focus-node)
+                   (assoc :value (display (first focus-node))
                           :message (or (:message result)
-                                       (str (display focus-node) " failed to conform to all " (display const/sh_and)
+                                       (str (display (first focus-node)) " failed to conform to all " (display const/sh_and)
                                             " shapes: " (mapv (comp display #(get % const/$id)) and-shapes)))))])))))))
 
 (defmethod validate-constraint const/sh_or
@@ -817,9 +821,9 @@
             (let [result (base-result v-ctx shape constraint focus-node)]
               [(-> result
                    (dissoc :expect)
-                   (assoc :value (display focus-node)
+                   (assoc :value (display (first focus-node))
                           :message (or (:message result)
-                                       (str (display focus-node) " failed to conform to any of the following shapes: "
+                                       (str (display (first focus-node)) " failed to conform to any of the following shapes: "
                                             (mapv (comp display #(get % const/$id)) or-shapes)))))])))))))
 
 (defmethod validate-constraint const/sh_xone
@@ -860,7 +864,7 @@
                              (mapv display))
           result (-> (base-result v-ctx shape constraint focus-node)
                      (assoc :expect pretty-expect))]
-      (loop [[[v dt] & r] value-nodes
+      (loop [[[v dt :as value-node] & r] value-nodes
              results []]
         (if (some? v)
           (if (iri/sid? v)
@@ -870,7 +874,7 @@
                              (if node-shape
                                (let [value-nodes (<? (query-range/index-range data-db :spot = [v]
                                                                               {:flake-xf (map object-node)}))]
-                                 (if-let [results* (<? (validate-node-shape v-ctx node-shape v value-nodes))]
+                                 (if-let [results* (<? (validate-node-shape v-ctx node-shape value-node value-nodes))]
                                    (recur r (conj results (assoc result
                                                                  :value (display v)
                                                                  :message (or (:message result)
@@ -914,11 +918,11 @@
           result (-> (base-result v-ctx shape constraint focus-node)
                      (assoc :expect (display (get q-shape const/$id)))
                      (assoc :value values))]
-      (loop [[[v _dt] & r] value-nodes
+      (loop [[[v _dt :as value-node] & r] value-nodes
              conforming []]
         (if (some? v)
           ;; build up conforming sids
-          (let [focus-node* (if (iri/sid? v) v focus-node)
+          (let [focus-node* (if (iri/sid? v) value-node focus-node)
                 value-nodes* (if (iri/sid? v)
                                (<? (query-range/index-range data-db :spot = [v] {:flake-xf (map object-node)}))
                                value-nodes)
@@ -942,8 +946,8 @@
                              (let [value-nodes (<? (query-range/index-range data-db :spot = [conforming-sid]
                                                                             {:flake-xf (map object-node)}))
                                    q-result (if (property-shape? sib-q-shape)
-                                              (<? (validate-property-shape v-ctx sib-q-shape conforming-sid))
-                                              (<? (validate-node-shape v-ctx sib-q-shape conforming-sid value-nodes)))]
+                                              (<? (validate-property-shape v-ctx sib-q-shape (sid-node conforming-sid)))
+                                              (<? (validate-node-shape v-ctx sib-q-shape (sid-node conforming-sid) value-nodes)))]
                                (if q-result
                                  (recur r non-disjoint-conformers*)
                                  (recur r (conj non-disjoint-conformers* conforming-sid))))
@@ -996,7 +1000,7 @@
            properties const/sh_property} shape
 
           [closed?]   expect
-          s-flakes    (<? (query-range/index-range data-db :spot = [focus-node]))
+          s-flakes    (<? (query-range/index-range data-db :spot = [(first focus-node)]))
           constrained (into #{} (map #(-> % (get const/sh_path) first) properties))
           allowed     (into constrained ignored)
           present     (into #{} (map flake/p) s-flakes)
