@@ -209,7 +209,7 @@
 
 (defn initialize
   [config]
-  (-> config convert-references ig/expand ig/init))
+  (-> config config/parse convert-references ig/expand ig/init))
 
 (defn terminate
   [sys]

@@ -7,7 +7,6 @@
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.query.api :as query-api]
             [fluree.db.api.transact :as transact-api]
@@ -59,7 +58,7 @@
   ;; TODO - do some validation
   (promise-wrap
     (go-try
-      (let [system-map (-> config config/parse system/initialize)
+      (let [system-map (system/initialize config)
             conn       (reduce-kv (fn [x k v]
                                     (if (isa? k :fluree.db/connection)
                                       (reduced v)
