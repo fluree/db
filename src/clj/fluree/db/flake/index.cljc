@@ -245,14 +245,18 @@
   "Returns a sorted set of flakes that are not out of date between the
   transactions `from-t` and `to-t`."
   ([{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty to-t]
-   (let [latest       (if (> to-t leaf-t)
+   (let [latest       (cond
+                        (> to-t leaf-t)
                         (into flakes (novelty-subrange leaf to-t novelty-t novelty))
-                        flakes)
-         stale-flakes (stale-by latest)
-         subsequent   (filter-after to-t latest)
-         out-of-range (concat stale-flakes subsequent)]
-     (if (seq out-of-range)
-       (flake/disj-all latest out-of-range)
+
+                        (= to-t leaf-t)
+                        flakes
+
+                        (< to-t leaf-t)
+                        (flake/disj-all flakes (filter-after to-t flakes)))
+         stale-flakes (stale-by latest)]
+     (if (seq stale-flakes)
+       (flake/disj-all latest stale-flakes)
        latest))))
 
 (defn resolve-t-range

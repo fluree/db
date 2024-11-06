@@ -155,7 +155,8 @@
    {:keys [to-t start-flake end-flake] :as opts}]
   (let [root      (get db idx)
         novelty   (get-in db [:novelty idx])
-        resolver  (index/index-catalog->t-range-resolver index-catalog t novelty to-t)
+        novelty-t (get-in db [:novelty :t])
+        resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
         query-xf  (extract-query-flakes opts)]
     (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
          (filter-authorized db error-ch))))

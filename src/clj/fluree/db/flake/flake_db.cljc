@@ -434,7 +434,8 @@
      (assoc m idx (-> comparators
                       (get idx)
                       flake/sorted-set-by)))
-   {:size 0} index/types))
+   {:size 0
+    :t    0} index/types))
 
 (defn genesis-root-map
   [ledger-alias]
