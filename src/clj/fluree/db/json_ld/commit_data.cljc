@@ -406,7 +406,7 @@
   ([db add]
    (update-novelty db add []))
 
-  ([db add rem]
+  ([{:keys [t] :as db} add rem]
    (try*
      (let [flake-count (cond-> 0
                                add (+ (count add))
@@ -427,6 +427,7 @@
                                          :cljs opst))
            (update-in [:novelty :size] + #?(:clj  @flake-size
                                             :cljs flake-size))
+           (assoc-in [:novelty :t] t)
            (update-in [:stats :size] + #?(:clj  @flake-size
                                           :cljs flake-size))
            (update-in [:stats :flakes] + flake-count)))

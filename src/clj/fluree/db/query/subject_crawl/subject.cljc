@@ -20,6 +20,7 @@
   [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o] :as _where-clause}]
   (let [idx-root    (get db :post)
         novelty     (get novelty :post)
+        novelty-t   (get novelty :t)
         o*          (if-some [v (:value o)]
                       v
                       (when-let [variable (:variable o)]
@@ -36,7 +37,7 @@
                           cat
                           (map flake/s)
                           (distinct))
-        resolver    (index/index-catalog->t-range-resolver (:index-catalog conn) t novelty t t)]
+        resolver    (index/index-catalog->t-range-resolver (:index-catalog conn) novelty-t novelty t)]
     (index/tree-chan resolver idx-root first-flake last-flake any? 10 query-xf error-ch)))
 
 (defn flakes-xf

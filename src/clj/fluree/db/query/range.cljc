@@ -152,10 +152,11 @@
   contain the flakes between `start-flake` and `end-flake` and are within the
   transaction range starting at `from-t` and ending at `to-t`."
   [{:keys [index-catalog t] :as db} idx error-ch
-   {:keys [from-t to-t start-flake end-flake] :as opts}]
+   {:keys [to-t start-flake end-flake] :as opts}]
   (let [root      (get db idx)
         novelty   (get-in db [:novelty idx])
-        resolver  (index/index-catalog->t-range-resolver index-catalog t novelty from-t to-t)
+        novelty-t (get-in db [:novelty :t])
+        resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
         query-xf  (extract-query-flakes opts)]
     (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
          (filter-authorized db error-ch))))
@@ -305,7 +306,6 @@
                                        error-ch
                                        (assoc opts
                                          :idx idx
-                                         :from-t t
                                          :to-t t
                                          :start-test start-test
                                          :start-flake start-flake

@@ -473,7 +473,6 @@
                         (remove nil?)
                         (apply comp))
         opts        {:idx         idx
-                     :from-t      t
                      :to-t        t
                      :start-flake start-flake
                      :end-flake   end-flake
