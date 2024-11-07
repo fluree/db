@@ -11,7 +11,7 @@
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
-(def iri-search (str iri/f-idx-ns "search"))
+(def iri-search (str iri/f-idx-ns "target"))
 (def iri-property (str iri/f-idx-ns "property"))
 (def iri-limit (str iri/f-idx-ns "limit"))
 (def iri-id (str iri/f-idx-ns "id"))
@@ -20,7 +20,7 @@
 (def iri-vector (str iri/f-idx-ns "vector"))
 (def iri-xsd-float "http://www.w3.org/2001/XMLSchema#float")
 
-(def flatrank-vg-re (re-pattern "##Flatrank-(.*)"))
+(def flatrank-vg-re (re-pattern "##FlatRank-(.*)"))
 
 (defn result-sort
   [a b]
@@ -56,7 +56,7 @@
   (let [p-iri (prop-iri triple)]
     (cond
       (= iri-search p-iri)
-      (assoc-in solution [::flat-rank ::search] (obj-val triple solution))
+      (assoc-in solution [::flat-rank ::target] (obj-val triple solution))
 
       (= iri-property p-iri)
       (assoc-in solution [::flat-rank ::property] (obj-iri triple))
@@ -130,11 +130,11 @@
   [db score-fn sort-fn solution error-ch out-ch]
   (go
     (try*
-      (let [{::keys [property search limit] :as search-params}
+      (let [{::keys [property target limit] :as search-params}
             (get-search-params solution)
 
             pid       (iri/encode-iri db property)
-            score-opt {:flake-xf (comp (map (partial score-flake score-fn search))
+            score-opt {:flake-xf (comp (map (partial score-flake score-fn target))
                                        (remove nil?))}
             ;; For now, pulling all matching values from full index once hitting
             ;; the actual vector index, we'll only need to pull matches out of
