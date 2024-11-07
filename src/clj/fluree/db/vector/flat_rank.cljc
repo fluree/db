@@ -150,7 +150,7 @@
         (log/error e "Error ranking vectors")
         (>! error-ch e)))))
 
-(defrecord DotProductFlatRankGraph [db]
+(defrecord DotProductGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (match-search-triple solution triple))
@@ -170,11 +170,11 @@
   (-aliases [_]
     (where/-aliases db)))
 
-(defn dot-product-flat-rank-graph
+(defn dot-product-graph
   [db]
-  (->DotProductFlatRankGraph db))
+  (->DotProductGraph db))
 
-(defrecord CosineFlatRankGraph [db]
+(defrecord CosineGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (match-search-triple solution triple))
@@ -194,11 +194,11 @@
   (-aliases [_]
     (where/-aliases db)))
 
-(defn cosine-flat-rank-graph
+(defn cosine-graph
   [db]
-  (->CosineFlatRankGraph db))
+  (->CosineGraph db))
 
-(defrecord EuclideanFlatRankGraph [db]
+(defrecord EuclideanGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (match-search-triple solution triple))
@@ -218,9 +218,9 @@
   (-aliases [_]
     (where/-aliases db)))
 
-(defn euclidean-flat-rank-graph
+(defn euclidean-graph
   [db]
-  (->EuclideanFlatRankGraph db))
+  (->EuclideanGraph db))
 
 (defn extract-metric
   "Takes the graph alias as a string and extracts the metric name from the
@@ -235,10 +235,10 @@
   (let [metric (extract-metric graph-alias)]
     (cond
       (= metric :cosine)
-      (cosine-flat-rank-graph db)
+      (cosine-graph db)
 
       (= metric :dot-product)
-      (dot-product-flat-rank-graph db)
+      (dot-product-graph db)
 
       (= metric :distance)
-      (euclidean-flat-rank-graph db))))
+      (euclidean-graph db))))
