@@ -11,7 +11,7 @@
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
-(def iri-search (str iri/f-idx-ns "target"))
+(def iri-target (str iri/f-idx-ns "target"))
 (def iri-property (str iri/f-idx-ns "property"))
 (def iri-limit (str iri/f-idx-ns "limit"))
 (def iri-id (str iri/f-idx-ns "id"))
@@ -56,7 +56,7 @@
   (go
     (let [p-iri (prop-iri triple)]
       (cond
-        (= iri-search p-iri)
+        (= iri-target p-iri)
         (assoc-in solution [::flat-rank ::target] (obj-val triple solution))
 
         (= iri-property p-iri)
