@@ -3054,8 +3054,8 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                         "sh:maxCount" 1,
                                                         "sh:path" {"@id" "ex:term"}}],
                                         "sh:targetClass" [{"@id" "ex:Assertion"} {"@id" "ex:Fact"}]}]})]
-          (is (not (nil? @(fluree/stage db1 {"@type" "ex:Assertion" "ex:term" 123}))))
-          (is (not (nil? @(fluree/stage db1 {"@type" "ex:Fact" "ex:term" 123}))))))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@type" "ex:Assertion" "ex:term" 123}})))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@type" "ex:Fact" "ex:term" 123}})))))
       (testing "with extra data"
         (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
                                       "insert"
@@ -3064,7 +3064,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                         "sh:maxCount" 1,
                                                         "sh:path" {"@id" "ex:term"}}],
                                         "sh:targetClass" {"@id" "ex:Assertion" "ex:extra" "data"}}]})]
-          (is (not (nil? @(fluree/stage db1 {"@type" "ex:Assertion" "ex:term" 123})))))))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@type" "ex:Assertion" "ex:term" 123}}))))))
     (testing "targetNode"
       (testing "with multiple targets"
         (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
@@ -3075,8 +3075,8 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                         "sh:path" {"@id" "ex:term"}}],
                                         "sh:targetNode" [{"@id" "ex:foo"}
                                                          {"@id" "ex:bar"}]}]})]
-          (is (not (nil? @(fluree/stage db1 {"@id" "ex:foo" "ex:term" 123}))))
-          (is (not (nil? @(fluree/stage db1 {"@id" "ex:bar" "ex:term" 123}))))))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:foo" "ex:term" 123}})))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:bar" "ex:term" 123}})))))
       (testing "with extra data"
         (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
                                       "insert"
@@ -3085,7 +3085,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                         "sh:maxCount" 1,
                                                         "sh:path" {"@id" "ex:term"}}],
                                         "sh:targetNode" {"@id" "ex:foo" "ex:extra" "data"}}]})]
-          (is (not (nil? @(fluree/stage db1 {"@id" "ex:foo" "ex:term" 123})))))))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:foo" "ex:term" 123}}))))))
     (testing "targetObjectsOf"
       (testing "with multiple targets"
         (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
@@ -3094,8 +3094,8 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                         "sh:datatype" {"@id" "xsd:string"},
                                         "sh:targetObjectsOf" [{"@id" "ex:foo"}
                                                               {"@id" "ex:bar"}]}]})]
-          (is (not (nil? @(fluree/stage db1 {"@id" "ex:me" "ex:foo" 123}))))
-          (is (not (nil? @(fluree/stage db1 {"@id" "ex:me" "ex:bar" 123}))))))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:foo" 123}})))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:bar" 123}})))))
       (testing "with extra data"
         (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
                                       "insert"
@@ -3104,7 +3104,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                         "sh:maxCount" 1,
                                                         "sh:path" {"@id" "ex:term"}}],
                                         "sh:targetObjectsOf" {"@id" "ex:foo" "@type" "rdf:Property"}}]})]
-          (is (not (nil? @(fluree/stage db1 {"@id" "ex:foo" "ex:term" 123})))))))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:foo" "ex:term" 123}}))))))
     (testing "targetSubjectsof"
       (testing "with multiple targets"
         (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
@@ -3115,8 +3115,8 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                         "sh:path" {"@id" "ex:term"}}],
                                         "sh:targetSubjectsOf" [{"@id" "ex:foo"}
                                                                {"@id" "ex:bar"}]}]})]
-          (is (not (nil? @(fluree/stage db1 {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123}))))
-          (is (not (nil? @(fluree/stage db1 {"@id" "ex:me" "ex:bar" "bar" "ex:term" 123}))))))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123}})))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:bar" "bar" "ex:term" 123}})))))
       (testing "with extra data"
         (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
                                       "insert"
@@ -3125,4 +3125,4 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                         "sh:maxCount" 1,
                                                         "sh:path" {"@id" "ex:term"}}],
                                         "sh:targetSubjectsOf" {"@id" "ex:foo" "ex:extra" "data"}}]})]
-          (is (not (nil? @(fluree/stage db1 {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123})))))))))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123}}))))))))
