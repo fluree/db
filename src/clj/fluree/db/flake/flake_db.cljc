@@ -24,7 +24,7 @@
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.fql :as fql]
             [fluree.db.flake.index.storage :as index-storage]
-            [fluree.db.vector.index-graph :as index-graph :refer [index-graph]]
+            [fluree.db.vector.flat-rank :as flat-rank]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
@@ -328,7 +328,7 @@
   (-activate-alias [db alias']
     (cond
       (= alias alias')              db
-      (where/virtual-graph? alias') (index-graph db alias')))
+      (where/virtual-graph? alias') (flat-rank/index-graph db alias')))
 
   (-aliases [_]
     [alias])

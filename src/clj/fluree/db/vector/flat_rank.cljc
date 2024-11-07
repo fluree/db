@@ -1,4 +1,4 @@
-(ns fluree.db.vector.index-graph
+(ns fluree.db.vector.flat-rank
   (:require [camel-snake-kebab.core :refer [->kebab-case-keyword]]
             [clojure.core.async :as async :refer [>! go]]
             [fluree.db.constants :as const]
