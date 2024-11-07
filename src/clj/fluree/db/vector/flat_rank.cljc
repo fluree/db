@@ -82,12 +82,12 @@
   (dissoc solution ::flat-rank))
 
 (defn finalize
-  [rank-af error-ch solution-ch]
+  [search-af error-ch solution-ch]
   (let [out-ch (async/chan 1 (map clear-search-params))]
     (async/pipeline-async 2
                           out-ch
                           (fn [solution ch]
-                            (rank-af solution error-ch ch))
+                            (search-af solution error-ch ch))
                           solution-ch)
     out-ch))
 
