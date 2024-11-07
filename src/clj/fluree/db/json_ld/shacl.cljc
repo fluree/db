@@ -342,7 +342,7 @@
      (loop [[[s _dt :as focus-node] & r] (<? (resolve-focus-nodes data-db shape s-flakes))
             results          []]
        (if focus-node
-         (let [value-nodes (cond (= (some-> s-flakes first flake/s) s)
+         (let [value-nodes (cond (some-> s-flakes first flake/s (= s))
                                  (mapv object-node s-flakes)
 
                                  (iri/sid? s)
