@@ -53,25 +53,26 @@
 
 (defn match-search-triple
   [solution triple]
-  (let [p-iri (prop-iri triple)]
-    (cond
-      (= iri-search p-iri)
-      (assoc-in solution [::flat-rank ::target] (obj-val triple solution))
+  (go
+    (let [p-iri (prop-iri triple)]
+      (cond
+        (= iri-search p-iri)
+        (assoc-in solution [::flat-rank ::target] (obj-val triple solution))
 
-      (= iri-property p-iri)
-      (assoc-in solution [::flat-rank ::property] (obj-iri triple))
+        (= iri-property p-iri)
+        (assoc-in solution [::flat-rank ::property] (obj-iri triple))
 
-      (= iri-limit p-iri)
-      (assoc-in solution [::flat-rank ::limit] (obj-val triple solution))
+        (= iri-limit p-iri)
+        (assoc-in solution [::flat-rank ::limit] (obj-val triple solution))
 
-      (= iri-result p-iri)
-      (assoc-in solution [::flat-rank ::result ::id] (obj-var triple))
+        (= iri-result p-iri)
+        (assoc-in solution [::flat-rank ::result ::id] (obj-var triple))
 
-      (= iri-score p-iri)
-      (assoc-in solution [::flat-rank ::result ::score] (obj-var triple))
+        (= iri-score p-iri)
+        (assoc-in solution [::flat-rank ::result ::score] (obj-var triple))
 
-      (= iri-vector p-iri)
-      (assoc-in solution [::flat-rank ::result ::vector] (obj-var triple)))))
+        (= iri-vector p-iri)
+        (assoc-in solution [::flat-rank ::result ::vector] (obj-var triple))))))
 
 (defn get-search-params
   [solution]
@@ -152,7 +153,7 @@
 (defrecord DotProductFlatRankGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
-    (go (match-search-triple solution triple)))
+    (match-search-triple solution triple))
 
   (-finalize [_ _ error-ch solution-ch]
     (finalize (partial search db dot-product reverse-result-sort) error-ch solution-ch))
@@ -176,7 +177,7 @@
 (defrecord CosineFlatRankGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
-    (go (match-search-triple solution triple)))
+    (match-search-triple solution triple))
 
   (-finalize [_ _ error-ch solution-ch]
     (finalize (partial search db cosine-similarity reverse-result-sort) error-ch solution-ch))
@@ -200,7 +201,7 @@
 (defrecord EuclideanFlatRankGraph [db]
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
-    (go (match-search-triple solution triple)))
+    (match-search-triple solution triple))
 
   (-finalize [_ _ error-ch solution-ch]
     (finalize (partial search db euclidian-distance result-sort) error-ch solution-ch))
