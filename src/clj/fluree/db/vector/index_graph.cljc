@@ -126,7 +126,7 @@
     (take limit results)
     results))
 
-(defn rank
+(defn search
   [db score-fn sort-fn solution error-ch out-ch]
   (go
     (try*
@@ -146,8 +146,8 @@
              (process-results db solution search-params)
              (async/onto-chan! out-ch)))
       (catch* e
-              (log/error e "Error ranking vectors")
-              (>! error-ch e)))))
+        (log/error e "Error ranking vectors")
+        (>! error-ch e)))))
 
 (defrecord DotProductFlatRankGraph [db]
   where/Matcher
@@ -155,7 +155,7 @@
     (go (match-search-triple solution triple)))
 
   (-finalize [_ _ error-ch solution-ch]
-    (finalize (partial rank db dot-product reverse-result-sort) error-ch solution-ch))
+    (finalize (partial search db dot-product reverse-result-sort) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
@@ -179,7 +179,7 @@
     (go (match-search-triple solution triple)))
 
   (-finalize [_ _ error-ch solution-ch]
-    (finalize (partial rank db cosine-similarity reverse-result-sort) error-ch solution-ch))
+    (finalize (partial search db cosine-similarity reverse-result-sort) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
@@ -203,7 +203,7 @@
     (go (match-search-triple solution triple)))
 
   (-finalize [_ _ error-ch solution-ch]
-    (finalize (partial rank db euclidian-distance result-sort) error-ch solution-ch))
+    (finalize (partial search db euclidian-distance result-sort) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
