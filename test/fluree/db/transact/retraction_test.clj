@@ -37,7 +37,7 @@
       (is (= [{:id           :ex/alice,
                :type     :ex/User,
                :schema/name  "Alice"}]
-             @(fluree/query db-age-retract
+             @(fluree/q db-age-retract
                             {:context [test-utils/default-context
                                        {:ex "http://example.org/ns/"}],
                              :select {:ex/alice [:*]}}))
@@ -58,7 +58,7 @@
                                 "ex:items1" {"@list" ["zero" "one" "two"
                                                       "three"]}
                                 "ex:items2" ["four" "five" "six" "seven"]}]})
-          before-retract   @(fluree/query db q1)
+          before-retract   @(fluree/q db q1)
           db-after-retract @(fluree/stage
                              db
                              {"@context" context
@@ -68,7 +68,7 @@
                               "where"    {"id"        "ex:list-test"
                                           "ex:items1" "?items1"
                                           "ex:items2" "?items2"}})
-          after-retract    @(fluree/query db-after-retract q1)]
+          after-retract    @(fluree/q db-after-retract q1)]
       (is (= [{"id"        "ex:list-test"
                "ex:items1" ["zero" "one" "two" "three"]
                "ex:items2" ["four" "five" "six" "seven"]}]

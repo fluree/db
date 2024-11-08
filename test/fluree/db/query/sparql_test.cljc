@@ -755,7 +755,7 @@
               (let [query   "SELECT ?person ?fullName
                              WHERE {?person person:handle \"jdoe\".
                                     ?person person:fullName ?fullName.}"
-                    results (<p! (fluree/query db query {:format :sparql}))]
+                    results (<p! (fluree/q db query {:format :sparql}))]
                 (is (= [["ex:jdoe" "Jane Doe"]]
                        results))
                 (done))))))
@@ -776,7 +776,7 @@
                           SELECT ?person ?fullName
                           WHERE {?person person:handle \"jdoe\".
                                  ?person person:fullName ?fullName.}"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [["ex:jdoe" "Jane Doe"]]
                     results))))
          (testing "basic filter works"
@@ -786,13 +786,13 @@
                                          person:favNums ?favNum .
                                  FILTER ( ?favNum > 10 ) .}"]
              (is (= [["bbob" 23] ["jdoe" 42] ["jdoe" 99]]
-                    @(fluree/query db query {:format :sparql})))))
+                    @(fluree/q db query {:format :sparql})))))
          (testing "basic wildcard query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT *
                           WHERE {?person person:handle ?handle;
                                          person:favNums ?favNums.}"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= '[{?favNums 23, ?handle "bbob", ?person "ex:bbob"}
                       {?favNums 0, ?handle "jbob", ?person "ex:jbob"}
                       {?favNums 3, ?handle "jbob", ?person "ex:jbob"}
@@ -812,7 +812,7 @@
                           WHERE {?person person:handle ?handle;
                                          person:favNums ?favNums.}
                           GROUP BY ?person ?handle"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= '[{?favNums [23], ?handle "bbob", ?person "ex:bbob"}
                       {?favNums [0 3 5 6 7 8 9], ?handle "jbob", ?person "ex:jbob"}
                       {?favNums [3 7 42 99], ?handle "jdoe", ?person "ex:jdoe"}]
@@ -822,7 +822,7 @@
                           SELECT ?person ?favNums
                           WHERE {?person person:handle ?handle.
                                  OPTIONAL{?person person:favNums ?favNums.}}"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [["ex:bbob" 23]
                      ["ex:fbueller" nil]
                      ["ex:jbob" 0]
@@ -843,7 +843,7 @@
                           WHERE {?person person:handle ?handle.
                                  OPTIONAL{?person person:favNums ?favNums.}}
                           GROUP BY ?person"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [["ex:bbob" [23]]
                      ["ex:fbueller" nil]
                      ["ex:jbob" [0 3 5 6 7 8 9]]
@@ -855,7 +855,7 @@
                           WHERE {?person person:handle \"jdoe\";
                                          person:fullName ?fullName;
                                          person:favNums ?favNums.}"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [["ex:jdoe" "Jane Doe" 3]
                      ["ex:jdoe" "Jane Doe" 7]
                      ["ex:jdoe" "Jane Doe" 42]
@@ -865,7 +865,7 @@
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (SHA512(?handle) AS ?handleHash)
                           WHERE {?person person:handle ?handle.}"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [["f162b1f2b3a824f459164fe40ffc24a019993058061ca1bf90eca98a4652f98ccaa5f17496be3da45ce30a1f79f45d82d8b8b532c264d4455babc1359aaa461d"]
                      ["eca2f5ab92fddbf2b1c51a60f5269086ce2415cb37964a05ae8a0b999625a8a50df876e97d34735ebae3fa3abb088fca005a596312fdf3326c4e73338f4c8c90"]
                      ["696ba1c7597f0d80287b8f0917317a904fa23a8c25564331a0576a482342d3807c61eff8e50bf5cf09859cfdeb92d448490073f34fb4ea4be43663d2359b51a9"]
@@ -876,7 +876,7 @@
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav) ?avgFav
                           WHERE {?person person:favNums ?favNums.}"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [[17.66666666666667 17.66666666666667]]
                     results))))
          (testing "aggregate fn w/ GROUP BY query works"
@@ -884,7 +884,7 @@
                           SELECT (AVG(?favNums) AS ?avgFav)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [[5.428571428571429] [37.75] [23]]
                     results))))
          (testing "aggregate fn w/ GROUP BY ... HAVING query works"
@@ -892,7 +892,7 @@
                           SELECT (AVG(?favNums) AS ?avgFav)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person HAVING(AVG(?favNums) > 10)"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [[37.75] [23]]
                     results))))
          (testing "multi-arg fn query works"
@@ -900,7 +900,7 @@
                           SELECT (CONCAT(?handle, '-', ?fullName) AS ?hfn)
                           WHERE {?person person:handle ?handle.
                                  ?person person:fullName ?fullName.}"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [["bbob-Billy Bob"]
                      ["dankeshön-Ferris Bueller"]
                      ["jbob-Jenny Bob"]
@@ -910,7 +910,7 @@
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav) (CEIL(?avgFav) AS ?caf)
                           WHERE {?person person:favNums ?favNums.}"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [[17.66666666666667 18]]
                     results))))
          (testing "mix of bindings and variables in SELECT query works"
@@ -919,7 +919,7 @@
                           WHERE  {?person person:handle ?handle.
                                   ?person person:favNums ?favNums.}
                           GROUP BY ?person ?handle"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [[[23] 23 "ex:bbob" "bbob" 23]
                      [[0 3 5 6 7 8 9] 5.428571428571429 "ex:jbob" "jbob" 9]
                      [[3 7 42 99] 37.75 "ex:jdoe" "jdoe" 99]]
@@ -929,7 +929,7 @@
                           SELECT (COUNT(?favNums) AS ?numFavs)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [[7] [4] [1]]
                     results))))
          (testing "SAMPLE query works"
@@ -937,7 +937,7 @@
                           SELECT (SAMPLE(?favNums) AS ?favNum)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= 3 (count results)))
              (is (every? #(-> % first integer?) results))))
          (testing "SUM query works"
@@ -945,7 +945,7 @@
                           SELECT (SUM(?favNums) AS ?favNum)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [[38] [151] [23]]
                     results))))
          (testing "ORDER BY ASC query works"
@@ -953,7 +953,7 @@
                           SELECT ?handle
                           WHERE {?person person:handle ?handle.}
                           ORDER BY ASC(?handle)"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [["bbob"] ["dankeshön"] ["jbob"] ["jdoe"]]
                     results))))
          (testing "ORDER BY DESC query works"
@@ -961,7 +961,7 @@
                           SELECT ?handle
                           WHERE {?person person:handle ?handle.}
                           ORDER BY DESC(?handle)"
-                 results @(fluree/query db query {:format :sparql})]
+                 results @(fluree/q db query {:format :sparql})]
              (is (= [["jdoe"] ["jbob"] ["dankeshön"] ["bbob"]]
                     results))))
          (let [book-data [{"id"                            "http://example.org/book/1"
@@ -978,7 +978,7 @@
                    query   "BASE <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book <title> ?title.}"
-                   results @(fluree/query book-db query {:format :sparql})]
+                   results @(fluree/q book-db query {:format :sparql})]
                (is (= [["1" "For Whom the Bell Tolls"]
                        ["2" "The Hitchhiker's Guide to the Galaxy"]]
                       results))))
@@ -990,7 +990,7 @@
                    query   "PREFIX book: <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book book:title ?title.}"
-                   results @(fluree/query book-db query {:format :sparql})]
+                   results @(fluree/q book-db query {:format :sparql})]
                (is (= [["book:1" "For Whom the Bell Tolls"]
                        ["book:2" "The Hitchhiker's Guide to the Galaxy"]]
                       results)))))
@@ -1002,7 +1002,7 @@
              (let [query   "SELECT (CONCAT(?fullName, \"'s handle is \"@en, ?handle) AS ?hfn)
                             WHERE {?person person:handle ?handle.
                                    ?person person:fullName ?fullName.}"
-                   results @(fluree/query db query {:format :sparql})]
+                   results @(fluree/q db query {:format :sparql})]
                (is (= [["Billy Bob's handle is bbob"]
                        ["Jane Doe's handle is jdoe"]]
                       results))))
@@ -1013,7 +1013,7 @@
              (let [query   "SELECT ?handle
                             WHERE {VALUES ?handle { \"jdoe\" }
                                   ?person person:handle ?handle.}"
-                   results @(fluree/query db query {:format :sparql})]
+                   results @(fluree/q db query {:format :sparql})]
                (is (= ["jdoe"] results))))
 
            ;; BIND gets translated into :bind, but that expects a query fn on the right
@@ -1022,5 +1022,5 @@
              (let [query   "SELECT ?person ?handle
                            WHERE {BIND (\"jdoe\" AS ?handle)
                                   ?person person:handle ?handle.}"
-                   results @(fluree/query db query {:format :sparql})]
+                   results @(fluree/q db query {:format :sparql})]
                (is (= ["ex:jdoe" "jdoe"] results))))))))

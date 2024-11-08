@@ -21,7 +21,7 @@
                        "insert" {:id                 :ex/myClassInstance
                                  :type               :ex/MyClass
                                  :schema/description "Now a new subject uses MyClass as a Class"}})
-          query-res @(fluree/query db2 {:context context
+          query-res @(fluree/q db2 {:context context
                                         :select  {:ex/myClassInstance [:*]}})]
       (is (= query-res
              [{:id                 :ex/myClassInstance
@@ -61,7 +61,7 @@
                    :type            :ex/User,
                    :schema/name     "John",
                    :schema/callSign "j-rock"}]
-                 @(fluree/query db-ok user-query))
+                 @(fluree/q db-ok user-query))
               "basic rdf:type query response not correct")))
       (testing "cardinality less than"
         (let [db-no-names @(fluree/stage
@@ -143,7 +143,7 @@
                         {:id          :ex/john
                          :type        :ex/User
                          :schema/name "John"}})]
-          (is (= @(fluree/query db-ok user-query)
+          (is (= @(fluree/q db-ok user-query)
                  [{:id          :ex/john
                    :type        :ex/User
                    :schema/name "John"}])
@@ -233,7 +233,7 @@
           (is (= [{:id          :ex/john
                    :type        :ex/User
                    :schema/name "John"}]
-                 @(fluree/query db-ok user-query))
+                 @(fluree/q db-ok user-query))
               "basic type query response not correct")))
       (testing "extra properties"
         (let [db-extra-prop @(fluree/stage
@@ -321,7 +321,7 @@
                      :type         :ex/User
                      :schema/name  "Alice"
                      :ex/firstName "Alice"}]
-                   @(fluree/query db-ok user-query))))))
+                   @(fluree/q db-ok user-query))))))
       (testing "multi-cardinality equals"
         (let [db @(fluree/stage
                     (fluree/db ledger)
@@ -455,7 +455,7 @@
                      :schema/name  "Alice"
                      :ex/favNums   [11 17]
                      :ex/luckyNums [11 17]}]
-                   @(fluree/query db-ok user-query))))
+                   @(fluree/q db-ok user-query))))
           (let [db-ok2 @(fluree/stage
                           db
                           {"@context" ["https://ns.flur.ee" context]
@@ -470,7 +470,7 @@
                      :schema/name  "Alice"
                      :ex/favNums   [11 17]
                      :ex/luckyNums [11 17]}]
-                   @(fluree/query db-ok2 user-query))))))
+                   @(fluree/q db-ok2 user-query))))))
       (testing "disjoint"
         (let [db @(fluree/stage
                     (fluree/db ledger)
@@ -497,7 +497,7 @@
                        :schema/name  "Alice"
                        :ex/favNums   [11 17]
                        :ex/luckyNums 1}]
-                     @(fluree/query db-ok user-query)))))
+                     @(fluree/q db-ok user-query)))))
           (testing "single not disjoint value"
             (let [db-not-disjoint1 @(fluree/stage
                                       db
@@ -620,13 +620,13 @@
                      :schema/name "Alice"
                      :ex/p1       [11 17]
                      :ex/p2       [18 19]}]
-                   @(fluree/query db-ok1 user-query)))
+                   @(fluree/q db-ok1 user-query)))
             (is (= [{:id          :ex/alice
                      :type        :ex/User
                      :schema/name "Alice"
                      :ex/p1       [11 17]
                      :ex/p2       18}]
-                   @(fluree/query db-ok2 user-query))))
+                   @(fluree/q db-ok2 user-query))))
           (testing "values not less than other value"
             (let [db-fail1 @(fluree/stage
                               db
@@ -803,13 +803,13 @@
                        :schema/name "Alice"
                        :ex/p1       [11 17]
                        :ex/p2       [17 19]}]
-                     @(fluree/query db-ok1 user-query)))
+                     @(fluree/q db-ok1 user-query)))
               (is (= [{:id          :ex/alice
                        :type        :ex/User
                        :schema/name "Alice"
                        :ex/p1       [11 17]
                        :ex/p2       17}]
-                     @(fluree/query db-ok2 user-query)))))
+                     @(fluree/q db-ok2 user-query)))))
           (testing "all values not less than other value"
             (let [db-fail1 @(fluree/stage
                               db
@@ -954,7 +954,7 @@
               (is (= [{:id         :ex/john
                        :type       :ex/User
                        :schema/age 2}]
-                 @(fluree/query db-ok user-query)))))
+                 @(fluree/q db-ok user-query)))))
           (testing "values too low"
             (let [db-too-low @(fluree/stage
                                 db
@@ -1040,7 +1040,7 @@
                       {:id         :ex/brian
                        :type       :ex/User
                        :schema/age 1}]
-                     @(fluree/query db-ok2 user-query)))))
+                     @(fluree/q db-ok2 user-query)))))
           (testing "values below min"
             (let [db-too-low @(fluree/stage
                                 db
@@ -1186,7 +1186,7 @@
           (is (= [{:id          :ex/john
                    :type        :ex/User
                    :schema/name "John"}]
-                 @(fluree/query db-ok-str user-query)))))
+                 @(fluree/q db-ok-str user-query)))))
       (testing "non-string literals are stringified and checked"
         (let [db-ok-non-str @(fluree/stage
                                db
@@ -1198,7 +1198,7 @@
           (is (= [{:id          :ex/john
                    :type        :ex/User
                    :schema/name 12345}]
-                 @(fluree/query db-ok-non-str user-query)))))
+                 @(fluree/q db-ok-non-str user-query)))))
       (testing "string is too short"
         (let [db-too-short-str @(fluree/stage
                                   db
@@ -1337,7 +1337,7 @@
           (is (= [{:id          :ex/brian
                    :type        :ex/User
                    :ex/greeting "hello\nworld!"}]
-                 @(fluree/query db-ok-greeting user-query)))))
+                 @(fluree/q db-ok-greeting user-query)))))
       (testing "stringified literal matches pattern"
         (let [db-ok-birthyear @(fluree/stage
                                  db
@@ -1349,7 +1349,7 @@
           (is (= [{:id           :ex/john
                    :type         :ex/User
                    :ex/birthYear 1984}]
-                 @(fluree/query db-ok-birthyear user-query)))))
+                 @(fluree/q db-ok-birthyear user-query)))))
       (testing "string does not match pattern"
         (let [db-wrong-case-greeting @(fluree/stage
                                         db
@@ -1566,7 +1566,7 @@ WORLD!")
                    :schema/age   40
                    :schema/email "john@example.org"
                    :schema/name  "John"}]
-                 @(fluree/query db-ok user-query)))))
+                 @(fluree/q db-ok user-query)))))
       (testing "one constraint violated"
         (let [db-no-name @(fluree/stage
                             db
@@ -1734,7 +1734,7 @@ WORLD!")
                  "ex:parent"   {"id"          "ex:Anakin"
                                 "type"        "ex:Parent"
                                 "schema:name" "Anakin"}}]
-               @(fluree/query valid-parent {"@context" context
+               @(fluree/q valid-parent {"@context" context
                                             "select"   {"ex:Luke" ["*" {"ex:parent" ["*"]}]}})))
 
         (is (= {:status 422,
@@ -1781,7 +1781,7 @@ WORLD!")
                 "schema:name" "J.D."
                 "ex:pal"      #{{"schema:name" "Rowdy"}
                                 {"schema:name" "Turk"}}}
-               (-> @(fluree/query valid-pal {"@context" context
+               (-> @(fluree/q valid-pal {"@context" context
                                              "select"   {"ex:good-pal" ["*" {"ex:pal" ["schema:name"]}]}})
                    first
                    (update "ex:pal" set))))
@@ -1835,7 +1835,7 @@ WORLD!")
                 "type" "ex:Pal",
                 "ex:name" "J.D.",
                 "ex:pal" [{"ex:name" "Rowdy"} {"ex:name" "Turk"}]}
-               (-> @(fluree/query valid-pal {"@context" context
+               (-> @(fluree/q valid-pal {"@context" context
                                              "select"   {"ex:jd" ["*" {"ex:pal" ["ex:name"]}]}})
                    (first)
                    (update "ex:pal" #(sort-by first %)))))
@@ -1918,7 +1918,7 @@ WORLD!")
                                                                             "type"        "ex:Princess"
                                                                             "schema:name" "Gerb"}}})]
         (is (= [{"id" "ex:Mork", "type" "ex:Princess", "schema:name" "Mork"}]
-               @(fluree/query valid-princess {"@context" context
+               @(fluree/q valid-princess {"@context" context
                                               "select"   {"ex:Mork" ["*"]}})))
 
         (is (= {:status 422,
@@ -2142,7 +2142,7 @@ WORLD!")
       (is (= {"id"       "ex:PastelPony"
               "type"     "ex:Pony"
               "ex:color" [{"id" "ex:Pink"} {"id" "ex:Purple"}]}
-             (-> @(fluree/query db3 {"@context" context
+             (-> @(fluree/q db3 {"@context" context
                                      "select"   {"?p" ["*"]}
                                      "where"    {"id"   "?p"
                                                  "type" "ex:Pony"}})
@@ -2487,7 +2487,7 @@ WORLD!")
       (is (= [{"id"         "ex:Bob",
                "type"       "ex:Person",
                "ex:address" {"ex:postalCode" "12345"}}]
-             @(fluree/query valid-person {"@context" context
+             @(fluree/q valid-person {"@context" context
                                           "select"   {"ex:Bob" ["*" {"ex:address" ["ex:postalCode"]}]}})))
       (is (= {:status 422,
               :error  :shacl/violation,
@@ -2545,7 +2545,7 @@ WORLD!")
               "type"      "ex:Kid"
               "ex:parent" [{"id" "ex:Bob"}
                            {"id" "ex:Jane"}]}
-             (-> @(fluree/query valid-kid {"@context" context
+             (-> @(fluree/q valid-kid {"@context" context
                                            "select"   {"ex:ValidKid" ["*"]}})
                  first
                  (update "ex:parent" (partial sort-by #(get % "id"))))))
@@ -2611,7 +2611,7 @@ WORLD!")
                "type"      "ex:Kid"
                "ex:parent" [{"id" "ex:Dad"}
                             {"id" "ex:Mom"}]}]
-             @(fluree/query valid-kid {"@context" context
+             @(fluree/q valid-kid {"@context" context
                                        "select"   {"ex:ValidKid" ["*"]}})))
       (is (= {:status 422,
               :error  :shacl/violation,
@@ -2691,7 +2691,7 @@ WORLD!")
                 {"ex:name" "Finger"}
                 {"ex:name" "Finger"}
                 {"ex:name" "Thumb"}]}]
-             @(fluree/query valid-hand {"@context" context
+             @(fluree/q valid-hand {"@context" context
                                         "select"   {"ex:ValidHand" ["*" {"ex:digit" ["ex:name"]}]}})))
       (is (= {:status 422,
               :error  :shacl/violation,
@@ -2797,7 +2797,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         (is (= [{"id"      "ex:Bob",
                  "type"    "ex:Person",
                  "ex:cool" {"ex:isCool" true}}]
-               @(fluree/query valid-person {"@context" context
+               @(fluree/q valid-person {"@context" context
                                             "select"   {"ex:Bob" ["*" {"ex:cool" ["ex:isCool"]}]}})))
         (is (= {:status 422,
                 :error  :shacl/violation,
@@ -2841,7 +2841,7 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         (is (= [{"id"      "ex:Bob",
                  "type"    "ex:Person",
                  "ex:cool" {"ex:dude" {"ex:isBlank" true}}}]
-               @(fluree/query valid-person {"@context" context
+               @(fluree/q valid-person {"@context" context
                                             "select"   {"ex:Bob" ["*" {"ex:cool" [{"ex:dude" ["ex:isBlank"]}]}]}})))
         (is (= {:status 422,
                 :error  :shacl/violation,

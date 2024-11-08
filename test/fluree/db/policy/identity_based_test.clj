@@ -56,7 +56,7 @@
 
       (testing " with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
-               @(fluree/query
+               @(fluree/q
                  policy-db
                  {"@context" {"ex"     "http://example.org/ns/"
                               "schema" "http://schema.org/"}
@@ -68,7 +68,7 @@
 
       (testing " with where-clause match of restricted data"
         (is (= []
-               @(fluree/query
+               @(fluree/q
                  policy-db
                  {"@context" {"ex"     "http://example.org/ns/"
                               "schema" "http://schema.org/"}
@@ -89,7 +89,7 @@
                  "schema:name"      "John"
                  "schema:email"     "john@flur.ee"
                  "schema:birthDate" "2021-08-17"}]
-               @(fluree/query
+               @(fluree/q
                  policy-db
                  {"@context" {"ex"     "http://example.org/ns/"
                               "schema" "http://schema.org/"}

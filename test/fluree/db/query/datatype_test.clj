@@ -33,13 +33,13 @@
         (is (= [{:id          :ex/halie
                  :type        :schema/Person
                  :schema/name "Halie"}]
-               @(fluree/query mixed-db
+               @(fluree/q mixed-db
                               {:context default-context
                                :select  {'?u [:*]}
                                :where   {:id '?u, :schema/name "Halie"}}))
             "only returns the data type queried")
         (is (= []
-               @(fluree/query mixed-db
+               @(fluree/q mixed-db
                               {:context default-context
                                :select  {'?u [:*]}
                                :where   {:id '?u, :schema/name "a"}}))
@@ -47,7 +47,7 @@
         (is (= [{:id          :ex/john
                  :type        :schema/Person
                  :schema/name 3}]
-               @(fluree/query mixed-db
+               @(fluree/q mixed-db
                               {:context default-context
                                :select  {'?u [:*]}
                                :where   {:id '?u, :schema/name 3}}))

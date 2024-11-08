@@ -132,7 +132,7 @@
 
               grandparent-db* @(fluree/reason grandparent-db :datalog)
 
-              grandparents-of @(fluree/query grandparent-db*
+              grandparents-of @(fluree/q grandparent-db*
                                              {:context {"ex" "http://example.org/"}
                                               :select  ["?grandParent" "?person"]
                                               :where   {"@id"            "?person",
@@ -153,7 +153,7 @@
                             {"insert" [senior-rule]})
               senior-db* @(fluree/reason senior-db :datalog)
 
-              seniors    @(fluree/query
+              seniors    @(fluree/q
                             senior-db* {:context {"ex" "http://example.org/"}
                                         :select  "?s"
                                         :where   {"@id"              "?s",
@@ -173,7 +173,7 @@
 
           (is (= #{["ex:mike" "ex:carol"] ;; <- explicitly set
                    ["ex:bob" "ex:brian"]} ;; <- inferred
-                 (-> @(fluree/query
+                 (-> @(fluree/q
                         brother-db*
                         {:context {"ex" "http://example.org/"}
                          :select  ["?brother" "?s"]
@@ -192,7 +192,7 @@
 
       (testing "A recursive relationship"
         (let [grandparents-db @(fluree/reason db0 :datalog [grandparent-rule])
-              grandparents-of @(fluree/query grandparents-db
+              grandparents-of @(fluree/q grandparents-db
                                              {:context {"ex" "http://example.org/"}
                                               :select  ["?grandParent" "?person"]
                                               :where   {"@id"            "?person",
@@ -222,14 +222,14 @@
               full-reasoned-db @(fluree/reason db0 :datalog [uncle-rule aunt-rule])]
 
           (is (= [["ex:brian" "ex:janine"]]
-                 @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
+                 @(fluree/q half-reasoned-db {:context {"ex" "http://example.org/"}
                                                   :select  ["?s" "?aunt"]
                                                   :where   {"@id"     "?s",
                                                             "ex:aunt" "?aunt"}}))
               "Without only the aunt-rule included, only one result is returned.")
 
           (is (= [["ex:brian" "ex:holly"] ["ex:brian" "ex:janine"]]
-                 @(fluree/query full-reasoned-db {:context {"ex" "http://example.org/"}
+                 @(fluree/q full-reasoned-db {:context {"ex" "http://example.org/"}
                                                   :select  ["?s" "?aunt"]
                                                   :where   {"@id"     "?s",
                                                             "ex:aunt" "?aunt"}}))
@@ -240,14 +240,14 @@
               full-reasoned-db @(fluree/reason db0 :datalog [rule-db-1 rule-db-2])]
 
           (is (= []
-                 @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
+                 @(fluree/q half-reasoned-db {:context {"ex" "http://example.org/"}
                                                   :select  ["?s" "?aunt"]
                                                   :where   {"@id"     "?s",
                                                             "ex:aunt" "?aunt"}}))
               "With only the uncle-rule, no results are returned.")
           
           (is (= [["ex:brian" "ex:holly"] ["ex:brian" "ex:janine"]]
-                 @(fluree/query full-reasoned-db {:context {"ex" "http://example.org/"}
+                 @(fluree/q full-reasoned-db {:context {"ex" "http://example.org/"}
                                                   :select  ["?s" "?aunt"]
                                                   :where   {"@id"     "?s",
                                                             "ex:aunt" "?aunt"}}))
@@ -258,13 +258,13 @@
               full-reasoned-db @(fluree/reason db0 :datalog [rule-db-1 aunt-rule])]
 
           (is (= []
-                 @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
+                 @(fluree/q half-reasoned-db {:context {"ex" "http://example.org/"}
                                                   :select  ["?s" "?aunt"]
                                                   :where   {"@id"     "?s",
                                                             "ex:aunt" "?aunt"}}))
               "With only the uncle-rule, no results are returned.")
           (is (= [["ex:brian" "ex:holly"] ["ex:brian" "ex:janine"]]
-                 @(fluree/query full-reasoned-db {:context {"ex" "http://example.org/"}
+                 @(fluree/q full-reasoned-db {:context {"ex" "http://example.org/"}
                                                   :select  ["?s" "?aunt"]
                                                   :where   {"@id"     "?s",
                                                             "ex:aunt" "?aunt"}}))
@@ -274,12 +274,12 @@
         (let [alt-rule-first-reasoned-db @(fluree/reason db0 :datalog [alt-grandparent-rule grandparent-rule])
               alt-rule-last-reasoned-db @(fluree/reason db0 :datalog [grandparent-rule alt-grandparent-rule])]
           (is (and (= [["ex:alice" "ex:carol"]]
-                      @(fluree/query alt-rule-first-reasoned-db {:context {"ex" "http://example.org/"}
+                      @(fluree/q alt-rule-first-reasoned-db {:context {"ex" "http://example.org/"}
                                                                  :select  ["?s" "?grandParent"]
                                                                  :where   {"@id"            "?s",
                                                                            "ex:grandParent" "?grandParent"}}))
                    (= [["ex:brian" "ex:cheryl"]]
-                      @(fluree/query alt-rule-last-reasoned-db {:context {"ex" "http://example.org/"}
+                      @(fluree/q alt-rule-last-reasoned-db {:context {"ex" "http://example.org/"}
                                                                  :select  ["?s" "?grandParent"]
                                                                  :where   {"@id"            "?s",
                                                                            "ex:grandParent" "?grandParent"}})))
@@ -358,7 +358,7 @@
                   "ex:task1-2"
                   "ex:task1-2-1"
                   "ex:task1-2-2"]
-                 (-> @(fluree/query
+                 (-> @(fluree/q
                         db1* {:context {"ex" "http://example.org/"}
                               :select  "?subtask"
                               :where   {"@id"           "ex:task1",

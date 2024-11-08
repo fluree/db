@@ -36,7 +36,7 @@
                                       "rdfs:subClassOf" {"@id" "ex:Human"}}])]
 
       (is (= ["ex:Human"]
-             @(fluree/query db-reason {:context {"ex"   "http://example.org/"
+             @(fluree/q db-reason {:context {"ex"   "http://example.org/"
                                                  "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
                                        :select  "?subclasses"
                                        :where   {"@id"             "ex:Person"
@@ -45,7 +45,7 @@
 
       (is (= (list "ex:brian" "ex:laura")
              (sort
-               @(fluree/query db-reason
+               @(fluree/q db-reason
                               {:context {"ex" "http://example.org/"}
                                :select  "?s"
                                :where   {"@id"   "?s"
@@ -54,7 +54,7 @@
 
       (is (= (list "ex:alice" "ex:brian" "ex:laura")
              (sort
-               @(fluree/query db-reason
+               @(fluree/q db-reason
                               {:context {"ex" "http://example.org/"}
                                :select  "?s"
                                :where   {"@id"   "?s"
@@ -86,7 +86,7 @@
                                          "owl:equivalentClass" {"@id" "ex:Person"}}])]
           (is (= (list "ex:brian" "ex:laura")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?s"
@@ -96,7 +96,7 @@
 
           (is (= (list "ex:brian" "ex:laura")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?s"
@@ -113,7 +113,7 @@
                                          "owl:equivalentClass" [{"@id" "ex:Human"} {"@id" "ex:HumanBeing"}]}])]
           (is (= (list "ex:alice" "ex:brian" "ex:laura")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -122,7 +122,7 @@
 
           (is (= (list "ex:alice" "ex:brian" "ex:laura")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -131,7 +131,7 @@
 
           (is (= (list "ex:alice" "ex:brian" "ex:laura")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -166,7 +166,7 @@
                                                                  "owl:hasValue"   true}]}])]
           (is (= (list "ex:alice" "ex:susan")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -175,7 +175,7 @@
 
           (is (= (list "ex:alice" "ex:susan")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"           "?s"
@@ -192,7 +192,7 @@
                                                                  "owl:onProperty" "ex:hasAccount" ;; OOPS! should be an IRI
                                                                  "owl:hasValue"   true}]}])]
           (is (= ["ex:susan"]
-                 @(fluree/query db-equiv
+                 @(fluree/q db-equiv
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?s"
                                  :where   {"@id"   "?s"
@@ -239,7 +239,7 @@
                                                                     "owl:someValuesFrom" {"@id" "ex:Winery"}}]}])]
           (is (= (list "ex:a-wine-1" "ex:a-wine-2" "ex:maybe-a-wine")
                  (sort
-                   @(fluree/query db-some-val
+                   @(fluree/q db-some-val
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -259,7 +259,7 @@
                                                                                                                 {"@id" "ex:winery1"}]}}}]}])]
           (is (= (list "ex:a-wine-1" "ex:a-wine-2" "ex:maybe-a-wine")
                  (sort
-                   @(fluree/query db-some-val
+                   @(fluree/q db-some-val
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -277,7 +277,7 @@
                                                                    "owl:allValuesFrom" {"@id" "ex:Winery"}}]}])]
           (is (= (list "ex:textile-company" "ex:winery1" "ex:winery2")
                  (sort
-                   @(fluree/query db-all-val
+                   @(fluree/q db-all-val
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -307,7 +307,7 @@
 
           (is (= (list "ex:carol" "ex:carol2" "ex:carol3")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -317,7 +317,7 @@
 
           (is (= (list "ex:carol" "ex:carol2" "ex:carol3")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -327,7 +327,7 @@
 
           (is (= (list "ex:carol" "ex:carol2" "ex:carol3")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -344,7 +344,7 @@
                                       "owl:onProperty"     {"@id" "ex:mother"}
                                       "owl:maxCardinality" 42}])]
           (is (= []
-                 @(fluree/query db-42
+                 @(fluree/q db-42
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  "?s"
@@ -379,7 +379,7 @@
                                                                  "owl:maxQualifiedCardinality" 1}]}])]
           (is (= (list "ex:carol" "ex:carol2")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -389,7 +389,7 @@
 
           (is (= (list "ex:carol" "ex:carol2")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -398,7 +398,7 @@
               "ex:carol and ex:carol2 should be sameAs because their classes are same as owl:onClass restriction")
 
           (is (= []
-                 @(fluree/query db-equiv
+                 @(fluree/q db-equiv
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  "?same"
@@ -418,7 +418,7 @@
                                                                  "owl:maxQualifiedCardinality" 1}]}])]
           (is (= (list "ex:carol" "ex:carol-not" "ex:carol2")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -428,7 +428,7 @@
 
           (is (= (list "ex:carol" "ex:carol-not" "ex:carol2")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -438,7 +438,7 @@
 
           (is (= (list "ex:carol" "ex:carol-not" "ex:carol2")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -456,7 +456,7 @@
                                       "owl:onClass"                 {"@id" "owl:Thing"}
                                       "owl:maxQualifiedCardinality" 42}])]
           (is (= []
-                 @(fluree/query db-42
+                 @(fluree/q db-42
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  "?s"
@@ -492,7 +492,7 @@
                                                                                                     {"@id" "ex:Blue"}]}}]}]}])]
           (is (= (list "ex:Green" "ex:Red")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -500,7 +500,7 @@
 
           (is (= (list "ex:Blue" "ex:Red")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -522,7 +522,7 @@
                                                                                            {"@id" "ex:Blue"}]}]}]}])]
           (is (= (list "ex:Green" "ex:Red")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -530,7 +530,7 @@
 
           (is (= (list "ex:Blue" "ex:Red")
                  (sort
-                   @(fluree/query db-equiv
+                   @(fluree/q db-equiv
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -564,7 +564,7 @@
           
           (is (= (list "ex:carol" "ex:jen")
                  (sort
-                   @(fluree/query db-reasoned
+                   @(fluree/q db-reasoned
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -573,7 +573,7 @@
 
           (is (= (list "ex:alice" "ex:carol" "ex:jen")
                  (sort
-                   @(fluree/query db-reasoned
+                   @(fluree/q db-reasoned
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -582,7 +582,7 @@
 
           (is (= (list "ex:Parent" "ex:Woman")
                  (sort
-                   @(fluree/query db-reasoned
+                   @(fluree/q db-reasoned
                                   {:context {"ex"   "http://example.org/"
                                              "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
                                    :select  "?subclasses"
@@ -603,7 +603,7 @@
                                                                                                     "owl:hasValue"   21}]}}]}])]
 
           (is (= ["ex:alice"]
-                 @(fluree/query db-reasoned
+                 @(fluree/q db-reasoned
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?s"
                                  :where   {"@id"   "?s"
@@ -638,7 +638,7 @@
           
           (is (= (list "ex:bob" "ex:carol")
                  (sort
-                   @(fluree/query db-reasoned
+                   @(fluree/q db-reasoned
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -647,7 +647,7 @@
 
           (is (= (list "ex:Father" "ex:Mother")
                  (sort
-                   @(fluree/query db-reasoned
+                   @(fluree/q db-reasoned
                                   {:context {"ex"   "http://example.org/"
                                              "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
                                    :select  "?s"
@@ -670,7 +670,7 @@
           
           (is (= (list "ex:bob" "ex:carol" "ex:sue")
                  (sort
-                   @(fluree/query db-reasoned
+                   @(fluree/q db-reasoned
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"

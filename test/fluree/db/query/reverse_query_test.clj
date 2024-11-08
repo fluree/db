@@ -27,12 +27,12 @@
 
       (is (= {:schema/name "Brian"
               :friended    :ex/cam}
-             @(fluree/query db {:context   [context {:friended {:reverse :ex/friend}}]
+             @(fluree/q db {:context   [context {:friended {:reverse :ex/friend}}]
                                 :selectOne {:ex/brian [:schema/name :friended]}})))
 
       (is (= {:schema/name "Alice"
               :friended    [:ex/brian :ex/cam]}
-             @(fluree/query db {:context   [context {:friended {:reverse :ex/friend}}]
+             @(fluree/q db {:context   [context {:friended {:reverse :ex/friend}}]
                                 :selectOne {:ex/alice [:schema/name :friended]}})))
 
 
@@ -42,7 +42,7 @@
                             :schema/name "Cam"
                             :ex/friend   #{{:id :ex/brian} {:id :ex/alice}}}}
              (-> db
-                 (fluree/query {:context   [context {:friended {:reverse :ex/friend}}]
+                 (fluree/q {:context   [context {:friended {:reverse :ex/friend}}]
                                 :selectOne {:ex/brian [:schema/name {:friended [:*]}]}})
                  deref
                  (update-in [:friended :ex/friend] set)))))))
@@ -74,7 +74,7 @@
               "parent"
               #{{"@id" "ex:mom", "ex:name" "Mom", "@type" "ex:Person" "ex:child" {"@id" "ex:kid"}}
                 {"@id" "ex:dad", "ex:name" "Dad", "@type" "ex:Person" "ex:child" {"@id" "ex:kid"}}}}
-             (-> @(fluree/query db1 {"@context" {"ex"     "http://example.org/ns/"
+             (-> @(fluree/q db1 {"@context" {"ex"     "http://example.org/ns/"
                                                  "parent" {"@reverse" "ex:child"}}
                                      "select"   {"ex:kid" ["*" {"parent" ["*"]}]}})
                  (first)
@@ -83,19 +83,19 @@
       (is (= [{"@id"     "ex:kid"
                "@type"   "ex:Person"
                "ex:name" "Kiddo"}]
-             @(fluree/query db1 {"@context"       {"ex"     "http://example.org/ns/"
+             @(fluree/q db1 {"@context"       {"ex"     "http://example.org/ns/"
                                                    "parent" {"@reverse" "ex:child"}}
                                  "where"          {"@id" "?s" "parent" "?x"}
                                  "selectDistinct" {"?s" ["*"]}}))))
 
     (testing "@type reverse"
       (is (= #{"ex:Person" "ex:Organization"}
-             (set @(fluree/query db1 {"@context"       {"ex"           "http://example.org/ns/"
+             (set @(fluree/q db1 {"@context"       {"ex"           "http://example.org/ns/"
                                                         "isTypeObject" {"@reverse" "@type"}}
                                       "where"          {"@id" "?class" "isTypeObject" "?x"}
                                       "selectDistinct" "?class"})))))
     (testing "@type forward"
       (is (= #{"ex:Person" "ex:Organization"}
-             (set @(fluree/query db1 {"@context"       {"ex" "http://example.org/ns/"}
+             (set @(fluree/q db1 {"@context"       {"ex" "http://example.org/ns/"}
                                       "where"          {"@id" "?x" "@type" "?class"}
                                       "selectDistinct" "?class"})))))))

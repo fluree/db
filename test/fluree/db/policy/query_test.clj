@@ -60,7 +60,7 @@
 
       (testing " with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
-               @(fluree/query
+               @(fluree/q
                  policy-db
                  {"@context" {"ex"     "http://example.org/ns/"
                               "schema" "http://schema.org/"}
@@ -72,7 +72,7 @@
 
       (testing " with where-clause match of restricted data"
         (is (= []
-               @(fluree/query
+               @(fluree/q
                  policy-db
                  {"@context" {"ex"     "http://example.org/ns/"
                               "schema" "http://schema.org/"}
@@ -93,7 +93,7 @@
                  "schema:name"      "John"
                  "schema:email"     "john@flur.ee"
                  "schema:birthDate" "2021-08-17"}]
-               @(fluree/query
+               @(fluree/q
                  policy-db
                  {"@context" {"ex"     "http://example.org/ns/"
                               "schema" "http://schema.org/"}
@@ -179,7 +179,7 @@
                  "ex:internalId"        "widget-1234"
                  "ex:priorYearSales"    10000000
                  "ex:priorYearCurrency" "USD"}]
-               @(fluree/query
+               @(fluree/q
                  john-policy-db
                  {"@context" {"ex"     "http://example.org/ns/"
                               "schema" "http://schema.org/"
@@ -190,7 +190,7 @@
 
       (testing " and values binding has user without policy relationship"
         (is (= []
-               @(fluree/query
+               @(fluree/q
                  alice-policy-db
                  {"@context" {"ex"     "http://example.org/ns/"
                               "schema" "http://schema.org/"
@@ -268,12 +268,12 @@
         (is (= [{"@id"               "ex:data-0",
                  "@type"             "ex:Data",
                  "ex:classification" 0}]
-               @(fluree/query policy-allow data-query)))
+               @(fluree/q policy-allow data-query)))
 
         (is (= [{"@id"               "ex:other",
                  "@type"             "ex:Other",
                  "ex:classification" -99}]
-               @(fluree/query policy-allow other-query))
+               @(fluree/q policy-allow other-query))
             "ex:Other class should not be restricted")
 
         (is (= [{"@id"          "ex:referred"
@@ -281,15 +281,15 @@
                  "ex:referData" [{"@id"               "ex:data-0"
                                   "@type"             "ex:Data"
                                   "ex:classification" 0}]}]
-               @(fluree/query policy-allow refer-query))
+               @(fluree/q policy-allow refer-query))
             " in graph crawl ex:Data is still restricted"))
 
       (testing " with policy default allow? set to false"
         (is (= [{"@id"               "ex:data-0",
                  "@type"             "ex:Data",
                  "ex:classification" 0}]
-               @(fluree/query policy-deny data-query)))
+               @(fluree/q policy-deny data-query)))
 
         (is (= []
-               @(fluree/query policy-deny other-query))
+               @(fluree/q policy-deny other-query))
             "ex:Other class should be restricted")))))

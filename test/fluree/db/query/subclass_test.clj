@@ -61,7 +61,7 @@
                 :schema/name   "The Hitchhiker's Guide to the Galaxy",
                 :schema/isbn   "0-330-25864-8",
                 :schema/author {:id :wiki/Q42}}}
-             (set @(fluree/query db3
+             (set @(fluree/q db3
                                  {:context test-utils/default-context
                                   :select  {'?s [:*]}
                                   :where   {:id '?s, :type :schema/CreativeWork}})))
@@ -112,7 +112,7 @@
                {"id"          "ex:andrew"
                 "type"        "schema:Person"
                 "schema:name" "Andrew Johnson"}}
-             (set @(fluree/query db2 {"@context" context
+             (set @(fluree/q db2 {"@context" context
                                       "where"    {"@id" "?s", "@type" "ex:Humanoid"}
                                       "select"   {"?s" ["*"]}})))))))
 
@@ -163,7 +163,7 @@
                {"id"          "ex:andrew"
                 "type"        "schema:Person"
                 "schema:name" "Andrew Johnson"}}
-             (set @(fluree/query db4 {"@context" context
+             (set @(fluree/q db4 {"@context" context
                                       "where"    {"@id" "?s", "@type" "ex:Humanoid"}
                                       "select"   {"?s" ["*"]}})))))))
 
@@ -199,7 +199,7 @@
                           "insert"   [{"@id"             "ex:Employee"
                                        "rdfs:subClassOf" {"@id" "ex:Person"}}]})]
       (is (= #{"ex:brian" "ex:laura" "ex:alice"}
-             (set @(fluree/query db3 {"@context" {"ex" "http://example.org/"}
+             (set @(fluree/q db3 {"@context" {"ex" "http://example.org/"}
                                       "select"   "?s"
                                       "where"    {"@id"   "?s"
                                                   "@type" "ex:Human"}})))))))

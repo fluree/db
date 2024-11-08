@@ -78,7 +78,7 @@
                                       "skos:prefLabel"      {"@type" "xsd:string", "@value" "Geo Segment"}}])]
 
       (is (= ["ex:is-account"]
-             @(fluree/query db-reason {:context {"gist" "https://ontologies.semanticarts.com/gist/"
+             @(fluree/q db-reason {:context {"gist" "https://ontologies.semanticarts.com/gist/"
                                                  "ex"   "http://example.org/"}
                                        :select  "?id"
                                        :where   {"@id"   "?id"
@@ -129,7 +129,7 @@
                                                              "@value" "Agreement"}}])]
       
       (is (= ["ex:doc-commitment"]
-             @(fluree/query db-reason {:context {"gist" "https://ontologies.semanticarts.com/gist/"
+             @(fluree/q db-reason {:context {"gist" "https://ontologies.semanticarts.com/gist/"
                                                  "ex"   "http://example.org/"}
                                        :select  "?id"
                                        :where   {"@id"   "?id"
@@ -176,7 +176,7 @@
       (is (= #{"gist:_USDollar", "gist:_ampere", "gist:_bit", "gist:_candela",
                "gist:_each", "gist:_kelvin", "gist:_kilogram", "gist:_meter",
                "gist:_mole", "gist:_second"}
-             (set @(fluree/query db-reason {:context {"gist" "https://ontologies.semanticarts.com/gist/"}
+             (set @(fluree/q db-reason {:context {"gist" "https://ontologies.semanticarts.com/gist/"}
                                             :select  "?id"
                                             :where   {"@id"   "?id"
                                                       "@type" "gist:BaseUnit"}})))

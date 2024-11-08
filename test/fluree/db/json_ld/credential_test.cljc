@@ -170,19 +170,19 @@
            query {"@context" context
                   "select"   {(:id auth) ["*"]}}]
        (is (= [{"id" "ct:open", "ct:foo" "bar"}]
-              @(fluree/query db0 {"@context" context
+              @(fluree/q db0 {"@context" context
                                   "select"   {"ct:open" ["*"]}}))
            "can see everything when no identity is asserted")
 
        (is (= [root-user]
-              @(fluree/query db1 query)))
+              @(fluree/q db1 query)))
 
        (is (= [{"id"            (:id auth)
                 "type"          "ct:User"
                 "ct:name"       "D"
                 "ct:favnums"    [2 3 4 5 6]
                 "f:policyClass" {"id" "ct:DefaultUserPolicy"}}]
-              @(fluree/query db2 query))
+              @(fluree/q db2 query))
            "modify transaction in credential")
 
        (is (= []

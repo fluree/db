@@ -51,7 +51,7 @@
              (:stats stage-empty-node))
           "empty nodes are allowed as long as there is other data, they are just noops")
       (is (= [[:ex/alice :schema/age 42]]
-             @(fluree/query db-ok {:context [test-utils/default-context
+             @(fluree/q db-ok {:context [test-utils/default-context
                                              {:ex "http://example.org/ns/"}]
                                    :select  '[?s ?p ?o]
                                    :where   '{:id ?s
@@ -69,7 +69,7 @@
                       {:id        :ex/alice
                        :ex/isCool false}})]
       (is (= [[:ex/alice :ex/isCool false]]
-             @(fluree/query db-bool {:context [test-utils/default-context
+             @(fluree/q db-bool {:context [test-utils/default-context
                                                {:ex "http://example.org/ns/"}]
                                      :select  '[?s ?p ?o]
                                      :where   '{:id ?s, ?p ?o}})))))
@@ -93,7 +93,7 @@
                   :select  {:ex/brian [:*]}}]
       (is (= [{:id               :ex/brian
                :ex/favCoffeeShop [{:id :wiki/Q37158} "Clemmons Coffee"]}]
-             @(fluree/query db query)))))
+             @(fluree/q db query)))))
 
   (testing "mixed data types (num & string) are handled correctly"
     (let [conn   (test-utils/create-conn)
@@ -114,7 +114,7 @@
                   :select  {:ex/wes [:*]}}]
       (is (= [{:id                        :ex/wes
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
-             @(fluree/query db query)))))
+             @(fluree/q db query)))))
 
   (testing "mixed data types (ref & string) are handled correctly"
     (let [conn   (test-utils/create-conn)
@@ -135,7 +135,7 @@
                   :select  {:ex/brian [:*]}}]
       (is (= [{:id               :ex/brian
                :ex/favCoffeeShop [{:id :wiki/Q37158} "Clemmons Coffee"]}]
-             @(fluree/query db query)))))
+             @(fluree/q db query)))))
 
   (testing "mixed data types (num & string) are handled correctly"
     (let [conn   (test-utils/create-conn)
@@ -156,7 +156,7 @@
                   :select  {:ex/wes [:*]}}]
       (is (= [{:id                        :ex/wes
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
-             @(fluree/query db query)))))
+             @(fluree/q db query)))))
   (testing "iri value maps are handled correctly"
     (let [conn @(fluree/connect-memory)
           ledger @(fluree/create conn "any-iri")
@@ -168,7 +168,7 @@
                                                        "@value" "ex:baz"}}]})]
       (is (= [{"@id" "http://example.com/foo"
                "http://example.com/bar" {"@id" "http://example.com/baz"}}]
-             @(fluree/query db1 {"@context" nil
+             @(fluree/q db1 {"@context" nil
                                  "select" {"http://example.com/foo" ["*"]}}))
           "ex:baz is properly expanded and wrapped in an id-map"))))
 
@@ -192,7 +192,7 @@
       (is (= [{"@id"          "ex:jane"
                "ex:friend"    {"@id" "ex:alice", "ex:bestFriend" {"@id" "ex:bob"}}
                "ex:friendBFF" {"@id" "ex:bob"}}]
-             @(fluree/query
+             @(fluree/q
                db2
                {"@context" {"ex" "http://example.org/"}
                 "select"   {"ex:jane" ["*"]}
@@ -237,9 +237,9 @@
       (let [users #{{:id :ex/john, :type :ex/User, :schema/name "John"}
                     {:id :ex/alice, :type :ex/User, :schema/name "Alice"}}]
         (is (= users
-               (set @(fluree/query db-data-first user-query))))
+               (set @(fluree/q db-data-first user-query))))
         (is (= users
-               (set @(fluree/query db-policy-first user-query))))))))
+               (set @(fluree/q db-policy-first user-query))))))))
 
 (deftest ^:integration transact-large-dataset-test
   (with-tmp-dir storage-path
@@ -269,7 +269,7 @@
                      "where"    {"@id"      "?m"
                                  "type"     "ex:Movie"
                                  "ex:title" "?title"}}
-            results @(fluree/query db2 query)]
+            results @(fluree/q db2 query)]
         (is (= 100 (count results)))
         (is (every? (set results)
                     ["Interstellar" "Wreck-It Ralph" "The Jungle Book" "WALL·E"
@@ -317,7 +317,7 @@
                   :type        :ex/User,
                   :foo/bar     "foo",
                   :schema/name "Alice"}}
-               (set @(fluree/query db (assoc user-query
+               (set @(fluree/q db (assoc user-query
                                              :context [context
                                                        {:ex "http://example.org/ns/"}
                                                        {:foo "http://foo.com/"}])))))))
@@ -339,7 +339,7 @@
                   :schema/name      "Alice",
                   :foo/bar          "foo",
                   :schema/givenName "Alicia"}}
-               (set @(fluree/query db (assoc user-query
+               (set @(fluree/q db (assoc user-query
                                              :context [context
                                                        {:ex "http://example.org/ns/"}
                                                        {:foo "http://foo.com/"
@@ -364,7 +364,7 @@
                   :schema/givenName "Alicia"
                   :quux/corge       "grault"
                   :foo/bar          "foo"}}
-               (set @(fluree/query db (assoc user-query
+               (set @(fluree/q db (assoc user-query
                                              :context [context
                                                        {:ex "http://example.org/ns/"}
                                                        {:foo  "http://foo.com/"
@@ -410,7 +410,7 @@
       (is (= [{"@id"                              "http://example.org/nessie"
                "@type"                            "http://example.org/terms/SeaMonster"
                "http://example.org/terms/isScary" false}]
-             @(fluree/query db1 {"select"   '{?m ["*"]}
+             @(fluree/q db1 {"select"   '{?m ["*"]}
                                  "where"    '{"@id"   ?m
                                               "@type" "http://example.org/terms/SeaMonster"}})))))
   (testing "@base & @vocab work w/ stage"
@@ -431,7 +431,7 @@
                "@type"                            "http://example.org/terms/SeaMonster"
                "http://example.org/terms/isScary" false}]
 
-             @(fluree/query db1 '{"select"   {?m ["*"]}
+             @(fluree/q db1 '{"select"   {?m ["*"]}
                                   "where"    {"@id"   ?m
                                               "@type" "http://example.org/terms/SeaMonster"}}))))))
 
@@ -462,14 +462,14 @@
               {"id"     "ex:bob",
                "type"   "ex:Person",
                "ex:json" {":edn" "data", ":is" ["cool" "right?" 1 false 1]}}]
-             @(fluree/query db1 {"@context" [test-utils/default-str-context
+             @(fluree/q db1 {"@context" [test-utils/default-str-context
                                              {"ex" "http://example.org/ns/"}]
                                  "where"  {"@id" "?s" "@type" "ex:Person"}
                                  "select" {"?s" ["*"]}}))
           "comes out as data from subject crawl")
       (is (= [{":edn" "data", ":is" ["cool" "right?" 1 false 1]}
               {"json" "data", "is" ["cool" "right?" 1 false 1]}]
-             @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"}
+             @(fluree/q db1 {"@context" {"ex" "http://example.org/ns/"}
                                  "select"   "?json"
                                  "where"  {"@id" "?s" "ex:json" "?json"}}))
           "comes out as data from select clause"))))
@@ -494,7 +494,7 @@
     (is (= {"@id"                "ex:andrew"
             "schema:name"        "Andrew"
             "schema:description" "He's great!"}
-           @(fluree/query db2 {"@context"  context
+           @(fluree/q db2 {"@context"  context
                                "selectOne" {"ex:andrew" ["*"]}})))))
 
 (deftest ^:integration shacl-datatype-coercion
@@ -540,7 +540,7 @@
                                                            "schema:name" "Letti",
                                                            "schema:age"  "alot"}})]
     (is (= {"schema:age" 8}
-           @(fluree/query db2 {"@context"  context
+           @(fluree/q db2 {"@context"  context
                                "selectOne" {"ex:freddy" ["schema:age"]}}))
         "8 is converted from a long to an int.")
     (is (test-utils/shacl-error? db3)
@@ -574,8 +574,8 @@
       (is (= [{"@id"     "ex:aஃ",
                "@type"   "ex:Foo"
                "ex:desc" "try special ஃ as second iri char"}]
-             @(fluree/query db1a q1a)))
+             @(fluree/q db1a q1a)))
       (is (= [{"@id"     "ex:ஃb",
                "@type"   "ex:Foo"
                "ex:desc" "try special ஃ as first iri char"}]
-             @(fluree/query db1b q1b))))))
+             @(fluree/q db1b q1b))))))

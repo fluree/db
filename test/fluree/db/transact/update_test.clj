@@ -97,7 +97,7 @@
                                          "insert"   {:id :ex/jane, :schema/age 31}
                                          "where"    {:id :ex/jane, :schema/age "?current-age"}})]
 
-      (is (= @(fluree/query db-subj-delete
+      (is (= @(fluree/q db-subj-delete
                             {:context [test-utils/default-context
                                        {:ex "http://example.org/ns/"}]
                              :select '?name
@@ -105,7 +105,7 @@
              ["Bob" "Jane"])
           "Only Jane and Bob should be left in the db.")
 
-      (is (= @(fluree/query db-subj-pred-del
+      (is (= @(fluree/q db-subj-pred-del
                             {:context [test-utils/default-context
                                        {:ex "http://example.org/ns/"}]
                              :selectOne {:ex/bob [:*]}})
@@ -114,7 +114,7 @@
               :schema/name "Bob"})
           "Bob should no longer have an age property.")
 
-      (is (= @(fluree/query db-all-preds
+      (is (= @(fluree/q db-all-preds
                             {:context [test-utils/default-context
                                        {:ex "http://example.org/ns/"}]
                              :select '?name
@@ -122,7 +122,7 @@
              ["Bob"])
           "Only Bob should be left, as he is the only one without an email.")
 
-      (is (= @(fluree/query db-age-delete
+      (is (= @(fluree/q db-age-delete
                             {:context [test-utils/default-context
                                        {:ex "http://example.org/ns/"}]
                              :select '?name
@@ -135,7 +135,7 @@
                  :type        :ex/User,
                  :schema/name "Bob"
                  :schema/age  23}]
-               @(fluree/query db-update-bob
+               @(fluree/q db-update-bob
                               {:context [test-utils/default-context
                                          {:ex "http://example.org/ns/"}]
                                :select {:ex/bob [:*]}}))
@@ -146,7 +146,7 @@
                  :type        :ex/User,
                  :schema/name "Bob"
                  :schema/age  22}]
-               @(fluree/query db-update-bob2
+               @(fluree/q db-update-bob2
                               {:context [test-utils/default-context
                                          {:ex "http://example.org/ns/"}]
                                :select {:ex/bob [:*]}}))
@@ -158,7 +158,7 @@
                  :schema/name  "Jane"
                  :schema/email "jane@flur.ee"
                  :schema/age   31}]
-               @(fluree/query db-update-jane
+               @(fluree/q db-update-jane
                               {:context [test-utils/default-context
                                          {:ex "http://example.org/ns/"}]
                                :select {:ex/jane [:*]}}))
@@ -192,7 +192,7 @@
                                                      "ex:sha512" "?sha512"}}))]
           (is (= {"ex:sha512" "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
                   "ex:sha256" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}
-                 @(fluree/query @updated {"@context"  [test-utils/default-str-context
+                 @(fluree/q @updated {"@context"  [test-utils/default-str-context
                                                        {"ex" "http://example.com/"}]
                                           "selectOne" {"ex:hash-fns" ["ex:sha512" "ex:sha256"]}}))))))
     (testing "datetime functions"
@@ -262,7 +262,7 @@
                   "ex:comp<="  true
                   "ex:comp>"   false
                   "ex:comp>="  false}
-                 @(fluree/query db3
+                 @(fluree/q db3
                                 {"@context" [test-utils/default-str-context
                                              {"ex" "http://example.com/"}]
                                  "selectOne"
@@ -308,13 +308,13 @@
                 "ex:round" 1
                 "ex:ceil"  2
                 "ex:floor" 1}
-               @(fluree/query @updated
+               @(fluree/q @updated
                               {"@context" [test-utils/default-str-context
                                            {"ex" "http://example.com/"}]
                                "selectOne"
                                {"ex:numeric-fns" ["ex:abs" "ex:round" "ex:ceil"
                                                   "ex:floor"]}})))
-        (is (pos? @(fluree/query @updated {"@context"  [test-utils/default-str-context
+        (is (pos? @(fluree/q @updated {"@context"  [test-utils/default-str-context
                                                         {"ex" "http://example.com/"}]
                                            "where"     {"id"      "ex:numeric-fns"
                                                         "ex:rand" "?rand"}
@@ -374,7 +374,7 @@
                 "ex:strBefore" "A"
                 "ex:strAfter"  "efg"
                 "ex:concat"    "Abcdefg STR1 STR2"}
-               @(fluree/query
+               @(fluree/q
                  @updated
                  {"@context" [test-utils/default-str-context
                               {"ex" "http://example.com/"}]
@@ -461,7 +461,7 @@
                                        "ex:strLang"      "Abcdefg"
                                        "ex:strdt"        "Abcdefg"
                                        "ex:bnode"        {"id" test-utils/blank-node-id?}}
-                 @(fluree/query @updated {"@context"  [test-utils/default-str-context
+                 @(fluree/q @updated {"@context"  [test-utils/default-str-context
                                                        {"ex" "http://example.com/"}]
                                           "selectOne" {"ex:rdf-term-fns" ["ex:isIRI" "ex:isURI" "ex:isLiteral"
                                                                           "ex:lang" "ex:datatype" "ex:IRI"
@@ -508,7 +508,7 @@
         (is (= {"ex:bound"  true
                 "ex:in"     true
                 "ex:not-in" false}
-               @(fluree/query @updated {"@context"  [test-utils/default-str-context
+               @(fluree/q @updated {"@context"  [test-utils/default-str-context
                                                      {"ex" "http://example.com/"}]
                                         "selectOne" {"ex:functional-fns" ["ex:bound"
                                                                           "ex:if"
@@ -551,7 +551,7 @@
                    :cause))
             "mdfn parse error")
         (is (= "Query function references illegal symbol: foo"
-               (-> @(fluree/query db2 {"@context" [test-utils/default-str-context
+               (-> @(fluree/q db2 {"@context" [test-utils/default-str-context
                                                    {"ex" "http://example.com/"}]
                                        "where"    [{"id"      "ex:error"
                                                     "ex:text" "?text"}
@@ -593,7 +593,7 @@
                      :where   '{"@id"                ?s
                                 "schema:description" ?o
                                 ?p                   ?o}}
-            subject @(fluree/query db1 q)]
+            subject @(fluree/q db1 q)]
         (is (= [["ex:fluree" "schema:description" "We ❤️ Data"]
                 ["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
                 ["ex:w3c" "schema:description" "We ❤️ Internet"]]
@@ -616,7 +616,7 @@
                      :where  '{"id"                 ?s
                                "schema:description" ?o
                                ?p                   ?o}}
-            subject @(fluree/query db2 q)]
+            subject @(fluree/q db2 q)]
         (is (= []
                subject)
             "returns no results")))))
@@ -656,7 +656,7 @@
       (is (= [{"id"                 "ex:mosquitos"
                "type"               "ex:Monster"
                "schema:description" "We ❤️ All Blood"}]
-             @(fluree/query db2 {"@context" test-utils/default-str-context
+             @(fluree/q db2 {"@context" test-utils/default-str-context
                                  :select    {"ex:mosquitos" ["*"]}}))))))
 
 
@@ -694,7 +694,7 @@
                    :schema/email "rbhayes@usa.gov",
                    :schema/name "Rutherford B. Hayes",
                    :id :ex/rutherford}]
-                 @(fluree/query db2 {"@context" [test-utils/default-context
+                 @(fluree/q db2 {"@context" [test-utils/default-context
                                                  {:ex "http://example.org/ns/"}]
                                      :select    {:ex/rutherford [:*]}}))
               "updates the specified properties on the specified subjects")
@@ -702,7 +702,7 @@
                    :type        :ex/User
                    :schema/name "Millard Fillmore"
                    :schema/age  62}]
-                 @(fluree/query db2 {"@context" [test-utils/default-context
+                 @(fluree/q db2 {"@context" [test-utils/default-context
                                                  {:ex "http://example.org/ns/"}]
                                      :select    {:ex/millard [:*]}}))
               "does not update different subjects")))
@@ -721,12 +721,12 @@
                    :schema/email "rbhayes@usa.gov",
                    :schema/name "Rutherford",
                    :id :ex/rutherford}]
-                 @(fluree/query db2 {"@context" [test-utils/default-context
+                 @(fluree/q db2 {"@context" [test-utils/default-context
                                                  {:ex "http://example.org/ns/"}]
                                      :select    {:ex/rutherford [:*]}}))
               "does not update existing subjects")
           (is (= [{:id :ex/chester}]
-                 @(fluree/query db2 {"@context" [test-utils/default-context
+                 @(fluree/q db2 {"@context" [test-utils/default-context
                                                  {:ex "http://example.org/ns/"}]
                                      :select    {:ex/chester [:*]}}))
               "does not add any facts for non-existing subjects"))))))

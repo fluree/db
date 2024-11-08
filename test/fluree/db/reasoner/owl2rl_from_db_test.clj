@@ -38,7 +38,7 @@
           db-some-val   @(fluree/reason db-with-rules :owl2rl)]
       (is (= (list "ex:a-wine-1" "ex:a-wine-2" "ex:maybe-a-wine")
              (sort
-               @(fluree/query db-some-val
+               @(fluree/q db-some-val
                               {:context {"ex" "http://example.org/"}
                                :select  "?s"
                                :where   {"@id"   "?s"

@@ -178,11 +178,11 @@
                                                            :schema/name "Jonathan"}}]})
                            query        {:context {:ex "http://example.com/"}
                                          :select  {:ex/Andrew [:*]}}
-                           res1         @(fluree/query db query)
+                           res1         @(fluree/q db query)
                            _            @(fluree/commit! ledger db)
                            loaded       (test-utils/retry-load conn ledger-alias 100)
                            loaded-db    (fluree/db loaded)
-                           res2         @(fluree/query loaded-db query)]
+                           res2         @(fluree/q loaded-db query)]
                        (is (= res1 res2)))))
 
      (testing "can load a ledger with `list` values"
@@ -218,7 +218,7 @@
                                   :type       :ex/User,
                                   :ex/numList [7 8 9 10]}
                                  {:id :ex/john, :type :ex/User}]
-                                @(fluree/query loaded-db {:context [test-utils/default-context
+                                @(fluree/q loaded-db {:context [test-utils/default-context
                                                                     {:ex "http://example.org/ns/"}]
                                                           :select  '{?s [:*]}
                                                           :where   '{:id ?s, :type :ex/User}}))))))
@@ -285,7 +285,7 @@
                                                               :f/targetRole {:id :ex/userRole}
                                                               :f/equals     [{:id :f/$identity} {:id :ex/user}]},},
                                     :f/targetClass {:id :ex/User}}]
-                                  @(fluree/query loaded-db
+                                  @(fluree/q loaded-db
                                                  {:context [test-utils/default-context
                                                             {:ex "http://example.org/ns/"}]
                                                   :select  '{?s [:id
@@ -328,8 +328,8 @@
                                                   {"ex" "http://example.org/ns/"}]
                                       "select"   {"?s" ["*"]}
                                       "where"    {"@id" "?s", "type" "ex:Bar"}}]
-                       (is (= @(fluree/query (fluree/db loaded) q)
-                              @(fluree/query db q))))))))
+                       (is (= @(fluree/q (fluree/db loaded) q)
+                              @(fluree/q db q))))))))
 
 #?(:clj
    (deftest load-from-memory-test
@@ -441,11 +441,11 @@
                                              :schema/name "Jonathan"}}]})
              query        {:context {:ex "http://example.com/"}
                            :select  '{:ex/Andrew [:*]}}
-             res1         @(fluree/query db query)
+             res1         @(fluree/q db query)
              _            @(fluree/commit! ledger db)
              loaded       (test-utils/retry-load conn ledger-alias 100)
              loaded-db    (fluree/db loaded)
-             res2         @(fluree/query loaded-db query)]
+             res2         @(fluree/q loaded-db query)]
          (is (= res1 res2))))
 
      (testing "can load a ledger with `list` values"
@@ -479,7 +479,7 @@
                     {:id         :ex/alice,
                      :type       :ex/User,
                      :ex/friends [{:id :ex/john} {:id :ex/cam}]}}
-                  (set @(fluree/query loaded-db {:context [test-utils/default-context
+                  (set @(fluree/q loaded-db {:context [test-utils/default-context
                                                            {:ex "http://example.org/ns/"}]
                                                  :select  '{?s [:*]}
                                                  :where   '{:id ?s, :type :ex/User}}))))))
@@ -543,7 +543,7 @@
                         :f/equals     [{:id :f/$identity} {:id :ex/user}]}
                        :f/path {:id :schema/ssn}}
                       :f/targetClass {:id :ex/User}}]
-                    @(fluree/query loaded-db {:context [test-utils/default-context
+                    @(fluree/q loaded-db {:context [test-utils/default-context
                                                         {:ex "http://example.org/ns/"}]
                                               :select  '{?s [:id
                                                              :type
@@ -569,7 +569,7 @@
                                          {"ex" "http://example.org/ns/"}]
                              :select    {"?s" ["*" {"sh:property" ["sh:path" "sh:datatype"]}]}
                              :where     {"id" "?s", "sh:property" "?property"}}
-             shape-id       (-> @(fluree/query db1 property-query)
+             shape-id       (-> @(fluree/q db1 property-query)
                                 first
                                 (get "id"))
              loaded1        (test-utils/retry-load conn ledger-alias 100)]
@@ -577,12 +577,12 @@
                   "type"           "sh:NodeShape",
                   "sh:targetClass" {"id" "schema:Person"},
                   "sh:property"    {"sh:path" {"id" "schema:familyName"}, "sh:datatype" {"id" "xsd:string"}}}]
-                @(fluree/query db1 property-query)))
+                @(fluree/q db1 property-query)))
          (is (= [{"id"             shape-id
                   "type"           "sh:NodeShape",
                   "sh:targetClass" {"id" "schema:Person"},
                   "sh:property"    {"sh:path" {"id" "schema:familyName"}, "sh:datatype" {"id" "xsd:string"}}}]
-                @(fluree/query (fluree/db loaded1) property-query)))
+                @(fluree/q (fluree/db loaded1) property-query)))
          (testing "load ref retracts"
            (let [db2     @(fluree/transact! conn
                                             {"@context" ["https://ns.flur.ee"
@@ -604,7 +604,7 @@
                       "type"           "sh:NodeShape",
                       "sh:targetClass" {"id" "schema:Person"},
                       "sh:property"    {"sh:path" {"id" "schema:age"}, "sh:datatype" {"id" "xsd:string"}}}]
-                    @(fluree/query (fluree/db loaded2) property-query)))))))
+                    @(fluree/q (fluree/db loaded2) property-query)))))))
      (testing "can load after deletion of entire subjects"
        (let [conn              @(fluree/connect-memory)
              ledger-alias      "tx/delete"
@@ -646,7 +646,7 @@
              loaded2           (test-utils/retry-load conn ledger-alias 100)
              loaded-db2        (fluree/db loaded2)]
          (is (= [{:id :ex/fluree} {:id :ex/w3c} {:id :ex/kittens}]
-                @(fluree/query loaded-db2 description-query))
+                @(fluree/q loaded-db2 description-query))
              "The id :ex/mosquitos should be removed")
          (let [db3        @(fluree/stage
                             loaded-db2
@@ -661,7 +661,7 @@
                loaded3    (test-utils/retry-load conn ledger-alias 100)
                loaded-db3 (fluree/db loaded3)]
            (is (= [{:id :ex/kittens}]
-                  @(fluree/query loaded-db3 description-query))
+                  @(fluree/q loaded-db3 description-query))
                "Only :ex/kittens should be left"))))))
 
 (deftest ^:integration query-test
@@ -679,14 +679,14 @@
       #?(:clj
          (let [conn    (test-utils/create-conn)
                ledger  (test-utils/load-people conn)
-               results @(fluree/query (fluree/db ledger) query)]
+               results @(fluree/q (fluree/db ledger) query)]
            (is (= expected results)))
          :cljs
          (async done
            (go
             (let [conn    (<! (test-utils/create-conn))
                   ledger  (<! (test-utils/load-people conn))
-                  results (<p! (fluree/query (fluree/db ledger) query))]
+                  results (<p! (fluree/q (fluree/db ledger) query))]
               (is (= expected results))
               (done))))))))
 
@@ -735,12 +735,12 @@
                               :select  '[?s ?p ?o]
                               :where   '{:id ?s, ?p ?o}}]
              (testing "queries not returning metadata"
-               (let [sut @(fluree/query db query)]
+               (let [sut @(fluree/q db query)]
                  (is (nil? (:fuel sut))
                      "Reports no fuel")))
              (testing "queries returning metadata"
                (let [query* (assoc-in query [:opts :meta] true)
-                     sut    @(fluree/query db query*)]
+                     sut    @(fluree/q db query*)]
                  (is (= flake-total (:fuel sut))
                      "Reports that all flakes were traversed"))))
            (testing "short-circuits if request fuel exhausted"
@@ -753,7 +753,7 @@
                                                            test-utils/default-context
                                                            {:ex "http://example.org/ns/"}]
                                                "insert"   test-utils/people})
-                   results @(fluree/query db query)]
+                   results @(fluree/q db query)]
                (is (util/exception? results))
                (is (re-find #"Fuel limit exceeded"
                             (-> results ex-cause ex-message))))))))
@@ -804,12 +804,12 @@
                                  :where   '{:id ?s
                                             ?p  ?o}}]
                 (testing "queries not returning metadata"
-                  (let [sut (<p! (fluree/query db query))]
+                  (let [sut (<p! (fluree/q db query))]
                     (is (nil? (:fuel sut))
                         "Reports no fuel")))
                 (testing "queries returning metadata"
                   (let [query* (assoc-in query [:opts :meta] true)
-                        sut    (<p! (fluree/query db query*))]
+                        sut    (<p! (fluree/q db query*))]
                     (is (= flake-total (:fuel sut))
                         "Reports that all flakes were traversed"))))
               (testing "short-circuits if request fuel exhausted"
@@ -824,7 +824,7 @@
                                                                   {:ex "http://example.org/ns/"}]
                                                       "insert"   test-utils/people}))
                       results (try
-                                (<p! (fluree/query db query))
+                                (<p! (fluree/q db query))
                                 (catch :default e (ex-cause e)))]
                   (is (util/exception? results))
                   (is (re-find #"Fuel limit exceeded"
@@ -930,13 +930,13 @@
            committed @(fluree/commit! ledger db7)
            loaded    @(fluree/load conn ledger-id)]
        (is (= #{"AP" "Dan" "KP" "NP"}
-              (into #{} @(fluree/query db1 {"@context" [test-utils/default-str-context
+              (into #{} @(fluree/q db1 {"@context" [test-utils/default-str-context
                                                         {"ex" "ns:ex/"}]
                                             "where"    {"id" "?s", "ex:name" "?name"}
                                             "select"   "?name"}))))
 
        (is (= {"BORG" 4 "Murray" 1}
-              (frequencies @(fluree/query db2 {"@context" [test-utils/default-str-context
+              (frequencies @(fluree/q db2 {"@context" [test-utils/default-str-context
                                                            {"ex" "ns:ex/"}]
                                                "where"    {"id" "?s", "ex:name" "?name"}
                                                "select"   "?name"}))))
@@ -948,7 +948,7 @@
                 "ex:isOrange" true
                 "ex:isPerson" false
                 "ex:nickname" "The Wretch"}]
-              @(fluree/query db2 {"@context" [test-utils/default-str-context
+              @(fluree/q db2 {"@context" [test-utils/default-str-context
                                               {"ex" "ns:ex/"}]
                                   "where"    {"id" "?s", "ex:name" "Murray"}
                                   "select"   {"?s" ["*" {"ex:address" ["ex:street" "ex:city" "ex:state" "ex:zip"]}]}})))
@@ -957,7 +957,7 @@
 
 
        (is (= #{"Freddy" "Betty" "Leticia" "Andrew"}
-              (set @(fluree/query db7 {"@context"       test-utils/default-str-context
+              (set @(fluree/q db7 {"@context"       test-utils/default-str-context
                                        "selectDistinct" "?name",
                                        "where"          {"id"               "?s"
                                                          "schema:givenName" "?name"}})))

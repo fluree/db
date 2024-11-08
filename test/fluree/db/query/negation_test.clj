@@ -27,14 +27,14 @@
         (testing "checking for existence of a pattern"
           (testing "when the pattern is present in the data"
             (is (= [["ex:alice"]]
-                   @(fluree/query db1 {"@context" context
+                   @(fluree/q db1 {"@context" context
                                        "select"   ["?person"]
                                        "where"    [{"@id" "?person" "@type" {"@id" "ex:Person"}}
                                                    ["exists" [{"@id" "?person" "ex:givenName" "?name"}]]]}))
                 "returns the subject with that pattern"))
           (testing "when the pattern is absent in the data"
             (is (= []
-                   @(fluree/query db1 {"@context" context
+                   @(fluree/q db1 {"@context" context
                                        "select"   ["?person"]
                                        "where"    [{"@id" "?person" "@type" {"@id" "ex:Person"}}
                                                    ["exists" [{"@id" "?person" "ex:name" "?name"}]]]}))
@@ -44,28 +44,28 @@
         (testing "checking for the non-existence of a pattern"
           (testing "when the pattern does not exist in the data"
             (is (= [["ex:bob"] ["ex:carol"]]
-                   @(fluree/query db1 {"@context" context
+                   @(fluree/q db1 {"@context" context
                                        "select"   ["?person"]
                                        "where"    [{"@id" "?person" "ex:givenName" "?gname"}
                                                    ["not-exists" [{"@id" "?person" "ex:nickname" "?name"}]]]}))
                 "returns only subjects who do not have a nickname"))
           (testing "when the pattern does exist in the data"
             (is (= []
-                   @(fluree/query db1 {"@context" context
+                   @(fluree/q db1 {"@context" context
                                        "select"   ["?person"]
                                        "where"    [{"@id" "?person" "ex:givenName" "?gname"}
                                                    ["not-exists" [{"@id" "?person" "ex:familyName" "?fname"}]]]}))
                 "returns no subjects, as every subject has an ex:familyName"))
           (testing "when pattern has all variables"
             (is (= []
-                   @(fluree/query db1 {"@context" context
+                   @(fluree/q db1 {"@context" context
                                        "select"   ["?s" "?p" "?o"]
                                        "where"    [{"@id" "?s" "?p" "?o"}
                                                    ["not-exists" [{"@id" "?x" "?y" "?z"}]]]}))
                 "two patterns match the same data, everything is filtered out"))
           (testing "when pattern has all literals"
             (is (= []
-                   @(fluree/query db1 {"@context" context
+                   @(fluree/q db1 {"@context" context
                                        "select"   ["?s" "?p" "?o"]
                                        "where"    [{"@id" "?s" "?p" "?o"}
                                                    ["not-exists" [{"@id" "ex:alice" "type" "ex:Person"}]]]}))
@@ -73,7 +73,7 @@
         (testing "checking for the removal of solutions that match a pattern"
           (testing "when the pattern produces a solution that matches existing solutions"
             (is (= ["ex:alice" "ex:carol"]
-                   @(fluree/query db1 {"@context"       context
+                   @(fluree/q db1 {"@context"       context
                                        "selectDistinct" "?s"
                                        "where"          [{"@id" "?s" "?p" "?o"}
                                                          ["minus" [{"@id" "?s" "ex:givenName" "Bob"}]]]}))
@@ -87,7 +87,7 @@
                     ["ex:bob" "ex:givenName" "Bob"]
                     ["ex:carol" "ex:familyName" "Smith"]
                     ["ex:carol" "ex:givenName" "Carol"]]
-                   @(fluree/query db1 {"@context" context
+                   @(fluree/q db1 {"@context" context
                                        "select"   ["?s" "?p" "?o"]
                                        "where"    [{"@id" "?s" "?p" "?o"}
                                                    ["minus" [{"@id" "?x" "?y" "?z"}]]]}))
@@ -101,7 +101,7 @@
                     ["ex:bob" "ex:givenName" "Bob"]
                     ["ex:carol" "ex:familyName" "Smith"]
                     ["ex:carol" "ex:givenName" "Carol"]]
-                   @(fluree/query db1 {"@context" context
+                   @(fluree/q db1 {"@context" context
                                        "select"   ["?s" "?p" "?o"]
                                        "where"    [{"@id" "?s" "?p" "?o"}
                                                    ["minus" [{"@id" "ex:alice" "ex:familyName" "Smith"}]]]}))
@@ -117,7 +117,7 @@
                                                      "ex:q" [4.0 5.0]}]})]
               (testing "where the filter is inside a not-exists pattern"
                 (is (= [["ex:b" 3.0]]
-                       @(fluree/query db1 {"where" [{"@id" "?x" "ex:p" "?p"}
+                       @(fluree/q db1 {"where" [{"@id" "?x" "ex:p" "?p"}
                                                     ["not-exists" [{"@id" "?x" "ex:q" "?q"}
                                                                    ["filter" "(= ?p ?q)"]]]]
                                            "select" ["?x" "?p"]}))
@@ -125,7 +125,7 @@
               (testing "where the filter is inside a minus pattern and one result is filtered out"
                 (is (= [["ex:a" 1]
                         ["ex:b" 3.0]]
-                       @(fluree/query db1 {"where" [{"@id" "?x" "ex:p" "?p"}
+                       @(fluree/q db1 {"where" [{"@id" "?x" "ex:p" "?p"}
                                                     ["minus" [{"@id" "?x" "ex:q" "?q"}
                                                               ["filter" "(= ?p ?q)"]]]]
                                            "select" ["?x" "?p"]}))

@@ -19,20 +19,20 @@
     (testing "current query"
       (is (= [{:id   :ex/dan
                :ex/x 1}]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  {:ex/dan [:*]}}))
           "default context")
       (is (= [{:id    :foo/dan
                :foo/x 1}]
-             @(fluree/query db {"@context" [test-utils/default-context
+             @(fluree/q db {"@context" [test-utils/default-context
                                             {:ex "http://example.org/ns/"}
                                             {:foo "http://example.org/ns/"}]
                                 :select    {:foo/dan [:*]}}))
           "default unwrapped objects")
       (is (= [{:id    :foo/dan
                :foo/x [1]}]
-             @(fluree/query db {"@context" [[test-utils/default-context
+             @(fluree/q db {"@context" [[test-utils/default-context
                                              {:ex "http://example.org/ns/"}
                                              {:foo   "http://example.org/ns/"
                                               :foo/x {:container :set}}]]
@@ -40,7 +40,7 @@
           "override unwrapping with :set")
       (is (= [{:id     :ex/dan
                "foo:x" [1]}]
-             @(fluree/query db {"@context" [test-utils/default-context
+             @(fluree/q db {"@context" [test-utils/default-context
                                             {:ex "http://example.org/ns/"}
                                             {"foo"   "http://example.org/ns/"
                                              "foo:x" {"@container" "@list"}}]
@@ -48,16 +48,16 @@
           "override unwrapping with @list")
       (is (= [{"@id"                     "http://example.org/ns/dan"
                "http://example.org/ns/x" 1}]
-             @(fluree/query db {:select {"http://example.org/ns/dan" ["*"]}}))
+             @(fluree/q db {:select {"http://example.org/ns/dan" ["*"]}}))
           "no context")
       (is (= [{"@id"                     "http://example.org/ns/dan"
                "http://example.org/ns/x" 1}]
-             @(fluree/query db {"@context" {}
+             @(fluree/q db {"@context" {}
                                 :select    {"http://example.org/ns/dan" ["*"]}}))
           "empty context")
       (is (= [{"@id"                     "http://example.org/ns/dan"
                "http://example.org/ns/x" 1}]
-             @(fluree/query db {"@context" []
+             @(fluree/q db {"@context" []
                                 :select    {"http://example.org/ns/dan" ["*"]}}))
           "empty context vector"))
     (testing "history query"
@@ -114,7 +114,7 @@
                 [:ex/jane :schema/age 30]
                 [:ex/jane :schema/email "jane@flur.ee"]
                 [:ex/jane :schema/name "Jane"]]
-               @(fluree/query db {:context [test-utils/default-context
+               @(fluree/q db {:context [test-utils/default-context
                                             {:ex "http://example.org/ns/"}]
                                   :select  ['?s '?p '?o]
                                   :where   {:id '?s
@@ -163,13 +163,13 @@
                  :schema/age 30,
                  :schema/email "jane@flur.ee",
                  :schema/name "Jane"}]
-               @(fluree/query db {:context [test-utils/default-context
+               @(fluree/q db {:context [test-utils/default-context
                                             {:ex "http://example.org/ns/"}]
                                   :select  {'?s ["*"]}
                                   :where   {:id '?s, '?p '?o}}))
             "Every triple should be returned.")
         (let [db*    @(fluree/commit! ledger db)
-              result @(fluree/query db* {:context [test-utils/default-context
+              result @(fluree/q db* {:context [test-utils/default-context
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
                                          :where   {:id '?s, '?p '?o}})]
@@ -226,7 +226,7 @@
           people (test-utils/load-people conn)
           db     (fluree/db people)]
       (testing "with non-string objects"
-        (let [test-subject @(fluree/query db {:context [test-utils/default-context
+        (let [test-subject @(fluree/q db {:context [test-utils/default-context
                                                         {:ex "http://example.org/ns/"}]
                                               :select  ['?s '?p]
                                               :where   {:id '?s, '?p 22}})]
@@ -236,7 +236,7 @@
                  (-> test-subject ex-data :error))
               "have 'invalid query' error codes")))
       (testing "with string objects"
-        (let [test-subject @(fluree/query db {:context [test-utils/default-context
+        (let [test-subject @(fluree/q db {:context [test-utils/default-context
                                                         {:ex "http://example.org/ns/"}]
                                               :select  ['?s '?p]
                                               :where   {:id '?s, '?p "Bob"}})]
@@ -274,7 +274,7 @@
                      :schema/name "Dave"}]})]
     (testing "type"
       (is (= [[:ex/User]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?class]
                                 :where   '{:id :ex/jane, :type ?class}})))
@@ -282,7 +282,7 @@
                [:ex/bob :ex/User]
                [:ex/alice :ex/User]
                [:ex/dave :ex/nonUser]}
-             (set @(fluree/query db {:context [test-utils/default-context
+             (set @(fluree/q db {:context [test-utils/default-context
                                                {:ex "http://example.org/ns/"}]
                                      :select  '[?s ?class]
                                      :where   '{:id ?s, :type ?class}})))))
@@ -299,7 +299,7 @@
                           :sh/property    [{:sh/path     :schema/name
                                             :sh/datatype :xsd/string}]}})]
         (is (= [[:ex/User]]
-               @(fluree/query shacl-db {:context [test-utils/default-context
+               @(fluree/q shacl-db {:context [test-utils/default-context
                                                   {:ex "http://example.org/ns/"}]
                                         :select  '[?class]
                                         :where   '{:id :ex/UserShape, :sh/targetClass ?class}})))))))
@@ -332,14 +332,14 @@
                                                "rdf:type" "ex:Diamond"}})]
     (is (= #{{"id" "ex:queen" "type" "ex:Heart"}
              {"id" "ex:king" "type" "ex:Heart"}}
-           (set @(fluree/query db1 {"@context" [test-utils/default-str-context
+           (set @(fluree/q db1 {"@context" [test-utils/default-str-context
                                                 {"ex" "http://example.org/ns/"}]
                                     "select"   {"?s" ["*"]}
                                     "where"    {"id" "?s", "type" "ex:Heart"}})))
         "Query with type and type in results")
     (is (= #{{"id" "ex:queen" "type" "ex:Heart"}
              {"id" "ex:king" "type" "ex:Heart"}}
-           (set @(fluree/query db1 {"@context" [test-utils/default-str-context
+           (set @(fluree/q db1 {"@context" [test-utils/default-str-context
                                                 {"ex" "http://example.org/ns/"}]
                                     "select"   {"?s" ["*"]}
                                     "where"    {"id" "?s", "rdf:type" "ex:Heart"}})))
@@ -348,7 +348,7 @@
            (-> db2 Throwable->map :cause)))
 
     (is (= [{"id" "ex:two" "type" "ex:Diamond"}]
-           @(fluree/query db3 {"@context" [test-utils/default-str-context
+           @(fluree/q db3 {"@context" [test-utils/default-str-context
                                            {"ex" "http://example.org/ns/"}]
                                "select"   {"?s" ["*"]}
                                "where"    {"id" "?s", "type" "ex:Diamond"}}))

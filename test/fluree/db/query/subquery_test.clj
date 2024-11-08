@@ -12,7 +12,7 @@
 
       (testing "binding an IRI in the select"
         (is (= [["Alice" 50] ["Brian" 50] ["Cam" 34] ["Liam" 13]]
-               @(fluree/query db {"@context" {"schema" "http://schema.org/"
+               @(fluree/q db {"@context" {"schema" "http://schema.org/"
                                               "ex"     "http://example.org/ns/"}
                                   "select"   ["?name" "?age"]
                                   "where"    [{"@id"         "?s"
@@ -26,7 +26,7 @@
         (is (= [[13 5] [13 7] [13 9] [13 10] [13 11] [13 42] [13 42] [13 76] [34 5] [34 7] [34 9]
                 [34 10] [34 11] [34 42] [34 42] [34 76] [50 5] [50 5] [50 7] [50 7] [50 9] [50 9]
                 [50 10] [50 10] [50 11] [50 11] [50 42] [50 42] [50 42] [50 42] [50 76] [50 76]]
-               @(fluree/query db {"@context" {"schema" "http://schema.org/"
+               @(fluree/q db {"@context" {"schema" "http://schema.org/"
                                               "ex"     "http://example.org/ns/"}
                                   "select"   ["?age" "?favNums"]
                                   "where"    [{"schema:age" "?age"}
@@ -36,7 +36,7 @@
 
         (testing "and shorten results with subquery 'limit'"
           (is (= [[13 5] [13 7] [34 5] [34 7] [50 5] [50 5] [50 7] [50 7]]
-                 @(fluree/query db {"@context" {"schema" "http://schema.org/"
+                 @(fluree/q db {"@context" {"schema" "http://schema.org/"
                                                 "ex"     "http://example.org/ns/"}
                                     "select"   ["?age" "?favNums"]
                                     "where"    [{"schema:age" "?age"}
@@ -49,7 +49,7 @@
             (is (= [[13 5] [13 7] [13 9] [13 10] [13 11] [13 42] [13 42] [13 76]
                     [34 5] [34 7] [34 9] [34 10] [34 11] [34 42] [34 42] [34 76]
                     [50 5] [50 7] [50 9] [50 10] [50 11] [50 42] [50 42] [50 76]]
-                   @(fluree/query db {"@context" {"schema" "http://schema.org/"
+                   @(fluree/q db {"@context" {"schema" "http://schema.org/"
                                                   "ex"     "http://example.org/ns/"}
                                       "select"   ["?age" "?favNums"]
                                       "where"    [{"ex:favNums" "?favNums"}
@@ -74,7 +74,7 @@
                                         :select [(as (avg ?favN) ?avgFavNum)]}]]
                    :order-by '[?iri ?favNums]}]
           (is (= [[:ex/alice 42] [:ex/alice 76] [:ex/liam 42]]
-                 @(fluree/query db qry))))))))
+                 @(fluree/q db qry))))))))
 
 (deftest ^:integration multiple-subqueries
   (testing "More than one subquery"
@@ -86,7 +86,7 @@
         (is (= [[13 5] [13 7] [13 9] [13 10] [13 11] [13 42] [13 42] [13 76] [34 5] [34 7] [34 9]
                 [34 10] [34 11] [34 42] [34 42] [34 76] [50 5] [50 5] [50 7] [50 7] [50 9] [50 9]
                 [50 10] [50 10] [50 11] [50 11] [50 42] [50 42] [50 42] [50 42] [50 76] [50 76]]
-               @(fluree/query db {"@context" {"schema" "http://schema.org/"
+               @(fluree/q db {"@context" {"schema" "http://schema.org/"
                                               "ex"     "http://example.org/ns/"}
                                   "select"   ["?age" "?favNums"]
                                   "where"    [["query" {"select" ["?age"]
@@ -112,7 +112,7 @@
                 ["Liam" "brian@example.org" 13] ["Liam" "brian@example.org" 34] ["Liam" "brian@example.org" 50]
                 ["Liam" "cam@example.org" 13] ["Liam" "cam@example.org" 34] ["Liam" "cam@example.org" 50]
                 ["Liam" "liam@example.org" 13] ["Liam" "liam@example.org" 34] ["Liam" "liam@example.org" 50]]
-               @(fluree/query db {"@context" {"schema" "http://schema.org/"
+               @(fluree/q db {"@context" {"schema" "http://schema.org/"
                                               "ex"     "http://example.org/ns/"}
                                   "select"   ["?name" "?email" "?age"]
                                   "where"    [{"schema:name" "?name"}
@@ -139,7 +139,7 @@
                                         :select '[(as (str "Cam") ?person) (as (avg ?favN) ?avgFavNum)]}]]]
                    :order-by '[?iri ?favNums]}]
           (is (= [["Alice" 42.33333333333333] ["Cam" 7.5]]
-                 @(fluree/query db qry))))))))
+                 @(fluree/q db qry))))))))
 
 (deftest ^:integration subquery-values
   (testing "Subquery with inline values"
@@ -148,7 +148,7 @@
           db     (fluree/db people)]
       (testing "inline values filters subquery results"
         (is (= [[:ex/alice] [:ex/liam]]
-               @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+               @(fluree/q db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
                                   :select  '[?person]
                                   :where   [[:query {:values          '[?name ["Alice" "Liam"]]
                                                      :where           '[{:id ?person :schema/name ?name}

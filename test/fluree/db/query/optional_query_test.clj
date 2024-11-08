@@ -31,7 +31,7 @@
       (is (= [["Alice" "Green"]
               ["Brian" nil]
               ["Cam" nil]]
-             @(fluree/query db {:context context
+             @(fluree/q db {:context context
                                 :select  '[?name ?favColor]
                                 :where   '[{:id          ?s
                                             :type        :ex/User
@@ -42,7 +42,7 @@
       (is (= [["Alice" "Green"]
               ["Brian" nil]
               ["Cam" nil]]
-             @(fluree/query db {:context context
+             @(fluree/q db {:context context
                                 :select  '[?name ?favColor]
                                 :where   '[{:id          ?s
                                             :type        :ex/User
@@ -53,7 +53,7 @@
       ;; including another pass-through variable - note Brian doesn't have an email
       (is (= [["Alice" "Green" "alice@flur.ee"]
               ["Cam" nil "cam@flur.ee"]]
-             @(fluree/query db {:context context
+             @(fluree/q db {:context context
                                 :select  '[?name ?favColor ?email]
                                 :where   '[{:id           ?s
                                             :type         :ex/User
@@ -64,7 +64,7 @@
       ;; including another pass-through variable, but with 'optional' sandwiched
       (is (= [["Alice" "Green" "alice@flur.ee"]
               ["Cam" nil "cam@flur.ee"]]
-             @(fluree/query db {:context context
+             @(fluree/q db {:context context
                                 :select  '[?name ?favColor ?email]
                                 :where   '[{:id          ?s,
                                             :type        :ex/User
@@ -77,7 +77,7 @@
       (is (= [["Alice" "Green" "alice@flur.ee"]
               ["Brian" nil nil]
               ["Cam" nil "cam@flur.ee"]]
-             @(fluree/query db {:context context
+             @(fluree/q db {:context context
                                 :select  '[?name ?favColor ?email]
                                 :where   '[{:id          ?s
                                             :type        :ex/User
@@ -89,7 +89,7 @@
       (is (= [["Alice" "Green" "alice@flur.ee"]
               ["Brian" nil nil]
               ["Cam" nil "cam@flur.ee"]]
-             @(fluree/query db {:context context
+             @(fluree/q db {:context context
                                 :select  '[?name ?favColor ?email]
                                 :where   '[{:id          ?s
                                             :type        :ex/User
@@ -102,7 +102,7 @@
       (is (= [["Alice" "Green"]
               ["Brian" nil]
               ["Cam" nil]]
-             @(fluree/query db {:context context
+             @(fluree/q db {:context context
                                 :select  '[?name ?favColor]
                                 :where   '[{:id          ?s
                                             :type        :ex/User
@@ -114,7 +114,7 @@
       (is (= [["Alice" "Green" "alice@flur.ee"]
               ["Brian" nil nil]
               ["Cam" nil nil]]
-             @(fluree/query db {:context context
+             @(fluree/q db {:context context
                                 :select  '[?name ?favColor ?email]
                                 :where   '[{:id          ?s
                                             :type        :ex/User

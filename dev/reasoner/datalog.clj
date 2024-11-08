@@ -43,13 +43,13 @@
 
   ;;;; parents (via sibling)
   ;; without reasoning
-  @(fluree/query db2
+  @(fluree/q db2
                  {:context {"ex" "http://example.org/"}
                   :select  ["?s" "?parent"]
                   :where   {"@id"       "?s",
                             "ex:parent" "?parent"}})
   ;; with reasoning
-  @(fluree/query reasoned-db
+  @(fluree/q reasoned-db
                  {:context {"ex" "http://example.org/"}
                   :select  ["?s" "?parent"]
                   :where   {"@id"       "?s",
@@ -57,13 +57,13 @@
 
   ;;;; brother
   ;; without reasoning
-  @(fluree/query db2
+  @(fluree/q db2
                  {:context {"ex" "http://example.org/"}
                   :select  ["?s" "?brother"]
                   :where   {"@id"        "?s",
                             "ex:brother" "?brother"}})
   ;; with reasoning
-  @(fluree/query reasoned-db
+  @(fluree/q reasoned-db
                  {:context {"ex" "http://example.org/"}
                   :select  ["?s" "?brother"]
                   :where   {"@id"        "?s",
@@ -71,13 +71,13 @@
 
   ;;;; uncle
   ;; without reasoning
-  @(fluree/query db2
+  @(fluree/q db2
                  {:context {"ex" "http://example.org/"}
                   :select  ["?s" "?uncle"]
                   :where   {"@id"      "?s",
                             "ex:uncle" "?uncle"}})
   ;; with reasoning
-  @(fluree/query reasoned-db
+  @(fluree/q reasoned-db
                  {:context {"ex" "http://example.org/"}
                   :select  ["?s" "?uncle"]
                   :where   {"@id"      "?s",
@@ -85,13 +85,13 @@
 
   ;;;; seniorCitizen
   ;; without reasoning
-  @(fluree/query db2
+  @(fluree/q db2
                  {:context {"ex" "http://example.org/"}
                   :select  "?s"
                   :where   {"@id"              "?s",
                             "ex:seniorCitizen" true}})
   ;; with reasoning
-  @(fluree/query reasoned-db
+  @(fluree/q reasoned-db
                  {:context {"ex" "http://example.org/"}
                   :select  "?s"
                   :where   {"@id"              "?s",
@@ -172,13 +172,13 @@
 (comment
 
   ;; runsCold
-  @(fluree/query
+  @(fluree/q
      db2 {:context {"ex" "http://example.org/"}
           :select  "?s"
           :where   {"@id"         "?s",
                     "ex:runsCold" true}})
 
-  @(fluree/query
+  @(fluree/q
      db2 {:context {"ex" "http://example.org/"}
           :select  {"ex:laura" ["*"]}
           :depth   3})

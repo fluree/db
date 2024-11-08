@@ -10,7 +10,7 @@
     (let [conn   (test-utils/create-conn)
           ledger (test-utils/load-movies conn)
           db     (fluree/db ledger)
-          movies @(fluree/query db {:context [test-utils/default-context
+          movies @(fluree/q db {:context [test-utils/default-context
                                               {:ex "http://example.org/ns/"}]
                                     :select  '{?s [:*]}
                                     :where   '{:id ?s, :type :schema/Movie}
@@ -86,13 +86,13 @@
           base-query             {:context test-utils/default-context
                                   :select  '{?s [:*]}
                                   :where   '{:id ?s, :type :schema/Movie}}
-          one-movie              @(fluree/query db (assoc base-query
+          one-movie              @(fluree/q db (assoc base-query
                                                           :t after-one-loaded-iso))
-          three-movies           @(fluree/query db (assoc base-query
+          three-movies           @(fluree/q db (assoc base-query
                                                           :t after-three-loaded-iso))
-          all-movies             @(fluree/query db (assoc base-query
+          all-movies             @(fluree/q db (assoc base-query
                                                           :t after-all-loaded-iso))
-          too-early              @(fluree/query db (assoc base-query
+          too-early              @(fluree/q db (assoc base-query
                                                           :t too-early-iso))]
       (is (= 1 (count one-movie)))
       (is (= 3 (count three-movies)))

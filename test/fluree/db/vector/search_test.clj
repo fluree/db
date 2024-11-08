@@ -30,7 +30,7 @@
                      "where"    [{"@id"     "?x"
                                   "ex:xVec" "?vec"}
                                  ["bind" "?score" "(dotproduct ?vec ?targetVec)"]]}
-            results @(fluree/query db query)]
+            results @(fluree/q db query)]
         (is (= [["ex:bart" 0.61 [0.1, 0.9]]
                 ["ex:homer" 0.72 [0.6, 0.5]]]
                results))))
@@ -44,7 +44,7 @@
                                   "ex:age"  36
                                   "ex:xVec" "?vec"}
                                  ["bind" "?score" "(dotproduct ?vec ?targetVec)"]]}
-            results @(fluree/query db query)]
+            results @(fluree/q db query)]
         (is (= [["ex:homer" 0.72 [0.6, 0.5]]]
                results))))
 
@@ -57,7 +57,7 @@
                                   "ex:xVec" "?vec"}
                                  ["bind" "?score" "(dotproduct ?vec ?targetVec)"]
                                  ["filter" "(> ?score 0.7)"]]}
-            results @(fluree/query db query)]
+            results @(fluree/q db query)]
         (is (= [["ex:homer" 0.72]]
                results))))))
 
@@ -87,7 +87,7 @@
                                     "ex:xVec" "?vec"}
                                    ["bind" "?score" "(dotproduct ?vec ?targetVec)"]]
                        "orderBy"  "?score"}
-              results @(fluree/query db query)]
+              results @(fluree/q db query)]
           (is (= [["ex:bart" 0.61 [0.1, 0.9]]
                   ["ex:bart" 0.68 [0.2, 0.9]]
                   ["ex:homer" 0.72 [0.6, 0.5]]]
@@ -102,7 +102,7 @@
                                     "ex:xVec" "?vec"}
                                    ["bind" "?score" "(cosine-similarity ?vec ?targetVec)"]]
                        "orderBy"  "?score"}
-              results @(fluree/query db query)]
+              results @(fluree/q db query)]
           (is (= [["ex:bart" 0.7306568260253945 [0.1 0.9]]
                   ["ex:bart" 0.8 [0.2 0.9]]
                   ["ex:homer" 0.9999035633345558 [0.6 0.5]]]
@@ -117,7 +117,7 @@
                                     "ex:xVec" "?vec"}
                                    ["bind" "?score" "(euclidian-distance ?vec ?targetVec)"]]
                        "orderBy"  "?score"}
-              results @(fluree/query db query)]
+              results @(fluree/q db query)]
           (is (= [["ex:homer" 0.14142135623730956 [0.6 0.5]]
                   ["ex:bart" 0.5830951894845299 [0.2 0.9]]
                   ["ex:bart" 0.6708203932499369 [0.1 0.9]]]
@@ -151,7 +151,7 @@
                                     "ex:xVec" "?vec"}
                                    ["bind" "?score" "(dotproduct ?vec ?targetVec)"]]
                        "orderBy"  "?score"}
-              results @(fluree/query db query)]
+              results @(fluree/q db query)]
           (is (= [["ex:lucy" nil "Not a Vector"]
                   ["ex:bart" 0.61 [0.1, 0.9]]
                   ["ex:bart" 0.68 [0.2, 0.9]]

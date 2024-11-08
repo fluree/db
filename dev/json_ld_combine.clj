@@ -50,12 +50,12 @@
                                   :push?   true}))
       ledger))
 
-  @(fluree/query (fluree/db movies-ledger)
+  @(fluree/q (fluree/db movies-ledger)
                  {:select [:*]
                   :from   :wiki/Q836821})
 
   ;; you cannot crawl additional data with isBasedOn in the movies-ledger - as we created the DB with just an IRI and no book data
-  @(fluree/query (fluree/db movies-ledger)
+  @(fluree/q (fluree/db movies-ledger)
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
@@ -70,7 +70,7 @@
                                "fluree:ipns://data.fluree.com/cmb/movies"]}))
 
   ;; now we can crawl from the movie, into the book, and into the author
-  @(fluree/query (fluree/db ledger-cmb)
+  @(fluree/q (fluree/db ledger-cmb)
                  {:select [:* {:schema/isBasedOn [:* {:schema/author [:*]}]}]
                   :from   :wiki/Q836821})
 

@@ -60,7 +60,7 @@
 
           (is (= (list "ex:carol" "ex:carol-lynn")
                  (sort
-                   @(fluree/query db-reasoned
+                   @(fluree/q db-reasoned
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -77,7 +77,7 @@
           
           (is (= (list "ex:carol" "ex:carol-lynn")
                  (sort
-                   @(fluree/query db-reasoned
+                   @(fluree/q db-reasoned
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -102,7 +102,7 @@
 
           (is (= (list "ex:carol1" "ex:carol2" "ex:carol3" "ex:carol4")
                  (sort
-                   @(fluree/query db-reasoned
+                   @(fluree/q db-reasoned
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -112,7 +112,7 @@
 
           (is (= (list "ex:carol1" "ex:carol2" "ex:carol3" "ex:carol4")
                  (sort
-                   @(fluree/query db-reasoned
+                   @(fluree/q db-reasoned
                                   {:context {"ex"  "http://example.org/"
                                              "owl" "http://www.w3.org/2002/07/owl#"}
                                    :select  "?same"
@@ -161,28 +161,28 @@
                              "owl:sameAs" [{"@id" "ex:carol1"} {"@id" "ex:carol2"} {"@id" "ex:carol3"} {"@id" "ex:carol4"}]}]
 
           (is (= [(merge merged-result {"@id" "ex:carol1"})]
-                 @(fluree/query db-reasoned
+                 @(fluree/q db-reasoned
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  {"ex:carol1" ["*"]}}))
               "ex:carol1 have all other carols' properties and values")
 
           (is (= [(merge merged-result {"@id" "ex:carol2"})]
-                 @(fluree/query db-reasoned
+                 @(fluree/q db-reasoned
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  {"ex:carol2" ["*"]}}))
               "ex:carol2 have all other carols' properties and values")
 
           (is (= [(merge merged-result {"@id" "ex:carol3"})]
-                 @(fluree/query db-reasoned
+                 @(fluree/q db-reasoned
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  {"ex:carol3" ["*"]}}))
               "ex:carol3 have all other carols' properties and values")
 
           (is (= [(merge merged-result {"@id" "ex:carol4"})]
-                 @(fluree/query db-reasoned
+                 @(fluree/q db-reasoned
                                 {:context {"ex"  "http://example.org/"
                                            "owl" "http://www.w3.org/2002/07/owl#"}
                                  :select  {"ex:carol4" ["*"]}}))
@@ -206,7 +206,7 @@
 
           (is (= (list "ex:Child" "ex:Person")
                  (sort
-                   @(fluree/query db-prp-dom
+                   @(fluree/q db-prp-dom
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?t"
                                    :where   {"@id"   "ex:brian"
@@ -214,7 +214,7 @@
               "ex:brian should be of type ex:Person and ex:Child")
 
           (is (= ["ex:brian" "ex:carol"]
-                 @(fluree/query db-prp-dom
+                 @(fluree/q db-prp-dom
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?s"
                                  :where   {"@id"   "?s"
@@ -233,7 +233,7 @@
 
           (is (= (list "ex:Person" "ex:parents")
                  (sort
-                   @(fluree/query db-prp-rng
+                   @(fluree/q db-prp-rng
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?t"
                                    :where   {"@id"   "ex:carol"
@@ -241,7 +241,7 @@
               "ex:carol should be of type ex:Person and ex:parents")
 
           (is (= ["ex:carol" "ex:cheryl"]
-                 @(fluree/query db-prp-rng
+                 @(fluree/q db-prp-rng
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?s"
                                  :where   {"@id"   "?s"
@@ -261,7 +261,7 @@
                                   "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
 
           (is (= ["ex:brian" "ex:carol"]
-                 @(fluree/query db-prp-dom+rng
+                 @(fluree/q db-prp-dom+rng
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?s"
                                  :where   {"@id"   "?s"
@@ -269,7 +269,7 @@
               "ex:brian and ex:carol should be the only subjects of type ex:Child")
 
           (is (= ["ex:carol" "ex:cheryl"]
-                 @(fluree/query db-prp-dom+rng
+                 @(fluree/q db-prp-dom+rng
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?s"
                                  :where   {"@id"   "?s"
@@ -278,7 +278,7 @@
 
           (is (= (list "ex:brian" "ex:carol" "ex:cheryl")
                  (sort
-                   @(fluree/query db-prp-dom+rng
+                   @(fluree/q db-prp-dom+rng
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?s"
                                    :where   {"@id"   "?s"
@@ -304,7 +304,7 @@
 
       (is (= (list "ex:carol" "ex:carol2")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex"  "http://example.org/"
                                          "owl" "http://www.w3.org/2002/07/owl#"}
                                :select  "?same"
@@ -314,7 +314,7 @@
 
       (is (= (list "ex:carol" "ex:carol2")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex"  "http://example.org/"
                                          "owl" "http://www.w3.org/2002/07/owl#"}
                                :select  "?same"
@@ -324,7 +324,7 @@
 
       (is (= (list "ex:anne" "ex:anne2")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex"  "http://example.org/"
                                          "owl" "http://www.w3.org/2002/07/owl#"}
                                :select  "?same"
@@ -334,7 +334,7 @@
 
       (is (= (list "ex:anne" "ex:anne2")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex"  "http://example.org/"
                                          "owl" "http://www.w3.org/2002/07/owl#"}
                                :select  "?same"
@@ -365,7 +365,7 @@
       
       (is (= (list "ex:brian" "ex:brian2")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex"  "http://example.org/"
                                          "owl" "http://www.w3.org/2002/07/owl#"}
                                :select  "?same"
@@ -375,7 +375,7 @@
 
       (is (= (list "ex:ralph" "ex:ralph2")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex"  "http://example.org/"
                                          "owl" "http://www.w3.org/2002/07/owl#"}
                                :select  "?same"
@@ -406,7 +406,7 @@
                                 "@type"    ["owl:ObjectProperty" "owl:SymetricProperty"]}])]
           
           (is (= ["ex:person-a"]
-                 @(fluree/query db-prp-symp
+                 @(fluree/q db-prp-symp
                                 {:context {"ex" "http://example.org/"}
                                  :select  "?x"
                                  :where   {"@id"          "ex:person-b"
@@ -439,7 +439,7 @@
       
       (is (= (list "ex:person-b" "ex:person-c" "ex:person-d")
              (sort
-               @(fluree/query db-prp-trp
+               @(fluree/q db-prp-trp
                               {:context {"ex" "http://example.org/"}
                                :select  "?people"
                                :where   {"@id"          "ex:person-a"
@@ -472,7 +472,7 @@
 
       (is (= (list "ex:alice-mom" "ex:greg-dad")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex" "http://example.org/"}
                                :select  "?parents"
                                :where   {"@id"       "ex:bob"
@@ -508,7 +508,7 @@
       
       (is (= (list "ex:dad-dad" "ex:dad-mom" "ex:mom-dad" "ex:mom-mom")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex" "http://example.org/"}
                                :select  "?people"
                                :where   {"@id"            "ex:person-a"
@@ -517,7 +517,7 @@
 
       (is (= (list "ex:mom-mom-dad" "ex:mom-mom-mom")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex" "http://example.org/"}
                                :select  "?people"
                                :where   {"@id"            "ex:mom"
@@ -525,7 +525,7 @@
           "all two of ex:mom's grandparents should be found")
 
       (is (= (list "ex:mom-mom-dad" "ex:mom-mom-mom")
-             (sort @(fluree/query db-reasoned
+             (sort @(fluree/q db-reasoned
                                   {:context {"ex" "http://example.org/"}
                                    :select  "?people"
                                    :where   {"@id"                 "ex:person-a"
@@ -554,7 +554,7 @@
                                         "owl:inverseOf" {"@id" "ex:parents"}}])]
 
       (is (= ["ex:son"]
-             @(fluree/query db-reasoned
+             @(fluree/q db-reasoned
                             {:context {"ex" "http://example.org/"}
                              :select  "?x"
                              :where   {"@id"      "ex:mom"
@@ -562,7 +562,7 @@
           "ex:son should be the child of ex:mom")
 
       (is (= ["ex:mom"]
-             @(fluree/query db-reasoned
+             @(fluree/q db-reasoned
                             {:context {"ex" "http://example.org/"}
                              :select  "?x"
                              :where   {"@id"      "ex:mom-mom"
@@ -570,7 +570,7 @@
           "ex:mom should be the child of ex:mom-mom")
 
       (is (= ["ex:alice"]
-             @(fluree/query db-reasoned
+             @(fluree/q db-reasoned
                             {:context {"ex" "http://example.org/"}
                              :select  "?x"
                              :where   {"@id"       "ex:bob"
@@ -630,7 +630,7 @@
 
       (is (= (list "ex:brian" "ex:brian2")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex"  "http://example.org/"
                                          "owl" "http://www.w3.org/2002/07/owl#"}
                                :select  "?x"
@@ -640,7 +640,7 @@
 
       (is (= (list "ex:t1" "ex:t2")
              (sort
-               @(fluree/query db-reasoned
+               @(fluree/q db-reasoned
                               {:context {"ex"  "http://example.org/"
                                          "owl" "http://www.w3.org/2002/07/owl#"}
                                :select  "?x"

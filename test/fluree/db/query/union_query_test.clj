@@ -44,7 +44,7 @@
       (is (= [["Alice" "alice@example.org"]
               ["Brian" "brian@example.org"]
               ["Cam" "cam@example.org"]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  ['?name '?email]
                                 :where   [{:id          '?s
@@ -59,7 +59,7 @@
       (is (= [[:ex/alice nil "alice@example.org"]
               [:ex/brian nil "brian@example.org"]
               [:ex/cam "cam@example.org" nil]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  ['?s '?email1 '?email2]
                                 :where   [{:id '?s, :type :ex/User}
@@ -72,7 +72,7 @@
       (is (= [["Alice" nil "alice@example.org"]
               ["Brian" nil "brian@example.org"]
               ["Cam" "cam@example.org" nil]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  ['?name '?email1 '?email2]
                                 :where   [{:id          '?s

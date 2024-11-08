@@ -223,7 +223,7 @@
 
             (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
                     ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
-                   @(fluree/query dataset q))
+                   @(fluree/q dataset q))
                 "returns unified results from each component ledger")))
         (testing "selecting subgraphs"
           (let [q '{"context" "https://schema.org"
@@ -244,7 +244,7 @@
                      "name"                      "Gone with the Wind",
                      "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
                      "id"                        "https://www.wikidata.org/wiki/Q2875"}]
-                   @(fluree/query dataset q))
+                   @(fluree/q dataset q))
                 "returns unified results for the requested subject"))))
       (testing "with separate data sets"
         (testing "directly selecting variables"
@@ -261,7 +261,7 @@
                                                         "name" ?authorName}]]}]
             (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
                     ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
-                   @(fluree/query dataset q))
+                   @(fluree/q dataset q))
                 "returns unified results from each component ledger")))
         (testing "selecting subgraphs"
           (let [q '{"context" "https://schema.org"
@@ -281,5 +281,5 @@
                      "name"                      "Gone with the Wind",
                      "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
                      "id"                        "https://www.wikidata.org/wiki/Q2875"}]
-                   @(fluree/query dataset q))
+                   @(fluree/q dataset q))
                 "returns unified results for the requested subject")))))))

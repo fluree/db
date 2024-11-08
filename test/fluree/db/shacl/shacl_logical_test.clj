@@ -38,7 +38,7 @@
                               :type            [:ex/User],
                               :schema/name     "John"
                               :schema/callSign "j-rock"}})
-              ok-results @(fluree/query db-ok user-query)]
+              ok-results @(fluree/q db-ok user-query)]
           (is (= [{:id              :ex/john,
                    :type            :ex/User,
                    :schema/name     "John",
@@ -168,7 +168,7 @@
                               :schema/callSign "j-rock"
                               :schema/age      42
                               :schema/favNums  [9004 9008 9015 9016 9023 9042]}})
-              ok-results @(fluree/query db-ok user-query)]
+              ok-results @(fluree/q db-ok user-query)]
           (is (= [{:id              :ex/john,
                    :type            :ex/User,
                    :schema/name     "John",
@@ -303,7 +303,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                    :schema/name "Jean-Claude"
                    :ex/greeting "HOWDY"
                    :ex/tag      1}]
-                 @(fluree/query db-ok user-query)))))
+                 @(fluree/q db-ok user-query)))))
       (testing "name conforms"
         (let [db-name-too-short @(fluree/stage
                                    db

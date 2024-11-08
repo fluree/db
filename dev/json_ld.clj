@@ -23,7 +23,7 @@
 
   (def dbx (fluree/db loaded-ledger))
 
-  @(fluree/query dbx
+  @(fluree/q dbx
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
@@ -64,7 +64,7 @@
 
   (def ledger @(fluree/create ipfs-conn "test/db1" {}))
 
-  @(fluree/query (fluree/db ledger)
+  @(fluree/q (fluree/db ledger)
                  {:select {'?s [:* {:f/role [:*]}]}
                   :where  [['?s :type :f/DID]]})
 
@@ -86,7 +86,7 @@
                                                "name"  "Douglas Adams"}}}))
 
 
-  @(fluree/query newdb
+  @(fluree/q newdb
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
@@ -98,7 +98,7 @@
                             "name"         "NEW TITLE: The Hitchhiker's Guide to the Galaxy",
                             "commentCount" 42}]}))
 
-  @(fluree/query db2
+  @(fluree/q db2
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
@@ -113,7 +113,7 @@
                "@graph"   [{"id"           "https://www.wikidata.org/wiki/Q836821"
                             "commentCount" 52}]}))
 
-  @(fluree/query db3
+  @(fluree/q db3
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
@@ -125,7 +125,7 @@
   ;; or, if ipns key set up with DNS-link:
   ;; (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipns://data.fluree.com/test/db1"))
 
-  @(fluree/query (fluree/db loaded-ledger)
+  @(fluree/q (fluree/db loaded-ledger)
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
@@ -145,10 +145,10 @@
   (fluree/status ledger)
 
 
-  @(fluree/query latest-db {:select [:* {:f/function [:*]}]
+  @(fluree/q latest-db {:select [:* {:f/function [:*]}]
                             :from   :f/Rule})
 
-  @(fluree/query latest-db {:select {'?s [:* {:f/role [:*]}]}
+  @(fluree/q latest-db {:select {'?s [:* {:f/role [:*]}]}
                             :where  [['?s :type :f/DID]]})
 
 
@@ -192,7 +192,7 @@
 
 
   ;; query for Book with reverse reference
-  @(fluree/query db2 {:context {:derivedFrom {"@reverse" "http://schema.org/isBasedOn"}}
+  @(fluree/q db2 {:context {:derivedFrom {"@reverse" "http://schema.org/isBasedOn"}}
                       :select  [:* {:derivedFrom [:*]}]
                       :from    :wiki/Q3107329})
 
@@ -216,7 +216,7 @@
                                         "commentCount" 62}]}))
 
 
-  @(fluree/query db4 {:select [:*]
+  @(fluree/q db4 {:select [:*]
                       :from   :wiki/Q836821})
 
 

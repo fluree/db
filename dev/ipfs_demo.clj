@@ -67,7 +67,7 @@
   (def db1 @(fluree/stage db {"@context" default-context
                               "insert"   tx-1}))
 
-  @(fluree/query db1 {:context default-context
+  @(fluree/q db1 {:context default-context
                       :select  {:ex/cam [:*]}})
 
   (def c1 @(fluree/commit! ledger db1))

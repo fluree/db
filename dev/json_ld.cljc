@@ -34,7 +34,7 @@
                (-> (fluree/create conn "test/dan1")
                    (.then (fn [ledger]
                             (println "ledger" (pr-str ledger))
-                            (-> (fluree/query (fluree/db ledger)
+                            (-> (fluree/q (fluree/db ledger)
                                               {:select {'?s [:* {:f/role [:*]}]}
                                                :where [['?s :type :f/DID]]})
                                 (.then (fn [q0] (println "q0" q0))))
@@ -57,7 +57,7 @@
                                                           "@type" "Person"
                                                           "name" "Douglas Adams"}}})
                                 (.then (fn [ledger]
-                                         (fluree/query ledger
+                                         (fluree/q ledger
                                                        {:select [:* {:schema/isBasedOn [:*]}]
                                                         :from :wiki/Q836821})))
                                 (.then (fn [q1] (println "q1" (pr-str q1)))))
@@ -69,7 +69,7 @@
                                               "name" "NEW TITLE: The Hitchhiker's Guide to the Galaxy",
                                               "commentCount" 42}]})
                                 (.then (fn [ledger]
-                                         (fluree/query ledger
+                                         (fluree/q ledger
                                                        {:select [:* {:schema/isBasedOn [:*]}]
                                                         :from :wiki/Q836821})))
                                 (.then (fn [q2] (println "q2" q2))))
@@ -92,7 +92,7 @@
 
 
 
-  @(fluree/query (fluree/db ledger)
+  @(fluree/q (fluree/db ledger)
                  {:select {'?s [:* {:f/role [:*]}]}
                   :where  [['?s :type :f/DID]]})
 
@@ -114,7 +114,7 @@
                                                "name"  "Douglas Adams"}}}))
 
 
-  @(fluree/query newdb
+  @(fluree/q newdb
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
@@ -126,7 +126,7 @@
                             "name"         "NEW TITLE: The Hitchhiker's Guide to the Galaxy",
                             "commentCount" 42}]}))
 
-  @(fluree/query db2
+  @(fluree/q db2
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
@@ -151,7 +151,7 @@
   ;; load ledger from disk
   (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipfs://QmPTXAvmWrmcbqAPxY82N6nRcLUyEWP51UZVtq15CDMVYs"))
 
-  @(fluree/query (fluree/db loaded-ledger)
+  @(fluree/q (fluree/db loaded-ledger)
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
@@ -171,10 +171,10 @@
   (fluree/status ledger)
 
 
-  @(fluree/query latest-db {:select [:* {:f/function [:*]}]
+  @(fluree/q latest-db {:select [:* {:f/function [:*]}]
                             :from   :f/Rule})
 
-  @(fluree/query latest-db {:select {'?s [:* {:f/role [:*]}]}
+  @(fluree/q latest-db {:select {'?s [:* {:f/role [:*]}]}
                             :where  [['?s :type :f/DID]]})
 
 
@@ -218,7 +218,7 @@
 
 
   ;; query for Book with reverse reference
-  @(fluree/query db2 {:context {:derivedFrom {"@reverse" "http://schema.org/isBasedOn"}}
+  @(fluree/q db2 {:context {:derivedFrom {"@reverse" "http://schema.org/isBasedOn"}}
                       :select  [:* {:derivedFrom [:*]}]
                       :from    :wiki/Q3107329})
 
@@ -242,7 +242,7 @@
                                         "commentCount" 62}]}))
 
 
-  @(fluree/query db4 {:select [:*]
+  @(fluree/q db4 {:select [:*]
                       :from   :wiki/Q836821})
 
 

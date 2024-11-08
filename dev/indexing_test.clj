@@ -52,11 +52,11 @@
       :commit)
 
 
-  @(fluree/query (fluree/db ledger)
+  @(fluree/q (fluree/db ledger)
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
-  @(fluree/query (fluree/db ledger)
+  @(fluree/q (fluree/db ledger)
                  {:select {'?s [:* {:schema/isBasedOn [:*]}]}
                   :where  [['?s :type :schema/Movie]]})
 
@@ -67,7 +67,7 @@
                             "commentCount" 52}]}))
 
 
-  @(fluree/query db2
+  @(fluree/q db2
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
@@ -80,7 +80,7 @@
 
   (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipns://k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2/test/db1"))
 
-  @(fluree/query (fluree/db loaded-ledger)
+  @(fluree/q (fluree/db loaded-ledger)
                  {:select {'?s [:* {:schema/isBasedOn [:*]}]}
                   :where  [['?s :type :schema/Movie]]})
 
@@ -93,7 +93,7 @@
                "@graph"   [{"id"           "https://www.wikidata.org/wiki/Q836821"
                             "commentCount" 62}]}))
 
-  @(fluree/query db3
+  @(fluree/q db3
                  {:select {'?s [:* {:schema/isBasedOn [:*]}]}
                   :where  [['?s :type :schema/Movie]]})
 

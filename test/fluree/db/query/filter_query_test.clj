@@ -48,7 +48,7 @@
     (testing "single filter"
       (is (= [["Brian" 50]
               ["David" 46]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?name ?age]
                                 :where   '[{:type        :ex/User
@@ -57,7 +57,7 @@
                                            [:filter "(> ?age 45)"]]}))))
     (testing "single filter, different vars"
       (is (= [["Brian" "Smith"]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?name ?last]
                                 :where   '[{:type        :ex/User
@@ -67,7 +67,7 @@
                                            [:filter "(and (> ?age 45) (strEnds ?last \"ith\"))"]]}))))
     (testing "multiple filters on same var"
       (is (= [["David" 46]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?name ?age]
                                 :where   '[{:type        :ex/User
@@ -76,7 +76,7 @@
                                            [:filter "(> ?age 45)" "(< ?age 50)"]]}))))
     (testing "multiple filters, different vars"
       (is (= [["Brian" "Smith"]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?name ?last]
                                 :where   '[{:type        :ex/User
@@ -87,7 +87,7 @@
 
     (testing "nested filters"
       (is (= [["Brian" 50]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?name ?age]
                                 :where   '[{:type        :ex/User
@@ -97,7 +97,7 @@
 
     (testing "filtering for absence"
       (is (= ["Brian" "David"]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '?name
                                 :where   '[{:id          ?s
@@ -109,7 +109,7 @@
 
     (testing "filtering bound variables"
       (is (= ["Cam"]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '?name
                                 :where   '[{:type        :ex/User
@@ -119,7 +119,7 @@
 
     (testing "filtering literal value-maps"
       (is (= ["Cam"]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '?name
                                 :where   '[{:type        :ex/User
@@ -127,7 +127,7 @@
                                            [:bind ?nameLength "(strLen ?name)"]
                                            [:filter "(> {\"@value\" 4 :type :xsd/int} ?nameLength)"]]})))
       (is (= ["Cam"]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '?name
                                 :where   '[{:type        :ex/User
@@ -142,7 +142,7 @@
                         "insert"   {"@id"       "ex:bob"
                                     "ex:father" [{"@id" "ex:alex-jr"}, {"@id" "ex:aj"}]}})]
         (is (= [["ex:bob" "ex:aj" "ex:alex-jr"] ["ex:bob" "ex:alex-jr" "ex:aj"]]
-               @(fluree/query db-dads {:context {"ex" "http://example.org/"}
+               @(fluree/q db-dads {:context {"ex" "http://example.org/"}
                                        :select  '[?s ?f1 ?f2]
                                        :where   '[{"@id"       ?s
                                                    "ex:father" ?f1}
@@ -152,7 +152,7 @@
 
     (testing "value map filters"
       (is (= [["Brian" "Smith"]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex     "http://example.org/ns/"
                                            :value  "@value"
                                            :filter "@filter"}]
@@ -182,7 +182,7 @@
                :schema/email "brian@example.org",
                :schema/age   50,
                :ex/favNums   7}]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  {"?s" ["*"]}
                                 :where   [{:id "?s", :schema/age "?age"}
@@ -195,7 +195,7 @@
                :schema/age   46,
                :ex/favNums   [15 70],
                :ex/friend    {:id :ex/cam}}]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  {"?s" ["*"]}
                                 :where   [{:id "?s", :schema/age "?age"}
@@ -209,14 +209,14 @@
                :id           :ex/cam
                :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
                :ex/favColor  "Blue"}]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  {"?s" ["*"]}
                                 :where   [{:id "?s", :ex/favColor "?color"}
                                           [:filter "(strStarts ?color \"B\")"]]}))))
     (testing "data expression"
       (is (= [["Brian" 50]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?name ?age]
                                 :where   '[{:type        :ex/User
@@ -226,7 +226,7 @@
           "string atoms")
 
       (is (= [["Brian" 50]]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?name ?age]
                                 :where   '[{:type        :ex/User
@@ -243,7 +243,7 @@
                :id           :ex/cam
                :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
                :ex/favColor  "Blue"}]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  {"?s" ["*"]}
                                 :where   [{:id "?s", :ex/favColor "?color"}
@@ -258,7 +258,7 @@
                :id           :ex/cam
                :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
                :ex/favColor  "Blue"}]
-             @(fluree/query db {:context [test-utils/default-context
+             @(fluree/q db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  {"?s" ["*"]}
                                 :where   [{:id "?s", :ex/favColor "?color"}
@@ -276,7 +276,7 @@
                                                       {"@id" "ex:3"
                                                        "ex:start" {"@value" "2023-08-12" "@type" "xsd:date"}}]})]
     (is (= ["ex:3"]
-           @(fluree/query db {:context test-utils/default-str-context
+           @(fluree/q db {:context test-utils/default-str-context
                               :select "?s",
                               :where [{"@id" "?s", "ex:start" "?date"}
                                       [:filter "(and (>= ?date {\"@value\" \"2023-08-01\", \"@type\" \"xsd:date\"}) (<= ?date {\"@value\" \"2023-08-31\", \"@type\" \"xsd:date\"}))"]]})))))

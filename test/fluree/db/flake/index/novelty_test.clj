@@ -37,5 +37,5 @@
             q         {"@context" context
                        "select"   {"?s" ["*"]}
                        "where"    {"@id" "?s", "type" "ex:Bar"}}]
-        (is (= @(fluree/query (fluree/db loaded) q)
-               @(fluree/query db q)))))))
+        (is (= @(fluree/q (fluree/db loaded) q)
+               @(fluree/q db q)))))))

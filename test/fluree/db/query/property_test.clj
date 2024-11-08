@@ -38,19 +38,19 @@
                       deref)]
       (testing "querying for the property defined to be equivalent"
         (is (= [["Ben"] ["Brian"] ["Francois"]]
-               @(fluree/query db '{"@context" {"vocab2" "http://vocab2.example.org/"}
+               @(fluree/q db '{"@context" {"vocab2" "http://vocab2.example.org/"}
                                    :select    [?name]
                                    :where     {"vocab2:firstName" ?name}}))
             "returns all values"))
       (testing "querying for the symmetric property"
         (is (= [["Ben"] ["Brian"] ["Francois"]]
-               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"}
+               @(fluree/q db '{"@context" {"vocab1" "http://vocab1.example.org/"}
                                    :select    [?name]
                                    :where     {"vocab1:givenName" ?name}}))
             "returns all values"))
       (testing "querying for the transitive properties"
         (is (= [["Ben"] ["Brian"] ["Francois"]]
-               @(fluree/query db '{"@context" {"vocab3" "http://vocab3.example.fr/"}
+               @(fluree/q db '{"@context" {"vocab3" "http://vocab3.example.fr/"}
                                    :select    [?name]
                                    :where     {"vocab3:prenom" ?name}}))
             "returns all values"))
@@ -62,7 +62,7 @@
                  "ex:age"           50}
                 {"@id"           "ex:francois"
                  "vocab3:prenom" "Francois"}]
-               @(fluree/query db '{"@context" {"ex"     "http://example.org/ns/"
+               @(fluree/q db '{"@context" {"ex"     "http://example.org/ns/"
                                                "vocab1" "http://vocab1.example.org/"
                                                "vocab2" "http://vocab2.example.org/"
                                                "vocab3" "http://vocab3.example.fr/"}
@@ -126,7 +126,7 @@
         (is (= ["ex:alice" "ex:george"]
                (vec
                  (sort
-                   @(fluree/query db '{"@context" {"ex" "http://example.org/ns/"}
+                   @(fluree/q db '{"@context" {"ex" "http://example.org/ns/"}
                                        :select    ?parent
                                        :where     {"@id"                 "ex:bob"
                                                    "ex:biologicalParent" ?parent}}))))
@@ -136,7 +136,7 @@
         (is (= ["ex:alice" "ex:george" "ex:jerry" "ex:john" "ex:mary"]
                (vec
                  (sort
-                   @(fluree/query db '{"@context" {"ex" "http://example.org/ns/"}
+                   @(fluree/q db '{"@context" {"ex" "http://example.org/ns/"}
                                        :select    ?parent
                                        :where     {"@id"       "ex:bob"
                                                    "ex:parent" ?parent}}))))
@@ -169,12 +169,12 @@
                "ex:new-pred"       {"id" "ex:nested"}
                "ex:labeled-pred"   "labeled"
                "ex:unlabeled-pred" "unlabeled"}]
-             @(fluree/query db2 {"@context" context
+             @(fluree/q db2 {"@context" context
                                  "select"   {"ex:subject-as-predicate" ["*"]}}))
           "via subgraph selector")
 
       (is (= [["ex:labeled-pred"] ["ex:new-pred"] ["ex:unlabeled-pred"]]
-             @(fluree/query db2 {"@context" context
+             @(fluree/q db2 {"@context" context
                                  "select"   ["?p"]
                                  "where"    {"@id" "ex:subject-as-predicate"
                                              "?p"  "?o"}}))
@@ -191,7 +191,7 @@
                                     "ex:labeled-pred"   "labeled",
                                     "ex:new-pred"       {"id" "ex:nested"},
                                     "ex:unlabeled-pred" "unlabeled"}]]
-             @(fluree/query db2 {"@context" context
+             @(fluree/q db2 {"@context" context
                                  "select"   ["?p" {"ex:subject-as-predicate" ["*"]}]
                                  "where"    {"@id" "ex:subject-as-predicate"
                                              "?p"  "?o"}}))
@@ -203,11 +203,11 @@
                 "ex:labeled-pred"   "labeled"
                 "ex:new-pred"       {"id" "ex:nested"}
                 "ex:unlabeled-pred" "unlabeled"}}]
-             @(fluree/query db2 {"@context" [context {"ex:reversed-pred" {"@reverse" "ex:new-pred"}}]
+             @(fluree/q db2 {"@context" [context {"ex:reversed-pred" {"@reverse" "ex:new-pred"}}]
                                  "select"   {"ex:nested" ["id" {"ex:reversed-pred" ["*"]}]}}))
           "via reverse crawl")
       (is (= [{"id" "ex:nested", "ex:reversed-pred" "ex:subject-as-predicate"}]
-             @(fluree/query db3 {"@context" [context {"ex:reversed-pred" {"@reverse" "ex:unlabeled-pred"}}]
+             @(fluree/q db3 {"@context" [context {"ex:reversed-pred" {"@reverse" "ex:unlabeled-pred"}}]
                                  "select"   {"ex:nested" ["id" "ex:reversed-pred"]}}))
           "via reverse no subgraph"))))
 
@@ -254,16 +254,16 @@
       (testing "before load"
         (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
                 {"id" "ex:dan", "ex:givenName" "Dan"}]
-               @(fluree/query db2 {"@context" context
+               @(fluree/q db2 {"@context" context
                                    "select"   {"?s" ["*"]}
                                    "where"    {"@id" "?s", "ex:givenName" "?o"}})))
         (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
                 {"id" "ex:dan", "ex:givenName" "Dan"}]
-               @(fluree/query db2 {"@context" context
+               @(fluree/q db2 {"@context" context
                                    "select"   {"?s" ["*"]}
                                    "where"    {"@id" "?s", "ex:firstName" "?o"}})))
         (is (= [["ex:other" true false]]
-               @(fluree/query db2 {"@context" context
+               @(fluree/q db2 {"@context" context
                                    "select"   ["?s" "?cool" "?fool"]
                                    "where"    {"@id"     "?s",
                                                "ex:cool" "?cool"
@@ -272,17 +272,17 @@
       (testing "after load"
         (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
                 {"id" "ex:dan", "ex:givenName" "Dan"}]
-               @(fluree/query dbl {"@context" context
+               @(fluree/q dbl {"@context" context
                                    "select"   {"?s" ["*"]}
                                    "where"    {"@id" "?s", "ex:givenName" "?o"}})))
         (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
                 {"id" "ex:dan", "ex:givenName" "Dan"}]
-               @(fluree/query dbl {"@context" context
+               @(fluree/q dbl {"@context" context
                                    "select"   {"?s" ["*"]}
                                    "where"    {"@id" "?s", "ex:firstName" "?o"}})))
 
         (is (= [["ex:other" true false]]
-               @(fluree/query dbl {"@context" context
+               @(fluree/q dbl {"@context" context
                                    "select"   ["?s" "?cool" "?fool"]
                                    "where"    {"@id"     "?s"
                                                "ex:cool" "?cool"

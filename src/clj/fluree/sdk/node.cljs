@@ -64,7 +64,7 @@
                                               k
                                               (keyword k)) v))
                                {}))]
-    (.then (fluree/query db query*)
+    (.then (fluree/q db query*)
            (fn [result] (clj->js result)))))
 
 (log/set-level! :warning)

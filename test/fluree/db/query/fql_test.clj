@@ -19,7 +19,7 @@
                                    :ex/favNums   ?favNums}
                        :group-by '?name
                        :order-by '?name}
-              subject @(fluree/query db qry)]
+              subject @(fluree/q db qry)]
           (is (= [["Alice"
                    ["alice@example.org" "alice@example.org" "alice@example.org"]
                    [50 50 50]
@@ -40,7 +40,7 @@
                                    :ex/favNums   ?favNums}
                        :group-by '[?name ?email ?age]
                        :order-by '?name}
-              subject @(fluree/query db qry)]
+              subject @(fluree/q db qry)]
           (is (= [["Alice" "alice@example.org" 50 [9 42 76]]
                   ["Brian" "brian@example.org" 50 [7]]
                   ["Cam" "cam@example.org" 34 [5 10]]
@@ -50,7 +50,7 @@
 
         (testing "with having clauses"
           (is (= [["Alice" [9 42 76]] ["Cam" [5 10]] ["Liam" [11 42]]]
-                 @(fluree/query db {:context  [test-utils/default-context
+                 @(fluree/q db {:context  [test-utils/default-context
                                                {:ex "http://example.org/ns/"}]
                                     :select   '[?name ?favNums]
                                     :where    '{:schema/name ?name
@@ -60,7 +60,7 @@
               "filters results according to the supplied having function code")
 
           (is (= [["Alice" [9 42 76]] ["Liam" [11 42]]]
-                 @(fluree/query db {:context  [test-utils/default-context
+                 @(fluree/q db {:context  [test-utils/default-context
                                                {:ex "http://example.org/ns/"}]
                                     :select   '[?name ?favNums]
                                     :where    '{:schema/name ?name
@@ -82,7 +82,7 @@
                                    :schema/email ?email
                                    :schema/age   ?age}
                        :order-by '?name}
-              subject @(fluree/query db qry)]
+              subject @(fluree/q db qry)]
           (is (= [["Alice" "alice@example.org" 50]
                   ["Brian" "brian@example.org" 50]
                   ["Cam" "cam@example.org" 34]
@@ -97,7 +97,7 @@
                                      :schema/email ?email
                                      :schema/age   ?age}
                          :order-by '(desc ?name)}
-                subject @(fluree/query db qry)]
+                subject @(fluree/q db qry)]
             (is (= [["Liam" "liam@example.org" 13]
                     ["Cam" "cam@example.org" 34]
                     ["Brian" "brian@example.org" 50]
@@ -113,7 +113,7 @@
                                    :schema/email ?email
                                    :schema/age   ?age}
                        :order-by '[?age ?name]}
-              subject @(fluree/query db qry)]
+              subject @(fluree/q db qry)]
           (is (= [["Liam" "liam@example.org" 13]
                   ["Cam" "cam@example.org" 34]
                   ["Alice" "alice@example.org" 50]
@@ -128,7 +128,7 @@
                                      "schema:email" "?email"
                                      "schema:age"   "?age"}
                          "orderBy"  ["(desc ?age)" "?name"]}
-                subject @(fluree/query db qry)]
+                subject @(fluree/q db qry)]
             (is (= [["Alice" "alice@example.org" 50]
                     ["Brian" "brian@example.org" 50]
                     ["Cam" "cam@example.org" 34]
@@ -152,7 +152,7 @@
               ["Brian" "brian@example.org"]
               ["Alice" "alice@example.org"]
               ["Liam" "liam@example.org"]]
-             @(fluree/query db q))
+             @(fluree/q db q))
           "return results without repeated entries"))))
 
 (deftest ^:integration select-one-test
@@ -163,14 +163,14 @@
       (testing "with result"
         (testing "with sequential select"
           (is (= [9]
-                 @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                 @(fluree/q db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
                                     :selectOne '[?favNum]
                                     :where '[{:id ?s :schema/name "Alice"}
                                              {:id ?s :ex/favNums ?favNum}]
                                     :order-by '?favNum}))))
         (testing "with single select"
           (is (= 9
-                 @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                 @(fluree/q db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
                                     :selectOne '?favNum
                                     :where '[{:id ?s :schema/name "Alice"}
                                              {:id ?s :ex/favNums ?favNum}]
@@ -178,12 +178,12 @@
       (testing "with no result"
         (testing "with sequential select"
           (is (= nil
-                 @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                 @(fluree/q db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
                                     :selectOne '[?s]
                                     :where '{:id ?s :schema/name "Bob"}}))))
         (testing "with single select"
           (is (= nil
-                 @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                 @(fluree/q db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
                                     :selectOne '?s
                                     :where '{:id ?s :schema/name "Bob"}}))))))))
 
@@ -202,7 +202,7 @@
                               :schema/age   ?age}
                    :values  '[?email ["alice@example.org"]]}]
             (is (= [["Alice" 50]]
-                   @(fluree/query db q))
+                   @(fluree/q db q))
                 "returns only the results related to the bound value")))
         (testing "with an iri"
           (let [q {:context [test-utils/default-context
@@ -215,7 +215,7 @@
                               :schema/age  ?age}
                    :values  '[?s [{:value :ex/alice, :type :id}]]}]
             (is (= [["Alice" 50]]
-                   @(fluree/query db q))
+                   @(fluree/q db q))
                 "returns only the results related to the bound value")))
         (testing "with multiple values"
           (let [q {:context [test-utils/default-context
@@ -226,7 +226,7 @@
                               :schema/age   ?age}
                    :values  '[?email ["alice@example.org" "cam@example.org"]]}]
             (is (= [["Alice" 50] ["Cam" 34]]
-                   @(fluree/query db q))
+                   @(fluree/q db q))
                 "returns only the results related to the bound values"))))
       (testing "binding multiple variables"
         (testing "with multiple values"
@@ -240,7 +240,7 @@
                    :values  '[[?email ?favNum] [["alice@example.org" 42]
                                                 ["cam@example.org" 10]]]}]
             (is (= [["Alice" 50] ["Cam" 34]]
-                   @(fluree/query db q))
+                   @(fluree/q db q))
                 "returns only the results related to the bound values")))
         (testing "with some values not present"
           (let [q {:context [test-utils/default-context
@@ -253,7 +253,7 @@
                    :values  '[[?email ?favNum] [["alice@example.org" 42]
                                                 ["cam@example.org" 37]]]}]
             (is (= [["Alice" 50]]
-                   @(fluree/query db q))
+                   @(fluree/q db q))
                 "returns only the results related to the existing bound values"))))
       (testing "with string vars"
         (let [q {:context [test-utils/default-context
@@ -264,7 +264,7 @@
                            :schema/age   "?age"}
                  :values  ["?age" [13]]}]
           (is (= [["Liam" 13]]
-                 @(fluree/query db q))
+                 @(fluree/q db q))
               "returns only the results related to the bound values"))))))
 
 (deftest ^:integration bind-query-test
@@ -280,7 +280,7 @@
                              [:bind ?decadesOld (quot ?age 10)]
                              [:bind ?firstLetterOfName (subStr ?name 1 1)]]
                  :order-by '?firstLetterOfName}
-            res @(fluree/query db q)]
+            res @(fluree/q db q)]
         (is (= [["A" "Alice" 5]
                 ["B" "Brian" 5]
                 ["C" "Cam" 3]
@@ -297,7 +297,7 @@
                               ?firstLetterOfName (subStr ?name 1 1)
                               ?canVote           (>= ?age 18)]]
                  :order-by '?name}
-            res @(fluree/query db q)]
+            res @(fluree/q db q)]
         (is (= [["A" "Alice" true]
                 ["B" "Brian" true]
                 ["C" "Cam" true]
@@ -317,14 +317,14 @@
                :order-by '?name}]
         (is (re-matches
              #"Aggregate function sum is only valid for grouped values"
-             (ex-message @(fluree/query db q))))))))
+             (ex-message @(fluree/q db q))))))))
 
 (deftest ^:integration iri-test
   (let [conn   (test-utils/create-conn)
         movies (test-utils/load-movies conn)
         db     (fluree/db movies)]
     (testing "iri references"
-      (let [test-subject @(fluree/query db {:context test-utils/default-context
+      (let [test-subject @(fluree/q db {:context test-utils/default-context
                                             :select  '[?name]
                                             :where   '{:schema/name      ?name
                                                        :schema/isBasedOn {:id :wiki/Q3107329}}})]
@@ -336,7 +336,7 @@
         movies (test-utils/load-movies conn)
         db     (fluree/db movies)]
     (testing "searching for bare id maps"
-      (let [test-subject @(fluree/query db {:context test-utils/default-context
+      (let [test-subject @(fluree/q db {:context test-utils/default-context
                                             :select  '[?id]
                                             :where   '{:id ?id}})]
         (is (pred-match? [[test-utils/db-id?]
@@ -383,7 +383,7 @@
                                                      "fr" {"@value" "Cuisinier"}
                                                      "de" {"@value" "Köchin"}}}]})]
       (testing "with bound language tags"
-        (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+        (let [sut @(fluree/q db '{"@context" {"ex" "http://example.com/vocab/"}
                                       :select    [?job ?lang]
                                       :where     [{"@id"           "ex:frank"
                                                    "ex:occupation" ?job}
@@ -392,7 +392,7 @@
               "return the correct language tags.")))
 
       (testing "filtering by language tags"
-        (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+        (let [sut @(fluree/q db '{"@context" {"ex" "http://example.com/vocab/"}
                                       :select    [?s ?job]
                                       :where     [{"@id"           ?s
                                                    "ex:occupation" ?job}
@@ -402,7 +402,7 @@
 
       (testing "filtering with value maps"
         (testing "with scalar language tag"
-          (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+          (let [sut @(fluree/q db '{"@context" {"ex" "http://example.com/vocab/"}
                                         :select    [?s]
                                         :where     {"@id"           ?s
                                                     "ex:occupation" {"@value"    "Chef"
@@ -411,7 +411,7 @@
                 "returns correctly filtered results")))
 
         (testing "with variable language tag binding"
-          (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+          (let [sut @(fluree/q db '{"@context" {"ex" "http://example.com/vocab/"}
                                         :select    [?s]
                                         :where     {"@id"             ?s
                                                     "ex:nativeTongue" ?lang
@@ -453,7 +453,7 @@
                            :where   '{:ex/name ?name
                                       :ex/age  {:value 36
                                                 :type  :xsd/int}}}
-                  results @(fluree/query db query)]
+                  results @(fluree/q db query)]
               (is (= [["Marge"]] results)
                   "should only return the matching items with the specified type")))
           (testing "not compatible with the value"
@@ -465,7 +465,7 @@
                            :where   '{:ex/name ?name
                                       :ex/age  {:value 36
                                                 :type  :xsd/string}}}
-                  results @(fluree/query db query)]
+                  results @(fluree/q db query)]
               (is (exception? results)
                   "should return an error")))))
       (testing "bound to variables in 'bind' patterns"
@@ -476,7 +476,7 @@
                          :where   '[{:ex/name ?name
                                      :ex/age  ?age}
                                     [:bind ?dt (datatype ?age)]]}
-                results @(fluree/query db query)]
+                results @(fluree/q db query)]
             (is (= [["Bart" "forever 10" :xsd/string]
                     ["Homer" 36 :xsd/integer]
                     ["Marge" 36 :xsd/int]]
@@ -489,7 +489,7 @@
                                      :ex/age  ?age}
                                     [:bind ?dt (datatype ?age)]
                                     [:filter (= (iri :xsd/integer) ?dt)]]}
-                results @(fluree/query db query)]
+                results @(fluree/q db query)]
             (is (= [["Homer" 36 :xsd/integer]]
                    results)))))
       (testing "filtered in value maps"
@@ -502,7 +502,7 @@
                          :where   '[{:ex/name ?name
                                      :ex/age  {:value ?age
                                                :type  :xsd/string}}]}
-                results @(fluree/query db query)]
+                results @(fluree/q db query)]
             (is (= [["Bart" "forever 10"]]
                    results))))
         (testing "with variable types"
@@ -515,7 +515,7 @@
                                      :ex/age  {:value ?age
                                                :type  ?ageType}}
                                     [:bind ?ageType (iri :xsd/int)]]}
-                results @(fluree/query db query)]
+                results @(fluree/q db query)]
             (is (= [["Marge" 36 :xsd/int]]
                    results))))))))
 
@@ -574,7 +574,7 @@
                        :where   '[{:id :ex/bart
                                    ?p  {:value ?o
                                         :t     2}}]}
-              results @(fluree/query db3* query)]
+              results @(fluree/q db3* query)]
           (is (= [[:ex/dad :ex/homer]
                   [:ex/occupation "Getting into mischief"]]
                  results)
@@ -589,7 +589,7 @@
                        :where   '[{:id :ex/bart
                                    ?p  {:value ?o
                                         :t     ?t}}]}
-              results @(fluree/query db3* query)]
+              results @(fluree/q db3* query)]
           (is (= [[:ex/age "forever 10" 1]
                   [:ex/dad :ex/homer 2]
                   [:ex/mom :ex/marge 3]
@@ -636,7 +636,7 @@
                                  "schema:description" ?o}
                                 {"@id" ?s
                                  ?p    ?o}]}
-            subject @(fluree/query db q)]
+            subject @(fluree/q db q)]
         (is (= [["ex:fluree" "schema:description" "We ❤️ Data"]
                 ["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
                 ["ex:w3c" "schema:description" "We ❤️ Internet"]]
@@ -654,7 +654,7 @@
                      :where   '{:id          ?s
                                 :schema/name ?name
                                 :ex/favNums  ?favNums}}
-            results @(fluree/query db query)]
+            results @(fluree/q db query)]
         (is (= '[{?favNums 9, ?name "Alice", ?s :ex/alice}
                  {?favNums 42, ?name "Alice", ?s :ex/alice}
                  {?favNums 76, ?name "Alice", ?s :ex/alice}
@@ -672,7 +672,7 @@
                                  :schema/name ?name
                                  :ex/favNums  ?favNums}
                      :group-by '[?s ?name]}
-            results @(fluree/query db query)]
+            results @(fluree/q db query)]
         (is (= '[{?favNums [9 42 76], ?name "Alice", ?s :ex/alice}
                  {?favNums [7], ?name "Brian", ?s :ex/brian}
                  {?favNums [5 10], ?name "Cam", ?s :ex/cam}
@@ -683,4 +683,4 @@
                    :select [:* '?foo]
                    :where [{:id '?s :ex/foo '?foo}]}]
         (is (= "Error in value for \"select\"; Select must be a valid selector, a wildcard symbol (`*`), or a vector of selectors; Provided: [:* ?foo];  See documentation for details: https://next.developers.flur.ee/docs/reference/errorcodes#query-invalid-select"
-               (ex-message @(fluree/query db query))))))))
+               (ex-message @(fluree/q db query))))))))

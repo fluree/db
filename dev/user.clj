@@ -82,7 +82,7 @@
                             :ex/favNums   [5, 10]
                             :ex/friend    [:ex/brian :ex/alice]}]}))
 
-  @(fluree/query db1 {:context default-context
+  @(fluree/q db1 {:context default-context
                       :select  '[?e ?n]
                       :where   '{:id          ?e
                                  :schema/name ?n}})
@@ -91,7 +91,7 @@
 
   (-> @(fluree/load file-conn ledger-alias)
       (fluree/db)
-      (fluree/query {:context default-context
+      (fluree/q {:context default-context
                      :select  '[?e ?n]
                      :where   '{:id          ?e
                                 :schema/name ?n}})

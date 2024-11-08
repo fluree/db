@@ -1,4 +1,5 @@
 (ns fluree.db.api
+  (:refer-clojure :exclude [merge load range exists?])
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.walk :refer [postwalk]]
             [fluree.db.connection.config :as config]
@@ -7,7 +8,6 @@
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.query.api :as query-api]
             [fluree.db.transact.api :as transact-api]
@@ -18,8 +18,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
-            [fluree.db.json-ld.policy :as policy])
-  (:refer-clojure :exclude [merge load range exists?]))
+            [fluree.db.json-ld.policy :as policy]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -325,12 +324,12 @@
   ([named-graphs default-graphs]
    (query-api/dataset named-graphs default-graphs)))
 
-(defn query
+(defn q
   "Queries a dataset or single db and returns a promise with the results."
-  ([ds q]
-   (query ds q {}))
-  ([ds q opts]
-   (promise-wrap (query-api/query ds q opts))))
+  ([ds query]
+   (q ds query {}))
+  ([ds query opts]
+   (promise-wrap (query-api/query ds query opts))))
 
 (defn credential-query
   "Issues a policy-enforced query to the specified dataset/db as a verifiable
