@@ -4,7 +4,7 @@
   (:require [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
             [clojure.core.async :as async :refer [go <!]]
-            [fluree.db.api.transact :as transact-api]
+            [fluree.db.transact.api :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.ledger :as ledger]

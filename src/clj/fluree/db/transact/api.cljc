@@ -1,4 +1,4 @@
-(ns fluree.db.api.transact
+(ns fluree.db.transact.api
   (:require [fluree.db.constants :as const]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.connection :as connection]
