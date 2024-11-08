@@ -140,7 +140,15 @@
                          [:file-data? {:optional true} :boolean]
                          [:index-files-ch {:optional true} :any]
                          [:time {:optional true} :string]]
-    ::txn-opts          [:and ::stage-opts ::commit-opts]
+    ::ledger-opts       [:map
+                         [:did {:optional true} ::identity]
+                         [:identity {:optional true} ::identity]
+                         [:branch {:optional true} :string]
+                         [:indexing {:optional true}
+                          [:map
+                           [:reindex-min-bytes {:optional true} nat-int?]
+                           [:reindex-max-bytes {:optional true} nat-int?]]]]
+    ::txn-opts          [:and ::stage-opts ::commit-opts ::ledger-opts]
     ::function          ::v/function
     ::as-function       ::v/as-function
     ::wildcard          [:fn wildcard?]

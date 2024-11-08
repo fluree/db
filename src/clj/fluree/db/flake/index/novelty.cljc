@@ -33,11 +33,12 @@
   (let [novelty-size (get-in db [:novelty :size])]
     (> novelty-size reindex-min-bytes)))
 
-(defn novelty-max?
+(defn max-novelty?
   "Returns true if ledger is beyond novelty-max threshold."
-  [db reindex-max]
-  (let [novelty-size (get-in db [:novelty :size])]
-    (> novelty-size reindex-max)))
+  [db]
+  (let [novelty-size (get-in db [:novelty :size])
+        max-novelty  (:reindex-max-bytes db)]
+    (> novelty-size max-novelty)))
 
 (defn dirty?
   "Returns `true` if the index for `db` of type `idx` is out of date, or if `db`

@@ -1,6 +1,7 @@
 (ns fluree.db.flake.transact
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.policy :as policy]
@@ -120,6 +121,9 @@
 (defn stage
   [db fuel-tracker context identity author annotation raw-txn parsed-txn]
   (go-try
+    (when (novelty/max-novelty? db)
+      (throw (ex-info "Maximum novelty exceeded, try again later."
+                      {:status 429 :error :db/max-novelty-exceeded})))
     (when (policy.modify/deny-all? db)
       (throw (ex-info "Database policy denies all modifications."
                       {:status 403 :error :db/policy-exception})))
