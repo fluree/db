@@ -1,7 +1,7 @@
 (ns fluree.db.query.subject-crawl-reparse-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.api :as fluree]
+            [fluree.db :as fluree]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.subject-crawl.reparse :as reparse]))

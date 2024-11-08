@@ -1,4 +1,4 @@
-(ns fluree.db.api
+(ns fluree.db
   (:refer-clojure :exclude [merge load range exists?])
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.walk :refer [postwalk]]

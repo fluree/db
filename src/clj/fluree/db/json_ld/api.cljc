@@ -63,15 +63,15 @@
     "
   [{:keys [method parallelism remote-servers] :as opts}]
   ;; TODO - do some validation
-  (log/error "DEPRECATED function `connect` superseded by `fluree.db.api/connect`")
-  (throw (ex-info "DEPRECATED function `connect` superseded by `fluree.db.api/connect`"
+  (log/error "DEPRECATED function `connect` superseded by `fluree.db/connect`")
+  (throw (ex-info "DEPRECATED function `connect` superseded by `fluree.db/connect`"
                   {:status 400, :error :db/deprecated-api})))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/connect-file"}
   connect-file
   [opts]
-  (log/warn "DEPRECATED function `connect-file` superseded by `fluree.db.api/connect-file`")
+  (log/warn "DEPRECATED function `connect-file` superseded by `fluree.db/connect-file`")
   (connect (assoc opts :method :file)))
 
 (defn ^{:deprecated    "3.0"
@@ -82,7 +82,7 @@
   - profile - (optional) IPFS stored profile to use.
   - did - (optional) DId information to use, if storing blocks as verifiable credentials"
   [opts]
-  (log/warn "DEPRECATED function `connect-ipfs` superseded by `fluree.db.api/connect-ipfs`")
+  (log/warn "DEPRECATED function `connect-ipfs` superseded by `fluree.db/connect-ipfs`")
   (connect (assoc opts :method :ipfs)))
 
 (defn ^{:deprecated    "3.0"
@@ -91,7 +91,7 @@
   "Forms an in-memory connection using default settings.
   - did - (optional) DId information to use, if storing blocks as verifiable credentials"
   [opts]
-  (log/warn "DEPRECATED function `connect-memory` superseded by `fluree.db.api/connect-memory`")
+  (log/warn "DEPRECATED function `connect-memory` superseded by `fluree.db/connect-memory`")
   (connect (assoc opts :method :memory)))
 
 (defn ^{:deprecated    "3.0"
@@ -100,7 +100,7 @@
   "Returns true if the argument is a full ledger address, false if it is just an
   alias."
   [ledger-alias-or-address]
-  (log/warn "DEPRECATED function `address?` superseded by `fluree.db.api/address?`")
+  (log/warn "DEPRECATED function `address?` superseded by `fluree.db/address?`")
   (connection/fluree-address? ledger-alias-or-address))
 
 (defn ^{:deprecated    "3.0"
@@ -126,7 +126,7 @@
   ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
-   (log/warn "DEPRECATED function `create` superseded by `fluree.db.api/create`")
+   (log/warn "DEPRECATED function `create` superseded by `fluree.db/create`")
    (promise-wrap
     (do
       (log/info "Creating ledger" ledger-alias)
@@ -138,7 +138,7 @@
   "Returns a core.async channel with the connection-specific address of the
   given ledger-alias."
   [conn ledger-alias]
-  (log/warn "DEPRECATED function `alias->address` superseded by `fluree.db.api/alias->address`")
+  (log/warn "DEPRECATED function `alias->address` superseded by `fluree.db/alias->address`")
   (log/debug "Looking up address for ledger alias" ledger-alias)
   (connection/primary-address conn ledger-alias))
 
@@ -148,7 +148,7 @@
   "Loads an existing ledger by its alias (which will be converted to a
   connection-specific address first)."
   [conn alias-or-address]
-  (log/warn "DEPRECATED function `load` superseded by `fluree.db.api/load`")
+  (log/warn "DEPRECATED function `load` superseded by `fluree.db/load`")
   (promise-wrap
     (connection/load-ledger conn alias-or-address)))
 
@@ -158,7 +158,7 @@
   "Returns a promise with true if the ledger alias or address exists, false
   otherwise."
   [conn ledger-alias-or-address]
-  (log/warn "DEPRECATED function `exists?` superseded by `fluree.db.api/exists?`")
+  (log/warn "DEPRECATED function `exists?` superseded by `fluree.db/exists?`")
   (promise-wrap
     (go
       (let [address (if (address? ledger-alias-or-address)
@@ -177,7 +177,7 @@
   is for the next 't' value. If a commit is for a past 't' value, noop.
   If commit is for a future 't' value, will drop in-memory ledger for reload upon next request."
   [conn commit-map]
-  (log/warn "DEPRECATED function `notify` superseded by `fluree.db.api/notify`")
+  (log/warn "DEPRECATED function `notify` superseded by `fluree.db/notify`")
   (promise-wrap
     (if (map? commit-map)
       (notify-ledger conn commit-map)
@@ -221,7 +221,7 @@
   "Performs a transaction and queues change if valid (does not commit)"
   ([db json-ld] (stage db json-ld nil))
   ([db json-ld opts]
-   (log/warn "DEPRECATED function `stage` superseded by `fluree.db.api/stage`")
+   (log/warn "DEPRECATED function `stage` superseded by `fluree.db/stage`")
    (let [result-ch (transact-api/stage db json-ld opts)]
      (promise-wrap result-ch))))
 
@@ -239,7 +239,7 @@
    (promise-wrap
      (connection/commit! ledger db)))
   ([ledger db opts]
-   (log/warn "DEPRECATED function `commit!` superseded by `fluree.db.api/commit!`")
+   (log/warn "DEPRECATED function `commit!` superseded by `fluree.db/commit!`")
    (promise-wrap
      (connection/commit! ledger db opts))))
 
@@ -247,7 +247,7 @@
         :superseded-by "fluree.db/transact!"}
   transact!
   [conn txn]
-  (log/warn "DEPRECATED function `transact!` superseded by `fluree.db.api/transact!`")
+  (log/warn "DEPRECATED function `transact!` superseded by `fluree.db/transact!`")
   (promise-wrap
     (transact-api/transact! conn txn)))
 
@@ -255,7 +255,7 @@
         :superseded-by "fluree.db/create-with-txn"}
   create-with-txn
   [conn txn]
-  (log/warn "DEPRECATED function `create-with-txn` superseded by `fluree.db.api/create-with-txn`")
+  (log/warn "DEPRECATED function `create-with-txn` superseded by `fluree.db/create-with-txn`")
   (promise-wrap
     (transact-api/create-with-txn conn txn)))
 
@@ -265,7 +265,7 @@
   "Returns current status of ledger branch."
   ([ledger] (ledger/status ledger))
   ([ledger branch]
-   (log/warn "DEPRECATED function `status` superseded by `fluree.db.api/status`")
+   (log/warn "DEPRECATED function `status` superseded by `fluree.db/status`")
    (ledger/status ledger branch)))
 
 
@@ -311,7 +311,7 @@
   ([ledger]
    (db ledger nil))
   ([ledger opts]
-   (log/warn "DEPRECATED function `db` superseded by `fluree.db.api/db`")
+   (log/warn "DEPRECATED function `db` superseded by `fluree.db/db`")
    (if opts
      (throw (ex-info "DB opts not yet implemented"
                      {:status 500 :error :db/unexpected-error}))
@@ -323,7 +323,7 @@
   ([db policy]
    (wrap-policy db policy nil))
   ([db policy values-map]
-   (log/warn "DEPRECATED function `wrap-policy` superseded by `fluree.db.api/wrap-policy`")
+   (log/warn "DEPRECATED function `wrap-policy` superseded by `fluree.db/wrap-policy`")
    (promise-wrap
     (policy/wrap-policy db policy values-map))))
 
@@ -339,7 +339,7 @@
   ([db identity]
    (wrap-identity-policy db identity nil))
   ([db identity values-map]
-   (log/warn "DEPRECATED function `wrap-identity-policy` superseded by `fluree.db.api/wrap-identity-policy`")
+   (log/warn "DEPRECATED function `wrap-identity-policy` superseded by `fluree.db/wrap-identity-policy`")
    (promise-wrap
     (policy/wrap-identity-policy db identity values-map))))
 
@@ -369,7 +369,7 @@
    ...}"
   ([named-graphs] (dataset named-graphs (keys named-graphs)))
   ([named-graphs default-graphs]
-   (log/warn "DEPRECATED function `dataset` superseded by `fluree.db.api/dataset`")
+   (log/warn "DEPRECATED function `dataset` superseded by `fluree.db/dataset`")
    (query-api/dataset named-graphs default-graphs)))
 
 (defn ^{:deprecated    "3.0"
@@ -378,7 +378,7 @@
   "Queries a dataset or single db and returns a promise with the results."
   ([ds q] (query ds q {}))
   ([ds q opts]
-   (log/warn "DEPRECATED function `query` superseded by `fluree.db.api/query`")
+   (log/warn "DEPRECATED function `query` superseded by `fluree.db/query`")
    (promise-wrap (query-api/query ds q opts))))
 
 (defn ^{:deprecated    "3.0"
@@ -392,7 +392,7 @@
   the policy classes and apply the policies to the query."
   ([ds cred-query] (credential-query ds cred-query {}))
   ([ds cred-query {:keys [values-map] :as opts}]
-   (log/warn "DEPRECATED function `credential-query` superseded by `fluree.db.api/credential-query`")
+   (log/warn "DEPRECATED function `credential-query` superseded by `fluree.db/credential-query`")
    (promise-wrap
     (go-try
       (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
@@ -418,7 +418,7 @@
   with the results."
   ([conn q] (query-connection conn q {}))
   ([conn q opts]
-   (log/warn "DEPRECATED function `query-connection` superseded by `fluree.db.api/query-connection`")
+   (log/warn "DEPRECATED function `query-connection` superseded by `fluree.db/query-connection`")
    (promise-wrap (query-api/query-connection conn q opts))))
 
 (defn ^{:deprecated    "3.0"
@@ -431,7 +431,7 @@
          res-chan  (query-api/history latest-db query)]
      (promise-wrap res-chan)))
   ([ledger query {:keys [policy identity values-map] :as _opts}]
-   (log/warn "DEPRECATED function `history` superseded by `fluree.db.api/history`")
+   (log/warn "DEPRECATED function `history` superseded by `fluree.db/history`")
    (promise-wrap
      (let [latest-db (ledger/current-db ledger)
            policy-db (if identity
@@ -450,7 +450,7 @@
   the policy classes and apply the policies to the query."
   ([ledger cred-query] (credential-history ledger cred-query {}))
   ([ledger cred-query {:keys [values-map] :as opts}]
-   (log/warn "DEPRECATED function `credential-history` superseded by `fluree.db.api/credential-history`")
+   (log/warn "DEPRECATED function `credential-history` superseded by `fluree.db/credential-history`")
    (promise-wrap
     (go-try
       (let [latest-db                       (ledger/current-db ledger)
@@ -479,7 +479,7 @@
    (promise-wrap
      (query-range/index-range db index test match)))
   ([db index start-test start-match end-test end-match]
-   (log/warn "DEPRECATED function `range` superseded by `fluree.db.api/range`")
+   (log/warn "DEPRECATED function `range` superseded by `fluree.db/range`")
    (promise-wrap
      (query-range/index-range db index start-test start-match end-test end-match))))
 
@@ -488,7 +488,7 @@
   slice
   "Like range, but returns all flakes that match the supplied flake parts."
   [db index match]
-  (log/warn "DEPRECATED function `slice` superseded by `fluree.db.api/slice`")
+  (log/warn "DEPRECATED function `slice` superseded by `fluree.db/slice`")
   (promise-wrap
     (query-range/index-range db index = match)))
 
@@ -497,7 +497,7 @@
   expand-iri
   "Expands given IRI with the default database context, or provided context."
   ([context compact-iri]
-   (log/warn "DEPRECATED function `expand-iri` superseded by `fluree.db.api/expand-iri`")
+   (log/warn "DEPRECATED function `expand-iri` superseded by `fluree.db/expand-iri`")
    (json-ld/expand-iri compact-iri
                        (json-ld/parse-context context))))
 
@@ -508,7 +508,7 @@
   This can be used for doing range scans, slices and for other
   more advanced needs."
   [db iri]
-  (log/warn "DEPRECATED function `encode-iri` superseded by `fluree.db.api/encode-iri`")
+  (log/warn "DEPRECATED function `encode-iri` superseded by `fluree.db/encode-iri`")
   (iri/encode-iri db iri))
 
 (defn ^{:deprecated    "3.0"
@@ -529,7 +529,7 @@
   internal compact format. This allows the IRI to be returned
   as a full string IRI."
   [db iri]
-  (log/warn "DEPRECATED function `decode-iri` superseded by `fluree.db.api/decode-iri`")
+  (log/warn "DEPRECATED function `decode-iri` superseded by `fluree.db/decode-iri`")
   (iri/decode-sid db iri))
 
 ;; reasoning APIs
@@ -549,7 +549,7 @@
   ([db methods] (reason db methods nil nil))
   ([db methods rule-sources] (reason db methods rule-sources nil))
   ([db methods rule-sources opts]
-   (log/warn "DEPRECATED function `reason` superseded by `fluree.db.api/reason`")
+   (log/warn "DEPRECATED function `reason` superseded by `fluree.db/reason`")
    (promise-wrap
      (reasoner/reason db methods rule-sources opts))))
 
@@ -558,7 +558,7 @@
   reasoned-count
   "Returns a count of reasoned facts in the provided db."
   [db]
-  (log/warn "DEPRECATED function `reasoned-count` superseded by `fluree.db.api/reasoned-count`")
+  (log/warn "DEPRECATED function `reasoned-count` superseded by `fluree.db/reasoned-count`")
   (reasoner/reasoned-count db))
 
 (defn ^{:deprecated    "3.0"
@@ -580,5 +580,5 @@
   {:group-by ::property} - group by the reasoned triples' property IRI"
   ([db] (reasoned-facts db nil))
   ([db opts]
-   (log/warn "DEPRECATED function `reasoned-facts` superseded by `fluree.db.api/reasoned-facts`")
+   (log/warn "DEPRECATED function `reasoned-facts` superseded by `fluree.db/reasoned-facts`")
    (reasoner/reasoned-facts (:group-by opts))))

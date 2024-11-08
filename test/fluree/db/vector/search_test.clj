@@ -1,6 +1,6 @@
 (ns fluree.db.vector.search-test
   (:require [clojure.test :refer :all]
-            [fluree.db.api :as fluree]
+            [fluree.db :as fluree]
             [fluree.db.constants :as const]
             [fluree.db.test-utils :as test-utils]))
 

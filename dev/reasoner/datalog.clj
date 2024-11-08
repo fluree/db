@@ -1,5 +1,5 @@
 (ns reasoner.datalog
-  (:require [fluree.db.api :as fluree]
+  (:require [fluree.db :as fluree]
             [fluree.db.util.async :refer [<? <??]]))
 
 

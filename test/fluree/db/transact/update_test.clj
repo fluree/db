@@ -1,7 +1,7 @@
 (ns fluree.db.transact.update-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.api :as fluree]
+            [fluree.db :as fluree]
             [fluree.db.constants :as const])
   (:import [java.time OffsetDateTime]))
 

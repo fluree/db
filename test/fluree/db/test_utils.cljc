@@ -2,7 +2,7 @@
   (:require [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]
             [clojure.string :as str]
             [fluree.db.did :as did]
-            [fluree.db.api :as fluree]
+            [fluree.db :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.json-ld.iri :as iri]

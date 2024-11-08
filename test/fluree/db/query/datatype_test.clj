@@ -1,7 +1,7 @@
 (ns fluree.db.query.datatype-test
   (:require [clojure.test :refer :all]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.api :as fluree]))
+            [fluree.db :as fluree]))
 
 (def default-context
   {:id     "@id"

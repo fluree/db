@@ -1,6 +1,6 @@
 (ns fluree.db.query.stable-hashes-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.api :as fluree]
+            [fluree.db :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
 (deftest stable-hashes-test
