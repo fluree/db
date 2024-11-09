@@ -1,6 +1,8 @@
 (ns fluree.db.transact
-  (:require [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
+  (:require [fluree.db.fuel :as fuel]
+            [fluree.db.json-ld.policy :as policy]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]))
 
@@ -52,3 +54,30 @@
 
            annotation (extract-annotation context parsed-txn parsed-opts)]
        (<? (-stage-txn db fuel-tracker context identity author annotation raw-txn parsed-txn))))))
+
+(defn stage-triples
+  "Stages a new transaction that is already parsed into the
+   internal Fluree triples format."
+  [db parsed-txn parsed-opts]
+  (go-try
+    (let [identity    (:identity parsed-opts)
+          policy-db   (if (policy/policy-enforced-opts? parsed-opts)
+                        (let [parsed-context (:context parsed-opts)]
+                          (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
+                        db)]
+      (if (fuel/track? parsed-opts)
+        (let [start-time #?(:clj (System/nanoTime)
+                            :cljs (util/current-time-millis))
+              fuel-tracker       (fuel/tracker (:max-fuel parsed-opts))]
+          (try*
+            (let [result (<? (stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
+              {:status 200
+               :result result
+               :time   (util/response-time-formatted start-time)
+               :fuel   (fuel/tally fuel-tracker)})
+            (catch* e
+                    (throw (ex-info "Error staging database"
+                                    {:time (util/response-time-formatted start-time)
+                                     :fuel (fuel/tally fuel-tracker)}
+                                    e)))))
+        (<? (stage policy-db identity parsed-txn parsed-opts))))))

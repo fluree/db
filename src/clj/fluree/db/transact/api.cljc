@@ -1,5 +1,6 @@
 (ns fluree.db.transact.api
   (:require [fluree.db.constants :as const]
+            [fluree.db.transact :as transact]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.connection :as connection]
             [fluree.db.util.async :refer [<? go-try]]
@@ -7,7 +8,6 @@
             [fluree.db.util.context :as ctx-util]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.ledger :as ledger]
             [fluree.db.query.fql.syntax :as syntax]))
 
 (defn parse-opts
@@ -20,11 +20,6 @@
         (update :identity #(or % (:did opts)))
         (dissoc :did))))
 
-(defn track-fuel?
-  [parsed-opts]
-  (or (:max-fuel parsed-opts)
-      (:meta parsed-opts)))
-
 (defn stage
   [db txn opts]
   (go-try
@@ -33,7 +28,7 @@
          expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
          parsed-opts (parse-opts expanded opts txn-context)
          parsed-txn  (q-parse/parse-txn expanded txn-context)]
-     (<? (connection/stage-triples db parsed-txn parsed-opts)))))
+     (<? (transact/stage-triples db parsed-txn parsed-opts)))))
 
 (defn extract-ledger-id
   "Extracts ledger-id from expanded json-ld transaction"

@@ -38,3 +38,8 @@
 
         ([result]
          (rf result))))))
+
+(defn track?
+  [opts]
+  (or (:max-fuel opts)
+      (:meta opts)))

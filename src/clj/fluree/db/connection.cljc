@@ -6,11 +6,9 @@
             [fluree.db.constants :as const]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.did :as did]
-            [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.json-ld.policy :as policy]
             [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.transact :as transact]
@@ -21,7 +19,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.json-ld :as json-ld]
-            [fluree.db.ledger :as ledger])
+            [fluree.db.ledger :as ledger]
+            [fluree.db.fuel :as fuel])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -586,49 +585,17 @@
           :db               db*}
          db*)))))
 
-(defn track-fuel?
-  [parsed-opts]
-  (or (:max-fuel parsed-opts)
-      (:meta parsed-opts)))
-
-(defn stage-triples
-  "Stages a new transaction that is already parsed into the
-   internal Fluree triples format."
-  [db parsed-txn parsed-opts]
-  (go-try
-    (let [identity    (:identity parsed-opts)
-          policy-db   (if (policy/policy-enforced-opts? parsed-opts)
-                        (let [parsed-context (:context parsed-opts)]
-                          (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
-                        db)]
-      (if (track-fuel? parsed-opts)
-        (let [start-time #?(:clj (System/nanoTime)
-                            :cljs (util/current-time-millis))
-              fuel-tracker       (fuel/tracker (:max-fuel parsed-opts))]
-          (try*
-            (let [result (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
-              {:status 200
-               :result result
-               :time   (util/response-time-formatted start-time)
-               :fuel   (fuel/tally fuel-tracker)})
-            (catch* e
-                    (throw (ex-info "Error staging database"
-                                    {:time (util/response-time-formatted start-time)
-                                     :fuel (fuel/tally fuel-tracker)}
-                                    e)))))
-        (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
-
 (defn transact-ledger!
   [_conn ledger triples {:keys [branch] :as parsed-opts, :or {branch :main}}]
   (log/info "transacting ledger:" parsed-opts)
   (go-try
     (let [db       (ledger/current-db ledger branch)
-          staged   (<? (stage-triples db triples parsed-opts))
+          staged   (<? (transact/stage-triples db triples parsed-opts))
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
           cmt-opts (dissoc parsed-opts :context :identity)]
-      (if (track-fuel? parsed-opts)
+      (if (fuel/track? parsed-opts)
         (assoc staged :result (<? (commit! ledger (:result staged) cmt-opts)))
         (<? (commit! ledger staged cmt-opts))))))
 
