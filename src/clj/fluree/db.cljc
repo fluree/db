@@ -1,16 +1,20 @@
 (ns fluree.db
-  (:refer-clojure :exclude [merge load range exists?])
+  (:refer-clojure :exclude [load range exists?])
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.walk :refer [postwalk]]
+            [fluree.db.constants :as const]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
             [fluree.db.connection :as connection :refer [notify-ledger]]
+            [fluree.db.transact :as transact]
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.query.api :as query-api]
             [fluree.db.transact.api :as transact-api]
+            [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.ledger :as ledger]
@@ -212,14 +216,29 @@
         (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
                  {:status 400 :error :db/invalid-commit-map})))))
 
+(defn parse-transaction-opts
+  [expanded-txn override-opts txn-context]
+  (let [txn-opts (some-> (util/get-first-value expanded-txn const/iri-opts)
+                         (syntax/coerce-txn-opts))
+        opts     (merge txn-opts (some-> override-opts syntax/coerce-txn-opts))]
+    (-> opts
+        (assoc :context txn-context)
+        (update :identity #(or % (:did opts)))
+        (dissoc :did))))
 
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
-  ([db json-ld] (stage db json-ld nil))
+  ([db json-ld]
+   (stage db json-ld nil))
   ([db json-ld opts]
-   (let [result-ch (transact-api/stage db json-ld opts)]
-     (promise-wrap result-ch))))
-
+   (promise-wrap
+    (go-try
+      (let [txn-context (or (context/txn-context json-ld)
+                            (:context opts))
+            expanded    (json-ld/expand (context/use-fluree-context json-ld))
+            parsed-opts (parse-transaction-opts expanded opts txn-context)
+            parsed-txn  (parse/parse-txn expanded txn-context)]
+        (<? (transact/stage-triples db parsed-txn parsed-opts)))))))
 
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
