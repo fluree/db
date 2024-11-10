@@ -22,7 +22,8 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
-            [fluree.db.json-ld.policy :as policy]))
+            [fluree.db.json-ld.policy :as policy]
+            [fluree.db.query.dataset :as dataset]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -341,7 +342,7 @@
    ...}"
   ([named-graphs] (dataset named-graphs (keys named-graphs)))
   ([named-graphs default-graphs]
-   (query-api/dataset named-graphs default-graphs)))
+   (dataset/dataset named-graphs default-graphs)))
 
 (defn q
   "Queries a dataset or single db and returns a promise with the results."

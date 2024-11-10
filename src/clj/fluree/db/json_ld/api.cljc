@@ -14,7 +14,8 @@
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
-            [fluree.db.json-ld.policy :as policy])
+            [fluree.db.json-ld.policy :as policy]
+            [fluree.db.dataset :as dataset])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -370,7 +371,7 @@
   ([named-graphs] (dataset named-graphs (keys named-graphs)))
   ([named-graphs default-graphs]
    (log/warn "DEPRECATED function `dataset` superseded by `fluree.db/dataset`")
-   (query-api/dataset named-graphs default-graphs)))
+   (dataset/dataset named-graphs default-graphs)))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/query"}

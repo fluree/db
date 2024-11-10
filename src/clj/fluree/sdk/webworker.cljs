@@ -2,7 +2,6 @@
   (:require [cljs.core.async :as async]
             [fluree.db.query.api :as q]
             [fluree.db.util.core :as util]
-            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [goog.object]))
 

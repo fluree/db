@@ -6,7 +6,7 @@
             [fluree.db.fuel :as fuel]
             [fluree.db.ledger :as ledger]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.query.dataset :as dataset :refer [dataset?]]
+            [fluree.db.query.dataset :as dataset :refer [dataset dataset?]]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.log :as log]
             [fluree.db.query.history :as history]
@@ -74,11 +74,6 @@
                                     time-travel-db)]
        (assoc-in reasoned-db [:policy :cache] (atom {}))))))
 
-(defn track-fuel?
-  [sanitized-query]
-  (or (-> sanitized-query :opts :max-fuel)
-      (-> sanitized-query :opts :meta)))
-
 (defn track-query
   [ds max-fuel query]
   (go-try
@@ -114,9 +109,9 @@
                       (<? (restrict-db ds query*)))
            query**  (update query* :opts dissoc :meta :max-fuel ::track-fuel?)
            max-fuel (:max-fuel opts)]
-      (if (track-fuel? query*)
-        (<? (track-query ds* max-fuel query**))
-        (<? (fql/query ds* query**)))))))
+       (if (-> query* :opts fuel/track?)
+         (<? (track-query ds* max-fuel query**))
+         (<? (fql/query ds* query**)))))))
 
 (defn query-sparql
   [db query]
@@ -218,14 +213,6 @@
          (recur r db-map*))
        db-map))))
 
-(defn dataset
-  [named-graphs default-aliases]
-  (let [default-coll (some->> default-aliases
-                              util/sequential
-                              (select-keys named-graphs)
-                              vals)]
-    (dataset/combine named-graphs default-coll)))
-
 (defn load-dataset
   [conn defaults named sanitized-query]
   (go-try
@@ -253,7 +240,7 @@
         (let [ds            (<? (load-dataset conn default-aliases named-aliases sanitized-query))
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel ::track-fuel?)
               max-fuel      (:max-fuel opts)]
-          (if (track-fuel? sanitized-query)
+          (if (-> sanitized-query :opts fuel/track?)
             (<? (track-query ds max-fuel trimmed-query))
             (<? (fql/query ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"

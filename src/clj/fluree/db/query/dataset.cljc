@@ -130,3 +130,11 @@
   [named-map defaults]
   (let [default-graph (some->> defaults util/sequential)]
     (->DataSet named-map default-graph ::default)))
+
+(defn dataset
+  [named-graphs default-aliases]
+  (let [default-coll (some->> default-aliases
+                              util/sequential
+                              (select-keys named-graphs)
+                              vals)]
+    (combine named-graphs default-coll)))
