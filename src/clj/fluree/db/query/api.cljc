@@ -125,18 +125,6 @@
     :fql (query-fql db query)
     :sparql (query-sparql db query)))
 
-(defn contextualize-ledger-400-error
-  [info-str e]
-  (let [e-data (ex-data e)]
-    (if (= 400
-           (:status e-data))
-      (ex-info
-       (str info-str
-            (ex-message e))
-       e-data
-       e)
-      e)))
-
 (defn query-str->map
   "Converts the string query parameters of
   k=v&k2=v2&k3=v3 into a map of {k v, k2 v2, k3 v3}"
@@ -177,6 +165,16 @@
                  parse-t-val)]
       [alias nil])))
 
+(defn alias-error
+  [ledger-alias e]
+  (if-let [data (ex-data e)]
+    (let [message (str/join " " ["Error loading ledger:" ledger-alias ":"
+                                 (ex-message e)])]
+      (ex-info message data e))
+    (let [message (str "Error loading ledger: " ledger-alias)
+          data    {:status 500 :error :db/unexpected-error} ]
+      (ex-info message data e))))
+
 (defn load-alias
   [conn alias {:keys [t] :as sanitized-query}]
   (go-try
@@ -188,9 +186,7 @@
             query*       (assoc sanitized-query :t t*)]
         (<? (restrict-db db query* conn)))
       (catch* e
-              (throw (contextualize-ledger-400-error
-                       (str "Error loading ledger " alias ": ")
-                       e))))))
+        (throw (alias-error alias e))))))
 
 (defn load-aliases
   [conn aliases sanitized-query]
@@ -199,10 +195,10 @@
       (util/str->epoch-ms (:t sanitized-query))
       (catch* e
         (throw
-         (contextualize-ledger-400-error
-          (str "Error in federated query: top-level `t` values "
-               "must be iso-8601 wall-clock times. ")
-          e)))))
+         (ex-info (str "Error loading dataset: top-level `t` values "
+                       "must be iso-8601 wall-clock times.")
+                  {:status 400, :error :db/invalid-time}
+                  e)))))
   (go-try
    (loop [[alias & r] aliases
           db-map      {}]

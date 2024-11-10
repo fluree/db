@@ -241,6 +241,4 @@
                                     (catch Exception e e))]
               (is (util/exception? invalid-time))
               (is (= 400 (-> invalid-time ex-data :status)))
-              (is (str/includes? (ex-message invalid-time)
-                                 "Error in federated query: top-level `t` value")
-                  "error message should indicate invalid t value type"))))))))
+              (is (= :db/invalid-time (-> invalid-time ex-data :error))))))))))
