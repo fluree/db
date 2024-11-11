@@ -6,7 +6,6 @@
             [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.order :as order]
             [fluree.db.query.exec.having :as having]
-            [fluree.db.util.core :as util]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.util.log :as log :include-macros true]
             [clojure.walk :as walk]))

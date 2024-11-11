@@ -2,7 +2,7 @@
   (:require [clojure.core.async :refer [go <!]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
