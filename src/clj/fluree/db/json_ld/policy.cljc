@@ -3,7 +3,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -71,24 +71,22 @@
   that identity, queries for those classes and calls `wrap-policy`"
   [db identity values-map]
   (go
-   (let [policies  (<! (dbproto/-query db {"select" {"?policy" ["*"]}
-                                           "where"  [{"@id"                 identity
-                                                      const/iri-policyClass "?classes"}
-                                                     {"@id"   "?policy"
-                                                      "@type" "?classes"}]}))
-         policies* (if (util/exception? policies)
-                     policies
-                     (policy-from-query policies))
-         val-map   (assoc values-map "?$identity" {"@value" identity
-                                                   "@type"  const/iri-id})]
-     (log/trace "wrap-identity-policy - extracted policy from identity: " identity
-                " policy: " policies*)
-     (if (util/exception? policies*)
-       (ex-info (str "Unable to extract policies for identity: " identity
-                     " with error: " (ex-message policies*))
-                {:status 400 :error :db/policy-exception}
-                policies*)
-       (<! (wrap-policy db (json-ld/expand policies*) val-map))))))
+    (try*
+      (let [policies  (<? (dbproto/-query db {"select" {"?policy" ["*"]}
+                                              "where"  [{"@id"                 identity
+                                                         const/iri-policyClass "?classes"}
+                                                        {"@id"   "?policy"
+                                                         "@type" "?classes"}]}))
+            policies* (policy-from-query policies)
+            val-map   (assoc values-map "?$identity" {"@value" identity
+                                                      "@type"  const/iri-id})]
+        (log/trace "wrap-identity-policy - extracted policy from identity: " identity
+                   " policy: " policies*)
+        (<! (wrap-policy db (json-ld/expand policies*) val-map)))
+      (catch* e
+        (throw (ex-info (str "Unable to extract policies for identity: " identity)
+                        {:status 400, :error :db/policy-exception}
+                        e))))))
 
 (defn policy-enforced-opts?
   "Tests 'options' for a query or transaction to see if the options request
@@ -100,18 +98,16 @@
 
 (defn policy-enforce-db
   "Policy enforces a db based on the query/transaction options"
-  [db parsed-context opts]
-  (go-try
-    (let [{:keys [identity policy-class policy policy-values]} opts]
-      (cond
+  [db parsed-context {:keys [identity policy-class policy policy-values]}]
+  (cond
 
-        identity
-        (<? (wrap-identity-policy db identity policy-values))
+    identity
+    (wrap-identity-policy db identity policy-values)
 
-        policy-class
-        (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
-          (<? (wrap-class-policy db classes policy-values)))
+    policy-class
+    (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
+      (wrap-class-policy db classes policy-values))
 
-        policy
-        (let [expanded-policy (json-ld/expand policy parsed-context)]
-          (<? (wrap-policy db expanded-policy policy-values)))))))
+    policy
+    (let [expanded-policy (json-ld/expand policy parsed-context)]
+      (wrap-policy db expanded-policy policy-values))))
