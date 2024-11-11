@@ -1,5 +1,5 @@
-(ns fluree.db.query.exec
-  "Find and format results of queries against database values."
+(ns fluree.db.query
+  (:refer-clojure :exclude [var? vswap!])
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
@@ -8,9 +8,13 @@
             [fluree.db.query.exec.having :as having]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.util.log :as log :include-macros true]
-            [clojure.walk :as walk]))
+            [clojure.walk :as walk]
+            [fluree.db.util.async :refer [go-try]]
+            [fluree.db.query.fql.parse :as parse])
+  #?(:cljs (:require-macros [clojure.core])))
 
 #?(:clj (set! *warn-on-reflection* true))
+
 
 (defn queryable?
   [x]
@@ -49,9 +53,9 @@
     (async/take 1 result-ch)
     (async/into [] result-ch)))
 
-(defn execute*
+(defn execute
   ([ds fuel-tracker q error-ch]
-   (execute* ds fuel-tracker q error-ch nil))
+   (execute ds fuel-tracker q error-ch nil))
   ([ds fuel-tracker q error-ch initial-soln]
    (->> (where/search ds q fuel-tracker error-ch initial-soln)
         (group/combine q)
@@ -61,19 +65,13 @@
         (drop-offset q)
         (take-limit q))))
 
-(defn execute
-  [ds fuel-tracker q error-ch]
-  (->> (execute* ds fuel-tracker q error-ch)
-       (select/format ds q fuel-tracker error-ch)
-       (collect-results q)))
-
 ;; TODO: refactor namespace heirarchy so this isn't necessary
 (defn subquery-executor
   "Closes over a subquery to allow processing the whole query pipeline from within the
   search."
   [subquery]
   (fn [ds fuel-tracker error-ch]
-    (->> (execute* ds fuel-tracker subquery error-ch)
+    (->> (execute ds fuel-tracker subquery error-ch)
          (select/subquery-format ds subquery fuel-tracker error-ch))))
 
 (defn prep-subqueries
@@ -87,15 +85,17 @@
                                        x))
                                    %)))
 
-(defn query
-  "Execute the parsed query `q` against the database value `db`. Returns an async
-  channel which will eventually contain a single vector of results, or an
-  exception if there was an error."
-  [ds fuel-tracker q]
-  (go
-    (let [error-ch  (async/chan)
-          prepped-q (prep-subqueries q)
-          result-ch (execute ds fuel-tracker prepped-q error-ch)]
-      (async/alt!
-        error-ch ([e] e)
-        result-ch ([result] result)))))
+(defn q
+  "Returns core async channel with results or exception"
+  ([ds query-map]
+   (q ds nil query-map))
+  ([ds fuel-tracker query-map]
+   (go-try
+     (let [query     (-> query-map parse/parse-query prep-subqueries)
+           error-ch  (async/chan)
+           result-ch (->> (execute ds fuel-tracker query error-ch)
+                          (select/format ds query fuel-tracker error-ch)
+                          (collect-results query))]
+       (async/alt!
+         error-ch ([e] (throw e))
+         result-ch ([result] result))))))

@@ -9,7 +9,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.json :as json]
             [fluree.db.serde.json :as serdejson]
-            [fluree.db.query.fql :as fql]
+            [fluree.db.query :as query]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.json-ld :as json-ld]

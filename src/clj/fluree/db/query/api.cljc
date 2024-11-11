@@ -7,7 +7,7 @@
             [fluree.db.ledger :as ledger]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.dataset :as dataset :refer [dataset dataset?]]
-            [fluree.db.query.fql :as fql]
+            [fluree.db.query :as query]
             [fluree.db.util.log :as log]
             [fluree.db.query.history :as history]
             [fluree.db.query.sparql :as sparql]
@@ -80,7 +80,7 @@
     (let [start        #?(:clj (System/nanoTime)
                           :cljs (util/current-time-millis))
           fuel-tracker (fuel/tracker max-fuel)]
-      (try* (let [result (<? (fql/query ds fuel-tracker query))]
+      (try* (let [result (<? (query/q ds fuel-tracker query))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start)
@@ -111,7 +111,7 @@
            max-fuel (:max-fuel opts)]
        (if (-> query* :opts fuel/track?)
          (<? (track-query ds* max-fuel query**))
-         (<? (fql/query ds* query**)))))))
+         (<? (query/q ds* query**)))))))
 
 (defn query-sparql
   [db query]
@@ -238,7 +238,7 @@
               max-fuel      (:max-fuel opts)]
           (if (-> sanitized-query :opts fuel/track?)
             (<? (track-query ds max-fuel trimmed-query))
-            (<? (fql/query ds trimmed-query))))
+            (<? (query/q ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))
 

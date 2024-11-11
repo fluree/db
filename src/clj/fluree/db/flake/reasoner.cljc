@@ -1,12 +1,11 @@
 (ns fluree.db.flake.reasoner
-  (:require [clojure.core.async :as async]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.exec :as exec]
+            [fluree.db.query :as query]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.reasoner.resolve :as resolve]
@@ -191,7 +190,7 @@
   supplied rules graph or from the db if no graph is supplied."
   [methods db inserts rule-sources]
   (go-try
-    (let [rule-graphs           (filter #(and (map? %) (not (exec/queryable? %))) rule-sources)
+    (let [rule-graphs           (filter #(and (map? %) (not (query/queryable? %))) rule-sources)
           parsed-rule-graphs    (try*
                                   (map parse-rules-graph rule-graphs)
                                   (catch* e
@@ -202,7 +201,7 @@
                                                     (rules-from-graph method inserts parsed-rules-graph))
                                                   parsed-rule-graphs))
                                         methods)
-          rule-dbs              (filter #(or (string? %) (exec/queryable? %)) rule-sources)
+          rule-dbs              (filter #(or (string? %) (query/queryable? %)) rule-sources)
           all-rule-dbs          (if (seq rule-dbs)
                                   (conj rule-dbs db)
                                   [db])
@@ -277,7 +276,7 @@
           duplicate-id-freqs (find-duplicate-ids raw-rules)
           deduplicated-rules (when (not (empty? duplicate-id-freqs))
                                (log/warn "Duplicate ids detected. Some rules will be overwritten:" (apply str (map first duplicate-id-freqs))))
-          reasoning-rules    (-> raw-rules 
+          reasoning-rules    (-> raw-rules
                                  resolve/rules->graph
                                  add-rule-dependencies)
           db**               (if-let [inserts* @inserts]

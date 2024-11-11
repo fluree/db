@@ -8,7 +8,7 @@
             [fluree.db.query.exec.where :as exec-where]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
-            [fluree.db.query.fql :as fql]
+            [fluree.db.query :as query]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -97,16 +97,16 @@
 (defn extract-owl2rl-from-db
   [db]
   (async/go
-    (let [all-rules (async/<! (fql/query db nil
-                                         {:select {"?s" ["*"]}
-                                          :where  [["union"
-                                                    {"@id"   "?s",
-                                                     "@type" const/iri-owl:Class}
-                                                    {"@id"   "?s",
-                                                     "@type" const/iri-owl:ObjectProperty}
-                                                    {"@id"                "?s",
-                                                     const/iri-owl:sameAs nil}]]
-                                          :depth  6}))]
+    (let [all-rules (async/<! (query/q db nil
+                                       {:select {"?s" ["*"]}
+                                        :where  [["union"
+                                                  {"@id"   "?s",
+                                                   "@type" const/iri-owl:Class}
+                                                  {"@id"   "?s",
+                                                   "@type" const/iri-owl:ObjectProperty}
+                                                  {"@id"                "?s",
+                                                   const/iri-owl:sameAs nil}]]
+                                        :depth  6}))]
       (if (util/exception? all-rules)
         (do
           (log/error "Error extracting owl2rl from db:" (ex-message all-rules))
@@ -119,8 +119,8 @@
   "Returns core async channel with rules query result"
   [db method]
   (case method
-    :datalog (fql/query db nil
-                        {:select ["?s" "?rule"]
-                         :where  {"@id"          "?s",
-                                  const/iri-rule "?rule"}})
-    :owl2rl (extract-owl2rl-from-db db)))
+    :datalog (query/q db nil
+                      {:select ["?s" "?rule"]
+                       :where  {"@id"          "?s",
+                                const/iri-rule "?rule"}})
+    :owl2rl  (extract-owl2rl-from-db db)))

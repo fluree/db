@@ -21,7 +21,7 @@
             [fluree.db.flake.index :as index]
             [fluree.db.indexer :as indexer]
             [fluree.db.flake.index.novelty :as novelty]
-            [fluree.db.query.fql :as fql]
+            [fluree.db.query :as query]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
@@ -303,7 +303,7 @@
                     namespaces namespace-codes max-namespace-code
                     reindex-min-bytes reindex-max-bytes max-old-indexes]
   dbproto/IFlureeDb
-  (-query [this query-map] (fql/query this query-map))
+  (-query [this query-map] (query/q this query-map))
   (-class-ids [this subject] (match/class-ids this subject))
   (-index-update [db commit-index] (index-update db commit-index))
 
