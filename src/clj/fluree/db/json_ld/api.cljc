@@ -2,8 +2,10 @@
   {:deprecated "3.0"
    :superseded-by "fluree.db"}
   (:require [fluree.json-ld :as json-ld]
+            [fluree.db :as db]
             [fluree.db.json-ld.iri :as iri]
             [clojure.core.async :as async :refer [go <!]]
+            [fluree.db.transact :as transact]
             [fluree.db.transact.api :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
@@ -15,7 +17,7 @@
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.dataset :as dataset])
+            [fluree.db.query.dataset :as dataset])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -223,7 +225,7 @@
   ([db json-ld] (stage db json-ld nil))
   ([db json-ld opts]
    (log/warn "DEPRECATED function `stage` superseded by `fluree.db/stage`")
-   (let [result-ch (transact-api/stage db json-ld opts)]
+   (let [result-ch (db/stage db json-ld opts)]
      (promise-wrap result-ch))))
 
 
