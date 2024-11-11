@@ -1,12 +1,12 @@
-(ns fluree.db.query.exec.select
+(ns fluree.db.query.select
   "Format and display solutions consisting of pattern matches found in where
   searches."
   (:refer-clojure :exclude [format])
   (:require [clojure.core.async :as async :refer [<! >! chan go go-loop]]
             [fluree.db.constants :as const]
-            [fluree.db.query.exec.eval :as-alias eval]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.query.exec.select.subject :as subject]
+            [fluree.db.query.eval :as-alias eval]
+            [fluree.db.query.where :as where]
+            [fluree.db.query.select.subject :as subject]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]

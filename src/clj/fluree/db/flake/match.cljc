@@ -1,7 +1,7 @@
 (ns fluree.db.flake.match
   (:refer-clojure :exclude [load vswap!])
   (:require [clojure.core.async :as async]
-            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.where :as where]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [ vswap!]]

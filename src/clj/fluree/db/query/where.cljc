@@ -1,4 +1,4 @@
-(ns fluree.db.query.exec.where
+(ns fluree.db.query.where
   (:require [clojure.core.async :as async :refer [>! go]]
             [clojure.set :as set]
             [clojure.string :as str]
@@ -575,8 +575,8 @@
 
 (comment
   solution
-  {?s #:fluree.db.query.exec.where{:var ?s, :sids {"non-serializable-values" #fluree/SID [101 "2"]}, :iri "ex:2"},
-   ?date #:fluree.db.query.exec.where{:var ?date, :t 1, :meta nil, :val #time/date "2022-12-12", :datatype-iri "http://www.w3.org/2001/XMLSchema#date"}})
+  {?s #:fluree.db.query.where{:var ?s, :sids {"non-serializable-values" #fluree/SID [101 "2"]}, :iri "ex:2"},
+   ?date #:fluree.db.query.where{:var ?date, :t 1, :meta nil, :val #time/date "2022-12-12", :datatype-iri "http://www.w3.org/2001/XMLSchema#date"}})
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the

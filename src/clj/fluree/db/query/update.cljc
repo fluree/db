@@ -1,10 +1,10 @@
-(ns fluree.db.query.exec.update
+(ns fluree.db.query.update
   (:require [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.datatype :as datatype]
-            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.where :as where]
             [fluree.db.util.log :as log]
             [clojure.core.async :as async]))
 

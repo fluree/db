@@ -1,7 +1,7 @@
 (ns fluree.db.flake.transact
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.flake :as flake]
-            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.util.core :as util]
@@ -9,7 +9,7 @@
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.policy.modify :as policy.modify]
-            [fluree.db.query.exec.update :as update]
+            [fluree.db.query.update :as update]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.vocab :as vocab]))
 

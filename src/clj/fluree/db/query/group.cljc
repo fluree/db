@@ -1,7 +1,7 @@
-(ns fluree.db.query.exec.group
+(ns fluree.db.query.group
   (:require [clojure.core.async :as async]
-            [fluree.db.query.exec.select :as select]
-            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.select :as select]
+            [fluree.db.query.where :as where]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]))
 

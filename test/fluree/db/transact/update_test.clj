@@ -170,7 +170,7 @@
         db1    (fluree/db ledger)]
 
     (testing "hash functions"
-      (with-redefs [fluree.db.query.exec.eval/now const-now]
+      (with-redefs [fluree.db.query.eval/now const-now]
         (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
                                                           test-utils/default-str-context
                                                           {"ex" "http://example.com/"}]
@@ -196,7 +196,7 @@
                                                        {"ex" "http://example.com/"}]
                                           "selectOne" {"ex:hash-fns" ["ex:sha512" "ex:sha256"]}}))))))
     (testing "datetime functions"
-      (with-redefs [fluree.db.query.exec.eval/now const-now]
+      (with-redefs [fluree.db.query.eval/now const-now]
         (let [db2 @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
                                                   test-utils/default-str-context
                                                   {"ex" "http://example.com/"}]
@@ -386,8 +386,8 @@
                     "ex:replace"]}})))))
 
     (testing "rdf term functions"
-      (with-redefs [fluree.db.query.exec.eval/uuid    (fn [] {:value "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47" :datatype-iri "@id"})
-                    fluree.db.query.exec.eval/struuid (fn [] {:value "34bdb25f-9fae-419b-9c50-203b5f306e47" :datatype-iri const/iri-string})]
+      (with-redefs [fluree.db.query.eval/uuid    (fn [] {:value "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47" :datatype-iri "@id"})
+                    fluree.db.query.eval/struuid (fn [] {:value "34bdb25f-9fae-419b-9c50-203b5f306e47" :datatype-iri const/iri-string})]
         (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
                                                           test-utils/default-str-context
                                                           {"ex" "http://example.com/"}]

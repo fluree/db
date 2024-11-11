@@ -1,12 +1,12 @@
 (ns fluree.db.query
   (:refer-clojure :exclude [var? vswap!])
   (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.query.exec.select :as select]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.query.exec.group :as group]
-            [fluree.db.query.exec.order :as order]
-            [fluree.db.query.exec.having :as having]
-            [fluree.db.query.exec.select.subject :as subject]
+            [fluree.db.query.select :as select]
+            [fluree.db.query.where :as where]
+            [fluree.db.query.group :as group]
+            [fluree.db.query.order :as order]
+            [fluree.db.query.having :as having]
+            [fluree.db.query.select.subject :as subject]
             [fluree.db.util.log :as log :include-macros true]
             [clojure.walk :as walk]
             [fluree.db.util.async :refer [go-try]]

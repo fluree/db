@@ -7,8 +7,8 @@
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.query.exec.update :as update]
-            [fluree.db.query.exec.where :as where]))
+            [fluree.db.query.update :as update]
+            [fluree.db.query.where :as where]))
 
 (def commit-version 1)
 

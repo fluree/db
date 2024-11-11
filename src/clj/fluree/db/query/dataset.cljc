@@ -1,8 +1,8 @@
 (ns fluree.db.query.dataset
   (:require [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.query.exec.select.subject :as subject]
+            [fluree.db.query.where :as where]
+            [fluree.db.query.select.subject :as subject]
             [clojure.core.async :as async]))
 
 (defrecord DataSet [named default active])

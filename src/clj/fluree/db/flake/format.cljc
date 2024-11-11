@@ -1,5 +1,5 @@
 (ns fluree.db.flake.format
-  (:require [fluree.db.query.exec.select.subject :as subject]
+  (:require [fluree.db.query.select.subject :as subject]
             [clojure.core.async :as async :refer [go]]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]

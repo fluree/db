@@ -5,7 +5,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.query.exec.where :as exec-where]
+            [fluree.db.query.where :as exec-where]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
             [fluree.db.query :as query]

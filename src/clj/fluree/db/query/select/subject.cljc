@@ -1,4 +1,4 @@
-(ns fluree.db.query.exec.select.subject
+(ns fluree.db.query.select.subject
   (:require [fluree.db.util.async :refer [<?]]
             [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.util.core :as util :refer [try* catch*]]

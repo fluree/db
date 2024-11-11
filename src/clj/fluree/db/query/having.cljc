@@ -1,4 +1,4 @@
-(ns fluree.db.query.exec.having
+(ns fluree.db.query.having
   (:require [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [clojure.core.async :as async :refer [>! go]])

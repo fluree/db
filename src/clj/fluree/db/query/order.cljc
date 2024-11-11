@@ -1,6 +1,6 @@
-(ns fluree.db.query.exec.order
+(ns fluree.db.query.order
   (:require [clojure.core.async :as async]
-            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.where :as where]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
