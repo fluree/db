@@ -620,9 +620,14 @@
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
-  (if-let [graph (-activate-alias ds alias)]
-    (match-clause graph fuel-tracker solution clause error-ch)
-    nil-channel))
+  (try*
+    (if-let [graph (-activate-alias ds alias)]
+      (match-clause graph fuel-tracker solution clause error-ch)
+      nil-channel)
+    (catch* e (async/offer! error-ch (ex-info (str "Error activating alias: " alias
+                                                   " due to exception: " (ex-message e))
+                                              {:status 400
+                                               :error  :db/invalid-query} e)))))
 
 (defmethod match-pattern :exists
   [ds fuel-tracker solution pattern error-ch]

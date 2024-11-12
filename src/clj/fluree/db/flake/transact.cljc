@@ -1,5 +1,6 @@
 (ns fluree.db.flake.transact
   (:require [clojure.core.async :as async :refer [go]]
+            [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
@@ -11,7 +12,9 @@
             [fluree.db.json-ld.policy.modify :as policy.modify]
             [fluree.db.query.exec.update :as update]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.json-ld.vocab :as vocab]))
+            [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.virtual-graph.index-graph :as vg]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -91,6 +94,31 @@
           (recur r (assoc sid->s-flakes sid (into (set s-flakes) existing-flakes))))
         sid->s-flakes))))
 
+(defn new-virtual-graph
+  "Creates a new virtual graph. If the virtual graph is invalid, an
+  exception will be thrown and the transaction will not complete."
+  [db add new-vgs]
+  (loop [[new-vg & r] new-vgs
+         db db]
+    (if new-vg
+      (let [vg-flakes (filter #(= (flake/s %) new-vg) add)
+            [db* alias vg-record] (vg/create db vg-flakes)]
+        ;; TODO - VG - ensure alias is not being used, throw if so
+        (recur r (assoc-in db* [:vg alias] vg-record)))
+      db)))
+
+(defn check-virtual-graph
+  [db add rem]
+  ;; TODO - VG - should also check for retractions to "delete" virtual graph
+  ;; TODO - VG - check flakes if user updated existing virtual graph
+  (let [new-vgs  (keep #(when (= (flake/o %) const/$fluree:VirtualGraph)
+                          (flake/s %)) add)
+        has-vgs? (not-empty (:vg db))]
+    (cond-> db
+            (seq new-vgs) (new-virtual-graph add (set new-vgs))
+            has-vgs? (vg/update-vgs add rem))))
+
+
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
@@ -106,7 +134,8 @@
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id)
-                           (vocab/hydrate-schema add mods))]
+                           (vocab/hydrate-schema add mods)
+                           (check-virtual-graph add remove))]
       {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
 
 (defn validate-db-update

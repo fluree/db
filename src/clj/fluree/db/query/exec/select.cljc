@@ -196,7 +196,8 @@
   "Formats each solution within the stream of solutions in `solution-ch` according
   to the selectors within the select clause of the supplied parsed query `q`."
   [db q fuel-tracker error-ch solution-ch]
-  (let [context             (:context q)
+  (let [context             (or (:selection-context q)
+                                (:context q))
         compact             (json-ld/compact-fn context)
         selectors           (or (:select q)
                                 (:select-one q)
