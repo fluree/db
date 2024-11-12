@@ -12,6 +12,7 @@
             [fluree.db.json-ld.iri :as iri]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.query.api :as query-api]
+            [fluree.db.query.history :as history]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.util.core :as util]
@@ -444,8 +445,7 @@
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   ([ledger query]
-   (promise-wrap
-    (query-api/history (ledger/current-db ledger) query)))
+   (history ledger query nil))
   ([ledger query override-opts]
    (promise-wrap
     (go-try
@@ -465,7 +465,7 @@
 
                         :else
                         latest-db)]
-        (<? (query-api/history policy-db sanitized-query)))))))
+        (<? (history/query policy-db context sanitized-query)))))))
 
 (defn credential-history
   "Issues a policy-enforced history query to the specified ledger as a
@@ -478,15 +478,11 @@
   ([ledger cred-query override-opts]
    (promise-wrap
     (go-try
-      (let [latest-db (ledger/current-db ledger)
-            {query :subject, identity :did} (<? (cred/verify cred-query))]
+      (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
         (log/debug "Credential history query with identity: " identity " and query: " query)
         (cond
           (and query identity)
-          (let [{:keys [opts] :as sanitized-query} (query-api/sanitize-query-options query (assoc override-opts :identity identity))
-                {:keys [identity policy-values]} opts
-                policy-db (<? (policy/wrap-identity-policy latest-db identity policy-values))]
-            (<? (query-api/history policy-db sanitized-query)))
+          @(history ledger query (assoc override-opts :identity identity))
 
           identity
           (throw (ex-info "Query not present in credential"

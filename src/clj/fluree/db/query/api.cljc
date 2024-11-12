@@ -9,7 +9,6 @@
             [fluree.db.query.dataset :as dataset :refer [dataset dataset?]]
             [fluree.db.query :as query]
             [fluree.db.util.log :as log]
-            [fluree.db.query.history :as history]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -19,14 +18,6 @@
             [fluree.db.reasoner :as reasoner]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn history
-  "Return a summary of the changes over time, optionally with the full commit
-  details included."
-  [db query]
-  (go-try
-    (let [context (context/extract query)]
-      (<? (history/query db context query)))))
 
 (defn sanitize-query-options
   [query override-opts]
