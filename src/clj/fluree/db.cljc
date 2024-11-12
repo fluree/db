@@ -12,7 +12,6 @@
             [fluree.db.json-ld.iri :as iri]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.query.api :as query-api]
-            [fluree.db.transact.api :as transact-api]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.util.core :as util]
@@ -26,8 +25,6 @@
             [fluree.db.query.dataset :as dataset]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(declare query)
 
 (defn promise-wrap
   "Wraps an async channel that will contain a response in a promise."
@@ -227,6 +224,14 @@
         (update :identity #(or % (:did opts)))
         (dissoc :did))))
 
+(defn extract-ledger-id
+  "Extracts ledger-id from expanded json-ld transaction"
+  [expanded-json-ld]
+  (if-let [ledger-id (util/get-first-value expanded-json-ld const/iri-ledger)]
+    ledger-id
+    (throw (ex-info "Invalid transaction, missing required key: ledger."
+                    {:status 400 :error :db/invalid-transaction}))))
+
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
   ([db json-ld]
@@ -256,21 +261,68 @@
      (connection/commit! ledger db opts))))
 
 (defn transact!
-  ([conn txn] (transact! conn txn nil))
-  ([conn txn opts]
+  ([conn txn]
+   (transact! conn txn nil))
+  ([conn txn override-opts]
    (promise-wrap
-    (transact-api/transact! conn txn opts))))
+    (go-try
+      (let [expanded    (json-ld/expand (context/use-fluree-context txn))
+            context     (or (context/txn-context txn)
+                            ;; parent context might come from a Verifiable
+                            ;; Credential's context
+                            (:context override-opts))
+            ledger-id   (extract-ledger-id expanded)
+            triples     (parse/parse-txn expanded context)
+            parsed-opts (parse-transaction-opts expanded override-opts context)]
+        (<? (connection/transact! conn ledger-id triples parsed-opts)))))))
 
 (defn credential-transact!
-  ([conn txn] (credential-transact! conn txn nil))
+  ([conn txn]
+   (credential-transact! conn txn nil))
   ([conn txn opts]
    (promise-wrap
-    (transact-api/credential-transact! conn txn opts))))
+    (go-try
+      (let [{txn* :subject identity :did} (<? (cred/verify txn))
+            parent-context                (when (map? txn) ;; parent-context only relevant for verifiable credential
+                                            (context/txn-context txn))]
+        @(transact! conn txn* (assoc opts
+                                     :raw-txn txn
+                                     :identity identity
+                                     :context parent-context)))))))
 
 (defn create-with-txn
+  ([conn txn]
+   (create-with-txn conn txn nil))
+  ([conn txn {:keys [context] :as override-opts}]
+   (promise-wrap
+    (go-try
+      (let [expanded    (json-ld/expand (context/use-fluree-context txn))
+            txn-context (or (context/txn-context txn)
+                            context) ;; parent context from credential if present
+            ledger-id   (extract-ledger-id expanded)
+            address     (<? (connection/primary-address conn ledger-id))
+            parsed-opts (parse-transaction-opts expanded override-opts txn-context)]
+        (if (<? (connection/ledger-exists? conn address))
+          (throw (ex-info (str "Ledger " ledger-id " already exists")
+                          {:status 409 :error :db/ledger-exists}))
+          (let [ledger  (<? (connection/create-ledger conn ledger-id parsed-opts))
+                triples (parse/parse-txn expanded txn-context)
+
+                ;; commit API takes a did-map and parsed context as opts
+                ;; whereas stage API takes a did IRI and unparsed context.
+                ;; Dissoc them until deciding at a later point if they can carry through.
+                cmt-opts (dissoc parsed-opts :context :did)]
+            (<? (connection/transact-ledger! conn ledger triples cmt-opts)))))))))
+
+(defn credential-create-with-txn!
   [conn txn]
-  (promise-wrap
-    (transact-api/create-with-txn conn txn)))
+  (let [{txn* :subject identity :did} (<? (cred/verify txn))
+
+        parent-context (when (map? txn) ;; parent-context only relevant for verifiable credential
+                         (context/txn-context txn))]
+    (create-with-txn conn txn* {:raw-txn  txn
+                                :identity identity
+                                :context  parent-context})))
 
 (defn status
   "Returns current status of ledger branch."

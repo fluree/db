@@ -5,8 +5,6 @@
             [fluree.db :as db]
             [fluree.db.json-ld.iri :as iri]
             [clojure.core.async :as async :refer [go <!]]
-            [fluree.db.transact :as transact]
-            [fluree.db.transact.api :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.ledger :as ledger]
@@ -252,7 +250,7 @@
   [conn txn]
   (log/warn "DEPRECATED function `transact!` superseded by `fluree.db/transact!`")
   (promise-wrap
-    (transact-api/transact! conn txn)))
+    (db/transact! conn txn)))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/create-with-txn"}
@@ -260,7 +258,7 @@
   [conn txn]
   (log/warn "DEPRECATED function `create-with-txn` superseded by `fluree.db/create-with-txn`")
   (promise-wrap
-    (transact-api/create-with-txn conn txn)))
+    (db/create-with-txn conn txn)))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/status"}
