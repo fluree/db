@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [load vswap!])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [go]]
+            [clojure.string :as str]
             [clojure.set :refer [map-invert]]
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
@@ -23,6 +24,7 @@
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.fql :as fql]
             [fluree.db.flake.index.storage :as index-storage]
+            [fluree.db.vector.flat-rank :as flat-rank]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
@@ -317,18 +319,22 @@
   (-match-id [db fuel-tracker solution s-mch error-ch]
     (match/match-id db fuel-tracker solution s-mch error-ch))
 
-  (-match-triple [db fuel-tracker solution s-mch error-ch]
-    (match/match-triple db fuel-tracker solution s-mch error-ch))
+  (-match-triple [db fuel-tracker solution triple-mch error-ch]
+    (match/match-triple db fuel-tracker solution triple-mch error-ch))
 
-  (-match-class [db fuel-tracker solution s-mch error-ch]
-    (match/match-class db fuel-tracker solution s-mch error-ch))
+  (-match-class [db fuel-tracker solution class-mch error-ch]
+    (match/match-class db fuel-tracker solution class-mch error-ch))
 
   (-activate-alias [db alias']
-    (when (= alias alias')
-      db))
+    (cond
+      (= alias alias')              db
+      (where/virtual-graph? alias') (flat-rank/index-graph db alias')))
 
   (-aliases [_]
     [alias])
+
+  (-finalize [_ _ _ solution-ch]
+    solution-ch)
 
   transact/Transactable
   (-stage-txn [db fuel-tracker context identity author annotation raw-txn parsed-txn]
@@ -358,15 +364,15 @@
       (log/debug "datetime->t db:" (pr-str db))
       (let [epoch-datetime (util/str->epoch-ms datetime)
             current-time   (util/current-time-millis)
-            [start end] (if (< epoch-datetime current-time)
-                          [epoch-datetime current-time]
-                          [current-time epoch-datetime])
+            [start end]    (if (< epoch-datetime current-time)
+                             [epoch-datetime current-time]
+                             [current-time epoch-datetime])
             flakes         (-> db
                                policy/root
                                (query-range/index-range
-                                :post
-                                > [const/$_commit:time start]
-                                < [const/$_commit:time end])
+                                 :post
+                                 > [const/$_commit:time start]
+                                 < [const/$_commit:time end])
                                <?)]
         (log/debug "datetime->t index-range:" (pr-str flakes))
         (if (empty? flakes)

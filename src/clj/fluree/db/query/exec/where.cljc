@@ -181,6 +181,11 @@
   [match]
   (select-keys match [::iri ::val ::datatype-iri ::sids]))
 
+(defn virtual-graph?
+  "Returns true if named graph alias is a virtual graph (e.g. vector index)."
+  [graph-alias]
+  (str/starts-with? graph-alias "##"))
+
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]
@@ -274,7 +279,8 @@
   (-match-triple [s fuel-tracker solution triple error-ch])
   (-match-class [s fuel-tracker solution triple error-ch])
   (-activate-alias [s alias])
-  (-aliases [s]))
+  (-aliases [s])
+  (-finalize [s fuel-tracker error-ch solution-ch]))
 
 (defn matcher?
   [x]
@@ -603,18 +609,19 @@
   [ds fuel-tracker solution clause error-ch]
   (let [initial-ch (async/to-chan! [solution])
         {subquery-patterns true
-         other-patterns false} (group-by subquery? clause)]
-    (reduce (fn [solution-ch pattern]
-              (with-constraint ds fuel-tracker pattern error-ch solution-ch))
-            initial-ch
-            ;; process subqueries before other patterns
-            (into (vec subquery-patterns) other-patterns))))
+         other-patterns false} (group-by subquery? clause)
+        result-ch (reduce (fn [solution-ch pattern]
+                            (with-constraint ds fuel-tracker pattern error-ch solution-ch))
+                          initial-ch
+                          ;; process subqueries before other patterns
+                          (into (vec subquery-patterns) other-patterns))]
+    (-finalize ds fuel-tracker error-ch result-ch)))
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
-  (-> ds
-      (-activate-alias alias)
-      (match-clause fuel-tracker solution clause error-ch)))
+  (if-let [graph (-activate-alias ds alias)]
+    (match-clause graph fuel-tracker solution clause error-ch)
+    nil-channel))
 
 (defmethod match-pattern :exists
   [ds fuel-tracker solution pattern error-ch]
@@ -659,7 +666,7 @@
 (defmethod match-pattern :graph
   [ds fuel-tracker solution pattern error-ch]
   (let [[g clause] (pattern-data pattern)]
-    (if-let [v (::var g)]
+    (if-let [v (get-variable g)]
       (if-let [v-match (get solution v)]
         (let [alias (or (get-iri v-match)
                         (get-value v-match))]

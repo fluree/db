@@ -15,7 +15,7 @@
   #?(:clj  (v/vec? x)
      :cljs (vector? x)))
 
-(defn- dotproduct*
+(defn dot-product*
   [v1 v2]
   #?(:clj  (v/dot v1 v2)
      :cljs (reduce + (map * v1 v2))))
@@ -23,17 +23,17 @@
 (defn- magnitude
   [v]
   #?(:clj  (v/magnitude v)
-     :cljs (Math/sqrt (dotproduct* v v))))
+     :cljs (Math/sqrt (dot-product* v v))))
 
-(defn dotproduct
+(defn dot-product
   [v1 v2]
   (when (and (vec? v1) (vec? v2))
-    (dotproduct* v1 v2)))
+    (dot-product* v1 v2)))
 
 (defn cosine-similarity
   [v1 v2]
   (when (and (vec? v1) (vec? v2))
-    (/ (dotproduct* v1 v2)
+    (/ (dot-product* v1 v2)
        (* (magnitude v1)
           (magnitude v2)))))
 
@@ -42,4 +42,3 @@
   (when (and (vec? v1) (vec? v2))
     #?(:clj  (v/distance v1 v2)
        :cljs (Math/sqrt (reduce + (map #(* % %) (map - v1 v2)))))))
-
