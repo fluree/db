@@ -148,7 +148,7 @@
                           [:map
                            [:reindex-min-bytes {:optional true} nat-int?]
                            [:reindex-max-bytes {:optional true} nat-int?]]]]
-    ::txn-opts          [:and ::stage-opts ::commit-opts ::ledger-opts]
+    ::txn-opts          [:and ::stage-opts ::commit-opts]
     ::function          ::v/function
     ::as-function       ::v/as-function
     ::wildcard          [:fn wildcard?]
@@ -272,8 +272,6 @@
 (def parse-selector
   (m/parser ::selector {:registry registry}))
 
-
-
 (def coerce-txn-opts*
   (m/coercer ::txn-opts fql-transformer {:registry registry}))
 
@@ -286,3 +284,16 @@
           humanize-error
           (ex-info {:status 400, :error :db/invalid-txn})
           throw))))
+
+(def coerce-ledger-opts*
+  (m/coercer ::ledger-opts fql-transformer {:registry registry}))
+
+(defn coerce-ledger-opts
+  [opts]
+  (try*
+    (coerce-ledger-opts* opts)
+    (catch* e
+            (-> e
+                humanize-error
+                (ex-info {:status 400, :error :db/invalid-ledger-opts})
+                throw))))
