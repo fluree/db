@@ -15,12 +15,12 @@ This database can also be built as a web-worker, and be embedded inside the brow
 far, a [React Wrapper](https://github.com/fluree/fluree-react) (Beta) has been developed that allows
 you to create real-time apps by wrapping your React components with queries (GraphQL or FlureeQL).
 
-It is also possible to run Fluree in a "serverless" manner, where by utilizing Fluree SmartFunctions
+It is also possible to run Fluree in a "serverless" manner, whereby utilizing Fluree SmartFunctions
 to embed data security along side your data (Data Defending Itself), you can have a permissioned
 application with just a single-page application (i.e. React) and Fluree Ledgers, but no application server.
 
 Fluree includes time travel, allowing you to instantly query as of any historical moment in time,
-and even allows the abilty to stage proposed transactions to time travel into the future, to a hypothesized version
+and even allows the ability to stage proposed transactions to time travel into the future, to a hypothesized version
 of your data.
 
 The best way to get started with Fluree is to go to the [Getting Started](https://flur.ee/getstarted/) page
