@@ -27,11 +27,12 @@
   [children]
   (> (count children) *overflow-children*))
 
-(defn novelty-min?
+(defn min-novelty?
   "Returns true if ledger is beyond novelty-min threshold."
-  [db reindex-min-bytes]
-  (let [novelty-size (get-in db [:novelty :size])]
-    (> novelty-size reindex-min-bytes)))
+  [db]
+  (let [novelty-size (get-in db [:novelty :size])
+        min-novelty  (:reindex-min-bytes db)]
+    (> novelty-size min-novelty)))
 
 (defn max-novelty?
   "Returns true if ledger is beyond novelty-max threshold."
