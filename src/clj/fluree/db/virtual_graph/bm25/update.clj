@@ -4,6 +4,8 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.log :as log]))
 
+(set! *warn-on-reflection* true)
+
 (def SPACE_PATTERN #"[^\w]+")
 
 (defn- split-text

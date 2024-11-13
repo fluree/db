@@ -11,8 +11,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
             [fluree.db.datatype :as datatype]
-            [fluree.db.util.json :as json]
-            [fluree.db.json-ld.iri :as iri]))
+            [fluree.db.util.json :as json]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

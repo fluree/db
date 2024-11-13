@@ -2,8 +2,10 @@
   (:import (org.tartarus.snowball SnowballStemmer)
            (org.tartarus.snowball.ext englishStemmer)))
 
+(set! *warn-on-reflection* true)
+
 (defn stem
-  [stemmer word]
+  [^SnowballStemmer stemmer word]
   (doto stemmer
     (.setCurrent word)
     (.stem))

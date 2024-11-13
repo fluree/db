@@ -2,6 +2,8 @@
   (:require [fluree.db.virtual-graph.bm25.update :as update]
             [fluree.db.util.log :as log]))
 
+(set! *warn-on-reflection* true)
+
 ;; TODO - VG - this can be moved to unboxed math for some slight improvement
 (defn calc-term-score
   [k1 b avg-doc-len doc-len term-idf term-f]

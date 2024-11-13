@@ -11,6 +11,8 @@
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (def flatrank-vg-re (re-pattern "##FlatRank-(.*)"))
 
 (defn result-sort

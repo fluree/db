@@ -5,8 +5,11 @@
             [fluree.db.query.exec.update :as exec.update]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.where :as exec.where]
+            #?(:cljs fluree.db.query.exec.select :refer [SubgraphSelector])
             [fluree.db.query.fql.parse :as q-parse])
-  (:import (fluree.db.query.exec.select SubgraphSelector)))
+  #?(:clj (:import (fluree.db.query.exec.select SubgraphSelector))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn- prop-iri
   "Returns property IRI value from triple"

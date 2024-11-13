@@ -1,6 +1,8 @@
 (ns fluree.db.virtual-graph.bm25.stopwords
   (:require [clojure.string :as str]))
 
+(set! *warn-on-reflection* true)
+
 ;; TODO - need to add new stopword language support... right now everything is english
 (defn initialize
   "Returns a fn that will return truthy if the word is a stopword"
