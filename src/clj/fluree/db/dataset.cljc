@@ -85,6 +85,9 @@
   (-aliases [ds]
     (names ds))
 
+  (-finalize [_ _ _ solution-ch]
+    solution-ch)
+
 
   subject/SubjectFormatter
   (-forward-properties [ds iri select-spec context compact-fn cache fuel-tracker error-ch]

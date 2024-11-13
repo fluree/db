@@ -565,17 +565,17 @@
   [{x :value}]
   (where/->typed-val (nil? x)))
 
-(defn dotproduct
+(defn dotProduct
   [{v1 :value} {v2 :value}]
   (where/->typed-val
-    (score/dotproduct v1 v2)))
+    (score/dot-product v1 v2)))
 
-(defn cosine-similarity
+(defn cosineSimilarity
   [{v1 :value} {v2 :value}]
   (where/->typed-val
     (score/cosine-similarity v1 v2 )))
 
-(defn euclidean-distance
+(defn euclideanDistance
   [{v1 :value} {v2 :value}]
   (where/->typed-val
     (score/euclidian-distance v1 v2 )))
@@ -659,9 +659,9 @@
     max            fluree.db.query.exec.eval/max
     min            fluree.db.query.exec.eval/min
 
-    dotproduct         fluree.db.query.exec.eval/dotproduct
-    cosine-similarity  fluree.db.query.exec.eval/cosine-similarity
-    euclidian-distance fluree.db.query.exec.eval/euclidean-distance})
+    dotProduct         fluree.db.query.exec.eval/dotProduct
+    cosineSimilarity  fluree.db.query.exec.eval/cosineSimilarity
+    euclidianDistance fluree.db.query.exec.eval/euclideanDistance})
 
 (def allowed-aggregate-fns
   '#{avg ceil count count-distinct distinct floor groupconcat
@@ -689,7 +689,7 @@
      str-lang str-dt bnode
 
      ;; vector scoring fns
-     dotproduct cosine-similarity euclidian-distance})
+     dotProduct cosineSimilarity euclidianDistance})
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))

@@ -1,5 +1,5 @@
 (ns fluree.db.vector.index-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
@@ -29,8 +29,8 @@
                                    "fidx" iri/f-idx-ns}
                        "select"   ["?x", "?score", "?vec"]
                        "where"    [["graph"
-                                    "##Flatrank-DotProduct"
-                                    {"fidx:search"   {"@value" [0.7, 0.6]
+                                    "##FlatRank-DotProduct"
+                                    {"fidx:target"   {"@value" [0.7, 0.6]
                                                       "@type"  const/iri-vector}
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10,
@@ -48,8 +48,8 @@
                                    "fidx" iri/f-idx-ns},
                        "select"   ["?x", "?score", "?vec"],
                        "where"    [["graph"
-                                    "##Flatrank-Cosine"
-                                    {"fidx:search"   {"@value" [0.7, 0.6]
+                                    "##FlatRank-Cosine"
+                                    {"fidx:target"   {"@value" [0.7, 0.6]
                                                       "@type"  const/iri-vector}
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10,
@@ -67,8 +67,8 @@
                                    "fidx" iri/f-idx-ns},
                        "select"   ["?x", "?score", "?vec"],
                        "where"    [["graph"
-                                    "##Flatrank-Distance"
-                                    {"fidx:search"   {"@value" [0.7, 0.6]
+                                    "##FlatRank-Distance"
+                                    {"fidx:target"   {"@value" [0.7, 0.6]
                                                       "@type"  const/iri-vector}
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10,
@@ -106,8 +106,8 @@
                                    "fidx" iri/f-idx-ns}
                        "select"   ["?x", "?title", "?score", "?vec"]
                        "where"    [["graph"
-                                    "##Flatrank-DotProduct"
-                                    {"fidx:search"   {"@value" [0.7, 0.6]
+                                    "##FlatRank-DotProduct"
+                                    {"fidx:target"   {"@value" [0.7, 0.6]
                                                       "@type"  const/iri-vector}
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10,
@@ -146,8 +146,8 @@
                                    "fidx" iri/f-idx-ns}
                        "select"   ["?x", "?targetVec", "?score", "?vec"]
                        "where"    [["graph"
-                                    "##Flatrank-DotProduct"
-                                    {"fidx:search"   "?targetVec"
+                                    "##FlatRank-DotProduct"
+                                    {"fidx:target"   "?targetVec"
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10,
                                      "fidx:result"   {"@id"         "?x"
@@ -174,8 +174,8 @@
                        "where"    [{"@id"     "?targetSubj"
                                     "ex:xVec" "?targetVec"}
                                    ["graph"
-                                    "##Flatrank-Cosine"
-                                    {"fidx:search"   "?targetVec"
+                                    "##FlatRank-Cosine"
+                                    {"fidx:target"   "?targetVec"
                                      "fidx:property" {"@id" "ex:xVec"}
                                      "fidx:limit"    10
                                      "fidx:result"   {"@id"        "?x"

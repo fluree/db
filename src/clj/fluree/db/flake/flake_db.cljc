@@ -24,7 +24,7 @@
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.fql :as fql]
             [fluree.db.flake.index.storage :as index-storage]
-            [fluree.db.vector.index-graph :as index-graph]
+            [fluree.db.vector.flat-rank :as flat-rank]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
@@ -300,10 +300,6 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
-(defn virtual-graph?
-  [graph-alias]
-  (str/starts-with? graph-alias "##"))
-
 (defrecord FlakeDB [index-catalog commit-catalog alias branch commit t tt-id stats
                     spot post opst tspo schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code
@@ -323,30 +319,22 @@
   (-match-id [db fuel-tracker solution s-mch error-ch]
     (match/match-id db fuel-tracker solution s-mch error-ch))
 
-  (-match-triple [db fuel-tracker solution s-mch error-ch]
-    (match/match-triple db fuel-tracker solution s-mch error-ch))
+  (-match-triple [db fuel-tracker solution triple-mch error-ch]
+    (match/match-triple db fuel-tracker solution triple-mch error-ch))
 
-  (-match-class [db fuel-tracker solution s-mch error-ch]
-    (match/match-class db fuel-tracker solution s-mch error-ch))
+  (-match-class [db fuel-tracker solution class-mch error-ch]
+    (match/match-class db fuel-tracker solution class-mch error-ch))
 
   (-activate-alias [db alias']
     (cond
-      (= alias alias')
-      db
-
-      (virtual-graph? alias')
-      db
-
-      :else
-      (throw (ex-info (str "Unknown graph alias: " alias')
-                      {:status 400 :error :db/invalid-query}))))
+      (= alias alias')              db
+      (where/virtual-graph? alias') (flat-rank/index-graph db alias')))
 
   (-aliases [_]
     [alias])
 
-  where/Searcher
-  (-search [s fuel-tracker solution index-alias search-graph error-ch]
-    (index-graph/search s fuel-tracker solution index-alias search-graph error-ch))
+  (-finalize [_ _ _ solution-ch]
+    solution-ch)
 
   transact/Transactable
   (-stage-txn [db fuel-tracker context identity author annotation raw-txn parsed-txn]
@@ -376,15 +364,15 @@
       (log/debug "datetime->t db:" (pr-str db))
       (let [epoch-datetime (util/str->epoch-ms datetime)
             current-time   (util/current-time-millis)
-            [start end] (if (< epoch-datetime current-time)
-                          [epoch-datetime current-time]
-                          [current-time epoch-datetime])
+            [start end]    (if (< epoch-datetime current-time)
+                             [epoch-datetime current-time]
+                             [current-time epoch-datetime])
             flakes         (-> db
                                policy/root
                                (query-range/index-range
-                                :post
-                                > [const/$_commit:time start]
-                                < [const/$_commit:time end])
+                                 :post
+                                 > [const/$_commit:time start]
+                                 < [const/$_commit:time end])
                                <?)]
         (log/debug "datetime->t index-range:" (pr-str flakes))
         (if (empty? flakes)
