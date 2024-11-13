@@ -122,7 +122,7 @@
   [db fuel-tracker context identity author annotation raw-txn parsed-txn]
   (go-try
     (when (novelty/max-novelty? db)
-      (throw (ex-info "Maximum novelty exceeded, try again later."
+      (throw (ex-info "Maximum novelty exceeded, no transactions will be processed until indexing has completed."
                       {:status 503 :error :db/max-novelty-exceeded})))
     (when (policy.modify/deny-all? db)
       (throw (ex-info "Database policy denies all modifications."
