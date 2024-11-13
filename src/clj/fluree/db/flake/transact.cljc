@@ -123,7 +123,7 @@
   (go-try
     (when (novelty/max-novelty? db)
       (throw (ex-info "Maximum novelty exceeded, try again later."
-                      {:status 429 :error :db/max-novelty-exceeded})))
+                      {:status 503 :error :db/max-novelty-exceeded})))
     (when (policy.modify/deny-all? db)
       (throw (ex-info "Database policy denies all modifications."
                       {:status 403 :error :db/policy-exception})))
