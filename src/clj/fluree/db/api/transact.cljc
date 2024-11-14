@@ -81,7 +81,8 @@
                           context) ;; parent context from credential if present
           ledger-id   (extract-ledger-id expanded)
           address     (<? (connection/primary-address conn ledger-id))
-          parsed-opts (parse-opts expanded override-opts txn-context)]
+          parsed-opts (-> (parse-opts expanded override-opts txn-context)
+                          (syntax/coerce-ledger-opts))]
       (if (<? (connection/ledger-exists? conn address))
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))

@@ -354,7 +354,7 @@
 
   indexer/Indexable
   (index [db changes-ch]
-    (if (novelty/novelty-min? db reindex-min-bytes)
+    (if (novelty/min-novelty? db)
       (novelty/refresh db changes-ch max-old-indexes)
       (go)))
 

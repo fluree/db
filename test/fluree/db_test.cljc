@@ -979,3 +979,18 @@
                   (get "f:commit")
                   (get "f:data")
                   (get "f:flakes")))))))
+
+#?(:clj
+   (deftest novelty-max-test
+     (let [conn @(fluree/connect-memory nil)
+           db @(fluree/create-with-txn conn {"@context" test-utils/default-str-context
+                                             "ledger" "novelty/test"
+                                             "opts" {"indexing" {"reindex-min-bytes" 0 "reindex-max-bytes" 1}}
+                                             "insert" [{"@id" "ex:1",
+                                                        "ex:intro" "A long, long, time ago in a galaxy far, far away..."}]})]
+       (is (> (-> db :novelty :size) (:reindex-max-bytes db)))
+       (is (= {:status 503 :error :db/max-novelty-exceeded}
+              (ex-data @(fluree/stage db {"@context" test-utils/default-str-context
+                                          "ledger" "novelty/test"
+                                          "insert" [{"@id" "ex:1",
+                                                     "ex:crawl" "It is a period of civil war."}]})))))))
