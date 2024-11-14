@@ -136,7 +136,12 @@
                            (commit-data/add-tt-id)
                            (vocab/hydrate-schema add mods)
                            (check-virtual-graph add remove))]
-      {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
+      {:add       add
+       :remove    remove
+       :db-after  db-after
+       :db-before db-before
+       :mods      mods
+       :context   context})))
 
 (defn validate-db-update
   [{:keys [db-after db-before mods context] :as staged-map}]
