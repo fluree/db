@@ -191,7 +191,7 @@
         iri-var        (-> pq :select :subj)
         iri-values     (map #(hash-map iri-var (where/match-iri %)) affected-iris)
         pq*            (assoc pq :values iri-values)
-        upsert-docs-ch (exec/query db nil pq*)]
+        upsert-docs-ch (exec/query db pq*)]
 
     (bm25-upsert* bm25 db upsert-docs-ch)))
 

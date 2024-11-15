@@ -92,11 +92,13 @@
   "Execute the parsed query `q` against the database value `db`. Returns an async
   channel which will eventually contain a single vector of results, or an
   exception if there was an error."
-  [ds fuel-tracker q]
-  (go
-    (let [error-ch  (async/chan)
-          prepped-q (prep-subqueries q)
-          result-ch (execute ds fuel-tracker prepped-q error-ch)]
-      (async/alt!
-        error-ch ([e] e)
-        result-ch ([result] result)))))
+  ([ds q]
+   (query ds nil q))
+  ([ds fuel-tracker q]
+   (go
+     (let [error-ch  (async/chan)
+           prepped-q (prep-subqueries q)
+           result-ch (execute ds fuel-tracker prepped-q error-ch)]
+       (async/alt!
+         error-ch ([e] e)
+         result-ch ([result] result))))))
