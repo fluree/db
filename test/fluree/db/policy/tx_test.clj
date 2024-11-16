@@ -204,7 +204,7 @@
                     "insert"   [{"@id"         "ex:alice"
                                  "schema:name" "Alice"}]})]
 
-      (testing " apply policy with only view action, no modify and transact"
+      (testing "apply policy with only view action, no modify and transact"
         (let [policy-wrapped @(fluree/wrap-policy
                                db {"@context" {"ex" "http://example.org/ns/"
                                                "f"  "https://ns.flur.ee/ledger#"}
@@ -225,7 +225,7 @@
           (is (= "Database policy denies all modifications."
                  (ex-message no-policy-ex)))))
 
-      (testing " apply policy with modify policy that will always return false"
+      (testing "apply policy with modify policy that will always return false"
         (let [policy-wrapped @(fluree/wrap-policy
                                db [;; falesy always modify
                                    {"@context"    {"ex" "http://example.org/ns/"

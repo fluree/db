@@ -58,7 +58,7 @@
           policy-db @(fluree/wrap-policy db policy {"?$identity" {"@value" alice-did
                                                                   "@type"  "@id"}})]
 
-      (testing " with direct select binding restricts"
+      (testing "with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
                @(fluree/query
                  policy-db
@@ -70,7 +70,7 @@
                               "schema:ssn" "?ssn"}}))
             "ex:john should not show up in results"))
 
-      (testing " with where-clause match of restricted data"
+      (testing "with where-clause match of restricted data"
         (is (= []
                @(fluree/query
                  policy-db
@@ -81,7 +81,7 @@
                               "schema:ssn" "888-88-8888"}}))
             "ex:john has ssn 888-88-8888, so should results should be empty"))
 
-      (testing " in a graph crawl restricts"
+      (testing "in a graph crawl restricts"
         (is (= [{"@id"              "ex:alice",
                  "@type"            "ex:User",
                  "schema:name"      "Alice"
@@ -170,7 +170,7 @@
                             {"?$identity" {"@value" alice-did
                                            "@type"  "@id"}})]
 
-      (testing " and values binding has user with policy relationship"
+      (testing "and values binding has user with policy relationship"
         (is (= [{"@id"                  "ex:widget",
                  "@type"                "ex:Product",
                  "schema:name"          "Widget"
@@ -188,7 +188,7 @@
                   "where"    {"@id"   "?s"
                               "@type" "ex:Product"}}))))
 
-      (testing " and values binding has user without policy relationship"
+      (testing "and values binding has user without policy relationship"
         (is (= []
                @(fluree/query
                  alice-policy-db
@@ -264,7 +264,7 @@
                                     "@type" "ex:Referrer"},
                         "select"   {"?s" ["*" {"ex:referData" ["*"]}]}}]
 
-      (testing " with policy default allow? set to true"
+      (testing "with policy default allow? set to true"
         (is (= [{"@id"               "ex:data-0",
                  "@type"             "ex:Data",
                  "ex:classification" 0}]
@@ -282,9 +282,9 @@
                                   "@type"             "ex:Data"
                                   "ex:classification" 0}]}]
                @(fluree/query policy-allow refer-query))
-            " in graph crawl ex:Data is still restricted"))
+            "in graph crawl ex:Data is still restricted"))
 
-      (testing " with policy default allow? set to false"
+      (testing "with policy default allow? set to false"
         (is (= [{"@id"               "ex:data-0",
                  "@type"             "ex:Data",
                  "ex:classification" 0}]
