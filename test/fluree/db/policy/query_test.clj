@@ -55,8 +55,7 @@
                                   "f:query"  {"@type"  "@json"
                                               "@value" {}}}]}
 
-          policy-db @(fluree/wrap-policy db policy {"?$identity" {"@value" alice-did
-                                                                  "@type"  "@id"}})]
+          policy-db @(fluree/wrap-policy db policy ["?$identity" [{"@value" alice-did "@type"  "@id"}]])]
 
       (testing "with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
@@ -162,13 +161,11 @@
                                                     "@value" {}}}]}
           john-policy-db  @(fluree/wrap-policy
                             db policy
-                            {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}})
+                            ["?$identity" [{"@value" john-did "@type"  "@id"}]])
 
           alice-policy-db @(fluree/wrap-policy
                             db policy
-                            {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}})]
+                            ["?$identity" [{"@value" alice-did "@type"  "@id"}]])]
 
       (testing "and values binding has user with policy relationship"
         (is (= [{"@id"                  "ex:widget",

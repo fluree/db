@@ -31,12 +31,12 @@
          (if flake
            (let [sid (flake/s flake)]
              (if-let [p-policies (enforce/policies-for-property policy true (flake/p flake))]
-               (<? (enforce/policies-allow? db-after true sid (:values-map policy) p-policies))
+               (<? (enforce/policies-allow? db-after true sid p-policies))
                (if-let [c-policies (->> (classes-for-sid sid mods db-after)
                                         (enforce/policies-for-classes policy true))]
-                 (<? (enforce/policies-allow? db-after true sid (:values-map policy) c-policies))
+                 (<? (enforce/policies-allow? db-after true sid c-policies))
                  (if-let [d-policies (enforce/default-policies policy true)]
-                   (<? (enforce/policies-allow? db-after true sid (:values-map policy) d-policies))
+                   (<? (enforce/policies-allow? db-after true sid d-policies))
                    false)))
 
              (recur r))

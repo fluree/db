@@ -56,7 +56,7 @@
                                                    ["http://example.org/ns/EmployeePolicy"]
                                                    ;; presumably values like this would come from upstream
                                                    ;; application or identity provider
-                                                   {"?$identity" alice-did})]
+                                                   ["?$identity" [alice-did]])]
 
           (testing "with direct select binding restricts"
             (is (= [["ex:alice" "111-11-1111"]]

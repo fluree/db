@@ -41,15 +41,14 @@
   [{:keys [policy] :as db} flake]
   (go-try
    (let [pid     (flake/p flake)
-         sid     (flake/s flake)
-         val-map (:values-map policy)]
+         sid     (flake/s flake)]
      (if-let [p-policies (enforce/policies-for-property policy false pid)]
-       (<? (enforce/policies-allow? db false sid val-map p-policies))
+       (<? (enforce/policies-allow? db false sid p-policies))
        (if-let [c-policies (or (cached-class-policies policy sid)
                                (<? (class-policies db sid)))]
-         (<? (enforce/policies-allow? db false sid val-map c-policies))
+         (<? (enforce/policies-allow? db false sid c-policies))
          (if-let [d-policies (enforce/default-policies policy false)]
-           (<? (enforce/policies-allow? db false sid val-map d-policies))
+           (<? (enforce/policies-allow? db false sid d-policies))
            false))))))
 
 (defn allow-iri?

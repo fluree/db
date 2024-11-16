@@ -390,8 +390,8 @@
     (history/query-commits db context from-t to-t include error-ch))
 
   policy/Restrictable
-  (wrap-policy [db policy values-map]
-    (policy-rules/wrap-policy db policy values-map))
+  (wrap-policy [db policy policy-values]
+    (policy-rules/wrap-policy db policy policy-values))
   (root [db]
     (policy/root-db db))
 

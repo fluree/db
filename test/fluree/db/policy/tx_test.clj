@@ -59,11 +59,9 @@
                                           "f:query"  {"@type"  "@json"
                                                       "@value" {}}}]}
 
-          john-params       {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}}
+          john-params       ["?$identity" [{"@value" john-did "@type" "@id"}]]
 
-          alice-params      {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}}
+          alice-params      ["?$identity" [{"@value" alice-did "@type" "@id"}]]
 
           john-allowed      @(fluree/stage
                               @(fluree/wrap-policy db policy john-params)
@@ -157,11 +155,9 @@
                                           "f:query"  {"@type"  "@json"
                                                       "@value" {}}}]}
 
-          john-params       {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}}
+          john-params       ["?$identity" [{"@value" john-did "@type" "@id"}]]
 
-          alice-params      {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}}
+          alice-params      ["?$identity" [{"@value" alice-did "@type" "@id"}]]
 
           john-allowed      @(fluree/stage
                               @(fluree/wrap-policy db policy john-params)
