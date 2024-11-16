@@ -1,9 +1,10 @@
 (ns fluree.db.json-ld.policy.enforce
-  (:require [fluree.db.util.async :refer [<? go-try]]
+  (:require [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :refer [root]]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -50,17 +51,30 @@
     (get-in policy-map [const/iri-modify :default])
     (get-in policy-map [const/iri-view :default])))
 
+(defn normalize-values
+  "Normalize the structure of the values clause to
+  [[vars...] [[val1..] [val2...] ...]], handling nil properly."
+  [policy-values]
+  (let [[vars vals] policy-values]
+    [(into [] (when vars (util/sequential vars)))
+     (mapv util/sequential vals)]))
+
+(defn inject-this
+  "Ensure the ?$this variable is present in the values clause."
+  [policy-values this-val]
+  (let [[vars vals] policy-values]
+    [(into ["?$this"] (when vars (util/sequential vars)))
+     (if (seq vals)
+       (mapv (partial into [{"@value" this-val "@type" const/iri-id}]) vals)
+       [[{"@value" this-val "@type" const/iri-id}]])]))
+
 (defn policy-query
-  [db sid values-map policy]
-  (let [query    (:query policy)
-        this-var (iri/decode-sid db sid)
-        values   (if-let [existing-values (get query "values")]
-                   ;; TODO - merge existing values with new values
-                   :TODO
-                   [(into ["?$this"] (keys values-map))
-                    [(into [{"@value" this-var
-                             "@type"  const/iri-id}]
-                           (vals values-map))]])]
+  [db sid policy-values policy]
+  (let [query         (:query policy)
+        this-val      (iri/decode-sid db sid)
+        values        (-> (normalize-values policy-values)
+                          ;; TODO: merge in existing values, if any
+                          (inject-this this-val))]
     (assoc query "values" values)))
 
 (defn modify-exception

@@ -150,8 +150,6 @@
 (defn wrap-policy
   [db policy-rules values-map]
   (go-try
-   (when values-map
-     (validate-values-map values-map))
    (let [policy-rules (->> policy-rules
                            util/sequential
                            (parse-policy-rules db))]

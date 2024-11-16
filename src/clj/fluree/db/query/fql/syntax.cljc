@@ -116,6 +116,7 @@
                          [:issuer {:optional true} ::issuer]
                          [:role {:optional true} ::role]
                          [:identity {:optional true} ::identity]
+                         [:policy-values {:optional true} :any]
                          ;; deprecated
                          [:pretty-print {:optional true} ::pretty-print]
                          [:did {:optional true} ::identity]
@@ -128,7 +129,8 @@
                          [:did {:optional true} ::identity]
                          [:context {:optional true} ::context]
                          [:raw-txn {:optional true} :any]
-                         [:author {:optional true} ::identity]]
+                         [:author {:optional true} ::identity]
+                         [:policy-values {:optional true} :any]]
     ::commit-opts       [:map
                          [:identity {:optional true} ::identity]
                          [:context {:optional true} ::context]

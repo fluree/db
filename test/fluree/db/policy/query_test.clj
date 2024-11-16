@@ -293,3 +293,81 @@
         (is (= []
                @(fluree/query policy-deny other-query))
             "ex:Other class should be restricted")))))
+
+(deftest policy-values-test
+  (let [conn @(fluree/connect-memory)
+        db @(fluree/create-with-txn conn {"@context" [test-utils/default-str-context]
+                                          "ledger" "policy/values"
+                                          "insert"
+                                          [{"@id" "usa:wi"
+                                            "@type" "usa:state"
+                                            "ex:name" "Wisconsin"
+                                            "ex:capitol" "Madison"}
+                                           {"@id" "usa:ny"
+                                            "@type" "usa:state"
+                                            "ex:name" "New York"
+                                            "ex:capitol" "Albany"}
+                                           {"@id" "usa:nc"
+                                            "@type" "usa:state"
+                                            "ex:name" "North Carolina"
+                                            "ex:capitol" "Charlotte"}
+                                           {"@id" "usa:co"
+                                            "@type" "usa:state"
+                                            "ex:name" "Colorado"
+                                            "ex:capitol" "Denver"}
+                                           {"@id" "usa:pr"
+                                            "@type" "usa:territory"
+                                            "ex:name" "Puerto Rico"
+                                            "ex:capitol" "San Juan"}]})]
+    (testing "no policyValues"
+      (is (= ["Colorado" "New York" "North Carolina" "Puerto Rico" "Wisconsin"]
+             @(fluree/query db {"@context" test-utils/default-str-context
+                                "where" [{"@id" "?state" "ex:name" "?name"}]
+                                "select" "?name"
+                                "opts" {"policy"
+                                        {"@id" "ex:mystatepolicy"
+                                         "@type" ["f:Policy" "ex:StatePolicy"]
+                                         "f:action" {"@id" "f:view"}
+                                         "f:query" {"@type" "@json"
+                                                    "@value"
+                                                    {"where" [{"@id" "?$this" "ex:capitol" "?capitol"}]}}}}}))))
+    (testing "a single policyValues value"
+      (is (= ["Wisconsin"]
+             @(fluree/query db {"@context" test-utils/default-str-context
+                                "where" [{"@id" "?state" "ex:name" "?name"}]
+                                "select" "?name"
+                                "opts" {"policy"
+                                        {"@id" "ex:mystatepolicy"
+                                         "@type" ["f:Policy" "ex:StatePolicy"]
+                                         "f:action" {"@id" "f:view"}
+                                         "f:query" {"@type" "@json"
+                                                    "@value"
+                                                    {"where" [{"@id" "?$this" "ex:capitol" "?capitol"}]}}}
+                                        "policyValues" ["?capitol" ["Madison"]]}}))))
+    (testing "multiple policyValues values"
+      (is (= ["Puerto Rico" "Wisconsin"]
+             @(fluree/query db {"@context" test-utils/default-str-context
+                                "where" [{"@id" "?state" "ex:name" "?name"}]
+                                "select" "?name"
+                                "opts" {"policy"
+                                        {"@id" "ex:mystatepolicy"
+                                         "@type" ["f:Policy" "ex:StatePolicy"]
+                                         "f:action" {"@id" "f:view"}
+                                         "f:query" {"@type" "@json"
+                                                    "@value"
+                                                    {"where" [{"@id" "?$this" "ex:capitol" "?capitol"}]}}}
+                                        "policyValues" ["?capitol" ["Madison" "San Juan"]]}}))))
+    (testing "multiple vars and multiple values"
+      (is (= ["Wisconsin"]
+             @(fluree/query db {"@context" test-utils/default-str-context
+                                "where" [{"@id" "?state" "ex:name" "?name"}]
+                                "select" "?name"
+                                "opts" {"policy"
+                                        {"f:action" {"@id" "f:view"}
+                                         "f:query" {"@type" "@json"
+                                                    "@value"
+                                                    {"where" [{"@id" "?$this"
+                                                               "@type" "?type"
+                                                               "ex:capitol" "?capitol"}]}}}
+                                        "policyValues" [["?type" "?capitol"]
+                                                        [[{"@value" "usa:state" "@type" "@id"} "Madison"]]]}}))))))
