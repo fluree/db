@@ -122,7 +122,7 @@
            (score-candidates query-terms vectors avg-length k1 b)
            (sort-by :score #(compare %2 %1))
            (vg-parse/limit-results limit)
-           (vg-parse/process-results bm25 solution search-params true)
+           (vg-parse/process-sparse-results bm25 solution search-params)
            (async/onto-chan! out-ch)))
     (catch* e
             (log/error e "Error ranking vectors")

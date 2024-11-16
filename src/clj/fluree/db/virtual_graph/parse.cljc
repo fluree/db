@@ -141,18 +141,15 @@
     (take limit results)
     results))
 
-(defn process-results
+(defn process-results*
   "Adds virtual-graph results to solution.
   Leverages db/index (iri-codec) for IRI encoding"
-  [iri-codec solution parsed-search sparse-vec? search-results]
+  [iri-codec solution parsed-search vec-result-dt search-results]
   (let [result-bindings (::result parsed-search)
         id-var          (::id result-bindings)
         score-var       (::score result-bindings)
         vector-var      (::vector result-bindings)
-        db-alias        (first (where/-aliases iri-codec))
-        vec-result-dt   (if sparse-vec?
-                          const/iri-sparseVector
-                          const/iri-vector)]
+        db-alias        (first (where/-aliases iri-codec))]
     (map (fn [result]
            (cond-> solution
                    id-var (assoc id-var (-> (where/unmatched-var id-var)
@@ -163,3 +160,11 @@
                    vector-var (assoc vector-var (-> (where/unmatched-var vector-var)
                                                     (where/match-value (:vec result) vec-result-dt)))))
          search-results)))
+
+(defn process-sparse-results
+  [iri-codec solution parsed-search search-results]
+  (process-results* iri-codec solution parsed-search const/iri-sparseVector search-results))
+
+(defn process-dense-results
+  [iri-codec solution parsed-search search-results]
+  (process-results* iri-codec solution parsed-search const/iri-vector search-results))
