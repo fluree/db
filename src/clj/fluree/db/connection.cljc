@@ -301,19 +301,19 @@
        dorun)
   (swap! state remove-subscription ledger-alias))
 
-(defn parse-did
-  [conn did]
-  (if did
-    (if (map? did)
-      did
-      {:id did})
-    (-> conn :defaults :did)))
+(defn parse-identity
+  [conn identity]
+  (if identity
+    (if (map? identity)
+      identity
+      {:id identity})
+    (-> conn :defaults :identity)))
 
 (defn parse-ledger-options
   [conn {:keys [did branch indexing]
          :or   {branch :main}}]
-  (let [did*           (parse-did conn did)
-        ledger-default (-> conn :ledger-defaults :indexing)
+  (let [did*           (parse-identity conn did)
+        ledger-default (-> conn :defaults :indexing)
         indexing*      (merge ledger-default indexing)]
     {:did      did*
      :branch   branch

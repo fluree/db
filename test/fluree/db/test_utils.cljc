@@ -1,5 +1,6 @@
 (ns fluree.db.test-utils
   (:require [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]
+            [clojure.string :as str]
             [fluree.db.did :as did]
             [fluree.db.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -146,7 +147,7 @@
    (create-conn {}))
   ([{:keys [did]
      :or   {did (did/private->did-map default-private-key)}}]
-   (let [conn-p (fluree/connect-memory {:defaults {:did did}})]
+   (let [conn-p (fluree/connect-memory {:defaults {:identity did}})]
      #?(:clj @conn-p :cljs (go (<p! conn-p))))))
 
 (defn load-movies
@@ -271,6 +272,13 @@
       (log/warn "commit-id? falsey result from:" s))
     result))
 
+(defn blank-node-id?
+  [s]
+  (let [result (and (string? s) (str/starts-with? s "_:"))]
+    (when-not result
+      (log/warn "blank-node-id? falsey result from:" s))
+    result))
+
 (defn pred-match?
   "Does a deep compare of expected and actual map values but any predicate fns
   in expected are run with the equivalent value from actual and the result is
@@ -288,15 +296,42 @@
                 (set (concat (keys actual) (keys expected))))
 
         (and (coll? expected) (coll? actual))
-        (every? (fn [[e a]]
-                  (pred-match? e a))
-                (zipmap expected actual))
+        (and (= (count expected) (count actual))
+             (every? (fn [[e a]]
+                       (pred-match? e a))
+                     (zipmap expected actual)))
 
         :else false)))
 
-(defn deterministic-blank-node-fixture
-  [f]
-  (let [counter (atom 0)
-        deterministic-new-blank-node-id (fn [] (str "_:fdb-" (swap! counter inc)))]
-    (with-redefs [fluree.db.json-ld.iri/new-blank-node-id deterministic-new-blank-node-id]
-      (f))))
+(defn set-matcher
+  [expected]
+  (fn [actual]
+    (loop [[e & er]  expected
+           actual*   actual]
+      (if e
+        (let [[result remaining] (loop [[a & ar]  actual*
+                                        a-checked []]
+                                   (if a
+                                     (if (pred-match? e a)
+                                       [true (into a-checked ar)]
+                                       (recur ar (conj a-checked a)))
+                                     [false]))]
+          (if result
+            (recur er remaining)
+            false))
+        true))))
+
+(defn error-status
+  [ex]
+  (-> ex ex-data :status))
+
+(defn error-type
+  [ex]
+  (-> ex ex-data :error))
+
+(defn shacl-error?
+  [x]
+  (and (= (error-type x)
+          :shacl/violation)
+       (= (error-status x)
+          422)))

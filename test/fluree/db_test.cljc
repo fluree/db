@@ -13,8 +13,6 @@
                       :as twf]
                :cljs [test-with-files.tools :as-alias twf])))
 
-#?(:clj (use-fixtures :each test-utils/deterministic-blank-node-fixture))
-
 (deftest exists?-test
   (testing "returns false before committing data to a ledger"
     #?(:clj
@@ -70,7 +68,7 @@
    (deftest load-from-file-test
      (testing "can load a file ledger with single cardinality predicates"
        (with-tmp-dir storage-path
-                     (let [conn         @(fluree/connect {:method :file, :storage-path storage-path})
+                     (let [conn         @(fluree/connect-file {:storage-path storage-path})
                            ledger-alias "load-from-file-test-single-card"
                            ledger       @(fluree/create conn ledger-alias)
                            db           @(fluree/stage
@@ -112,7 +110,7 @@
 
      (testing "can load a file ledger with multi-cardinality predicates"
        (with-tmp-dir storage-path
-                     (let [conn         @(fluree/connect {:method :file, :storage-path storage-path})
+                     (let [conn         @(fluree/connect-file {:storage-path storage-path})
                            ledger-alias "load-from-file-test-multi-card"
                            ledger       @(fluree/create conn ledger-alias)
                            db           @(fluree/stage
@@ -161,7 +159,7 @@
 
      (testing "query returns the correct results from a loaded ledger"
        (with-tmp-dir storage-path
-                     (let [conn         @(fluree/connect {:method :file, :storage-path storage-path})
+                     (let [conn         @(fluree/connect-file {:storage-path storage-path})
                            ledger-alias "load-from-file-query"
                            ledger       @(fluree/create conn ledger-alias)
                            db           @(fluree/stage
@@ -189,8 +187,7 @@
 
      (testing "can load a ledger with `list` values"
        (with-tmp-dir storage-path
-                     (let [conn         @(fluree/connect {:method       :file
-                                                          :storage-path storage-path})
+                     (let [conn         @(fluree/connect-file {:storage-path storage-path})
                            ledger-alias "load-lists-test"
                            ledger       @(fluree/create conn ledger-alias
                                                         {:reindex-min-bytes 0}) ; force reindex on every commit
@@ -228,8 +225,7 @@
 
        (testing "can load with policies"
          (with-tmp-dir storage-path
-                       (let [conn         @(fluree/connect {:method       :file
-                                                            :storage-path storage-path})
+                       (let [conn         @(fluree/connect-file {:storage-path storage-path})
                              ledger-alias "load-policy-test"
                              ledger       @(fluree/create conn ledger-alias)
                              db           @(fluree/stage
@@ -303,8 +299,7 @@
 
      (testing "Can load a ledger with time values"
        (with-tmp-dir storage-path
-                     (let [conn      @(fluree/connect {:method       :file
-                                                       :storage-path storage-path})
+                     (let [conn      @(fluree/connect-file {:storage-path storage-path})
                            ledger    @(fluree/create conn "index/datetimes")
                            db        @(fluree/stage
                                        (fluree/db ledger)
@@ -339,7 +334,7 @@
 #?(:clj
    (deftest load-from-memory-test
      (testing "can load a memory ledger with single cardinality predicates"
-       (let [conn         @(fluree/connect {:method :memory})
+       (let [conn         @(fluree/connect-memory)
              ledger-alias "load-from-memory-test-single-card"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
@@ -379,7 +374,7 @@
          (is (= target-t (:t loaded-db)))))
 
      (testing "can load a memory ledger with multi-cardinality predicates"
-       (let [conn         @(fluree/connect {:method :memory})
+       (let [conn         @(fluree/connect-memory)
              ledger-alias "load-from-memory-test-multi-card"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
@@ -427,7 +422,7 @@
          (is (= target-t (:t loaded-db)))))
 
      (testing "query returns the correct results from a loaded ledger"
-       (let [conn         @(fluree/connect {:method :memory})
+       (let [conn         @(fluree/connect-memory)
              ledger-alias "load-from-memory-query"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
@@ -454,7 +449,7 @@
          (is (= res1 res2))))
 
      (testing "can load a ledger with `list` values"
-       (let [conn         @(fluree/connect {:method :memory})
+       (let [conn         @(fluree/connect-memory)
              ledger-alias "load-lists-test"
              ledger       @(fluree/create conn ledger-alias)
              db           @(fluree/stage
@@ -490,7 +485,7 @@
                                                  :where   '{:id ?s, :type :ex/User}}))))))
 
        (testing "can load with policies"
-         (let [conn         @(fluree/connect {:method :memory})
+         (let [conn         @(fluree/connect-memory)
                ledger-alias "load-policy-test"
                ledger       @(fluree/create conn ledger-alias)
                db           @(fluree/stage
@@ -611,7 +606,7 @@
                       "sh:property"    {"sh:path" {"id" "schema:age"}, "sh:datatype" {"id" "xsd:string"}}}]
                     @(fluree/query (fluree/db loaded2) property-query)))))))
      (testing "can load after deletion of entire subjects"
-       (let [conn              @(fluree/connect {:method :memory})
+       (let [conn              @(fluree/connect-memory)
              ledger-alias      "tx/delete"
              ledger            @(fluree/create conn ledger-alias)
              db1               @(fluree/stage
@@ -838,7 +833,7 @@
 
 #?(:clj
    (deftest transaction-test
-     (let [conn      @(fluree/connect {:method :memory})
+     (let [conn      @(fluree/connect-memory)
            ledger-id "update-syntax"
            ledger    @(fluree/create conn ledger-id)
            db0       (fluree/db ledger)
@@ -958,9 +953,7 @@
                                   "where"    {"id" "?s", "ex:name" "Murray"}
                                   "select"   {"?s" ["*" {"ex:address" ["ex:street" "ex:city" "ex:state" "ex:zip"]}]}})))
 
-       (is (= "Subject ex:mp path [\"ex:nickname\"] violates constraint sh:datatype of shape _:fdb-5 - the following values do not have expected datatype xsd:string: The Wretch.
-Subject ex:mp path [\"ex:nickname\"] violates constraint sh:maxCount of shape _:fdb-5 - count 2 is greater than maximum count of 1."
-              (ex-message db4)))
+       (is (test-utils/shacl-error? db4))
 
 
        (is (= #{"Freddy" "Betty" "Leticia" "Andrew"}
@@ -986,3 +979,18 @@ Subject ex:mp path [\"ex:nickname\"] violates constraint sh:maxCount of shape _:
                   (get "f:commit")
                   (get "f:data")
                   (get "f:flakes")))))))
+
+#?(:clj
+   (deftest novelty-max-test
+     (let [conn @(fluree/connect-memory nil)
+           db @(fluree/create-with-txn conn {"@context" test-utils/default-str-context
+                                             "ledger" "novelty/test"
+                                             "opts" {"indexing" {"reindex-min-bytes" 0 "reindex-max-bytes" 1}}
+                                             "insert" [{"@id" "ex:1",
+                                                        "ex:intro" "A long, long, time ago in a galaxy far, far away..."}]})]
+       (is (> (-> db :novelty :size) (:reindex-max-bytes db)))
+       (is (= {:status 503 :error :db/max-novelty-exceeded}
+              (ex-data @(fluree/stage db {"@context" test-utils/default-str-context
+                                          "ledger" "novelty/test"
+                                          "insert" [{"@id" "ex:1",
+                                                     "ex:crawl" "It is a period of civil war."}]})))))))

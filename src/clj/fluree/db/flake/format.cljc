@@ -107,8 +107,7 @@
         [start-flake end-flake] (flake-bounds db :spot [sid])
         flake-xf                (when fuel-tracker
                                   (comp (fuel/track fuel-tracker error-ch)))
-        range-opts              {:from-t      t
-                                 :to-t        t
+        range-opts              {:to-t        t
                                  :start-flake start-flake
                                  :end-flake   end-flake
                                  :flake-xf    flake-xf}
@@ -127,8 +126,7 @@
                                   (comp (fuel/track fuel-tracker error-ch)
                                         (map flake/s))
                                   (map flake/s))
-        range-opts              {:from-t      t
-                                 :to-t        t
+        range-opts              {:to-t        t
                                  :start-flake start-flake
                                  :end-flake   end-flake
                                  :flake-xf    flake-xf}

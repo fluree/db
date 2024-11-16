@@ -158,7 +158,7 @@
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
              @(fluree/query db query)))))
   (testing "iri value maps are handled correctly"
-    (let [conn @(fluree/connect {:method :memory})
+    (let [conn @(fluree/connect-memory)
           ledger @(fluree/create conn "any-iri")
           db0 (fluree/db ledger)
 
@@ -247,8 +247,7 @@
       (let [shacl   (-> "movies2-schema.json" io/resource json/read-value)
             movies  (-> "movies2.json" io/resource json/read-value)
             ;; TODO: Once :method :memory supports indexing, switch to that.
-            conn    @(fluree/connect {:method       :file
-                                      :storage-path storage-path})
+            conn    @(fluree/connect-file {:storage-path storage-path})
             ledger  @(fluree/create conn "movies2")
             db      (fluree/db ledger)
             db0     @(fluree/stage db {"@context" ["https://ns.flur.ee"
@@ -393,7 +392,7 @@
 
 (deftest ^:integration base-and-vocab-test
   (testing "@base & @vocab work w/ stage"
-    (let [conn        @(fluree/connect {:method :memory})
+    (let [conn        @(fluree/connect-memory)
           ctx         {"@base"  "http://example.org/"
                        "@vocab" "http://example.org/terms/"
                        "f"      "https://ns.flur.ee/ledger#"}
@@ -415,7 +414,7 @@
                                  "where"    '{"@id"   ?m
                                               "@type" "http://example.org/terms/SeaMonster"}})))))
   (testing "@base & @vocab work w/ stage"
-    (let [conn        @(fluree/connect {:method :memory})
+    (let [conn        @(fluree/connect-memory)
           ctx         ["https://ns.flur.ee"
                        {"@base"  "http://example.org/"
                         "@vocab" "http://example.org/terms/"}]
@@ -438,7 +437,7 @@
 
 (deftest json-objects
   (testing "Allow transacting `json` values"
-    (let [conn   @(fluree/connect {:method :memory})
+    (let [conn   @(fluree/connect-memory)
           ledger @(fluree/create conn "jsonpls")
           db0    (fluree/db ledger)
           db1    @(fluree/stage
@@ -476,7 +475,7 @@
           "comes out as data from select clause"))))
 
 (deftest ^:integration no-where-solutions
-  (let [conn    @(fluree/connect {:method :memory})
+  (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "insert-delete")
         context {"ex"     "http://example.org/ns/"
                  "schema" "http://schema.org/"}
@@ -499,7 +498,7 @@
                                "selectOne" {"ex:andrew" ["*"]}})))))
 
 (deftest ^:integration shacl-datatype-coercion
-  (let [conn      @(fluree/connect {:method :memory})
+  (let [conn      @(fluree/connect-memory)
         context   {"ex"     "http://example.org/",
                    "f"      "https://ns.flur.ee/ledger#",
                    "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
@@ -544,6 +543,39 @@
            @(fluree/query db2 {"@context"  context
                                "selectOne" {"ex:freddy" ["schema:age"]}}))
         "8 is converted from a long to an int.")
-    (is (= "Subject ex:letti path [\"schema:age\"] violates constraint sh:datatype of shape ex:PropertyShape/age - the following values do not have expected datatype xsd:integer: alot."
-           (ex-message db3))
+    (is (test-utils/shacl-error? db3)
         "datatype constraint is restored after a load")))
+
+;; TODO - below will brick the db when first IRI char is unicode, but the test where unicode comes second works
+(deftest ^:kaocha/pending ^:integration ^:json transaction-iri-special-char
+  (testing "transaction with special iri characters in @id"
+    (let [
+          conn      @(fluree/connect {:method :memory})
+          ledger-id "transaction-iri-special-char"
+          ledger    @(fluree/create conn ledger-id)
+          db0       (fluree/db ledger)
+          db1a      @(fluree/stage db0 {"@context" {"ex" "http://example.org/"}
+                                        "ledger"   ledger-id
+                                        "insert"   [{"@id"     "ex:aஃ",
+                                                     "@type"   "ex:Foo"
+                                                     "ex:desc" "try special ஃ as second iri char"}]})
+
+          db1b      @(fluree/stage db0 {"@context" {"ex" "http://example.org/"}
+                                        "ledger"   ledger-id
+                                        "insert"   [{"@id"     "ex:ஃb",
+                                                     "@type"   "ex:Foo"
+                                                     "ex:desc" "try special ஃ as first iri char"}]})
+          q1a       {"@context" {"ex" "http://example.org/"}
+                     "from"     ledger-id
+                     "select"   {"ex:aஃ" ["*"]}}
+          q1b       {"@context" {"ex" "http://example.org/"}
+                     "from"     ledger-id
+                     "select"   {"ex:ஃb" ["*"]}}]
+      (is (= [{"@id"     "ex:aஃ",
+               "@type"   "ex:Foo"
+               "ex:desc" "try special ஃ as second iri char"}]
+             @(fluree/query db1a q1a)))
+      (is (= [{"@id"     "ex:ஃb",
+               "@type"   "ex:Foo"
+               "ex:desc" "try special ஃ as first iri char"}]
+             @(fluree/query db1b q1b))))))

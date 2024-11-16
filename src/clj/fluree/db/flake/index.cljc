@@ -78,7 +78,7 @@
 (defn add-flakes
   [leaf flakes]
   (let [new-leaf (-> leaf
-                     (update :flakes flake/conj-all flakes)
+                     (update :flakes into flakes)
                      (update :size (fn [size]
                                      (->> flakes
                                           (map flake/size-flake)
@@ -194,7 +194,7 @@
        (flake/disj-all flakes)))
 
 (defn novelty-subrange
-  [{:keys [rhs leftmost?], first-flake :first, :as _node} through-t novelty]
+  [{:keys [rhs leftmost?], first-flake :first, :as _node} through-t novelty-t novelty]
   (log/trace "novelty-subrange: first-flake:" first-flake "\nrhs:" rhs "\nleftmost?" leftmost?)
   (let [subrange (cond
                    ;; standard case: both left and right boundaries
@@ -212,7 +212,9 @@
                    ;; no boundary
                    (and (nil? rhs) leftmost?)
                    novelty)]
-    (flakes-through through-t subrange)))
+    (if (= novelty-t through-t)
+      subrange
+      (flakes-through through-t subrange))))
 
 (def meta-hash
   (comp flake/hash-meta flake/m))
@@ -221,75 +223,81 @@
   "Function to extract the content being asserted or retracted by a flake."
   (juxt flake/s flake/p flake/o flake/dt meta-hash))
 
-(defn stale-by
-  "Returns a vector of flakes from the sorted set `flakes` that are out of date by
-  the transaction `from-t` because `flakes` contains another flake with the same
-  subject and predicate and a t-value later than that flake but on or before
-  `from-t`."
-  [from-t flakes]
-  (->> flakes
-       (flake/remove (partial after-t? from-t))
-       (flake/partition-by fact-content)
-       (mapcat (fn [flakes]
-                 ;; if the last flake pertaining to a unique
-                 ;; fact is an assert, then every flake before
-                 ;; that is stale. If that item is a retract,
-                 ;; then all the flakes are stale.
-                 (let [last-flake (flake/last flakes)]
-                   (if (flake/op last-flake)
-                     (disj flakes last-flake)
-                     flakes))))))
+(defn remove-stale-flakes
+  "Removes all flake retractions, along with the flakes they retract, from the sorted set.
+
+  Approach is to iterate through the flakes in reverse order, and for each retraction, find the
+  corresponding assertion and remove both from the set.
+
+  Note, with 'spo' not consisting of full uniqueness (e.g. lang, datatype, or duplicate @list value),
+  the 'next flake' is from a retraction is not guaranteed to be the corresponding assertion, however
+  it should be very close. For this reason, a scan over the remaining flakes using `some` is done below."
+  [flakes]
+  (loop [to-check (reverse flakes)
+         flakes*  (transient flakes)]
+    (if-let [next-flake (first to-check)]
+      (if (flake/op next-flake)
+        (recur (rest to-check) flakes*)
+        (let [r            (rest to-check)
+              cmp          (fact-content next-flake)
+              assert-flake (some #(when (= cmp (fact-content %)) %) r)]
+          (recur r (-> flakes*
+                       (disj! next-flake)
+                       (disj! assert-flake)))))
+      (persistent! flakes*))))
 
 (defn t-range
   "Returns a sorted set of flakes that are not out of date between the
   transactions `from-t` and `to-t`."
-  ([{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
-   (let [latest       (if (> to-t leaf-t)
-                        (flake/conj-all flakes (novelty-subrange leaf to-t novelty))
-                        flakes)
-         stale-flakes (stale-by from-t latest)
-         subsequent   (filter-after to-t latest)
-         out-of-range (concat stale-flakes subsequent)]
-     (flake/disj-all latest out-of-range))))
+  ([{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty to-t]
+   (let [latest (cond
+                  (> to-t leaf-t)
+                  (into flakes (novelty-subrange leaf to-t novelty-t novelty))
+
+                  (= to-t leaf-t)
+                  flakes
+
+                  (< to-t leaf-t)
+                  (flake/disj-all flakes (filter-after to-t flakes)))]
+     (remove-stale-flakes latest))))
 
 (defn resolve-t-range
-  [resolver node novelty from-t to-t]
+  [resolver node novelty-t novelty to-t]
   (go-try
     (let [resolved (<? (resolve resolver node))
-          flakes   (t-range resolved novelty from-t to-t)]
+          flakes   (t-range resolved novelty-t novelty to-t)]
       (-> resolved
           (dissoc :t)
-          (assoc :from-t from-t
-                 :to-t   to-t
+          (assoc :to-t   to-t
                  :flakes  flakes)))))
 
-(defrecord TRangeResolver [node-resolver novelty from-t to-t]
+(defrecord TRangeResolver [node-resolver novelty-t novelty to-t]
   Resolver
   (resolve [_ node]
     (if (branch? node)
       (resolve node-resolver node)
-      (resolve-t-range node-resolver node novelty from-t to-t))))
+      (resolve-t-range node-resolver node novelty-t novelty to-t))))
 
-(defrecord CachedTRangeResolver [node-resolver novelty from-t to-t cache]
+(defrecord CachedTRangeResolver [node-resolver novelty-t novelty to-t cache]
   Resolver
   (resolve [_ {:keys [id tempid tt-id] :as node}]
     (if (branch? node)
       (resolve node-resolver node)
       (cache/lru-lookup
         cache
-        [::t-range id tempid tt-id from-t to-t]
+        [::t-range id tempid tt-id to-t]
         (fn [_]
-          (resolve-t-range node-resolver node novelty from-t to-t))))))
+          (resolve-t-range node-resolver node novelty-t novelty to-t))))))
 
 (defn index-catalog->t-range-resolver
-  [{:keys [cache] :as idx-store} novelty from-t to-t]
-  (->CachedTRangeResolver idx-store novelty from-t to-t cache))
+  [{:keys [cache] :as idx-store} novelty-t novelty to-t]
+  (->CachedTRangeResolver idx-store novelty-t novelty to-t cache))
 
 (defn history-t-range
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
-  [{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
+  [{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty from-t to-t]
   (let [latest       (if (> to-t leaf-t)
-                       (flake/conj-all flakes (novelty-subrange leaf to-t novelty))
+                       (into flakes (novelty-subrange leaf to-t novelty-t novelty))
                        flakes)
         ;; flakes that happen after to-t
         subsequent   (filter-after to-t latest)
@@ -298,7 +306,7 @@
         out-of-range (concat subsequent previous)]
     (flake/disj-all latest out-of-range)))
 
-(defrecord CachedHistoryRangeResolver [node-resolver novelty from-t to-t lru-cache-atom]
+(defrecord CachedHistoryRangeResolver [node-resolver novelty-t novelty from-t to-t lru-cache-atom]
   Resolver
   (resolve [_ {:keys [id tempid tt-id] :as node}]
     (if (branch? node)
@@ -309,29 +317,12 @@
         (fn [_]
           (go-try
             (let [resolved (<? (resolve node-resolver node))
-                  flakes   (history-t-range resolved novelty from-t to-t)]
+                  flakes   (history-t-range resolved novelty-t novelty from-t to-t)]
               (-> resolved
                   (dissoc :t)
                   (assoc :from-t from-t
                          :to-t   to-t
                          :flakes  flakes)))))))))
-
-(defn at-t
-  "Find the value of `leaf` at transaction `t` by adding new flakes from
-  `idx-novelty` to `leaf` if `t` is newer than `leaf`, or removing flakes later
-  than `t` from `leaf` if `t` is older than `leaf`."
-  [{:keys [rhs leftmost? flakes], leaf-t :t, :as leaf} t idx-novelty]
-  (if (= leaf-t t)
-    leaf
-    (cond-> leaf
-      (< leaf-t t)
-      (add-flakes (novelty-subrange leaf t idx-novelty))
-
-      (> leaf-t t)
-      (rem-flakes (filter-after t flakes))
-
-      true
-      (assoc :t t))))
 
 (defn- mark-expanded
   [node]

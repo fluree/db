@@ -479,7 +479,6 @@
                         (remove nil?)
                         (apply comp))
         opts        {:idx         idx
-                     :from-t      t
                      :to-t        t
                      :start-flake start-flake
                      :end-flake   end-flake
@@ -708,10 +707,15 @@
         ;; transform a match into its identity for equality checks
         match-identity   (juxt get-iri get-value get-datatype-iri (comp get-meta :lang))
         solution*        (update-vals solution match-identity)]
-    ;; filter out any inline solutions whose matches don't match the solution's matches
     (->> inline-solutions
-         (filterv (fn [inline-solution] (= (select-keys solution* (keys inline-solution))
-                                           (update-vals inline-solution match-identity))))
+         ;; filter out any inline solutions whose matches don't match the solution's matches
+         (filterv (fn [inline-solution]
+                    (let [matches (not-empty (select-keys solution* (keys inline-solution)))]
+                      (or
+                        ;; no overlapping matches
+                        (nil? matches)
+                        ;; matches are the same
+                        (= matches (update-vals inline-solution match-identity))))))
          (mapv (fn [inline-solution]
                  (let [existing-vars (set (keys solution))
                        inline-vars   (set (keys inline-solution))

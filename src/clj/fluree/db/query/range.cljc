@@ -151,11 +151,12 @@
   "Returns a channel that will contain a stream of chunked flake collections that
   contain the flakes between `start-flake` and `end-flake` and are within the
   transaction range starting at `from-t` and ending at `to-t`."
-  [{:keys [index-catalog] :as db} idx error-ch
-   {:keys [from-t to-t start-flake end-flake] :as opts}]
+  [{:keys [index-catalog t] :as db} idx error-ch
+   {:keys [to-t start-flake end-flake] :as opts}]
   (let [root      (get db idx)
         novelty   (get-in db [:novelty idx])
-        resolver  (index/index-catalog->t-range-resolver index-catalog novelty from-t to-t)
+        novelty-t (get-in db [:novelty :t])
+        resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
         query-xf  (extract-query-flakes opts)]
     (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
          (filter-authorized db error-ch))))
@@ -239,7 +240,7 @@
 
          ;; resolve-flake-slices
          {:keys [cache]} index-catalog
-         resolver        (index/->CachedHistoryRangeResolver index-catalog novelty from-t to-t cache)
+         resolver        (index/->CachedHistoryRangeResolver index-catalog t novelty from-t to-t cache)
          range-set       (flake/sorted-set-by idx-cmp start-flake end-flake)
          in-range?       (fn [node] (intersects-range? node range-set))
          query-xf        (extract-query-flakes {:idx         idx
@@ -305,7 +306,6 @@
                                        error-ch
                                        (assoc opts
                                          :idx idx
-                                         :from-t t
                                          :to-t t
                                          :start-test start-test
                                          :start-flake start-flake

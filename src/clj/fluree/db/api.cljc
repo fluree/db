@@ -1,5 +1,8 @@
 (ns fluree.db.api
-  (:require [fluree.db.connection.system :as system]
+  (:require [camel-snake-kebab.core :refer [->camelCaseString]]
+            [clojure.walk :refer [postwalk]]
+            [fluree.db.connection.config :as config]
+            [fluree.db.connection.system :as system]
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
@@ -42,22 +45,6 @@
                (reject res)
                (resolve res))))))))
 
-(defn parse-connection-options
-  [{:keys [method parallelism cache-max-mb remote-servers]
-    :as   connect-opts
-    :or   {parallelism  4
-           cache-max-mb 100}}]
-  (let [method* (cond
-                  method         (keyword method)
-                  remote-servers :remote
-                  :else          (throw (ex-info (str "No Fluree connection method type specified in configuration: "
-                                                      connect-opts)
-                                                 {:status 500 :error :db/invalid-configuration})))]
-    (assoc connect-opts
-           :method method*
-           :parallelism parallelism
-           :cache-max-mb cache-max-mb)))
-
 (defn connect
   "Forms connection to ledger, enabling automatic pulls of new updates, event
   services, index service.
@@ -68,28 +55,22 @@
   Options include:
     - did - (optional) DId information to use, if storing blocks as verifiable
             credentials, or issuing queries against a permissioned database."
-  [opts]
+  [config]
   ;; TODO - do some validation
   (promise-wrap
     (go-try
-      (let [{:keys [method] :as opts*} (parse-connection-options opts)
+      (let [system-map (-> config config/parse system/initialize)
+            conn       (reduce-kv (fn [x k v]
+                                    (if (isa? k :fluree.db/connection)
+                                      (reduced v)
+                                      x))
+                                  nil system-map)]
+        (assoc conn ::system-map system-map)))))
 
-            config (case method
-                     :ipfs   (let [{:keys [server file-storage-path parallelism cache-max-mb defaults]} opts*]
-                               (system/ipfs-config server file-storage-path parallelism cache-max-mb defaults))
-                     :file   (if platform/BROWSER
-                               (throw (ex-info "File connection not supported in the browser" opts))
-                               (let [{:keys [storage-path parallelism cache-max-mb defaults]} opts*]
-                                 (system/file-config storage-path parallelism cache-max-mb defaults)))
-                     :memory (let [{:keys [parallelism cache-max-mb defaults]} opts*]
-                               (system/memory-config parallelism cache-max-mb defaults))
-                     :s3     #?(:clj
-                                (let [{:keys [endpoint bucket prefix parallelism cache-max-mb defaults]} opts*]
-                                  (system/s3-config endpoint bucket prefix parallelism cache-max-mb defaults))
-                                :cljs
-                                (throw (ex-info "S3 connections not yet supported in ClojureScript"
-                                                {:status 400, :error :db/unsupported-operation}))))]
-        (system/start config)))))
+(defn disconnect
+  [conn]
+  (go-try
+    (-> conn ::system-map system/terminate)))
 
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.
@@ -99,11 +80,66 @@
   [opts]
   (connect (assoc opts :method :ipfs)))
 
+(defn convert-config-key
+  [[k v]]
+  (if (#{:id :type} k)
+    [(str "@" (name k)) v]
+    (if (#{:public :private} k)
+      [(-> k name (str "Key")) v]
+      [(->camelCaseString k) v])))
+
+(defn convert-keys
+  [m]
+  (postwalk (fn [x]
+              (if (map? x)
+                (into {} (map convert-config-key) x)
+                x))
+            m))
+
 (defn connect-memory
   "Forms an in-memory connection using default settings.
   - did - (optional) DId information to use, if storing blocks as verifiable credentials"
-  [opts]
-  (connect (assoc opts :method :memory)))
+  ([]
+   (connect-memory {}))
+  ([{:keys [parallelism cache-max-mb defaults],
+     :or   {parallelism 4, cache-max-mb 1000}}]
+   (let [memory-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+                                            "@vocab" "https://ns.flur.ee/system#"}
+                                "@id"      "memory"
+                                "@graph"   [{"@id"   "memoryStorage"
+                                             "@type" "Storage"}
+                                            {"@id"              "connection"
+                                             "@type"            "Connection"
+                                             "parallelism"      parallelism
+                                             "cacheMaxMb"       cache-max-mb
+                                             "commitStorage"    {"@id" "memoryStorage"}
+                                             "indexStorage"     {"@id" "memoryStorage"}
+                                             "primaryPublisher" {"@type"   "Publisher"
+                                                                 "storage" {"@id" "memoryStorage"}}}]}
+                         defaults (assoc-in ["@graph" 1 "defaults"] (convert-keys defaults)))]
+     (connect memory-config))))
+
+(defn connect-file
+  ([]
+   (connect-file {}))
+  ([{:keys [storage-path parallelism cache-max-mb defaults],
+     :or   {storage-path "data", parallelism 4, cache-max-mb 1000}}]
+   (let [file-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+                                          "@vocab" "https://ns.flur.ee/system#"}
+                              "@id"      "file"
+                              "@graph"   [{"@id"      "fileStorage"
+                                           "@type"    "Storage"
+                                           "filePath" storage-path}
+                                          {"@id"              "connection"
+                                           "@type"            "Connection"
+                                           "parallelism"      parallelism
+                                           "cacheMaxMb"       cache-max-mb
+                                           "commitStorage"    {"@id" "fileStorage"}
+                                           "indexStorage"     {"@id" "fileStorage"}
+                                           "primaryPublisher" {"@type"   "Publisher"
+                                                               "storage" {"@id" "fileStorage"}}}]}
+                       defaults (assoc-in ["@graph" 1 "defaults"] (convert-keys defaults)))]
+     (connect file-config))))
 
 (defn address?
   "Returns true if the argument is a full ledger address, false if it is just an

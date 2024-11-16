@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.policy :as policy]
@@ -127,16 +128,23 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-          mods         (<? (modified-subjects (policy/root db) add))
+          mods-ch      (modified-subjects (policy/root db) add) ;; kick off mods in background
           db-after     (-> db
                            (update :staged conj [txn author annotation])
                            (assoc :t t
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
-                           (commit-data/add-tt-id)
+                           (commit-data/add-tt-id))
+          mods         (<? mods-ch)
+          db-after*    (-> db-after
                            (vocab/hydrate-schema add mods)
                            (check-virtual-graph add remove))]
-      {:add add :remove remove :db-after db-after :db-before db-before :mods mods :context context})))
+      {:add       add
+       :remove    remove
+       :db-after  db-after*
+       :db-before db-before
+       :mods      mods
+       :context   context})))
 
 (defn validate-db-update
   [{:keys [db-after db-before mods context] :as staged-map}]
@@ -148,6 +156,9 @@
 (defn stage
   [db fuel-tracker context identity author annotation raw-txn parsed-txn]
   (go-try
+    (when (novelty/max-novelty? db)
+      (throw (ex-info "Maximum novelty exceeded, no transactions will be processed until indexing has completed."
+                      {:status 503 :error :db/max-novelty-exceeded})))
     (when (policy.modify/deny-all? db)
       (throw (ex-info "Database policy denies all modifications."
                       {:status 403 :error :db/policy-exception})))

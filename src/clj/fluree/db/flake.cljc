@@ -471,19 +471,6 @@
   [comparator & entries]
   (apply avl/sorted-map-by comparator entries))
 
-(defn conj-all
-  "Adds all flakes in the `to-add` collection from the AVL-backed sorted flake set
-  `sorted-set`. This function uses transients for intermediate set values for
-  better performance because of the slower batched update performance of
-  AVL-backed sorted sets."
-  [ss to-add]
-  (loop [trans (transient ss)
-         add   to-add]
-    (if-let [f (first add)]
-      (recur (conj! trans f)
-             (rest add))
-      (persistent! trans))))
-
 (defn disj-all
   "Removes all flakes in the `to-remove` collection from the AVL-backed sorted
   flake set `sorted-set`. This function uses transients for intermediate set
@@ -515,6 +502,8 @@
     (persistent! added)))
 
 (defn remove
+  "Removes all flakes in the sorted-set where
+  applying function f to the element returns truthy."
   [f ss]
   (loop [trans (transient ss)
          items (seq ss)]
