@@ -2,8 +2,7 @@
   (:require [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.json-ld.policy :refer [root]]
-            [fluree.db.query.fql.parse :as parse]
+            [fluree.db.json-ld.policy :as policy :refer [root]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
@@ -58,8 +57,8 @@
   (let [query    (:query policy)
         this-val (iri/decode-sid db sid)
         ;; TODO: handle pre-existing :values clause on query
-        values   (-> (parse/normalize-values policy-values)
-                     (parse/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
+        values   (-> (policy/normalize-values policy-values)
+                     (policy/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
     (assoc query "values" values)))
 
 (defn modify-exception

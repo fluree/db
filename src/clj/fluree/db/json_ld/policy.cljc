@@ -2,7 +2,6 @@
   (:require [clojure.core.async :refer [go <!]]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.query.fql.parse :as parse]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
@@ -65,6 +64,23 @@
                  policies*)
         (<! (wrap-policy db (json-ld/expand policies*) policy-values))))))
 
+(defn normalize-values
+  "Normalize the structure of the values clause to
+  [[vars...] [[val1..] [val2...] ...]], handling nil properly."
+  [values]
+  (let [[vars vals] values]
+    [(into [] (when vars (util/sequential vars)))
+     (mapv util/sequential vals)]))
+
+(defn inject-value-binding
+  "Inject the given var and value into a normalized values clause."
+  [values var v]
+  (let [[vars vals] values]
+    [(into [var] (when vars (util/sequential vars)))
+     (if (seq vals)
+       (mapv (partial into [v]) vals)
+       [[v]])]))
+
 (defn wrap-identity-policy
   "Given an identity (@id) that exists in the db which contains a
   property `f:policyClass` listing policy classes associated with
@@ -80,8 +96,8 @@
                       policies
                       (policy-from-query policies))
 
-          policy-values* (-> (parse/normalize-values policy-values)
-                             (parse/inject-value-binding "?$identity" {"@value" identity "@type" const/iri-id}))]
+          policy-values* (-> (normalize-values policy-values)
+                             (inject-value-binding "?$identity" {"@value" identity "@type" const/iri-id}))]
       (log/trace "wrap-identity-policy - extracted policy from identity: " identity " policy: " policies*)
       (if (util/exception? policies*)
         (ex-info (str "Unable to extract policies for identity: " identity
