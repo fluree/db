@@ -266,7 +266,7 @@
           "with value maps"))))
 
 (deftest non-serializable-value-literals
-  (let [conn @(fluree/connect {:method :memory})
+  (let [conn @(fluree/connect-memory)
         db   @(fluree/create-with-txn conn {"@context" test-utils/default-str-context
                                             "ledger" "non-serializable-values"
                                             "insert" [{"@id" "ex:1"

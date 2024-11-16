@@ -395,34 +395,48 @@
   [flakes]
   (filter ref? flakes))
 
+;; TODO - flakes-size takes considerable time for lg txns, see if can be optimized
+(defn calc-flake-size
+  [add rem]
+  (cond-> 0
+          add (+ (flake/size-bytes add))
+          rem (- (flake/size-bytes rem))))
+
 (defn update-novelty
   ([db add]
    (update-novelty db add []))
 
-  ([db add rem]
+  ([{:keys [t] :as db} add rem]
    (try*
-    (let [ref-add     (ref-flakes add)
-          ref-rem     (ref-flakes rem)
-          flake-count (cond-> 0
-                              add (+ (count add))
-                              rem (- (count rem)))
-          flake-size  (cond-> 0
-                              add (+ (flake/size-bytes add))
-                              rem (- (flake/size-bytes rem)))]
-      (-> db
-          (update-in [:novelty :spot] flake/revise add rem)
-          (update-in [:novelty :post] flake/revise add rem)
-          (update-in [:novelty :opst] flake/revise ref-add ref-rem)
-          (update-in [:novelty :tspo] flake/revise add rem)
-          (update-in [:novelty :size] + flake-size)
-          (update-in [:stats :size] + flake-size)
-          (update-in [:stats :flakes] + flake-count)))
-    (catch* e
-            (log/error (str "Update novelty unexpected error while attempting to updated db: "
-                            (pr-str db) " due to exception: " (ex-message e))
-                       {:add-flakes add
-                        :rem-flakes rem})
-            (throw e)))))
+     (let [flake-count (cond-> 0
+                               add (+ (count add))
+                               rem (- (count rem)))
+           ;; launch futures for parallellism on JVM
+           flake-size  #?(:clj  (future (calc-flake-size add rem))
+                          :cljs (calc-flake-size add rem))
+           post        #?(:clj  (future (flake/revise (get-in db [:novelty :post]) add rem))
+                          :cljs (flake/revise (get-in db [:novelty :post]) add rem))
+           opst        #?(:clj  (future (flake/revise (get-in db [:novelty :opst]) (ref-flakes add) (ref-flakes rem)))
+                          :cljs (flake/revise (get-in db [:novelty :opst]) (ref-flakes add) (ref-flakes rem)))]
+       (-> db
+           (update-in [:novelty :spot] flake/revise add rem)
+           (update-in [:novelty :tspo] flake/revise add rem)
+           (assoc-in [:novelty :post] #?(:clj  @post
+                                         :cljs post))
+           (assoc-in [:novelty :opst] #?(:clj  @opst
+                                         :cljs opst))
+           (update-in [:novelty :size] + #?(:clj  @flake-size
+                                            :cljs flake-size))
+           (assoc-in [:novelty :t] t)
+           (update-in [:stats :size] + #?(:clj  @flake-size
+                                          :cljs flake-size))
+           (update-in [:stats :flakes] + flake-count)))
+     (catch* e
+             (log/error (str "Update novelty unexpected error while attempting to updated db: "
+                             (pr-str db) " due to exception: " (ex-message e))
+                        {:add-flakes add
+                         :rem-flakes rem})
+       (throw e)))))
 
 (defn add-tt-id
   "Associates a unique tt-id for any in-memory staged db in their index roots.

@@ -144,7 +144,7 @@
 
 (deftest ^:integration subjects-as-predicates
   (testing "predicate iri-cache loookups"
-    (let [conn    @(fluree/connect {:method :memory})
+    (let [conn    @(fluree/connect-memory)
           ledger  @(fluree/create conn "propertypathstest")
           db0     (fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/"}]
@@ -213,7 +213,7 @@
 
 (deftest ^:integration nested-properties
   (with-tmp-dir storage-path
-    (let [conn      @(fluree/connect {:method :file, :storage-path storage-path})
+    (let [conn      @(fluree/connect-file {:storage-path storage-path})
           ledger-id "bugproperty-iri"
           context   [test-utils/default-str-context
                      {"ex"  "http://example.com/"

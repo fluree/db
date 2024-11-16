@@ -355,7 +355,7 @@
 
   indexer/Indexable
   (index [db changes-ch]
-    (if (novelty/novelty-min? db reindex-min-bytes)
+    (if (novelty/min-novelty? db)
       (novelty/refresh db changes-ch max-old-indexes)
       (go)))
 
@@ -441,7 +441,8 @@
      (assoc m idx (-> comparators
                       (get idx)
                       flake/sorted-set-by)))
-   {:size 0} index/types))
+   {:size 0
+    :t    0} index/types))
 
 (defn genesis-root-map
   [ledger-alias]

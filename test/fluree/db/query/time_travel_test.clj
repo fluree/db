@@ -24,7 +24,7 @@
 (deftest query-with-iso8601-string-t-value-test
   (testing "only gets results from before that time"
     (let [;conn         (test-utils/create-conn) ; doesn't work see comment below
-          conn                   @(fluree/connect {:method :memory})
+          conn                   @(fluree/connect-memory)
           ;; if the :did default below is present on the conn
           ;; (as it is w/ test-utils/create-conn)
           ;; then the tests below fail at the last check
@@ -105,7 +105,7 @@
     (let [t1         "2023-11-04T00:00:00Z"
           query-time "2023-11-05T00:00:00Z"
           t2         "2023-11-06T00:00:00Z"
-          conn       @(fluree/connect {:method :memory})
+          conn       @(fluree/connect-memory)
           context    {"id"     "@id",
                       "type"   "@type",
                       "ex"     "http://example.org/",

@@ -48,7 +48,7 @@
                  (update-in [:friended :ex/friend] set)))))))
 
 (deftest ^:integration reverse-preds-in-where-and-select
-  (let [conn   @(fluree/connect {:method :memory})
+  (let [conn   @(fluree/connect-memory)
         ledger @(fluree/create conn "reverse")
         db0    (fluree/db ledger)
 

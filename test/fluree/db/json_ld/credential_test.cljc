@@ -115,7 +115,7 @@
 
 #?(:clj
    (deftest ^:integration cred-wrapped-transactions-and-queries
-     (let [conn      @(fluree/connect {:method :memory})
+     (let [conn      @(fluree/connect-memory)
            ledger-id "credentialtest"
            context   (merge test-utils/default-str-context
                             {"ct" "ledger:credentialtest/"})
