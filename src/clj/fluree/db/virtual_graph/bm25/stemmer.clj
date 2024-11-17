@@ -1,6 +1,6 @@
 (ns fluree.db.virtual-graph.bm25.stemmer
   (:import (org.tartarus.snowball SnowballStemmer)
-           (org.tartarus.snowball.ext englishStemmer)))
+           (org.tartarus.snowball.ext englishStemmer frenchStemmer)))
 
 (set! *warn-on-reflection* true)
 
