@@ -180,6 +180,103 @@
               ["ex:health-article" 1.9365594800478445 "Microplastics are in our food"]]
              q1)))))
 
+(deftest ^:integration bm25-index-retractions
+  (testing "Retracting data from a bm25 index"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "bm25-retract")
+
+          db     @(fluree/stage
+                   (fluree/db ledger)
+                   {"insert"
+                    {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                       "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                       "fidx" "https://ns.flur.ee/index#"
+                                       "ex"   "http://example.org/"},
+                     "@id"            "ex:articleSearch"
+                     "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                     "f:virtualGraph" "articleSearch"
+                     "f:query"        {"@type"  "@json"
+                                       "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                 "where"    [{"@id"       "?x"
+                                                              "ex:author" "?author"}]
+                                                 "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
+
+          db-r   @(fluree/stage
+                   db
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"        "ex:food-article"
+                      "ex:author"  "Jane Smith"
+                      "ex:title"   "This is one title of a document about food"
+                      "ex:summary" "This is a summary of the document about food including apples and oranges"}
+                     {"@id"        "ex:hobby-article"
+                      "ex:author"  "John Doe"
+                      "ex:title"   "This is an article about hobbies"
+                      "ex:summary" "Hobbies include reading and hiking"}]})
+
+          db-r2  @(fluree/stage
+                   db-r
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "where"    {"@id" "ex:food-article"
+                                "?p"  "?o"}
+                    "delete"   {"@id" "ex:food-article"
+                                "?p"  "?o"}})
+
+          q1     @(fluree/query db-r2 {"@context" {"ex"   "http://example.org/ns/"
+                                                   "fidx" "https://ns.flur.ee/index#"}
+                                       "select"   ["?x", "?score", "?title"]
+                                       "where"    [["graph" "##articleSearch" {"fidx:target" "Apples for snacks for John"
+                                                                               "fidx:limit"  10,
+                                                                               "fidx:sync"   true,
+                                                                               "fidx:result" {"@id"        "?x"
+                                                                                              "fidx:score" "?score"}}]
+                                                   {"@id"      "?x"
+                                                    "ex:title" "?title"}]})]
+
+      (is (= [["ex:hobby-article" 0.28768207245178085 "This is an article about hobbies"]]
+             q1))
+
+
+      (testing "Score after adding and retracting article is same as score with just one article"
+        (let [conn2   (test-utils/create-conn)
+              ledger2 @(fluree/create conn "bm25-retract-verify-same-score")
+
+              db2     @(fluree/stage
+                        (fluree/db ledger2)
+                        {"insert"
+                         {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                            "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                            "fidx" "https://ns.flur.ee/index#"
+                                            "ex"   "http://example.org/"},
+                          "@id"            "ex:articleSearch"
+                          "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                          "f:virtualGraph" "articleSearch"
+                          "f:query"        {"@type"  "@json"
+                                            "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                      "where"    [{"@id"       "?x"
+                                                                   "ex:author" "?author"}]
+                                                      "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
+
+              db-r2   @(fluree/stage
+                        db2
+                        {"@context" {"ex" "http://example.org/ns/"}
+                         "insert"
+                         [{"@id"        "ex:hobby-article"
+                           "ex:author"  "John Doe"
+                           "ex:title"   "This is an article about hobbies"
+                           "ex:summary" "Hobbies include reading and hiking"}]})
+              q2      @(fluree/query db-r2 {"@context" {"ex"   "http://example.org/ns/"
+                                                        "fidx" "https://ns.flur.ee/index#"}
+                                            "select"   ["?x", "?score", "?title"]
+                                            "where"    [["graph" "##articleSearch" {"fidx:target" "Apples for snacks for John"
+                                                                                    "fidx:limit"  10,
+                                                                                    "fidx:sync"   true,
+                                                                                    "fidx:result" {"@id"        "?x"
+                                                                                                   "fidx:score" "?score"}}]
+                                                        {"@id"      "?x"
+                                                         "ex:title" "?title"}]})]
+          (is (= q2 q1)))))))
+
 (deftest ^:integration bm25-index-exceptions
   (testing "The query of bm25 index has specific formatting requirements"
     (let [conn   (test-utils/create-conn)

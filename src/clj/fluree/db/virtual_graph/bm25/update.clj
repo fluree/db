@@ -1,5 +1,6 @@
 (ns fluree.db.virtual-graph.bm25.update
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.db.virtual-graph.bm25.stemmer :as stm]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.log :as log]))
@@ -112,59 +113,59 @@
                  :item-count item-count*
                  :vectors (assoc vectors id item-vec))))
 
-(defn assert-items
+(defn retract-terms-docs
+  "Returns updated terms map with doc-id for sparce vec removed"
+  [terms id sparse-vec]
+  ;; set of term indexes as set we'll disj until empty
+  (let [retract-idxs (reduce #(conj %1 (first %2)) #{} sparse-vec)]
+    ;; iterate over terms until we retract all items
+    (loop [[[term-str term-map] & r] terms
+           retract-idxs retract-idxs
+           terms        (transient terms)]
+      (if (retract-idxs (:idx term-map)) ;; matches one of our retraction items?
+        (let [retract-idxs* (disj retract-idxs (:idx term-map))
+              terms*        (assoc! terms term-str (update term-map :items disj id))]
+          (if (empty? retract-idxs*) ;; no more restriction items, return updated terms map
+            (persistent! terms*)
+            (recur r retract-idxs* terms*)))
+        (recur r retract-idxs terms)))))
+
+(defn- retract-item
+  [index iri-codec iri]
+  (let [{:keys [avg-length item-count terms vectors]} index
+        id          (iri/encode-iri iri-codec iri)
+        v           (get vectors id)
+        terms*      (retract-terms-docs terms id v)
+        vectors*    (dissoc vectors id)
+        doc-len     (reduce
+                     (fn [acc vec-tuple]
+                       (+ acc (second vec-tuple)))
+                     0
+                     v)
+        total-len   (* avg-length item-count)
+        total-len*  (- total-len doc-len)
+        item-count* (dec item-count)
+        avg-length* (/ total-len* item-count*)]
+    (assoc index :terms terms*
+                 :avg-length avg-length*
+                 :item-count item-count*
+                 :vectors vectors*)))
+
+(defn upsert-items
   "Asserts items into the bm25 index, returns updated state."
-  [{:keys [stemmer stopwords] :as bm25} latest-index assertions status-update]
-  (let [item-count (count assertions)]
+  [{:keys [stemmer stopwords] :as bm25} latest-index item-count items-ch status-update]
+  (async/go
     (status-update [0 item-count])
-    (loop [[item & r] assertions
-           i     1
+    (loop [i     1
            index latest-index]
-      (if item
-        (let [index* (index-item index stemmer stopwords bm25 item)]
+      (if-let [[action item] (async/<! items-ch)]
+        (let [index* (if (= ::upsert action)
+                       (index-item index stemmer stopwords bm25 item)
+                       (retract-item index bm25 item))]
           ;; supply status for every 100 items for timeout reporting, etc.
           (when (zero? (mod i 100))
             (status-update [i item-count]))
-          (recur r (inc i) index*))
+          (recur (inc i) index*))
         (do
           (status-update [item-count item-count]) ;; 100% done
           index)))))
-
-;(defn retract-terms-docs
-;  "Returns updated terms map with doc-id for sparce vec removed"
-;  [terms id sparse-vec]
-;  ;; set of term indexes as set we'll disj until empty
-;  (let [retract-idxs (reduce #(conj %1 (first %2)) #{} sparse-vec)]
-;    ;; iterate over terms until we retract all items
-;    (loop [[[term-str term-map] & r] terms
-;           retract-idxs retract-idxs
-;           terms        (transient terms)]
-;      (if (retract-idxs (:idx term-map)) ;; matches one of our retraction items?
-;        (let [retract-idxs* (disj retract-idxs (:idx term-map))
-;              terms*        (assoc! terms term-str (update term-map :items disj id))]
-;          (if (empty? retract-idxs*) ;; no more restriction items, return updated terms map
-;            (persistent! terms*)
-;            (recur r retract-idxs* terms*)))
-;        (recur r retract-idxs terms)))))
-;
-;(defn- retract-item
-;  [{:keys [avg-length item-count vectors terms] :as bm25-state} item]
-;  (let [id          (get item "@id")
-;        v           (get vectors id)
-;        terms*      (retract-terms-docs terms id v)
-;        vectors*    (dissoc vectors id)
-;        doc-len     (reduce
-;                     (fn [acc vec-tuple]
-;                       (+ acc (second vec-tuple)))
-;                     0
-;                     v)
-;        total-len   (* avg-length item-count)
-;        total-len*  (- total-len doc-len)
-;        item-count* (dec item-count)
-;        avg-length* (/ total-len* item-count*)]
-;    (assoc bm25-state :item-count item-count*
-;                      :avg-length avg-length*
-;                      :vectors vectors*
-;                      :terms terms*)))
-
-
