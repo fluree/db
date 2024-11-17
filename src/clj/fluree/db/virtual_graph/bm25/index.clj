@@ -196,7 +196,7 @@
                           result)]
             ;; note that query-result could be a single item if query used :selectOne, or a vector if not
             (async/>! results-ch (if (nil? result*)
-                                   [::bm25.update/retract next-iri]
+                                   [::bm25.update/retract {"@id" next-iri}]
                                    [::bm25.update/upsert result*]))
             (recur r))
           (async/close! results-ch))))
