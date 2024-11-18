@@ -1,5 +1,5 @@
 (ns fluree.db.serde.none
-  (:require [fluree.db.serde.protocol :as serdeproto]))
+  (:require [fluree.db.serde :as serde]))
 
 (set! *warn-on-reflection* true)
 
@@ -7,20 +7,20 @@
 ;; Identity serializer doens't serialize anything.
 
 (defrecord Serializer []
-  serdeproto/StorageSerializer
-  (-serialize-db-root [_ db-root]
+  serde/StorageSerializer
+  (serialize-db-root [_ db-root]
     db-root)
-  (-deserialize-db-root [_ db-root]
+  (deserialize-db-root [_ db-root]
     db-root)
-  (-serialize-branch [_ branch]
+  (serialize-branch [_ branch]
     branch)
-  (-deserialize-branch [_ branch]
+  (deserialize-branch [_ branch]
     branch)
-  (-serialize-leaf [_ leaf]
+  (serialize-leaf [_ leaf]
     leaf)
-  (-deserialize-leaf [_ leaf]
+  (deserialize-leaf [_ leaf]
     leaf)
-  (-serialize-garbage [_ garbage]
+  (serialize-garbage [_ garbage]
     garbage)
-  (-deserialize-garbage [_ garbage]
+  (deserialize-garbage [_ garbage]
     garbage))

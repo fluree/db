@@ -1,6 +1,6 @@
 (ns fluree.db.serde.json
   (:require [fluree.db.constants :as const]
-            [fluree.db.serde.protocol :as serdeproto]
+            [fluree.db.serde :as serde]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
@@ -154,8 +154,8 @@
    "garbage" (vec garbage)})
 
 (defrecord Serializer []
-  serdeproto/StorageSerializer
-  (-serialize-db-root [_ db-root]
+  serde/StorageSerializer
+  (serialize-db-root [_ db-root]
     (reduce-kv
       (fn [acc k v]
         (assoc acc (name k)
@@ -168,19 +168,19 @@
 
                      v)))
       {} db-root))
-  (-deserialize-db-root [_ db-root]
+  (deserialize-db-root [_ db-root]
     (deserialize-db-root db-root))
-  (-serialize-branch [_ {:keys [children] :as _branch}]
+  (serialize-branch [_ {:keys [children] :as _branch}]
     {"children" (map stringify-child children)})
-  (-deserialize-branch [_ branch]
+  (deserialize-branch [_ branch]
     (deserialize-branch-node branch))
-  (-serialize-leaf [_ leaf]
+  (serialize-leaf [_ leaf]
     {"flakes" (map serialize-flake (:flakes leaf))})
-  (-deserialize-leaf [_ leaf]
+  (deserialize-leaf [_ leaf]
     (deserialize-leaf-node leaf))
-  (-serialize-garbage [_ garbage-map]
+  (serialize-garbage [_ garbage-map]
     (serialize-garbage garbage-map))
-  (-deserialize-garbage [_ garbage]
+  (deserialize-garbage [_ garbage]
     (deserialize-garbage garbage)))
 
 

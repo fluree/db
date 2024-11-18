@@ -1,5 +1,5 @@
 (ns fluree.db.flake.index.storage
-  (:require [fluree.db.serde.protocol :as serdeproto]
+  (:require [fluree.db.serde :as serde]
             [fluree.db.flake :as flake]
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]
@@ -45,14 +45,14 @@
 (defn write-leaf
   "Serializes and writes the index leaf node `leaf` to storage."
   [{:keys [storage serializer] :as _index-catalog} ledger-alias idx-type leaf]
-  (let [serialized (serdeproto/-serialize-leaf serializer leaf)]
+  (let [serialized (serde/serialize-leaf serializer leaf)]
     (write-index-file storage ledger-alias idx-type serialized)))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key.
   Returns two-tuple of response output and raw bytes written."
   [{:keys [storage serializer] :as _index-catalog} ledger-alias idx-type data]
-  (let [serialized (serdeproto/-serialize-branch serializer data)]
+  (let [serialized (serde/serialize-branch serializer data)]
     (write-index-file storage ledger-alias idx-type serialized)))
 
 (defn write-branch
@@ -71,7 +71,7 @@
                     :branch  branch
                     :t       t
                     :garbage garbage}
-        serialized (serdeproto/-serialize-garbage serializer data)]
+        serialized (serde/serialize-garbage serializer data)]
     (write-index-file storage ledger-alias :garbage serialized)))
 
 (defn write-db-root
@@ -99,20 +99,20 @@
                         prev-idx-t   (assoc :prev-index {:t       prev-idx-t
                                                          :address prev-idx-addr})
                         garbage-addr (assoc-in [:garbage :address] garbage-addr))
-        serialized    (serdeproto/-serialize-db-root serializer data)]
+        serialized    (serde/serialize-db-root serializer data)]
     (write-index-file storage alias :root serialized)))
 
 (defn read-branch
   [{:keys [storage serializer] :as _idx-store} branch-address]
   (go-try
     (when-let [data (<? (storage/read-json storage branch-address true))]
-      (serdeproto/-deserialize-branch serializer data))))
+      (serde/deserialize-branch serializer data))))
 
 (defn read-leaf
   [{:keys [storage serializer] :as _idx-store} leaf-address]
   (go-try
     (when-let [data (<? (storage/read-json storage leaf-address true))]
-      (serdeproto/-deserialize-leaf serializer data))))
+      (serde/deserialize-leaf serializer data))))
 
 (defn reify-index-root
   [index-data ledger-alias comparator t]
@@ -146,7 +146,7 @@
   [{:keys [storage serializer] :as _idx-store} garbage-address]
   (go-try
     (when-let [data (<? (storage/read-json storage garbage-address true))]
-      (serdeproto/-deserialize-garbage serializer data))))
+      (serde/deserialize-garbage serializer data))))
 
 (defn delete-garbage-item
   "Deletes an index segment during garbage collection. Returns async chan"
@@ -166,7 +166,7 @@
   (go-try
     (if-let [data (<? (storage/read-json storage idx-address true))]
       (let [{:keys [t] :as root-data}
-            (serdeproto/-deserialize-db-root serializer data)]
+            (serde/deserialize-db-root serializer data)]
         (-> root-data
             reify-index-roots
             reify-namespaces
