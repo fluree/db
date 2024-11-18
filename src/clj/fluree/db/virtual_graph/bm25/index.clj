@@ -217,8 +217,6 @@
     (bm25-upsert this source-db new-flakes remove-flakes))
   (initialize [this source-db]
     (bm25-initialize this source-db))
-  (serialize [_] {}) ;; TODO - VG - serialize to JSON (plus, call when writing index to store)
-  (deserialize [_ source-db data] {}) ;; TODO - VG - deserialize to JSON (plus, reify when reading index from store)
 
   where/Matcher
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
