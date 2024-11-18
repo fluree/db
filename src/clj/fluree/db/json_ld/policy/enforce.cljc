@@ -51,15 +51,16 @@
     (get-in policy-map [const/iri-modify :default])
     (get-in policy-map [const/iri-view :default])))
 
-
 (defn policy-query
-  [db sid policy-values policy]
-  (let [query    (:query policy)
-        this-val (iri/decode-sid db sid)
-        ;; TODO: handle pre-existing :values clause on query
-        values   (-> (policy/normalize-values policy-values)
-                     (policy/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
-    (assoc query "values" values)))
+  [db sid policy]
+  (let [policy-values (-> db :policy :policy-values)
+        query         (:query policy)
+        this-val      (iri/decode-sid db sid)
+        values        (-> (policy/normalize-values policy-values)
+                          (policy/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
+    (update query "where" (fn [where-clause]
+                            (into [["values" values]]
+                                  (when where-clause (util/sequential where-clause)))))))
 
 (defn modify-exception
   [policies]
@@ -73,16 +74,15 @@
   appropriate policy response."
   [db modify? sid policies-to-eval]
   (go-try
-    (let [policy-values (-> db :policy :policy-values)]
-      (loop [[p-map & r] policies-to-eval]
-        ;; return first truthy response, else false
-        (if p-map
-          (let [query  (policy-query db sid policy-values p-map)
-                result (<? (dbproto/-query (root db) query))]
-            (if (seq result)
-              true
-              (recur r)))
-          ;; no more policies left to evaluate - all returned false
-          (if modify?
-            (modify-exception policies-to-eval)
-            false))))))
+    (loop [[policy & r] policies-to-eval]
+      ;; return first truthy response, else false
+      (if policy
+        (let [query  (policy-query db sid policy)
+              result (<? (dbproto/-query (root db) query))]
+          (if (seq result)
+            true
+            (recur r)))
+        ;; no more policies left to evaluate - all returned false
+        (if modify?
+          (modify-exception policies-to-eval)
+          false)))))

@@ -367,4 +367,18 @@
                                                                "@type" "?type"
                                                                "ex:capitol" "?capitol"}]}}}
                                         "policyValues" [["?type" "?capitol"]
-                                                        [[{"@value" "usa:state" "@type" "@id"} "Madison"]]]}}))))))
+                                                        [[{"@value" "usa:state" "@type" "@id"} "Madison"]]]}}))))
+    (testing "pre-existing values clause"
+      (is (= ["Wisconsin"]
+             @(fluree/query db {"@context" test-utils/default-str-context
+                                "where" [{"@id" "?state" "ex:name" "?name"}]
+                                "select" "?name"
+                                "opts" {"policy"
+                                        {"f:action" {"@id" "f:view"}
+                                         "f:query" {"@type" "@json"
+                                                    "@value"
+                                                    {"where" [{"@id" "?$this"
+                                                               "@type" "?type"
+                                                               "ex:capitol" "?capitol"}]
+                                                     "values" ["?type" [{"@value" "usa:state" "@type" "@id"}]]}}}
+                                        "policyValues" ["?capitol" ["Madison"]]}}))))))
