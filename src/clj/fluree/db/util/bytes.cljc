@@ -35,15 +35,9 @@
 
 
 (defn long->UTF8
-  [n]
-  (loop [result '()
-         n'     n]
-    (if (= 0 n')
-      #?(:clj (byte-array result)
-         :cljs (.from js/Int8Array result))
-      (let [b   (bit-and n' 0xFF)
-            n'' (bit-shift-right n' 8)]
-        (if (= b 0)
-          (recur result n'')
-          (recur (conj result b)
-                 n''))))))
+  [l]
+  (->> [56 48 40 32 24 16 8 0] ;; byte offsets
+       (map (fn [i] (bit-and (bit-shift-right l i) 0xFF)))
+       (remove zero?) ;; get rid of trailing padding
+       #?(:clj (byte-array)
+          :cljs (.from js/Int8Array))))
