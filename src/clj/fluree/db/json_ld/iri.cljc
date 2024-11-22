@@ -127,7 +127,7 @@
 
 (defn get-ns-code
   [^SID sid]
-  #?(:clj (.getNamespaceCode sid)
+  #?(:clj (.namespaceCode sid)
      :cljs (:namespace-code sid)))
 
 (defn get-namespace
@@ -139,7 +139,7 @@
 
 (defn get-name
   [^SID sid]
-  #?(:clj (->> sid .getNameCodes codes->name)
+  #?(:clj (->> sid .nameCodes codes->name)
      :cljs (:name sid)))
 
 (defn deserialize-sid
