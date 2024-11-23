@@ -57,6 +57,11 @@
                           terms vectors)]
     (assoc state :terms terms*)))
 
+(defn deserialize-avg-length
+  [avg-length]
+  #?(:clj (rationalize avg-length)
+     :cljs avg-length))
+
 (defn deserialize-state
   [serialized-state]
   (let [term-vec     (:terms serialized-state)
@@ -64,6 +69,7 @@
     (-> serialized-state
         (update :terms deserialize-terms)
         (update :vectors deserialize-vectors)
+        (update :avg-length deserialize-avg-length)
         (assoc :demensions (count term-vec))
         (assoc :item-count item-count)
         (cross-reference-items term-vec))))
