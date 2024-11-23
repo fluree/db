@@ -73,3 +73,11 @@
         (assoc :demensions (count term-vec))
         (assoc :item-count item-count)
         (cross-reference-items term-vec))))
+
+(defn serialize
+  [vg]
+  (-> vg
+      (select-keys [:k1 :b :index-state :initialized :genesis-t :t :alias :db-alias
+                    :query :property-deps :namespace-codes :type :lang :id :vg-name])
+      (update :index-state serialize-state)
+      (update :property-deps (partial map iri/serialize-sid))))
