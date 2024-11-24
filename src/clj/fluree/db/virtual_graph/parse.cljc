@@ -1,10 +1,9 @@
 (ns fluree.db.virtual-graph.parse
-  (:require [clojure.core.async :as async :refer [>! go]]
+  (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.query.exec.update :as exec.update]
+            [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.query.exec.where :as exec.where]
             #?(:cljs fluree.db.query.exec.select :refer [SubgraphSelector])
             [fluree.db.query.fql.parse :as q-parse])
   #?(:clj (:import (fluree.db.query.exec.select SubgraphSelector))))
@@ -14,23 +13,23 @@
 (defn- prop-iri
   "Returns property IRI value from triple"
   [triple]
-  (-> triple (nth 1) exec.where/get-iri))
+  (-> triple (nth 1) where/get-iri))
 
 (defn- obj-val
   [triple solution]
   (let [o (nth triple 2)]
-    (or (exec.where/get-value o)
-        (->> (exec.where/get-variable o)
+    (or (where/get-value o)
+        (->> (where/get-variable o)
              (get solution)
-             (exec.where/get-value)))))
+             (where/get-value)))))
 
 (defn- obj-var
   [triple]
-  (-> triple (nth 2) exec.where/get-variable))
+  (-> triple (nth 2) where/get-variable))
 
 (defn- obj-iri
   [triple]
-  (-> triple (nth 2) exec.where/get-iri))
+  (-> triple (nth 2) where/get-iri))
 
 (defn match-search-triple
   [solution triple]
@@ -115,15 +114,16 @@
         ;; TODO - trace up the chain to the node(s) that depend on them and update the index accordingly
         where-props    (->> query-parsed ;; IRIs of the properties in the query
                             :where
-                            (map #(::exec.where/iri (second %))))
+                            (map #(::where/iri (second %))))
         subgraph-props (subgraph-props query-parsed)
         property-deps  (->> (concat where-props subgraph-props)
-                            (map #(exec.update/generate-sid! db-vol %))
+                            (map #(update/generate-sid! db-vol %))
                             (into #{}))]
 
-    (assoc bm25-opts :query query
-                     :query-parsed (assoc query-parsed :selection-context {})
-                     :property-deps property-deps)))
+    (assoc bm25-opts
+           :query query
+           :query-parsed (assoc query-parsed :selection-context {})
+           :property-deps property-deps)))
 
 (defn finalize
   [search-af error-ch solution-ch]
