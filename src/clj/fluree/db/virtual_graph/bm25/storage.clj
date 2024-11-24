@@ -1,7 +1,9 @@
 (ns fluree.db.virtual-graph.bm25.storage
-  (:require [fluree.db.json-ld.iri :as iri]))
+  (:require [fluree.db.json-ld.iri :as iri]
+            [fluree.db.virtual-graph.bm25.stemmer :as stemmer]
+            [fluree.db.virtual-graph.bm25.stopwords :as stopwords]))
 
-#?(:clj (set! *warn-on-reflection* true))
+(set! *warn-on-reflection* true)
 
 (defn compare-term-indexes
   [terms x y]
@@ -59,8 +61,7 @@
 
 (defn deserialize-avg-length
   [avg-length]
-  #?(:clj (rationalize avg-length)
-     :cljs avg-length))
+  (rationalize avg-length))
 
 (defn deserialize-state
   [serialized-state]
@@ -72,12 +73,21 @@
         (update :avg-length deserialize-avg-length)
         (assoc :demensions (count term-vec))
         (assoc :item-count item-count)
-        (cross-reference-items term-vec))))
+        (cross-reference-items term-vec)
+        atom)))
 
 (defn serialize
-  [vg]
+  [{:keys [lang] :as vg}]
   (-> vg
       (select-keys [:k1 :b :index-state :initialized :genesis-t :t :alias :db-alias
                     :query :property-deps :namespace-codes :type :lang :id :vg-name])
       (update :index-state serialize-state)
       (update :property-deps (partial map iri/serialize-sid))))
+
+(defn deserialize
+  [{:keys [lang] :as serialized-vg}]
+  (-> serialized-vg
+      (update :index-state deserialize-state)
+      (update :property-deps (partial map iri/deserialize-sid))
+      (assoc :stemmer (stemmer/initialize lang))
+      (assoc :stopwords (stopwords/initialize lang))))
