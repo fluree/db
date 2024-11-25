@@ -38,22 +38,23 @@
 
 (defn add-vg-id
   "Adds the full virtual graph IRI to the index options map"
-  [{:keys [vg-name] :as idx-opts} {:keys [alias] :as _db}]
+  [{:keys [vg-name] :as idx-opts} db-alias]
   (let [vg-alias (str "##" vg-name)
-        vg-id    (str alias vg-alias)]
-    (assoc idx-opts :id vg-id
-                    :alias vg-alias)))
+        vg-id    (str db-alias vg-alias)]
+    (assoc idx-opts
+           :id vg-id
+           :alias vg-alias)))
 
 (defn bm25-idx?
   [idx-rdf-type]
   (some #(= % const/$fluree:index-BM25) idx-rdf-type))
 
 (defn create
-  [{:keys [t] :as db} vg-flakes]
+  [{:keys [alias t] :as db} vg-flakes]
   (let [db-vol         (volatile! db) ;; needed to potentially add new namespace codes based on query IRIs
         vg-opts        (-> (idx-flakes->opts vg-flakes)
                            (vg-parse/parse-document-query db-vol)
-                           (add-vg-id db)
+                           (add-vg-id alias)
                            (assoc :genesis-t t))
         {:keys [type alias]} vg-opts
         db*            @db-vol
