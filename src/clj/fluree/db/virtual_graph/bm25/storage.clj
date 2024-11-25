@@ -1,6 +1,10 @@
 (ns fluree.db.virtual-graph.bm25.storage
   (:require [clojure.set :refer [map-invert]]
+            [clojure.string :as str]
             [fluree.db.json-ld.iri :as iri]
+            [fluree.db.storage :as storage]
+            [fluree.db.serde :as serde]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.virtual-graph.bm25.stemmer :as stemmer]
             [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
             [fluree.db.virtual-graph.parse :as parse]))
@@ -78,7 +82,7 @@
                        (cross-reference-items term-vec))]
     (atom {:index index})))
 
-(defn serialize
+(defn vg-data
   [vg]
   (-> vg
       (select-keys [:k1 :b :index-state :initialized :genesis-t :t :alias :db-alias
@@ -94,13 +98,13 @@
                (iri/iri->sid prop namespaces)))
         props))
 
-(defn deserialize
-  [{:keys [lang query namespace-codes] :as serialized-vg}]
+(defn reconstruct
+  [{:keys [lang query namespace-codes] :as vg-data}]
   (let [parsed-query (parse/parse-query query)
         namespaces   (map-invert namespace-codes)
         query-props  (parse/get-query-props parsed-query)
         property-deps (get-property-sids namespaces query-props)]
-    (-> serialized-vg
+    (-> vg-data
         (assoc :parsed-query parsed-query)
         (assoc :namespaces namespaces)
         (assoc :property-deps property-deps)
@@ -108,3 +112,20 @@
         (assoc :stopwords (stopwords/initialize lang))
         (update :type (partial mapv iri/deserialize-sid))
         (update :index-state deserialize-state))))
+
+(defn write-vg
+  [{:keys [storage serializer] :as _index-catalog} {:keys [alias db-alias] :as vg}]
+  (let [data            (vg-data vg)
+        serialized-data (serde/serialize-bm25 serializer data)
+        path            (str/join "/" [db-alias "bm25" alias])]
+    (storage/content-write-json storage path serialized-data)))
+
+(defn read-vg
+  [{:keys [storage serializer] :as _index-catalog} vg-address]
+  (go-try
+    (if-let [serialized-data (<? (storage/read-json storage vg-address true))]
+      (let [vg-data (serde/deserialize-bm25 serializer serialized-data)]
+        (reconstruct vg-data))
+      (throw (ex-info (str "Could not load bm25 index at address: "
+                           vg-address ".")
+                      {:status 400, :error :db/unavailable})))))
