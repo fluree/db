@@ -164,7 +164,7 @@
 
 (defn parsed-query
   [vg]
-  (:query-parsed vg))
+  (:parsed-query vg))
 
 (defn affected-subjs
   [prop-deps add removes]
@@ -196,13 +196,13 @@
     (bm25-upsert* bm25 db upsert-docs-ch)))
 
 (defn bm25-initialize
-  [{:keys [query-parsed] :as bm25} db]
-  (let [index-items-ch (exec/query db nil query-parsed)]
+  [{:keys [parsed-query] :as bm25} db]
+  (let [index-items-ch (exec/query db nil parsed-query)]
     (bm25-upsert* bm25 db index-items-ch)))
 
 (defrecord BM25-VirtualGraph
   [stemmer stopwords k1 b index-state initialized genesis-t t
-   alias query query-parsed property-deps
+   alias query parsed-query property-deps
    ;; following taken from db - needs to be kept up to date with new db updates
    db-alias namespaces namespace-codes]
 
@@ -244,16 +244,15 @@
 ;; TODO - VG - future feature - weighted properties
 (defn new-bm25-index
   [{:keys [namespaces namespace-codes alias] :as _db} index-flakes vg-opts]
-  (let [opts (-> (idx-flakes->opts index-flakes)
-                 (merge vg-opts)
-                 ;; index-state held as atom, as we need -match-triple, etc. to hold both
-                 ;; current index state and future index state... as we don't know
-                 ;; yet if 'sync' option is used, but need to return a where/Matcher proto
-                 (assoc :t 0
-                        :initialized (util/current-time-millis)
-                        :index-state (atom initialized-index)
-                        :namespaces namespaces
-                        :namespace-codes namespace-codes
-                        :db-alias alias))
-        bm25 (map->BM25-VirtualGraph opts)]
-    bm25))
+  (-> (idx-flakes->opts index-flakes)
+      (merge vg-opts)
+      ;; index-state held as atom, as we need -match-triple, etc. to hold both
+      ;; current index state and future index state... as we don't know yet if
+      ;; 'sync' option is used, but need to return a where/Matcher proto
+      (assoc :t 0
+             :initialized (util/current-time-millis)
+             :index-state (atom initialized-index)
+             :namespaces namespaces
+             :namespace-codes namespace-codes
+             :db-alias alias)
+      map->BM25-VirtualGraph))
