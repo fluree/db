@@ -5,6 +5,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util]
+            [fluree.db.util.json :as json]
             [fluree.db.flake.index :as index]
             #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc]))
@@ -48,16 +49,17 @@
       (update :first deserialize-flake-bound)
       (update :rhs deserialize-flake-bound)))
 
-(defn keyword->int
+(defn parse->int
   [k]
   (-> k name util/str->int))
 
 (defn numerize-keys
   "Convert the keys of the provided map `m` to integers. Assumes that the keys are
-  keywordized integers and will throw an exception otherwise."
+  either stringified or keywordized integers and will throw an exception
+  otherwise."
   [m]
   (reduce-kv (fn [numerized k v]
-               (let [int-k (keyword->int k)]
+               (let [int-k (parse->int k)]
                  (assoc numerized int-k v)))
              {} m))
 
@@ -180,7 +182,17 @@
   (serialize-garbage [_ garbage-map]
     (serialize-garbage garbage-map))
   (deserialize-garbage [_ garbage]
-    (deserialize-garbage garbage)))
+    (deserialize-garbage garbage))
+
+  serde/BM25Serializer
+  (serialize-bm25 [_ bm25]
+    (json/stringify bm25))
+  (deserialize-bm25 [_ bm25]
+    (-> bm25
+        (json/parse false)
+        util/keywordize-keys
+        (update :namespace-codes numerize-keys)
+        (update :index-state util/keywordize-keys))))
 
 
 (defn json-serde

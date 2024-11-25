@@ -11,3 +11,7 @@
   (deserialize-leaf [this leaf] "Deserializes a leaf.")
   (serialize-garbage [this garbage] "Serializes database garbage for later cleanup.")
   (deserialize-garbage [this garbage] "Deserializes database garbage."))
+
+(defprotocol BM25Serializer
+  (serialize-bm25 [this bm25])
+  (deserialize-bm25 [this bm25]))
