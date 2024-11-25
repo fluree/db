@@ -84,6 +84,7 @@
       (select-keys [:k1 :b :index-state :initialized :genesis-t :t :alias :db-alias
                     :query :namespace-codes :property-deps :type :lang :id :vg-name])
       (update :index-state serialize-state)
+      (update :type (partial mapv iri/serialize-sid))
       (update :property-deps (partial map iri/serialize-sid))))
 
 (defn get-property-sids
@@ -105,4 +106,5 @@
         (assoc :property-deps property-deps)
         (assoc :stemmer (stemmer/initialize lang))
         (assoc :stopwords (stopwords/initialize lang))
+        (update :type (partial mapv iri/deserialize-sid))
         (update :index-state deserialize-state))))
