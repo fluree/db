@@ -94,7 +94,7 @@
 
 (defn generate-property-sids!
   [db-vol props]
-  (into {}
+  (into #{}
         (map (partial update/generate-sid! db-vol))
         props))
 
@@ -105,6 +105,10 @@
         subgraph-props (get-subgraph-props parsed-query)]
     (concat where-props subgraph-props)))
 
+(defn parse-query
+  [query]
+  (-> query q-parse/parse-query (assoc :selection-context {})))
+
 (defn parse-document-query
   "Parses document query, does some validation, and extracts a list of
   property dependencies in the query that all data updates can be
@@ -114,15 +118,14 @@
   (internal format) yet, because the namespaces used in the query may
   not yet exist if this index was created before data."
   [{:keys [query] :as bm25-opts} db-vol]
-  (let [parsed-query (q-parse/parse-query query)]
+  (let [parsed-query (parse-query query)]
     (if (has-subgraph-selector? parsed-query)
       ;; TODO - ultimately we want a property dependency chain, so when the properties change we can
       ;; TODO - trace up the chain to the node(s) that depend on them and update the index accordingly
       (let [query-props   (get-query-props parsed-query)
             property-deps (generate-property-sids! db-vol query-props)]
         (assoc bm25-opts
-               :query query
-               :parsed-query (assoc parsed-query :selection-context {})
+               :parsed-query parsed-query
                :property-deps property-deps))
       (throw (ex-info "BM25 index query must be created with a subgraph selector"
                       {:status 400

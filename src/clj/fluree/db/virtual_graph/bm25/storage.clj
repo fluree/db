@@ -1,7 +1,9 @@
 (ns fluree.db.virtual-graph.bm25.storage
-  (:require [fluree.db.json-ld.iri :as iri]
+  (:require [clojure.set :refer [map-invert]]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.virtual-graph.bm25.stemmer :as stemmer]
-            [fluree.db.virtual-graph.bm25.stopwords :as stopwords]))
+            [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
+            [fluree.db.virtual-graph.parse :as parse]))
 
 (set! *warn-on-reflection* true)
 
@@ -65,29 +67,42 @@
 
 (defn deserialize-state
   [serialized-state]
-  (let [term-vec     (:terms serialized-state)
-        item-count   (-> serialized-state :vectors count)]
-    (-> serialized-state
-        (update :terms deserialize-terms)
-        (update :vectors deserialize-vectors)
-        (update :avg-length deserialize-avg-length)
-        (assoc :demensions (count term-vec))
-        (assoc :item-count item-count)
-        (cross-reference-items term-vec)
-        atom)))
+  (let [term-vec   (:terms serialized-state)
+        item-count (-> serialized-state :vectors count)
+        index      (-> serialized-state
+                       (update :terms deserialize-terms)
+                       (update :vectors deserialize-vectors)
+                       (update :avg-length deserialize-avg-length)
+                       (assoc :dimensions (count term-vec))
+                       (assoc :item-count item-count)
+                       (cross-reference-items term-vec))]
+    (atom {:index index})))
 
 (defn serialize
-  [{:keys [lang] :as vg}]
+  [vg]
   (-> vg
       (select-keys [:k1 :b :index-state :initialized :genesis-t :t :alias :db-alias
-                    :query :property-deps :namespace-codes :type :lang :id :vg-name])
+                    :query :namespace-codes :property-deps :type :lang :id :vg-name])
       (update :index-state serialize-state)
       (update :property-deps (partial map iri/serialize-sid))))
 
+(defn get-property-sids
+  [namespaces props]
+  (into #{}
+        (map (fn [prop]
+               (iri/iri->sid prop namespaces)))
+        props))
+
 (defn deserialize
-  [{:keys [lang] :as serialized-vg}]
-  (-> serialized-vg
-      (update :index-state deserialize-state)
-      (update :property-deps (partial map iri/deserialize-sid))
-      (assoc :stemmer (stemmer/initialize lang))
-      (assoc :stopwords (stopwords/initialize lang))))
+  [{:keys [lang query namespace-codes] :as serialized-vg}]
+  (let [parsed-query (parse/parse-query query)
+        namespaces   (map-invert namespace-codes)
+        query-props  (parse/get-query-props parsed-query)
+        property-deps (get-property-sids namespaces query-props)]
+    (-> serialized-vg
+        (assoc :parsed-query parsed-query)
+        (assoc :namespaces namespaces)
+        (assoc :property-deps property-deps)
+        (assoc :stemmer (stemmer/initialize lang))
+        (assoc :stopwords (stopwords/initialize lang))
+        (update :index-state deserialize-state))))
