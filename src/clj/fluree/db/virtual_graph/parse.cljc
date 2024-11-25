@@ -76,23 +76,34 @@
   [parsed-query]
   (instance? SubgraphSelector (:select parsed-query)))
 
-(defn subgraph-props
+(defn get-subgraph-props
   "Returns a list of iris contained in the :select subgraph.
   Ensures one of them is @id."
-  [query-parsed]
-  (let [subgraph-iris (->> query-parsed
+  [parsed-query]
+  (let [subgraph-iris (->> parsed-query
                            :select
                            :spec
                            vals
                            (keep #(when (map? %)
-                                    (when-let [iri (:iri %)]
-                                      iri))))]
-    (if (some #(= "@id" %) subgraph-iris)
-      (->> subgraph-iris
-           (filter #(not= "@id" %)))
+                                    (:iri %))))]
+    (if (some #{"@id"} subgraph-iris)
+      (filter #(not= "@id" %) subgraph-iris)
       (throw (ex-info "BM25 index query must not contain @id in the subgraph selector"
                       {:status 400
                        :error  :db/invalid-index})))))
+
+(defn generate-property-sids!
+  [db-vol props]
+  (into {}
+        (map (partial update/generate-sid! db-vol))
+        props))
+
+(defn get-query-props
+  [parsed-query]
+  (let [where-props    (map (comp ::where/iri second) ; IRIs of the properties in the query
+                            (:where parsed-query))
+        subgraph-props (get-subgraph-props parsed-query)]
+    (concat where-props subgraph-props)))
 
 (defn parse-document-query
   "Parses document query, does some validation, and extracts a list of
@@ -102,28 +113,20 @@
   Note the property dependencies cannot be turned into encoded IRIs
   (internal format) yet, because the namespaces used in the query may
   not yet exist if this index was created before data."
-  [bm25-opts db-vol]
-  (let [query          (:query bm25-opts)
-        query-parsed   (q-parse/parse-query query)
-        _              (when-not (has-subgraph-selector? query-parsed)
-                         (throw (ex-info "BM25 index query must be created with a subgraph selector"
-                                         {:status 400
-                                          :error  :db/invalid-index})))
-
-        ;; TODO - ultimately we want a property dependency chain, so when the properties change we can
-        ;; TODO - trace up the chain to the node(s) that depend on them and update the index accordingly
-        where-props    (->> query-parsed ;; IRIs of the properties in the query
-                            :where
-                            (map #(::where/iri (second %))))
-        subgraph-props (subgraph-props query-parsed)
-        property-deps  (->> (concat where-props subgraph-props)
-                            (map #(update/generate-sid! db-vol %))
-                            (into #{}))]
-
-    (assoc bm25-opts
-           :query query
-           :query-parsed (assoc query-parsed :selection-context {})
-           :property-deps property-deps)))
+  [{:keys [query] :as bm25-opts} db-vol]
+  (let [parsed-query (q-parse/parse-query query)]
+    (if (has-subgraph-selector? parsed-query)
+      ;; TODO - ultimately we want a property dependency chain, so when the properties change we can
+      ;; TODO - trace up the chain to the node(s) that depend on them and update the index accordingly
+      (let [query-props   (get-query-props parsed-query)
+            property-deps (generate-property-sids! db-vol query-props)]
+        (assoc bm25-opts
+               :query query
+               :parsed-query (assoc parsed-query :selection-context {})
+               :property-deps property-deps))
+      (throw (ex-info "BM25 index query must be created with a subgraph selector"
+                      {:status 400
+                       :error  :db/invalid-index})))))
 
 (defn finalize
   [search-af error-ch solution-ch]
