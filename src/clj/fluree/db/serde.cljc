@@ -2,7 +2,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defprotocol StorageSerializer
+(defprotocol GraphSerializer
   (serialize-db-root [this db-root] "Serializes the database index root.")
   (deserialize-db-root [this db-root] "Deserializes the database index root.")
   (serialize-branch [this branch] "Serializes a branch.")

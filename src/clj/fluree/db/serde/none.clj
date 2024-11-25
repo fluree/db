@@ -7,7 +7,7 @@
 ;; Identity serializer doens't serialize anything.
 
 (defrecord Serializer []
-  serde/StorageSerializer
+  serde/GraphSerializer
   (serialize-db-root [_ db-root]
     db-root)
   (deserialize-db-root [_ db-root]
