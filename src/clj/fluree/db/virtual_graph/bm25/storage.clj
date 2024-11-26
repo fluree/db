@@ -5,6 +5,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.serde :as serde]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.bm25.stemmer :as stemmer]
             [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
             [fluree.db.virtual-graph.parse :as parse]))
@@ -109,14 +110,14 @@
         (update :type (partial mapv iri/deserialize-sid))
         (update :index-state reify-state))))
 
-(defn write-vg
+(defmethod vg/write-vg :bm25
   [{:keys [storage serializer] :as _index-catalog} {:keys [alias db-alias] :as vg}]
   (let [data            (vg-data vg)
         serialized-data (serde/serialize-bm25 serializer data)
         path            (str/join "/" [db-alias "bm25" alias])]
     (storage/content-write-json storage path serialized-data)))
 
-(defn read-vg
+(defmethod vg/read-vg :bm25
   [{:keys [storage serializer] :as _index-catalog} vg-address]
   (go-try
     (if-let [serialized-data (<? (storage/read-json storage vg-address true))]
