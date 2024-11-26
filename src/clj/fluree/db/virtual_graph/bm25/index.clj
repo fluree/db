@@ -10,7 +10,7 @@
             [fluree.db.virtual-graph.bm25.update :as bm25.update]
             [fluree.db.virtual-graph.bm25.search :as bm25.search]
             [fluree.db.virtual-graph.parse :as vg-parse]
-            [fluree.db.virtual-graph.proto :as vgproto]
+            [fluree.db.virtual-graph :as vg]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log])
   (:refer-clojure :exclude [assert]))
@@ -212,7 +212,7 @@
   (decode-sid [_ sid]
     (iri/sid->iri sid namespace-codes))
 
-  vgproto/UpdatableVirtualGraph
+  vg/UpdatableVirtualGraph
   (upsert [this source-db new-flakes remove-flakes]
     (bm25-upsert this source-db new-flakes remove-flakes))
   (initialize [this source-db]

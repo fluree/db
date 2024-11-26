@@ -4,7 +4,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             #?(:clj [fluree.db.virtual-graph.bm25.index :as bm25])
             [fluree.db.virtual-graph.parse :as vg-parse]
-            [fluree.db.virtual-graph.proto :as vgproto]
+            [fluree.db.virtual-graph :as vg]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
@@ -68,7 +68,7 @@
                          (throw (ex-info "Unrecognized virtual graph creation attempted."
                                          {:status 400
                                           :error  :db/invalid-index})))
-        initialized-vg (vgproto/initialize vg db*)]
+        initialized-vg (vg/initialize vg db*)]
     [db* alias initialized-vg]))
 
 (defn load-virtual-graph
@@ -93,6 +93,6 @@
   (let [vg* (reduce-kv
              (fn [vg* vg-alias vg-impl]
                (log/debug "Virtual Graph update started for: " vg-alias)
-               (assoc vg* vg-alias (vgproto/upsert vg-impl db add remove)))
+               (assoc vg* vg-alias (vg/upsert vg-impl db add remove)))
              {} vg)]
     (assoc db :vg vg*)))
