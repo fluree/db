@@ -174,17 +174,30 @@
     ;; legacy, for now only v0
     (update root-map :preds deserialize-preds)))
 
+(defn reify-virtual-graphs
+  [index-catalog vg-address-map]
+  (go-try
+    (loop [[[vg-alias address] & r] vg-address-map
+           vg-map         {}]
+      (if vg-alias
+        (let [vg (<? (vg/read-vg index-catalog address))]
+          (recur r (assoc vg-map vg-alias vg)))
+        vg-map))))
+
 (defn read-db-root
   "Returns all data for a db index root of a given t."
-  [{:keys [storage serializer] :as _idx-store} idx-address]
+  [{:keys [storage serializer] :as index-catalog} idx-address]
   (go-try
     (if-let [data (<? (storage/read-json storage idx-address true))]
-      (let [{:keys [t] :as root-data}
-            (serde/deserialize-db-root serializer data)]
+      (let [{:keys [t vg] :as root-data}
+            (serde/deserialize-db-root serializer data)
+
+            vg-map (<? (reify-virtual-graphs index-catalog vg))]
         (-> root-data
             reify-index-roots
             reify-namespaces
             reify-schema
+            (assoc :vg vg-map)
             (update :stats assoc :indexed t)))
       (throw (ex-info (str "Could not load index point at address: "
                            idx-address ".")
