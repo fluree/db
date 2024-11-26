@@ -11,7 +11,8 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.cache :as cache]
-            [fluree.db.storage :as storage]))
+            [fluree.db.storage :as storage]
+            [fluree.db.virtual-graph :as vg]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -74,33 +75,46 @@
         serialized (serde/serialize-garbage serializer data)]
     (write-index-file storage ledger-alias :garbage serialized)))
 
-(defn write-db-root
-  [{:keys [storage serializer] :as _index-catalog} db garbage-addr]
-  (let [{:keys [alias schema t stats spot post opst tspo commit namespace-codes
-                reindex-min-bytes reindex-max-bytes max-old-indexes]}
-        db
+(defn write-vg-map
+  [index-catalog vg-map]
+  (go-try
+    (loop [[[vg-alias vg] & r] vg-map
+           address-map         {}]
+      (if vg-alias
+        (let [address (<? (vg/write-vg index-catalog vg))]
+          (recur r (assoc address-map vg-alias address)))
+        address-map))))
 
-        prev-idx-t    (-> commit :index :data :t)
-        prev-idx-addr (-> commit :index :address)
-        data          (cond-> {:ledger-alias alias
-                               :t               t
-                               :v               1 ;; version of db root file
-                               :schema          (vocab/serialize-schema schema)
-                               :stats           (select-keys stats [:flakes :size])
-                               :spot            (child-data spot)
-                               :post            (child-data post)
-                               :opst            (child-data opst)
-                               :tspo            (child-data tspo)
-                               :timestamp       (util/current-time-millis)
-                               :namespace-codes namespace-codes
-                               :config          {:reindex-min-bytes reindex-min-bytes
-                                                 :reindex-max-bytes reindex-max-bytes
-                                                 :max-old-indexes   max-old-indexes}}
-                        prev-idx-t   (assoc :prev-index {:t       prev-idx-t
-                                                         :address prev-idx-addr})
-                        garbage-addr (assoc-in [:garbage :address] garbage-addr))
-        serialized    (serde/serialize-db-root serializer data)]
-    (write-index-file storage alias :root serialized)))
+(defn write-db-root
+  [{:keys [storage serializer] :as index-catalog} db garbage-addr]
+  (go-try
+    (let [{:keys [alias schema t stats spot post opst tspo vg commit namespace-codes
+                  reindex-min-bytes reindex-max-bytes max-old-indexes]}
+          db
+
+          prev-idx-t    (-> commit :index :data :t)
+          prev-idx-addr (-> commit :index :address)
+          vg-addresses  (<? (write-vg-map index-catalog vg))
+          data          (cond-> {:ledger-alias alias
+                                 :t               t
+                                 :v               1 ;; version of db root file
+                                 :schema          (vocab/serialize-schema schema)
+                                 :stats           (select-keys stats [:flakes :size])
+                                 :spot            (child-data spot)
+                                 :post            (child-data post)
+                                 :opst            (child-data opst)
+                                 :tspo            (child-data tspo)
+                                 :vg              vg-addresses
+                                 :timestamp       (util/current-time-millis)
+                                 :namespace-codes namespace-codes
+                                 :config          {:reindex-min-bytes reindex-min-bytes
+                                                   :reindex-max-bytes reindex-max-bytes
+                                                   :max-old-indexes   max-old-indexes}}
+                          prev-idx-t   (assoc :prev-index {:t       prev-idx-t
+                                                           :address prev-idx-addr})
+                          garbage-addr (assoc-in [:garbage :address] garbage-addr))
+          serialized    (serde/serialize-db-root serializer data)]
+      (<? (write-index-file storage alias :root serialized)))))
 
 (defn read-branch
   [{:keys [storage serializer] :as _idx-store} branch-address]
