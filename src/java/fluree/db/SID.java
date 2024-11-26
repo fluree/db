@@ -3,25 +3,33 @@ package fluree.db;
 import java.lang.Comparable;
 
 public final class SID implements Comparable {
-    public final int namespaceCode;
-    public final long[] nameCodes;
+    final int namespaceCode;
+    final long[] nameCodes;
 
-    public SID(int nsCode, long[] nameCodes) {
+    public SID(int nsCode, long... nameCodes) {
         this.namespaceCode = nsCode;
         this.nameCodes = nameCodes;
     }
 
+    public int getNamespaceCode() {
+        return namespaceCode;
+    }
+
+    public long[] getNameCodes() {
+        return nameCodes;
+    }
+
     public final int compareTo(Object o) {
         SID that = (SID) o;
-        int nsComp = Integer.compare(this.namespaceCode, that.namespaceCode);
+        int nsComp = Integer.compare(this.getNamespaceCode(), that.getNamespaceCode());
         if (nsComp != 0) {
             return nsComp;
         }
 
-        final long[] theseCodes = this.nameCodes;
+        final long[] theseCodes = this.getNameCodes();
         final int thisLength = theseCodes.length;
 
-        final long[] thoseCodes = that.nameCodes;
+        final long[] thoseCodes = that.getNameCodes();
         final int thatLength = thoseCodes.length;
 
         for(int i = 0; i < thisLength; i++) {
@@ -53,8 +61,8 @@ public final class SID implements Comparable {
     }
 
     public final int hashCode() {
-        int hsh = namespaceCode;
-        long[] nameCodes = this.nameCodes;
+        int hsh = this.getNamespaceCode();
+        final long[] nameCodes = this.getNameCodes();
 
         for(int i = 0; i < nameCodes.length; i++) {
             hsh += Long.hashCode(nameCodes[i]);
