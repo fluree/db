@@ -1,6 +1,6 @@
 (ns fluree.db.virtual-graph.bm25.storage
   (:require [clojure.set :refer [map-invert]]
-            [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.storage :as storage]
             [fluree.db.serde :as serde]
@@ -114,7 +114,7 @@
   [{:keys [storage serializer] :as _index-catalog} {:keys [alias db-alias] :as vg}]
   (let [data            (vg-data vg)
         serialized-data (serde/serialize-bm25 serializer data)
-        path            (str/join "/" [db-alias "bm25" alias])]
+        path            (vg/storage-path const/$fluree:index-BM25 db-alias alias)]
     (storage/content-write-json storage path serialized-data)))
 
 (defmethod vg/read-vg :bm25
