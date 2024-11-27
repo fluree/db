@@ -33,17 +33,14 @@
               (bit-shift-left result (* diff 8)))
             result))))))
 
-
 (defn long->UTF8
-  [n]
-  (loop [result '()
-         n'     n]
-    (if (= 0 n')
-      #?(:clj (byte-array result)
-         :cljs (.from js/Int8Array result))
-      (let [b   (bit-and n' 0xFF)
-            n'' (bit-shift-right n' 8)]
-        (if (= b 0)
-          (recur result n'')
-          (recur (conj result b)
-                 n''))))))
+  [l]
+  (loop [offset 56
+         bs     []]
+    (if (neg? offset)
+      #?(:clj (byte-array bs)
+          :cljs (.from js/Int8Array bs))
+      (let [b (bit-and (bit-shift-right l offset) 0xFF)]
+        (if (zero? b)
+          (recur (- offset 8) bs)
+          (recur (- offset 8) (conj bs b)))))))
