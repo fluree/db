@@ -50,7 +50,7 @@
         (->> vectors
              (sort sort-fn)
              (vg-parse/limit-results limit)
-             (vg-parse/process-results db solution search-params false)
+             (vg-parse/process-dense-results db solution search-params)
              (async/onto-chan! out-ch)))
       (catch* e
         (log/error e "Error ranking vectors")

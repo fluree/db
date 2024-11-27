@@ -95,7 +95,7 @@
           (recur r (assoc sid->s-flakes sid (into (set s-flakes) existing-flakes))))
         sid->s-flakes))))
 
-(defn new-virtual-graph
+(defn create-virtual-graphs
   "Creates a new virtual graph. If the virtual graph is invalid, an
   exception will be thrown and the transaction will not complete."
   [db add new-vgs]
@@ -108,17 +108,30 @@
         (recur r (assoc-in db* [:vg alias] vg-record)))
       db)))
 
+(defn has-vgs?
+  [db]
+  (not-empty (:vg db)))
+
+(defn virtual-graph?
+  [f]
+  (-> f flake/o (= const/$fluree:VirtualGraph)))
+
+(defn extract-vgs
+  [fs]
+  (->> fs
+       (keep (fn [f]
+               (when (virtual-graph? f)
+                 (flake/s f))))
+       set))
+
 (defn check-virtual-graph
   [db add rem]
   ;; TODO - VG - should also check for retractions to "delete" virtual graph
   ;; TODO - VG - check flakes if user updated existing virtual graph
-  (let [new-vgs  (keep #(when (= (flake/o %) const/$fluree:VirtualGraph)
-                          (flake/s %)) add)
-        has-vgs? (not-empty (:vg db))]
+  (let [new-vgs (extract-vgs add)]
     (cond-> db
-            (seq new-vgs) (new-virtual-graph add (set new-vgs))
-            has-vgs? (vg/update-vgs add rem))))
-
+      (seq new-vgs) (create-virtual-graphs add new-vgs)
+      (has-vgs? db) (vg/update-vgs add rem))))
 
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an

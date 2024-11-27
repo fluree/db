@@ -4,7 +4,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             #?(:clj [fluree.db.virtual-graph.bm25.index :as bm25])
             [fluree.db.virtual-graph.parse :as vg-parse]
-            [fluree.db.virtual-graph.proto :as vgproto]
+            [fluree.db.virtual-graph :as vg]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
@@ -38,22 +38,23 @@
 
 (defn add-vg-id
   "Adds the full virtual graph IRI to the index options map"
-  [{:keys [vg-name] :as idx-opts} {:keys [alias] :as _db}]
+  [{:keys [vg-name] :as idx-opts} db-alias]
   (let [vg-alias (str "##" vg-name)
-        vg-id    (str alias vg-alias)]
-    (assoc idx-opts :id vg-id
-                    :alias vg-alias)))
+        vg-id    (str db-alias vg-alias)]
+    (assoc idx-opts
+           :id vg-id
+           :alias vg-alias)))
 
 (defn bm25-idx?
   [idx-rdf-type]
   (some #(= % const/$fluree:index-BM25) idx-rdf-type))
 
 (defn create
-  [{:keys [t] :as db} vg-flakes]
+  [{:keys [alias t] :as db} vg-flakes]
   (let [db-vol         (volatile! db) ;; needed to potentially add new namespace codes based on query IRIs
         vg-opts        (-> (idx-flakes->opts vg-flakes)
                            (vg-parse/parse-document-query db-vol)
-                           (add-vg-id db)
+                           (add-vg-id alias)
                            (assoc :genesis-t t))
         {:keys [type alias]} vg-opts
         db*            @db-vol
@@ -67,7 +68,7 @@
                          (throw (ex-info "Unrecognized virtual graph creation attempted."
                                          {:status 400
                                           :error  :db/invalid-index})))
-        initialized-vg (vgproto/initialize vg db*)]
+        initialized-vg (vg/initialize vg db*)]
     [db* alias initialized-vg]))
 
 (defn load-virtual-graph
@@ -92,6 +93,6 @@
   (let [vg* (reduce-kv
              (fn [vg* vg-alias vg-impl]
                (log/debug "Virtual Graph update started for: " vg-alias)
-               (assoc vg* vg-alias (vgproto/upsert vg-impl db add remove)))
+               (assoc vg* vg-alias (vg/upsert vg-impl db add remove)))
              {} vg)]
     (assoc db :vg vg*)))
