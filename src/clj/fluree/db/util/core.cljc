@@ -1,5 +1,6 @@
 (ns fluree.db.util.core
   (:require [clojure.string :as str]
+            [fluree.db.constants :as const]
             #?@(:clj [[fluree.db.util.clj-exceptions :as clj-exceptions]
                       [fluree.db.util.cljs-exceptions :as cljs-exceptions]]))
   #?(:cljs (:require-macros [fluree.db.util.core :refer [case+]]))
@@ -437,6 +438,15 @@
     (or (:value val)
         (get val "@value"))
     val))
+
+(defn get-datatype
+  [node]
+  (if (or (contains? node :value)
+          (contains? node "@value"))
+    (get-types node)
+    (when (or (contains? node :id)
+              (contains? node "@id"))
+      const/iri-id)))
 
 (defn get-first-value
   [json-ld k]
