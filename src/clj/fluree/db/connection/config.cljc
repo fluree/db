@@ -61,6 +61,24 @@
   (and (storage? node)
        (contains? node conn-vocab/ipfs-endpoint)))
 
+(defn env-var-datatype?
+  [node]
+  (-> node util/get-datatype (= conn-vocab/env-var-datatype)))
+
+(defn get-value
+  [node]
+  (let [v (util/get-value node)]
+    (if (env-var-datatype? node)
+      #?(:clj (System/getenv v)
+         :cljs nil) ; TODO: Support environment variable overrides in cljs
+      v)))
+
+(defn get-first-value
+  [jsonld k]
+  (-> jsonld
+      (get-first k)
+      get-value))
+
 (defn derive-node-id
   [node]
   (let [id (get-id node)]
