@@ -108,6 +108,19 @@
   [node k]
   (mapv get-string (get node k)))
 
+(defn get-boolean
+  [x]
+  (if (string? x)
+    #?(:clj (Boolean/parseBoolean x)
+       :cljs (js/Boolean x))
+    (boolean x)))
+
+(defn get-first-boolean
+  [node k]
+  (some-> node
+          (get-first-value k)
+          get-boolean))
+
 (defn derive-node-id
   [node]
   (let [id (get-id node)]
