@@ -69,7 +69,9 @@
   [node]
   (let [v (util/get-value node)]
     (if (env-var-datatype? node)
-      #?(:clj (System/getenv v)
+      #?(:clj (or (System/getenv v)
+                  (throw (ex-info (str "Environment variable " v " unset.")
+                                  {:status 400 :error :db/missing-env-var})))
          :cljs nil) ; TODO: Support environment variable overrides in cljs
       v)))
 
