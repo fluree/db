@@ -75,6 +75,10 @@
          :cljs nil) ; TODO: Support environment variable overrides in cljs
       v)))
 
+(defn get-values
+  [node k]
+  (mapv get-value (get node k)))
+
 (defn get-first-value
   [jsonld k]
   (-> jsonld
