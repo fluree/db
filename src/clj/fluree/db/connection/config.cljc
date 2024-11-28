@@ -75,15 +75,38 @@
          :cljs nil) ; TODO: Support environment variable overrides in cljs
       v)))
 
-(defn get-values
-  [node k]
-  (mapv get-value (get node k)))
-
 (defn get-first-value
-  [jsonld k]
-  (-> jsonld
+  [node k]
+  (-> node
       (get-first k)
       get-value))
+
+(defn get-integer
+  [x]
+  (if (string? x)
+    #?(:clj (Integer/parseInt x)
+       :cljs (js/parseInt x))
+    (int x)))
+
+(defn get-first-integer
+  [node k]
+  (some-> node
+          (get-first-value k)
+          get-integer))
+
+(defn get-first-string
+  [node k]
+  (some-> node
+          (get-first-value k)
+          str))
+
+(defn get-string
+  [node]
+  (some-> node get-value str))
+
+(defn get-strings
+  [node k]
+  (mapv get-string (get node k)))
 
 (defn derive-node-id
   [node]

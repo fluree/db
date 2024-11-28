@@ -14,7 +14,7 @@
             [fluree.db.flake.index.storage :as index-storage]
             #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
-            [fluree.db.util.core :as util :refer [get-id get-first get-first-value get-values]]
+            [fluree.db.util.core :as util :refer [get-id get-first]]
             [integrant.core :as ig]))
 
 (derive :fluree.db.storage/file :fluree.db/content-storage)
@@ -82,7 +82,7 @@
 
 (defmethod ig/expand-key :fluree.db/connection
   [k config]
-  (let [cache-max-mb   (get-first-value config conn-vocab/cache-max-mb)
+  (let [cache-max-mb   (config/get-first-integer config conn-vocab/cache-max-mb)
         commit-storage (get-first config conn-vocab/commit-storage)
         index-storage  (get-first config conn-vocab/index-storage)
         remote-systems (get config conn-vocab/remote-systems)
@@ -108,28 +108,28 @@
 
 (defmethod ig/init-key :fluree.db.storage/file
   [_ config]
-  (let [identifier (get-first-value config conn-vocab/address-identifier)
-        root-path  (get-first-value config conn-vocab/file-path)]
+  (let [identifier (config/get-first-string config conn-vocab/address-identifier)
+        root-path  (config/get-first-string config conn-vocab/file-path)]
     (file-storage/open identifier root-path)))
 
 (defmethod ig/init-key :fluree.db.storage/memory
   [_ config]
-  (let [identifier (get-first-value config conn-vocab/address-identifier)]
+  (let [identifier (config/get-first-string config conn-vocab/address-identifier)]
     (memory-storage/open identifier)))
 
 #?(:clj
    (defmethod ig/init-key :fluree.db.storage/s3
      [_ config]
-     (let [identifier  (get-first-value config conn-vocab/address-identifier)
-           s3-bucket   (get-first-value config conn-vocab/s3-bucket)
-           s3-prefix   (get-first-value config conn-vocab/s3-prefix)
-           s3-endpoint (get-first-value config conn-vocab/s3-endpoint)]
+     (let [identifier  (config/get-first-string config conn-vocab/address-identifier)
+           s3-bucket   (config/get-first-string config conn-vocab/s3-bucket)
+           s3-prefix   (config/get-first-string config conn-vocab/s3-prefix)
+           s3-endpoint (config/get-first-string config conn-vocab/s3-endpoint)]
        (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint))))
 
 (defmethod ig/init-key :fluree.db.storage/ipfs
   [_ config]
-  (let [identifier    (get-first-value config conn-vocab/address-identifier)
-        ipfs-endpoint (get-first-value config conn-vocab/ipfs-endpoint)]
+  (let [identifier    (config/get-first-string config conn-vocab/address-identifier)
+        ipfs-endpoint (config/get-first-string config conn-vocab/ipfs-endpoint)]
     (ipfs-storage/open identifier ipfs-endpoint)))
 
 #?(:cljs
@@ -139,8 +139,8 @@
 
 (defmethod ig/init-key :fluree.db/remote-system
   [_ config]
-  (let [urls        (get-values config conn-vocab/server-urls)
-        identifiers (get-values config conn-vocab/address-identifiers)]
+  (let [urls        (config/get-strings config conn-vocab/server-urls)
+        identifiers (config/get-strings config conn-vocab/address-identifiers)]
     (remote-system/connect urls identifiers)))
 
 (defmethod ig/init-key :fluree.db/commit-catalog
@@ -159,8 +159,8 @@
 
 (defmethod ig/init-key :fluree.db.nameservice/ipns
   [_ config]
-  (let [endpoint (get-first-value config conn-vocab/ipfs-endpoint)
-        ipns-key (get-first-value config conn-vocab/ipns-key)]
+  (let [endpoint (config/get-first-string config conn-vocab/ipfs-endpoint)
+        ipns-key (config/get-first-string config conn-vocab/ipns-key)]
     (ipns-nameservice/initialize endpoint ipns-key)))
 
 (defmethod ig/init-key :fluree.db.serializer/json
@@ -171,15 +171,15 @@
   [defaults]
   (when-let [identity (get-first defaults conn-vocab/identity)]
     {:id      (get-id identity)
-     :public  (get-first-value identity conn-vocab/public-key)
-     :private (get-first-value identity conn-vocab/private-key)}))
+     :public  (config/get-first-string identity conn-vocab/public-key)
+     :private (config/get-first-string identity conn-vocab/private-key)}))
 
 (defn parse-index-options
   [defaults]
   (when-let [index-options (get-first defaults conn-vocab/index-options)]
-    {:reindex-min-bytes (get-first-value index-options conn-vocab/reindex-min-bytes)
-     :reindex-max-bytes (get-first-value index-options conn-vocab/reindex-max-bytes)
-     :max-old-indexes   (get-first-value index-options conn-vocab/max-old-indexes)}))
+    {:reindex-min-bytes (config/get-first-integer index-options conn-vocab/reindex-min-bytes)
+     :reindex-max-bytes (config/get-first-integer index-options conn-vocab/reindex-max-bytes)
+     :max-old-indexes   (config/get-first-integer index-options conn-vocab/max-old-indexes)}))
 
 (defn parse-defaults
   [config]
@@ -192,7 +192,7 @@
 
 (defmethod ig/init-key :fluree.db/connection
   [_ {:keys [cache commit-catalog index-catalog serializer] :as config}]
-  (let [parallelism          (get-first-value config conn-vocab/parallelism)
+  (let [parallelism          (config/get-first-integer config conn-vocab/parallelism)
         primary-publisher    (get-first config conn-vocab/primary-publisher)
         secondary-publishers (get config conn-vocab/secondary-publishers)
         remote-systems       (get config conn-vocab/remote-systems)
