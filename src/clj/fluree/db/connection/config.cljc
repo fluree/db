@@ -2,7 +2,7 @@
   (:require [clojure.string :as str]
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util :refer [get-id get-first get-first-value get-values]]
+            [fluree.db.util.core :as util :refer [get-id get-first]]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]))
 
@@ -65,14 +65,14 @@
   [node]
   (let [id (get-id node)]
     (cond
-      (connection? node)           (derive id :fluree.db/connection)
-      (system? node)               (derive id :fluree.db/remote-system)
-      (memory-storage? node)       (derive id :fluree.db.storage/memory)
-      (file-storage? node)         (derive id :fluree.db.storage/file)
-      (s3-storage? node)           (derive id :fluree.db.storage/s3)
-      (ipfs-storage? node)         (derive id :fluree.db.storage/ipfs)
-      (ipns-nameservice? node)     (derive id :fluree.db.nameservice/ipns)
-      (storage-nameservice? node)  (derive id :fluree.db.nameservice/storage))
+      (connection? node)          (derive id :fluree.db/connection)
+      (system? node)              (derive id :fluree.db/remote-system)
+      (memory-storage? node)      (derive id :fluree.db.storage/memory)
+      (file-storage? node)        (derive id :fluree.db.storage/file)
+      (s3-storage? node)          (derive id :fluree.db.storage/s3)
+      (ipfs-storage? node)        (derive id :fluree.db.storage/ipfs)
+      (ipns-nameservice? node)    (derive id :fluree.db.nameservice/ipns)
+      (storage-nameservice? node) (derive id :fluree.db.nameservice/storage))
     node))
 
 (def component-exclusions
