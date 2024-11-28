@@ -10,6 +10,9 @@
   [s]
   (str system-ns s))
 
+(def env-var-datatype
+  (system-iri "EnvVar"))
+
 (def connection-type
   (system-iri "Connection"))
 
