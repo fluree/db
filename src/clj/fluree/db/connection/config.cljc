@@ -72,7 +72,9 @@
       #?(:clj (or (System/getenv v)
                   (throw (ex-info (str "Environment variable " v " unset.")
                                   {:status 400 :error :db/missing-env-var})))
-         :cljs nil) ; TODO: Support environment variable overrides in cljs
+         ;; TODO: Support environment variable overrides in cljs
+         :cljs (throw (ex-info "Environment variables are not supported on this platform"
+                               {:status 400 :error :db/unsupported-config})))
       v)))
 
 (defn get-first-value
