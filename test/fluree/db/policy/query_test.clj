@@ -316,7 +316,7 @@
                                             "@type" "usa:territory"
                                             "ex:name" "Puerto Rico"
                                             "ex:capitol" "San Juan"}]})]
-    (testing "no policyValues"
+    (testing "no policyValues returns all results"
       (is (= ["Colorado" "New York" "North Carolina" "Puerto Rico" "Wisconsin"]
              @(fluree/query db {"@context" test-utils/default-str-context
                                 "where" [{"@id" "?state" "ex:name" "?name"}]
@@ -328,7 +328,7 @@
                                          "f:query" {"@type" "@json"
                                                     "@value"
                                                     {"where" [{"@id" "?$this" "ex:capitol" "?capitol"}]}}}}}))))
-    (testing "a single policyValues value"
+    (testing "a single policyValues value constrains results to corresponding value"
       (is (= ["Wisconsin"]
              @(fluree/query db {"@context" test-utils/default-str-context
                                 "where" [{"@id" "?state" "ex:name" "?name"}]
@@ -341,7 +341,7 @@
                                                     "@value"
                                                     {"where" [{"@id" "?$this" "ex:capitol" "?capitol"}]}}}
                                         "policyValues" ["?capitol" ["Madison"]]}}))))
-    (testing "multiple policyValues values"
+    (testing "multiple policyValues values constrains results to corresponding values"
       (is (= ["Puerto Rico" "Wisconsin"]
              @(fluree/query db {"@context" test-utils/default-str-context
                                 "where" [{"@id" "?state" "ex:name" "?name"}]
@@ -354,7 +354,7 @@
                                                     "@value"
                                                     {"where" [{"@id" "?$this" "ex:capitol" "?capitol"}]}}}
                                         "policyValues" ["?capitol" ["Madison" "San Juan"]]}}))))
-    (testing "multiple vars and multiple values"
+    (testing "multiple vars and multiple values constrains results to corresponding values"
       (is (= ["Wisconsin"]
              @(fluree/query db {"@context" test-utils/default-str-context
                                 "where" [{"@id" "?state" "ex:name" "?name"}]
@@ -368,7 +368,7 @@
                                                                "ex:capitol" "?capitol"}]}}}
                                         "policyValues" [["?type" "?capitol"]
                                                         [[{"@value" "usa:state" "@type" "@id"} "Madison"]]]}}))))
-    (testing "pre-existing values clause"
+    (testing "pre-existing values clause compose with supplied policyValues"
       (is (= ["Wisconsin"]
              @(fluree/query db {"@context" test-utils/default-str-context
                                 "where" [{"@id" "?state" "ex:name" "?name"}]
