@@ -350,7 +350,6 @@
                                          (json-ld/expand genesis-commit))]
           (when (util/exception? ledger)
             (release-ledger conn ledger-alias))
-          (<? (publish-commit conn genesis-commit))
           (async/put! ledger-chan ledger)
           ledger)))))
 

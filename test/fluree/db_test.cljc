@@ -14,26 +14,55 @@
                :cljs [test-with-files.tools :as-alias twf])))
 
 (deftest exists?-test
-  (testing "returns false before ledger creation and true afterwards"
+  (testing "returns false before committing data to a ledger"
     #?(:clj
-       (let [conn            (test-utils/create-conn)
-             ledger-alias    "testledger"
-             before-creation @(fluree/exists? conn ledger-alias)
-             ledger          @(fluree/create conn ledger-alias)
-             after-creation  @(fluree/exists? conn ledger-alias)]
-         (is (false? before-creation))
-         (is (true? after-creation)))
+       (let [conn         (test-utils/create-conn)
+             ledger-alias "testledger"
+             check1       @(fluree/exists? conn ledger-alias)
+             ledger       @(fluree/create conn ledger-alias)
+             check2       @(fluree/exists? conn ledger-alias)
+             _            @(fluree/stage (fluree/db ledger)
+                                         {"@context" ["https://ns.flur.ee"
+                                                      test-utils/default-context]
+                                          "insert"
+                                          [{:id :f/me
+                                            :type :schema/Person
+                                            :schema/fname "Me"}]})
+             check3       @(fluree/exists? conn ledger-alias)]
+         (is (every? false? [check1 check2 check3])))))
+  (testing "returns true after committing data to a ledger"
+    #?(:clj
+       (let [conn         (test-utils/create-conn)
+             ledger-alias "testledger"
+             ledger       @(fluree/create conn ledger-alias)
+             db           @(fluree/stage (fluree/db ledger)
+                                         {"@context" ["https://ns.flur.ee"
+                                                      test-utils/default-context]
+                                          "insert"
+                                          [{:id           :f/me
+                                            :type         :schema/Person
+                                            :schema/fname "Me"}]})]
+         @(fluree/commit! ledger db)
+         (is (test-utils/retry-exists? conn ledger-alias 100))
+         (is (not @(fluree/exists? conn "notaledger"))))
+
        :cljs
        (async done
          (go
-           (let [conn            (<! (test-utils/create-conn))
-                 ledger-alias    "testledger"
-                 before-creation (<p! (fluree/exists? conn ledger-alias))
-                 ledger          (<p! (fluree/create conn ledger-alias))
-                 after-creation  (<p! (fluree/exists? conn ledger-alias))]
-             (is (false? before-creation))
-             (is (true? after-creation))
-             (done)))))))
+          (let [conn         (<! (test-utils/create-conn))
+                ledger-alias "testledger"
+                ledger       (<p! (fluree/create conn ledger-alias))
+                db           (<p! (fluree/stage (fluree/db ledger)
+                                                {"@context" ["https://ns.flur.ee"
+                                                             test-utils/default-context]
+                                                 "insert"
+                                                 [{:id           :f/me
+                                                   :type         :schema/Person
+                                                   :schema/fname "Me"}]}))]
+            (<p! (fluree/commit! ledger db))
+            (is (test-utils/retry-exists? conn ledger-alias 100))
+            (is (not (<p! (fluree/exists? conn "notaledger"))))
+            (done)))))))
 
 
 #?(:clj
