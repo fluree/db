@@ -5,6 +5,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
+            [fluree.db.util.parse :as util.parse]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -64,14 +65,6 @@
                  policies*)
         (<! (wrap-policy db (json-ld/expand policies*) policy-values))))))
 
-(defn normalize-values
-  "Normalize the structure of the values clause to
-  [[vars...] [[val1..] [val2...] ...]], handling nil properly."
-  [values]
-  (let [[vars vals] values]
-    [(into [] (when vars (util/sequential vars)))
-     (mapv util/sequential vals)]))
-
 (defn inject-value-binding
   "Inject the given var and value into a normalized values clause."
   [values var v]
@@ -96,7 +89,7 @@
                       policies
                       (policy-from-query policies))
 
-          policy-values* (-> (normalize-values policy-values)
+          policy-values* (-> (util.parse/normalize-values policy-values)
                              (inject-value-binding "?$identity" {"@value" identity "@type" const/iri-id}))]
       (log/trace "wrap-identity-policy - extracted policy from identity: " identity " policy: " policies*)
       (if (util/exception? policies*)

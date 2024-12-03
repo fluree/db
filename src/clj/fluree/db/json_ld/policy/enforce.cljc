@@ -5,7 +5,8 @@
             [fluree.db.json-ld.policy :as policy :refer [root]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.util.parse :as util.parse]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -56,7 +57,7 @@
   (let [policy-values (-> db :policy :policy-values)
         query         (:query policy)
         this-val      (iri/decode-sid db sid)
-        values        (-> (policy/normalize-values policy-values)
+        values        (-> (util.parse/normalize-values policy-values)
                           (policy/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
     (update query "where" (fn [where-clause]
                             (into [["values" values]]

@@ -5,7 +5,6 @@
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.json-ld.policy :as policy]
             [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
@@ -13,6 +12,7 @@
             [fluree.db.util.context :as context]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.parse :as util.parse]
             [fluree.db.validation :as v]
             [fluree.json-ld :as json-ld]))
 
@@ -146,7 +146,7 @@
 (defn parse-values
   [values context]
   (when values
-    (let [[vars vals] (policy/normalize-values values)
+    (let [[vars vals] (util.parse/normalize-values values)
           parsed-vars (keep parse-var-name vars)
           var-count   (count vars)]
       (if (every? (fn [binding] (= (count binding) var-count))
