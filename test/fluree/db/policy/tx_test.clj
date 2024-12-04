@@ -59,11 +59,9 @@
                                           "f:query"  {"@type"  "@json"
                                                       "@value" {}}}]}
 
-          john-params       {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}}
+          john-params       ["?$identity" [{"@value" john-did "@type" "@id"}]]
 
-          alice-params      {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}}
+          alice-params      ["?$identity" [{"@value" alice-did "@type" "@id"}]]
 
           john-allowed      @(fluree/stage
                               @(fluree/wrap-policy db policy john-params)
@@ -157,11 +155,9 @@
                                           "f:query"  {"@type"  "@json"
                                                       "@value" {}}}]}
 
-          john-params       {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}}
+          john-params       ["?$identity" [{"@value" john-did "@type" "@id"}]]
 
-          alice-params      {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}}
+          alice-params      ["?$identity" [{"@value" alice-did "@type" "@id"}]]
 
           john-allowed      @(fluree/stage
                               @(fluree/wrap-policy db policy john-params)
@@ -204,7 +200,7 @@
                     "insert"   [{"@id"         "ex:alice"
                                  "schema:name" "Alice"}]})]
 
-      (testing " apply policy with only view action, no modify and transact"
+      (testing "apply policy with only view action, no modify and transact"
         (let [policy-wrapped @(fluree/wrap-policy
                                db {"@context" {"ex" "http://example.org/ns/"
                                                "f"  "https://ns.flur.ee/ledger#"}
@@ -225,7 +221,7 @@
           (is (= "Database policy denies all modifications."
                  (ex-message no-policy-ex)))))
 
-      (testing " apply policy with modify policy that will always return false"
+      (testing "apply policy with modify policy that will always return false"
         (let [policy-wrapped @(fluree/wrap-policy
                                db [;; falesy always modify
                                    {"@context"    {"ex" "http://example.org/ns/"

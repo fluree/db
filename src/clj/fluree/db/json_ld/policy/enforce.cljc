@@ -1,10 +1,12 @@
 (ns fluree.db.json-ld.policy.enforce
-  (:require [fluree.db.util.async :refer [<? go-try]]
+  (:require [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.json-ld.policy :refer [root]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.json-ld.policy :as policy :refer [root]]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]
+            [fluree.db.util.parse :as util.parse]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -51,17 +53,15 @@
     (get-in policy-map [const/iri-view :default])))
 
 (defn policy-query
-  [db sid values-map policy]
-  (let [query    (:query policy)
-        this-var (iri/decode-sid db sid)
-        values   (if-let [existing-values (get query "values")]
-                   ;; TODO - merge existing values with new values
-                   :TODO
-                   [(into ["?$this"] (keys values-map))
-                    [(into [{"@value" this-var
-                             "@type"  const/iri-id}]
-                           (vals values-map))]])]
-    (assoc query "values" values)))
+  [db sid policy]
+  (let [policy-values (-> db :policy :policy-values)
+        query         (:query policy)
+        this-val      (iri/decode-sid db sid)
+        values        (-> (util.parse/normalize-values policy-values)
+                          (policy/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
+    (update query "where" (fn [where-clause]
+                            (into [["values" values]]
+                                  (when where-clause (util/sequential where-clause)))))))
 
 (defn modify-exception
   [policies]
@@ -73,17 +73,17 @@
 (defn policies-allow?
   "Once narrowed to a specific set of policies, execute and return
   appropriate policy response."
-  [db modify? sid values-map policies-to-eval]
+  [db modify? sid policies-to-eval]
   (go-try
-   (loop [[p-map & r] policies-to-eval]
-     ;; return first truthy response, else false
-     (if p-map
-       (let [query  (policy-query db sid values-map p-map)
-             result (<? (dbproto/-query (root db) query))]
-         (if (seq result)
-           true
-           (recur r)))
-       ;; no more policies left to evaluate - all returned false
-       (if modify?
-         (modify-exception policies-to-eval)
-         false)))))
+    (loop [[policy & r] policies-to-eval]
+      ;; return first truthy response, else false
+      (if policy
+        (let [query  (policy-query db sid policy)
+              result (<? (dbproto/-query (root db) query))]
+          (if (seq result)
+            true
+            (recur r)))
+        ;; no more policies left to evaluate - all returned false
+        (if modify?
+          (modify-exception policies-to-eval)
+          false)))))
