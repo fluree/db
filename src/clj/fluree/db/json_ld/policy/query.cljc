@@ -40,16 +40,15 @@
   hits this fn."
   [{:keys [policy] :as db} flake]
   (go-try
-   (let [pid     (flake/p flake)
-         sid     (flake/s flake)]
-     (if-let [p-policies (enforce/policies-for-property policy false pid)]
-       (<? (enforce/policies-allow? db false sid p-policies))
-       (if-let [c-policies (or (cached-class-policies policy sid)
-                               (<? (class-policies db sid)))]
-         (<? (enforce/policies-allow? db false sid c-policies))
-         (if-let [d-policies (enforce/default-policies policy false)]
-           (<? (enforce/policies-allow? db false sid d-policies))
-           false))))))
+   (let [pid (flake/p flake)
+         sid (flake/s flake)]
+     (or (when-let [p-policies (enforce/policies-for-property policy false pid)]
+           (<? (enforce/policies-allow? db false sid p-policies)))
+         (when-let [c-policies (or (cached-class-policies policy sid)
+                                   (<? (class-policies db sid)))]
+           (<? (enforce/policies-allow? db false sid c-policies)))
+         (when-let [d-policies (enforce/default-policies policy false)]
+           (<? (enforce/policies-allow? db false sid d-policies)))))))
 
 (defn allow-iri?
   "Returns async channel with truthy value if iri is visible for query results"
