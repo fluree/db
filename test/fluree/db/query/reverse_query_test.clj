@@ -30,6 +30,12 @@
              @(fluree/query db {:context   [context {:friended {:reverse :ex/friend}}]
                                 :selectOne {:ex/brian [:schema/name :friended]}})))
 
+      (is (= {:schema/name "Brian"
+              :friended    [:ex/cam]}
+             @(fluree/query db {:context   [context {:friended {:container :set
+                                                                :reverse :ex/friend}}]
+                                :selectOne {:ex/brian [:schema/name :friended]}})))
+
       (is (= {:schema/name "Alice"
               :friended    [:ex/brian :ex/cam]}
              @(fluree/query db {:context   [context {:friended {:reverse :ex/friend}}]

@@ -90,13 +90,13 @@
             (>! error-ch e))))
       prop-ch))
 
-  (-reverse-property [_ iri reverse-spec compact-fn cache fuel-tracker error-ch]
+  (-reverse-property [_ iri reverse-spec context compact-fn cache fuel-tracker error-ch]
     (let [prop-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (subject/-reverse-property iri reverse-spec compact-fn cache fuel-tracker error-ch)
+                (subject/-reverse-property iri reverse-spec context compact-fn cache fuel-tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
             (log/error e "Error loading database")
