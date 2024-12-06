@@ -93,7 +93,7 @@
                       (set classes))
         src-query   (util/get-first-value restriction const/iri-query)
         query       (if (map? src-query)
-                      (assoc src-query "select" "?$this")
+                      (assoc src-query "select" "?$this" "limit" 1)
                       (throw (ex-info (str "Invalid policy, unable to extract query from f:query. "
                                            "Did you forget @context?. Parsed restriction: " restriction)
                                       {:status 400
