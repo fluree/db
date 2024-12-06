@@ -24,23 +24,24 @@
   message (if available)."
   [{:keys [db-after add mods]}]
   (go-try
-   (let [{:keys [policy]} db-after]
-     (if (enforce/unrestricted-modify? policy)
-       db-after
-       (loop [[flake & r] add]
-         (if flake
-           (let [sid (flake/s flake)]
-             (or (when-let [p-policies (enforce/policies-for-property policy true (flake/p flake))]
-                   (<? (enforce/policies-allow? db-after true sid p-policies)))
-                 (when-let [c-policies (->> (classes-for-sid sid mods db-after)
-                                            (enforce/policies-for-classes policy true))]
-                   (<? (enforce/policies-allow? db-after true sid c-policies)))
-                 (when-let [d-policies (enforce/default-policies policy true)]
-                   (<? (enforce/policies-allow? db-after true sid d-policies))))
-
-             (recur r))
-           ;; no more flakes, all passed so return final db
-           db-after))))))
+    (let [{:keys [policy]} db-after]
+      (if (enforce/unrestricted-modify? policy)
+        db-after
+        (loop [[flake & r] add]
+          (if flake
+            (let [sid      (flake/s flake)
+                  pid      (flake/p flake)
+                  policies (concat (enforce/policies-for-property policy true pid)
+                                   (->> (classes-for-sid sid mods db-after)
+                                        (enforce/policies-for-classes policy true))
+                                   (enforce/default-policies policy true))]
+              ;; policies-allow? will throw if access forbidden
+              (if-some [required-policies (not-empty (filter :required? policies))]
+                (<? (enforce/policies-allow? db-after true sid required-policies))
+                (<? (enforce/policies-allow? db-after true sid policies)))
+              (recur r))
+            ;; no more flakes, all passed so return final db
+            db-after))))))
 
 (defn deny-all?
   "Returns true if policy allows no modification."
