@@ -11,8 +11,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
             [fluree.db.datatype :as datatype]
-            [fluree.db.util.json :as json]
-            [fluree.db.json-ld.iri :as iri]))
+            [fluree.db.util.json :as json]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -196,7 +195,8 @@
   "Formats each solution within the stream of solutions in `solution-ch` according
   to the selectors within the select clause of the supplied parsed query `q`."
   [db q fuel-tracker error-ch solution-ch]
-  (let [context             (:context q)
+  (let [context             (or (:selection-context q)
+                                (:context q))
         compact             (json-ld/compact-fn context)
         selectors           (or (:select q)
                                 (:select-one q)
