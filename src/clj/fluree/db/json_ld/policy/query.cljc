@@ -44,7 +44,9 @@
           sid      (flake/s flake)
           policies (concat (enforce/policies-for-property policy false pid)
                            (or (cached-class-policies policy sid)
-                               (<? (class-policies db sid)))
+                               (when (-> policy (get const/iri-view) :class not-empty)
+                                 ;; only do range scan if we have /any/ class policies
+                                 (<? (class-policies db sid))))
                            (enforce/default-policies policy false))]
       (if-some [required-policies (not-empty (filter :required? policies))]
         (<? (enforce/policies-allow? db false sid required-policies))
