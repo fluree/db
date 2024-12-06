@@ -124,7 +124,7 @@
   [db policy-rules]
   (reduce
    (fn [acc rule]
-     (let [parsed-restriction (restriction-map rule)] ;; will return nil if formatting is not valid
+     (let [parsed-restriction (restriction-map rule)] ;; will throw if formatting is not valid
        (cond
 
          (property-restriction? parsed-restriction)
