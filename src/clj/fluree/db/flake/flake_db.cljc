@@ -346,8 +346,8 @@
   (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
     (jld-format/forward-properties db iri spec context compact-fn cache fuel-tracker error-ch))
 
-  (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch]
-    (jld-format/reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch))
+  (-reverse-property [db iri reverse-spec context compact-fn cache fuel-tracker error-ch]
+    (jld-format/reverse-property db iri reverse-spec context compact-fn cache fuel-tracker error-ch))
 
   (-iri-visible? [db iri]
     (qpolicy/allow-iri? db iri))
