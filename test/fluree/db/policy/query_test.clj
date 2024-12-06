@@ -43,6 +43,7 @@
                                  "f"      "https://ns.flur.ee/ledger#"}
                      "@graph"   [{"@id"          "ex:ssnRestriction"
                                   "@type"        ["f:AccessPolicy"]
+                                  "f:required"   true
                                   "f:onProperty" [{"@id" "schema:ssn"}]
                                   "f:action"     {"@id" "f:view"}
                                   "f:query"      {"@type"  "@json"
@@ -148,6 +149,7 @@
                                        "f"      "https://ns.flur.ee/ledger#"}
                            "@graph"   [{"@id"       "ex:productPropertyRestriction"
                                         "@type"     ["f:AccessPolicy"]
+                                        "f:required" true
                                         "f:onClass" [{"@id" "ex:Product"}]
                                         "f:action"  {"@id" "f:view"}
                                         "f:query"   {"@type"  "@json"
@@ -230,6 +232,7 @@
                                       "f"  "https://ns.flur.ee/ledger#"}
                          "@id"       "ex:unclassRestriction"
                          "@type"     ["f:AccessPolicy", "ex:UnclassPolicy"]
+                         "f:required" true
                          "f:onClass" [{"@id" "ex:Data"}]
                          "f:action"  [{"@id" "f:view"}, {"@id" "f:modify"}]
                          "f:query"   {"@type"  "@json"

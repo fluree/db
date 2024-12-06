@@ -136,6 +136,7 @@
                                      "ct" "ledger:credentialtest/"}
                       "@id"         "ct:userPolicy"
                       "@type"       ["f:AccessPolicy" "ct:DefaultUserPolicy"]
+                      "f:required"  true
                       "f:onClass"   [{"@id" "ct:User"}]
                       "f:action"    [{"@id" "f:view"}, {"@id" "f:modify"}]
                       "f:exMessage" "Users can only manage their own data."
