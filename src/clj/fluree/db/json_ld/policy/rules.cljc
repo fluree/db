@@ -93,7 +93,7 @@
                       (set classes))
         src-query   (util/get-first-value restriction const/iri-query)
         query       (if (map? src-query)
-                      (assoc src-query "select" "?$this")
+                      (assoc src-query "select" "?$this" "limit" 1)
                       (throw (ex-info (str "Invalid policy, unable to extract query from f:query. "
                                            "Did you forget @context?. Parsed restriction: " restriction)
                                       {:status 400
@@ -107,6 +107,7 @@
       {:id          id
        :on-property on-property
        :on-class    on-class
+       :required?   (util/get-first-value restriction const/iri-required)
        :default?    (and (nil? on-property) (nil? on-class)) ;; with no class or property restrictions, becomes a default policy
        :ex-message  (util/get-first-value restriction const/iri-exMessage)
        :view?       view?
@@ -123,7 +124,7 @@
   [db policy-rules]
   (reduce
    (fn [acc rule]
-     (let [parsed-restriction (restriction-map rule)] ;; will return nil if formatting is not valid
+     (let [parsed-restriction (restriction-map rule)] ;; will throw if formatting is not valid
        (cond
 
          (property-restriction? parsed-restriction)
