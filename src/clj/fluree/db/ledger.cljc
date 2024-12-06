@@ -7,7 +7,9 @@
             [clojure.string :as str]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake]))
+            [fluree.db.flake :as flake]
+            [fluree.db.nameservice :as nameservice]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -137,24 +139,6 @@
    :branch   current-branch
    :graphs   {}})
 
-(defn instantiate
-  "Creates a new ledger, optionally bootstraps it as permissioned or with default
-  context."
-  [conn ledger-alias ledger-address branch commit-catalog index-catalog
-   indexing-opts did latest-commit]
-  (let [branches {branch (branch/state-map ledger-alias branch commit-catalog index-catalog
-                                           latest-commit indexing-opts)}]
-    (map->Ledger {:conn                 conn
-                  :id                   (random-uuid)
-                  :did                  did
-                  :state                (atom (initial-state branches branch))
-                  :alias                ledger-alias
-                  :address              ledger-address
-                  :commit-catalog       commit-catalog
-                  :index-catalog        index-catalog
-                  :cache                (atom {})
-                  :reasoner             #{}})))
-
 (defn normalize-alias
   "For a ledger alias, removes any preceding '/' or '#' if exists."
   [ledger-alias]
@@ -163,17 +147,21 @@
     (subs ledger-alias 1)
     ledger-alias))
 
-(defn create
+(defn instantiate
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [{:keys [conn alias primary-address publish-addresses commit-catalog index-catalog]}
-   {:keys [did branch indexing] :as opts}]
-  (go-try
-    (let [ledger-alias*  (normalize-alias alias)
-          ;; internal-only opt used for migrating ledgers without genesis commits
-          init-time      (or (:fluree.db.json-ld.migrate.sid/time opts)
-                             (util/current-time-iso))
-          genesis-commit (<? (commit-storage/write-genesis-commit
-                               commit-catalog alias branch publish-addresses init-time))]
-      (instantiate conn ledger-alias* primary-address branch commit-catalog index-catalog
-                   indexing did genesis-commit))))
+  [conn ledger-alias ledger-address branch commit-catalog index-catalog
+   indexing-opts did latest-commit]
+  (let [alias    (normalize-alias ledger-alias)
+        branches {branch (branch/state-map alias branch commit-catalog index-catalog
+                                           latest-commit indexing-opts)}]
+    (map->Ledger {:conn                 conn
+                  :id                   (random-uuid)
+                  :did                  did
+                  :state                (atom (initial-state branches branch))
+                  :alias                alias
+                  :address              ledger-address
+                  :commit-catalog       commit-catalog
+                  :index-catalog        index-catalog
+                  :cache                (atom {})
+                  :reasoner             #{}})))
