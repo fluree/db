@@ -244,21 +244,21 @@
                   (crypto/create-jws sparql (:private auth))
                   {:format :sparql}))
              "SPARQL query credential - allowing access")
-         
+
          (is (= []
                 @(fluree/credential-query
                   (fluree/db ledger)
                   (crypto/create-jws sparql (:private pleb-auth))
                   {:format :sparql}))
              "SPARQL query credential - forbidding access")
-         
+
          (is (= [["D"]]
                 @(fluree/credential-query-connection
                   conn
                   (crypto/create-jws sparql (:private auth))
                   {:format :sparql}))
              "SPARQL query connection credential - allowing access")
-         
+
          (is (= []
                 @(fluree/credential-query-connection
                   conn
