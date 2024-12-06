@@ -2,7 +2,7 @@
   (:require [clojure.string :as str]
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util :refer [get-id get-first get-first-value get-values]]
+            [fluree.db.util.core :as util :refer [get-id get-first]]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]))
 
@@ -61,18 +61,80 @@
   (and (storage? node)
        (contains? node conn-vocab/ipfs-endpoint)))
 
+(defn env-var-datatype?
+  [node]
+  (-> node util/get-datatype (= conn-vocab/env-var-datatype)))
+
+(defn get-value
+  [node]
+  (let [v (util/get-value node)]
+    (if (env-var-datatype? node)
+      #?(:clj (or (System/getenv v)
+                  (throw (ex-info (str "Environment variable " v " unset.")
+                                  {:status 400 :error :db/missing-env-var})))
+         ;; TODO: Support environment variable overrides in cljs
+         :cljs (throw (ex-info "Environment variables are not supported on this platform"
+                               {:status 400 :error :db/unsupported-config})))
+      v)))
+
+(defn get-first-value
+  [node k]
+  (-> node
+      (get-first k)
+      get-value))
+
+(defn get-integer
+  [x]
+  (if (string? x)
+    #?(:clj (Integer/parseInt x)
+       :cljs (js/parseInt x))
+    (int x)))
+
+(defn get-first-integer
+  [node k]
+  (some-> node
+          (get-first-value k)
+          get-integer))
+
+(defn get-first-string
+  [node k]
+  (some-> node
+          (get-first-value k)
+          str))
+
+(defn get-string
+  [node]
+  (some-> node get-value str))
+
+(defn get-strings
+  [node k]
+  (mapv get-string (get node k)))
+
+(defn get-boolean
+  [x]
+  (if (string? x)
+    #?(:clj (Boolean/parseBoolean x)
+       :cljs (js/Boolean x))
+    (boolean x)))
+
+(defn get-first-boolean
+  [node k]
+  (some-> node
+          (get-first-value k)
+          get-boolean))
+
 (defn derive-node-id
   [node]
   (let [id (get-id node)]
     (cond
-      (connection? node)           (derive id :fluree.db/connection)
-      (system? node)               (derive id :fluree.db/remote-system)
-      (memory-storage? node)       (derive id :fluree.db.storage/memory)
-      (file-storage? node)         (derive id :fluree.db.storage/file)
-      (s3-storage? node)           (derive id :fluree.db.storage/s3)
-      (ipfs-storage? node)         (derive id :fluree.db.storage/ipfs)
-      (ipns-nameservice? node)     (derive id :fluree.db.nameservice/ipns)
-      (storage-nameservice? node)  (derive id :fluree.db.nameservice/storage))
+      (connection? node)          (derive id :fluree.db/connection)
+      (system? node)              (derive id :fluree.db/remote-system)
+      (memory-storage? node)      (derive id :fluree.db.storage/memory)
+      (file-storage? node)        (derive id :fluree.db.storage/file)
+      (s3-storage? node)          (derive id :fluree.db.storage/s3)
+      (ipfs-storage? node)        (derive id :fluree.db.storage/ipfs)
+      (ipns-nameservice? node)    (derive id :fluree.db.nameservice/ipns)
+      (storage-nameservice? node) (derive id :fluree.db.nameservice/storage))
     node))
 
 (def component-exclusions
