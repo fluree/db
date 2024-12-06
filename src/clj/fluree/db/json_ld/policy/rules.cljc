@@ -107,6 +107,7 @@
       {:id          id
        :on-property on-property
        :on-class    on-class
+       :required?   (util/get-first-value restriction const/iri-required)
        :default?    (and (nil? on-property) (nil? on-class)) ;; with no class or property restrictions, becomes a default policy
        :ex-message  (util/get-first-value restriction const/iri-exMessage)
        :view?       view?
