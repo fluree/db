@@ -346,8 +346,8 @@
   (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
     (jld-format/forward-properties db iri spec context compact-fn cache fuel-tracker error-ch))
 
-  (-reverse-property [db iri reverse-spec compact-fn cache fuel-tracker error-ch]
-    (jld-format/reverse-property db iri reverse-spec compact-fn cache fuel-tracker error-ch))
+  (-reverse-property [db iri reverse-spec context compact-fn cache fuel-tracker error-ch]
+    (jld-format/reverse-property db iri reverse-spec context compact-fn cache fuel-tracker error-ch))
 
   (-iri-visible? [db iri]
     (qpolicy/allow-iri? db iri))
@@ -396,8 +396,8 @@
     (history/query-commits db context from-t to-t include error-ch))
 
   policy/Restrictable
-  (wrap-policy [db policy values-map]
-    (policy-rules/wrap-policy db policy values-map))
+  (wrap-policy [db policy policy-values]
+    (policy-rules/wrap-policy db policy policy-values))
   (root [db]
     (policy/root-db db))
 
