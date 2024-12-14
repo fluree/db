@@ -2,7 +2,8 @@
   (:require [clojure.string :as str]
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util :refer [get-id get-first]]
+            [fluree.db.util.core :as util :refer [get-id get-first get-first-value
+                                                  get-value]]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]))
 
@@ -67,28 +68,6 @@
   [node]
   (and (storage? node)
        (contains? node conn-vocab/ipfs-endpoint)))
-
-(defn env-var-datatype?
-  [node]
-  (-> node util/get-datatype (= conn-vocab/env-var-datatype)))
-
-(defn get-value
-  [node]
-  (let [v (util/get-value node)]
-    (if (env-var-datatype? node)
-      #?(:clj (or (System/getenv v)
-                  (throw (ex-info (str "Environment variable " v " unset.")
-                                  {:status 400 :error :db/missing-env-var})))
-         ;; TODO: Support environment variable overrides in cljs
-         :cljs (throw (ex-info "Environment variables are not supported on this platform"
-                               {:status 400 :error :db/unsupported-config})))
-      v)))
-
-(defn get-first-value
-  [node k]
-  (-> node
-      (get-first k)
-      get-value))
 
 (defn get-integer
   [x]
