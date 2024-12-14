@@ -12,6 +12,13 @@
   [node kind]
   (-> node (get-first :type) (= kind)))
 
+(defn config-value?
+  [node]
+  (or (contains? node conn-vocab/env-var)
+      (contains? node conn-vocab/java-prop)
+      (contains? node conn-vocab/default-val)
+      (type? node conn-vocab/config-val-type)))
+
 (defn connection?
   [node]
   (type? node conn-vocab/connection-type))

@@ -10,8 +10,8 @@
   [s]
   (str system-ns s))
 
-(def env-var-datatype
-  (system-iri "envVar"))
+(def config-val-type
+  (system-iri "ConfigurationValue"))
 
 (def connection-type
   (system-iri "Connection"))
@@ -24,6 +24,15 @@
 
 (def system-type
   (system-iri "System"))
+
+(def env-var
+  (system-iri "envVar"))
+
+(def java-prop
+  (system-iri "javaProp"))
+
+(def default-val
+  (system-iri "defaultVal"))
 
 (def address-identifier
   (system-iri "addressIdentifier"))
