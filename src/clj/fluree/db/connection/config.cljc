@@ -94,7 +94,10 @@
 
 (defn get-strings
   [node k]
-  (mapv get-string (get node k)))
+  (into []
+        (comp (map get-string)
+              (remove nil?))
+        (get node k)))
 
 (defn get-boolean
   [x]
