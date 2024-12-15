@@ -116,6 +116,7 @@
   [node]
   (let [id (get-id node)]
     (cond
+      (config-value? node)        (derive id :fluree.db/config-value)
       (connection? node)          (derive id :fluree.db/connection)
       (system? node)              (derive id :fluree.db/remote-system)
       (memory-storage? node)      (derive id :fluree.db.storage/memory)

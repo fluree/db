@@ -1,5 +1,6 @@
 (ns fluree.db.connection.system
-  (:require [fluree.db.connection :as connection]
+  (:require [clojure.string :as str]
+            [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.cache :as cache]
@@ -14,7 +15,7 @@
             [fluree.db.flake.index.storage :as index-storage]
             #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
-            [fluree.db.util.core :as util :refer [get-id get-first]]
+            [fluree.db.util.core :as util :refer [get-id get-first get-first-value]]
             [integrant.core :as ig]))
 
 (derive :fluree.db.storage/file :fluree.db/content-storage)
@@ -76,10 +77,6 @@
                (assoc m id (convert-node-references node)))
              {} cfg))
 
-(defmethod ig/init-key :default
-  [_ component]
-  component)
-
 (defmethod ig/expand-key :fluree.db/connection
   [k config]
   (let [cache-max-mb   (config/get-first-integer config conn-vocab/cache-max-mb)
@@ -101,6 +98,50 @@
                              :cache              (ig/ref :fluree.db/cache)
                              :serializer         (ig/ref :fluree.db/serializer)}
      k                      config*}))
+
+(defmethod ig/init-key :default
+  [_ component]
+  component)
+
+(defn get-env
+  [env-var]
+  #?(:clj (System/getenv env-var)
+     :cljs (throw (ex-info "Environment variables are not supported on this platform"
+                           {:status 400, :error :db/unsupported-config}))))
+
+(defn get-java-prop
+  [java-prop]
+  #?(:clj (System/getProperty java-prop)
+     :cljs (throw (ex-info "Java system properties are not supported on this platform"
+                           {:status 400, :error :db/unsupported-config}))))
+
+(defn missing-config-error
+  [env-var java-prop]
+  (let [env-var-msg   (and env-var (str "environment variable " env-var))
+        java-prop-msg (and java-prop (str "Java system property " java-prop))
+        combined-msg  (cond (and env-var-msg java-prop-msg)
+                            (str env-var-msg " and " java-prop-msg)
+
+                            env-var-msg   env-var-msg
+                            java-prop-msg java-prop-msg)]
+    (ex-info (str "Missing config value specified by " combined-msg)
+             {:status 400, :error :db/missing-config-val})))
+
+(defn get-priority-value
+  [env-var java-prop default-val]
+  (or (and env-var
+           (get-env env-var))
+      (and java-prop
+           (get-java-prop java-prop))
+      default-val
+      (throw (missing-config-error env-var java-prop))))
+
+(defmethod ig/init-key :fluree.db/config-value
+  [_ config-value-node]
+  (let [env-var     (get-first-value config-value-node conn-vocab/env-var)
+        java-prop   (get-first-value config-value-node conn-vocab/java-prop)
+        default-val (get-first-value config-value-node conn-vocab/default-val)]
+    {:value (get-priority-value env-var java-prop default-val)}))
 
 (defmethod ig/init-key :fluree.db/cache
   [_ max-mb]
