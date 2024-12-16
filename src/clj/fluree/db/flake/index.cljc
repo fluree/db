@@ -237,7 +237,12 @@
          flakes*  (transient flakes)]
     (if-let [next-flake (first to-check)]
       (if (flake/op next-flake)
-        (recur (rest to-check) flakes*)
+        (let [r            (rest to-check)
+              cmp          (fact-content next-flake)
+              ;; flakes with same content but different t values
+              stale-flakes (filterv #(when (= cmp (fact-content %)) %) r)
+              fresh-flakes (reduce (fn [flakes f] (disj! flakes f)) flakes* stale-flakes)]
+          (recur r fresh-flakes))
         (let [r            (rest to-check)
               cmp          (fact-content next-flake)
               assert-flake (some #(when (= cmp (fact-content %)) %) r)]
@@ -249,17 +254,17 @@
 (defn t-range
   "Returns a sorted set of flakes that are not out of date between the
   transactions `from-t` and `to-t`."
-  ([{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty to-t]
-   (let [latest (cond
-                  (> to-t leaf-t)
-                  (into flakes (novelty-subrange leaf to-t novelty-t novelty))
+  [{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty to-t]
+  (let [latest (cond
+                 (> to-t leaf-t)
+                 (into flakes (novelty-subrange leaf to-t novelty-t novelty))
 
-                  (= to-t leaf-t)
-                  flakes
+                 (= to-t leaf-t)
+                 flakes
 
-                  (< to-t leaf-t)
-                  (flake/disj-all flakes (filter-after to-t flakes)))]
-     (remove-stale-flakes latest))))
+                 (< to-t leaf-t)
+                 (flake/disj-all flakes (filter-after to-t flakes)))]
+    (remove-stale-flakes latest)))
 
 (defn resolve-t-range
   [resolver node novelty-t novelty to-t]
