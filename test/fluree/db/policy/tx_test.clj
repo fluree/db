@@ -46,6 +46,7 @@
                                          "f"      "https://ns.flur.ee/ledger#"}
                              "@graph"   [{"@id"          "ex:emailPropertyRestriction"
                                           "@type"        ["f:AccessPolicy"]
+                                          "f:required"   true
                                           "f:onProperty" [{"@id" "schema:email"}]
                                           "f:action"     [{"@id" "f:view"}, {"@id" "f:modify"}]
                                           "f:exMessage"  "Only users can update their own emails."
@@ -142,6 +143,7 @@
                                          "f"      "https://ns.flur.ee/ledger#"}
                              "@graph"   [{"@id"         "ex:productClassRestriction"
                                           "@type"       ["f:AccessPolicy"]
+                                          "f:required"  true
                                           "f:onClass"   [{"@id" "ex:Product"}]
                                           "f:action"    [{"@id" "f:view"}, {"@id" "f:modify"}]
                                           "f:exMessage" "Only products managed by the user can be modified."
@@ -228,6 +230,7 @@
                                                    "f"  "https://ns.flur.ee/ledger#"}
                                     "@id"         "ex:defaultAllowViewModify"
                                     "@type"       ["f:AccessPolicy"]
+                                    "f:required"  true
                                     "f:action"    [{"@id" "f:modify"}]
                                     "f:exMessage" "Sample policy always returns false - denied!"
                                     "f:query"     {"@type"  "@json"

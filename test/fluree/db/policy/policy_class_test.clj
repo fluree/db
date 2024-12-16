@@ -40,6 +40,7 @@
                                    ;; embedded policy
                                    {"@id"          "ex:ssnRestriction"
                                     "@type"        ["f:AccessPolicy" "ex:EmployeePolicy"]
+                                    "f:required"   true
                                     "f:onProperty" [{"@id" "schema:ssn"}]
                                     "f:action"     {"@id" "f:view"}
                                     "f:query"      {"@type"  "@json"
