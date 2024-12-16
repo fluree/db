@@ -103,16 +103,16 @@
   [_ component]
   component)
 
-(defn get-env
-  [env-var]
-  #?(:clj (System/getenv env-var)
-     :cljs (throw (ex-info "Environment variables are not supported on this platform"
-                           {:status 400, :error :db/unsupported-config}))))
-
 (defn get-java-prop
   [java-prop]
   #?(:clj (System/getProperty java-prop)
      :cljs (throw (ex-info "Java system properties are not supported on this platform"
+                           {:status 400, :error :db/unsupported-config}))))
+
+(defn get-env
+  [env-var]
+  #?(:clj (System/getenv env-var)
+     :cljs (throw (ex-info "Environment variables are not supported on this platform"
                            {:status 400, :error :db/unsupported-config}))))
 
 (defn missing-config-error
@@ -129,10 +129,10 @@
 
 (defn get-priority-value
   [env-var java-prop default-val]
-  (or (and env-var
-           (get-env env-var))
-      (and java-prop
+  (or (and java-prop
            (get-java-prop java-prop))
+      (and env-var
+           (get-env env-var))
       default-val
       (throw (missing-config-error env-var java-prop))))
 
