@@ -236,19 +236,23 @@
   (loop [to-check (reverse flakes)
          flakes*  (transient flakes)]
     (if-let [next-flake (first to-check)]
-      (if (flake/op next-flake)
-        (let [r            (rest to-check)
-              cmp          (fact-content next-flake)
-              ;; flakes with same content but different t values
-              stale-flakes (filterv #(when (= cmp (fact-content %)) %) r)
-              fresh-flakes (reduce (fn [flakes f] (disj! flakes f)) flakes* stale-flakes)]
-          (recur r fresh-flakes))
-        (let [r            (rest to-check)
-              cmp          (fact-content next-flake)
-              assert-flake (some #(when (= cmp (fact-content %)) %) r)]
-          (recur r (-> flakes*
-                       (disj! next-flake)
-                       (disj! assert-flake)))))
+      (let [r   (rest to-check)
+            cmp (fact-content next-flake)]
+        (if (flake/op next-flake)
+          (do
+            ;; remove flakes with same content but different t values (quickly!)
+            (loop [check-flakes r]
+              (if-let [f (first check-flakes)]
+                (if (= cmp (fact-content (first check-flakes)))
+                  (do (disj! flakes* f)
+                      (recur (rest check-flakes)))
+                  (recur (rest check-flakes)))))
+
+            (recur r flakes*))
+          (let [assert-flake (some #(when (= cmp (fact-content %)) %) r)]
+            (recur r (-> flakes*
+                         (disj! next-flake)
+                         (disj! assert-flake))))))
       (persistent! flakes*))))
 
 (defn t-range
