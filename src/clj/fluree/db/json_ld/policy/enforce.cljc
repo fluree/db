@@ -69,7 +69,6 @@
                "Policy enforcement prevents modification.")
            {:status 403 :error :db/policy-exception}))
 
-
 (defn policies-allow?
   "Once narrowed to a specific set of policies, execute and return
   appropriate policy response."
