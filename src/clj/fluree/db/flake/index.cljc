@@ -236,30 +236,39 @@
   (loop [to-check (reverse flakes)
          flakes*  (transient flakes)]
     (if-let [next-flake (first to-check)]
-      (if (flake/op next-flake)
-        (recur (rest to-check) flakes*)
-        (let [r            (rest to-check)
-              cmp          (fact-content next-flake)
-              assert-flake (some #(when (= cmp (fact-content %)) %) r)]
-          (recur r (-> flakes*
-                       (disj! next-flake)
-                       (disj! assert-flake)))))
+      (let [r   (rest to-check)
+            cmp (fact-content next-flake)]
+        (if (flake/op next-flake)
+          (do
+            ;; remove flakes with same content but different t values (quickly!)
+            (loop [check-flakes r]
+              (if-let [f (first check-flakes)]
+                (if (= cmp (fact-content (first check-flakes)))
+                  (do (disj! flakes* f)
+                      (recur (rest check-flakes)))
+                  (recur (rest check-flakes)))))
+
+            (recur r flakes*))
+          (let [assert-flake (some #(when (= cmp (fact-content %)) %) r)]
+            (recur r (-> flakes*
+                         (disj! next-flake)
+                         (disj! assert-flake))))))
       (persistent! flakes*))))
 
 (defn t-range
   "Returns a sorted set of flakes that are not out of date between the
   transactions `from-t` and `to-t`."
-  ([{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty to-t]
-   (let [latest (cond
-                  (> to-t leaf-t)
-                  (into flakes (novelty-subrange leaf to-t novelty-t novelty))
+  [{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty to-t]
+  (let [latest (cond
+                 (> to-t leaf-t)
+                 (into flakes (novelty-subrange leaf to-t novelty-t novelty))
 
-                  (= to-t leaf-t)
-                  flakes
+                 (= to-t leaf-t)
+                 flakes
 
-                  (< to-t leaf-t)
-                  (flake/disj-all flakes (filter-after to-t flakes)))]
-     (remove-stale-flakes latest))))
+                 (< to-t leaf-t)
+                 (flake/disj-all flakes (filter-after to-t flakes)))]
+    (remove-stale-flakes latest)))
 
 (defn resolve-t-range
   [resolver node novelty-t novelty to-t]
