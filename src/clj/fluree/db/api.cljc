@@ -220,6 +220,13 @@
    (let [result-ch (transact-api/stage db json-ld opts)]
      (promise-wrap result-ch))))
 
+(defn actualize!
+  ([ledger staged-db]
+   (promise-wrap
+    (actualize! ledger staged-db {})))
+  ([ledger staged-db opts]
+   (promise-wrap
+    (connection/actualize! ledger staged-db opts))))
 
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
