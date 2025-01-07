@@ -248,9 +248,13 @@
                          :serializer           serializer
                          :defaults             defaults})))
 
+(defn prepare
+  [parsed-config]
+  (-> parsed-config convert-references ig/expand))
+
 (defn parsed-initialize
   [parsed-config]
-  (-> parsed-config convert-references ig/expand ig/init))
+  (-> parsed-config prepare ig/init))
 
 (defn initialize
   [config]
