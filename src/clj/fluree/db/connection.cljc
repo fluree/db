@@ -523,7 +523,7 @@
     {:message opts}
     (select-keys opts [:context :did :private :message :tag :file-data? :index-files-ch])))
 
-(defn actualize!
+(defn apply-stage!
   [{:keys [conn] ledger-alias :alias, :as ledger}
    {:keys [branch t stats commit] :as staged-db}
    opts]
