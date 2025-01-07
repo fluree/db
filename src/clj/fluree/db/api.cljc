@@ -222,8 +222,7 @@
 
 (defn apply-stage!
   ([ledger staged-db]
-   (promise-wrap
-    (apply-stage! ledger staged-db {})))
+   (apply-stage! ledger staged-db {}))
   ([ledger staged-db opts]
    (promise-wrap
     (connection/apply-stage! ledger staged-db opts))))
