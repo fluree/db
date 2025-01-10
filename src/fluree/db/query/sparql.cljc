@@ -23,7 +23,26 @@
        :cljs (inline-resource "sparql.bnf"))
     PN_CHARS_BASE))
 
+(def property-path-grammar
+  (str
+    #?(:clj  (slurp (io/resource "sparql-property-path.bnf"))
+       :cljs (inline-resource "sparql-property-path.bnf"))
+    PN_CHARS_BASE))
+
 (defparser parser grammar)
+
+(defparser path-parser property-path-grammar)
+
+(defn parse-path-expr
+  [s]
+  (let [parsed (path-parser s)]
+    (if (insta/failure? parsed)
+      (do (log/debug (insta/get-failure parsed) "Property path expression failed to parse.")
+          (throw (ex-info "Invalid property path expression. Must be a valid SPARQL property path expression, see https://www.w3.org/TR/sparql11-query/#pp-language"
+                          {:status 400
+                           :error :db/invalid-property-path
+                           :path s})))
+      parsed)))
 
 (defn parse
   [sparql]

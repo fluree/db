@@ -42,6 +42,16 @@
       (async/close! matched-ch))
     matched-ch))
 
+(defn transitive-flakes
+  [db fuel-tracker [s p o] error-ch]
+  (loop [[s* & nodes] [s]
+         result      (flake/sorted-set-by (:spot (:comparators db)))]
+    (if s*
+      (let [step-flakes (async/<!! (async/into [] (where/resolve-flake-range db fuel-tracker error-ch [s* p o])))]
+        (recur (into nodes (mapcat #(map (partial where/match-object o db) %)) step-flakes)
+               (into result cat step-flakes)))
+      [result])))
+
 (defn match-triple
   [db fuel-tracker solution tuple error-ch]
   (let [matched-ch (async/chan 2 (comp cat
@@ -62,9 +72,12 @@
                                           (async/pipe ch))))
                                   prop-ch))
 
-          (-> db
-              (where/resolve-flake-range fuel-tracker error-ch [s p o])
-              (async/pipe matched-ch))))
+          (if-let [transitive (where/get-transitive-property p)]
+            (->> (transitive-flakes db fuel-tracker [s p o] error-ch)
+                 (async/onto-chan! matched-ch))
+            (-> db
+                (where/resolve-flake-range fuel-tracker error-ch [s p o])
+                (async/pipe matched-ch)))))
       (async/close! matched-ch))
     matched-ch))
 
