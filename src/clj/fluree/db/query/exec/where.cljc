@@ -110,6 +110,14 @@
   [mch]
   (::t mch))
 
+(defn transitive-property
+  [mch tag]
+  (assoc mch ::recur tag))
+
+(defn get-transitive-property
+  [mch]
+  (::recur mch))
+
 (defn matched?
   [match]
   (or (matched-value? match)
