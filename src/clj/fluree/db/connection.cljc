@@ -523,68 +523,71 @@
     {:message opts}
     (select-keys opts [:context :did :private :message :tag :file-data? :index-files-ch])))
 
+(defn apply-stage!
+  [{:keys [conn] ledger-alias :alias, :as ledger}
+   {:keys [branch t stats commit] :as staged-db}
+   opts]
+  (go-try
+    (let [{:keys [commit-catalog]} conn
+
+          {:keys [tag time message index-files-ch]
+           :or   {time (util/current-time-iso)}}
+          (parse-commit-options opts)
+
+          {commit-data-opts      :commit-data-helpers
+           {:keys [did private]} :commit-opts}
+          (enrich-commit-opts ledger opts)
+
+          {:keys [dbid db-jsonld staged-txns]}
+          (flake-db/db->jsonld staged-db commit-data-opts)
+
+          ;; TODO - we do not support multiple "transactions" in a single
+          ;; commit (although other code assumes we do which needs cleaning)
+          [[txn-id author annotation] :as _txns]
+          (<? (write-transactions! commit-catalog ledger-alias staged-txns))
+
+          data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
+          db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
+          keypair           {:did did :private private}
+
+          new-commit (commit-data/new-db-commit-map
+                      {:old-commit commit
+                       :issuer     did
+                       :message    message
+                       :tag        tag
+                       :dbid       dbid
+                       :t          t
+                       :time       time
+                       :db-address db-address
+                       :author     author
+                       :annotation annotation
+                       :txn-id     txn-id
+                       :flakes     (:flakes stats)
+                       :size       (:size stats)})
+
+          {:keys [commit-map commit-jsonld write-result]}
+          (<? (write-commit commit-catalog ledger-alias keypair new-commit))
+
+          db  (formalize-commit staged-db commit-map)
+          db* (ledger/update-commit! ledger branch db index-files-ch)]
+
+      (log/debug "Committing t" t "at" time)
+
+      (<? (publish-commit conn commit-jsonld))
+
+      (-> write-result
+          (select-keys [:address :hash :size])
+          (assoc :t t, :db db*)))))
+
 (defn commit!
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
   ([ledger staged-db]
    (commit! ledger staged-db nil))
-  ([{:keys [conn] ledger-alias :alias, :as ledger}
-    {:keys [branch t stats commit] :as staged-db}
-    opts]
+  ([ledger staged-db opts]
    (go-try
-     (let [{:keys [commit-catalog]} conn
-
-           {:keys [tag time message file-data? index-files-ch]
-            :or   {time (util/current-time-iso)}}
-           (parse-commit-options opts)
-
-           {commit-data-opts      :commit-data-helpers
-            {:keys [did private]} :commit-opts}
-           (enrich-commit-opts ledger opts)
-
-           {:keys [dbid db-jsonld staged-txns]}
-           (flake-db/db->jsonld staged-db commit-data-opts)
-
-           ;; TODO - we do not support multiple "transactions" in a single
-           ;; commit (although other code assumes we do which needs cleaning)
-           [[txn-id author annotation] :as _txns]
-           (<? (write-transactions! commit-catalog ledger-alias staged-txns))
-
-           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
-           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
-           keypair           {:did did :private private}
-
-           new-commit (commit-data/new-db-commit-map
-                        {:old-commit commit
-                         :issuer     did
-                         :message    message
-                         :tag        tag
-                         :dbid       dbid
-                         :t          t
-                         :time       time
-                         :db-address db-address
-                         :author     author
-                         :annotation annotation
-                         :txn-id     txn-id
-                         :flakes     (:flakes stats)
-                         :size       (:size stats)})
-
-           {:keys [commit-map commit-jsonld write-result]}
-           (<? (write-commit commit-catalog ledger-alias keypair new-commit))
-
-           db  (formalize-commit staged-db commit-map)
-           db* (ledger/update-commit! ledger branch db index-files-ch)]
-
-       (log/debug "Committing t" t "at" time)
-
-       (<? (publish-commit conn commit-jsonld))
-
-       (if file-data?
-         {:data-file-meta   data-write-result
-          :commit-file-meta write-result
-          :db               db*}
-         db*)))))
+     (:db (<? (apply-stage! ledger staged-db opts))))))
 
 (defn track-fuel?
   [parsed-opts]
