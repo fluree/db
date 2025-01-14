@@ -384,7 +384,7 @@
                      (map (partial apply str)))
         recur-mod   ({"+" :one+ "*" :zero+} mod)]
     (cond-> (parse-predicate pred context)
-      recur-mod (where/transitive-property recur-mod))))
+      recur-mod (where/add-transitivity recur-mod))))
 
 (defn parse-predicate
   [p context]

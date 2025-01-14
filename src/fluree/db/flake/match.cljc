@@ -46,48 +46,54 @@
   (comp cat
         (map (fn [flake] (where/match-flake solution triple db flake)))))
 
+(defn var-pattern [triple] (mapv #(if (where/get-variable %) :? :v) triple))
+
 (defmulti resolve-transitive
-  (fn [db fuel-tracker solution triple error-ch]
-    (mapv #(if (where/get-variable %) :? :v) triple)))
+  (fn [db fuel-tracker solution triple error-ch] (var-pattern triple)))
 
 (defmethod resolve-transitive :default [_ _ _ triple error-ch]
   (async/put! error-ch (ex-info "Unsupported transitive path." {:status 400 :error :db/unsupported-transitive-path})))
 
 (defmethod resolve-transitive [:v :v :?]
-  [db fuel-tracker solution triple error-ch]
-  (let [[s p o]    triple
-        matched-ch (async/chan 2 (map (fn [flake] (where/match-flake solution triple db flake))))]
-    (loop [[s* & nodes] [s]
-           result       (flake/sorted-set-by (-> db :comparators :spot))]
+  [db fuel-tracker solution [s p o] error-ch]
+  (let [p*    (where/remove-transitivity p)
+        o-var (where/get-variable o)]
+    (loop [[s* & nodes] #{s}
+           visited-iris #{(where/get-iri s)}
+           solns        []]
       (if s*
-        (let [step-flakes (async/<!! (async/into [] (where/resolve-flake-range db fuel-tracker error-ch [s* p o])))]
-          (recur (into nodes (mapcat #(map (partial where/match-object o db) %)) step-flakes)
-                 (into result cat step-flakes)))
-        (async/onto-chan! matched-ch result)))
-    matched-ch))
+        (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[s* p* o]] error-ch)))
+              o-matches  (map #(get % o-var) step-solns)]
+          (recur (into nodes (remove (fn [soln] (visited-iris (where/get-iri soln)))) o-matches)
+                 (into visited-iris (map where/get-iri) o-matches)
+                 (into solns step-solns)))
+        (async/to-chan! solns)))))
+
 
 (defn transitive-step
   [s-var o-var solns]
-  (reduce (fn [results {o o-var s s-var :as soln}]
-            (into results
-                  ;; do not include solns we've already found
-                  (remove solns)
-                  ;; join each result o-match to each other result's s-match and create a new solution
-                  (reduce (fn [joins {o-match o-var s-match s-var}]
-                            (if (= (where/get-iri o) (where/get-iri s-match))
-                              (conj joins (assoc soln s-var s o-var o-match))
-                              joins))
-                          []
-                          solns)))
-          []
-          solns))
+  (let [get-solution-iris (juxt #(-> % (get s-var) (where/get-iri))
+                                #(-> % (get o-var) (where/get-iri)))
+        solution-iris (into #{} (map get-solution-iris) solns)]
+    (reduce (fn [results {o o-var s s-var :as soln}]
+              (into results
+                    ;; do not include solns we've already found
+                    (remove #(contains? solution-iris (get-solution-iris %)))
+                    ;; join each result o-match to each other result's s-match and create a new solution
+                    (reduce (fn [joins {o-match o-var s-match s-var}]
+                              (if (= (where/get-iri o) (where/get-iri s-match))
+                                (conj joins (assoc soln s-var s o-var o-match))
+                                joins))
+                            []
+                            solns)))
+            []
+            solns)))
 
 (defmethod resolve-transitive [:? :v :?]
   [db fuel-tracker solution [s p o] error-ch]
   (let [s-var  (where/get-variable s)
         o-var  (where/get-variable o)
-        step0  (->> (async/<!! (async/into #{} (where/resolve-flake-range db fuel-tracker error-ch [s p o])))
-                    (into #{} (match-flakes-xf db solution [s p o])))
+        step0  (async/<!! (async/into #{} (where/match-clause db fuel-tracker solution [[s (where/remove-transitivity p) o]] error-ch)))
         soln-ch (async/chan)]
     (loop [steps      0
            step-solns step0
