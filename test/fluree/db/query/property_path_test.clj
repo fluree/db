@@ -6,6 +6,30 @@
   (let [conn   @(fluree/connect-memory)
         ledger @(fluree/create conn "property/path")
         db0    (fluree/db ledger)]
+    (testing "no variables"
+      (let [db1 @(fluree/stage db0 {"insert"
+                                    [{"@id" "ex:a"
+                                      "ex:y" [{"@id" "ex:b"
+                                               "ex:y" {"@id" "ex:c"
+                                                       "ex:y" {"@id" "ex:d"
+                                                               "ex:y" {"@id" "ex:e"
+                                                                       "ex:y" {"@id" "ex:f"}}}}}
+                                              {"@id" "ex:g"
+                                               "ex:y" [{"@id" "ex:h"
+                                                        "ex:y" {"@id" "ex:i"}}
+                                                       {"@id" "ex:j"
+                                                        "ex:y" {"@id" "ex:k"}}]}]}]})]
+        (testing "non-transitive"
+          (is (= []
+                 @(fluree/query db1 {"where" [{"@id" "ex:a" "ex:y" {"@id" "ex:f"}}]
+                                     "select" {"ex:a" ["*"]}}))))
+        (testing "transitive"
+          (let [result @(fluree/query db1 {"where" [{"@id" "ex:a" "<ex:y+>" {"@id" "ex:f"}}]
+                                           "select" {"ex:a" ["*"]}})]
+            (is (= {:status 400, :error :db/unsupported-transitive-path}
+                   (ex-data result)))
+            (is (= "Unsupported transitive path."
+                   (ex-message result)))))))
     (testing "object variable"
       (let [db1 @(fluree/stage db0 {"insert"
                                     [{"@id" "ex:a"
