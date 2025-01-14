@@ -53,6 +53,21 @@
 
 (defmethod resolve-transitive :default [_ _ _ triple error-ch]
   (async/put! error-ch (ex-info "Unsupported transitive path." {:status 400 :error :db/unsupported-transitive-path})))
+(defmethod resolve-transitive [:? :v :v]
+  [db fuel-tracker solution [s p o] error-ch]
+  (let [p*    (where/remove-transitivity p)
+        s-var (where/get-variable s)]
+    (loop [[o* & nodes] #{o}
+           visited-iris #{(where/get-iri o)}
+           solns        []]
+      (if o*
+        (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[s p* o*]] error-ch)))
+              s-matches  (map #(get % s-var) step-solns)]
+          (recur (into nodes (remove (fn [soln] (visited-iris (where/get-iri soln)))) s-matches)
+                 (into visited-iris (map where/get-iri) s-matches)
+                 (into solns step-solns)))
+        (async/to-chan! solns)))))
+
 
 (defmethod resolve-transitive [:v :v :?]
   [db fuel-tracker solution [s p o] error-ch]
