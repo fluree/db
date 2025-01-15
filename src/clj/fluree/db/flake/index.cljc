@@ -236,25 +236,19 @@
   For this reason, a scan over the remaining flakes using `some` is done below."
   [flakes]
   (loop [to-check (rseq flakes)
+         checked  #{}
          flakes*  (transient flakes)]
     (if-let [next-flake (first to-check)]
       (let [r   (rest to-check)
             cmp (fact-content next-flake)]
         (if (flake/op next-flake)
-          (do
-            ;; remove flakes with same content but different t values (quickly!)
-            (loop [check-flakes r]
-              (when-let [f (first check-flakes)]
-                (if (= cmp (fact-content (first check-flakes)))
-                  (do (disj! flakes* f)
-                      (recur (rest check-flakes)))
-                  (recur (rest check-flakes)))))
-
-            (recur r flakes*))
+          (if (contains? checked cmp)
+            (recur r checked (disj! flakes* next-flake))
+            (recur r (conj checked cmp) flakes*))
           (let [assert-flake (some #(when (= cmp (fact-content %)) %) r)]
-            (recur r (-> flakes*
-                         (disj! next-flake)
-                         (disj! assert-flake))))))
+            (recur r checked (-> flakes*
+                                 (disj! next-flake)
+                                 (disj! assert-flake))))))
       (persistent! flakes*))))
 
 (defn t-range
