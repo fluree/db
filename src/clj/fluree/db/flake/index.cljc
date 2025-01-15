@@ -224,21 +224,13 @@
   the `t` value."
   (juxt flake/s flake/p flake/o flake/dt meta-hash))
 
-(defn same-fact?
-  [fact f]
-  (-> f fact-content (= fact)))
-
 (defn remove-stale-flakes
-  "Removes all flake retractions, along with the flakes they retract, from the
-  sorted set.
+  "Removes all flake retractions, along with the flakes they retract, as well as
+  all but the latest duplicate flake assertions, from the sorted set.
 
-  Approach is to iterate through the flakes in reverse order, and for each
-  retraction, find the corresponding assertion and remove both from the set.
-
-  Note, with 'spo' not consisting of full uniqueness (e.g. lang, datatype, or
-  duplicate @list value), the 'next flake' is from a retraction is not
-  guaranteed to be the corresponding assertion, however it should be very close.
-  For this reason, a scan over the remaining flakes using `some` is done below."
+  Approach is to iterate through the flakes in reverse order, keeping track of
+  facts already seen. Then, any flake encountered with the same fact content of
+  a previously seen flake is removed from the set as well as any retractions."
   [flakes]
   (loop [to-check (rseq flakes)
          checked  #{}
@@ -246,14 +238,12 @@
     (if-let [next-flake (first to-check)]
       (let [r    (rest to-check)
             fact (fact-content next-flake)]
-        (if (flake/op next-flake)
-          (if (contains? checked fact)
-            (recur r checked (disj! flakes* next-flake))
-            (recur r (conj checked fact) flakes*))
-          (let [assert-flake (some #(when (same-fact? fact %) %) r)]
-            (recur r checked (-> flakes*
-                                 (disj! next-flake)
-                                 (disj! assert-flake))))))
+        (if (contains? checked fact)
+          (recur r checked (disj! flakes* next-flake))
+          (let [checked* (conj checked fact)]
+            (if (flake/op next-flake)
+              (recur r checked* flakes*)
+              (recur r checked* (disj! flakes* next-flake))))))
       (persistent! flakes*))))
 
 (defn t-range
