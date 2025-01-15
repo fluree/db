@@ -98,7 +98,7 @@
   (system-iri "privateKey"))
 
 (def index-options
-  (system-iri "indexOptions"))
+  (system-iri "indexing"))
 
 (def reindex-min-bytes
   (system-iri "reindexMinBytes"))
