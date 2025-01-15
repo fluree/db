@@ -220,7 +220,8 @@
   (comp flake/hash-meta flake/m))
 
 (def fact-content
-  "Function to extract the content being asserted or retracted by a flake."
+  "Function to extract the fact being asserted or retracted by a flake, ignoring
+  the `t` value."
   (juxt flake/s flake/p flake/o flake/dt meta-hash))
 
 (defn same-fact?
