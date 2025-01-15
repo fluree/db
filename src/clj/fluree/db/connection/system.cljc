@@ -229,7 +229,7 @@
           index-options (parse-index-options defaults)]
       (cond-> nil
         identity      (assoc :identity identity)
-        index-options (assoc :index-options index-options)))))
+        index-options (assoc :indexing index-options)))))
 
 (defmethod ig/init-key :fluree.db/connection
   [_ {:keys [cache commit-catalog index-catalog serializer] :as config}]
