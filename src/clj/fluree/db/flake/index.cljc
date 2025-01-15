@@ -223,6 +223,10 @@
   "Function to extract the content being asserted or retracted by a flake."
   (juxt flake/s flake/p flake/o flake/dt meta-hash))
 
+(defn same-fact?
+  [fact f]
+  (-> f fact-content (= fact)))
+
 (defn remove-stale-flakes
   "Removes all flake retractions, along with the flakes they retract, from the
   sorted set.
@@ -239,13 +243,13 @@
          checked  #{}
          flakes*  (transient flakes)]
     (if-let [next-flake (first to-check)]
-      (let [r   (rest to-check)
-            cmp (fact-content next-flake)]
+      (let [r    (rest to-check)
+            fact (fact-content next-flake)]
         (if (flake/op next-flake)
-          (if (contains? checked cmp)
+          (if (contains? checked fact)
             (recur r checked (disj! flakes* next-flake))
-            (recur r (conj checked cmp) flakes*))
-          (let [assert-flake (some #(when (= cmp (fact-content %)) %) r)]
+            (recur r (conj checked fact) flakes*))
+          (let [assert-flake (some #(when (same-fact? fact %) %) r)]
             (recur r checked (-> flakes*
                                  (disj! next-flake)
                                  (disj! assert-flake))))))
