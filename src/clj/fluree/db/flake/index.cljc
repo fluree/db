@@ -169,29 +169,31 @@
   [t flake]
   (flake/t-before? (flake/t flake) t))
 
+(defn filter-by-t
+  [pred t flakes]
+  (loop [[f & r] flakes
+         flakes* (transient flakes)]
+    (if f
+      (if (pred t f)
+        (recur r flakes*)
+        (recur r (disj! flakes* f)))
+      (persistent! flakes*))))
+
 (defn filter-after
   "Returns a sequence containing only flakes from the flake set `flakes` with
   transaction values after the provided `t`."
   [t flakes]
-  (filter (partial after-t? t) flakes))
+  (filter-by-t after-t? t flakes))
 
 (defn filter-before
   [t flakes]
-  (filter (partial before-t? t) flakes))
+  (filter-by-t before-t? t flakes))
 
 (defn flakes-through
   "Returns an avl-subset of the avl-set `flakes` with transaction values on or
   before the provided `t`."
   [t flakes]
-  (->> flakes
-       (filter-after t)
-       (flake/disj-all flakes)))
-
-(defn flakes-after
-  [t flakes]
-  (->> flakes
-       (filter-before (flake/next-t t))
-       (flake/disj-all flakes)))
+  (filter-before (flake/next-t t) flakes))
 
 (defn novelty-subrange
   [{:keys [rhs leftmost?], first-flake :first, :as _node} through-t novelty-t novelty]
@@ -258,7 +260,7 @@
                  flakes
 
                  (< to-t leaf-t)
-                 (flake/disj-all flakes (filter-after to-t flakes)))]
+                 (flakes-through to-t flakes))]
     (remove-stale-flakes latest)))
 
 (defn resolve-t-range
