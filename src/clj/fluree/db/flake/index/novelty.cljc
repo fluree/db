@@ -419,7 +419,7 @@
                                             :garbage (:address garbage-res))]
                    (log/info "Index refresh complete:" end-stats)
                    ;; kick off automatic garbage collection
-                   (async/thread
-                    (garbage/clean-garbage indexed-db max-old-indexes))
+                  ;;  (async/thread
+                  ;;   (garbage/clean-garbage indexed-db max-old-indexes))
                    indexed-db)))))
         db))))
