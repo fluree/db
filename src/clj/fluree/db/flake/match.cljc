@@ -57,33 +57,34 @@
 
 (defmethod resolve-transitive [:? :v :v]
   [db fuel-tracker solution [s p o] error-ch]
-  (let [p*    (where/remove-transitivity p)
+  (let [tag   (where/get-transitive-property p)
+        p*    (where/remove-transitivity p)
         s-var (where/get-variable s)]
     (loop [[o* & nodes] #{o}
-           visited-iris #{(where/get-iri o)}
-           solns        []]
+           visited-iris (if (= :zero+ tag) #{(where/get-iri o)} #{})
+           solns        (if (= :zero+ tag) [{s-var o}] [])]
       (if o*
         (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[s p* o*]] error-ch)))
               s-matches  (map #(get % s-var) step-solns)]
           (recur (into nodes (remove (fn [soln] (visited-iris (where/get-iri soln)))) s-matches)
                  (into visited-iris (map where/get-iri) s-matches)
-                 (into solns step-solns)))
+                 (into solns (remove (fn [soln] (visited-iris (-> soln (get s-var) where/get-iri)))) step-solns)))
         (async/to-chan! solns)))))
-
 
 (defmethod resolve-transitive [:v :v :?]
   [db fuel-tracker solution [s p o] error-ch]
-  (let [p*    (where/remove-transitivity p)
+  (let [tag   (where/get-transitive-property p)
+        p*    (where/remove-transitivity p)
         o-var (where/get-variable o)]
     (loop [[s* & nodes] #{s}
-           visited-iris #{(where/get-iri s)}
-           solns        []]
+           visited-iris (if (= :zero+ tag) #{(where/get-iri s)} #{})
+           solns        (if (= :zero+ tag) [{o-var s}] [])]
       (if s*
         (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[s* p* o]] error-ch)))
               o-matches  (map #(get % o-var) step-solns)]
           (recur (into nodes (remove (fn [soln] (visited-iris (where/get-iri soln)))) o-matches)
                  (into visited-iris (map where/get-iri) o-matches)
-                 (into solns step-solns)))
+                 (into solns (remove (fn [soln] (visited-iris (-> soln (get o-var) where/get-iri)))) step-solns)))
         (async/to-chan! solns)))))
 
 (defn transitive-step
@@ -105,15 +106,35 @@
             []
             solns)))
 
+(defn o-match->s-match
+  "Strip extra keys from a match on an o-var so taht it can be compared to a match from an
+  s-var."
+  [mch]
+  (select-keys mch [::where/var ::where/sids ::where/iri]))
+
+(defn add-reflexive-solutions
+  [s-var o-var solns]
+  (let [{s s-var} (first solns)]
+    (into #{}
+          (mapcat (fn [{s s-var o o-var :as soln}]
+                    (let [s* (assoc s ::where/var o-var)
+                          o* (assoc (o-match->s-match o) ::where/var s-var)]
+                      [{s-var s o-var s*}
+                       {s-var o* o-var (o-match->s-match o)}
+                       soln])))
+          solns)))
+
 (defmethod resolve-transitive [:? :v :?]
   [db fuel-tracker solution [s p o] error-ch]
-  (let [s-var  (where/get-variable s)
-        o-var  (where/get-variable o)
-        step0  (async/<!! (async/into #{} (where/match-clause db fuel-tracker solution [[s (where/remove-transitivity p) o]] error-ch)))
+  (let [s-var   (where/get-variable s)
+        o-var   (where/get-variable o)
+        step0   (async/<!! (async/into #{} (where/match-clause db fuel-tracker solution [[s (where/remove-transitivity p) o]] error-ch)))
         soln-ch (async/chan)]
     (loop [steps      0
            step-solns step0
-           result     step0]
+           result     (if (= :zero+ (where/get-transitive-property p))
+                        (add-reflexive-solutions s-var o-var step0)
+                        step0)]
       (if (seq step-solns)
         (let [next-step-solns (transitive-step s-var o-var result)]
           (recur (inc steps) next-step-solns (into result next-step-solns)))
