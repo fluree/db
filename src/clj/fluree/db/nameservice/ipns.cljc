@@ -67,8 +67,7 @@
     (lookup-address ipfs-endpoint ipns-key ledger-alias))
   (alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
-      alias))
-  (-close [_] true))
+      alias)))
 
 (defn initialize
   [ipfs-endpoint ipns-key]
