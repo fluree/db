@@ -87,18 +87,6 @@
                       flake/maximum)]
     (assoc new-leaf :first new-first)))
 
-(defn rem-flakes
-  [leaf flakes]
-  (let [new-leaf (-> leaf
-                     (update :flakes flake/disj-all flakes)
-                     (update :size (fn [size]
-                                     (->> flakes
-                                          (map flake/size-flake)
-                                          (reduce - size)))))
-        new-first (or (some-> new-leaf :flakes first)
-                      flake/maximum)]
-    (assoc new-leaf :first new-first)))
-
 (defn empty-leaf
   "Returns a blank leaf node map for the provided `ledger-alias` and index
   comparator `cmp`."
