@@ -100,12 +100,12 @@
   ([ledger-alias branch-name commit-catalog index-catalog commit-jsonld]
    (state-map ledger-alias branch-name commit-catalog index-catalog commit-jsonld nil))
   ([ledger-alias branch-name commit-catalog index-catalog commit-jsonld indexing-opts]
-   (let [initial-db   (async-db/load ledger-alias branch-name commit-catalog index-catalog
-                                     commit-jsonld indexing-opts)
-         commit-map   (commit-data/jsonld->clj commit-jsonld)
-         state        (atom {:commit     commit-map
-                             :current-db initial-db})
-         idx-q        (index-queue ledger-alias branch-name state)]
+   (let [initial-db (async-db/load ledger-alias branch-name commit-catalog index-catalog
+                                   commit-jsonld indexing-opts)
+         commit-map (commit-data/jsonld->clj commit-jsonld)
+         state      (atom {:commit     commit-map
+                           :current-db initial-db})
+         idx-q      (index-queue ledger-alias branch-name state)]
      {:name        branch-name
       :alias       ledger-alias
       :state       state
