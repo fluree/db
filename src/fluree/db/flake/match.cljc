@@ -60,33 +60,38 @@
   (let [tag   (where/get-transitive-property p)
         p*    (where/remove-transitivity p)
         s-var (where/get-variable s)]
-    (loop [[o* & nodes] #{o}
-           visited-iris (if (= :zero+ tag) #{(where/get-iri o)} #{})
-           solns        (if (= :zero+ tag) [{s-var o}] [])]
+    (loop [[o* & to-visit] #{o}
+           visited-iris    (if (= :zero+ tag) #{(where/get-iri o)} #{})
+           solns           (if (= :zero+ tag) [{s-var o}] [])]
       (if o*
         (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[s p* o*]] error-ch)))
               s-matches  (map #(get % s-var) step-solns)]
-          (recur (into nodes (remove (fn [soln] (visited-iris (where/get-iri soln)))) s-matches)
+          (recur (into to-visit (remove (fn [s-mch] (visited-iris (where/get-iri s-mch)))) s-matches)
                  (into visited-iris (map where/get-iri) s-matches)
                  (into solns (remove (fn [soln] (visited-iris (-> soln (get s-var) where/get-iri)))) step-solns)))
         (async/to-chan! solns)))))
 
 (defmethod resolve-transitive [:v :v :?]
   [db fuel-tracker solution [s p o] error-ch]
-  (let [tag   (where/get-transitive-property p)
-        p*    (where/remove-transitivity p)
-        o-var (where/get-variable o)]
-    (loop [[s* & nodes] #{s}
-           visited-iris (if (= :zero+ tag) #{(where/get-iri s)} #{})
-           solns        (if (= :zero+ tag) [{o-var s}] [])]
+  (let [tag             (where/get-transitive-property p)
+        p*              (where/remove-transitivity p)
+        o-var           (where/get-variable o)
+        get-o           (fn [soln] (get soln o-var))
+        initial-visited (if (= :zero+ tag) #{(where/get-iri s)} #{})]
+    (loop [[s* & to-visit] #{s}
+           visited-iris    initial-visited
+           solns           (if (= :zero+ tag) [{o-var s}] [])]
       (if s*
         (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[s* p* o]] error-ch)))
-              o-matches  (map #(get % o-var) step-solns)]
-          (recur (into nodes (remove (fn [soln] (visited-iris (where/get-iri soln)))) o-matches)
-                 (into visited-iris (map where/get-iri) o-matches)
-                 (into solns (remove (fn [soln] (visited-iris (-> soln (get o-var) where/get-iri)))) step-solns)))
-        (async/to-chan! solns)))))
 
+              to-visit-xf (comp (map get-o)
+                                (remove (fn [o-match] (visited-iris (where/get-iri o-match)))))
+              visited-xf  (map #(-> % get-o where/get-iri))
+              soln-xf     (remove (fn [soln] (visited-iris (-> soln get-o where/get-iri))))]
+          (recur (into to-visit to-visit-xf step-solns)
+                 (into visited-iris visited-xf step-solns)
+                 (into solns soln-xf step-solns)))
+        (async/to-chan! solns)))))
 
 (defn o-match->s-match
   "Strip extra keys from a match on an o-var so taht it can be compared to a match from an
