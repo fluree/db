@@ -5,6 +5,7 @@
             [fluree.db.method.ipfs :as ipfs]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -57,8 +58,12 @@
 
 (defrecord IpnsNameService [ipfs-endpoint ipns-key base-address?]
   nameservice/Publisher
-  (publish [_ commit-data]
-    (ipfs/push! ipfs-endpoint commit-data))
+  (publish [_ commit-jsonld]
+    (let [ledger-alias (get commit-jsonld "alias")
+          ns-address   (ipns-address ipfs-endpoint ipns-key ledger-alias)
+          record       (nameservice/ns-record ns-address commit-jsonld)
+          record-bytes (json/stringify-UTF8 record)]
+      (ipfs/push! ipfs-endpoint record-bytes)))
   (publishing-address [_ ledger-alias]
     (ipns-address ipfs-endpoint ipns-key ledger-alias))
 
