@@ -76,18 +76,18 @@
   (let [tag             (where/get-transitive-property p)
         p*              (where/remove-transitivity p)
         o-var           (where/get-variable o)
-        get-o           (fn [soln] (get soln o-var))
+        get-o           #(get % o-var)
+        get-soln-iri    (fn [soln] (-> soln get-o where/get-iri))
         initial-visited (if (= :zero+ tag) #{(where/get-iri s)} #{})]
-    (loop [[s* & to-visit] #{s}
+    (loop [[soln & to-visit] #{{o-var s}}
            visited-iris    initial-visited
            solns           (if (= :zero+ tag) [{o-var s}] [])]
-      (if s*
-        (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[s* p* o]] error-ch)))
+      (if soln
+        (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[(get-o soln) p* o]] error-ch)))
 
-              to-visit-xf (comp (map get-o)
-                                (remove (fn [o-match] (visited-iris (where/get-iri o-match)))))
-              visited-xf  (map #(-> % get-o where/get-iri))
-              soln-xf     (remove (fn [soln] (visited-iris (-> soln get-o where/get-iri))))]
+              to-visit-xf (remove (fn [soln] (visited-iris (get-soln-iri soln))))
+              visited-xf  (map get-soln-iri)
+              soln-xf     (remove (fn [soln] (visited-iris (get-soln-iri soln))))]
           (recur (into to-visit to-visit-xf step-solns)
                  (into visited-iris visited-xf step-solns)
                  (into solns soln-xf step-solns)))
