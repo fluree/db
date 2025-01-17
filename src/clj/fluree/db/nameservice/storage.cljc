@@ -45,10 +45,7 @@
     (-> (storage/get-local-path ledger-address)
         (str/split #"/")
         (->> (drop-last 2) ; branch-name, head
-             (str/join #"/"))))
-
-  (-close [_]
-    true))
+             (str/join #"/")))))
 
 (defn start
   [store]

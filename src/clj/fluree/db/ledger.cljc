@@ -73,8 +73,7 @@
   "Shuts down ledger and resources."
   [{:keys [cache state] :as _ledger}]
   (reset! state {:closed? true})
-  (reset! cache {})
-  #_(release-ledger conn alias)) ;; remove ledger from conn cache
+  (reset! cache {}))
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because

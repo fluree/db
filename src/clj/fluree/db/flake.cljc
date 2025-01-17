@@ -471,19 +471,6 @@
   [comparator & entries]
   (apply avl/sorted-map-by comparator entries))
 
-(defn disj-all
-  "Removes all flakes in the `to-remove` collection from the AVL-backed sorted
-  flake set `sorted-set`. This function uses transients for intermediate set
-  values for better performance because of the slower batched update performance
-  of AVL-backed sorted sets."
-  [ss to-remove]
-  (loop [trans (transient ss)
-         rem   to-remove]
-    (if-let [f (first rem)]
-      (recur (disj! trans f)
-             (rest rem))
-      (persistent! trans))))
-
 (defn revise
   "Changes the composition of the sorted set `ss` by adding all the flakes in the
   `to-add` collection and removing all flakes in the `to-remove` collection."
@@ -500,44 +487,6 @@
                     (recur r (conj! t-set f))
                     t-set))]
     (persistent! added)))
-
-(defn remove
-  "Removes all flakes in the sorted-set where
-  applying function f to the element returns truthy."
-  [f ss]
-  (loop [trans (transient ss)
-         items (seq ss)]
-    (if-let [item (first items)]
-      (if (f item)
-        (recur (disj! trans item)
-               (rest items))
-        (recur trans
-               (rest items)))
-      (persistent! trans))))
-
-(defn partition-by
-  [f ss]
-  (if-let [items (seq ss)]
-    (let [first-item  (first items)
-          other-items (rest items)
-          empty-set   (empty ss)]
-      (loop [cur-set (-> empty-set transient (conj! first-item))
-             cur-val (f first-item)
-             items   other-items
-             out     []]
-        (if-let [item (first items)]
-          (let [v (f item)]
-            (if (= v cur-val)
-              (recur (conj! cur-set item)
-                     cur-val
-                     (rest items)
-                     out)
-              (recur (-> empty-set transient (conj! item))
-                     v
-                     (rest items)
-                     (conj out (persistent! cur-set)))))
-          (conj out (persistent! cur-set)))))
-    []))
 
 (defn last
   "Returns the last item in `ss` in constant time as long as `ss` is a sorted

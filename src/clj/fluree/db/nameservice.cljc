@@ -13,9 +13,7 @@
     and other metadata")
   (alias [nameservice ledger-address]
     "Given a ledger address, returns ledger's default alias name else nil, if
-    not avail")
-  (-close [nameservice]
-    "Closes all resources for this nameservice"))
+    not avail"))
 
 (defprotocol Publisher
   (publish [publisher commit-data]
