@@ -58,7 +58,7 @@
 
 (defrecord IpnsNameService [ipfs-endpoint ipns-key base-address?]
   nameservice/Publisher
-  (publish [_ commit-jsonld]
+  (publish-commit [_ commit-jsonld]
     (let [ledger-alias (get commit-jsonld "alias")
           ns-address   (ipns-address ipfs-endpoint ipns-key ledger-alias)
           record       (nameservice/ns-record ns-address commit-jsonld)

@@ -19,7 +19,7 @@
 
 (defrecord StorageNameService [store]
   nameservice/Publisher
-  (publish [_ commit-jsonld]
+  (publish-commit [_ commit-jsonld]
     (go-try
       (let [ledger-alias (get commit-jsonld "alias")
             ns-address   (publishing-address store ledger-alias)

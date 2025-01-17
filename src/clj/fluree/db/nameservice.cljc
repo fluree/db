@@ -16,7 +16,7 @@
     not avail"))
 
 (defprotocol Publisher
-  (publish [publisher commit-data]
+  (publish-commit [publisher commit-data]
     "Publishes new commit.")
   (publishing-address [publisher ledger-alias]
     "Returns full publisher address/iri which will get published in commit. If
