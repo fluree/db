@@ -149,12 +149,12 @@
 
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
-  [t flake]
+  [flake t]
   (flake/t-after? (flake/t flake) t))
 
 (defn before-t?
   "Returns `true` if `flake` has a transaction value before the provided `t`"
-  [t flake]
+  [flake t]
   (flake/t-before? (flake/t flake) t))
 
 (defn filter-by-t
@@ -165,7 +165,7 @@
   (loop [[f & r] flakes
          flakes* (transient flakes)]
     (if f
-      (if (pred t f)
+      (if (pred f t)
         (recur r flakes*)
         (recur r (disj! flakes* f)))
       (persistent! flakes*))))
