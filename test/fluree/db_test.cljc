@@ -64,6 +64,7 @@
             (is (not (<p! (fluree/exists? conn "notaledger"))))
             (done)))))))
 
+
 #?(:clj
    (deftest load-from-file-test
      (testing "can load a file ledger with single cardinality predicates"
