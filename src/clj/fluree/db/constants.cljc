@@ -1,5 +1,5 @@
 (ns fluree.db.constants
-  (:require [fluree.db.json-ld.iri :as iri :refer [fluree-iri]]))
+  (:require [fluree.db.json-ld.iri :as iri :refer [fluree-iri fluree-idx-iri]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -65,6 +65,22 @@
 (def ^:const iri-policyClass (fluree-iri "policyClass"))
 (def ^:const iri-vector (fluree-iri "vector"))
 (def ^:const iri-sparseVector (fluree-iri "sparseVector"))
+(def ^:const iri-VirtualGraph (fluree-iri "VirtualGraph"))
+(def ^:const iri-virtualGraph (fluree-iri "virtualGraph"))
+
+(def ^:const iri-index-BM25 (fluree-idx-iri "BM25"))
+(def ^:const iri-index-b (fluree-idx-iri "b"))
+(def ^:const iri-index-k1 (fluree-idx-iri "k1"))
+(def ^:const iri-index-target (fluree-idx-iri "target"))
+(def ^:const iri-index-property (fluree-idx-iri "property"))
+(def ^:const iri-index-limit (fluree-idx-iri "limit"))
+(def ^:const iri-index-id (fluree-idx-iri "id"))
+(def ^:const iri-index-score (fluree-idx-iri "score"))
+(def ^:const iri-index-result (fluree-idx-iri "result"))
+(def ^:const iri-index-vector (fluree-idx-iri "vector"))
+(def ^:const iri-index-sync (fluree-idx-iri "sync"))
+(def ^:const iri-index-timeout (fluree-idx-iri "timeout"))
+
 (def ^:const iri-context "@context")
 (def ^:const iri-base "@base")
 (def ^:const iri-vocab "@vocab")
@@ -330,5 +346,11 @@
 (def ^:const $xsd:base64Binary (iri/iri->sid iri-xsd-base64Binary))
 (def ^:const $rdf:json (iri/iri->sid iri-rdf-json))
 (def ^:const $fluree:vector (iri/iri->sid iri-vector)) ;; dense vector/embedding
+(def ^:const $fluree:VirtualGraph (iri/iri->sid iri-VirtualGraph))
+(def ^:const $fluree:virtualGraph-name (iri/iri->sid iri-virtualGraph))
+(def ^:const $fluree:query (iri/iri->sid iri-query))
+(def ^:const $fluree:index-BM25 (iri/iri->sid iri-index-BM25))
+(def ^:const $fluree:index-b (iri/iri->sid iri-index-b))
+(def ^:const $fluree:index-k1 (iri/iri->sid iri-index-k1))
 ;; NOTE: Add multibyte type?
 ;; NOTE: Add geo types? string-encoded GeoJSON?
