@@ -1,7 +1,9 @@
 (ns fluree.db.nameservice
   (:refer-clojure :exclude [alias])
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :as async :refer [go]]
+            [clojure.string :as str]
             [fluree.db.storage :as storage]
+            [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
@@ -16,7 +18,7 @@
     not avail"))
 
 (defprotocol Publisher
-  (publish-commit [publisher commit-data]
+  (publish-commit [publisher commit-jsonld]
     "Publishes new commit.")
   (publishing-address [publisher ledger-alias]
     "Returns full publisher address/iri which will get published in commit. If
@@ -29,6 +31,19 @@
   (unsubscribe [publication ledger-alias]
     "Unsubscribes to publication for ledger events")
   (known-addresses [publication ledger-alias]))
+
+(defn publish-to-all
+  [commit-jsonld publishers]
+  (->> publishers
+       (map (fn [ns]
+                (go
+                  (try*
+                    (<? (publish-commit ns commit-jsonld))
+                    (catch* e
+                      (log/warn e "Publisher failed to publish commit")
+                      ::publishing-error)))))
+       doall
+       async/merge))
 
 (defn published-ledger?
   [nsv ledger-alias]

@@ -501,9 +501,7 @@
   [{:keys [primary-publisher secondary-publishers] :as _conn} commit-jsonld]
   (go-try
     (let [result (<? (nameservice/publish-commit primary-publisher commit-jsonld))]
-      (dorun (map (fn [ns]
-                    (nameservice/publish-commit ns commit-jsonld)))
-             secondary-publishers)
+      (nameservice/publish-to-all commit-jsonld secondary-publishers)
       result)))
 
 (defn formalize-commit
