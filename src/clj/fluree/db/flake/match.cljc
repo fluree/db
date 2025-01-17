@@ -42,11 +42,125 @@
       (async/close! matched-ch))
     matched-ch))
 
+(defn match-flakes-xf [db solution triple]
+  (comp cat
+        (map (fn [flake] (where/match-flake solution triple db flake)))))
+
+(defn var-pattern [triple] (mapv #(if (where/get-variable %) :? :v) triple))
+
+(defmulti resolve-transitive
+  (fn [db fuel-tracker solution triple error-ch] (var-pattern triple)))
+
+(defmethod resolve-transitive :default [_ _ _ triple error-ch]
+  (async/put! error-ch (ex-info "Unsupported transitive path." {:status 400 :error :db/unsupported-transitive-path}))
+  (doto (async/chan) async/close!))
+
+(defmethod resolve-transitive [:? :v :v]
+  [db fuel-tracker solution [s p o] error-ch]
+  (let [tag   (where/get-transitive-property p)
+        p*    (where/remove-transitivity p)
+        s-var (where/get-variable s)]
+    (loop [[o* & to-visit] #{o}
+           visited-iris    (if (= :zero+ tag) #{(where/get-iri o)} #{})
+           solns           (if (= :zero+ tag) [{s-var o}] [])]
+      (if o*
+        (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[s p* o*]] error-ch)))
+              s-matches  (map #(get % s-var) step-solns)]
+          (recur (into to-visit (remove (fn [s-mch] (visited-iris (where/get-iri s-mch)))) s-matches)
+                 (into visited-iris (map where/get-iri) s-matches)
+                 (into solns (remove (fn [soln] (visited-iris (-> soln (get s-var) where/get-iri)))) step-solns)))
+        (async/to-chan! solns)))))
+
+(defmethod resolve-transitive [:v :v :?]
+  [db fuel-tracker solution [s p o] error-ch]
+  (let [tag             (where/get-transitive-property p)
+        p*              (where/remove-transitivity p)
+        o-var           (where/get-variable o)
+        get-o           #(get % o-var)
+        get-soln-iri    (fn [soln] (-> soln get-o where/get-iri))
+        initial-visited (if (= :zero+ tag) #{(where/get-iri s)} #{})
+        initial-soln    {o-var s}]
+    (loop [[soln & to-visit] #{initial-soln}
+           result-solns      (if (= :zero+ tag) [initial-soln] [])
+           visited-iris      initial-visited]
+      (if soln
+        (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[(get-o soln) p* o]] error-ch)))
+
+              remove-visited-xf (remove (fn [soln] (visited-iris (get-soln-iri soln))))
+              visited-xf        (map get-soln-iri)]
+          (recur (into to-visit     remove-visited-xf step-solns)
+                 (into result-solns remove-visited-xf step-solns)
+                 (into visited-iris visited-xf        step-solns)))
+        (async/to-chan! result-solns)))))
+
+(defn o-match->s-match
+  "Strip extra keys from a match on an o-var so taht it can be compared to a match from an
+  s-var."
+  [mch]
+  (select-keys mch [::where/var ::where/sids ::where/iri]))
+
+(defn add-reflexive-solutions
+  [s-var o-var solns]
+  (let [{s s-var} (first solns)]
+    (into #{}
+          (mapcat (fn [{s s-var o o-var :as soln}]
+                    (let [s* (assoc s ::where/var o-var)
+                          o* (assoc (o-match->s-match o) ::where/var s-var)]
+                      [{s-var s o-var s*}
+                       {s-var o* o-var (o-match->s-match o)}
+                       soln])))
+          solns)))
+
+(defn transitive-step
+  [s-var o-var solns]
+  (let [get-solution-iris (juxt #(-> % (get s-var) (where/get-iri))
+                                #(-> % (get o-var) (where/get-iri)))
+        solution-iris     (into #{} (map get-solution-iris) solns)]
+    (reduce (fn [results {o o-var s s-var :as soln}]
+              (into results
+                    ;; do not include solns we've already found
+                    (remove #(solution-iris (get-solution-iris %)))
+                    ;; join each result o-match to each other result's s-match and create a new solution
+                    (reduce (fn [joins {o-match o-var s-match s-var}]
+                              (if (= (where/get-iri o) (where/get-iri s-match))
+                                (conj joins (assoc soln s-var s o-var o-match))
+                                joins))
+                            []
+                            solns)))
+            []
+            solns)))
+
+(defn transitive-steps
+  [step0 [s p o]]
+  (let [tag   (where/get-transitive-property p)
+        s-var (where/get-variable s)
+        o-var (where/get-variable o)]
+    (loop [steps      0
+           step-solns step0
+           result     (if (= :zero+ tag)
+                        (add-reflexive-solutions s-var o-var step0)
+                        step0)]
+      (if (seq step-solns)
+        (let [next-step-solns (transitive-step s-var o-var result)]
+          (recur (inc steps) next-step-solns (into result next-step-solns)))
+        (async/to-chan! result)))))
+
+(defmethod resolve-transitive [:? :v :?]
+  [db fuel-tracker solution [s p o] error-ch]
+  (let [step-ch (async/into #{} (where/match-clause db fuel-tracker solution [[s (where/remove-transitivity p) o]] error-ch))
+        soln-ch (async/chan)]
+    (async/pipeline-async 2
+                          soln-ch
+                          (fn [step ch]
+                            (-> (transitive-steps step [s p o])
+                                (async/pipe ch)))
+                          step-ch)
+    soln-ch))
+
+
 (defn match-triple
   [db fuel-tracker solution tuple error-ch]
-  (let [matched-ch (async/chan 2 (comp cat
-                                       (map (fn [flake]
-                                              (where/match-flake solution tuple db flake)))))
+  (let [out-ch     (async/chan 2)
         db-alias   (:alias db)
         triple     (where/assign-matched-values tuple solution)]
     (if-let [[s p o] (where/compute-sids db triple)]
@@ -54,19 +168,24 @@
         (if-let [props (and pid (where/get-child-properties db pid))]
           (let [prop-ch (-> props (conj pid) async/to-chan!)]
             (async/pipeline-async 2
-                                  matched-ch
+                                  out-ch
                                   (fn [prop ch]
                                     (let [p* (where/match-sid p db-alias prop)]
                                       (-> db
                                           (where/resolve-flake-range fuel-tracker error-ch [s p* o])
+                                          (async/pipe (async/chan 2 (match-flakes-xf db solution tuple)))
                                           (async/pipe ch))))
                                   prop-ch))
 
-          (-> db
-              (where/resolve-flake-range fuel-tracker error-ch [s p o])
-              (async/pipe matched-ch))))
-      (async/close! matched-ch))
-    matched-ch))
+          (if-let [transitive (where/get-transitive-property p)]
+            (-> (resolve-transitive db fuel-tracker solution [s p o] error-ch)
+                (async/pipe out-ch))
+            (-> db
+                (where/resolve-flake-range fuel-tracker error-ch [s p o])
+                (async/pipe (async/chan 2 (match-flakes-xf db solution tuple)))
+                (async/pipe out-ch)))))
+      (async/close! out-ch))
+    out-ch))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
