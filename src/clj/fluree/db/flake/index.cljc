@@ -158,6 +158,9 @@
   (flake/t-before? (flake/t flake) t))
 
 (defn filter-by-t
+  "Returns a subset of the sorted flake set `flakes` consisting of all elements
+  that the supplied predicate function `pred` returns `true` when applied to
+  that element and the supplied t value `t`."
   [pred t flakes]
   (loop [[f & r] flakes
          flakes* (transient flakes)]
@@ -168,16 +171,20 @@
       (persistent! flakes*))))
 
 (defn filter-after
-  "Returns a sequence containing only flakes from the flake set `flakes` with
+  "Returns a flake set containing only flakes from the flake set `flakes` with
   transaction values after the provided `t`."
   [t flakes]
   (filter-by-t after-t? t flakes))
 
 (defn flakes-from
+  "Returns a subset of the flake set `flakes` with transaction values greater than
+  or equal to `t`."
   [t flakes]
   (filter-after (flake/prev-t t) flakes))
 
 (defn filter-before
+  "Returns a subset of the flake set `flakes` with transaction values less than
+  `t`."
   [t flakes]
   (filter-by-t before-t? t flakes))
 
