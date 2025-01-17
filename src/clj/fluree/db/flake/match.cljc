@@ -87,24 +87,6 @@
                  (into solns (remove (fn [soln] (visited-iris (-> soln (get o-var) where/get-iri)))) step-solns)))
         (async/to-chan! solns)))))
 
-(defn transitive-step
-  [s-var o-var solns]
-  (let [get-solution-iris (juxt #(-> % (get s-var) (where/get-iri))
-                                #(-> % (get o-var) (where/get-iri)))
-        solution-iris (into #{} (map get-solution-iris) solns)]
-    (reduce (fn [results {o o-var s s-var :as soln}]
-              (into results
-                    ;; do not include solns we've already found
-                    (remove #(contains? solution-iris (get-solution-iris %)))
-                    ;; join each result o-match to each other result's s-match and create a new solution
-                    (reduce (fn [joins {o-match o-var s-match s-var}]
-                              (if (= (where/get-iri o) (where/get-iri s-match))
-                                (conj joins (assoc soln s-var s o-var o-match))
-                                joins))
-                            []
-                            solns)))
-            []
-            solns)))
 
 (defn o-match->s-match
   "Strip extra keys from a match on an o-var so taht it can be compared to a match from an
@@ -124,21 +106,50 @@
                        soln])))
           solns)))
 
-(defmethod resolve-transitive [:? :v :?]
-  [db fuel-tracker solution [s p o] error-ch]
-  (let [s-var   (where/get-variable s)
-        o-var   (where/get-variable o)
-        step0   (async/<!! (async/into #{} (where/match-clause db fuel-tracker solution [[s (where/remove-transitivity p) o]] error-ch)))
-        soln-ch (async/chan)]
+(defn transitive-step
+  [s-var o-var solns]
+  (let [get-solution-iris (juxt #(-> % (get s-var) (where/get-iri))
+                                #(-> % (get o-var) (where/get-iri)))
+        solution-iris     (into #{} (map get-solution-iris) solns)]
+    (reduce (fn [results {o o-var s s-var :as soln}]
+              (into results
+                    ;; do not include solns we've already found
+                    (remove #(solution-iris (get-solution-iris %)))
+                    ;; join each result o-match to each other result's s-match and create a new solution
+                    (reduce (fn [joins {o-match o-var s-match s-var}]
+                              (if (= (where/get-iri o) (where/get-iri s-match))
+                                (conj joins (assoc soln s-var s o-var o-match))
+                                joins))
+                            []
+                            solns)))
+            []
+            solns)))
+
+(defn transitive-steps
+  [step0 [s p o]]
+  (let [tag   (where/get-transitive-property p)
+        s-var (where/get-variable s)
+        o-var (where/get-variable o)]
     (loop [steps      0
            step-solns step0
-           result     (if (= :zero+ (where/get-transitive-property p))
+           result     (if (= :zero+ tag)
                         (add-reflexive-solutions s-var o-var step0)
                         step0)]
       (if (seq step-solns)
         (let [next-step-solns (transitive-step s-var o-var result)]
           (recur (inc steps) next-step-solns (into result next-step-solns)))
-        (async/onto-chan! soln-ch result)))
+        (async/to-chan! result)))))
+
+(defmethod resolve-transitive [:? :v :?]
+  [db fuel-tracker solution [s p o] error-ch]
+  (let [step-ch (async/into #{} (where/match-clause db fuel-tracker solution [[s (where/remove-transitivity p) o]] error-ch))
+        soln-ch (async/chan)]
+    (async/pipeline-async 2
+                          soln-ch
+                          (fn [step ch]
+                            (-> (transitive-steps step [s p o])
+                                (async/pipe ch)))
+                          step-ch)
     soln-ch))
 
 
