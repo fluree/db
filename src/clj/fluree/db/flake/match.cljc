@@ -78,9 +78,10 @@
         o-var           (where/get-variable o)
         get-o           #(get % o-var)
         get-soln-iri    (fn [soln] (-> soln get-o where/get-iri))
-        initial-visited (if (= :zero+ tag) #{(where/get-iri s)} #{})]
-    (loop [[soln & to-visit] #{{o-var s}}
-           result-solns      (if (= :zero+ tag) [{o-var s}] [])
+        initial-visited (if (= :zero+ tag) #{(where/get-iri s)} #{})
+        initial-soln    {o-var s}]
+    (loop [[soln & to-visit] #{initial-soln}
+           result-solns      (if (= :zero+ tag) [initial-soln] [])
            visited-iris      initial-visited]
       (if soln
         (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[(get-o soln) p* o]] error-ch)))
