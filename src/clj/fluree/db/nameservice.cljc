@@ -42,7 +42,6 @@
                     (catch* e
                       (log/warn e "Publisher failed to publish commit")
                       ::publishing-error)))))
-       doall
        async/merge))
 
 (defn published-ledger?
