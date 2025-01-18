@@ -80,7 +80,7 @@
         get-soln-iri    (fn [soln] (-> soln get-o where/get-iri))
         initial-visited (if (= :zero+ tag) #{(where/get-iri s)} #{})
         initial-soln    {o-var s}]
-    (loop [[soln & to-visit] #{initial-soln}
+    (loop [[soln & to-visit] [initial-soln]
            result-solns      (if (= :zero+ tag) [initial-soln] [])
            visited-iris      initial-visited]
       (if soln
