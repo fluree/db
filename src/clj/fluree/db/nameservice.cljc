@@ -18,7 +18,7 @@
     not avail"))
 
 (defprotocol Publisher
-  (publish-commit [publisher commit-jsonld]
+  (publish [publisher commit-jsonld]
     "Publishes new commit.")
   (publishing-address [publisher ledger-alias]
     "Returns full publisher address/iri which will get published in commit. If
@@ -38,7 +38,7 @@
        (map (fn [ns]
                 (go
                   (try*
-                    (<? (publish-commit ns commit-jsonld))
+                    (<? (publish ns commit-jsonld))
                     (catch* e
                       (log/warn e "Publisher failed to publish commit")
                       ::publishing-error)))))

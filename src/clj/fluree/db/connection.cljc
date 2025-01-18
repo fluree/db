@@ -503,7 +503,7 @@
   "Publishes commit to all nameservices registered with the ledger."
   [{:keys [primary-publisher secondary-publishers] :as _conn} commit-jsonld]
   (go-try
-    (let [result (<? (nameservice/publish-commit primary-publisher commit-jsonld))]
+    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
       (nameservice/publish-to-all commit-jsonld secondary-publishers)
       result)))
 
