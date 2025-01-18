@@ -139,10 +139,10 @@
 (defn instantiate
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [conn ledger-alias ledger-address branch commit-catalog index-catalog
+  [conn ledger-alias ledger-address branch commit-catalog index-catalog publishers
    indexing-opts did latest-commit]
   (let [branches {branch (branch/state-map ledger-alias branch commit-catalog index-catalog
-                                           latest-commit indexing-opts)}]
+                                           publishers latest-commit indexing-opts)}]
     (map->Ledger {:conn                 conn
                   :id                   (random-uuid)
                   :did                  did
@@ -165,7 +165,8 @@
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [{:keys [conn alias primary-address publish-addresses commit-catalog index-catalog]}
+  [{:keys [conn alias primary-address publish-addresses commit-catalog index-catalog
+           publishers]}
    {:keys [did branch indexing] :as opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias alias)
@@ -175,4 +176,4 @@
           genesis-commit (<? (commit-storage/write-genesis-commit
                                commit-catalog alias branch publish-addresses init-time))]
       (instantiate conn ledger-alias* primary-address branch commit-catalog index-catalog
-                   indexing did genesis-commit))))
+                   publishers indexing did genesis-commit))))

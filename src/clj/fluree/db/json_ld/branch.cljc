@@ -77,7 +77,7 @@
     db))
 
 (defn index-queue
-  [alias branch branch-state]
+  [alias branch publishers branch-state]
   (let [buf   (async/sliding-buffer 1)
         queue (async/chan buf)]
     (go-loop [last-index-commit nil]
@@ -97,15 +97,15 @@
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
-  ([ledger-alias branch-name commit-catalog index-catalog commit-jsonld]
-   (state-map ledger-alias branch-name commit-catalog index-catalog commit-jsonld nil))
-  ([ledger-alias branch-name commit-catalog index-catalog commit-jsonld indexing-opts]
+  ([ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld]
+   (state-map ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
+  ([ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
    (let [initial-db (async-db/load ledger-alias branch-name commit-catalog index-catalog
                                    commit-jsonld indexing-opts)
          commit-map (commit-data/jsonld->clj commit-jsonld)
          state      (atom {:commit     commit-map
                            :current-db initial-db})
-         idx-q      (index-queue ledger-alias branch-name state)]
+         idx-q      (index-queue ledger-alias branch-name publishers state)]
      {:name        branch-name
       :alias       ledger-alias
       :state       state
