@@ -6,7 +6,8 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log :include-macros true]
-            [clojure.core.async :as async :refer [<! go-loop]]))
+            [clojure.core.async :as async :refer [<! go-loop]]
+            [fluree.db.nameservice :as nameservice]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -86,8 +87,12 @@
           (if-let [indexed-db (try* (<? (indexer/index db* index-files-ch))
                                     (catch* e
                                       (log/error e "Error updating index")))]
-            (do (swap! branch-state update-index indexed-db)
-                (recur (:commit indexed-db)))
+            (let [[{prev-commit :commit} {indexed-commit :commit}]
+                  (swap-vals! branch-state update-index indexed-db)]
+              (when (not= prev-commit indexed-commit)
+                (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
+                  (nameservice/publish-to-all commit-jsonld publishers)))
+              (recur indexed-commit))
             (recur last-index-commit)))))
     queue))
 
