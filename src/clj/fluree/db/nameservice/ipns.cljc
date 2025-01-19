@@ -33,7 +33,7 @@
   "Given IPNS address, performs lookup and returns latest ledger address."
   [ipfs-endpoint ipns-profile ledger-name]
   (go-try
-    (let [ipns-address (if-let [[proto address ledger] (address-parts ledger-name)]
+    (let [ipns-address (if-let [[_proto address _ledger] (address-parts ledger-name)]
                          address
                          (<? (ipfs-keys/address ipfs-endpoint ipns-profile)))
           ipfs-address (str "/ipns/" ipns-address)
@@ -59,11 +59,7 @@
 (defrecord IpnsNameService [ipfs-endpoint ipns-key base-address?]
   nameservice/Publisher
   (publish [_ commit-jsonld]
-    (let [ledger-alias (get commit-jsonld "alias")
-          ns-address   (ipns-address ipfs-endpoint ipns-key ledger-alias)
-          record       (nameservice/ns-record ns-address commit-jsonld)
-          record-bytes (json/stringify-UTF8 record)]
-      (ipfs/push! ipfs-endpoint record-bytes)))
+    (ipfs/push! ipfs-endpoint commit-jsonld))
   (publishing-address [_ ledger-alias]
     (ipns-address ipfs-endpoint ipns-key ledger-alias))
 
