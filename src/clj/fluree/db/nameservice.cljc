@@ -50,20 +50,6 @@
     (let [addr (<? (publishing-address nsv ledger-alias))]
       (boolean (<? (lookup nsv addr))))))
 
-(defn ns-record
-  "Generates nameservice metadata map for JSON storage. For now, since we only
-  have a single branch possible, always sets default-branch. Eventually will
-  need to merge changes from different branches into existing metadata map"
-  [ns-address {address "address", alias "alias", branch "branch", :as commit-jsonld}]
-  (let [branch-iri (str ns-address "(" branch ")")]
-    {"@context"      "https://ns.flur.ee/ledger/v1"
-     "@id"           ns-address
-     "defaultBranch" branch-iri
-     "ledgerAlias"   alias
-     "branches"      [{"@id"     branch-iri
-                       "address" address
-                       "commit"  commit-jsonld}]}))
-
 (defn commit-address-from-record
   [record branch]
   (let [branch-iri (if branch
