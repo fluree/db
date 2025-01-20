@@ -52,8 +52,8 @@
 
 (comment
 
-  (def file-conn @(fluree/connect {:storage-path "dev/data"
-                                   :defaults     {:did did}}))
+  (def file-conn @(fluree/connect-file {:storage-path "dev/data"
+                                        :defaults     {:did did}}))
 
   (def ledger-alias "user/test")
 
