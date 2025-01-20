@@ -330,13 +330,15 @@
                          :error  :db/ledger-exists}))
         (let [addr          (<? (primary-address conn ledger-alias))
               publish-addrs (<? (publishing-addresses conn ledger-alias))
+              pubs          (publishers conn)
               ledger-opts   (parse-ledger-options conn opts)
               ledger        (<! (ledger/create {:conn              conn
                                                 :alias             ledger-alias
                                                 :address           addr
                                                 :publish-addresses publish-addrs
                                                 :commit-catalog    commit-catalog
-                                                :index-catalog     index-catalog}
+                                                :index-catalog     index-catalog
+                                                :publishers        pubs}
                                                ledger-opts))]
           (when (util/exception? ledger)
             (release-ledger conn ledger-alias))
@@ -373,8 +375,9 @@
 
           {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 
-          ledger   (ledger/instantiate conn ledger-alias address branch commit-catalog
-                                       index-catalog did indexing commit)]
+          pubs   (publishers conn)
+          ledger (ledger/instantiate conn ledger-alias address branch commit-catalog
+                                     index-catalog pubs did indexing commit)]
       (subscribe-ledger conn ledger-alias)
       (async/put! ledger-chan ledger)
       ledger)))
@@ -501,9 +504,7 @@
   [{:keys [primary-publisher secondary-publishers] :as _conn} commit-jsonld]
   (go-try
     (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
-      (dorun (map (fn [ns]
-                    (nameservice/publish ns commit-jsonld)))
-             secondary-publishers)
+      (nameservice/publish-to-all commit-jsonld secondary-publishers)
       result)))
 
 (defn formalize-commit
