@@ -163,7 +163,6 @@
 
   Options map (opts) can include:
   - did - DId information to use, if storing blocks as verifiable credentials"
-  ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (promise-wrap
