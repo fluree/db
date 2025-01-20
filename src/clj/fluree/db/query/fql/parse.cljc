@@ -586,7 +586,7 @@
     (if (v/variable? subj)
       (let [var (parse-var-name subj)]
         (select/subgraph-selector var selection depth spec))
-      (let [iri (json-ld/expand-iri subj context)]
+      (let [iri (json-ld/expand-iri subj context false)]
         (select/subgraph-selector iri selection depth spec)))))
 
 (defn parse-selector

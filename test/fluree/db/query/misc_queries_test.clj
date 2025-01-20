@@ -394,4 +394,9 @@
             ["@type" "Yeti"]]
            @(fluree/query db1 {"@context" {"@base" "https://flur.ee/"}
                                "where" [{"@id" "freddy" "?p" "?o"}]
-                               "select" ["?p" "?o"]})))))
+                               "select" ["?p" "?o"]})))
+    (is (= [{"@id" "freddy"
+             "@type" "Yeti"
+             "name" "Freddy"}]
+           @(fluree/query db1 {"@context" {"@base" "https://flur.ee/"}
+                               "select" {"freddy" ["*"]}})))))
