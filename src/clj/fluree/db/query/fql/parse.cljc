@@ -269,10 +269,10 @@
         f    (eval/compile code context false)]
     (where/->var-filter var-name f)))
 
-(defn parse-iri
+(defn parse-subject-iri
   [x context]
   (-> x
-      (json-ld/expand-iri context)
+      (json-ld/expand-iri context false)
       where/->iri-ref))
 
 (defn parse-class
@@ -362,7 +362,7 @@
   [id context]
   (if (v/variable? id)
     (parse-variable id)
-    (parse-iri id context)))
+    (parse-subject-iri id context)))
 
 (defn parse-predicate
   [p context]
