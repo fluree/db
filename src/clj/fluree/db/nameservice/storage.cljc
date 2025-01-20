@@ -34,13 +34,12 @@
 (defrecord StorageNameService [store]
   nameservice/Publisher
   (publish [_ commit-jsonld]
-    (go-try
-      (let [ledger-alias (get commit-jsonld "alias")
-            ns-address   (publishing-address store ledger-alias)
-            record       (ns-record ns-address commit-jsonld)
-            record-bytes (json/stringify-UTF8 record)
-            filename     (local-filename ledger-alias)]
-        (<? (storage/write-bytes store filename record-bytes)))))
+    (let [ledger-alias (get commit-jsonld "alias")
+          ns-address   (publishing-address store ledger-alias)
+          record       (ns-record ns-address commit-jsonld)
+          record-bytes (json/stringify-UTF8 record)
+          filename     (local-filename ledger-alias)]
+      (storage/write-bytes store filename record-bytes)))
 
   (publishing-address [_ ledger-alias]
     (go (publishing-address store ledger-alias)))
