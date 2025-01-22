@@ -405,9 +405,8 @@
         (<? ledger-chan)
         (loop [[addr & r] (<? (current-addresses conn alias))]
           (if addr
-            (do (log/info "trying to load address:" addr)
-                (or (<? (try-load-address conn ledger-chan alias addr))
-                    (recur r)))
+            (or (<? (try-load-address conn ledger-chan alias addr))
+                (recur r))
             (do (release-ledger conn alias)
                 (let [ex (ex-info (str "Load for " alias " failed due to failed address lookup.")
                                   {:status 404 :error :db/unknown-address}
