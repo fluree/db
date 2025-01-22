@@ -237,7 +237,7 @@
         primary-publisher    (get-first config conn-vocab/primary-publisher)
         secondary-publishers (get config conn-vocab/secondary-publishers)
         remote-systems       (get config conn-vocab/remote-systems)
-        defaults      (parse-defaults config)]
+        defaults             (parse-defaults config)]
     (connection/connect {:parallelism          parallelism
                          :cache                cache
                          :commit-catalog       commit-catalog

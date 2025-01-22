@@ -422,37 +422,6 @@
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
-(defn parse-commit-context
-  [context]
-  (let [parsed-context (if context
-                         (-> context
-                             json-ld/parse-context
-                             (json-ld/parse-context f-context))
-                         (json-ld/parse-context f-context))]
-    (context/stringify parsed-context)))
-
-(defn enrich-commit-opts
-  [ledger {:keys [context did private] :as _opts}]
-  (let [context*      (parse-commit-context context)
-        private*      (or private
-                          (:private did)
-                          (-> ledger :did :private))
-        did*          (or (some-> private* did/private->did)
-                          did
-                          (:did ledger))
-        ctx-used-atom (atom {})
-        compact-fn    (json-ld/compact-fn context* ctx-used-atom)]
-    {:commit-opts
-     {:private private*
-      :did did*}
-
-     :commit-data-helpers
-     {:compact-fn compact-fn
-      :compact (fn [iri] (json-ld/compact iri compact-fn))
-      :id-key (json-ld/compact "@id" compact-fn)
-      :type-key (json-ld/compact "@type" compact-fn)
-      :ctx-used-atom ctx-used-atom}}))
-
 (defn write-transaction
   [storage ledger-alias txn]
   (let [path (str/join "/" [ledger-alias "txn"])]
@@ -516,12 +485,49 @@
                :max-namespace-code max-ns-code)
         (commit-data/add-commit-flakes prev-commit))))
 
-(defn parse-commit-options
+(defn sanitize-commit-options
   "Parses the commit options and removes non-public opts."
   [opts]
   (if (string? opts)
     {:message opts}
     (select-keys opts [:context :did :private :message :tag :index-files-ch])))
+
+(defn parse-commit-context
+  [context]
+  (let [parsed-context (if context
+                         (-> context
+                             json-ld/parse-context
+                             (json-ld/parse-context f-context))
+                         (json-ld/parse-context f-context))]
+    (context/stringify parsed-context)))
+
+(defn parse-keypair
+  [ledger {:keys [did private] :as opts}]
+  (let [private* (or private
+                     (:private did)
+                     (-> ledger :did :private))
+        did*     (or (some-> private* did/private->did)
+                     did
+                     (:did ledger))]
+    (assoc opts :did did*, :private private*)))
+
+(defn parse-data-helpers
+  [{:keys [context] :as opts}]
+  (let [ctx-used-atom (atom {})
+        compact-fn    (json-ld/compact-fn context ctx-used-atom)]
+    (assoc opts
+           :commit-data-opts {:compact-fn    compact-fn
+                              :compact       (fn [iri] (json-ld/compact iri compact-fn))
+                              :id-key        (json-ld/compact "@id" compact-fn)
+                              :type-key      (json-ld/compact "@type" compact-fn)
+                              :ctx-used-atom ctx-used-atom})))
+
+(defn parse-commit-opts
+  [ledger opts]
+  (-> opts
+      (update :context parse-commit-context)
+      (->> (parse-keypair ledger))
+      parse-data-helpers))
 
 (defn apply-stage!
   [{:keys [conn] ledger-alias :alias, :as ledger}
@@ -530,13 +536,9 @@
   (go-try
     (let [{:keys [commit-catalog]} conn
 
-          {:keys [tag time message index-files-ch]
+          {:keys [tag time message did private commit-data-opts index-files-ch]
            :or   {time (util/current-time-iso)}}
-          (parse-commit-options opts)
-
-          {commit-data-opts      :commit-data-helpers
-           {:keys [did private]} :commit-opts}
-          (enrich-commit-opts ledger opts)
+          (parse-commit-opts ledger opts)
 
           {:keys [dbid db-jsonld staged-txns]}
           (flake-db/db->jsonld staged-db commit-data-opts)
@@ -548,22 +550,21 @@
 
           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
-          keypair           {:did did :private private}
+          keypair           {:did did, :private private}
 
-          new-commit (commit-data/new-db-commit-map
-                      {:old-commit commit
-                       :issuer     did
-                       :message    message
-                       :tag        tag
-                       :dbid       dbid
-                       :t          t
-                       :time       time
-                       :db-address db-address
-                       :author     author
-                       :annotation annotation
-                       :txn-id     txn-id
-                       :flakes     (:flakes stats)
-                       :size       (:size stats)})
+          new-commit (commit-data/new-db-commit-map {:old-commit commit
+                                                     :issuer     did
+                                                     :message    message
+                                                     :tag        tag
+                                                     :dbid       dbid
+                                                     :t          t
+                                                     :time       time
+                                                     :db-address db-address
+                                                     :author     author
+                                                     :annotation annotation
+                                                     :txn-id     txn-id
+                                                     :flakes     (:flakes stats)
+                                                     :size       (:size stats)})
 
           {:keys [commit-map commit-jsonld write-result]}
           (<? (write-commit commit-catalog ledger-alias keypair new-commit))
