@@ -377,7 +377,7 @@
 
           pubs   (publishers conn)
           ledger (ledger/instantiate conn ledger-alias address branch commit-catalog
-                                     index-catalog pubs did indexing commit)]
+                                     index-catalog pubs indexing did commit)]
       (subscribe-ledger conn ledger-alias)
       (async/put! ledger-chan ledger)
       ledger)))
