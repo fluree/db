@@ -139,7 +139,6 @@
                          [:private {:optional true} :string]
                          [:message {:optional true} :string]
                          [:tag {:optional true} :string]
-                         [:file-data? {:optional true} :boolean]
                          [:index-files-ch {:optional true} :any]
                          [:time {:optional true} :string]]
     ::ledger-opts       [:map

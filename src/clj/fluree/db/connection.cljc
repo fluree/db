@@ -521,7 +521,7 @@
   [opts]
   (if (string? opts)
     {:message opts}
-    (select-keys opts [:context :did :private :message :tag :file-data? :index-files-ch])))
+    (select-keys opts [:context :did :private :message :tag :index-files-ch])))
 
 (defn apply-stage!
   [{:keys [conn] ledger-alias :alias, :as ledger}
