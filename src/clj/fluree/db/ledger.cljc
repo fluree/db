@@ -126,8 +126,8 @@
                     " however, latest t is more current: " current-t)
           false)))))
 
-(defrecord Ledger [conn id address alias did state cache commit-storage
-                   index-storage reasoner])
+(defrecord Ledger [conn id address alias did state cache commit-catalog
+                   index-catalog reasoner])
 
 (defn initial-state
   [branches current-branch]

@@ -59,7 +59,7 @@
    :ns-default build}
 
   :dev
-  {:extra-paths ["dev" "dev-resources" "src-cljs" "src-nodejs" "src-docs"]
+  {:extra-paths ["dev" "dev-resources"]
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.5.0"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}

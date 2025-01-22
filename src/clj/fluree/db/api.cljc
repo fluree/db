@@ -1,7 +1,6 @@
 (ns fluree.db.api
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.walk :refer [postwalk]]
-            [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.util.context :as context]
@@ -164,7 +163,6 @@
 
   Options map (opts) can include:
   - did - DId information to use, if storing blocks as verifiable credentials"
-  ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (promise-wrap
