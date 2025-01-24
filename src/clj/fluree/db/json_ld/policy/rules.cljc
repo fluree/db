@@ -10,18 +10,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn property-restriction?
-  [restriction-map]
-  (seq (:on-property restriction-map)))
-
-(defn class-restriction?
-  [restriction-map]
-  (seq (:on-class restriction-map)))
-
-(defn default-restriction?
-  [restriction-map]
-  (:default? restriction-map))
-
 (defn view-restriction?
   [restriction-map]
   (:view? restriction-map))
@@ -123,23 +111,22 @@
 (defn parse-policy-rules
   [db policy-rules]
   (reduce
-   (fn [acc rule]
-     (let [parsed-restriction (restriction-map rule)] ;; will throw if formatting is not valid
-       (cond
+    (fn [acc rule]
+      (let [parsed-restriction (restriction-map rule)] ;; will throw if formatting is not valid
+        (cond
+          (seq (:on-property parsed-restriction))
+          (add-property-restriction parsed-restriction db acc)
 
-         (property-restriction? parsed-restriction)
-         (add-property-restriction parsed-restriction db acc)
+          (seq (:on-class parsed-restriction))
+          (add-class-restriction parsed-restriction db acc)
 
-         (class-restriction? parsed-restriction)
-         (add-class-restriction parsed-restriction db acc)
+          (:default? parsed-restriction)
+          (add-default-restriction parsed-restriction acc)
 
-         (default-restriction? parsed-restriction)
-         (add-default-restriction parsed-restriction acc)
-
-         :else
-         acc)))
-   {}
-   policy-rules))
+          :else
+          acc)))
+    {}
+    policy-rules))
 
 (defn wrap-policy
   [db policy-rules policy-values]
