@@ -1,5 +1,5 @@
 (ns fluree.db.json-ld.policy.rules
-  (:require [clojure.core.async :refer [<! go]]
+  (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
