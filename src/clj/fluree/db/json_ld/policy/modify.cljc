@@ -34,7 +34,7 @@
                   policies (concat (enforce/policies-for-property policy true pid)
                                    (->> (classes-for-sid sid mods db-after)
                                         (enforce/policies-for-classes policy true))
-                                   (enforce/default-policies policy true))]
+                                   (enforce/policies-for-flake db-after flake))]
               ;; policies-allow? will throw if access forbidden
               (if-some [required-policies (not-empty (filter :required? policies))]
                 (<? (enforce/policies-allow? db-after true sid required-policies))

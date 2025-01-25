@@ -72,15 +72,38 @@
      policy-map
      (:on-property restriction-map))))
 
+(defn parse-targets
+  [db target-exprs]
+  (let [out-ch (async/chan 2)
+        in-ch  (async/to-chan! (mapv #(or (util/get-id %) (util/get-value %)) target-exprs))]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [target-expr ch]
+                            (if (map? target-expr)
+                              ;; maps are query where clauses
+                              (-> (dbproto/-query db (assoc target-expr "select" "?$target"))
+                                  (async/pipe (async/chan 2 cat))
+                                  (async/pipe ch))
+                              ;; non-maps are literals
+                              (async/onto-chan! ch [target-expr])))
+                          in-ch)
+    (async/into #{} out-ch)))
+
 (defn parse-policy
   [db policy-doc]
   (go-try
     (let [id (util/get-id policy-doc) ;; @id name of policy-doc
 
-          on-property (when-let [props (util/get-all-ids policy-doc const/iri-onProperty)]
-                        (set props)) ;; can be multiple properties
-          on-class    (when-let [classes (util/get-all-ids policy-doc const/iri-onClass)]
-                        (set classes))
+          subject-targets  (when-let [target-exprs (get policy-doc const/iri-targetSubject)]
+                             (<? (parse-targets db target-exprs)))
+          property-targets (when-let [target-exprs (get policy-doc const/iri-targetProperty)]
+                             (<? (parse-targets db target-exprs)))
+          object-targets   (when-let [target-exprs (get policy-doc const/iri-targetObject)]
+                             (<? (parse-targets db target-exprs)))
+          on-property      (when-let [props (util/get-all-ids policy-doc const/iri-onProperty)]
+                             (set props)) ;; can be multiple properties
+          on-class         (when-let [classes (util/get-all-ids policy-doc const/iri-onClass)]
+                             (set classes))
 
           src-query (util/get-first-value policy-doc const/iri-query)
           query     (if (map? src-query)
@@ -95,15 +118,18 @@
           modify?   (or (empty? actions)
                         (contains? actions const/iri-modify))]
       (if (or view? modify?)
-        {:id          id
-         :on-property on-property
-         :on-class    on-class
-         :required?   (util/get-first-value policy-doc const/iri-required)
-         :default?    (and (nil? on-property) (nil? on-class)) ;; with no class or property restrictions, becomes a default policy-doc
-         :ex-message  (util/get-first-value policy-doc const/iri-exMessage)
-         :view?       view?
-         :modify?     modify?
-         :query       query}
+        (cond-> {:id          id
+                 :on-property on-property
+                 :on-class    on-class
+                 :required?   (util/get-first-value policy-doc const/iri-required)
+                 :default?    (and (nil? on-property) (nil? on-class)) ;; with no class or property restrictions, becomes a default policy-doc
+                 :ex-message  (util/get-first-value policy-doc const/iri-exMessage)
+                 :view?       view?
+                 :modify?     modify?
+                 :query       query}
+          (not-empty subject-targets)  (assoc :s-targets subject-targets)
+          (not-empty property-targets) (assoc :p-targets property-targets)
+          (not-empty object-targets)   (assoc :o-targets object-targets))
         ;; policy-doc has incorrectly formatted view? and/or modify?
         ;; this might allow data through that was intended to be restricted, so throw.
         (throw (ex-info (str "Invalid policy definition. Policies must have f:action of {@id: f:view} or {@id: f:modify}. "
@@ -115,6 +141,11 @@
   [db]
   (fn [wrapper policy]
     (cond
+      (or (:s-targets policy)
+          (:p-targets policy)
+          (:o-targets policy))
+      (add-default-restriction policy wrapper)
+
       (seq (:on-property policy))
       (add-property-restriction policy db wrapper)
 
@@ -143,5 +174,4 @@
   [db policy-rules policy-values]
   (go-try
     (let [wrapper (<? (parse-policies db (util/sequential policy-rules)))]
-      (-> db
-          (assoc :policy (assoc wrapper :cache (atom {}) :policy-values policy-values))))))
+      (assoc db :policy (assoc wrapper :cache (atom {}) :policy-values policy-values)))))

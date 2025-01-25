@@ -52,6 +52,19 @@
     (get-in policy-map [const/iri-modify :default])
     (get-in policy-map [const/iri-view :default])))
 
+(defn policies-for-flake
+  [{:keys [policy namespace-codes] :as db} [s p o :as flake]]
+  (let [s-iri (iri/sid->iri s namespace-codes)
+        p-iri (iri/sid->iri p namespace-codes)
+        o-val (if (iri/sid? o) (iri/sid->iri o namespace-codes) o) ]
+    (->> (default-policies policy false)
+         (keep (fn [{:keys [s-targets p-targets o-targets default?] :as policy}]
+                 (when (or (contains? s-targets s-iri)
+                           (contains? p-targets p-iri)
+                           (contains? o-targets o-val)
+                           default?)
+                   policy))))))
+
 (defn policy-query
   [db sid policy]
   (let [policy-values (-> db :policy :policy-values)
