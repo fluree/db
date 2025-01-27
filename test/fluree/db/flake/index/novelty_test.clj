@@ -9,7 +9,7 @@
     (with-tmp-dir storage-path
       (let [conn    @(fluree/connect-file {:storage-path storage-path
                                            :defaults
-                                           {:indexer {:reindex-min-bytes 12
+                                           {:indexing {:reindex-min-bytes 12
                                                       :reindex-max-bytes 10000000}}})
             context (merge test-utils/default-str-context {"ex" "http://example.org/ns/"})
             ledger  @(fluree/create conn "index/datetimes")

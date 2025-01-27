@@ -151,11 +151,10 @@
         (merge-template json-ld-data-template))))
 
 (defn ->json-ld
-  "Converts a clojure commit map to a JSON-LD version.
-  Uses the JSON-LD template, and only incorporates values
-  that exist in both the commit-map and the json-ld template,
-  except for some defaults (like rdf:type) which are not in
-  our internal commit map, but are part of json-ld."
+  "Converts a clojure commit map to a JSON-LD version. Uses the JSON-LD template,
+  and only incorporates values that exist in both the commit-map and the json-ld
+  template, except for some defaults (like rdf:type) which are not in our
+  internal commit map, but are part of json-ld."
   [{:keys [previous data ns index issuer] :as commit-map}]
   (let [commit-map*    (assoc commit-map
                               :previous (merge-template previous json-ld-prev-commit-template)

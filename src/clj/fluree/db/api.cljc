@@ -1,13 +1,11 @@
 (ns fluree.db.api
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.walk :refer [postwalk]]
-            [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.query.api :as query-api]
             [fluree.db.api.transact :as transact-api]
@@ -59,7 +57,7 @@
   ;; TODO - do some validation
   (promise-wrap
     (go-try
-      (let [system-map (-> config config/parse system/initialize)
+      (let [system-map (system/initialize config)
             conn       (reduce-kv (fn [x k v]
                                     (if (isa? k :fluree.db/connection)
                                       (reduced v)
@@ -165,7 +163,6 @@
 
   Options map (opts) can include:
   - did - DId information to use, if storing blocks as verifiable credentials"
-  ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (promise-wrap
@@ -221,6 +218,12 @@
    (let [result-ch (transact-api/stage db json-ld opts)]
      (promise-wrap result-ch))))
 
+(defn apply-stage!
+  ([ledger staged-db]
+   (apply-stage! ledger staged-db {}))
+  ([ledger staged-db opts]
+   (promise-wrap
+    (connection/apply-stage! ledger staged-db opts))))
 
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
@@ -272,19 +275,19 @@
   policy restrictions"
   ([db policy]
    (wrap-policy db policy nil))
-  ([db policy values-map]
+  ([db policy policy-values]
    (promise-wrap
     (let [policy* (json-ld/expand policy)]
-      (policy/wrap-policy db policy* values-map)))))
+      (policy/wrap-policy db policy* policy-values)))))
 
 (defn wrap-class-policy
   "Restricts the provided db with policies in the db
   which have a class @type of the provided class(es)."
   ([db policy-classes]
    (wrap-class-policy db policy-classes nil))
-  ([db policy-classes values-map]
+  ([db policy-classes policy-values]
    (promise-wrap
-    (policy/wrap-class-policy db policy-classes values-map))))
+    (policy/wrap-class-policy db policy-classes policy-values))))
 
 (defn wrap-identity-policy
   "For provided identity, locates specific property f:policyClass on
@@ -295,9 +298,9 @@
   declaration."
   ([db identity]
    (wrap-identity-policy db identity nil))
-  ([db identity values-map]
+  ([db identity policy-values]
    (promise-wrap
-    (policy/wrap-identity-policy db identity values-map))))
+    (policy/wrap-identity-policy db identity policy-values))))
 
 (defn dataset
   "Creates a composed dataset from multiple resolved graph databases.

@@ -93,7 +93,7 @@
                       (set classes))
         src-query   (util/get-first-value restriction const/iri-query)
         query       (if (map? src-query)
-                      (assoc src-query "select" "?$this")
+                      (assoc src-query "select" "?$this" "limit" 1)
                       (throw (ex-info (str "Invalid policy, unable to extract query from f:query. "
                                            "Did you forget @context?. Parsed restriction: " restriction)
                                       {:status 400
@@ -107,6 +107,7 @@
       {:id          id
        :on-property on-property
        :on-class    on-class
+       :required?   (util/get-first-value restriction const/iri-required)
        :default?    (and (nil? on-property) (nil? on-class)) ;; with no class or property restrictions, becomes a default policy
        :ex-message  (util/get-first-value restriction const/iri-exMessage)
        :view?       view?
@@ -123,7 +124,7 @@
   [db policy-rules]
   (reduce
    (fn [acc rule]
-     (let [parsed-restriction (restriction-map rule)] ;; will return nil if formatting is not valid
+     (let [parsed-restriction (restriction-map rule)] ;; will throw if formatting is not valid
        (cond
 
          (property-restriction? parsed-restriction)
@@ -140,21 +141,11 @@
    {}
    policy-rules))
 
-(defn validate-values-map
-  [values-map]
-  (or (map? values-map)
-      (throw (ex-info (str "Invalid policy values map. Must be a map. Received: " values-map)
-                      {:status 400
-                       :error  :db/invalid-values-map}))))
-
 (defn wrap-policy
-  [db policy-rules values-map]
+  [db policy-rules policy-values]
   (go-try
-   (when values-map
-     (validate-values-map values-map))
    (let [policy-rules (->> policy-rules
                            util/sequential
                            (parse-policy-rules db))]
      (log/trace "policy-rules: " policy-rules)
-     (assoc db :policy (assoc policy-rules :cache (atom {})
-                                           :values-map values-map)))))
+     (assoc db :policy (assoc policy-rules :cache (atom {}) :policy-values policy-values)))))

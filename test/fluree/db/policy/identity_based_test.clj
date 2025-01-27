@@ -40,6 +40,7 @@
                                    ;; embedded policy
                                    {"@id"          "ex:ssnRestriction"
                                     "@type"        ["f:AccessPolicy" "ex:EmployeePolicy"]
+                                    "f:required"   true
                                     "f:onProperty" [{"@id" "schema:ssn"}]
                                     "f:action"     {"@id" "f:view"}
                                     "f:query"      {"@type"  "@json"
@@ -54,7 +55,7 @@
 
           policy-db @(fluree/wrap-identity-policy db alice-did)]
 
-      (testing " with direct select binding restricts"
+      (testing "with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
                @(fluree/query
                  policy-db
@@ -66,7 +67,7 @@
                               "schema:ssn" "?ssn"}}))
             "ex:john should not show up in results"))
 
-      (testing " with where-clause match of restricted data"
+      (testing "with where-clause match of restricted data"
         (is (= []
                @(fluree/query
                  policy-db
@@ -77,7 +78,7 @@
                               "schema:ssn" "888-88-8888"}}))
             "ex:john has ssn 888-88-8888, so should results should be empty"))
 
-      (testing " in a graph crawl restricts"
+      (testing "in a graph crawl restricts"
         (is (= [{"@id"              "ex:alice",
                  "@type"            "ex:User",
                  "schema:name"      "Alice"

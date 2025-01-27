@@ -43,6 +43,7 @@
                                  "f"      "https://ns.flur.ee/ledger#"}
                      "@graph"   [{"@id"          "ex:ssnRestriction"
                                   "@type"        ["f:AccessPolicy"]
+                                  "f:required"   true
                                   "f:onProperty" [{"@id" "schema:ssn"}]
                                   "f:action"     {"@id" "f:view"}
                                   "f:query"      {"@type"  "@json"
@@ -55,10 +56,9 @@
                                   "f:query"  {"@type"  "@json"
                                               "@value" {}}}]}
 
-          policy-db @(fluree/wrap-policy db policy {"?$identity" {"@value" alice-did
-                                                                  "@type"  "@id"}})]
+          policy-db @(fluree/wrap-policy db policy ["?$identity" [{"@value" alice-did "@type"  "@id"}]])]
 
-      (testing " with direct select binding restricts"
+      (testing "with direct select binding restricts"
         (is (= [["ex:alice" "111-11-1111"]]
                @(fluree/query
                  policy-db
@@ -70,7 +70,7 @@
                               "schema:ssn" "?ssn"}}))
             "ex:john should not show up in results"))
 
-      (testing " with where-clause match of restricted data"
+      (testing "with where-clause match of restricted data"
         (is (= []
                @(fluree/query
                  policy-db
@@ -81,7 +81,7 @@
                               "schema:ssn" "888-88-8888"}}))
             "ex:john has ssn 888-88-8888, so should results should be empty"))
 
-      (testing " in a graph crawl restricts"
+      (testing "in a graph crawl restricts"
         (is (= [{"@id"              "ex:alice",
                  "@type"            "ex:User",
                  "schema:name"      "Alice"
@@ -149,6 +149,7 @@
                                        "f"      "https://ns.flur.ee/ledger#"}
                            "@graph"   [{"@id"       "ex:productPropertyRestriction"
                                         "@type"     ["f:AccessPolicy"]
+                                        "f:required" true
                                         "f:onClass" [{"@id" "ex:Product"}]
                                         "f:action"  {"@id" "f:view"}
                                         "f:query"   {"@type"  "@json"
@@ -162,15 +163,13 @@
                                                     "@value" {}}}]}
           john-policy-db  @(fluree/wrap-policy
                             db policy
-                            {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}})
+                            ["?$identity" [{"@value" john-did "@type"  "@id"}]])
 
           alice-policy-db @(fluree/wrap-policy
                             db policy
-                            {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}})]
+                            ["?$identity" [{"@value" alice-did "@type"  "@id"}]])]
 
-      (testing " and values binding has user with policy relationship"
+      (testing "and values binding has user with policy relationship"
         (is (= [{"@id"                  "ex:widget",
                  "@type"                "ex:Product",
                  "schema:name"          "Widget"
@@ -188,7 +187,7 @@
                   "where"    {"@id"   "?s"
                               "@type" "ex:Product"}}))))
 
-      (testing " and values binding has user without policy relationship"
+      (testing "and values binding has user without policy relationship"
         (is (= []
                @(fluree/query
                  alice-policy-db
@@ -233,6 +232,7 @@
                                       "f"  "https://ns.flur.ee/ledger#"}
                          "@id"       "ex:unclassRestriction"
                          "@type"     ["f:AccessPolicy", "ex:UnclassPolicy"]
+                         "f:required" true
                          "f:onClass" [{"@id" "ex:Data"}]
                          "f:action"  [{"@id" "f:view"}, {"@id" "f:modify"}]
                          "f:query"   {"@type"  "@json"
@@ -264,7 +264,7 @@
                                     "@type" "ex:Referrer"},
                         "select"   {"?s" ["*" {"ex:referData" ["*"]}]}}]
 
-      (testing " with policy default allow? set to true"
+      (testing "with policy default allow? set to true"
         (is (= [{"@id"               "ex:data-0",
                  "@type"             "ex:Data",
                  "ex:classification" 0}]
@@ -282,9 +282,9 @@
                                   "@type"             "ex:Data"
                                   "ex:classification" 0}]}]
                @(fluree/query policy-allow refer-query))
-            " in graph crawl ex:Data is still restricted"))
+            "in graph crawl ex:Data is still restricted"))
 
-      (testing " with policy default allow? set to false"
+      (testing "with policy default allow? set to false"
         (is (= [{"@id"               "ex:data-0",
                  "@type"             "ex:Data",
                  "ex:classification" 0}]
@@ -293,3 +293,95 @@
         (is (= []
                @(fluree/query policy-deny other-query))
             "ex:Other class should be restricted")))))
+
+(deftest policy-values-test
+  (let [conn @(fluree/connect-memory)
+        db @(fluree/create-with-txn conn {"@context" [test-utils/default-str-context]
+                                          "ledger" "policy/values"
+                                          "insert"
+                                          [{"@id" "usa:wi"
+                                            "@type" "usa:state"
+                                            "ex:name" "Wisconsin"
+                                            "ex:capitol" "Madison"}
+                                           {"@id" "usa:ny"
+                                            "@type" "usa:state"
+                                            "ex:name" "New York"
+                                            "ex:capitol" "Albany"}
+                                           {"@id" "usa:nc"
+                                            "@type" "usa:state"
+                                            "ex:name" "North Carolina"
+                                            "ex:capitol" "Charlotte"}
+                                           {"@id" "usa:co"
+                                            "@type" "usa:state"
+                                            "ex:name" "Colorado"
+                                            "ex:capitol" "Denver"}
+                                           {"@id" "usa:pr"
+                                            "@type" "usa:territory"
+                                            "ex:name" "Puerto Rico"
+                                            "ex:capitol" "San Juan"}]})]
+    (testing "no policyValues returns all results"
+      (is (= ["Colorado" "New York" "North Carolina" "Puerto Rico" "Wisconsin"]
+             @(fluree/query db {"@context" test-utils/default-str-context
+                                "where" [{"@id" "?state" "ex:name" "?name"}]
+                                "select" "?name"
+                                "opts" {"policy"
+                                        {"@id" "ex:mystatepolicy"
+                                         "@type" ["f:Policy" "ex:StatePolicy"]
+                                         "f:action" {"@id" "f:view"}
+                                         "f:query" {"@type" "@json"
+                                                    "@value"
+                                                    {"where" [{"@id" "?$this" "ex:capitol" "?capitol"}]}}}}}))))
+    (testing "a single policyValues value constrains results to corresponding value"
+      (is (= ["Wisconsin"]
+             @(fluree/query db {"@context" test-utils/default-str-context
+                                "where" [{"@id" "?state" "ex:name" "?name"}]
+                                "select" "?name"
+                                "opts" {"policy"
+                                        {"@id" "ex:mystatepolicy"
+                                         "@type" ["f:Policy" "ex:StatePolicy"]
+                                         "f:action" {"@id" "f:view"}
+                                         "f:query" {"@type" "@json"
+                                                    "@value"
+                                                    {"where" [{"@id" "?$this" "ex:capitol" "?capitol"}]}}}
+                                        "policyValues" ["?capitol" ["Madison"]]}}))))
+    (testing "multiple policyValues values constrains results to corresponding values"
+      (is (= ["Puerto Rico" "Wisconsin"]
+             @(fluree/query db {"@context" test-utils/default-str-context
+                                "where" [{"@id" "?state" "ex:name" "?name"}]
+                                "select" "?name"
+                                "opts" {"policy"
+                                        {"@id" "ex:mystatepolicy"
+                                         "@type" ["f:Policy" "ex:StatePolicy"]
+                                         "f:action" {"@id" "f:view"}
+                                         "f:query" {"@type" "@json"
+                                                    "@value"
+                                                    {"where" [{"@id" "?$this" "ex:capitol" "?capitol"}]}}}
+                                        "policyValues" ["?capitol" ["Madison" "San Juan"]]}}))))
+    (testing "multiple vars and multiple values constrains results to corresponding values"
+      (is (= ["Wisconsin"]
+             @(fluree/query db {"@context" test-utils/default-str-context
+                                "where" [{"@id" "?state" "ex:name" "?name"}]
+                                "select" "?name"
+                                "opts" {"policy"
+                                        {"f:action" {"@id" "f:view"}
+                                         "f:query" {"@type" "@json"
+                                                    "@value"
+                                                    {"where" [{"@id" "?$this"
+                                                               "@type" "?type"
+                                                               "ex:capitol" "?capitol"}]}}}
+                                        "policyValues" [["?type" "?capitol"]
+                                                        [[{"@value" "usa:state" "@type" "@id"} "Madison"]]]}}))))
+    (testing "pre-existing values clause compose with supplied policyValues"
+      (is (= ["Wisconsin"]
+             @(fluree/query db {"@context" test-utils/default-str-context
+                                "where" [{"@id" "?state" "ex:name" "?name"}]
+                                "select" "?name"
+                                "opts" {"policy"
+                                        {"f:action" {"@id" "f:view"}
+                                         "f:query" {"@type" "@json"
+                                                    "@value"
+                                                    {"where" [{"@id" "?$this"
+                                                               "@type" "?type"
+                                                               "ex:capitol" "?capitol"}]
+                                                     "values" ["?type" [{"@value" "usa:state" "@type" "@id"}]]}}}
+                                        "policyValues" ["?capitol" ["Madison"]]}}))))))

@@ -368,3 +368,17 @@
                                               :from      ledger-id
                                               :where     {"@id" "?s" "ex:createdAt" "now"},
                                               :select    {"?s" ["ex:createdAt"]}}))))))
+
+(deftest ^:integration repeated-transaction-results
+  (testing "duplicate flakes with different t values"
+    (let [conn   @(fluree/connect-memory)
+          ledger @(fluree/create conn "dup-flakes")
+          db0    (fluree/db ledger)
+          tx     {"insert" {"@id" "ex:1" "ex:foo" 30}}
+          db1    @(fluree/stage db0 tx)
+          ;; advance the `t`
+          db2    @(fluree/commit! ledger db1)
+          db3    @(fluree/stage db2 tx)]
+      (testing "do not become multicardinal result values"
+        (is (= [{"ex:foo" 30, "@id" "ex:1"}]
+               @(fluree/query db3 {"select" {"ex:1" ["*"]}})))))))

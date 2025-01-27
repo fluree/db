@@ -12,6 +12,7 @@
             [fluree.db.util.context :as context]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.parse :as util.parse]
             [fluree.db.validation :as v]
             [fluree.json-ld :as json-ld]))
 
@@ -145,19 +146,15 @@
 (defn parse-values
   [values context]
   (when values
-    (let [[vars vals] values
-          vars* (keep parse-var-name (util/sequential vars))
-          vals* (mapv util/sequential vals)
-          var-count (count vars*)]
-      (if (every? (fn [binding]
-                    (= (count binding) var-count))
-                  vals*)
-        [vars* (mapv (fn [vals**]
-                       (parse-value-binding vars* vals** context))
-                     vals*)]
-        (throw (ex-info (str "Invalid value binding: "
-                             "number of variables and values don't match: "
-                             values)
+    (let [[vars vals] (util.parse/normalize-values values)
+          parsed-vars (keep parse-var-name vars)
+          var-count   (count vars)]
+      (if (every? (fn [binding] (= (count binding) var-count))
+                  vals)
+        [parsed-vars (mapv (fn [binding] (parse-value-binding parsed-vars binding context))
+                           vals)]
+        (throw (ex-info (str "Invalid value binding: number of variables and values don't match: "
+                             (pr-str values))
                         {:status 400 :error :db/invalid-query}))))))
 
 (def type-pred-iris #{const/iri-type const/iri-rdf-type})
