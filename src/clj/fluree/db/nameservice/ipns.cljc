@@ -5,6 +5,7 @@
             [fluree.db.method.ipfs :as ipfs]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -32,7 +33,7 @@
   "Given IPNS address, performs lookup and returns latest ledger address."
   [ipfs-endpoint ipns-profile ledger-name]
   (go-try
-    (let [ipns-address (if-let [[proto address ledger] (address-parts ledger-name)]
+    (let [ipns-address (if-let [[_proto address _ledger] (address-parts ledger-name)]
                          address
                          (<? (ipfs-keys/address ipfs-endpoint ipns-profile)))
           ipfs-address (str "/ipns/" ipns-address)
@@ -57,8 +58,8 @@
 
 (defrecord IpnsNameService [ipfs-endpoint ipns-key base-address?]
   nameservice/Publisher
-  (publish [_ commit-data]
-    (ipfs/push! ipfs-endpoint commit-data))
+  (publish [_ commit-jsonld]
+    (ipfs/push! ipfs-endpoint commit-jsonld))
   (publishing-address [_ ledger-alias]
     (ipns-address ipfs-endpoint ipns-key ledger-alias))
 
@@ -67,8 +68,7 @@
     (lookup-address ipfs-endpoint ipns-key ledger-alias))
   (alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
-      alias))
-  (-close [_] true))
+      alias)))
 
 (defn initialize
   [ipfs-endpoint ipns-key]

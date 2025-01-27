@@ -87,18 +87,6 @@
                       flake/maximum)]
     (assoc new-leaf :first new-first)))
 
-(defn rem-flakes
-  [leaf flakes]
-  (let [new-leaf (-> leaf
-                     (update :flakes flake/disj-all flakes)
-                     (update :size (fn [size]
-                                     (->> flakes
-                                          (map flake/size-flake)
-                                          (reduce - size)))))
-        new-first (or (some-> new-leaf :flakes first)
-                      flake/maximum)]
-    (assoc new-leaf :first new-first)))
-
 (defn empty-leaf
   "Returns a blank leaf node map for the provided `ledger-alias` and index
   comparator `cmp`."
@@ -161,37 +149,50 @@
 
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
-  [t flake]
+  [flake t]
   (flake/t-after? (flake/t flake) t))
 
 (defn before-t?
   "Returns `true` if `flake` has a transaction value before the provided `t`"
-  [t flake]
+  [flake t]
   (flake/t-before? (flake/t flake) t))
 
+(defn filter-by-t
+  "Returns a subset of the sorted flake set `flakes` consisting of all elements
+  that the supplied predicate function `pred` returns `true` when applied to
+  that element and the supplied t value `t`."
+  [pred t flakes]
+  (loop [[f & r] flakes
+         flakes* (transient flakes)]
+    (if f
+      (if (pred f t)
+        (recur r flakes*)
+        (recur r (disj! flakes* f)))
+      (persistent! flakes*))))
+
 (defn filter-after
-  "Returns a sequence containing only flakes from the flake set `flakes` with
+  "Returns a flake set containing only flakes from the flake set `flakes` with
   transaction values after the provided `t`."
   [t flakes]
-  (filter (partial after-t? t) flakes))
+  (filter-by-t after-t? t flakes))
+
+(defn flakes-from
+  "Returns a subset of the flake set `flakes` with transaction values greater than
+  or equal to `t`."
+  [t flakes]
+  (filter-after (flake/prev-t t) flakes))
 
 (defn filter-before
+  "Returns a subset of the flake set `flakes` with transaction values less than
+  `t`."
   [t flakes]
-  (filter (partial before-t? t) flakes))
+  (filter-by-t before-t? t flakes))
 
 (defn flakes-through
   "Returns an avl-subset of the avl-set `flakes` with transaction values on or
   before the provided `t`."
   [t flakes]
-  (->> flakes
-       (filter-after t)
-       (flake/disj-all flakes)))
-
-(defn flakes-after
-  [t flakes]
-  (->> flakes
-       (filter-before (flake/next-t t))
-       (flake/disj-all flakes)))
+  (filter-before (flake/next-t t) flakes))
 
 (defn novelty-subrange
   [{:keys [rhs leftmost?], first-flake :first, :as _node} through-t novelty-t novelty]
@@ -220,46 +221,46 @@
   (comp flake/hash-meta flake/m))
 
 (def fact-content
-  "Function to extract the content being asserted or retracted by a flake."
+  "Function to extract the fact being asserted or retracted by a flake, ignoring
+  the `t` value."
   (juxt flake/s flake/p flake/o flake/dt meta-hash))
 
 (defn remove-stale-flakes
-  "Removes all flake retractions, along with the flakes they retract, from the sorted set.
+  "Removes all flake retractions, along with the flakes they retract, as well as
+  all but the latest duplicate flake assertions, from the sorted set.
 
-  Approach is to iterate through the flakes in reverse order, and for each retraction, find the
-  corresponding assertion and remove both from the set.
-
-  Note, with 'spo' not consisting of full uniqueness (e.g. lang, datatype, or duplicate @list value),
-  the 'next flake' is from a retraction is not guaranteed to be the corresponding assertion, however
-  it should be very close. For this reason, a scan over the remaining flakes using `some` is done below."
+  Approach is to iterate through the flakes in reverse order, keeping track of
+  facts already seen. Then, any flake encountered with the same fact content of
+  a previously seen flake is removed from the set as well as any retractions."
   [flakes]
-  (loop [to-check (reverse flakes)
+  (loop [to-check (rseq flakes)
+         checked  #{}
          flakes*  (transient flakes)]
     (if-let [next-flake (first to-check)]
-      (if (flake/op next-flake)
-        (recur (rest to-check) flakes*)
-        (let [r            (rest to-check)
-              cmp          (fact-content next-flake)
-              assert-flake (some #(when (= cmp (fact-content %)) %) r)]
-          (recur r (-> flakes*
-                       (disj! next-flake)
-                       (disj! assert-flake)))))
+      (let [r    (rest to-check)
+            fact (fact-content next-flake)]
+        (if (contains? checked fact)
+          (recur r checked (disj! flakes* next-flake))
+          (let [checked* (conj checked fact)]
+            (if (flake/op next-flake)
+              (recur r checked* flakes*)
+              (recur r checked* (disj! flakes* next-flake))))))
       (persistent! flakes*))))
 
 (defn t-range
   "Returns a sorted set of flakes that are not out of date between the
   transactions `from-t` and `to-t`."
-  ([{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty to-t]
-   (let [latest (cond
-                  (> to-t leaf-t)
-                  (into flakes (novelty-subrange leaf to-t novelty-t novelty))
+  [{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty to-t]
+  (let [latest (cond
+                 (> to-t leaf-t)
+                 (into flakes (novelty-subrange leaf to-t novelty-t novelty))
 
-                  (= to-t leaf-t)
-                  flakes
+                 (= to-t leaf-t)
+                 flakes
 
-                  (< to-t leaf-t)
-                  (flake/disj-all flakes (filter-after to-t flakes)))]
-     (remove-stale-flakes latest))))
+                 (< to-t leaf-t)
+                 (flakes-through to-t flakes))]
+    (remove-stale-flakes latest)))
 
 (defn resolve-t-range
   [resolver node novelty-t novelty to-t]
@@ -296,15 +297,10 @@
 (defn history-t-range
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
   [{:keys [flakes] leaf-t :t :as leaf} novelty-t novelty from-t to-t]
-  (let [latest       (if (> to-t leaf-t)
-                       (into flakes (novelty-subrange leaf to-t novelty-t novelty))
-                       flakes)
-        ;; flakes that happen after to-t
-        subsequent   (filter-after to-t latest)
-        ;; flakes that happen before from-t
-        previous     (filter (partial before-t? from-t) latest)
-        out-of-range (concat subsequent previous)]
-    (flake/disj-all latest out-of-range)))
+  (let [latest (if (> to-t leaf-t)
+                 (into flakes (novelty-subrange leaf to-t novelty-t novelty))
+                 (flakes-through to-t flakes))]
+    (flakes-from from-t latest)))
 
 (defrecord CachedHistoryRangeResolver [node-resolver novelty-t novelty from-t to-t lru-cache-atom]
   Resolver

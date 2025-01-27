@@ -1,16 +1,17 @@
 (ns fluree.db.json-ld.policy
   (:require [clojure.core.async :refer [go <!]]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
+            [fluree.db.util.parse :as util.parse]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol Restrictable
-  (wrap-policy [db policy-rules values-map])
+  (wrap-policy [db policy-rules policy-values])
   (root [db]))
 
 (def root-policy-map
@@ -42,7 +43,7 @@
 (defn wrap-class-policy
   "Given one or more policy classes, queries for policies
   containing those classes and calls `wrap-policy`"
-  [db classes values-map]
+  [db classes policy-values]
   (go
     (let [c-values  (->> classes ;; for passing in classes as query `values`
                          util/sequential
@@ -62,33 +63,41 @@
                       " with error: " (ex-message policies*))
                  {:status 400 :error :db/policy-exception}
                  policies*)
-        (<! (wrap-policy db (json-ld/expand policies*) values-map))))))
+        (<! (wrap-policy db (json-ld/expand policies*) policy-values))))))
 
+(defn inject-value-binding
+  "Inject the given var and value into a normalized values clause."
+  [values var v]
+  (let [[vars vals] values]
+    [(into [var] (when vars (util/sequential vars)))
+     (if (seq vals)
+       (mapv (partial into [v]) vals)
+       [[v]])]))
 
 (defn wrap-identity-policy
   "Given an identity (@id) that exists in the db which contains a
   property `f:policyClass` listing policy classes associated with
   that identity, queries for those classes and calls `wrap-policy`"
-  [db identity values-map]
+  [db identity policy-values]
   (go
-   (let [policies  (<! (dbproto/-query db {"select" {"?policy" ["*"]}
-                                           "where"  [{"@id"                 identity
-                                                      const/iri-policyClass "?classes"}
-                                                     {"@id"   "?policy"
-                                                      "@type" "?classes"}]}))
-         policies* (if (util/exception? policies)
-                     policies
-                     (policy-from-query policies))
-         val-map   (assoc values-map "?$identity" {"@value" identity
-                                                   "@type"  const/iri-id})]
-     (log/trace "wrap-identity-policy - extracted policy from identity: " identity
-                " policy: " policies*)
-     (if (util/exception? policies*)
-       (ex-info (str "Unable to extract policies for identity: " identity
-                     " with error: " (ex-message policies*))
-                {:status 400 :error :db/policy-exception}
-                policies*)
-       (<! (wrap-policy db (json-ld/expand policies*) val-map))))))
+    (let [policies  (<! (dbproto/-query db {"select" {"?policy" ["*"]}
+                                            "where"  [{"@id"                 identity
+                                                       const/iri-policyClass "?classes"}
+                                                      {"@id"   "?policy"
+                                                       "@type" "?classes"}]}))
+          policies* (if (util/exception? policies)
+                      policies
+                      (policy-from-query policies))
+
+          policy-values* (-> (util.parse/normalize-values policy-values)
+                             (inject-value-binding "?$identity" {"@value" identity "@type" const/iri-id}))]
+      (log/trace "wrap-identity-policy - extracted policy from identity: " identity " policy: " policies*)
+      (if (util/exception? policies*)
+        (ex-info (str "Unable to extract policies for identity: " identity
+                      " with error: " (ex-message policies*))
+                 {:status 400 :error :db/policy-exception}
+                 policies*)
+        (<! (wrap-policy db (json-ld/expand policies*) policy-values*))))))
 
 (defn policy-enforced-opts?
   "Tests 'options' for a query or transaction to see if the options request

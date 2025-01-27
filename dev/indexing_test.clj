@@ -22,7 +22,7 @@
                     {:server   nil                          ;; use default
                      ;; ledger defaults used for newly created ledgers
                      :defaults {:ipns    {:key "self"}      ;; publish to ipns by default using the provided key/profile
-                                :indexer {:reindex-min-bytes 9000
+                                :indexing {:reindex-min-bytes 9000
                                           :reindex-max-bytes 10000000}
                                 :did     (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")}}))
 

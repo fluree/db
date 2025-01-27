@@ -6,7 +6,8 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log :include-macros true]
-            [clojure.core.async :as async :refer [<! go-loop]]))
+            [clojure.core.async :as async :refer [<! go-loop]]
+            [fluree.db.nameservice :as nameservice]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -77,7 +78,7 @@
     db))
 
 (defn index-queue
-  [alias branch branch-state]
+  [alias branch publishers branch-state]
   (let [buf   (async/sliding-buffer 1)
         queue (async/chan buf)]
     (go-loop [last-index-commit nil]
@@ -86,8 +87,12 @@
           (if-let [indexed-db (try* (<? (indexer/index db* index-files-ch))
                                     (catch* e
                                       (log/error e "Error updating index")))]
-            (do (swap! branch-state update-index indexed-db)
-                (recur (:commit indexed-db)))
+            (let [[{prev-commit :commit} {indexed-commit :commit}]
+                  (swap-vals! branch-state update-index indexed-db)]
+              (when (not= prev-commit indexed-commit)
+                (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
+                  (nameservice/publish-to-all commit-jsonld publishers)))
+              (recur indexed-commit))
             (recur last-index-commit)))))
     queue))
 
@@ -97,15 +102,15 @@
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
-  ([ledger-alias branch-name commit-catalog index-catalog commit-jsonld]
-   (state-map ledger-alias branch-name commit-catalog index-catalog commit-jsonld nil))
-  ([ledger-alias branch-name commit-catalog index-catalog commit-jsonld indexing-opts]
-   (let [initial-db   (async-db/load ledger-alias branch-name commit-catalog index-catalog
-                                     commit-jsonld indexing-opts)
-         commit-map   (commit-data/jsonld->clj commit-jsonld)
-         state        (atom {:commit     commit-map
-                             :current-db initial-db})
-         idx-q        (index-queue ledger-alias branch-name state)]
+  ([ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld]
+   (state-map ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
+  ([ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
+   (let [initial-db (async-db/load ledger-alias branch-name commit-catalog index-catalog
+                                   commit-jsonld indexing-opts)
+         commit-map (commit-data/jsonld->clj commit-jsonld)
+         state      (atom {:commit     commit-map
+                           :current-db initial-db})
+         idx-q      (index-queue ledger-alias branch-name publishers state)]
      {:name        branch-name
       :alias       ledger-alias
       :state       state

@@ -987,7 +987,7 @@
                                              "ledger" "novelty/test"
                                              "opts" {"indexing" {"reindex-min-bytes" 0 "reindex-max-bytes" 1}}
                                              "insert" [{"@id" "ex:1",
-                                                        "ex:intro" "A long, long, time ago in a galaxy far, far away..."}]})]
+                                                        "ex:intro" "A long time ago in a galaxy far, far away..."}]})]
        (is (> (-> db :novelty :size) (:reindex-max-bytes db)))
        (is (= {:status 503 :error :db/max-novelty-exceeded}
               (ex-data @(fluree/stage db {"@context" test-utils/default-str-context

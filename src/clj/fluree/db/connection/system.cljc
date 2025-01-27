@@ -1,5 +1,6 @@
 (ns fluree.db.connection.system
-  (:require [fluree.db.connection :as connection]
+  (:require [clojure.string :as str]
+            [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.cache :as cache]
@@ -14,7 +15,7 @@
             [fluree.db.flake.index.storage :as index-storage]
             #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
-            [fluree.db.util.core :as util :refer [get-id get-first get-first-value get-values]]
+            [fluree.db.util.core :as util :refer [get-id get-first get-first-value]]
             [integrant.core :as ig]))
 
 (derive :fluree.db.storage/file :fluree.db/content-storage)
@@ -76,13 +77,9 @@
                (assoc m id (convert-node-references node)))
              {} cfg))
 
-(defmethod ig/init-key :default
-  [_ component]
-  component)
-
 (defmethod ig/expand-key :fluree.db/connection
   [k config]
-  (let [cache-max-mb   (get-first-value config conn-vocab/cache-max-mb)
+  (let [cache-max-mb   (config/get-first-integer config conn-vocab/cache-max-mb)
         commit-storage (get-first config conn-vocab/commit-storage)
         index-storage  (get-first config conn-vocab/index-storage)
         remote-systems (get config conn-vocab/remote-systems)
@@ -102,34 +99,78 @@
                              :serializer         (ig/ref :fluree.db/serializer)}
      k                      config*}))
 
+(defmethod ig/init-key :default
+  [_ component]
+  component)
+
+(defn get-java-prop
+  [java-prop]
+  #?(:clj (System/getProperty java-prop)
+     :cljs (throw (ex-info "Java system properties are not supported on this platform"
+                           {:status 400, :error :db/unsupported-config}))))
+
+(defn get-env
+  [env-var]
+  #?(:clj (System/getenv env-var)
+     :cljs (throw (ex-info "Environment variables are not supported on this platform"
+                           {:status 400, :error :db/unsupported-config}))))
+
+(defn missing-config-error
+  [env-var java-prop]
+  (let [env-var-msg   (and env-var (str "environment variable " env-var))
+        java-prop-msg (and java-prop (str "Java system property " java-prop))
+        combined-msg  (cond (and env-var-msg java-prop-msg)
+                            (str env-var-msg " and " java-prop-msg)
+
+                            env-var-msg   env-var-msg
+                            java-prop-msg java-prop-msg)]
+    (ex-info (str "Missing config value specified by " combined-msg)
+             {:status 400, :error :db/missing-config-val})))
+
+(defn get-priority-value
+  [env-var java-prop default-val]
+  (or (and java-prop
+           (get-java-prop java-prop))
+      (and env-var
+           (get-env env-var))
+      default-val
+      (throw (missing-config-error env-var java-prop))))
+
+(defmethod ig/init-key :fluree.db/config-value
+  [_ config-value-node]
+  (let [env-var     (get-first-value config-value-node conn-vocab/env-var)
+        java-prop   (get-first-value config-value-node conn-vocab/java-prop)
+        default-val (get-first-value config-value-node conn-vocab/default-val)]
+    {:value (get-priority-value env-var java-prop default-val)}))
+
 (defmethod ig/init-key :fluree.db/cache
   [_ max-mb]
   (-> max-mb cache/memory->cache-size cache/create-lru-cache atom))
 
 (defmethod ig/init-key :fluree.db.storage/file
   [_ config]
-  (let [identifier (get-first-value config conn-vocab/address-identifier)
-        root-path  (get-first-value config conn-vocab/file-path)]
+  (let [identifier (config/get-first-string config conn-vocab/address-identifier)
+        root-path  (config/get-first-string config conn-vocab/file-path)]
     (file-storage/open identifier root-path)))
 
 (defmethod ig/init-key :fluree.db.storage/memory
   [_ config]
-  (let [identifier (get-first-value config conn-vocab/address-identifier)]
+  (let [identifier (config/get-first-string config conn-vocab/address-identifier)]
     (memory-storage/open identifier)))
 
 #?(:clj
    (defmethod ig/init-key :fluree.db.storage/s3
      [_ config]
-     (let [identifier  (get-first-value config conn-vocab/address-identifier)
-           s3-bucket   (get-first-value config conn-vocab/s3-bucket)
-           s3-prefix   (get-first-value config conn-vocab/s3-prefix)
-           s3-endpoint (get-first-value config conn-vocab/s3-endpoint)]
+     (let [identifier  (config/get-first-string config conn-vocab/address-identifier)
+           s3-bucket   (config/get-first-string config conn-vocab/s3-bucket)
+           s3-prefix   (config/get-first-string config conn-vocab/s3-prefix)
+           s3-endpoint (config/get-first-string config conn-vocab/s3-endpoint)]
        (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint))))
 
 (defmethod ig/init-key :fluree.db.storage/ipfs
   [_ config]
-  (let [identifier    (get-first-value config conn-vocab/address-identifier)
-        ipfs-endpoint (get-first-value config conn-vocab/ipfs-endpoint)]
+  (let [identifier    (config/get-first-string config conn-vocab/address-identifier)
+        ipfs-endpoint (config/get-first-string config conn-vocab/ipfs-endpoint)]
     (ipfs-storage/open identifier ipfs-endpoint)))
 
 #?(:cljs
@@ -139,8 +180,8 @@
 
 (defmethod ig/init-key :fluree.db/remote-system
   [_ config]
-  (let [urls        (get-values config conn-vocab/server-urls)
-        identifiers (get-values config conn-vocab/address-identifiers)]
+  (let [urls        (config/get-strings config conn-vocab/server-urls)
+        identifiers (config/get-strings config conn-vocab/address-identifiers)]
     (remote-system/connect urls identifiers)))
 
 (defmethod ig/init-key :fluree.db/commit-catalog
@@ -159,8 +200,8 @@
 
 (defmethod ig/init-key :fluree.db.nameservice/ipns
   [_ config]
-  (let [endpoint (get-first-value config conn-vocab/ipfs-endpoint)
-        ipns-key (get-first-value config conn-vocab/ipns-key)]
+  (let [endpoint (config/get-first-string config conn-vocab/ipfs-endpoint)
+        ipns-key (config/get-first-string config conn-vocab/ipns-key)]
     (ipns-nameservice/initialize endpoint ipns-key)))
 
 (defmethod ig/init-key :fluree.db.serializer/json
@@ -171,15 +212,15 @@
   [defaults]
   (when-let [identity (get-first defaults conn-vocab/identity)]
     {:id      (get-id identity)
-     :public  (get-first-value identity conn-vocab/public-key)
-     :private (get-first-value identity conn-vocab/private-key)}))
+     :public  (config/get-first-string identity conn-vocab/public-key)
+     :private (config/get-first-string identity conn-vocab/private-key)}))
 
 (defn parse-index-options
   [defaults]
   (when-let [index-options (get-first defaults conn-vocab/index-options)]
-    {:reindex-min-bytes (get-first-value index-options conn-vocab/reindex-min-bytes)
-     :reindex-max-bytes (get-first-value index-options conn-vocab/reindex-max-bytes)
-     :max-old-indexes   (get-first-value index-options conn-vocab/max-old-indexes)}))
+    {:reindex-min-bytes (config/get-first-integer index-options conn-vocab/reindex-min-bytes)
+     :reindex-max-bytes (config/get-first-integer index-options conn-vocab/reindex-max-bytes)
+     :max-old-indexes   (config/get-first-integer index-options conn-vocab/max-old-indexes)}))
 
 (defn parse-defaults
   [config]
@@ -188,15 +229,15 @@
           index-options (parse-index-options defaults)]
       (cond-> nil
         identity      (assoc :identity identity)
-        index-options (assoc :index-options index-options)))))
+        index-options (assoc :indexing index-options)))))
 
 (defmethod ig/init-key :fluree.db/connection
   [_ {:keys [cache commit-catalog index-catalog serializer] :as config}]
-  (let [parallelism          (get-first-value config conn-vocab/parallelism)
+  (let [parallelism          (config/get-first-integer config conn-vocab/parallelism)
         primary-publisher    (get-first config conn-vocab/primary-publisher)
         secondary-publishers (get config conn-vocab/secondary-publishers)
         remote-systems       (get config conn-vocab/remote-systems)
-        defaults      (parse-defaults config)]
+        defaults             (parse-defaults config)]
     (connection/connect {:parallelism          parallelism
                          :cache                cache
                          :commit-catalog       commit-catalog
@@ -207,9 +248,17 @@
                          :serializer           serializer
                          :defaults             defaults})))
 
+(defn prepare
+  [parsed-config]
+  (-> parsed-config convert-references ig/expand))
+
+(defn parsed-initialize
+  [parsed-config]
+  (-> parsed-config prepare ig/init))
+
 (defn initialize
   [config]
-  (-> config convert-references ig/expand ig/init))
+  (-> config config/parse parsed-initialize))
 
 (defn terminate
   [sys]
