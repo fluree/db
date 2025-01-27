@@ -152,11 +152,13 @@
                  :vectors (assoc vectors id item-vec))))
 
 (defn upsert-items
-  "Asserts items into the bm25 index, returns updated state."
+  "Asserts items into the bm25 index, returns updated state.
+
+  item-count will be 'nil' for an initialization query as we process results lazily
+  and therefore the status-update won't be able to report % complete."
   [{:keys [stemmer stopwords] :as bm25} latest-index item-count items-ch status-update]
   (async/go
-    (status-update [0 item-count])
-    (loop [i     1
+    (loop [i     0
            index latest-index]
       (if-let [[action item] (async/<! items-ch)]
         (let [id     (->> (get item "@id")
@@ -170,5 +172,5 @@
             (status-update [i item-count]))
           (recur (inc i) index*))
         (do
-          (status-update [item-count item-count]) ;; 100% done
+          (status-update [i i]) ;; 100% done - item-count can be nil for initialized query so use 'i' for both tuples
           index)))))

@@ -74,12 +74,16 @@
       (add-stemmer)
       (add-stopwords)))
 
-(defn percent-complete
+(defn percent-complete-str
   [index-state]
-  (let [{:keys [pending-status]} @index-state]
-    (if pending-status
-      (int (* 100 (/ (first pending-status) (second pending-status))))
-      0)))
+  (let [{:keys [pending-status]} @index-state
+        [processed-n item-count] pending-status
+        percentage (when (and (pos-int? processed-n) (pos-int? item-count))
+                     (int (* 100 (/ processed-n item-count))))]
+    (cond
+      percentage (str "Index is " percentage "% complete.")
+      (pos-int? processed-n) (str "Index has processed " processed-n " items of an unknown total to process.")
+      :else "Index is 0% complete.")))
 
 (defn score-candidates
   [query-terms vectors avg-length k1 b candidates]
@@ -107,10 +111,10 @@
                                 [idx ch] (alts! [timeout-ch pending-ch])]
                             (if (= timeout-ch ch)
                               (put! error-ch (ex-info (str "Timeout waiting for BM25 index to sync after "
-                                                           timeout* "ms. Index is " (percent-complete index-state)
-                                                           "% complete. Please try again later. To configure a "
+                                                           timeout* "ms. " (percent-complete-str index-state)
+                                                           " Please try again later. To configure a "
                                                            "different timeout, set " const/iri-index-timeout " in the virtual "
-                                                           "graph query to an integer of milliseconds.")
+                                                           "graph query to the desired number of milliseconds.")
                                                       {:error  :db/timeout
                                                        :status 408}))
                               idx))
@@ -215,11 +219,10 @@
 (defn bm25-initialize
   [{:keys [query-parsed] :as bm25} db]
   (let [query-result (exec/query db nil query-parsed)
-        ;item-count  (count query-result)
         items-ch     (async/chan 1 (map #(vector ::bm25.update/upsert %)))]
     ;; break up query results into individual document items on a new chan
     (async/pipeline-async 1 items-ch #(async/onto-chan! %2 %1) query-result)
-    (bm25-upsert* bm25 db 999 items-ch)))
+    (bm25-upsert* bm25 db nil items-ch)))
 
 (defrecord BM25-VirtualGraph
   [stemmer stopwords k1 b index-state initialized genesis-t t
