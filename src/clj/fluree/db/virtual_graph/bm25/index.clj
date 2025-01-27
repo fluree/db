@@ -196,9 +196,11 @@
                           (first result)
                           result)]
 
-            (async/>! results-ch (if (nil? result*)
-                                   [::bm25.update/retract {"@id" next-iri}]
-                                   [::bm25.update/upsert result*]))
+            (if (util/exception? result)
+              (log/warn "BM25 upsert query failed for IRI:" next-iri "with exception message:" (ex-message result) "Skipping")
+              (async/>! results-ch (if (nil? result*)
+                                     [::bm25.update/retract {"@id" next-iri}]
+                                     [::bm25.update/upsert result*])))
             (recur r))
           (async/close! results-ch))))
     results-ch))
