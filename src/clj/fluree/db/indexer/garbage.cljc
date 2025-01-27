@@ -33,7 +33,8 @@
              garbage*      (if garbage-meta
                              (conj garbage garbage-meta)
                              garbage)]
-         (recur (<! (storage/read-db-root index-catalog prev-idx-addr))
+         (recur (when prev-idx-addr ;; first index won't have a prev-index
+                  (<! (storage/read-db-root index-catalog prev-idx-addr)))
                 garbage*))))))
 
 (defn clean-garbage-record
@@ -64,6 +65,21 @@
       ;; then delete the parent index root
       (<! (storage/delete-garbage-item index-catalog index)))))
 
+(defn remove-cleaned
+  "Returns an updated to-clean garbage list with any already deleted garbage removed.
+
+  After garbage has been cleaned at least once, we'll still have a pointer
+  to the oldest garbage file in the oldest index root, but that will have already
+  been removed. This will not be the case for the first time garbage is cleaned."
+  [index-catalog to-clean]
+  (go
+    (loop [to-clean* to-clean]
+      (let [next-garbage (first to-clean*)
+            removed?     (nil? (<! (storage/read-garbage index-catalog (:address next-garbage))))]
+        (if removed?
+          (recur (rest to-clean*))
+          to-clean*)))))
+
 (defn clean-garbage
   "Cleans up garbage data for old indexes, but retains
   the most recent `max-indexes` indexes.
@@ -79,19 +95,20 @@
   (go
     (if (nat-int? max-indexes)
       (let [all-garbage (<? (trace-idx-roots index-catalog commit))
-            to-clean    (->> all-garbage
+            to-clean    (->> all-garbage ;; garbage will be in order of newest to oldest
                              (drop max-indexes)
                              (sort-by :t)) ;; clean oldest 't' value first
+            to-clean*   (<! (remove-cleaned index-catalog to-clean))
             start-time  (util/current-time-millis)]
-        (if (empty? to-clean)
+        (if (empty? to-clean*)
           (log/debug "Clean-garbage called, but no garbage to clean.")
           (do
             (log/info "Starting garbage collection of oldest"
-                      (count to-clean) "indexes.")
-            (doseq [next-garbage to-clean]
+                      (count to-clean*) "indexes.")
+            (doseq [next-garbage to-clean*]
               (<! (clean-garbage-record index-catalog next-garbage)))
             (log/info "Finished garbage collection of oldest"
-                      (count to-clean) "indexes in"
+                      (count to-clean*) "indexes in"
                       (- (util/current-time-millis) start-time) "ms.")
             :done)))
       ;; Unexpected setting. In async chan, don't throw.
