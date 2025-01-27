@@ -95,6 +95,22 @@
                       {:status 400
                        :error  :db/invalid-index})))))
 
+(defn ensure-select-subgraph
+  "Downstream we assume all queries are :select, and not :select-one.
+  This wil convert a `:select-one` to a `:select`, in addition verify
+  that the select is a subgraph selector."
+  [parsed-query]
+  (let [parsed-query* (if-let [select-one (:select-one parsed-query)]
+                        (-> parsed-query
+                            (assoc :select select-one)
+                            (dissoc :select-one))
+                        parsed-query)]
+    (if (has-subgraph-selector? parsed-query*)
+      parsed-query*
+      (throw (ex-info "BM25 index query must be created with a subgraph selector"
+                      {:status 400
+                       :error  :db/invalid-index})))))
+
 (defn parse-document-query
   "Parses document query, does some validation, and extracts a list of
   property dependencies in the query that all data updates can be
@@ -105,12 +121,8 @@
   not yet exist if this index was created before data."
   [bm25-opts db-vol]
   (let [query          (:query bm25-opts)
-        query-parsed   (q-parse/parse-query query)
-        _              (when-not (has-subgraph-selector? query-parsed)
-                         (throw (ex-info "BM25 index query must be created with a subgraph selector"
-                                         {:status 400
-                                          :error  :db/invalid-index})))
-
+        query-parsed   (-> (q-parse/parse-query query)
+                           (ensure-select-subgraph))
         ;; TODO - ultimately we want a property dependency chain, so when the properties change we can
         ;; TODO - trace up the chain to the node(s) that depend on them and update the index accordingly
         where-props    (->> query-parsed ;; IRIs of the properties in the query

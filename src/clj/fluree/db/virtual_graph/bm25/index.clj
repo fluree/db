@@ -188,19 +188,15 @@
     (async/go
       (loop [[next-iri & r] affected-iris]
         (if next-iri
-          (let [values  [{iri-var (where/match-iri next-iri)}]
-                pq      (assoc parsed-query :values values)
-                result  (async/<! (exec/query db nil pq))
-                ;; note that query-result could be a single item if query used :selectOne, or a vector if not
-                result* (if (vector? result)
-                          (first result)
-                          result)]
+          (let [values [{iri-var (where/match-iri next-iri)}]
+                pq     (assoc parsed-query :values values)
+                result (first (async/<! (exec/query db nil pq)))] ;; inject one IRI into :values, expect one result
 
             (if (util/exception? result)
               (log/warn "BM25 upsert query failed for IRI:" next-iri "with exception message:" (ex-message result) "Skipping")
-              (async/>! results-ch (if (nil? result*)
+              (async/>! results-ch (if (nil? result)
                                      [::bm25.update/retract {"@id" next-iri}]
-                                     [::bm25.update/upsert result*])))
+                                     [::bm25.update/upsert result])))
             (recur r))
           (async/close! results-ch))))
     results-ch))

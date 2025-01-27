@@ -78,10 +78,11 @@
                      "@type"          ["f:VirtualGraph" "fidx:BM25"]
                      "f:virtualGraph" "articleSearch"
                      "f:query"        {"@type"  "@json"
-                                       "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                                 "where"    [{"@id"       "?x"
-                                                              "ex:author" "?author"}]
-                                                 "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
+                                       "@value" {"@context"  {"ex" "http://example.org/ns/"}
+                                                 "where"     [{"@id"       "?x"
+                                                               "ex:author" "?author"}]
+                                                 ;; a 'selectOne' wil get converted to a 'select' internally
+                                                 "selectOne" {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
           db-r   @(fluree/stage
                    db
