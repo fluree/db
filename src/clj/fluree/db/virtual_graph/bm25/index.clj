@@ -142,7 +142,7 @@
                             index)
             status-update (fn [status]
                             (swap! new-index-state assoc :pending-status status))
-            new-index     (async/<! (bm25.update/upsert-items bm25 latest-index item-count assertions-ch status-update))]
+            new-index     (<! (bm25.update/upsert-items bm25 latest-index item-count assertions-ch status-update))]
         ;; reset index state atom once index is complete, remove pending-ch
         (swap! new-index-state (fn [idx-state]
                                  (assoc idx-state :index new-index
@@ -191,10 +191,11 @@
           (let [values  [{iri-var (where/match-iri next-iri)}]
                 pq      (assoc parsed-query :values values)
                 result  (async/<! (exec/query db nil pq))
+                ;; note that query-result could be a single item if query used :selectOne, or a vector if not
                 result* (if (vector? result)
                           (first result)
                           result)]
-            ;; note that query-result could be a single item if query used :selectOne, or a vector if not
+
             (async/>! results-ch (if (nil? result*)
                                    [::bm25.update/retract {"@id" next-iri}]
                                    [::bm25.update/upsert result*]))
@@ -209,9 +210,7 @@
         affected-iris  (map #(iri/decode-sid db %) affected-sids)
         item-count     (count affected-iris)
         pq             (parsed-query bm25)
-
-        ;; TODO - change below single query to upsert-queries to handle multiple queries
-        upsert-docs-ch (upsert-queries db pq affected-iris) #_(exec/query db nil pq*)]
+        upsert-docs-ch (upsert-queries db pq affected-iris)]
 
     (bm25-upsert* bm25 db item-count upsert-docs-ch)))
 
