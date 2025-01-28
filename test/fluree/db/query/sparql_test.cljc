@@ -123,6 +123,12 @@
              where)
           "datatype literal"))
     (let [query "SELECT ?person
+                 WHERE {?person person:isCool true .}"
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?person", "person:isCool" true}]
+             where)
+          "boolean literal"))
+    (let [query "SELECT ?person
                  WHERE { ?person a schema:Person . }"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?person", "@type" {"@id" "schema:Person"}}]
