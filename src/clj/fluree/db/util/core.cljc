@@ -413,21 +413,21 @@
    (clojure.core/vswap! vol f arg1 arg2 arg3)))
 
 (defn get-first
-  [json-ld k]
-  (let [v (get json-ld k)]
+  [jsonld k]
+  (let [v (get jsonld k)]
     (if (sequential? v)
       (first v)
       v)))
 
 (defn get-types
-  [json-ld]
-  (or (:type json-ld)
-      (get json-ld "@type")))
+  [jsonld]
+  (or (:type jsonld)
+      (get jsonld "@type")))
 
 (defn of-type?
   "Returns true if the provided json-ld node is of the provided type."
-  [json-ld rdf-type]
-  (->> json-ld
+  [jsonld rdf-type]
+  (->> jsonld
        get-types
        (some #(= % rdf-type))))
 
@@ -438,24 +438,30 @@
         (get val "@value"))
     val))
 
+(defn get-datatype
+  [node]
+  (when (or (contains? node :value)
+            (contains? node "@value"))
+    (get-types node)))
+
 (defn get-first-value
-  [json-ld k]
-  (-> json-ld
+  [jsonld k]
+  (-> jsonld
       (get-first k)
       get-value))
 
 (defn get-values
-  [json-ld k]
-  (mapv get-value (get json-ld k)))
+  [jsonld k]
+  (mapv get-value (get jsonld k)))
 
 (defn get-id
-  [json-ld]
-  (or (:id json-ld)
-      (get json-ld "@id")))
+  [jsonld]
+  (or (:id jsonld)
+      (get jsonld "@id")))
 
 (defn get-first-id
-  [json-ld k]
-  (-> json-ld
+  [jsonld k]
+  (-> jsonld
       (get-first k)
       get-id))
 
@@ -489,13 +495,13 @@
         vals)))
 
 (defn get-all-ids
-  "Returns all @id values for a given key in a json-ld node.
+  "Returns all @id values for a given key in a jsonld node.
 
   If values are contained in a @list, unwraps them.
 
   Elides any scalar values (those without an @id key)."
-  [json-ld k]
-  (some->> (get json-ld k)
+  [jsonld k]
+  (some->> (get jsonld k)
            unwrap-list
            (keep get-id)))
 

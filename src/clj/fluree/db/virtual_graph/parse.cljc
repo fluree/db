@@ -109,6 +109,22 @@
   [query]
   (-> query q-parse/parse-query (assoc :selection-context {})))
 
+(defn ensure-select-subgraph
+  "Downstream we assume all queries are :select, and not :select-one.
+  This wil convert a `:select-one` to a `:select`, in addition verify
+  that the select is a subgraph selector."
+  [parsed-query]
+  (let [parsed-query* (if-let [select-one (:select-one parsed-query)]
+                        (-> parsed-query
+                            (assoc :select select-one)
+                            (dissoc :select-one))
+                        parsed-query)]
+    (if (has-subgraph-selector? parsed-query*)
+      parsed-query*
+      (throw (ex-info "BM25 index query must be created with a subgraph selector"
+                      {:status 400
+                       :error  :db/invalid-index})))))
+
 (defn parse-document-query
   "Parses document query, does some validation, and extracts a list of
   property dependencies in the query that all data updates can be
@@ -118,18 +134,16 @@
   (internal format) yet, because the namespaces used in the query may
   not yet exist if this index was created before data."
   [{:keys [query] :as bm25-opts} db-vol]
-  (let [parsed-query (parse-query query)]
-    (if (has-subgraph-selector? parsed-query)
-      ;; TODO - ultimately we want a property dependency chain, so when the properties change we can
-      ;; TODO - trace up the chain to the node(s) that depend on them and update the index accordingly
-      (let [query-props   (get-query-props parsed-query)
-            property-deps (generate-property-sids! db-vol query-props)]
-        (assoc bm25-opts
-               :parsed-query parsed-query
-               :property-deps property-deps))
-      (throw (ex-info "BM25 index query must be created with a subgraph selector"
-                      {:status 400
-                       :error  :db/invalid-index})))))
+  (let [parsed-query (-> (parse-query query)
+                         (ensure-select-subgraph))
+        ;; TODO - ultimately we want a property dependency chain, so when the properties change we can
+        ;; TODO - trace up the chain to the node(s) that depend on them and update the index accordingly
+        query-props   (get-query-props parsed-query)
+        property-deps (generate-property-sids! db-vol query-props)]
+
+    (assoc bm25-opts
+      :parsed-query parsed-query
+      :property-deps property-deps)))
 
 (defn finalize
   [search-af error-ch solution-ch]

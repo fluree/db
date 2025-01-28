@@ -118,7 +118,7 @@
          (async/transduce subj-xf (completing conj) {}))))
 
 (defn reverse-property
-  [{:keys [t] :as db} o-iri {:keys [as spec], p-iri :iri, :as reverse-spec} compact-fn cache fuel-tracker error-ch]
+  [{:keys [t] :as db} o-iri {:keys [as spec], p-iri :iri, :as reverse-spec} context compact-fn cache fuel-tracker error-ch]
   (let [oid                     (iri/encode-iri db o-iri)
         pid                     (iri/encode-iri db p-iri)
         [start-flake end-flake] (flake-bounds db :opst [oid pid])
@@ -138,7 +138,7 @@
          (async/transduce (comp cat sid-xf)
                           (completing conj
                                       (fn [result]
-                                        [as (util/unwrap-singleton result)]))
+                                        [as (util/unwrap-singleton as context result)]))
                           []))))
 
 (defn format-subject-flakes
@@ -152,7 +152,7 @@
                               (format-subject-xf db cache context compact-fn select-spec)
                               s-flakes)
           subject-ch    (if reverse
-                          (let [reverse-ch (subject/format-reverse-properties db s-iri reverse compact-fn cache fuel-tracker error-ch)]
+                          (let [reverse-ch (subject/format-reverse-properties db s-iri reverse context compact-fn cache fuel-tracker error-ch)]
                             (async/reduce conj subject-attrs reverse-ch))
                           (go subject-attrs))]
       (->> subject-ch

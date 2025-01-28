@@ -1,7 +1,9 @@
 (ns fluree.db.nameservice
   (:refer-clojure :exclude [alias])
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :as async :refer [go]]
+            [clojure.string :as str]
             [fluree.db.storage :as storage]
+            [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
@@ -13,12 +15,10 @@
     and other metadata")
   (alias [nameservice ledger-address]
     "Given a ledger address, returns ledger's default alias name else nil, if
-    not avail")
-  (-close [nameservice]
-    "Closes all resources for this nameservice"))
+    not avail"))
 
 (defprotocol Publisher
-  (publish [publisher commit-data]
+  (publish [publisher commit-jsonld]
     "Publishes new commit.")
   (publishing-address [publisher ledger-alias]
     "Returns full publisher address/iri which will get published in commit. If
@@ -32,25 +32,23 @@
     "Unsubscribes to publication for ledger events")
   (known-addresses [publication ledger-alias]))
 
+(defn publish-to-all
+  [commit-jsonld publishers]
+  (->> publishers
+       (map (fn [ns]
+                (go
+                  (try*
+                    (<? (publish ns commit-jsonld))
+                    (catch* e
+                      (log/warn e "Publisher failed to publish commit")
+                      ::publishing-error)))))
+       async/merge))
+
 (defn published-ledger?
   [nsv ledger-alias]
   (go-try
     (let [addr (<? (publishing-address nsv ledger-alias))]
       (boolean (<? (lookup nsv addr))))))
-
-(defn ns-record
-  "Generates nameservice metadata map for JSON storage. For now, since we only
-  have a single branch possible, always sets default-branch. Eventually will
-  need to merge changes from different branches into existing metadata map"
-  [ns-address {address "address", alias "alias", branch "branch", :as commit-jsonld}]
-  (let [branch-iri (str ns-address "(" branch ")")]
-    {"@context"      "https://ns.flur.ee/ledger/v1"
-     "@id"           ns-address
-     "defaultBranch" branch-iri
-     "ledgerAlias"   alias
-     "branches"      [{"@id"     branch-iri
-                       "address" address
-                       "commit"  commit-jsonld}]}))
 
 (defn commit-address-from-record
   [record branch]

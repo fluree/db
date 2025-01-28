@@ -46,6 +46,7 @@
                                          "f"      "https://ns.flur.ee/ledger#"}
                              "@graph"   [{"@id"          "ex:emailPropertyRestriction"
                                           "@type"        ["f:AccessPolicy"]
+                                          "f:required"   true
                                           "f:onProperty" [{"@id" "schema:email"}]
                                           "f:action"     [{"@id" "f:view"}, {"@id" "f:modify"}]
                                           "f:exMessage"  "Only users can update their own emails."
@@ -59,11 +60,9 @@
                                           "f:query"  {"@type"  "@json"
                                                       "@value" {}}}]}
 
-          john-params       {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}}
+          john-params       ["?$identity" [{"@value" john-did "@type" "@id"}]]
 
-          alice-params      {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}}
+          alice-params      ["?$identity" [{"@value" alice-did "@type" "@id"}]]
 
           john-allowed      @(fluree/stage
                               @(fluree/wrap-policy db policy john-params)
@@ -144,6 +143,7 @@
                                          "f"      "https://ns.flur.ee/ledger#"}
                              "@graph"   [{"@id"         "ex:productClassRestriction"
                                           "@type"       ["f:AccessPolicy"]
+                                          "f:required"  true
                                           "f:onClass"   [{"@id" "ex:Product"}]
                                           "f:action"    [{"@id" "f:view"}, {"@id" "f:modify"}]
                                           "f:exMessage" "Only products managed by the user can be modified."
@@ -157,11 +157,9 @@
                                           "f:query"  {"@type"  "@json"
                                                       "@value" {}}}]}
 
-          john-params       {"?$identity" {"@value" john-did
-                                           "@type"  "@id"}}
+          john-params       ["?$identity" [{"@value" john-did "@type" "@id"}]]
 
-          alice-params      {"?$identity" {"@value" alice-did
-                                           "@type"  "@id"}}
+          alice-params      ["?$identity" [{"@value" alice-did "@type" "@id"}]]
 
           john-allowed      @(fluree/stage
                               @(fluree/wrap-policy db policy john-params)
@@ -204,7 +202,7 @@
                     "insert"   [{"@id"         "ex:alice"
                                  "schema:name" "Alice"}]})]
 
-      (testing " apply policy with only view action, no modify and transact"
+      (testing "apply policy with only view action, no modify and transact"
         (let [policy-wrapped @(fluree/wrap-policy
                                db {"@context" {"ex" "http://example.org/ns/"
                                                "f"  "https://ns.flur.ee/ledger#"}
@@ -225,13 +223,14 @@
           (is (= "Database policy denies all modifications."
                  (ex-message no-policy-ex)))))
 
-      (testing " apply policy with modify policy that will always return false"
+      (testing "apply policy with modify policy that will always return false"
         (let [policy-wrapped @(fluree/wrap-policy
                                db [;; falesy always modify
                                    {"@context"    {"ex" "http://example.org/ns/"
                                                    "f"  "https://ns.flur.ee/ledger#"}
                                     "@id"         "ex:defaultAllowViewModify"
                                     "@type"       ["f:AccessPolicy"]
+                                    "f:required"  true
                                     "f:action"    [{"@id" "f:modify"}]
                                     "f:exMessage" "Sample policy always returns false - denied!"
                                     "f:query"     {"@type"  "@json"
