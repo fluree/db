@@ -74,12 +74,16 @@
       (add-stemmer)
       (add-stopwords)))
 
-(defn percent-complete
+(defn percent-complete-str
   [index-state]
-  (let [{:keys [pending-status]} @index-state]
-    (if pending-status
-      (int (* 100 (/ (first pending-status) (second pending-status))))
-      0)))
+  (let [{:keys [pending-status]} @index-state
+        [processed-n item-count] pending-status
+        percentage (when (and (pos-int? processed-n) (pos-int? item-count))
+                     (int (* 100 (/ processed-n item-count))))]
+    (cond
+      percentage (str "Index is " percentage "% complete.")
+      (pos-int? processed-n) (str "Index has processed " processed-n " items of an unknown total to process.")
+      :else "Index is 0% complete.")))
 
 (defn score-candidates
   [query-terms vectors avg-length k1 b candidates]
@@ -95,41 +99,41 @@
 (defn search
   [{:keys [stemmer stopwords k1 b index-state] :as bm25} solution error-ch out-ch]
   (go
-   (try*
-    (let [{::vg-parse/keys [target limit timeout] :as search-params} (vg-parse/get-search-params solution)
-          {:keys [pending-ch index]} @index-state
+    (try*
+      (let [{::vg-parse/keys [target limit timeout] :as search-params} (vg-parse/get-search-params solution)
+            {:keys [pending-ch index]} @index-state
 
-          ;; TODO - check for "sync" options and don't wait for pending-ch if sync is false
+            ;; TODO - check for "sync" options and don't wait for pending-ch if sync is false
 
-          index*      (if pending-ch
-                        (let [timeout*   (or timeout 10000)
-                              timeout-ch (async/timeout timeout*)
-                              [idx ch] (alts! [timeout-ch pending-ch])]
-                          (if (= timeout-ch ch)
-                            (put! error-ch (ex-info (str "Timeout waiting for BM25 index to sync after "
-                                                         timeout* "ms. Index is " (percent-complete index-state)
-                                                         "% complete. Please try again later. To configure a "
-                                                         "different timeout, set " const/iri-index-timeout " in the virtual "
-                                                         "graph query to an integer of milliseconds.")
-                                                    {:error  :db/timeout
-                                                     :status 408}))
-                            idx))
-                        index)
-          {:keys [vectors item-count avg-length terms]} index*
-          query-terms (bm25.search/parse-query target terms item-count stemmer stopwords) ;; parsed terms from query with idf calculated
-          candidates  (reduce #(into %1 (:items %2)) #{} query-terms)] ;; reverse index allows us to know which docs contain each query term, put into single set
-      (->> candidates
-           (score-candidates query-terms vectors avg-length k1 b)
-           (sort-by :score #(compare %2 %1))
-           (vg-parse/limit-results limit)
-           (vg-parse/process-results bm25 solution search-params true)
-           (async/onto-chan! out-ch)))
-    (catch* e
-            (log/error e "Error ranking vectors")
-            (>! error-ch e)))))
+            index*      (if pending-ch
+                          (let [timeout*   (or timeout 10000)
+                                timeout-ch (async/timeout timeout*)
+                                [idx ch] (alts! [timeout-ch pending-ch])]
+                            (if (= timeout-ch ch)
+                              (put! error-ch (ex-info (str "Timeout waiting for BM25 index to sync after "
+                                                           timeout* "ms. " (percent-complete-str index-state)
+                                                           " Please try again later. To configure a "
+                                                           "different timeout, set " const/iri-index-timeout " in the virtual "
+                                                           "graph query to the desired number of milliseconds.")
+                                                      {:error  :db/timeout
+                                                       :status 408}))
+                              idx))
+                          index)
+            {:keys [vectors item-count avg-length terms]} index*
+            query-terms (bm25.search/parse-query target terms item-count stemmer stopwords) ;; parsed terms from query with idf calculated
+            candidates  (reduce #(into %1 (:items %2)) #{} query-terms)] ;; reverse index allows us to know which docs contain each query term, put into single set
+        (->> candidates
+             (score-candidates query-terms vectors avg-length k1 b)
+             (sort-by :score #(compare %2 %1))
+             (vg-parse/limit-results limit)
+             (vg-parse/process-results bm25 solution search-params true)
+             (async/onto-chan! out-ch)))
+      (catch* e
+              (log/error e "Error ranking vectors")
+        (>! error-ch e)))))
 
 (defn bm25-upsert*
-  [{:keys [index-state] :as bm25} {:keys [t alias namespaces namespace-codes] :as _db} items-ch]
+  [{:keys [index-state] :as bm25} db item-count assertions-ch]
   (let [{:keys [pending-ch index] :as prior-idx-state} @index-state
         new-pending-ch  (promise-chan)
         new-index-state (atom (assoc prior-idx-state :pending-ch new-pending-ch))]
@@ -137,13 +141,12 @@
     ;; following go-block happens asynchronously in the background
     ;; TODO - VG - capture error conditions in async/<! or other opts below and resolve the response with an error.
     (go
-      (let [items         (<! items-ch)
-            latest-index  (if pending-ch
+      (let [latest-index  (if pending-ch
                             (<! pending-ch)
                             index)
             status-update (fn [status]
                             (swap! new-index-state assoc :pending-status status))
-            new-index     (bm25.update/assert-items bm25 latest-index items status-update)]
+            new-index     (<! (bm25.update/upsert-items bm25 latest-index item-count assertions-ch status-update))]
         ;; reset index state atom once index is complete, remove pending-ch
         (swap! new-index-state (fn [idx-state]
                                  (assoc idx-state :index new-index
@@ -151,11 +154,11 @@
         (>! new-pending-ch new-index)))
 
     ;; new bm25 record returned to get attached to db
-    (assoc bm25 :t t
-                :namespaces namespaces
-                :namespace-codes namespace-codes
+    (assoc bm25 :t (:t db)
+                :namespaces (:namespaces db)
+                :namespace-codes (:namespace-codes db)
                 ;; unlikely, but in case db's alias has been changed keep in sync
-                :db-alias alias
+                :db-alias (:alias db)
                 :index-state new-index-state)))
 
 (defn property-dependencies
@@ -182,23 +185,44 @@
               adds
               removes))))
 
+(defn upsert-queries
+  [db parsed-query affected-iris]
+  (let [results-ch (async/chan)
+        iri-var    (-> parsed-query :select :subj)]
+    (async/go
+      (loop [[next-iri & r] affected-iris]
+        (if next-iri
+          (let [values [{iri-var (where/match-iri next-iri)}]
+                pq     (assoc parsed-query :values values)
+                result (first (async/<! (exec/query db nil pq)))] ;; inject one IRI into :values, expect one result
+
+            (if (util/exception? result)
+              (log/warn "BM25 upsert query failed for IRI:" next-iri "with exception message:" (ex-message result) "Skipping")
+              (async/>! results-ch (if (nil? result)
+                                     [::bm25.update/retract {"@id" next-iri}]
+                                     [::bm25.update/upsert result])))
+            (recur r))
+          (async/close! results-ch))))
+    results-ch))
+
 (defn bm25-upsert
   [bm25 db add removes]
   (let [prop-deps      (property-dependencies bm25)
         affected-sids  (affected-subjs prop-deps add removes)
         affected-iris  (map #(iri/decode-sid db %) affected-sids)
+        item-count     (count affected-iris)
         pq             (parsed-query bm25)
-        iri-var        (-> pq :select :subj)
-        iri-values     (map #(hash-map iri-var (where/match-iri %)) affected-iris)
-        pq*            (assoc pq :values iri-values)
-        upsert-docs-ch (exec/query db nil pq*)]
+        upsert-docs-ch (upsert-queries db pq affected-iris)]
 
-    (bm25-upsert* bm25 db upsert-docs-ch)))
+    (bm25-upsert* bm25 db item-count upsert-docs-ch)))
 
 (defn bm25-initialize
   [{:keys [query-parsed] :as bm25} db]
-  (let [index-items-ch (exec/query db nil query-parsed)]
-    (bm25-upsert* bm25 db index-items-ch)))
+  (let [query-result (exec/query db nil query-parsed)
+        items-ch     (async/chan 1 (map #(vector ::bm25.update/upsert %)))]
+    ;; break up query results into individual document items on a new chan
+    (async/pipeline-async 1 items-ch #(async/onto-chan! %2 %1) query-result)
+    (bm25-upsert* bm25 db nil items-ch)))
 
 (defrecord BM25-VirtualGraph
   [stemmer stopwords k1 b index-state initialized genesis-t t
