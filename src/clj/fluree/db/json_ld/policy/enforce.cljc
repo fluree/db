@@ -56,8 +56,8 @@
   [{:keys [policy namespace-codes] :as db} [s p o :as flake] modify?]
   (->> (default-policies policy modify?)
        (keep (fn [{:keys [s-targets p-targets default?] :as policy}]
-               (when (or (contains? s-targets s)
-                         (contains? p-targets p)
+               (when (or (and (or (nil? s-targets) (contains? s-targets s))
+                              (or (nil? p-targets) (contains? p-targets p)))
                          default?)
                  policy)))))
 
