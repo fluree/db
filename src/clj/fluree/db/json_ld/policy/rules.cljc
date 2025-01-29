@@ -74,8 +74,8 @@
 
 (defn parse-targets
   [db target-exprs]
-  (let [out-ch (async/chan 2)
-        in-ch  (async/to-chan! (mapv #(or (util/get-id %) (util/get-value %)) target-exprs))]
+  (let [in-ch  (async/to-chan! (mapv #(or (util/get-id %) (util/get-value %)) target-exprs))
+        out-ch (async/chan 2 (map (fn [iri] (iri/iri->sid iri (:namespaces db)))))]
     (async/pipeline-async 2
                           out-ch
                           (fn [target-expr ch]
@@ -97,8 +97,6 @@
           subject-targets  (when-let [target-exprs (get policy-doc const/iri-targetSubject)]
                              (<? (parse-targets db target-exprs)))
           property-targets (when-let [target-exprs (get policy-doc const/iri-targetProperty)]
-                             (<? (parse-targets db target-exprs)))
-          object-targets   (when-let [target-exprs (get policy-doc const/iri-targetObject)]
                              (<? (parse-targets db target-exprs)))
           on-property      (when-let [props (util/get-all-ids policy-doc const/iri-onProperty)]
                              (set props)) ;; can be multiple properties
@@ -122,14 +120,17 @@
                  :on-property on-property
                  :on-class    on-class
                  :required?   (util/get-first-value policy-doc const/iri-required)
-                 :default?    (and (nil? on-property) (nil? on-class)) ;; with no class or property restrictions, becomes a default policy-doc
+                 ;; with no class or property restrictions, becomes a default policy-doc
+                 :default?    (and (nil? on-property)
+                                   (nil? on-class)
+                                   (nil? subject-targets)
+                                   (nil? property-targets))
                  :ex-message  (util/get-first-value policy-doc const/iri-exMessage)
                  :view?       view?
                  :modify?     modify?
                  :query       query}
           (not-empty subject-targets)  (assoc :s-targets subject-targets)
-          (not-empty property-targets) (assoc :p-targets property-targets)
-          (not-empty object-targets)   (assoc :o-targets object-targets))
+          (not-empty property-targets) (assoc :p-targets property-targets))
         ;; policy-doc has incorrectly formatted view? and/or modify?
         ;; this might allow data through that was intended to be restricted, so throw.
         (throw (ex-info (str "Invalid policy definition. Policies must have f:action of {@id: f:view} or {@id: f:modify}. "
