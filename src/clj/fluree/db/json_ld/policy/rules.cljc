@@ -6,7 +6,8 @@
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -81,9 +82,11 @@
                           (fn [target-expr ch]
                             (if (map? target-expr)
                               ;; maps are query where clauses
-                              (-> (dbproto/-query db (assoc target-expr "select" "?$target"))
-                                  (async/pipe (async/chan 2 cat))
-                                  (async/pipe ch))
+                              (let [context (get target-expr "@context")
+                                    sid-xf  (map #(json-ld/expand-iri % (json-ld/parse-context context)))]
+                                (-> (dbproto/-query db (assoc target-expr "select" "?$target"))
+                                    (async/pipe (async/chan 2 (comp cat sid-xf)))
+                                    (async/pipe ch)))
                               ;; non-maps are literals
                               (async/onto-chan! ch [target-expr])))
                           in-ch)
