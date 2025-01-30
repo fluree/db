@@ -1111,15 +1111,15 @@
   [shape-db data-db modified-subjects context]
   (go-try
     (if-let [node-shape-sids (seq (<? (all-node-shape-ids shape-db)))]
-      (doseq [s-flakes modified-subjects]
-        (doseq [shape-sid node-shape-sids]
-          (let [shape   (<? (build-shape shape-db shape-sid))
-                v-ctx   {:display  (make-display data-db context)
-                         :context  context
-                         :shape-db shape-db
-                         :data-db  data-db}]
-            ;; only enforce activated shapes
-            (when (not (get shape const/sh_deactivated))
-              (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
-                (throw-shacl-violation context results))))))
+      (let [v-ctx {:display  (make-display data-db context)
+                   :context  context
+                   :shape-db shape-db
+                   :data-db  data-db}]
+        (doseq [s-flakes modified-subjects]
+          (doseq [shape-sid node-shape-sids]
+            (let [shape (<? (build-shape shape-db shape-sid))]
+              ;; only enforce activated shapes
+              (when (not (get shape const/sh_deactivated))
+                (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
+                  (throw-shacl-violation context results)))))))
       :valid)))
