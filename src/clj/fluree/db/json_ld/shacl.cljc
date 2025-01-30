@@ -1110,16 +1110,16 @@
   `modified-subjects` is a sequence of s-flakes of modified subjects."
   [shape-db data-db modified-subjects context]
   (go-try
-    (if-let [node-shape-sids (seq (<? (all-node-shape-ids shape-db)))]
-      (let [v-ctx {:display  (make-display data-db context)
-                   :context  context
-                   :shape-db shape-db
-                   :data-db  data-db}]
-        (doseq [s-flakes modified-subjects]
-          (doseq [shape-sid node-shape-sids]
-            (let [shape (<? (build-shape shape-db shape-sid))]
-              ;; only enforce activated shapes
-              (when (not (get shape const/sh_deactivated))
+    (let [v-ctx {:display  (make-display data-db context)
+                 :context  context
+                 :shape-db shape-db
+                 :data-db  data-db}]
+      (loop [[next-shape-sid node-shape-sids*] (<? (all-node-shape-ids shape-db))]
+        (if next-shape-sid
+          (let [shape (<? (build-shape shape-db shape-sid))]
+            (when (not (get shape const/sh_deactivated))
+              (doseq [s-flakes modified-subjects]
                 (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
-                  (throw-shacl-violation context results)))))))
-      :valid)))
+                  (throw-shacl-violation context results))))
+            (recur node-shape-sids*))
+          :valid)))))
