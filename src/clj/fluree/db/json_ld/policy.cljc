@@ -74,6 +74,12 @@
        (mapv (partial into [v]) vals)
        [[v]])]))
 
+(defn inject-where-pattern
+  [q pattern]
+  (update q "where" (fn [where-clause]
+                      (into [pattern]
+                            (when where-clause (util/sequential where-clause))))))
+
 (defn wrap-identity-policy
   "Given an identity (@id) that exists in the db which contains a
   property `f:policyClass` listing policy classes associated with
@@ -89,8 +95,7 @@
                       policies
                       (policy-from-query policies))
 
-          policy-values* (-> (util.parse/normalize-values policy-values)
-                             (inject-value-binding "?$identity" {"@value" identity "@type" const/iri-id}))]
+          policy-values* (inject-value-binding policy-values "?$identity" {"@value" identity "@type" const/iri-id})]
       (log/trace "wrap-identity-policy - extracted policy from identity: " identity " policy: " policies*)
       (if (util/exception? policies*)
         (ex-info (str "Unable to extract policies for identity: " identity
@@ -111,16 +116,17 @@
   "Policy enforces a db based on the query/transaction options"
   [db parsed-context opts]
   (go-try
-    (let [{:keys [identity policy-class policy policy-values]} opts]
+    (let [{:keys [identity policy-class policy policy-values]} opts
+          policy-values* (util.parse/normalize-values policy-values)]
       (cond
 
         identity
-        (<? (wrap-identity-policy db identity policy-values))
+        (<? (wrap-identity-policy db identity policy-values*))
 
         policy-class
         (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
-          (<? (wrap-class-policy db classes policy-values)))
+          (<? (wrap-class-policy db classes policy-values*)))
 
         policy
         (let [expanded-policy (json-ld/expand policy parsed-context)]
-          (<? (wrap-policy db expanded-policy policy-values)))))))
+          (<? (wrap-policy db expanded-policy policy-values*)))))))

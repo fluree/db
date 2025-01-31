@@ -68,9 +68,7 @@
         this-val      (iri/decode-sid db sid)
         values        (-> (util.parse/normalize-values policy-values)
                           (policy/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
-    (update query "where" (fn [where-clause]
-                            (into [["values" values]]
-                                  (when where-clause (util/sequential where-clause)))))))
+    (policy/inject-where-pattern query ["values" values])))
 
 (defn modify-exception
   [policies]

@@ -3,6 +3,7 @@
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
+            [fluree.db.json-ld.policy :as policy]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
@@ -74,7 +75,7 @@
      (:on-property restriction-map))))
 
 (defn parse-targets
-  [db target-exprs]
+  [db policy-values target-exprs]
   (let [in-ch  (async/to-chan! (mapv #(or (util/get-id %) (util/get-value %)) target-exprs))
         out-ch (async/chan 2 (map (fn [iri] (iri/iri->sid iri (:namespaces db)))))]
     (async/pipeline-async 2
@@ -83,8 +84,10 @@
                             (if (map? target-expr)
                               ;; maps are query where clauses
                               (let [context (get target-expr "@context")
-                                    sid-xf  (map #(json-ld/expand-iri % (json-ld/parse-context context)))]
-                                (-> (dbproto/-query db (assoc target-expr "select" "?$target"))
+                                    sid-xf  (map #(json-ld/expand-iri % (json-ld/parse-context context)))
+                                    target-q (cond-> (assoc target-expr "select" "?$target")
+                                               policy-values (policy/inject-where-pattern ["values" policy-values]))]
+                                (-> (dbproto/-query db target-q)
                                     (async/pipe (async/chan 2 (comp cat sid-xf)))
                                     (async/pipe ch)))
                               ;; non-maps are literals
@@ -93,16 +96,16 @@
     (async/into #{} out-ch)))
 
 (defn parse-policy
-  [db policy-doc]
+  [db policy-values policy-doc]
   (go-try
     (let [id (util/get-id policy-doc) ;; @id name of policy-doc
 
           subject-targets  (when-let [target-exprs (get policy-doc const/iri-targetSubject)]
-                             (<? (parse-targets db target-exprs)))
+                             (<? (parse-targets db policy-values target-exprs)))
           property-targets (when-let [target-exprs (get policy-doc const/iri-targetProperty)]
-                             (<? (parse-targets db target-exprs)))
+                             (<? (parse-targets db policy-values target-exprs)))
           on-property      (when-let [property-exprs (get policy-doc const/iri-onProperty)]
-                             (<? (parse-targets db property-exprs)))
+                             (<? (parse-targets db policy-values property-exprs)))
 
           on-class         (when-let [classes (util/get-all-ids policy-doc const/iri-onClass)]
                              (set classes))
@@ -164,13 +167,13 @@
       wrapper)))
 
 (defn parse-policies
-  [db policy-docs]
+  [db policy-values policy-docs]
   (let [policy-ch     (async/chan)
         policy-doc-ch (async/to-chan! policy-docs)]
     (async/pipeline-async 2
                           policy-ch
                           (fn [policy-doc ch]
-                            (-> (parse-policy db policy-doc)
+                            (-> (parse-policy db policy-values policy-doc)
                                 (async/pipe ch)))
                           policy-doc-ch)
     (async/reduce (build-wrapper db) {} policy-ch)))
@@ -178,5 +181,5 @@
 (defn wrap-policy
   [db policy-rules policy-values]
   (go-try
-    (let [wrapper (<? (parse-policies db (util/sequential policy-rules)))]
+    (let [wrapper (<? (parse-policies db policy-values (util/sequential policy-rules)))]
       (assoc db :policy (assoc wrapper :cache (atom {}) :policy-values policy-values)))))
