@@ -144,7 +144,11 @@
                              "@graph"   [{"@id"         "ex:productClassRestriction"
                                           "@type"       ["f:AccessPolicy"]
                                           "f:required"  true
-                                          "f:onClass"   [{"@id" "ex:Product"}]
+                                          "f:targetSubject"
+                                          {"@type" "@json"
+                                           "@value"
+                                           {"@context" {"ex" "http://example.org/ns/"}
+                                            "where" [{"@id" "?$target" "@type" {"@id" "ex:Product"}}]}}
                                           "f:action"    [{"@id" "f:view"}, {"@id" "f:modify"}]
                                           "f:exMessage" "Only products managed by the user can be modified."
                                           "f:query"     {"@type"  "@json"
