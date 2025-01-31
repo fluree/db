@@ -23,7 +23,7 @@
                       "f:action"     {"@id" "f:modify"}
                       "f:required"   true
                       "f:exMessage"  "User can only create a wishlist linked to their own identity."
-                      "f:onProperty" [{"@id" "a:wishlist"}]
+                      "f:targetProperty" [{"@id" "a:wishlist"}]
                       "f:query"
                       {"@type"  "@json"
                        "@value" {"@context" {"a" "http://a.co/"}
@@ -35,7 +35,7 @@
                       "f:action"     {"@id" "f:modify"}
                       "f:required"   true
                       "f:exMessage"  "User can only modify own wishlist properties."
-                      "f:onProperty" [{"@id" "a:name"} {"@id" "a:summary"} {"@id" "a:item"}]
+                      "f:targetProperty" [{"@id" "a:name"} {"@id" "a:summary"} {"@id" "a:item"}]
                       "f:query"
                       {"@type"  "@json"
                        "@value" {"@context" {"a" "http://a.co/"}
@@ -46,7 +46,7 @@
                     "@id"          "a:wishlistViewPolicy"
                     "f:action"     {"@id" "f:view"}
                     "f:required"   true
-                    "f:onProperty" [{"@id" "a:wishlist"}]
+                    "f:targetProperty" [{"@id" "a:wishlist"}]
                     "f:query"
                     {"@type"  "@json"
                      "@value" {"@context" {"a" "http://a.co/"}
@@ -59,7 +59,7 @@
                   "f:action"     {"@id" "f:modify"}
                   "f:required"   true
                   "f:exMessage"  "User can only create an item on their own wishlist."
-                  "f:onProperty" [{"@id" "a:item"}]
+                  "f:targetProperty" [{"@id" "a:item"}]
                   "f:query"
                   {"@type"  "@json"
                    "@value" {"@context" {"a" "http://a.co/"}
@@ -71,7 +71,7 @@
                   "f:action"     {"@id" "f:modify"}
                   "f:required"   true
                   "f:exMessage"  "User can modify all but available on item."
-                  "f:onProperty" [{"@id" "a:title"}
+                  "f:targetProperty" [{"@id" "a:title"}
                                   {"@id" "a:description"}
                                   {"@id" "a:rank"}]
                   "f:query"
@@ -85,7 +85,7 @@
                 "@id"      "a:wishlistItemViewPolicy"
 
 
-                "f:onProperty" [{"@id" "a:title"}
+                "f:targetProperty" [{"@id" "a:title"}
                                 {"@id" "a:description"}
                                 {"@id" "a:rank"}]
                 "f:query"
@@ -98,7 +98,7 @@
                 "@id" "a:availableModifyPolicy"
                 "f:required" true
                 "f:exMessage" "User cannot modify available status on their own items."
-                "f:onProperty" [{"@id" "a:available"}]
+                "f:targetProperty" [{"@id" "a:available"}]
                 "f:query"
                 {"@type" "@json"
                  "@value" {"@context" {"a" "http://a.co/"}
