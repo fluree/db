@@ -47,7 +47,7 @@
                              "@graph"   [{"@id"          "ex:emailPropertyRestriction"
                                           "@type"        ["f:AccessPolicy"]
                                           "f:required"   true
-                                          "f:onProperty" [{"@id" "schema:email"}]
+                                          "f:targetProperty" [{"@id" "schema:email"}]
                                           "f:action"     [{"@id" "f:view"}, {"@id" "f:modify"}]
                                           "f:exMessage"  "Only users can update their own emails."
                                           "f:query"      {"@type"  "@json"
