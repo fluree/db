@@ -60,7 +60,7 @@
   (let [cids (policy-cids db restriction-map)]
     (reduce
      (fn [policy property]
-       (let [pid              (iri/encode-iri db property)
+       (let [pid              (if (iri/sid? property) property (iri/encode-iri db property))
              restriction-map* (assoc restriction-map :pid pid
                                                      :cids cids)]
          (cond-> policy
@@ -101,8 +101,9 @@
                              (<? (parse-targets db target-exprs)))
           property-targets (when-let [target-exprs (get policy-doc const/iri-targetProperty)]
                              (<? (parse-targets db target-exprs)))
-          on-property      (when-let [props (util/get-all-ids policy-doc const/iri-onProperty)]
-                             (set props)) ;; can be multiple properties
+          on-property      (when-let [property-exprs (get policy-doc const/iri-onProperty)]
+                             (<? (parse-targets db property-exprs)))
+
           on-class         (when-let [classes (util/get-all-ids policy-doc const/iri-onClass)]
                              (set classes))
 
