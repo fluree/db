@@ -100,14 +100,14 @@
   (go-try
     (let [id (util/get-id policy-doc) ;; @id name of policy-doc
 
-          subject-targets  (when-let [target-exprs (get policy-doc const/iri-targetSubject)]
-                             (<? (parse-targets db policy-values target-exprs)))
-          property-targets (when-let [target-exprs (get policy-doc const/iri-targetProperty)]
-                             (<? (parse-targets db policy-values target-exprs)))
-          on-property      (when-let [property-exprs (get policy-doc const/iri-onProperty)]
-                             (<? (parse-targets db policy-values property-exprs)))
+          subject-targets-ch  (when-let [target-exprs (get policy-doc const/iri-targetSubject)]
+                                (parse-targets db policy-values target-exprs))
+          property-targets-ch (when-let [target-exprs (get policy-doc const/iri-targetProperty)]
+                                (parse-targets db policy-values target-exprs))
 
-          on-class         (when-let [classes (util/get-all-ids policy-doc const/iri-onClass)]
+          on-property (when-let [p-iris (util/get-all-ids policy-doc const/iri-onProperty)]
+                             (set p-iris))
+          on-class    (when-let [classes (util/get-all-ids policy-doc const/iri-onClass)]
                              (set classes))
 
           src-query (util/get-first-value policy-doc const/iri-query)
@@ -121,7 +121,10 @@
           view?     (or (empty? actions) ;; if actions is not specified, default to all actions
                         (contains? actions const/iri-view))
           modify?   (or (empty? actions)
-                        (contains? actions const/iri-modify))]
+                        (contains? actions const/iri-modify))
+
+          subject-targets  (when subject-targets-ch (<? subject-targets-ch))
+          property-targets (when property-targets-ch (<? property-targets-ch))]
       (if (or view? modify?)
         (cond-> {:id          id
                  :on-property on-property
