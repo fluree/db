@@ -152,13 +152,13 @@
   [db]
   (fn [wrapper policy]
     (cond
+      (seq (:on-property policy))
+      (add-property-restriction policy db wrapper)
+
       (or (:s-targets policy)
           (:p-targets policy)
           (:o-targets policy))
       (add-default-restriction policy wrapper)
-
-      (seq (:on-property policy))
-      (add-property-restriction policy db wrapper)
 
       (seq (:on-class policy))
       (add-class-restriction policy db wrapper)
