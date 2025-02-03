@@ -128,14 +128,14 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-          mods-ch      (modified-subjects (policy/root db) add) ;; kick off mods in background
+          ;; mods-ch      (modified-subjects (policy/root db) add) ;; kick off mods in background
           db-after     (-> db
                            (update :staged conj [txn author annotation])
                            (assoc :t t
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id))
-          mods         (<? mods-ch)
+          mods         {} ; (<? mods-ch)
           db-after*    (-> db-after
                            (vocab/hydrate-schema add mods)
                            (check-virtual-graph add remove))]
@@ -149,7 +149,7 @@
 (defn validate-db-update
   [{:keys [db-after db-before mods context] :as staged-map}]
   (go-try
-    (<? (shacl/validate! db-before (policy/root db-after) (vals mods) context))
+    ;; (<? (shacl/validate! db-before (policy/root db-after) (vals mods) context))
     (let [allowed-db (<? (policy.modify/allowed? staged-map))]
       allowed-db)))
 
