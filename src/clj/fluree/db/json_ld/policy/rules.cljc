@@ -76,7 +76,7 @@
 
 (defn parse-targets
   [db policy-values target-exprs]
-  (let [in-ch  (async/to-chan! (mapv #(or (util/get-id %) (util/get-value %)) target-exprs))
+  (let [in-ch  (async/to-chan! target-exprs)
         out-ch (async/chan 2 (map (fn [iri] (iri/iri->sid iri (:namespaces db)))))]
     (async/pipeline-async 2
                           out-ch
@@ -95,20 +95,26 @@
                           in-ch)
     (async/into #{} out-ch)))
 
+(defn unwrap
+  [targets]
+  (not-empty (mapv #(or (util/get-id %) (util/get-value %)) targets)))
+
 (defn parse-policy
   [db policy-values policy-doc]
   (go-try
     (let [id (util/get-id policy-doc) ;; @id name of policy-doc
 
-          subject-targets-ch  (when-let [target-exprs (get policy-doc const/iri-targetSubject)]
-                                (parse-targets db policy-values target-exprs))
-          property-targets-ch (when-let [target-exprs (get policy-doc const/iri-targetProperty)]
-                                (parse-targets db policy-values target-exprs))
+          target-subject      (unwrap (get policy-doc const/iri-targetSubject))
+          subject-targets-ch  (when target-subject
+                                (parse-targets db policy-values target-subject))
+          target-property     (unwrap (get policy-doc const/iri-targetProperty))
+          property-targets-ch (when target-property
+                                (parse-targets db policy-values target-property))
 
           on-property (when-let [p-iris (util/get-all-ids policy-doc const/iri-onProperty)]
-                             (set p-iris))
+                        (set p-iris))
           on-class    (when-let [classes (util/get-all-ids policy-doc const/iri-onClass)]
-                             (set classes))
+                        (set classes))
 
           src-query (util/get-first-value policy-doc const/iri-query)
           query     (if (map? src-query)
@@ -139,6 +145,8 @@
                  :view?       view?
                  :modify?     modify?
                  :query       query}
+          target-subject               (assoc :target-subject target-subject)
+          target-property              (assoc :target-property target-property)
           (not-empty subject-targets)  (assoc :s-targets subject-targets)
           (not-empty property-targets) (assoc :p-targets property-targets))
         ;; policy-doc has incorrectly formatted view? and/or modify?
