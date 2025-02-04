@@ -155,7 +155,7 @@
 
 (defn reify-schema
   [{:keys [namespace-codes v] :as root-map}]
-  (if (not= 1 v)
+  (if (> v 0)
     (update root-map :schema vocab/deserialize-schema namespace-codes)
     ;; legacy, for now only v0
     (update root-map :preds deserialize-preds)))
