@@ -35,10 +35,10 @@
   (cond-> policy
 
           (view-restriction? restriction)
-          (update-in [const/iri-view :default] util/conjv restriction)
+          (update-in [:view :default] util/conjv restriction)
 
           (modify-restriction? restriction)
-          (update-in [const/iri-modify :default] util/conjv restriction)))
+          (update-in [:modify :default] util/conjv restriction)))
 
 (defn add-class-restriction
   [restriction-map db policy-map]
@@ -49,10 +49,10 @@
          (cond-> policy
 
                  (view-restriction? restriction-map*)
-                 (update-in [const/iri-view :class cid] util/conjv restriction-map*)
+                 (update-in [:view :class cid] util/conjv restriction-map*)
 
                  (modify-restriction? restriction-map*)
-                 (update-in [const/iri-modify :class cid] util/conjv restriction-map*))))
+                 (update-in [:modify :class cid] util/conjv restriction-map*))))
      policy-map
      cids)))
 
@@ -67,10 +67,10 @@
          (cond-> policy
 
                  (view-restriction? restriction-map*)
-                 (update-in [const/iri-view :property pid] util/conjv restriction-map*)
+                 (update-in [:view :property pid] util/conjv restriction-map*)
 
                  (modify-restriction? restriction-map*)
-                 (update-in [const/iri-modify :property pid] util/conjv restriction-map*))))
+                 (update-in [:modify :property pid] util/conjv restriction-map*))))
      policy-map
      (:on-property restriction-map))))
 

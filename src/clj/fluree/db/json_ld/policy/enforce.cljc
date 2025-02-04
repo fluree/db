@@ -12,25 +12,25 @@
 
 (defn unrestricted-modify?
   [policy]
-  (true? (get-in policy [const/iri-modify :root?])))
+  (true? (get-in policy [:modify :root?])))
 
 (defn unrestricted-view?
   [policy]
-  (true? (get-in policy [const/iri-view :root?])))
+  (true? (get-in policy [:view :root?])))
 
 (defn class-policy-map
   "Returns class policy map"
   [policy modify?]
   (if modify?
-    (get-in policy [const/iri-modify :class])
-    (get-in policy [const/iri-view :class])))
+    (get-in policy [:modify :class])
+    (get-in policy [:view :class])))
 
 (defn property-policy-map
   "Returns property policy map"
   [policy modify?]
   (if modify?
-    (get-in policy [const/iri-modify :property])
-    (get-in policy [const/iri-view :property])))
+    (get-in policy [:modify :property])
+    (get-in policy [:view :property])))
 
 (defn policies-for-classes
   "Returns sequence of policies that apply to the provided classes."
@@ -49,8 +49,8 @@
   "Returns default policies if they exist else nil"
   [policy-map modify?]
   (if modify?
-    (get-in policy-map [const/iri-modify :default])
-    (get-in policy-map [const/iri-view :default])))
+    (get-in policy-map [:modify :default])
+    (get-in policy-map [:view :default])))
 
 (defn policies-for-flake
   [{:keys [policy namespace-codes] :as db} [s p o :as flake] modify?]

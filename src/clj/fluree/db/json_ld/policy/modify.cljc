@@ -46,4 +46,4 @@
 (defn deny-all?
   "Returns true if policy allows no modification."
   [{:keys [policy] :as _db}]
-  (empty? (get policy const/iri-modify)))
+  (empty? (:modify policy)))
