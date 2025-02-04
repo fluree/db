@@ -106,7 +106,7 @@
   (let [sid                     (iri/encode-iri db iri)
         [start-flake end-flake] (flake-bounds db :spot [sid])
         flake-xf                (when fuel-tracker
-                                  (comp (fuel/track fuel-tracker error-ch)))
+                                  (comp (fuel/track fuel-tracker :spot start-flake end-flake error-ch)))
         range-opts              {:to-t        t
                                  :start-flake start-flake
                                  :end-flake   end-flake
@@ -123,7 +123,7 @@
         pid                     (iri/encode-iri db p-iri)
         [start-flake end-flake] (flake-bounds db :opst [oid pid])
         flake-xf                (if fuel-tracker
-                                  (comp (fuel/track fuel-tracker error-ch)
+                                  (comp (fuel/track fuel-tracker :opst start-flake end-flake error-ch)
                                         (map flake/s))
                                   (map flake/s))
         range-opts              {:to-t        t
