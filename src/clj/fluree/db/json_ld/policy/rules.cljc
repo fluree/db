@@ -74,6 +74,11 @@
      policy-map
      (:on-property restriction-map))))
 
+(defn query-target?
+  "A target-expr can either be a static IRI or a query map."
+  [target-expr]
+  (map? target-expr))
+
 (defn parse-targets
   [db policy-values target-exprs]
   (let [in-ch  (async/to-chan! target-exprs)
@@ -81,8 +86,7 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [target-expr ch]
-                            (if (map? target-expr)
-                              ;; maps are query where clauses
+                            (if (query-target? target-expr)
                               (let [context (get target-expr "@context")
                                     sid-xf  (map #(json-ld/expand-iri % (json-ld/parse-context context)))
                                     target-q (cond-> (assoc target-expr "select" "?$target")
