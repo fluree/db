@@ -87,8 +87,8 @@
                           out-ch
                           (fn [target-expr ch]
                             (if (query-target? target-expr)
-                              (let [context (get target-expr "@context")
-                                    sid-xf  (map #(json-ld/expand-iri % (json-ld/parse-context context)))
+                              (let [context (json-ld/parse-context (get target-expr "@context"))
+                                    sid-xf  (map #(json-ld/expand-iri % context))
                                     target-q (cond-> (assoc target-expr "select" "?$target")
                                                policy-values (policy/inject-where-pattern ["values" policy-values]))]
                                 (-> (dbproto/-query db target-q)
