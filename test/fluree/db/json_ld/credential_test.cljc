@@ -137,7 +137,11 @@
                       "@id"         "ct:userPolicy"
                       "@type"       ["f:AccessPolicy" "ct:DefaultUserPolicy"]
                       "f:required"  true
-                      "f:onClass"   [{"@id" "ct:User"}]
+                      "f:targetSubject"
+                      {"@type" "@json"
+                       "@value"
+                       {"@context" {"ct" "ledger:credentialtest/"}
+                        "where" [{"@id" "?$target" "@type" {"@id" "ct:User"}}]}}
                       "f:action"    [{"@id" "f:view"}, {"@id" "f:modify"}]
                       "f:exMessage" "Users can only manage their own data."
                       "f:query"     {"@type"  "@json"

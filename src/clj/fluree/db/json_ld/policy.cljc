@@ -16,8 +16,8 @@
 
 (def root-policy-map
   "Base policy (permissions) map that will give access to all flakes."
-  {const/iri-view   {:root? true}
-   const/iri-modify {:root? true}})
+  {:view   {:root? true}
+   :modify {:root? true}})
 
 (defn root-db
   [db]
@@ -34,11 +34,14 @@
   would looses the @type information."
   [query-results]
   (mapv
-   #(if-let [query (get % const/iri-query)]
-      (assoc % const/iri-query {"@value" query
-                                "@type"  "@json"})
-      %)
-   query-results))
+    (fn [{q   const/iri-query
+          t-s const/iri-targetSubject
+          t-p const/iri-targetProperty :as policy}]
+      (cond-> policy
+        q   (assoc const/iri-query {"@value" q "@type" "@json"})
+        t-s (assoc const/iri-targetSubject (if (get t-s "@id") t-s {"@value" t-s "@type" "@json"}))
+        t-p (assoc const/iri-targetProperty (if (get t-p "@id") t-p {"@value" t-p "@type" "@json"}))))
+    query-results))
 
 (defn wrap-class-policy
   "Given one or more policy classes, queries for policies
@@ -74,6 +77,12 @@
        (mapv (partial into [v]) vals)
        [[v]])]))
 
+(defn inject-where-pattern
+  [q pattern]
+  (update q "where" (fn [where-clause]
+                      (into [pattern]
+                            (when where-clause (util/sequential where-clause))))))
+
 (defn wrap-identity-policy
   "Given an identity (@id) that exists in the db which contains a
   property `f:policyClass` listing policy classes associated with
@@ -89,8 +98,7 @@
                       policies
                       (policy-from-query policies))
 
-          policy-values* (-> (util.parse/normalize-values policy-values)
-                             (inject-value-binding "?$identity" {"@value" identity "@type" const/iri-id}))]
+          policy-values* (inject-value-binding policy-values "?$identity" {"@value" identity "@type" const/iri-id})]
       (log/trace "wrap-identity-policy - extracted policy from identity: " identity " policy: " policies*)
       (if (util/exception? policies*)
         (ex-info (str "Unable to extract policies for identity: " identity
@@ -111,16 +119,17 @@
   "Policy enforces a db based on the query/transaction options"
   [db parsed-context opts]
   (go-try
-    (let [{:keys [identity policy-class policy policy-values]} opts]
+    (let [{:keys [identity policy-class policy policy-values]} opts
+          policy-values* (util.parse/normalize-values policy-values)]
       (cond
 
         identity
-        (<? (wrap-identity-policy db identity policy-values))
+        (<? (wrap-identity-policy db identity policy-values*))
 
         policy-class
         (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
-          (<? (wrap-class-policy db classes policy-values)))
+          (<? (wrap-class-policy db classes policy-values*)))
 
         policy
         (let [expanded-policy (json-ld/expand policy parsed-context)]
-          (<? (wrap-policy db expanded-policy policy-values)))))))
+          (<? (wrap-policy db expanded-policy policy-values*)))))))
