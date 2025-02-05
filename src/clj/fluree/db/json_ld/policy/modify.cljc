@@ -4,7 +4,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
-            [fluree.db.json-ld.policy.enforce :as enforce]))
+            [fluree.db.json-ld.policy.enforce :as enforce]
+            [fluree.db.json-ld.policy.rules :as policy.rules]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -16,6 +17,28 @@
        (map flake/o)
        seq))
 
+(defn refresh-policy
+  [db-after policy-values {:keys [target-subject target-property] :as policy}]
+  (go-try
+    (cond-> policy
+      target-subject  (update :s-targets into (<? (policy.rules/parse-targets db-after policy-values target-subject)))
+      target-property (update :p-targets into (<? (policy.rules/parse-targets db-after policy-values target-subject))))))
+
+(defn refresh-modify-policies
+  "Update targets to include newly created targets."
+  [db-after]
+  (go-try
+    (let [policy-values (-> db-after :policy :policy-values)]
+      (loop [[policy & r] (-> db-after :policy :modify :default)
+             refreshed []]
+        (if policy
+          (let [{:keys [target-subject target-property]} policy]
+            (if (or target-subject target-property)
+              (let [policy* (<? (refresh-policy db-after policy-values policy))]
+                (recur r (conj refreshed policy*)))
+              (recur r (conj refreshed policy))))
+          (assoc-in db-after [:policy :modify :default] refreshed))))))
+
 (defn allowed?
   "Checks if all 'adds' are allowed by the policy. If so
   returns final db.
@@ -24,7 +47,7 @@
   message (if available)."
   [{:keys [db-after add mods]}]
   (go-try
-    (let [{:keys [policy]} db-after]
+    (let [{:keys [policy]} (<? (refresh-modify-policies db-after))]
       (if (enforce/unrestricted-modify? policy)
         db-after
         (loop [[flake & r] add]
