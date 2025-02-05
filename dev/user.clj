@@ -87,6 +87,40 @@
                       :where   '{:id          ?e
                                  :schema/name ?n}})
 
+  @(fluree/explain db1 {:context default-context
+                        :select  '[?n ?f-name]
+                        :where   '[{:id ?e :schema/name ?n}
+                                   {:id ?e :ex/friend ?friend}
+                                   {:id ?friend :schema/name ?f-name}]})
+  {:status 200,
+   :result [["Cam" "Alice"] ["Cam" "Brian"]],
+   :explain
+   ;; map of [<idx> <start-flake> <end-flake>] -> flake count
+   {[:post
+     #fluree/Flake [nil #fluree/SID [17 "name"] nil nil nil nil -2147483647]
+     #fluree/Flake [nil #fluree/SID [17 "name"] nil nil nil nil 2147483647]] 3,
+    [:spot
+     #fluree/Flake [#fluree/SID [101 "alice"] #fluree/SID [101 "friend"] nil nil nil nil -2147483647]
+     #fluree/Flake [#fluree/SID [101 "alice"] #fluree/SID [101 "friend"] nil nil nil nil 2147483647]] 0,
+    [:spot
+     #fluree/Flake [#fluree/SID [101 "brian"] #fluree/SID [101 "friend"] nil nil nil nil -2147483647]
+     #fluree/Flake [#fluree/SID [101 "brian"] #fluree/SID [101 "friend"] nil nil nil nil 2147483647]] 0,
+    [:spot
+     #fluree/Flake [#fluree/SID [101 "cam"] #fluree/SID [101 "friend"] nil nil nil nil -2147483647]
+     #fluree/Flake [#fluree/SID [101 "cam"] #fluree/SID [101 "friend"] nil nil nil nil 2147483647]] 2,
+    [:spot
+     #fluree/Flake [#fluree/SID [101 "alice"] #fluree/SID [17 "name"] nil nil nil nil -2147483647]
+     #fluree/Flake [#fluree/SID [101 "alice"] #fluree/SID [17 "name"] nil nil nil nil 2147483647]] 1,
+    [:spot
+     #fluree/Flake [#fluree/SID [101 "brian"] #fluree/SID [17 "name"] nil nil nil nil -2147483647]
+     #fluree/Flake [#fluree/SID [101 "brian"] #fluree/SID [17 "name"] nil nil nil nil 2147483647]] 1},
+   :time "11.22ms",
+   :fuel 7}
+
+
+
+
+
   (def db2 @(fluree/commit! ledger db1 {:message "hi"}))
 
   (-> @(fluree/load file-conn ledger-alias)
