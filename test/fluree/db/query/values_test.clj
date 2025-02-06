@@ -73,7 +73,13 @@
                                      "values" ["?friend" [{"@value" "ex:alice" "@type" "@id"}]]
                                      "where" [{"@id" "?s" "ex:friend" {"@id" "?friend"}}]
                                      "select" ["?s"]}))
-              "variable in id-map"))))
+              "variable in id-map")))
+      (testing "matching id only"
+        (is (= ["ex:brian"]
+               @(fluree/query db1 {"@context" context
+                                   "values" ["?s" [{"@type" "@id" "@value" "ex:brian"}]]
+                                   "where" [{"@id" "?s"}]
+                                   "select" "?s"})))))
     (testing "where pattern"
       (testing "single var"
         (is (= [["Brian" "brian@example.org"]
