@@ -35,7 +35,7 @@
                                                   (assoc solution var matched))
                                                 solution)))))
         s-mch*     (where/assign-matched-component s-mch solution)]
-    (if-let [s (where/compute-sid db s-mch*)]
+    (if-let [s (where/compute-sid s-mch* db)]
       (-> db
           (where/resolve-flake-range fuel-tracker error-ch [s])
           (async/pipe matched-ch))

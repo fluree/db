@@ -62,6 +62,10 @@
 (defmethod pprint/simple-dispatch Connection [^Connection conn]
   (pr conn))
 
+(defn connection?
+  [x]
+  (instance? Connection x))
+
 (defn connect
   [{:keys [parallelism commit-catalog index-catalog cache serializer
            primary-publisher secondary-publishers remote-systems defaults]

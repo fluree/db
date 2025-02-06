@@ -65,7 +65,8 @@
    "urn:uuid"                                    21
    "urn:isbn:"                                   22
    "urn:issn:"                                   23
-   "_:"                                          24})
+   "_:"                                          24
+   f-idx-ns                                      25})
 
 
 (def default-namespace-codes
@@ -239,6 +240,10 @@
 (defn fluree-iri
   [nme]
   (str f-ns nme))
+
+(defn fluree-idx-iri
+  [nme]
+  (str f-idx-ns nme))
 
 (def blank-node-prefix
   "_:fdb")

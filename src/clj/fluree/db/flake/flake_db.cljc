@@ -23,7 +23,8 @@
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.fql :as fql]
             [fluree.db.flake.index.storage :as index-storage]
-            [fluree.db.vector.flat-rank :as flat-rank]
+            [fluree.db.virtual-graph.flat-rank :as flat-rank]
+            [fluree.db.virtual-graph.index-graph :as vg]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
@@ -300,7 +301,7 @@
           (assoc :commit commit-metadata)))))
 
 (defrecord FlakeDB [index-catalog commit-catalog alias branch commit t tt-id stats
-                    spot post opst tspo schema comparators staged novelty policy
+                    spot post opst tspo vg schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code
                     reindex-min-bytes reindex-max-bytes max-old-indexes]
   dbproto/IFlureeDb
@@ -327,7 +328,8 @@
   (-activate-alias [db alias']
     (cond
       (= alias alias')              db
-      (where/virtual-graph? alias') (flat-rank/index-graph db alias')))
+      (flat-rank/flatrank-alias? alias') (flat-rank/index-graph db alias')
+      (where/virtual-graph? alias') (vg/load-virtual-graph db alias')))
 
   (-aliases [_]
     [alias])
@@ -451,6 +453,7 @@
      :post            (index/empty-branch ledger-alias post-cmp)
      :opst            (index/empty-branch ledger-alias opst-cmp)
      :tspo            (index/empty-branch ledger-alias tspo-cmp)
+     :vg              {}
      :stats           {:flakes 0, :size 0, :indexed 0}
      :namespaces      iri/default-namespaces
      :namespace-codes iri/default-namespace-codes
@@ -495,6 +498,7 @@
                     :reindex-max-bytes reindex-max-bytes
                     :max-old-indexes max-old-indexes)))
 
+;; TODO - VG - need to reify vg from db-root!!
 (defn load
   ([ledger-alias commit-catalog index-catalog branch commit-pair]
    (load ledger-alias commit-catalog index-catalog branch commit-pair {}))

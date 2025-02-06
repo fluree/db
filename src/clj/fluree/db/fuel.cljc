@@ -28,13 +28,13 @@
 
         ([result next]
          (vswap! counter inc)
-         (let [tly   (tally trkr)
-               limit (:limit trkr)]
-           (when (< 0 limit tly)
-             (log/error "Fuel limit of" limit "exceeded:" tly)
-             (put! error-ch
-                   (ex-info "Fuel limit exceeded" {:used tly, :limit limit})))
-           (rf result next)))
+         (when-let [limit (:limit trkr)]
+           (let [tly (tally trkr)]
+             (when (< 0 limit tly)
+               (log/error "Fuel limit of" limit "exceeded:" tly)
+               (put! error-ch
+                     (ex-info "Fuel limit exceeded" {:used tly, :limit limit})))))
+         (rf result next))
 
         ([result]
          (rf result))))))

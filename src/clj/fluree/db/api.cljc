@@ -43,6 +43,13 @@
                (reject res)
                (resolve res))))))))
 
+(defn- validate-connection
+  "Throws exception if x is not a valid connection"
+  [x]
+  (when-not (connection/connection? x)
+    (throw (ex-info "Unable to create new ledger, connection is not valid. fluree/connect returns a promise, did you deref it?"
+                    {:status 400 :error :db/invalid-connection}))))
+
 (defn connect
   "Forms connection to ledger, enabling automatic pulls of new updates, event
   services, index service.
@@ -165,6 +172,7 @@
   - did - DId information to use, if storing blocks as verifiable credentials"
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
+   (validate-connection conn)
    (promise-wrap
     (do
       (log/info "Creating ledger" ledger-alias)
@@ -174,12 +182,14 @@
   "Returns a core.async channel with the connection-specific address of the
   given ledger-alias."
   [conn ledger-alias]
+  (validate-connection conn)
   (connection/primary-address conn ledger-alias))
 
 (defn load
   "Loads an existing ledger by its alias (which will be converted to a
   connection-specific address first)."
   [conn alias-or-address]
+  (validate-connection conn)
   (promise-wrap
     (connection/load-ledger conn alias-or-address)))
 
@@ -187,6 +197,7 @@
   "Returns a promise with true if the ledger alias or address exists, false
   otherwise."
   [conn ledger-alias-or-address]
+  (validate-connection conn)
   (promise-wrap
     (go
       (let [address (if (address? ledger-alias-or-address)
@@ -203,6 +214,7 @@
   is for the next 't' value. If a commit is for a past 't' value, noop.
   If commit is for a future 't' value, will drop in-memory ledger for reload upon next request."
   [conn commit-map]
+  (validate-connection conn)
   (promise-wrap
     (if (map? commit-map)
       (notify-ledger conn commit-map)
@@ -242,17 +254,20 @@
 (defn transact!
   ([conn txn] (transact! conn txn nil))
   ([conn txn opts]
+   (validate-connection conn)
    (promise-wrap
     (transact-api/transact! conn txn opts))))
 
 (defn credential-transact!
   ([conn txn] (credential-transact! conn txn nil))
   ([conn txn opts]
+   (validate-connection conn)
    (promise-wrap
     (transact-api/credential-transact! conn txn opts))))
 
 (defn create-with-txn
   [conn txn]
+  (validate-connection conn)
   (promise-wrap
     (transact-api/create-with-txn conn txn)))
 
@@ -359,11 +374,13 @@
   with the results."
   ([conn q] (query-connection conn q {}))
   ([conn q opts]
+   (validate-connection conn)
    (promise-wrap (query-api/query-connection conn q opts))))
 
 (defn credential-query-connection
   ([conn cred-query] (credential-query-connection conn cred-query {}))
   ([conn cred-query {:keys [format] :as opts}]
+   (validate-connection conn)
    (promise-wrap
     (go-try
       (let [{query :subject, identity :did} (if (= :sparql format)
