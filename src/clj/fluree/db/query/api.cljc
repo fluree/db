@@ -15,6 +15,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.policy :as perm]
+            [fluree.db.json-ld.policy.rules :as policy.rules]
             [fluree.db.connection :as connection]
             [fluree.db.reasoner :as reasoner]))
 
@@ -85,11 +86,14 @@
     (let [start        #?(:clj (System/nanoTime)
                           :cljs (util/current-time-millis))
           fuel-tracker (fuel/tracker max-fuel)]
-      (try* (let [result (<? (fql/query ds fuel-tracker query))]
-              {:status 200
-               :result result
-               :time   (util/response-time-formatted start)
-               :fuel   (fuel/tally fuel-tracker)})
+      (try* (let [result (<? (fql/query ds fuel-tracker query))
+                  policy-report (when-not (dataset? ds)
+                                  (policy.rules/enforcement-report ds))]
+              (cond-> {:status 200
+                       :result result
+                       :time   (util/response-time-formatted start)
+                       :fuel   (fuel/tally fuel-tracker)}
+                policy-report (assoc :policy policy-report)))
             (catch* e
                     (throw (ex-info "Error executing query"
                                     {:status (-> e ex-data :status)
