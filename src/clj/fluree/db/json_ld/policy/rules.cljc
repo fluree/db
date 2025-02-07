@@ -160,26 +160,33 @@
                         {:status 400
                          :error  :db/invalid-policy}))))))
 
+(defn enforcement-report
+  [db]
+  (some-> db :policy :trace (update-vals (fn [p-report] (update-vals p-report deref)))))
+
 (defn build-wrapper
   [db]
-  (fn [wrapper policy]
-    (cond
-      (seq (:on-property policy))
-      (add-property-restriction policy db wrapper)
+  (fn [wrapper {:keys [id] :as policy}]
+    (let [wrapper* (-> wrapper
+                       (assoc-in [:trace id :executed] (atom 0))
+                       (assoc-in [:trace id :allowed] (atom 0)))]
+      (cond
+        (seq (:on-property policy))
+        (add-property-restriction policy db wrapper*)
 
-      (or (:s-targets policy)
-          (:p-targets policy)
-          (:o-targets policy))
-      (add-default-restriction policy wrapper)
+        (or (:s-targets policy)
+            (:p-targets policy)
+            (:o-targets policy))
+        (add-default-restriction policy wrapper*)
 
-      (seq (:on-class policy))
-      (add-class-restriction policy db wrapper)
+        (seq (:on-class policy))
+        (add-class-restriction policy db wrapper*)
 
-      (:default? policy)
-      (add-default-restriction policy wrapper)
+        (:default? policy)
+        (add-default-restriction policy wrapper*)
 
-      :else
-      wrapper)))
+        :else
+        wrapper*))))
 
 (defn parse-policies
   [db policy-values policy-docs]
@@ -191,7 +198,7 @@
                             (-> (parse-policy db policy-values policy-doc)
                                 (async/pipe ch)))
                           policy-doc-ch)
-    (async/reduce (build-wrapper db) {} policy-ch)))
+    (async/reduce (build-wrapper db) {:trace {}} policy-ch)))
 
 (defn wrap-policy
   [db policy-rules policy-values]
