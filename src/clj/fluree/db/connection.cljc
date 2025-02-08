@@ -362,18 +362,12 @@
   [{:keys [commit-catalog index-catalog] :as conn}
    ledger-chan address]
   (go-try
-    (let [commit-addr  (<? (lookup-commit conn address))
-          _            (log/debug "Attempting to load from address:" address
-                                  "with commit address:" commit-addr)
-          _            (when-not commit-addr
+    (let [commit  (<? (lookup-commit conn address))
+          _            (if-not commit
                          (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
-                                         {:status 400 :error :db/invalid-commit-address})))
-          [commit _]   (<? (commit-storage/read-commit-jsonld commit-catalog commit-addr))
-          _            (when-not commit
-                         (throw (ex-info (str "Unable to load. Commit file for ledger: " address
-                                              " at location: " commit-addr " is not found.")
-                                         {:status 400 :error :db/invalid-db})))
-          _            (log/debug "load commit:" commit)
+                                         {:status 400 :error :db/invalid-db}))
+                         (log/debug "Attempting to load from address:" address
+                                    "with commit:" commit))
           ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
 

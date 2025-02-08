@@ -155,10 +155,9 @@
 
 (defn reify-schema
   [{:keys [namespace-codes v] :as root-map}]
-  (if (not= 1 v)
-    (update root-map :schema vocab/deserialize-schema namespace-codes)
-    ;; legacy, for now only v0
-    (update root-map :preds deserialize-preds)))
+  (if (or (nil? v) (= 0 v))
+    (update root-map :preds deserialize-preds) ;; legacy, for now only v0
+    (update root-map :schema vocab/deserialize-schema namespace-codes)))
 
 (defn read-db-root
   "Returns all data for a db index root of a given t."
