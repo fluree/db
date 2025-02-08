@@ -5,7 +5,8 @@
             [fluree.db.storage :as storage]
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -50,14 +51,21 @@
     (let [addr (<? (publishing-address nsv ledger-alias))]
       (boolean (<? (lookup nsv addr))))))
 
-(defn commit-address-from-record
+(defn commit-from-record
   [record branch]
   (let [branch-iri (if branch
                      (str (get record "@id") "(" branch ")")
                      (get record "defaultBranch"))]
     (->> (get record "branches")
          (some #(when (= (get % "@id") branch-iri)
-                  (get % "address"))))))
+                  (-> %
+                      (get "commit")
+                      (json-ld/expand)))))))
+
+(defn commit-address-from-record
+  [record branch]
+  (let [commit-data (commit-from-record record branch)]
+    (get commit-data "address")))
 
 (defn address-path
   [address]
