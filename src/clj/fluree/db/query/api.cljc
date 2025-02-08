@@ -130,6 +130,34 @@
     :fql (query-fql db query)
     :sparql (query-sparql db query)))
 
+(defn explain
+  [ds query override-opts]
+  (go-try
+    (let [{:keys [opts] :as query*} (-> query
+                                        syntax/coerce-query
+                                        (sanitize-query-options override-opts))
+
+          ds*          (if (dataset? ds)
+                         ds
+                         (<? (restrict-db ds query*)))
+          query**      (update query* :opts dissoc :meta :max-fuel ::track-fuel?)
+          start        #?(:clj (System/nanoTime)
+                          :cljs (util/current-time-millis))
+          fuel-tracker (fuel/tracker)]
+      (try* (let [result (<? (fql/query ds fuel-tracker query))]
+              {:status 200
+               :result result
+               :explain (-> @(:ranges fuel-tracker)
+                            (update-vals deref))
+               :time   (util/response-time-formatted start)
+               :fuel   (fuel/tally fuel-tracker)})
+            (catch* e
+                    (throw (ex-info "Error executing query"
+                                    {:status (-> e ex-data :status)
+                                     :time   (util/response-time-formatted start)
+                                     :fuel   (fuel/tally fuel-tracker)}
+                                    e)))))))
+
 (defn contextualize-ledger-400-error
   [info-str e]
   (let [e-data (ex-data e)]
