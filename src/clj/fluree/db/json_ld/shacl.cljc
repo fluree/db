@@ -1114,12 +1114,12 @@
                  :context  context
                  :shape-db shape-db
                  :data-db  data-db}]
-      (loop [[next-shape-sid node-shape-sids*] (<? (all-node-shape-ids shape-db))]
-        (if next-shape-sid
+      (loop [[shape-sid & r] (<? (all-node-shape-ids shape-db))]
+        (if shape-sid
           (let [shape (<? (build-shape shape-db shape-sid))]
             (when (not (get shape const/sh_deactivated))
               (doseq [s-flakes modified-subjects]
                 (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
                   (throw-shacl-violation context results))))
-            (recur node-shape-sids*))
+            (recur r))
           :valid)))))
