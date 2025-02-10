@@ -341,3 +341,122 @@
                        (:policy result)))
                 (is (= 4
                        (:fuel result)))))))))))
+
+(deftest policy-class-test
+  (let [conn   @(fluree/connect-memory)
+        ledger @(fluree/create conn "policy/target")
+        db0    (fluree/db ledger)
+
+        default-policy
+        {"@id"      "ex:defaultAllowView"
+         "@type"    ["f:AccessPolicy" "ex:UnclassPolicy"]
+         "f:action" {"@id" "f:view"}
+         "f:query"  {"@type"  "@json"
+                     "@value" {}}}
+
+        classification-policy
+        {"@id"             "ex:unclassRestriction"
+         "@type"           ["f:AccessPolicy" "ex:UnclassPolicy"]
+         "f:required"      true
+         "f:targetSubject" {"@type"  "@json"
+                            "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                      "where"    [{"@id" "?$target" "@type" "ex:Data"}]}}
+         "f:action"        [{"@id" "f:view"}, {"@id" "f:modify"}]
+         "f:query"         {"@type"  "@json"
+                            "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                      "where"    [{"@id" "?$this" "ex:classification" "?c"}
+                                                  ["filter", "(< ?c 1)"]]}}}
+
+        db1 @(fluree/stage db0 {"@context" {"ex" "http://example.org/ns/"
+                                            "f"  "https://ns.flur.ee/ledger#"}
+                                "insert"
+                                [{"@id"               "ex:data-0",
+                                  "@type"             "ex:Data",
+                                  "ex:classification" 0}
+                                 {"@id"               "ex:data-1",
+                                  "@type"             "ex:Data",
+                                  "ex:classification" 1}
+                                 {"@id"               "ex:data-2",
+                                  "@type"             "ex:Data",
+                                  "ex:classification" 2}
+                                 ;; note below is of class ex:Other, not ex:Data
+                                 {"@id"               "ex:other",
+                                  "@type"             "ex:Other",
+                                  "ex:classification" -99}
+                                 ;; a node that refers to items in ex:Data which, if
+                                 ;; pulled in a graph crawl, should still be restricted
+                                 {"@id"          "ex:referred",
+                                  "@type"        "ex:Referrer",
+                                  "ex:referData" [{"@id" "ex:data-0"}
+                                                  {"@id" "ex:data-1"}
+                                                  {"@id" "ex:data-2"}]}
+
+                                 classification-policy]})]
+    (testing "without default allow"
+      (is (= [{"@type" "ex:Data"
+               "ex:classification" 0
+               "@id" "ex:data-0"}]
+             @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"
+                                             "f" "https://ns.flur.ee/ledger#"},
+                                 "where" {"@id" "?s",
+                                          "@type" "ex:Data"},
+                                 "select" {"?s" ["*"]}
+                                 "opts" {"policyClass" "ex:UnclassPolicy"}}))
+          "only data with classification < 1 should be visible when using opts.policyClass")
+      (is (= []
+             @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"
+                                             "f" "https://ns.flur.ee/ledger#"},
+                                 "where" {"@id" "?s",
+                                          "@type" "ex:Other"},
+                                 "select" {"?s" ["*"]}
+                                 "opts" {"policyClass" "ex:UnclassPolicy"}}))
+          "ex:Other class should not be restricted"))
+    (testing "with default allow"
+      (let [db2 @(fluree/stage db1 {"@context" {"ex" "http://example.org/ns/"
+                                                "f"  "https://ns.flur.ee/ledger#"}
+                                    "insert"   [default-policy]})]
+        (testing "using opts.policyClass"
+          (is (= [{"@type"             "ex:Data"
+                   "ex:classification" 0
+                   "@id"               "ex:data-0"}]
+                 @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
+                                                 "f"  "https://ns.flur.ee/ledger#"},
+                                     "where"    {"@id"   "?s",
+                                                 "@type" "ex:Data"},
+                                     "select"   {"?s" ["*"]}
+                                     "opts"     {"policyClass" "ex:UnclassPolicy"}}))
+              "only data with classification < 1 should be visible when using opts.policyClass")
+          (is (= [{"@id"               "ex:other",
+                   "@type"             "ex:Other",
+                   "ex:classification" -99}]
+                 @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
+                                                 "f"  "https://ns.flur.ee/ledger#"},
+                                     "where"    {"@id"   "?s",
+                                                 "@type" "ex:Other"},
+                                     "select"   {"?s" ["*"]}
+                                     "opts"     {"policyClass" "ex:UnclassPolicy"}}))
+              "ex:Other class should not be restricted")
+
+          (is (= [{"@id"          "ex:referred"
+                   "@type"        "ex:Referrer"
+                   "ex:referData" [{"@id"               "ex:data-0"
+                                    "@type"             "ex:Data"
+                                    "ex:classification" 0}]}]
+                 @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
+                                                 "f"  "https://ns.flur.ee/ledger#"},
+                                     "where"    {"@id"   "?s",
+                                                 "@type" "ex:Referrer"},
+                                     "select"   {"?s" ["*" {"ex:referData" ["*"]}]}
+                                     "opts"     {"policyClass" "ex:UnclassPolicy"}}))
+              "in graph crawl ex:Data is still restricted"))
+        (testing "using opts.policy"
+          (is (= [{"@type"             "ex:Data"
+                   "ex:classification" 0
+                   "@id"               "ex:data-0"}]
+                 @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
+                                                 "f"  "https://ns.flur.ee/ledger#"},
+                                     "where"    {"@id"   "?s",
+                                                 "@type" "ex:Data"},
+                                     "select"   {"?s" ["*"]}
+                                     "opts"     {"policy" [default-policy classification-policy]}}))
+              "only data with classification < 1 should be visible when using opts.policy"))))))
