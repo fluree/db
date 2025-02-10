@@ -72,8 +72,8 @@
                   "f:required"   true
                   "f:exMessage"  "User can modify all but available on item."
                   "f:targetProperty" [{"@id" "a:title"}
-                                  {"@id" "a:description"}
-                                  {"@id" "a:rank"}]
+                                      {"@id" "a:description"}
+                                      {"@id" "a:rank"}]
                   "f:query"
                   {"@type"  "@json"
                    "@value" {"@context" {"a" "http://a.co/"}
@@ -86,8 +86,8 @@
 
 
                 "f:targetProperty" [{"@id" "a:title"}
-                                {"@id" "a:description"}
-                                {"@id" "a:rank"}]
+                                    {"@id" "a:description"}
+                                    {"@id" "a:rank"}]
                 "f:query"
                 {"@type"  "@json"
                  "@value" {"@context" {"a" "http://a.co/"}
@@ -349,7 +349,7 @@
 
         default-policy
         {"@id"      "ex:defaultAllowView"
-         "@type"    ["f:AccessPolicy" "ex:UnclassPolicy"]
+         "@type"    ["f:AccessPolicy" "ex:UnclassPolicy" "http://example.org/ns/DoublePropertyPolicy"]
          "f:action" {"@id" "f:view"}
          "f:query"  {"@type"  "@json"
                      "@value" {}}}
@@ -367,18 +367,31 @@
                                       "where"    [{"@id" "?$this" "ex:classification" "?c"}
                                                   ["filter", "(< ?c 1)"]]}}}
 
+        double-property-policy
+        {"@id"              "ex:doublePropertyRestriction"
+         "@type"            ["f:AccessPolicy" "http://example.org/ns/DoublePropertyPolicy"]
+         "f:required"       true
+         "f:targetProperty" [{"@id" "http://example.org/ns/secretProperty"} {"@id" "http://example.org/ns/secretPropertyTwo"}]
+         "f:action"         [{"@id" "f:view"}, {"@id" "f:modify"}]
+         "f:query"          {"@type"  "@json"
+                             "@value" {"where" [["filter" "(not= 1 1)"]]}}}
+
         db1 @(fluree/stage db0 {"@context" {"ex" "http://example.org/ns/"
                                             "f"  "https://ns.flur.ee/ledger#"}
                                 "insert"
                                 [{"@id"               "ex:data-0",
                                   "@type"             "ex:Data",
                                   "ex:classification" 0}
-                                 {"@id"               "ex:data-1",
-                                  "@type"             "ex:Data",
-                                  "ex:classification" 1}
-                                 {"@id"               "ex:data-2",
-                                  "@type"             "ex:Data",
-                                  "ex:classification" 2}
+                                 {"@id"                  "ex:data-1",
+                                  "@type"                "ex:Data",
+                                  "ex:classification"    1
+                                  "ex:secretProperty"    "secret 1"
+                                  "ex:secretPropertyTwo" "second secret 1"}
+                                 {"@id"                  "ex:data-2",
+                                  "@type"                "ex:Data",
+                                  "ex:classification"    2
+                                  "ex:secretProperty"    "secret 2"
+                                  "ex:secretPropertyTwo" "second secret 2"}
                                  ;; note below is of class ex:Other, not ex:Data
                                  {"@id"               "ex:other",
                                   "@type"             "ex:Other",
@@ -391,25 +404,25 @@
                                                   {"@id" "ex:data-1"}
                                                   {"@id" "ex:data-2"}]}
 
-                                 classification-policy]})]
+                                 classification-policy double-property-policy]})]
     (testing "without default allow"
-      (is (= [{"@type" "ex:Data"
-               "ex:classification" 0
-               "@id" "ex:data-0"}]
-             @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"
-                                             "f" "https://ns.flur.ee/ledger#"},
-                                 "where" {"@id" "?s",
-                                          "@type" "ex:Data"},
-                                 "select" {"?s" ["*"]}
-                                 "opts" {"policyClass" "ex:UnclassPolicy"}}))
+        (is (= [{"@type"             "ex:Data"
+                 "ex:classification" 0
+                 "@id"               "ex:data-0"}]
+               @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"
+                                               "f"  "https://ns.flur.ee/ledger#"},
+                                   "where"    {"@id"   "?s",
+                                               "@type" "ex:Data"},
+                                   "select"   {"?s" ["*"]}
+                                   "opts"     {"policyClass" "ex:UnclassPolicy"}}))
           "only data with classification < 1 should be visible when using opts.policyClass")
       (is (= []
              @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"
-                                             "f" "https://ns.flur.ee/ledger#"},
-                                 "where" {"@id" "?s",
-                                          "@type" "ex:Other"},
-                                 "select" {"?s" ["*"]}
-                                 "opts" {"policyClass" "ex:UnclassPolicy"}}))
+                                             "f"  "https://ns.flur.ee/ledger#"},
+                                 "where"    {"@id"   "?s",
+                                             "@type" "ex:Other"},
+                                 "select"   {"?s" ["*"]}
+                                 "opts"     {"policyClass" "ex:UnclassPolicy"}}))
           "ex:Other class should not be restricted"))
     (testing "with default allow"
       (let [db2 @(fluree/stage db1 {"@context" {"ex" "http://example.org/ns/"
@@ -417,14 +430,14 @@
                                     "insert"   [default-policy]})]
         (testing "using opts.policyClass"
           (is (= [{"@type"             "ex:Data"
-                   "ex:classification" 0
-                   "@id"               "ex:data-0"}]
-                 @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
-                                                 "f"  "https://ns.flur.ee/ledger#"},
-                                     "where"    {"@id"   "?s",
-                                                 "@type" "ex:Data"},
-                                     "select"   {"?s" ["*"]}
-                                     "opts"     {"policyClass" "ex:UnclassPolicy"}}))
+                     "ex:classification" 0
+                     "@id"               "ex:data-0"}]
+                   @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
+                                                   "f"  "https://ns.flur.ee/ledger#"},
+                                       "where"    {"@id"   "?s",
+                                                   "@type" "ex:Data"},
+                                       "select"   {"?s" ["*"]}
+                                       "opts"     {"policyClass" "ex:UnclassPolicy"}}))
               "only data with classification < 1 should be visible when using opts.policyClass")
           (is (= [{"@id"               "ex:other",
                    "@type"             "ex:Other",
@@ -448,15 +461,30 @@
                                                  "@type" "ex:Referrer"},
                                      "select"   {"?s" ["*" {"ex:referData" ["*"]}]}
                                      "opts"     {"policyClass" "ex:UnclassPolicy"}}))
-              "in graph crawl ex:Data is still restricted"))
-        (testing "using opts.policy"
-          (is (= [{"@type"             "ex:Data"
-                   "ex:classification" 0
-                   "@id"               "ex:data-0"}]
+              "in graph crawl ex:Data is still restricted")
+          (is (= [{"@id"               "ex:data-0"
+                   "@type"             "ex:Data"
+                   "ex:classification" 0}
+                  {"@id"               "ex:data-1"
+                   "@type"             "ex:Data"
+                   "ex:classification" 1}
+                  {"@id"               "ex:data-2"
+                   "@type"             "ex:Data"
+                   "ex:classification" 2}]
                  @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
                                                  "f"  "https://ns.flur.ee/ledger#"},
-                                     "where"    {"@id"   "?s",
-                                                 "@type" "ex:Data"},
+                                     "where"    {"@id"   "?s" "@type" "ex:Data"}
                                      "select"   {"?s" ["*"]}
-                                     "opts"     {"policy" [default-policy classification-policy]}}))
+                                     "opts"     {"policyClass" "ex:DoublePropertyPolicy"}}))
+              "all properties besides secretProperty and secretPropertyTwo should be visible when using opts.policyClass"))
+        (testing "using opts.policy"
+            (is (= [{"@type"             "ex:Data"
+                     "ex:classification" 0
+                     "@id"               "ex:data-0"}]
+                   @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
+                                                   "f"  "https://ns.flur.ee/ledger#"},
+                                       "where"    {"@id"   "?s",
+                                                   "@type" "ex:Data"},
+                                       "select"   {"?s" ["*"]}
+                                       "opts"     {"policy" [default-policy classification-policy]}}))
               "only data with classification < 1 should be visible when using opts.policy"))))))
