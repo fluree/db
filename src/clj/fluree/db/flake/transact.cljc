@@ -147,9 +147,9 @@
        :context   context})))
 
 (defn validate-db-update
-  [{:keys [db-after db-before mods context] :as staged-map}]
+  [{:keys [db-after db-before add context] :as staged-map}]
   (go-try
-    (<? (shacl/validate! db-before (policy/root db-after) (vals mods) context))
+    (<? (shacl/validate! db-before (policy/root db-after) add context))
     (let [allowed-db (<? (policy.modify/allowed? staged-map))]
       allowed-db)))
 

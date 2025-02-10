@@ -1100,6 +1100,18 @@
           (json-ld/compact context))
       v)))
 
+(defn modified-subjects
+  "Returns a seq of s-flakes for each modified subject."
+  [data-db flakes]
+  (go-try
+    (loop [[s-flakes & r] (partition-by flake/s flakes)
+           all-s-flakes []]
+      (if s-flakes
+        (let [sid        (some-> s-flakes first flake/s)
+              sid-flakes (set (<? (query-range/index-range data-db :spot = [sid])))]
+          (recur r (conj all-s-flakes sid-flakes)))
+        all-s-flakes))))
+
 (defn validate!
   "Will throw an exception if any of the modified subjects fails to conform to a shape that targets it.
 
@@ -1108,9 +1120,10 @@
   the shapes in the shape-db.
 
   `modified-subjects` is a sequence of s-flakes of modified subjects."
-  [shape-db data-db modified-subjects context]
+  [shape-db data-db new-flakes context]
   (go-try
-    (let [v-ctx {:display  (make-display data-db context)
+    (let [modified-subjects (<? (modified-subjects data-db new-flakes))
+          v-ctx {:display  (make-display data-db context)
                  :context  context
                  :shape-db shape-db
                  :data-db  data-db}]
