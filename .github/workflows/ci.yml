@@ -90,7 +90,33 @@ jobs:
       - name: Run tests
         run: docker run fluree/db make cljtest eastwood nodejs-test
 
-  notifications:
+  cljfmt-check:
+    name: cljfmt check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: 'latest'
+          cljfmt: 'latest'
+      - run: make cljfmt-check
+
+  clj-kondo-lint:
+    name: clj-kondo lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: 'latest'
+          clj-kondo: 'latest'
+      - run: make clj-kondo-lint-ci
+
+notifications:
     name: send notifications
     if: always()
     needs: [test-browser, test-cljs, test-other]
