@@ -116,7 +116,7 @@ jobs:
           clj-kondo: 'latest'
       - run: make clj-kondo-lint-ci
 
-notifications:
+  notifications:
     name: send notifications
     if: always()
     needs: [test-browser, test-cljs, test-other]
