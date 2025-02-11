@@ -1,14 +1,14 @@
 (ns fluree.db.query.range
-  (:require [fluree.db.flake.index :as index]
-            [fluree.db.util.schema :as schema-util]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.flake :as flake]
-            #?(:clj  [clojure.core.async :refer [chan go >!] :as async]
+  (:require #?(:clj  [clojure.core.async :refer [chan go >!] :as async]
                :cljs [cljs.core.async :refer [chan  >!] :refer-macros [go] :as async])
+            [fluree.db.flake :as flake]
+            [fluree.db.flake.index :as index]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy.query :as policy]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.json-ld.iri :as iri]))
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -20,7 +20,6 @@
         (throw (ex-info (str "Invalid predicate, does not exist: " pred)
                         {:status 400, :error :db/invalid-predicate})))
     pred))
-
 
 (defn match->flake-parts
   "Takes a match from index-range, and based on the index
@@ -34,14 +33,12 @@
       :opst [p3 (coerce-predicate db p2) p1 p4 op m]
       :tspo [p2 (coerce-predicate db p3) p4 p1 op m])))
 
-
 (def ^{:private true :const true} subject-min-match [flake/min-s])
 (def ^{:private true :const true} subject-max-match [flake/max-s])
 (def ^{:private true :const true} pred-min-match [flake/min-p])
 (def ^{:private true :const true} pred-max-match [flake/max-p])
 (def ^{:private true :const true} txn-max-match [flake/min-t])
 (def ^{:private true :const true} txn-min-match [flake/max-t])
-
 
 (defn- min-match
   "Smallest index flake part match by index"
@@ -51,7 +48,6 @@
     :post pred-min-match
     :opst subject-min-match
     :tspo txn-min-match))
-
 
 (defn- max-match
   "Biggest index flake part match by index"
@@ -116,7 +112,7 @@
             flake
             ::unauthorized)
           (catch* e
-                  (>! error-ch (authorize-flake-exception e db flake))))))
+            (>! error-ch (authorize-flake-exception e db flake))))))
 
 (defn authorize-flakes
   "Authorize each flake in the supplied `flakes` collection asynchronously,
@@ -305,12 +301,12 @@
              range-ch    (index-range* db
                                        error-ch
                                        (assoc opts
-                                         :idx idx
-                                         :to-t t
-                                         :start-test start-test
-                                         :start-flake start-flake
-                                         :end-test end-test
-                                         :end-flake end-flake))]
+                                              :idx idx
+                                              :to-t t
+                                              :start-test start-test
+                                              :start-flake start-flake
+                                              :end-test end-test
+                                              :end-flake end-flake))]
          (async/alt!
            error-ch ([e]
                      (throw e))

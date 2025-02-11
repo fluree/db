@@ -5,14 +5,14 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph.bm25.search :as bm25.search]
             [fluree.db.virtual-graph.bm25.stemmer :as stm]
             [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
             [fluree.db.virtual-graph.bm25.update :as bm25.update]
-            [fluree.db.virtual-graph.bm25.search :as bm25.search]
             [fluree.db.virtual-graph.parse :as vg-parse]
-            [fluree.db.virtual-graph.proto :as vgproto]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log])
+            [fluree.db.virtual-graph.proto :as vgproto])
   (:refer-clojure :exclude [assert]))
 
 (set! *warn-on-reflection* true)
@@ -129,7 +129,7 @@
              (vg-parse/process-results bm25 solution search-params true)
              (async/onto-chan! out-ch)))
       (catch* e
-              (log/error e "Error ranking vectors")
+        (log/error e "Error ranking vectors")
         (>! error-ch e)))))
 
 (defn bm25-upsert*
@@ -150,16 +150,16 @@
         ;; reset index state atom once index is complete, remove pending-ch
         (swap! new-index-state (fn [idx-state]
                                  (assoc idx-state :index new-index
-                                                  :pending-ch nil)))
+                                        :pending-ch nil)))
         (>! new-pending-ch new-index)))
 
     ;; new bm25 record returned to get attached to db
     (assoc bm25 :t (:t db)
-                :namespaces (:namespaces db)
-                :namespace-codes (:namespace-codes db)
+           :namespaces (:namespaces db)
+           :namespace-codes (:namespace-codes db)
                 ;; unlikely, but in case db's alias has been changed keep in sync
-                :db-alias (:alias db)
-                :index-state new-index-state)))
+           :db-alias (:alias db)
+           :index-state new-index-state)))
 
 (defn property-dependencies
   [vg]
@@ -225,10 +225,10 @@
     (bm25-upsert* bm25 db nil items-ch)))
 
 (defrecord BM25-VirtualGraph
-  [stemmer stopwords k1 b index-state initialized genesis-t t
-   alias query query-parsed property-deps
+           [stemmer stopwords k1 b index-state initialized genesis-t t
+            alias query query-parsed property-deps
    ;; following taken from db - needs to be kept up to date with new db updates
-   db-alias namespaces namespace-codes]
+            db-alias namespaces namespace-codes]
 
   iri/IRICodec
   (encode-iri [_ iri]

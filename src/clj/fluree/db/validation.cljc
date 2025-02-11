@@ -1,11 +1,11 @@
 (ns fluree.db.validation
-  (:require [fluree.db.constants :as const]
+  (:require [clojure.string :as str]
+            [clojure.walk :as walk]
+            [fluree.db.constants :as const]
             [fluree.db.util.docs :as docs]
             [malli.core :as m]
             [malli.error :as me]
-            [malli.util :as mu]
-            [clojure.string :as str]
-            [clojure.walk :as walk]))
+            [malli.util :as mu]))
 
 (defn decode-json-ld-keyword
   [v]
@@ -180,14 +180,14 @@
         provided-value    (or value full-value)]
     [top-level-message root-message direct-message
      (some->> provided-value
-             pr-str
-             (str "Provided: "))
+              pr-str
+              (str "Provided: "))
      docs-pointer-msg]))
 
 (defn top-level-fn-error
   [errors]
   (first (filter #(and (empty? (:in %))
-                    (= :fn (m/type (:schema %)))) errors)))
+                       (= :fn (m/type (:schema %)))) errors)))
 
 (def default-error-overrides
   {:errors

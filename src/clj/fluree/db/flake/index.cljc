@@ -1,13 +1,13 @@
 (ns fluree.db.flake.index
   (:refer-clojure :exclude [resolve])
-  (:require [fluree.db.constants :as const]
-            [fluree.db.flake :as flake]
-            #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
+  (:require #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
                :cljs [cljs.core.async :refer [chan go <! >!] :as async])
+            [fluree.db.cache :as cache]
+            [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.cache :as cache]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 (def comparators
   "Map of default index comparators for the four index types"
@@ -285,10 +285,10 @@
     (if (branch? node)
       (resolve node-resolver node)
       (cache/lru-lookup
-        cache
-        [::t-range id tempid tt-id to-t]
-        (fn [_]
-          (resolve-t-range node-resolver node novelty-t novelty to-t))))))
+       cache
+       [::t-range id tempid tt-id to-t]
+       (fn [_]
+         (resolve-t-range node-resolver node novelty-t novelty to-t))))))
 
 (defn index-catalog->t-range-resolver
   [{:keys [cache] :as idx-store} novelty-t novelty to-t]
@@ -308,17 +308,17 @@
     (if (branch? node)
       (resolve node-resolver node)
       (cache/lru-lookup
-        lru-cache-atom
-        [::history-t-range id tempid tt-id from-t to-t]
-        (fn [_]
-          (go-try
-            (let [resolved (<? (resolve node-resolver node))
-                  flakes   (history-t-range resolved novelty-t novelty from-t to-t)]
-              (-> resolved
-                  (dissoc :t)
-                  (assoc :from-t from-t
-                         :to-t   to-t
-                         :flakes  flakes)))))))))
+       lru-cache-atom
+       [::history-t-range id tempid tt-id from-t to-t]
+       (fn [_]
+         (go-try
+           (let [resolved (<? (resolve node-resolver node))
+                 flakes   (history-t-range resolved novelty-t novelty from-t to-t)]
+             (-> resolved
+                 (dissoc :t)
+                 (assoc :from-t from-t
+                        :to-t   to-t
+                        :flakes  flakes)))))))))
 
 (defn- mark-expanded
   [node]

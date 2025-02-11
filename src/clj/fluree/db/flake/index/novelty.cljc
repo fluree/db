@@ -1,14 +1,14 @@
 (ns fluree.db.flake.index.novelty
-  (:require [fluree.db.flake.index :as index]
+  (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.flake.index :as index]
             [fluree.db.flake.index.storage :as storage]
             [fluree.db.indexer.garbage :as garbage]
-            [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [clojure.core.async :as async :refer [<! >! go go-loop]]
+            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.commit-data :as commit-data]))
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -93,7 +93,7 @@
   (into [maybe-leftmost]
         (map (fn [non-left-node]
                (assoc non-left-node
-                 :leftmost? false)))
+                      :leftmost? false)))
         not-leftmost))
 
 (defn rebalance-children
@@ -268,11 +268,11 @@
   Takes original node, and map of temp left ids to final leaf ids for updating children."
   [temp->final-ids {:keys [children] :as branch-node}]
   (let [children* (reduce-kv
-                    (fn [acc k v]
-                      (if-let [updated-id (get temp->final-ids (:id v))]
-                        (assoc acc k (assoc v :id updated-id))
-                        acc))
-                    children children)]
+                   (fn [acc k v]
+                     (if-let [updated-id (get temp->final-ids (:id v))]
+                       (assoc acc k (assoc v :id updated-id))
+                       acc))
+                   children children)]
     (assoc branch-node :children children*)))
 
 (defn update-node-id
@@ -314,10 +314,9 @@
                 (update-node-id node* write-response))))
 
         (catch* e
-                (log/error e
-                           "Error writing novel index node:" display-node)
-                (async/>! error-ch e))))))
-
+          (log/error e
+                     "Error writing novel index node:" display-node)
+          (async/>! error-ch e))))))
 
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
@@ -355,14 +354,12 @@
      ::novelty      index-novelty
      ::t            t}))
 
-
 (defn tally
   [db-status {:keys [idx root garbage] :as _tally-data}]
   (-> db-status
       (update :db assoc idx root)
       (update :indexes conj idx)
       (update :garbage into garbage)))
-
 
 (defn refresh-all
   ([db error-ch]
@@ -422,6 +419,6 @@
                    (log/info "Index refresh complete:" end-stats)
                    ;; kick off automatic garbage collection
                    (async/thread
-                    (garbage/clean-garbage indexed-db max-old-indexes))
+                     (garbage/clean-garbage indexed-db max-old-indexes))
                    indexed-db)))))
         db))))

@@ -1,8 +1,8 @@
 (ns fluree.db.query.sql-test
   (:require
-    #?@(:clj  [[clojure.test :refer :all]]
-        :cljs [[cljs.test :refer-macros [deftest is testing]]])
-    [fluree.db.query.sql :refer [parse]]))
+   #?@(:clj  [[clojure.test :refer :all]]
+       :cljs [[cljs.test :refer-macros [deftest is testing]]])
+   [fluree.db.query.sql :refer [parse]]))
 
 (deftest sql-query-parser-test
   (testing "parse"
@@ -214,7 +214,7 @@
                     subject (parse query)]
 
                 (is (= ["(count (distinct ?personMiddleName))"]
-                     (:select subject))
+                       (:select subject))
                     "correctly constructs the select clause")
 
                 (is (= [["?person" "type" "person"]

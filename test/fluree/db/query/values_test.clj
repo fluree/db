@@ -33,7 +33,7 @@
         (testing "single var"
           (is (= [["foo1"] ["foo2"] ["foo3"]]
                  @(fluree/query db1 {"select" ["?foo"]
-                                     "values" ["?foo" ["foo1" "foo2" "foo3" ]]}))
+                                     "values" ["?foo" ["foo1" "foo2" "foo3"]]}))
               "syntactic form is parsed correctly")))
       (testing "iri values"
         (is (= [["Brian" "brian@example.org"]

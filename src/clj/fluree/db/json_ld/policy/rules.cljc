@@ -5,8 +5,8 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.reasoner.util :refer [parse-rules-graph]]
-            [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -34,11 +34,11 @@
   [restriction policy]
   (cond-> policy
 
-          (view-restriction? restriction)
-          (update-in [:view :default] util/conjv restriction)
+    (view-restriction? restriction)
+    (update-in [:view :default] util/conjv restriction)
 
-          (modify-restriction? restriction)
-          (update-in [:modify :default] util/conjv restriction)))
+    (modify-restriction? restriction)
+    (update-in [:modify :default] util/conjv restriction)))
 
 (defn add-class-restriction
   [restriction-map db policy-map]
@@ -48,11 +48,11 @@
        (let [restriction-map* (assoc restriction-map :cid cid)]
          (cond-> policy
 
-                 (view-restriction? restriction-map*)
-                 (update-in [:view :class cid] util/conjv restriction-map*)
+           (view-restriction? restriction-map*)
+           (update-in [:view :class cid] util/conjv restriction-map*)
 
-                 (modify-restriction? restriction-map*)
-                 (update-in [:modify :class cid] util/conjv restriction-map*))))
+           (modify-restriction? restriction-map*)
+           (update-in [:modify :class cid] util/conjv restriction-map*))))
      policy-map
      cids)))
 
@@ -63,14 +63,14 @@
      (fn [policy property]
        (let [pid              (if (iri/sid? property) property (iri/encode-iri db property))
              restriction-map* (assoc restriction-map :pid pid
-                                                     :cids cids)]
+                                     :cids cids)]
          (cond-> policy
 
-                 (view-restriction? restriction-map*)
-                 (update-in [:view :property pid] util/conjv restriction-map*)
+           (view-restriction? restriction-map*)
+           (update-in [:view :property pid] util/conjv restriction-map*)
 
-                 (modify-restriction? restriction-map*)
-                 (update-in [:modify :property pid] util/conjv restriction-map*))))
+           (modify-restriction? restriction-map*)
+           (update-in [:modify :property pid] util/conjv restriction-map*))))
      policy-map
      (:on-property restriction-map))))
 

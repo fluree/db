@@ -1,17 +1,17 @@
 (ns fluree.db.json-ld.shacl
-  (:require [fluree.db.util.async :refer [<? go-try]]
-            #?(:clj  [fluree.db.util.clj-const :as uc]
+  (:require #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc])
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.query.range :as query-range]
+            [clojure.core.async :as async]
+            [clojure.set :as set]
+            [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.json-ld :as json-ld]
-            [clojure.core.async :as async]
-            [clojure.string :as str]
-            [clojure.set :as set])
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.util.regex Pattern))))
 
 (comment
@@ -35,8 +35,7 @@
 
     {#fluree/SID [1 "id"] #fluree/SID [24 "fdb-4"]
      #fluree/SID [5 "datatype"] [#fluree/SID [2 "string"]]
-     #fluree/SID [5 "path"] [#fluree/SID [17 "email"]]}]}
-  ,)
+     #fluree/SID [5 "path"] [#fluree/SID [17 "email"]]}]})
 
 (def numeric-types
   #{const/$xsd:int
@@ -329,11 +328,11 @@
                 (implicit-target? shape s-flakes))
             [(sid-node sid)]
 
-             (target-objects-of-target? shape)
-             (<? (target-objects-of-focus-nodes data-db shape s-flakes))
+            (target-objects-of-target? shape)
+            (<? (target-objects-of-focus-nodes data-db shape s-flakes))
 
-             :else ;; no target declaration, no focus nodes
-             []))))
+            :else ;; no target declaration, no focus nodes
+            []))))
 
 (defn validate-node-shape
   "Validate the focus nodes that are targeted by the target declaration, or the provided nodes."
@@ -394,8 +393,8 @@
         (if o
           (let [classes (if (iri/sid? o)
                           (->>
-                            (<? (query-range/index-range data-db :spot = [o const/$rdf:type]))
-                            (into #{} (map flake/o)))
+                           (<? (query-range/index-range data-db :spot = [o const/$rdf:type]))
+                           (into #{} (map flake/o)))
                           #{})
                 missing-classes (set/difference expected-classes classes)]
             (recur r (into results
@@ -773,10 +772,10 @@
             (recur r (conj results (-> result
                                        (dissoc :expect)
                                        (assoc
-                                         :value (display (first focus-node))
-                                         :message (or (:message result)
-                                                      (str (display (first focus-node)) " conforms to shape "
-                                                           (display (get not-shape const/$id))))))))))
+                                        :value (display (first focus-node))
+                                        :message (or (:message result)
+                                                     (str (display (first focus-node)) " conforms to shape "
+                                                          (display (get not-shape const/$id))))))))))
         (not-empty results)))))
 
 (defmethod validate-constraint const/sh_and
@@ -953,21 +952,20 @@
                                  (recur r (conj non-disjoint-conformers* conforming-sid))))
                              (into non-disjoint-conformers non-disjoint-conformers*))))
 
-
                   (if (not-empty non-disjoint-conformers)
                     ;; each non-disjoint sid produces a validation result
                     (mapv
-                      (fn [non-disjoint-sid]
-                        (assoc result
-                               :value (display non-disjoint-sid)
-                               :message (or (:message result)
-                                            (str "value " (display non-disjoint-sid)
-                                                 " conformed to a sibling qualified value shape "
-                                                 (mapv #(display (get % const/$id)) sibling-q-shapes)
-                                                 " in violation of the "
-                                                 (display const/sh_qualifiedValueShapesDisjoint) " constraint"))))
+                     (fn [non-disjoint-sid]
+                       (assoc result
+                              :value (display non-disjoint-sid)
+                              :message (or (:message result)
+                                           (str "value " (display non-disjoint-sid)
+                                                " conformed to a sibling qualified value shape "
+                                                (mapv #(display (get % const/$id)) sibling-q-shapes)
+                                                " in violation of the "
+                                                (display const/sh_qualifiedValueShapesDisjoint) " constraint"))))
 
-                      non-disjoint-conformers)
+                     non-disjoint-conformers)
 
                     ;; no non-disjoint conformers, validate count constraints
                     (cond (and q-min-count (< (count conforming) q-min-count))

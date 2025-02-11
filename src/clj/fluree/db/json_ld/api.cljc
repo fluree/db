@@ -1,20 +1,20 @@
 (ns fluree.db.json-ld.api
   {:deprecated "3.0"
    :superseded-by "fluree.db"}
-  (:require [fluree.json-ld :as json-ld]
-            [fluree.db.json-ld.iri :as iri]
-            [clojure.core.async :as async :refer [go <!]]
+  (:require [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.transact :as transact-api]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.ledger :as ledger]
-            [fluree.db.util.log :as log]
-            [fluree.db.query.api :as query-api]
-            [fluree.db.query.range :as query-range]
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.json-ld.credential :as cred]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.json-ld.policy :as policy]
+            [fluree.db.ledger :as ledger]
+            [fluree.db.query.api :as query-api]
+            [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
-            [fluree.db.json-ld.policy :as policy])
+            [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -36,12 +36,12 @@
        p)
      :cljs
      (js/Promise.
-       (fn [resolve reject]
-         (go
-           (let [res (<! port)]
-             (if (util/exception? res)
-               (reject res)
-               (resolve res))))))))
+      (fn [resolve reject]
+        (go
+          (let [res (<! port)]
+            (if (util/exception? res)
+              (reject res)
+              (resolve res))))))))
 
 ;; ledger operations
 
@@ -150,7 +150,7 @@
   [conn alias-or-address]
   (log/warn "DEPRECATED function `load` superseded by `fluree.db.api/load`")
   (promise-wrap
-    (connection/load-ledger conn alias-or-address)))
+   (connection/load-ledger conn alias-or-address)))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/exists?"}
@@ -160,12 +160,12 @@
   [conn ledger-alias-or-address]
   (log/warn "DEPRECATED function `exists?` superseded by `fluree.db.api/exists?`")
   (promise-wrap
-    (go
-      (let [address (if (address? ledger-alias-or-address)
-                      ledger-alias-or-address
-                      (<! (alias->address conn ledger-alias-or-address)))]
-        (log/debug "exists? - ledger address:" address)
-        (<! (connection/ledger-exists? conn address))))))
+   (go
+     (let [address (if (address? ledger-alias-or-address)
+                     ledger-alias-or-address
+                     (<! (alias->address conn ledger-alias-or-address)))]
+       (log/debug "exists? - ledger address:" address)
+       (<! (connection/ledger-exists? conn address))))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/notify"}
@@ -179,19 +179,17 @@
   [conn commit-map]
   (log/warn "DEPRECATED function `notify` superseded by `fluree.db.api/notify`")
   (promise-wrap
-    (if (map? commit-map)
-      (notify-ledger conn commit-map)
-      (go
-        (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
-                 {:status 400 :error :db/invalid-commit-map})))))
-
+   (if (map? commit-map)
+     (notify-ledger conn commit-map)
+     (go
+       (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
+                {:status 400 :error :db/invalid-commit-map})))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/index"}
   index
   "Performs indexing operation on the specified ledger"
   [ledger])
-
 
 ;; MAYBE CHALLENGE?
 (defn ^{:deprecated    "3.0"
@@ -200,20 +198,17 @@
   "Validates a ledger, checks block integrity along with signatures."
   [])
 
-
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/pull"}
   pull
   "Checks name service for ledger and pulls latest version locally."
   [])
 
-
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/combine"}
   combine
   "Combines multiple ledgers into a new, read-only ledger."
   [])
-
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/stage"}
@@ -224,7 +219,6 @@
    (log/warn "DEPRECATED function `stage` superseded by `fluree.db.api/stage`")
    (let [result-ch (transact-api/stage db json-ld opts)]
      (promise-wrap result-ch))))
-
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/commit!"}
@@ -237,11 +231,11 @@
   distributed rules."
   ([ledger db]
    (promise-wrap
-     (connection/commit! ledger db)))
+    (connection/commit! ledger db)))
   ([ledger db opts]
    (log/warn "DEPRECATED function `commit!` superseded by `fluree.db.api/commit!`")
    (promise-wrap
-     (connection/commit! ledger db opts))))
+    (connection/commit! ledger db opts))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/transact!"}
@@ -249,7 +243,7 @@
   [conn txn]
   (log/warn "DEPRECATED function `transact!` superseded by `fluree.db.api/transact!`")
   (promise-wrap
-    (transact-api/transact! conn txn)))
+   (transact-api/transact! conn txn)))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/create-with-txn"}
@@ -257,7 +251,7 @@
   [conn txn]
   (log/warn "DEPRECATED function `create-with-txn` superseded by `fluree.db.api/create-with-txn`")
   (promise-wrap
-    (transact-api/create-with-txn conn txn)))
+   (transact-api/create-with-txn conn txn)))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/status"}
@@ -268,7 +262,6 @@
    (log/warn "DEPRECATED function `status` superseded by `fluree.db.api/status`")
    (ledger/status ledger branch)))
 
-
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/push"}
   push
@@ -276,15 +269,11 @@
   Depending on consensus requirements for a Fluree Network, will accept or reject push as newest update."
   [])
 
-
-
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/squash"}
   squash
   "Squashes multiple unpublished commits into a single unpublished commit"
   [])
-
-
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/merge"}
@@ -292,14 +281,11 @@
   "Merges changes from one branch into another branch."
   [])
 
-
-
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/branch"}
   branch
   "Creates a new branch of a given ledger"
   [])
-
 
 ;; db operations
 
@@ -396,19 +382,19 @@
    (promise-wrap
     (go-try
       (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
-       (log/debug "Credential query with identity: " identity " and query: " query)
-       (cond
-         (and query identity)
-         (let [policy-db (<? (policy/wrap-identity-policy ds identity values-map))]
-           (<? (query-api/query policy-db query opts)))
+        (log/debug "Credential query with identity: " identity " and query: " query)
+        (cond
+          (and query identity)
+          (let [policy-db (<? (policy/wrap-identity-policy ds identity values-map))]
+            (<? (query-api/query policy-db query opts)))
 
-         identity
-         (throw (ex-info "Query not present in credential"
-                         {:status 400 :error :db/invalid-credential}))
+          identity
+          (throw (ex-info "Query not present in credential"
+                          {:status 400 :error :db/invalid-credential}))
 
-         :else
-         (throw (ex-info "Invalid credential"
-                         {:status 400 :error :db/invalid-credential}))))))))
+          :else
+          (throw (ex-info "Invalid credential"
+                          {:status 400 :error :db/invalid-credential}))))))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/query-connection"}
@@ -433,10 +419,10 @@
   ([ledger query {:keys [policy identity values-map] :as _opts}]
    (log/warn "DEPRECATED function `history` superseded by `fluree.db.api/history`")
    (promise-wrap
-     (let [latest-db (ledger/current-db ledger)
-           policy-db (if identity
-                       (<? (policy/wrap-identity-policy latest-db identity values-map))
-                       (<? (policy/wrap-policy latest-db policy values-map)))]
+    (let [latest-db (ledger/current-db ledger)
+          policy-db (if identity
+                      (<? (policy/wrap-identity-policy latest-db identity values-map))
+                      (<? (policy/wrap-policy latest-db policy values-map)))]
       (query-api/history policy-db query)))))
 
 (defn ^{:deprecated    "3.0"
@@ -455,19 +441,19 @@
     (go-try
       (let [latest-db                       (ledger/current-db ledger)
             {query :subject, identity :did} (<? (cred/verify cred-query))]
-       (log/debug "Credential history query with identity: " identity " and query: " query)
-       (cond
-         (and query identity)
-         (let [policy-db (<? (policy/wrap-identity-policy latest-db identity values-map))]
-           (<? (query-api/history policy-db query)))
+        (log/debug "Credential history query with identity: " identity " and query: " query)
+        (cond
+          (and query identity)
+          (let [policy-db (<? (policy/wrap-identity-policy latest-db identity values-map))]
+            (<? (query-api/history policy-db query)))
 
-         identity
-         (throw (ex-info "Query not present in credential"
-                         {:status 400 :error :db/invalid-credential}))
+          identity
+          (throw (ex-info "Query not present in credential"
+                          {:status 400 :error :db/invalid-credential}))
 
-         :else
-         (throw (ex-info "Invalid credential"
-                         {:status 400 :error :db/invalid-credential}))))))))
+          :else
+          (throw (ex-info "Invalid credential"
+                          {:status 400 :error :db/invalid-credential}))))))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/range"}
@@ -477,11 +463,11 @@
   ;; TODO - assert index is valid index type
   ([db index test match]
    (promise-wrap
-     (query-range/index-range db index test match)))
+    (query-range/index-range db index test match)))
   ([db index start-test start-match end-test end-match]
    (log/warn "DEPRECATED function `range` superseded by `fluree.db.api/range`")
    (promise-wrap
-     (query-range/index-range db index start-test start-match end-test end-match))))
+    (query-range/index-range db index start-test start-match end-test end-match))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/slice"}
@@ -490,7 +476,7 @@
   [db index match]
   (log/warn "DEPRECATED function `slice` superseded by `fluree.db.api/slice`")
   (promise-wrap
-    (query-range/index-range db index = match)))
+   (query-range/index-range db index = match)))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/expand-iri"}
@@ -551,7 +537,7 @@
   ([db methods rule-sources opts]
    (log/warn "DEPRECATED function `reason` superseded by `fluree.db.api/reason`")
    (promise-wrap
-     (reasoner/reason db methods rule-sources opts))))
+    (reasoner/reason db methods rule-sources opts))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/reasoned-count"}

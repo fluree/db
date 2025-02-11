@@ -1,14 +1,13 @@
 (ns fluree.db.json-ld.credential-test
-  (:require [fluree.crypto :as crypto]
-            [fluree.db.json-ld.credential :as cred]
-            [clojure.core.async :as async]
-            #?(:clj  [clojure.test :as t :refer [deftest testing is]]
+  (:require #?(:clj  [clojure.test :as t :refer [deftest testing is]]
                :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])
+            [clojure.core.async :as async]
+            [fluree.crypto :as crypto]
             [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
             [fluree.db.did :as did]
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]))
-
 
 (def kp
   {:public  "03b160698617e3b4cd621afd96c0591e33824cb9753ab2f1dace567884b4e242b0"
@@ -76,42 +75,42 @@
 #?(:cljs
    (deftest generate
      (t/async done
-       (async/go
-        (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
-                     (let [cred (async/<! (cred/generate example-cred-subject (:private auth)))]
-                       (is (= example-credential
-                              cred))
-                       (done)))))))
+              (async/go
+                (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
+                  (let [cred (async/<! (cred/generate example-cred-subject (:private auth)))]
+                    (is (= example-credential
+                           cred))
+                    (done)))))))
 
 #?(:cljs
    (deftest verify-correct-signature
      (t/async done
-       (async/go
-        (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
-                     (let [cljs-result (async/<! (cred/verify example-credential))
-                           clj-result  (async/<! (cred/verify (assoc-in example-credential ["proof" "jws"] clj-generated-jws)))]
-                       (is (= {:subject example-cred-subject :did example-issuer} cljs-result))
-                       (is (= {:subject example-cred-subject :did example-issuer} clj-result))
-                       (done)))))))
+              (async/go
+                (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
+                  (let [cljs-result (async/<! (cred/verify example-credential))
+                        clj-result  (async/<! (cred/verify (assoc-in example-credential ["proof" "jws"] clj-generated-jws)))]
+                    (is (= {:subject example-cred-subject :did example-issuer} cljs-result))
+                    (is (= {:subject example-cred-subject :did example-issuer} clj-result))
+                    (done)))))))
 
 #?(:cljs
    (deftest verify-incorrect-signature
      (t/async done
-       (async/go
-        (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
-                     (let [wrong-cred (assoc example-credential "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
-                       (is (= "Verification failed, invalid credential."
-                              (-> (async/<! (cred/verify wrong-cred))
-                                  (.-message e))))
-                       (done)))))))
+              (async/go
+                (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
+                  (let [wrong-cred (assoc example-credential "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
+                    (is (= "Verification failed, invalid credential."
+                           (-> (async/<! (cred/verify wrong-cred))
+                               (.-message e))))
+                    (done)))))))
 #?(:cljs
    (deftest verify-non-credential
      (t/async done
-       (async/go
-        (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
-                     (let [non-cred example-cred-subject]
-                       (is (util/exception? (async/<! (cred/verify non-cred))))
-                       (done)))))))
+              (async/go
+                (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
+                  (let [non-cred example-cred-subject]
+                    (is (util/exception? (async/<! (cred/verify non-cred))))
+                    (done)))))))
 
 #?(:clj
    (deftest ^:integration cred-wrapped-transactions-and-queries
@@ -271,6 +270,6 @@
              "SPARQL query connection credential - forbidding access")))))
 
 (comment
- #?(:cljs
+  #?(:cljs
 
-    (cljs.test/run-tests)),)
+     (cljs.test/run-tests)))

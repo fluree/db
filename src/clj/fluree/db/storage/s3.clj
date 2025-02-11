@@ -4,12 +4,12 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [cognitect.aws.client.api :as aws]
-            [fluree.db.util.log :as log]
+            [fluree.crypto :as crypto]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
-            [fluree.crypto :as crypto]
-            [fluree.db.util.bytes :as bytes])
+            [fluree.db.util.log :as log])
   (:import (java.io ByteArrayOutputStream Closeable)))
 
 (def method-name "s3")
@@ -66,8 +66,8 @@
                      (not= full-path "/") (assoc-in [:request :Prefix]
                                                     full-path)
                      continuation-token (assoc-in
-                                          [:request :ContinuationToken]
-                                          continuation-token))]
+                                         [:request :ContinuationToken]
+                                         continuation-token))]
      (log/debug "s3-list* req:" req)
      (aws/invoke-async s3-client req)
      ch)))

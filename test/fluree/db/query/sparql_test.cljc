@@ -4,9 +4,9 @@
        :cljs [[cljs.test :refer-macros [deftest is testing async]]
               [clojure.core.async :refer [go <!]]
               [clojure.core.async.interop :refer [<p!]]])
+   [fluree.db.api :as fluree]
    [fluree.db.query.sparql :as sparql]
-   [fluree.db.test-utils :as test-utils]
-   [fluree.db.api :as fluree])
+   [fluree.db.test-utils :as test-utils])
   #?(:clj (:import (clojure.lang ExceptionInfo))))
 
 (deftest parse-select
@@ -353,12 +353,12 @@
                    }}"]
         (is (= [[:values
                  [["?color" "?direction"]
-                 [[{"@type" "@id",
-                    "@value" "dm:red"}
-                   "north"]
-                  [{"@type" "@id",
-                    "@value" "dm:blue"}
-                   "west"]]]]]
+                  [[{"@type" "@id",
+                     "@value" "dm:red"}
+                    "north"]
+                   [{"@type" "@id",
+                     "@value" "dm:blue"}
+                    "west"]]]]]
                (:where (sparql/->fql query)))
             "multiple vars, multiple values")))
     (testing "clause"
@@ -558,7 +558,7 @@
                          [:filter "(= ?n ?m)"]]]]
                where)))))
   (testing "subquery"
-      (let [query "PREFIX : <http://people.example/>
+    (let [query "PREFIX : <http://people.example/>
                  SELECT ?y ?minName
                  WHERE {
                   :alice :knows ?y .
@@ -569,15 +569,15 @@
                     } GROUP BY ?y
                   }
                 }"]
-        (is (= {:context {"" "http://people.example/"},
-                :select ["?y" "?minName"],
-                :where
-                [{"@id" ":alice", ":knows" "?y"}
-                 [:query
-                  {:select ["?y" "(as (min ?name) ?minName)"],
-                   :where [{"@id" "?y", ":name" "?name"}],
-                   :groupBy ["?y"]}]]}
-               (sparql/->fql query))))))
+      (is (= {:context {"" "http://people.example/"},
+              :select ["?y" "?minName"],
+              :where
+              [{"@id" ":alice", ":knows" "?y"}
+               [:query
+                {:select ["?y" "(as (min ?name) ?minName)"],
+                 :where [{"@id" "?y", ":name" "?name"}],
+                 :groupBy ["?y"]}]]}
+             (sparql/->fql query))))))
 
 (deftest parse-prefixes
   (testing "PREFIX"
@@ -695,25 +695,25 @@
 
 ;; TODO: these expectations do not work in FQL
 #_(deftest parse-recursive
-  (let [query "SELECT ?followHandle
+    (let [query "SELECT ?followHandle
                WHERE {?person person:handle \"anguyen\".
                       ?person person:follows+ ?follows.
                       ?follows person:handle ?followHandle.}"
-        {:keys [where]} (sparql/->fql query)]
-    (is (= [{"@id" "?person", "person:handle" "anguyen"}
-            {"@id" "?person", "person:follows+" "?follows"}
-            {"@id" "?follows", "person:handle" "?followHandle"}]
-           where)))
-  (testing "depth"
-    (let [query "SELECT ?followHandle
+          {:keys [where]} (sparql/->fql query)]
+      (is (= [{"@id" "?person", "person:handle" "anguyen"}
+              {"@id" "?person", "person:follows+" "?follows"}
+              {"@id" "?follows", "person:handle" "?followHandle"}]
+             where)))
+    (testing "depth"
+      (let [query "SELECT ?followHandle
                  WHERE {?person person:handle \"anguyen\".
                         ?person person:follows+3 ?follows.
                         ?follows person:handle ?followHandle.}"
-          {:keys [where]} (sparql/->fql query)]
-      (is (= [{"@id" "?person", "person:handle" "anguyen"}
-              {"@id" "?person", "person:follows+3" "?follows"}
-              {"@id" "?follows", "person:handle" "?followHandle"}]
-             where)))))
+            {:keys [where]} (sparql/->fql query)]
+        (is (= [{"@id" "?person", "person:handle" "anguyen"}
+                {"@id" "?person", "person:follows+3" "?follows"}
+                {"@id" "?follows", "person:handle" "?followHandle"}]
+               where)))))
 
 ;; TODO
 #_(deftest parse-functions)
@@ -751,20 +751,20 @@
                       "person:handle"   "dankeshön"
                       "person:fullName" "Ferris Bueller"}]]
     #?(#_#_:cljs
-       (async done
-         (go
-           (let [conn   (<! (test-utils/create-conn))
-                ledger (<p! (fluree/create conn "people"))
-                db     (<p! (fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
-                                                               "insert" people-data}))]
-            (testing "basic query works"
-              (let [query   "SELECT ?person ?fullName
+         (async done
+                (go
+                  (let [conn   (<! (test-utils/create-conn))
+                        ledger (<p! (fluree/create conn "people"))
+                        db     (<p! (fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
+                                                                      "insert" people-data}))]
+                    (testing "basic query works"
+                      (let [query   "SELECT ?person ?fullName
                              WHERE {?person person:handle \"jdoe\".
                                     ?person person:fullName ?fullName.}"
-                    results (<p! (fluree/query db query {:format :sparql}))]
-                (is (= [["ex:jdoe" "Jane Doe"]]
-                       results))
-                (done))))))
+                            results (<p! (fluree/query db query {:format :sparql}))]
+                        (is (= [["ex:jdoe" "Jane Doe"]]
+                               results))
+                        (done))))))
 
        :clj
        (let [conn @(fluree/connect-memory)
@@ -775,7 +775,7 @@
                       (fluree/stage {"@context" ["https://ns.flur.ee"
                                                  test-utils/default-str-context
                                                  {"person" "http://example.org/Person#"}]
-                                      "insert" people-data})
+                                     "insert" people-data})
                       deref)]
          (testing "basic query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
@@ -980,7 +980,7 @@
              (let [book-db @(fluree/stage db {"@context" ["https://ns.flur.ee"
                                                           test-utils/default-str-context
                                                           {"person" "http://example.org/Person#"}]
-                                               "insert" book-data})
+                                              "insert" book-data})
                    query   "BASE <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book <title> ?title.}"
@@ -992,7 +992,7 @@
              (let [book-db @(fluree/stage db {"@context" ["https://ns.flur.ee"
                                                           test-utils/default-str-context
                                                           {"person" "http://example.org/Person#"}]
-                                               "insert" book-data})
+                                              "insert" book-data})
                    query   "PREFIX book: <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book book:title ?title.}"

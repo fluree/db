@@ -2,12 +2,12 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy.enforce :as enforce]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -25,9 +25,9 @@
 (defn class-policies
   [{:keys [policy] :as db} sid]
   (go-try
-   (let [class-sids (<? (dbproto/-class-ids db sid))]
-     (swap! (:cache policy) assoc sid class-sids)
-     (enforce/policies-for-classes policy false class-sids))))
+    (let [class-sids (<? (dbproto/-class-ids db sid))]
+      (swap! (:cache policy) assoc sid class-sids)
+      (enforce/policies-for-classes policy false class-sids))))
 
 (defn allow-flake?
   "Returns one of:
@@ -73,29 +73,29 @@
   an empty sequence if none are allowed."
   [db error-ch flakes]
   (go-try
-   (let [parellelism 4
-         from-ch     (async/chan parellelism) ;; keep to parallelism, so if exception occurs can close prematurely
-         to-ch       (async/chan)]
-     (async/onto-chan! from-ch flakes)
-     (async/pipeline-async parellelism
-                           to-ch
-                           (fn [flake ch]
-                             (async/go
-                               (try*
-                                (let [allow? (<? (allow-flake? db flake))]
-                                  (if allow?
-                                    (async/>! ch flake)
-                                    (async/>! ch ::restricted))
-                                  (async/close! ch))
-                                (catch* e
-                                        (log/error e "Exception in allow-flakes? checking permission for flake: " flake)
-                                        (async/>! error-ch e)))))
-                           from-ch)
-     (async/reduce (fn [acc result]
-                     (if (= ::restricted result)
-                       acc
-                       (conj acc result)))
-                   [] to-ch))))
+    (let [parellelism 4
+          from-ch     (async/chan parellelism) ;; keep to parallelism, so if exception occurs can close prematurely
+          to-ch       (async/chan)]
+      (async/onto-chan! from-ch flakes)
+      (async/pipeline-async parellelism
+                            to-ch
+                            (fn [flake ch]
+                              (async/go
+                                (try*
+                                  (let [allow? (<? (allow-flake? db flake))]
+                                    (if allow?
+                                      (async/>! ch flake)
+                                      (async/>! ch ::restricted))
+                                    (async/close! ch))
+                                  (catch* e
+                                    (log/error e "Exception in allow-flakes? checking permission for flake: " flake)
+                                    (async/>! error-ch e)))))
+                            from-ch)
+      (async/reduce (fn [acc result]
+                      (if (= ::restricted result)
+                        acc
+                        (conj acc result)))
+                    [] to-ch))))
 
 (defn filter-subject-flakes
   "Takes multiple flakes for the *same* subject and optimizes evaluation
@@ -113,6 +113,6 @@
   (let [error-ch  (async/chan)
         result-ch (filter-flakes db error-ch flakes)]
     (async/go
-     (async/alt!
-      result-ch ([r] r)
-      error-ch ([e] e)))))
+      (async/alt!
+        result-ch ([r] r)
+        error-ch ([e] e)))))

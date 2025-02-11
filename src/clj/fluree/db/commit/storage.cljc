@@ -1,8 +1,8 @@
 (ns fluree.db.commit.storage
   (:require [clojure.string :as str]
             [fluree.db.constants :as const]
-            [fluree.db.storage :as storage]
             [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.log :as log]
@@ -35,7 +35,7 @@
 (defn read-data-jsonld
   [storage address]
   (go-try
-    (let [jsonld (<? (storage/read-json storage address)) ]
+    (let [jsonld (<? (storage/read-json storage address))]
       (-> jsonld
           (assoc "f:address" address)
           json-ld/expand))))

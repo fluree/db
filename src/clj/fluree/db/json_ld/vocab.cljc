@@ -1,12 +1,12 @@
 (ns fluree.db.json-ld.vocab
   "Generates vocabulary/schema pre-cached maps."
   (:require [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.datatype :as datatype]))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -76,8 +76,7 @@
           "http://www.w3.org/ns/shacl#qualifiedValueShape"      const/sh_qualifiedValueShape
           "http://www.w3.org/ns/shacl#qualifiedMinCount"        const/sh_qualifiedMinCount
           "http://www.w3.org/ns/shacl#qualifiedMaxCount"        const/sh_qualifiedMaxCount
-          "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint" const/sh_qualifiedValueShapesDisjoint
-          }))
+          "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint" const/sh_qualifiedValueShapesDisjoint}))
 
 (def class+property-iris #{const/iri-class
                            "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
@@ -117,10 +116,10 @@
   lookup of either."
   [properties]
   (reduce
-    (fn [acc prop-map]
-      (assoc acc (:id prop-map) prop-map
-                 (:iri prop-map) prop-map))
-    {} properties))
+   (fn [acc prop-map]
+     (assoc acc (:id prop-map) prop-map
+            (:iri prop-map) prop-map))
+   {} properties))
 
 (defn- recur-sub-classes
   "Once an initial parent->child relationship is established, recursively place
@@ -143,22 +142,21 @@
    "
   [pred-items]
   (let [subclass-map (reduce
-                       (fn [acc class]
-                         (if-let [parent-classes (:subclassOf class)]
-                           (reduce #(update %1 %2 conj (:id class)) acc parent-classes)
-                           acc))
-                       {} pred-items)]
+                      (fn [acc class]
+                        (if-let [parent-classes (:subclassOf class)]
+                          (reduce #(update %1 %2 conj (:id class)) acc parent-classes)
+                          acc))
+                      {} pred-items)]
     (reduce-kv
-      (fn [acc parent children]
-        (loop [[child & r] children
-               all-children (apply sorted-set children)]
-          (if (nil? child)
-            (assoc acc parent all-children)
-            (if-let [child-children (get subclass-map child)]
-              (recur (into child-children r) (into all-children child-children))
-              (recur r all-children)))))
-      {} subclass-map)))
-
+     (fn [acc parent children]
+       (loop [[child & r] children
+              all-children (apply sorted-set children)]
+         (if (nil? child)
+           (assoc acc parent all-children)
+           (if-let [child-children (get subclass-map child)]
+             (recur (into child-children r) (into all-children child-children))
+             (recur r all-children)))))
+     {} subclass-map)))
 
 (defn calc-subclass
   "Calculates subclass map for use with queries for rdf:type."
@@ -166,10 +164,10 @@
   (let [subclass-map (recur-sub-classes (vals property-maps))]
     ;; map subclasses for both subject-id and iri
     (reduce-kv
-      (fn [acc class-id subclasses]
-        (let [iri (get-in property-maps [class-id :iri])]
-          (assoc acc iri subclasses)))
-      subclass-map subclass-map)))
+     (fn [acc class-id subclasses]
+       (let [iri (get-in property-maps [class-id :iri])]
+         (assoc acc iri subclasses)))
+     subclass-map subclass-map)))
 
 (def ^:const base-property-map
   {:id          nil
@@ -270,9 +268,9 @@
                      obj " is not an IRI."
                      (when (string? obj)
                        (str
-                         " It is a string, and likely was intended to be "
-                         "input as {\"@id\": \"" obj "\"} instead of as a "
-                         "string datatype."))))
+                        " It is a string, and likely was intended to be "
+                        "input as {\"@id\": \"" obj "\"} instead of as a "
+                        "string datatype."))))
       pred-map)))
 
 (defn update-pred-map
@@ -332,11 +330,11 @@
   (some (fn [[_ p o :as _f]]
           (or
             ;; modified a subject with a shape type
-            (and (= p const/$rdf:type)
-                 (or (= o const/sh_NodeShape)
-                     (= o const/sh_PropertyShape)))
+           (and (= p const/$rdf:type)
+                (or (= o const/sh_NodeShape)
+                    (= o const/sh_PropertyShape)))
             ;; most property shapes don't have a type, but do need a path
-            (= p const/sh_path)))
+           (= p const/sh_path)))
         s-flakes))
 
 (defn invalidate-shape-cache!
@@ -491,7 +489,7 @@
                    (case k
                      :id (let [sid (iri/deserialize-sid raw-val)]
                            (assoc acc :id sid
-                                      :iri (iri/sid->iri sid namespace-codes)))
+                                  :iri (iri/sid->iri sid namespace-codes)))
                      :subclassOf (assoc acc :subclassOf (into (:subclassOf base-property-map) (map iri/deserialize-sid raw-val)))
                      :parentProps (assoc acc :parentProps (into (:parentProps base-property-map) (map iri/deserialize-sid raw-val)))
                      :childProps (assoc acc :childProps (into (:childProps base-property-map) (map iri/deserialize-sid raw-val)))
@@ -513,7 +511,7 @@
     (reduce
      (fn [acc pred-map]
        (assoc acc (:id pred-map) pred-map
-                  (:iri pred-map) pred-map))
+              (:iri pred-map) pred-map))
      {}
      pred-maps)))
 

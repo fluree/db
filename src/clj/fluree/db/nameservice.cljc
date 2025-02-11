@@ -3,8 +3,8 @@
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.db.storage :as storage]
-            [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -37,12 +37,12 @@
   [commit-jsonld publishers]
   (->> publishers
        (map (fn [ns]
-                (go
-                  (try*
-                    (<? (publish ns commit-jsonld))
-                    (catch* e
-                      (log/warn e "Publisher failed to publish commit")
-                      ::publishing-error)))))
+              (go
+                (try*
+                  (<? (publish ns commit-jsonld))
+                  (catch* e
+                    (log/warn e "Publisher failed to publish commit")
+                    ::publishing-error)))))
        async/merge))
 
 (defn published-ledger?

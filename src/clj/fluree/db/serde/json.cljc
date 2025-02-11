@@ -1,14 +1,14 @@
 (ns fluree.db.serde.json
-  (:require [fluree.db.constants :as const]
-            [fluree.db.serde.protocol :as serdeproto]
+  (:require #?(:clj  [fluree.db.util.clj-const :as uc]
+               :cljs [fluree.db.util.cljs-const :as uc])
+            [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util]
             [fluree.db.flake.index :as index]
-            [fluree.db.util.json :as json]
-            #?(:clj  [fluree.db.util.clj-const :as uc]
-               :cljs [fluree.db.util.cljs-const :as uc]))
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.serde.protocol :as serdeproto]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.json :as json])
   #?(:clj (:import (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -140,11 +140,11 @@
   types into seq."
   [m]
   (reduce-kv
-    (fn [acc k v]
-      (assoc acc (name k) (if (flake/flake? v)
-                            (serialize-flake v)
-                            v)))
-    {} m))
+   (fn [acc k v]
+     (assoc acc (name k) (if (flake/flake? v)
+                           (serialize-flake v)
+                           v)))
+   {} m))
 
 (defn serialize-garbage
   [{:keys [alias branch t garbage]}]
@@ -157,17 +157,17 @@
   serdeproto/StorageSerializer
   (-serialize-db-root [_ db-root]
     (reduce-kv
-      (fn [acc k v]
-        (assoc acc (name k)
-                   (case k
-                     (:stats :config :garbage :prev-index)
-                     (util/stringify-keys v)
+     (fn [acc k v]
+       (assoc acc (name k)
+              (case k
+                (:stats :config :garbage :prev-index)
+                (util/stringify-keys v)
 
-                     (:spot :post :opst :tspo)
-                     (stringify-child v)
+                (:spot :post :opst :tspo)
+                (stringify-child v)
 
-                     v)))
-      {} db-root))
+                v)))
+     {} db-root))
   (-deserialize-db-root [_ db-root]
     (deserialize-db-root db-root))
   (-serialize-branch [_ {:keys [children] :as _branch}]
@@ -182,7 +182,6 @@
     (serialize-garbage garbage-map))
   (-deserialize-garbage [_ garbage]
     (deserialize-garbage garbage)))
-
 
 (defn json-serde
   "Returns a JSON serializer / deserializer"

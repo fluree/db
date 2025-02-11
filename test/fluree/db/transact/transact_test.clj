@@ -1,8 +1,8 @@
 (ns fluree.db.transact.transact-test
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
-            [fluree.db.did :as did]
             [fluree.db.api :as fluree]
+            [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
             [jsonista.core :as json]
@@ -15,34 +15,34 @@
           db0    (fluree/db ledger)
 
           stage-id-only    @(fluree/stage
-                              db0
-                              {"@context" ["https://ns.flur.ee"
-                                           test-utils/default-context
-                                           {:ex "http://example.org/ns/"}]
-                               "insert"   {:id :ex/alice}})
+                             db0
+                             {"@context" ["https://ns.flur.ee"
+                                          test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                              "insert"   {:id :ex/alice}})
           stage-empty-txn  @(fluree/stage
-                              db0
-                              {"@context" ["https://ns.flur.ee"
-                                           test-utils/default-context
-                                           {:ex "http://example.org/ns/"}]
-                               "insert"   {}})
+                             db0
+                             {"@context" ["https://ns.flur.ee"
+                                          test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                              "insert"   {}})
           stage-empty-node @(fluree/stage
-                              db0
-                              {"@context" ["https://ns.flur.ee"
-                                           test-utils/default-context
-                                           {:ex "http://example.org/ns/"}]
-                               "insert"
-                               [{:id         :ex/alice
-                                 :schema/age 42}
-                                {}]})
+                             db0
+                             {"@context" ["https://ns.flur.ee"
+                                          test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                              "insert"
+                              [{:id         :ex/alice
+                                :schema/age 42}
+                               {}]})
           db-ok            @(fluree/stage
-                              db0
-                              {"@context" ["https://ns.flur.ee"
-                                           test-utils/default-context
-                                           {:ex "http://example.org/ns/"}]
-                               "insert"
-                               {:id         :ex/alice
-                                :schema/age 42}})]
+                             db0
+                             {"@context" ["https://ns.flur.ee"
+                                          test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                              "insert"
+                              {:id         :ex/alice
+                               :schema/age 42}})]
       (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
              (ex-message stage-id-only)))
       (is (= "Invalid transaction, insert or delete clause must contain nodes with objects."
@@ -61,13 +61,13 @@
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "tx/bools")
           db-bool @(fluree/stage
-                     (fluree/db ledger)
-                     {"@context" ["https://ns.flur.ee"
-                                  test-utils/default-context
-                                  {:ex "http://example.org/ns/"}]
-                      "insert"
-                      {:id        :ex/alice
-                       :ex/isCool false}})]
+                    (fluree/db ledger)
+                    {"@context" ["https://ns.flur.ee"
+                                 test-utils/default-context
+                                 {:ex "http://example.org/ns/"}]
+                     "insert"
+                     {:id        :ex/alice
+                      :ex/isCool false}})]
       (is (= [[:ex/alice :ex/isCool false]]
              @(fluree/query db-bool {:context [test-utils/default-context
                                                {:ex "http://example.org/ns/"}]
@@ -219,17 +219,17 @@
                                              :f/targetRole :ex/userRole
                                              :f/action     [:f/view]}]}]
           db-data-first   @(fluree/stage
-                             (fluree/db ledger)
-                             {"@context" ["https://ns.flur.ee"
-                                          test-utils/default-context
-                                          {:ex "http://example.org/ns/"}]
-                              "insert"   (into data policy)})
+                            (fluree/db ledger)
+                            {"@context" ["https://ns.flur.ee"
+                                         test-utils/default-context
+                                         {:ex "http://example.org/ns/"}]
+                             "insert"   (into data policy)})
           db-policy-first @(fluree/stage
-                             (fluree/db ledger)
-                             {"@context" ["https://ns.flur.ee"
-                                          test-utils/default-context
-                                          {:ex "http://example.org/ns/"}]
-                              "insert"   (into policy data)})
+                            (fluree/db ledger)
+                            {"@context" ["https://ns.flur.ee"
+                                         test-utils/default-context
+                                         {:ex "http://example.org/ns/"}]
+                             "insert"   (into policy data)})
           user-query      {:context [test-utils/default-context
                                      {:ex "http://example.org/ns/"}]
                            :select  '{?s [:*]}
@@ -389,7 +389,6 @@
         (is (= "Invalid transaction, missing required key: ledger."
                (ex-message @(fluree/transact! conn txn))))))))
 
-
 (deftest ^:integration base-and-vocab-test
   (testing "@base & @vocab work w/ stage"
     (let [conn        @(fluree/connect-memory)
@@ -441,21 +440,21 @@
           ledger @(fluree/create conn "jsonpls")
           db0    (fluree/db ledger)
           db1    @(fluree/stage
-                    db0
-                    {"@context" ["https://ns.flur.ee"
-                                 test-utils/default-str-context
-                                 {"ex" "http://example.org/ns/"}]
-                     "insert"
-                     [{"@id"     "ex:alice"
-                       "@type"   "ex:Person"
-                       "ex:json" {"@type"  "@json"
-                                  "@value" {"json" "data"
-                                            "is"   ["cool" "right?" 1 false 1.0]}}}
-                      {"@id"     "ex:bob"
-                       "@type"   "ex:Person"
-                       "ex:json" {"@type"  "@json"
-                                  "@value" {:edn "data"
-                                            :is  ["cool" "right?" 1 false 1.0]}}}]})]
+                   db0
+                   {"@context" ["https://ns.flur.ee"
+                                test-utils/default-str-context
+                                {"ex" "http://example.org/ns/"}]
+                    "insert"
+                    [{"@id"     "ex:alice"
+                      "@type"   "ex:Person"
+                      "ex:json" {"@type"  "@json"
+                                 "@value" {"json" "data"
+                                           "is"   ["cool" "right?" 1 false 1.0]}}}
+                     {"@id"     "ex:bob"
+                      "@type"   "ex:Person"
+                      "ex:json" {"@type"  "@json"
+                                 "@value" {:edn "data"
+                                           :is  ["cool" "right?" 1 false 1.0]}}}]})]
       (is (= [{"id"     "ex:alice",
                "type"   "ex:Person",
                "ex:json" {"json" "data", "is" ["cool" "right?" 1 false 1]}}
@@ -520,7 +519,6 @@
                                                                "sh:path"     {"@id" "schema:age"},
                                                                "sh:datatype" {"@id" "xsd:integer"}}]}})
 
-
         db2 @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
                                             context],
                                 "ledger"   ledger-id
@@ -549,8 +547,7 @@
 ;; TODO - below will brick the db when first IRI char is unicode, but the test where unicode comes second works
 (deftest ^:kaocha/pending ^:integration ^:json transaction-iri-special-char
   (testing "transaction with special iri characters in @id"
-    (let [
-          conn      @(fluree/connect {:method :memory})
+    (let [conn      @(fluree/connect {:method :memory})
           ledger-id "transaction-iri-special-char"
           ledger    @(fluree/create conn ledger-id)
           db0       (fluree/db ledger)

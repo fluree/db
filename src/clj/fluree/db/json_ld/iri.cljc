@@ -1,14 +1,13 @@
 (ns fluree.db.json-ld.iri
-  (:require [fluree.db.util.core :as util]
-            [fluree.db.util.bytes :as bytes]
-            [clojure.string :as str]
+  (:require #?(:cljs [fluree.db.sid :refer [SID]])
             [clojure.set :refer [map-invert]]
-            [nano-id.core :refer [nano-id]]
-            #?(:cljs [fluree.db.sid :refer [SID]]))
+            [clojure.string :as str]
+            [fluree.db.util.bytes :as bytes]
+            [fluree.db.util.core :as util]
+            [nano-id.core :refer [nano-id]])
   #?(:clj (:import (fluree.db SID))))
 
 #?(:clj (set! *warn-on-reflection* true))
-
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")
@@ -67,7 +66,6 @@
    "urn:issn:"                                   23
    "_:"                                          24
    f-idx-ns                                      25})
-
 
 (def default-namespace-codes
   (map-invert default-namespaces))

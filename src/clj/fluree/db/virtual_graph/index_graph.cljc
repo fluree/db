@@ -1,12 +1,12 @@
 (ns fluree.db.virtual-graph.index-graph
-  (:require [fluree.db.constants :as const]
+  (:require #?(:clj [fluree.db.virtual-graph.bm25.index :as bm25])
+            [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            #?(:clj [fluree.db.virtual-graph.bm25.index :as bm25])
-            [fluree.db.virtual-graph.parse :as vg-parse]
-            [fluree.db.virtual-graph.proto :as vgproto]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph.parse :as vg-parse]
+            [fluree.db.virtual-graph.proto :as vgproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -26,9 +26,9 @@
        (try*
          (assoc acc :query (json/parse (flake/o idx-flake) false))
          (catch* e
-                 (throw (ex-info (str "Invalid query json provided for Bm25 index, unable to parse: " (flake/o idx-flake))
-                                 {:status 400
-                                  :error  :db/invalid-index}))))
+           (throw (ex-info (str "Invalid query json provided for Bm25 index, unable to parse: " (flake/o idx-flake))
+                           {:status 400
+                            :error  :db/invalid-index}))))
 
        :else acc))
    {:type    []
@@ -42,7 +42,7 @@
   (let [vg-alias (str "##" vg-name)
         vg-id    (str alias vg-alias)]
     (assoc idx-opts :id vg-id
-                    :alias vg-alias)))
+           :alias vg-alias)))
 
 (defn bm25-idx?
   [idx-rdf-type]
@@ -61,8 +61,8 @@
                          ;; add vector index and other types of virtual graphs here
                          (bm25-idx? type) #?(:clj  (bm25/new-bm25-index db vg-flakes vg-opts)
                                              :cljs (throw (ex-info "BM25 index not supported in cljs"
-                                                                  {:status 400
-                                                                   :error  :db/invalid-index}))))
+                                                                   {:status 400
+                                                                    :error  :db/invalid-index}))))
         _              (when (nil? vg)
                          (throw (ex-info "Unrecognized virtual graph creation attempted."
                                          {:status 400

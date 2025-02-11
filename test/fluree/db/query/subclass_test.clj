@@ -1,54 +1,54 @@
 (ns fluree.db.query.subclass-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.api :as fluree]))
+            [fluree.db.api :as fluree]
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest subclass-test
   (testing "Subclass queries work."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/subclass")
           db1    @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" "https://ns.flur.ee"
-                     "insert"
-                     {"@context"                  "https://schema.org"
-                      "id"                        "https://www.wikidata.org/wiki/Q836821"
-                      "type"                      ["Movie"]
-                      "name"                      "The Hitchhiker's Guide to the Galaxy"
-                      "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings"
-                      "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N"
-                      "isBasedOn"                 {"id"     "https://www.wikidata.org/wiki/Q3107329"
-                                                   "type"   ["Book"]
-                                                   "name"   "The Hitchhiker's Guide to the Galaxy"
-                                                   "isbn"   "0-330-25864-8"
-                                                   "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
-                                                             "@type" "Person"
-                                                             "name"  "Douglas Adams"}}}})
+                   (fluree/db ledger)
+                   {"@context" "https://ns.flur.ee"
+                    "insert"
+                    {"@context"                  "https://schema.org"
+                     "id"                        "https://www.wikidata.org/wiki/Q836821"
+                     "type"                      ["Movie"]
+                     "name"                      "The Hitchhiker's Guide to the Galaxy"
+                     "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings"
+                     "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N"
+                     "isBasedOn"                 {"id"     "https://www.wikidata.org/wiki/Q3107329"
+                                                  "type"   ["Book"]
+                                                  "name"   "The Hitchhiker's Guide to the Galaxy"
+                                                  "isbn"   "0-330-25864-8"
+                                                  "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
+                                                            "@type" "Person"
+                                                            "name"  "Douglas Adams"}}}})
           ;; add CreativeWork class
           db2    @(fluree/stage
-                    db1
-                    {"@context" "https://ns.flur.ee"
-                     "insert"
-                     {"@context"        {"schema" "http://schema.org/"
-                                         "rdfs"   "http://www.w3.org/2000/01/rdf-schema#"}
-                      "@id"             "schema:CreativeWork",
-                      "@type"           "rdfs:Class",
-                      "rdfs:comment"    "The most generic kind of creative work, including books, movies, photographs, software programs, etc.",
-                      "rdfs:label"      "CreativeWork",
-                      "rdfs:subClassOf" {"@id" "schema:Thing"},
-                      "schema:source"   {"@id" "http://www.w3.org/wiki/WebSchemas/SchemaDotOrgSources#source_rNews"}}})
+                   db1
+                   {"@context" "https://ns.flur.ee"
+                    "insert"
+                    {"@context"        {"schema" "http://schema.org/"
+                                        "rdfs"   "http://www.w3.org/2000/01/rdf-schema#"}
+                     "@id"             "schema:CreativeWork",
+                     "@type"           "rdfs:Class",
+                     "rdfs:comment"    "The most generic kind of creative work, including books, movies, photographs, software programs, etc.",
+                     "rdfs:label"      "CreativeWork",
+                     "rdfs:subClassOf" {"@id" "schema:Thing"},
+                     "schema:source"   {"@id" "http://www.w3.org/wiki/WebSchemas/SchemaDotOrgSources#source_rNews"}}})
 
           ;; Make Book and Movie subclasses of CreativeWork
           db3 @(fluree/stage
-                 db2
-                 {"@context" "https://ns.flur.ee"
-                  "insert"
-                  {"@context" {"schema" "http://schema.org/"
-                               "rdfs"   "http://www.w3.org/2000/01/rdf-schema#"}
-                   "@graph"   [{"@id"             "schema:Book",
-                                "rdfs:subClassOf" {"@id" "schema:CreativeWork"}}
-                               {"@id"             "schema:Movie",
-                                "rdfs:subClassOf" {"@id" "schema:CreativeWork"}}]}})]
+                db2
+                {"@context" "https://ns.flur.ee"
+                 "insert"
+                 {"@context" {"schema" "http://schema.org/"
+                              "rdfs"   "http://www.w3.org/2000/01/rdf-schema#"}
+                  "@graph"   [{"@id"             "schema:Book",
+                               "rdfs:subClassOf" {"@id" "schema:CreativeWork"}}
+                              {"@id"             "schema:Movie",
+                               "rdfs:subClassOf" {"@id" "schema:CreativeWork"}}]}})]
 
       (is (= #{{:id                               :wiki/Q836821,
                 :type                             :schema/Movie,
@@ -75,31 +75,31 @@
           db0         (fluree/db ledger)
           context     test-utils/default-str-context
           db1         @(fluree/stage
-                         db0
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          [{"@id"         "ex:freddy"
-                            "@type"       "ex:Yeti"
-                            "schema:name" "Freddy"}
-                           {"@id"         "ex:letty"
-                            "@type"       "ex:Yeti"
-                            "schema:name" "Leticia"}
-                           {"@id"         "ex:betty"
-                            "@type"       "ex:Yeti"
-                            "schema:name" "Betty"}
-                           {"@id"         "ex:andrew"
-                            "@type"       "schema:Person",
-                            "schema:name" "Andrew Johnson"}]})
+                        db0
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         [{"@id"         "ex:freddy"
+                           "@type"       "ex:Yeti"
+                           "schema:name" "Freddy"}
+                          {"@id"         "ex:letty"
+                           "@type"       "ex:Yeti"
+                           "schema:name" "Leticia"}
+                          {"@id"         "ex:betty"
+                           "@type"       "ex:Yeti"
+                           "schema:name" "Betty"}
+                          {"@id"         "ex:andrew"
+                           "@type"       "schema:Person",
+                           "schema:name" "Andrew Johnson"}]})
           db2         @(fluree/stage
-                         db1
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          [{"@id"   "ex:Humanoid"
-                            "@type" "rdfs:Class"}
-                           {"@id"             "ex:Yeti"
-                            "rdfs:subClassOf" {"@id" "ex:Humanoid"}}
-                           {"@id"             "schema:Person"
-                            "rdfs:subClassOf" {"@id" "ex:Humanoid"}}]})]
+                        db1
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         [{"@id"   "ex:Humanoid"
+                           "@type" "rdfs:Class"}
+                          {"@id"             "ex:Yeti"
+                           "rdfs:subClassOf" {"@id" "ex:Humanoid"}}
+                          {"@id"             "schema:Person"
+                           "rdfs:subClassOf" {"@id" "ex:Humanoid"}}]})]
       (is (= #{{"id"          "ex:freddy"
                 "type"        "ex:Yeti"
                 "schema:name" "Freddy"}
@@ -124,31 +124,31 @@
           db0         (fluree/db ledger)
           context     test-utils/default-str-context
           db1         @(fluree/stage
-                         db0
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          [{"@id"         "ex:freddy"
-                            "@type"       "ex:Yeti"
-                            "schema:name" "Freddy"}
-                           {"@id"         "ex:letty"
-                            "@type"       "ex:Yeti"
-                            "schema:name" "Leticia"}
-                           {"@id"         "ex:betty"
-                            "@type"       "ex:Yeti"
-                            "schema:name" "Betty"}
-                           {"@id"         "ex:andrew"
-                            "@type"       "schema:Person",
-                            "schema:name" "Andrew Johnson"}]})
+                        db0
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         [{"@id"         "ex:freddy"
+                           "@type"       "ex:Yeti"
+                           "schema:name" "Freddy"}
+                          {"@id"         "ex:letty"
+                           "@type"       "ex:Yeti"
+                           "schema:name" "Leticia"}
+                          {"@id"         "ex:betty"
+                           "@type"       "ex:Yeti"
+                           "schema:name" "Betty"}
+                          {"@id"         "ex:andrew"
+                           "@type"       "schema:Person",
+                           "schema:name" "Andrew Johnson"}]})
           db2         @(fluree/stage
-                         db1
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          [{"@id"   "ex:Humanoid"
-                            "@type" "rdfs:Class"}
-                           {"@id"             "ex:Yeti"
-                            "rdfs:subClassOf" {"@id" "ex:Humanoid"}}
-                           {"@id"             "schema:Person"
-                            "rdfs:subClassOf" {"@id" "ex:Humanoid"}}]})
+                        db1
+                        {"@context" ["https://ns.flur.ee" context]
+                         "insert"
+                         [{"@id"   "ex:Humanoid"
+                           "@type" "rdfs:Class"}
+                          {"@id"             "ex:Yeti"
+                           "rdfs:subClassOf" {"@id" "ex:Humanoid"}}
+                          {"@id"             "schema:Person"
+                           "rdfs:subClassOf" {"@id" "ex:Humanoid"}}]})
           _db3        @(fluree/commit! ledger db2)
           db4         (-> conn (test-utils/retry-load ledger-name 100) fluree/db)]
       (is (= #{{"id"          "ex:freddy"
@@ -175,29 +175,29 @@
           db0         (fluree/db ledger)
           context     test-utils/default-str-context
           db1         @(fluree/stage
-                         db0
-                         {"@context" {"ex" "http://example.org/"}
-                          "insert"   [{"@id"     "ex:brian"
-                                       "@type"   "ex:Person"
-                                       "ex:name" "Brian"}
-                                      {"@id"     "ex:laura"
-                                       "@type"   "ex:Employee"
-                                       "ex:name" "Laura"}
-                                      {"@id"     "ex:alice"
-                                       "@type"   "ex:Human"
-                                       "ex:name" "Alice"}]})
+                        db0
+                        {"@context" {"ex" "http://example.org/"}
+                         "insert"   [{"@id"     "ex:brian"
+                                      "@type"   "ex:Person"
+                                      "ex:name" "Brian"}
+                                     {"@id"     "ex:laura"
+                                      "@type"   "ex:Employee"
+                                      "ex:name" "Laura"}
+                                     {"@id"     "ex:alice"
+                                      "@type"   "ex:Human"
+                                      "ex:name" "Alice"}]})
           db2         @(fluree/stage
-                         db1
-                         {"@context" {"ex"   "http://example.org/"
-                                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                          "insert"   [{"@id"             "ex:Person"
-                                       "rdfs:subClassOf" {"@id" "ex:Human"}}]})
+                        db1
+                        {"@context" {"ex"   "http://example.org/"
+                                     "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                         "insert"   [{"@id"             "ex:Person"
+                                      "rdfs:subClassOf" {"@id" "ex:Human"}}]})
           db3         @(fluree/stage
-                         db2
-                         {"@context" {"ex"   "http://example.org/"
-                                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                          "insert"   [{"@id"             "ex:Employee"
-                                       "rdfs:subClassOf" {"@id" "ex:Person"}}]})]
+                        db2
+                        {"@context" {"ex"   "http://example.org/"
+                                     "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                         "insert"   [{"@id"             "ex:Employee"
+                                      "rdfs:subClassOf" {"@id" "ex:Person"}}]})]
       (is (= #{"ex:brian" "ex:laura" "ex:alice"}
              (set @(fluree/query db3 {"@context" {"ex" "http://example.org/"}
                                       "select"   "?s"

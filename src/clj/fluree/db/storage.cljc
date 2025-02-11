@@ -1,8 +1,8 @@
 (ns fluree.db.storage
   (:refer-clojure :exclude [read list exists?])
   (:require [clojure.core.async :as async]
-            [clojure.string :as str]
             [clojure.pprint :as pprint]
+            [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
             [fluree.json-ld :as json-ld])

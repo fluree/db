@@ -1,22 +1,22 @@
 (ns fluree.db.api
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
-            [clojure.walk :refer [postwalk]]
-            [fluree.db.connection.system :as system]
-            [fluree.db.connection :as connection :refer [notify-ledger]]
-            [fluree.db.util.context :as context]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.json-ld.iri :as iri]
             [clojure.core.async :as async :refer [go <!]]
-            [fluree.db.query.api :as query-api]
+            [clojure.walk :refer [postwalk]]
             [fluree.db.api.transact :as transact-api]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.ledger :as ledger]
-            [fluree.db.util.log :as log]
-            [fluree.db.query.range :as query-range]
+            [fluree.db.connection :as connection :refer [notify-ledger]]
+            [fluree.db.connection.system :as system]
             [fluree.db.json-ld.credential :as cred]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.json-ld.policy :as policy]
+            [fluree.db.ledger :as ledger]
+            [fluree.db.query.api :as query-api]
+            [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
-            [fluree.db.json-ld.policy :as policy])
+            [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.context :as context]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -36,12 +36,12 @@
        p)
      :cljs
      (js/Promise.
-       (fn [resolve reject]
-         (go
-           (let [res (<! port)]
-             (if (util/exception? res)
-               (reject res)
-               (resolve res))))))))
+      (fn [resolve reject]
+        (go
+          (let [res (<! port)]
+            (if (util/exception? res)
+              (reject res)
+              (resolve res))))))))
 
 (defn- validate-connection
   "Throws exception if x is not a valid connection"
@@ -63,14 +63,14 @@
   [config]
   ;; TODO - do some validation
   (promise-wrap
-    (go-try
-      (let [system-map (system/initialize config)
-            conn       (reduce-kv (fn [x k v]
-                                    (if (isa? k :fluree.db/connection)
-                                      (reduced v)
-                                      x))
-                                  nil system-map)]
-        (assoc conn ::system-map system-map)))))
+   (go-try
+     (let [system-map (system/initialize config)
+           conn       (reduce-kv (fn [x k v]
+                                   (if (isa? k :fluree.db/connection)
+                                     (reduced v)
+                                     x))
+                                 nil system-map)]
+       (assoc conn ::system-map system-map)))))
 
 (defn disconnect
   [conn]
@@ -191,7 +191,7 @@
   [conn alias-or-address]
   (validate-connection conn)
   (promise-wrap
-    (connection/load-ledger conn alias-or-address)))
+   (connection/load-ledger conn alias-or-address)))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
@@ -199,12 +199,12 @@
   [conn ledger-alias-or-address]
   (validate-connection conn)
   (promise-wrap
-    (go
-      (let [address (if (address? ledger-alias-or-address)
-                      ledger-alias-or-address
-                      (<! (alias->address conn ledger-alias-or-address)))]
-        (log/debug "exists? - ledger address:" address)
-        (<! (connection/ledger-exists? conn address))))))
+   (go
+     (let [address (if (address? ledger-alias-or-address)
+                     ledger-alias-or-address
+                     (<! (alias->address conn ledger-alias-or-address)))]
+       (log/debug "exists? - ledger address:" address)
+       (<! (connection/ledger-exists? conn address))))))
 
 (defn notify
   "Notifies the connection with a new commit map (parsed JSON commit with string keys).
@@ -216,12 +216,11 @@
   [conn commit-map]
   (validate-connection conn)
   (promise-wrap
-    (if (map? commit-map)
-      (notify-ledger conn commit-map)
-      (go
-        (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
-                 {:status 400 :error :db/invalid-commit-map})))))
-
+   (if (map? commit-map)
+     (notify-ledger conn commit-map)
+     (go
+       (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
+                {:status 400 :error :db/invalid-commit-map})))))
 
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
@@ -246,10 +245,10 @@
   distributed rules."
   ([ledger db]
    (promise-wrap
-     (connection/commit! ledger db)))
+    (connection/commit! ledger db)))
   ([ledger db opts]
    (promise-wrap
-     (connection/commit! ledger db opts))))
+    (connection/commit! ledger db opts))))
 
 (defn transact!
   ([conn txn] (transact! conn txn nil))
@@ -269,13 +268,12 @@
   [conn txn]
   (validate-connection conn)
   (promise-wrap
-    (transact-api/create-with-txn conn txn)))
+   (transact-api/create-with-txn conn txn)))
 
 (defn status
   "Returns current status of ledger branch."
   ([ledger] (ledger/status ledger))
   ([ledger branch] (ledger/status ledger branch)))
-
 
 ;; db operations
 
@@ -364,9 +362,9 @@
       (let [{query :subject, identity :did} (if (= :sparql format)
                                               (cred/verify-jws cred-query)
                                               (<? (cred/verify cred-query)))]
-       (log/debug "Credential query with identity: " identity " and query: " query)
-       (let [policy-db (<? (policy/wrap-identity-policy ds identity values-map))]
-         (<? (query-api/query policy-db query opts))))))))
+        (log/debug "Credential query with identity: " identity " and query: " query)
+        (let [policy-db (<? (policy/wrap-identity-policy ds identity values-map))]
+          (<? (query-api/query policy-db query opts))))))))
 
 (defn query-connection
   "Queries the latest db in the ledger specified by the 'from' parameter in the
@@ -451,16 +449,16 @@
   ;; TODO - assert index is valid index type
   ([db index test match]
    (promise-wrap
-     (query-range/index-range db index test match)))
+    (query-range/index-range db index test match)))
   ([db index start-test start-match end-test end-match]
    (promise-wrap
-     (query-range/index-range db index start-test start-match end-test end-match))))
+    (query-range/index-range db index start-test start-match end-test end-match))))
 
 (defn slice
   "Like range, but returns all flakes that match the supplied flake parts."
   [db index match]
   (promise-wrap
-    (query-range/index-range db index = match)))
+   (query-range/index-range db index = match)))
 
 (defn expand-iri
   "Expands given IRI with the default database context, or provided context."
@@ -499,7 +497,7 @@
   ([db methods rule-sources] (reason db methods rule-sources nil))
   ([db methods rule-sources opts]
    (promise-wrap
-     (reasoner/reason db methods rule-sources opts))))
+    (reasoner/reason db methods rule-sources opts))))
 
 (defn reasoned-count
   "Returns a count of reasoned facts in the provided db."

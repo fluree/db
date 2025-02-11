@@ -38,9 +38,9 @@
           db-some-val   @(fluree/reason db-with-rules :owl2rl)]
       (is (= (list "ex:a-wine-1" "ex:a-wine-2" "ex:maybe-a-wine")
              (sort
-               @(fluree/query db-some-val
-                              {:context {"ex" "http://example.org/"}
-                               :select  "?s"
-                               :where   {"@id"   "?s"
-                                         "@type" "ex:Wine"}})))
+              @(fluree/query db-some-val
+                             {:context {"ex" "http://example.org/"}
+                              :select  "?s"
+                              :where   {"@id"   "?s"
+                                        "@type" "ex:Wine"}})))
           "hasMaker ref can no be of either ex:Winery or ex:TextileFactory to qualify as an ex:Wine"))))

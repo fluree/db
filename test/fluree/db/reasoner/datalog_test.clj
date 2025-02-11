@@ -125,8 +125,6 @@
           ledger @(fluree/create conn "reasoner/basic-datalog" nil)
           db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
 
-
-
       (testing "A standard relationship"
         (let [grandparent-db  @(fluree/stage db0 {"insert" [grandparent-rule]})
 
@@ -149,36 +147,35 @@
 
       (testing "A filter rule works"
         (let [senior-db  @(fluree/stage
-                            db0
-                            {"insert" [senior-rule]})
+                           db0
+                           {"insert" [senior-rule]})
               senior-db* @(fluree/reason senior-db :datalog)
 
               seniors    @(fluree/query
-                            senior-db* {:context {"ex" "http://example.org/"}
-                                        :select  "?s"
-                                        :where   {"@id"              "?s",
-                                                  "ex:seniorCitizen" true}})]
+                           senior-db* {:context {"ex" "http://example.org/"}
+                                       :select  "?s"
+                                       :where   {"@id"              "?s",
+                                                 "ex:seniorCitizen" true}})]
           (is (= ["ex:carol"]
                  seniors))
 
           (is (= 1 (fluree/reasoned-count senior-db*))
               "Only one reasoned triple should be added")))
 
-
       (testing "Inferring based on a relationship and IRI value"
         (let [brother-db  @(fluree/stage
-                             db0
-                             {"insert" [brother-rule]})
+                            db0
+                            {"insert" [brother-rule]})
               brother-db* @(fluree/reason brother-db :datalog)]
 
           (is (= #{["ex:mike" "ex:carol"] ;; <- explicitly set
                    ["ex:bob" "ex:brian"]} ;; <- inferred
                  (-> @(fluree/query
-                        brother-db*
-                        {:context {"ex" "http://example.org/"}
-                         :select  ["?brother" "?s"]
-                         :where   {"@id"        "?s",
-                                   "ex:brother" "?brother"}})
+                       brother-db*
+                       {:context {"ex" "http://example.org/"}
+                        :select  ["?brother" "?s"]
+                        :where   {"@id"        "?s",
+                                  "ex:brother" "?brother"}})
                      set)))
 
           (is (= 1 (fluree/reasoned-count brother-db*))
@@ -216,7 +213,6 @@
           rule-ledger-2 @(fluree/create conn "reasoner/rule-ledger-2")
           rule-db-2     @(fluree/stage (fluree/db rule-ledger-2) {"insert" [aunt-rule]})]
 
-
       (testing "multiple graphs as rule sources"
         (let [half-reasoned-db @(fluree/reason db0 :datalog [aunt-rule])
               full-reasoned-db @(fluree/reason db0 :datalog [uncle-rule aunt-rule])]
@@ -245,7 +241,7 @@
                                                   :where   {"@id"     "?s",
                                                             "ex:aunt" "?aunt"}}))
               "With only the uncle-rule, no results are returned.")
-          
+
           (is (= [["ex:brian" "ex:holly"] ["ex:brian" "ex:janine"]]
                  @(fluree/query full-reasoned-db {:context {"ex" "http://example.org/"}
                                                   :select  ["?s" "?aunt"]
@@ -280,11 +276,10 @@
                                                                            "ex:grandParent" "?grandParent"}}))
                    (= [["ex:brian" "ex:cheryl"]]
                       @(fluree/query alt-rule-last-reasoned-db {:context {"ex" "http://example.org/"}
-                                                                 :select  ["?s" "?grandParent"]
-                                                                 :where   {"@id"            "?s",
-                                                                           "ex:grandParent" "?grandParent"}})))
+                                                                :select  ["?s" "?grandParent"]
+                                                                :where   {"@id"            "?s",
+                                                                          "ex:grandParent" "?grandParent"}})))
               "Rules are deduplicated and used in reasoning"))))))
-
 
 (def has-subtask-rule
   {"@context" {"f"  "https://ns.flur.ee/ledger#"
@@ -296,7 +291,6 @@
                                    "ex:hasImmediateSubTask" "?sub-task"}
                        "insert"   {"@id"           "?task",
                                    "ex:hasSubTask" {"@id" "?sub-task"}}}}})
-
 
 (def has-subtask-transitive
   {"@context" {"f"  "https://ns.flur.ee/ledger#"
@@ -314,38 +308,35 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "reasoner/recursive-datalog" nil)
           db0    @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" {"ex" "http://example.org/"}
-                     "insert"   [{"@id"                    "ex:task1"
-                                  "ex:description"         "Task 1 (Top Level)"
-                                  "ex:hasImmediateSubTask" [{"@id" "ex:task1-1"}
-                                                            {"@id" "ex:task1-2"}]}
-                                 {"@id"                    "ex:task1-1"
-                                  "ex:description"         "Task 1-1 (Second Level)"
-                                  "ex:hasImmediateSubTask" [{"@id" "ex:task1-1-1"}
-                                                            {"@id" "ex:task1-1-2"}]}
-                                 {"@id"                    "ex:task1-2"
-                                  "ex:description"         "Task 1-2 (Second Level)"
-                                  "ex:hasImmediateSubTask" [{"@id" "ex:task1-2-1"}
-                                                            {"@id" "ex:task1-2-2"}]}
-                                 {"@id"                    "ex:task1-1-1"
-                                  "ex:description"         "Task 1-1-1 (Third Level)"
-                                  "ex:hasImmediateSubTask" [{"@id" "ex:task1-1-1-1"}
-                                                            {"@id" "ex:task1-1-1-2"}
-                                                            {"@id" "ex:task1-1-1-3"}]}
-                                 {"@id"                    "ex:task1-1-2"
-                                  "ex:description"         "Task 1-1-2 (Third Level)"
-                                  "ex:hasImmediateSubTask" [{"@id" "ex:task1-1-2-1"}
-                                                            {"@id" "ex:task1-1-2-2"}]}]})]
-
+                   (fluree/db ledger)
+                   {"@context" {"ex" "http://example.org/"}
+                    "insert"   [{"@id"                    "ex:task1"
+                                 "ex:description"         "Task 1 (Top Level)"
+                                 "ex:hasImmediateSubTask" [{"@id" "ex:task1-1"}
+                                                           {"@id" "ex:task1-2"}]}
+                                {"@id"                    "ex:task1-1"
+                                 "ex:description"         "Task 1-1 (Second Level)"
+                                 "ex:hasImmediateSubTask" [{"@id" "ex:task1-1-1"}
+                                                           {"@id" "ex:task1-1-2"}]}
+                                {"@id"                    "ex:task1-2"
+                                 "ex:description"         "Task 1-2 (Second Level)"
+                                 "ex:hasImmediateSubTask" [{"@id" "ex:task1-2-1"}
+                                                           {"@id" "ex:task1-2-2"}]}
+                                {"@id"                    "ex:task1-1-1"
+                                 "ex:description"         "Task 1-1-1 (Third Level)"
+                                 "ex:hasImmediateSubTask" [{"@id" "ex:task1-1-1-1"}
+                                                           {"@id" "ex:task1-1-1-2"}
+                                                           {"@id" "ex:task1-1-1-3"}]}
+                                {"@id"                    "ex:task1-1-2"
+                                 "ex:description"         "Task 1-1-2 (Third Level)"
+                                 "ex:hasImmediateSubTask" [{"@id" "ex:task1-1-2-1"}
+                                                           {"@id" "ex:task1-1-2-2"}]}]})]
 
       (testing "A recursive relationship"
         (let [db1  @(fluree/stage
-                      db0
-                      {"insert" [has-subtask-rule has-subtask-transitive]})
+                     db0
+                     {"insert" [has-subtask-rule has-subtask-transitive]})
               db1* @(fluree/reason db1 :datalog)]
-
-
 
           (is (= ["ex:task1-1"
                   "ex:task1-1-1"
@@ -359,10 +350,10 @@
                   "ex:task1-2-1"
                   "ex:task1-2-2"]
                  (-> @(fluree/query
-                        db1* {:context {"ex" "http://example.org/"}
-                              :select  "?subtask"
-                              :where   {"@id"           "ex:task1",
-                                        "ex:hasSubTask" "?subtask"}})
+                       db1* {:context {"ex" "http://example.org/"}
+                             :select  "?subtask"
+                             :where   {"@id"           "ex:task1",
+                                       "ex:hasSubTask" "?subtask"}})
                      sort
                      vec))
               "Subtasks from every level should show at top level"))))))

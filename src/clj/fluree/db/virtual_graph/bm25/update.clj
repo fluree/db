@@ -1,9 +1,9 @@
 (ns fluree.db.virtual-graph.bm25.update
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
-            [fluree.db.virtual-graph.bm25.stemmer :as stm]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph.bm25.stemmer :as stm]))
 
 (set! *warn-on-reflection* true)
 
@@ -106,9 +106,9 @@
           item-count* (dec item-count)
           avg-length* (/ total-len* item-count*)]
       (assoc index :terms terms*
-                   :avg-length avg-length*
-                   :item-count item-count*
-                   :vectors vectors*))
+             :avg-length avg-length*
+             :item-count item-count*
+             :vectors vectors*))
     index))
 
 (defn update-terms
@@ -146,10 +146,10 @@
         [terms* dimensions*] (update-terms terms dimensions id terms-distinct)
         item-vec       (vectorize-item terms* term-freq)]
     (assoc index :terms terms*
-                 :dimensions dimensions*
-                 :avg-length avg-length*
-                 :item-count item-count*
-                 :vectors (assoc vectors id item-vec))))
+           :dimensions dimensions*
+           :avg-length avg-length*
+           :item-count item-count*
+           :vectors (assoc vectors id item-vec))))
 
 (defn upsert-items
   "Asserts items into the bm25 index, returns updated state.

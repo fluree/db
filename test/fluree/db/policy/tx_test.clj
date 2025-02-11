@@ -1,7 +1,7 @@
 (ns fluree.db.policy.tx-test
   (:require [clojure.test :refer :all]
-            [fluree.db.did :as did]
             [fluree.db.api :as fluree]
+            [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
@@ -94,7 +94,6 @@
              (ex-message alice-not-allowed)))
 
       (is (not (util/exception? john-allowed))))))
-
 
 (deftest ^:integration class-policy-tx-enforcement
   (testing "Restrict an entire class for modification"

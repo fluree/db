@@ -4,14 +4,14 @@
   (:refer-clojure :exclude [format])
   (:require [clojure.core.async :as async :refer [<! >! chan go go-loop]]
             [fluree.db.constants :as const]
-            [fluree.db.query.exec.eval :as-alias eval]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.query.exec.select.subject :as subject]
-            [fluree.db.util.core :as util :refer [catch* try*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.json-ld :as json-ld]
             [fluree.db.datatype :as datatype]
-            [fluree.db.util.json :as json]))
+            [fluree.db.query.exec.eval :as-alias eval]
+            [fluree.db.query.exec.select.subject :as subject]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.core :as util :refer [catch* try*]]
+            [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -58,8 +58,8 @@
               (get var)
               (display compact))
           (catch* e
-                  (log/error e "Error formatting variable:" var)
-                  (>! error-ch e)))))
+            (log/error e "Error formatting variable:" var)
+            (>! error-ch e)))))
   ValueAdapter
   (solution-value
     [_ _ solution]
@@ -84,8 +84,8 @@
               (recur vars (assoc result var display-var)))
             result))
         (catch* e
-                (log/error e "Error formatting wildcard")
-                (>! error-ch e)))))
+          (log/error e "Error formatting wildcard")
+          (>! error-ch e)))))
   ValueAdapter
   (solution-value
     [_ _ solution]
@@ -102,8 +102,8 @@
     [_ _ _ _ _ _ error-ch solution]
     (go (try* (:value (agg-fn solution))
               (catch* e
-                      (log/error e "Error applying aggregate selector")
-                      (>! error-ch e))))))
+                (log/error e "Error applying aggregate selector")
+                (>! error-ch e))))))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
@@ -168,10 +168,10 @@
         modifying-selectors (filter #(satisfies? SolutionModifier %) (util/sequential selectors))
         mods-xf             (map (fn [solution]
                                    (reduce
-                                     (fn [sol sel]
-                                       (log/trace "Updating solution:" sol)
-                                       (update-solution sel sol))
-                                     solution modifying-selectors)))
+                                    (fn [sol sel]
+                                      (log/trace "Updating solution:" sol)
+                                      (update-solution sel sol))
+                                    solution modifying-selectors)))
         modify-ch               (chan 1 mods-xf)]
     (async/pipe solution-ch modify-ch)))
 

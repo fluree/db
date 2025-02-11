@@ -2,15 +2,15 @@
   (:require [clojure.core.async :as async :refer [>! go]]
             [clojure.set :as set]
             [clojure.string :as str]
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
-            [fluree.db.fuel :as fuel]
             [fluree.db.flake.index :as index]
+            [fluree.db.fuel :as fuel]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.datatype :as datatype]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.constants :as const]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))
 
@@ -453,8 +453,8 @@
 
         idx         (try* (index/for-components s p o o-dt)
                           (catch* e
-                                  (log/error e "Error resolving flake range")
-                                  (async/put! error-ch e)))
+                            (log/error e "Error resolving flake range")
+                            (async/put! error-ch e)))
         [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
         start-flake (flake/create s p o* o-dt nil nil util/min-integer)
         end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
@@ -476,15 +476,14 @@
                                     (match-object db f)
                                     o-fn*))))
         flake-xf    (->> [subj-filter pred-filter obj-filter track-fuel]
-                        (remove nil?)
-                        (apply comp))
+                         (remove nil?)
+                         (apply comp))
         opts        {:idx         idx
                      :to-t        t
                      :start-flake start-flake
                      :end-flake   end-flake
                      :flake-xf    flake-xf}]
     (query-range/resolve-flake-slices db idx error-ch opts)))
-
 
 (defn compute-sid
   [s-mch db]
@@ -707,9 +706,9 @@
                     (let [matches (not-empty (select-keys solution* (keys inline-solution)))]
                       (or
                         ;; no overlapping matches
-                        (nil? matches)
+                       (nil? matches)
                         ;; matches are the same
-                        (= matches (update-vals inline-solution match-identity))))))
+                       (= matches (update-vals inline-solution match-identity))))))
          (mapv (fn [inline-solution]
                  (let [existing-vars (set (keys solution))
                        inline-vars   (set (keys inline-solution))

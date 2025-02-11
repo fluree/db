@@ -42,48 +42,48 @@
               "No exceptions should be thrown when reasoning with the entire ontology"))))))
 
 #_(deftest ^:integration owl-gist-account
-  (testing "gist:Account description described in owl with owl2rl reasoning"
-    (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "reasoner/owl-equiv" nil)
-          db-base   @(fluree/stage (fluree/db ledger)
-                                   {"@context" {"ex"   "http://example.org/"
-                                                "gist" "https://ontologies.semanticarts.com/gist/"}
-                                    "insert"   [{"@id"               "ex:is-account"
-                                                 "@type"             "gist:Agreement"
-                                                 "gist:hasMagnitude" []}]})
+    (testing "gist:Account description described in owl with owl2rl reasoning"
+      (let [conn      (test-utils/create-conn)
+            ledger    @(fluree/create conn "reasoner/owl-equiv" nil)
+            db-base   @(fluree/stage (fluree/db ledger)
+                                     {"@context" {"ex"   "http://example.org/"
+                                                  "gist" "https://ontologies.semanticarts.com/gist/"}
+                                      "insert"   [{"@id"               "ex:is-account"
+                                                   "@type"             "gist:Agreement"
+                                                   "gist:hasMagnitude" []}]})
 
-          db-reason @(fluree/reason db-base :owl2rl
-                                    [{"@context"            {"gist" "https://w3id.org/semanticarts/ns/ontology/gist/",
-                                                             "rdf"  "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-                                                             "owl"  "http://www.w3.org/2002/07/owl#",
-                                                             "skos" "http://www.w3.org/2004/02/skos/core#",
-                                                             "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                      "@id"                 "gist:GeoSegment",
-                                      "@type"               "owl:Class",
-                                      "rdfs:subClassOf"     {"@id" "gist:Place"},
-                                      "rdfs:isDefinedBy"    {"@id" "https://w3id.org/semanticarts/ontology/gistCore"},
-                                      "owl:equivalentClass" {"@type"              "owl:Class",
-                                                             "owl:intersectionOf" {"@list" [{"@type"                    "owl:Restriction",
-                                                                                             "owl:onProperty"           {"@id" "gist:comesFromPlace"},
-                                                                                             "owl:onClass"              {"@id" "gist:GeoPoint"},
-                                                                                             "owl:qualifiedCardinality" {"@type"  "xsd:nonNegativeInteger",
-                                                                                                                         "@value" "1"}}
-                                                                                            {"@type"                    "owl:Restriction",
-                                                                                             "owl:onProperty"           {"@id" "gist:goesToPlace"},
-                                                                                             "owl:onClass"              {"@id" "gist:GeoPoint"},
-                                                                                             "owl:qualifiedCardinality" {"@type"  "xsd:nonNegativeInteger",
-                                                                                                                         "@value" "1"}}]}},
-                                      "skos:definition"     {"@type"  "xsd:string",
-                                                             "@value" "A single portion of a GeoRegion which has been divided (i.e., segmented)."},
-                                      "skos:prefLabel"      {"@type" "xsd:string", "@value" "Geo Segment"}}])]
+            db-reason @(fluree/reason db-base :owl2rl
+                                      [{"@context"            {"gist" "https://w3id.org/semanticarts/ns/ontology/gist/",
+                                                               "rdf"  "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                                               "owl"  "http://www.w3.org/2002/07/owl#",
+                                                               "skos" "http://www.w3.org/2004/02/skos/core#",
+                                                               "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                        "@id"                 "gist:GeoSegment",
+                                        "@type"               "owl:Class",
+                                        "rdfs:subClassOf"     {"@id" "gist:Place"},
+                                        "rdfs:isDefinedBy"    {"@id" "https://w3id.org/semanticarts/ontology/gistCore"},
+                                        "owl:equivalentClass" {"@type"              "owl:Class",
+                                                               "owl:intersectionOf" {"@list" [{"@type"                    "owl:Restriction",
+                                                                                               "owl:onProperty"           {"@id" "gist:comesFromPlace"},
+                                                                                               "owl:onClass"              {"@id" "gist:GeoPoint"},
+                                                                                               "owl:qualifiedCardinality" {"@type"  "xsd:nonNegativeInteger",
+                                                                                                                           "@value" "1"}}
+                                                                                              {"@type"                    "owl:Restriction",
+                                                                                               "owl:onProperty"           {"@id" "gist:goesToPlace"},
+                                                                                               "owl:onClass"              {"@id" "gist:GeoPoint"},
+                                                                                               "owl:qualifiedCardinality" {"@type"  "xsd:nonNegativeInteger",
+                                                                                                                           "@value" "1"}}]}},
+                                        "skos:definition"     {"@type"  "xsd:string",
+                                                               "@value" "A single portion of a GeoRegion which has been divided (i.e., segmented)."},
+                                        "skos:prefLabel"      {"@type" "xsd:string", "@value" "Geo Segment"}}])]
 
-      (is (= ["ex:is-account"]
-             @(fluree/query db-reason {:context {"gist" "https://ontologies.semanticarts.com/gist/"
-                                                 "ex"   "http://example.org/"}
-                                       :select  "?id"
-                                       :where   {"@id"   "?id"
-                                                 "@type" "gist:Account"}}))
-          "ex:doc-commitment is both @type = gist:Commitment with a gist:hasParty value of @type = gist:Person"))))
+        (is (= ["ex:is-account"]
+               @(fluree/query db-reason {:context {"gist" "https://ontologies.semanticarts.com/gist/"
+                                                   "ex"   "http://example.org/"}
+                                         :select  "?id"
+                                         :where   {"@id"   "?id"
+                                                   "@type" "gist:Account"}}))
+            "ex:doc-commitment is both @type = gist:Commitment with a gist:hasParty value of @type = gist:Person"))))
 
 (deftest ^:integration owl-gist-agreement
   (testing "gist:Agreement description described in owl with owl2rl reasoning"
@@ -127,7 +127,7 @@
                                                              "@value" "Something which two or more People or Organizations mutually commit to do."}
                                       "skos:prefLabel"      {"@type"  "xsd:string"
                                                              "@value" "Agreement"}}])]
-      
+
       (is (= ["ex:doc-commitment"]
              @(fluree/query db-reason {:context {"gist" "https://ontologies.semanticarts.com/gist/"
                                                  "ex"   "http://example.org/"}
@@ -135,7 +135,6 @@
                                        :where   {"@id"   "?id"
                                                  "@type" "gist:Agreement"}}))
           "ex:doc-commitment is both @type = gist:Commitment with a gist:hasParty value of @type = gist:Person"))))
-
 
 (deftest ^:integration owl-gist-baseunit
   (testing "gist:BaseUnit description described in owl with owl2rl reasoning"
@@ -172,7 +171,7 @@
                                                              "@value" "A primitive unit that cannot be decomposed into other units. It can be converted from one measurement system to another.  The base units in gist are the seven primitive units from the System Internationale (SI): (meter, second, kilogram, ampere, kelvin, mole, candela), plus three convenience ones: each. bit and usDollar."}
                                       "skos:prefLabel"      {"@type"  "xsd:string"
                                                              "@value" "Base Unit"}}])]
-      
+
       (is (= #{"gist:_USDollar", "gist:_ampere", "gist:_bit", "gist:_candela",
                "gist:_each", "gist:_kelvin", "gist:_kilogram", "gist:_meter",
                "gist:_mole", "gist:_second"}

@@ -1,12 +1,12 @@
 (ns fluree.db.test-utils
-  (:require [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]
+  (:require #?@(:cljs [[clojure.core.async.interop :refer [<p!]]])
+            [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]
             [clojure.string :as str]
-            [fluree.db.did :as did]
             [fluree.db.api :as fluree]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.did :as did]
             [fluree.db.json-ld.iri :as iri]
-            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]])))
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]))
 
 (def default-context
   {:id     "@id"
@@ -97,7 +97,7 @@
     :schema/email "alice@example.org"
     :schema/age   50
     :ex/favNums   [42, 76, 9]
-    :schema/birthDate { "@value" "1974-09-26" "@type" :xsd/date}}
+    :schema/birthDate {"@value" "1974-09-26" "@type" :xsd/date}}
    {:id           :ex/cam,
     :type         :ex/User,
     :schema/name  "Cam"
@@ -112,7 +112,7 @@
     :schema/age   13
     :ex/favNums   [42, 11]
     :ex/friend    [:ex/brian :ex/alice :ex/cam]
-    :schema/birthDate { "@value" "2011-09-26" "@type" :xsd/date }}])
+    :schema/birthDate {"@value" "2011-09-26" "@type" :xsd/date}}])
 
 (def people-strings
   [{"@id"           "ex:brian",
@@ -184,11 +184,11 @@
   [pwrapped max-attempts & [retry-on-false?]]
   (#?(:clj loop, :cljs go-loop) [attempt 0]
     (let [res' (try*
-                (let [res (#?(:clj deref, :cljs <p!) (pwrapped))]
-                  (if (util/exception? res)
-                    (throw res)
-                    res))
-                (catch* e e))]
+                 (let [res (#?(:clj deref, :cljs <p!) (pwrapped))]
+                   (if (util/exception? res)
+                     (throw res)
+                     res))
+                 (catch* e e))]
       (if (= (inc attempt) max-attempts)
         (if (util/exception? res')
           (throw res')

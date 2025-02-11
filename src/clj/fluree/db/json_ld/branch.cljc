@@ -1,13 +1,13 @@
 (ns fluree.db.json-ld.branch
-  (:require [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.indexer :as indexer]
-            [fluree.json-ld :as json-ld]
+  (:require [clojure.core.async :as async :refer [<! go-loop]]
             [fluree.db.async-db :as async-db]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.indexer :as indexer]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [clojure.core.async :as async :refer [<! go-loop]]
-            [fluree.db.nameservice :as nameservice]))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

@@ -1,11 +1,11 @@
 (ns fluree.db.json-ld.policy.modify
   (:require [fluree.db.constants :as const]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [fluree.db.json-ld.policy.enforce :as enforce]
-            [fluree.db.json-ld.policy.rules :as policy.rules]))
+            [fluree.db.json-ld.policy.rules :as policy.rules]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

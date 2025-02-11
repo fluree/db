@@ -1,10 +1,10 @@
 (ns fluree.db.query.index-range-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
             [fluree.db.api :as fluree]
-            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.constants :as const]))
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration index-range-scans
   (testing "Various index range scans using the API."
@@ -12,28 +12,28 @@
           ledger  @(fluree/create conn "query/index-range")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db      @(fluree/stage
-                     (fluree/db ledger)
-                     {"@context" ["https://ns.flur.ee" context]
-                      "insert"
-                      [{:id           :ex/brian,
-                        :type         :ex/User,
-                        :schema/name  "Brian"
-                        :schema/email "brian@example.org"
-                        :schema/age   50
-                        :ex/favNums   7}
-                       {:id           :ex/alice,
-                        :type         :ex/User,
-                        :schema/name  "Alice"
-                        :schema/email "alice@example.org"
-                        :schema/age   50
-                        :ex/favNums   [42, 76, 9]}
-                       {:id           :ex/cam,
-                        :type         :ex/User,
-                        :schema/name  "Cam"
-                        :schema/email "cam@example.org"
-                        :schema/age   34
-                        :ex/favNums   [5, 10]
-                        :ex/friend    [:ex/brian :ex/alice]}]})
+                    (fluree/db ledger)
+                    {"@context" ["https://ns.flur.ee" context]
+                     "insert"
+                     [{:id           :ex/brian,
+                       :type         :ex/User,
+                       :schema/name  "Brian"
+                       :schema/email "brian@example.org"
+                       :schema/age   50
+                       :ex/favNums   7}
+                      {:id           :ex/alice,
+                       :type         :ex/User,
+                       :schema/name  "Alice"
+                       :schema/email "alice@example.org"
+                       :schema/age   50
+                       :ex/favNums   [42, 76, 9]}
+                      {:id           :ex/cam,
+                       :type         :ex/User,
+                       :schema/name  "Cam"
+                       :schema/email "cam@example.org"
+                       :schema/age   34
+                       :ex/favNums   [5, 10]
+                       :ex/friend    [:ex/brian :ex/alice]}]})
           cam-iri (fluree/expand-iri context :ex/cam)
           cam-sid (fluree/encode-iri db cam-iri)]
 

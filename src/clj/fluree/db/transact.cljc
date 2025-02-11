@@ -1,8 +1,8 @@
 (ns fluree.db.transact
-  (:require [fluree.db.util.async :refer [<? go-try]]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.constants :as const]))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -21,8 +21,8 @@
                                     (fn [v]
                                       ;; remove value objects unless they have type @id
                                       (and
-                                        (some? (:value v))
-                                        (not= (:type v) const/iri-id)))))))
+                                       (some? (:value v))
+                                       (not= (:type v) const/iri-id)))))))
        not-empty))
 
 (defn extract-annotation

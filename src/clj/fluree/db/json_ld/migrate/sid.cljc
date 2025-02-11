@@ -2,18 +2,18 @@
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.db.async-db :as async-db]
+            [fluree.db.commit.storage :as commit-storage]
+            [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
             [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.ledger :as ledger]
-            [fluree.db.connection :as connection]
             [fluree.db.query.exec.update :as update]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-id get-first-id get-first-value]]
-            [fluree.db.util.log :as log]
-            [fluree.db.commit.storage :as commit-storage]))
+            [fluree.db.util.log :as log]))
 
 (defrecord NamespaceMapping [mapping]
   iri/IRICodec
@@ -86,11 +86,11 @@
                                          issuer-flakes (into issuer-flakes)
                                          message-flakes (into message-flakes)))
           tx-state           (flake.transact/->tx-state
-                               :db db
-                               :txn (get-first-value commit const/iri-txn)
-                               :author (let [author (get-first-value commit const/iri-author)]
-                                         (when-not (str/blank? author) author))
-                               :annotation (get-first-value commit const/iri-annotation))
+                              :db db
+                              :txn (get-first-value commit const/iri-txn)
+                              :author (let [author (get-first-value commit const/iri-author)]
+                                        (when-not (str/blank? author) author))
+                              :annotation (get-first-value commit const/iri-annotation))
           staged-db          (-> (<? (flake.transact/final-db db all-flakes tx-state))
                                  :db-after
                                  (set-namespaces ns-mapping))

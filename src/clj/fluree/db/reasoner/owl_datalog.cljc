@@ -1,6 +1,6 @@
 (ns fluree.db.reasoner.owl-datalog
-  (:require [fluree.db.json-ld.iri :as iri]
-            [fluree.db.constants :as const]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
@@ -196,32 +196,32 @@
 (defmethod to-datalog ::prp-spo2
   [_ _ owl-statement all-rules]
   (try*
-   (let [prop    (util/get-id owl-statement)
-         p-chain (get-named-ids owl-statement const/iri-owl:propertyChainAxiom)
-         where   (->> p-chain
-                      (map-indexed (fn [idx p-n]
-                                     (if p-n
-                                       {"@id" (str "?u" idx)
-                                        p-n   (str "?u" (inc idx))}
-                                       (throw
-                                        (ex-info
-                                         (str "propertyChainAxiom for property: "
-                                              prop " - should only contain IRIs however "
-                                              "it appears to contain at least one scalar value "
-                                              "(e.g. a string or number)")
-                                         {:owl-statement owl-statement})))))
-                      (into []))
-         rule    {"where"  where
-                  "insert" {"@id" "?u0"
-                            prop  (str "?u" (count p-chain))}}]
-     (when (empty? p-chain)
-       (throw (ex-info (str "propertyChainAxiom for property: " prop
-                            " - is not property defined. Value should be of "
-                            "type @list and it likely is defined as a set.")
-                       {:owl-statement owl-statement})))
-     (conj all-rules [(str prop "(owl:propertyChainAxiom)") rule]))
-   (catch* e (log/warn (str "Ignoring OWL rule " (ex-message e)))
-           all-rules)))
+    (let [prop    (util/get-id owl-statement)
+          p-chain (get-named-ids owl-statement const/iri-owl:propertyChainAxiom)
+          where   (->> p-chain
+                       (map-indexed (fn [idx p-n]
+                                      (if p-n
+                                        {"@id" (str "?u" idx)
+                                         p-n   (str "?u" (inc idx))}
+                                        (throw
+                                         (ex-info
+                                          (str "propertyChainAxiom for property: "
+                                               prop " - should only contain IRIs however "
+                                               "it appears to contain at least one scalar value "
+                                               "(e.g. a string or number)")
+                                          {:owl-statement owl-statement})))))
+                       (into []))
+          rule    {"where"  where
+                   "insert" {"@id" "?u0"
+                             prop  (str "?u" (count p-chain))}}]
+      (when (empty? p-chain)
+        (throw (ex-info (str "propertyChainAxiom for property: " prop
+                             " - is not property defined. Value should be of "
+                             "type @list and it likely is defined as a set.")
+                        {:owl-statement owl-statement})))
+      (conj all-rules [(str prop "(owl:propertyChainAxiom)") rule]))
+    (catch* e (log/warn (str "Ignoring OWL rule " (ex-message e)))
+            all-rules)))
 
 (defmethod to-datalog ::prp-inv
   [_ _ owl-statement all-rules]
@@ -238,7 +238,6 @@
     (-> all-rules
         (conj [(str inv-prop "(owl:inverseOf-1)") rule1])
         (conj [(str inv-prop "(owl:inverseOf-2)") rule2]))))
-
 
 (defn equiv-class-rules
   "Maps every class equivalence to every other class in the set"
@@ -507,8 +506,8 @@
      (let [intersections (util/unwrap-list (get intersection-of-statement const/iri-owl:intersectionOf))
            {:keys [classes has-value some-values qual-cardinality]} (group-by equiv-class-type intersections)
            restrictions  (cond->> []
-                                  has-value (into (has-value-condition "?y" has-value))
-                                  some-values (into (some-values-condition "?y" some-values)))
+                           has-value (into (has-value-condition "?y" has-value))
+                           some-values (into (some-values-condition "?y" some-values)))
            class-list    (only-named-ids classes)
            cls-int1      (when (or (seq class-list)
                                    (seq restrictions))
@@ -542,8 +541,8 @@
          (swap! inserts assoc (str rule-class "(owl:intersectionOf-subclass)") triples))
 
        (cond-> acc
-               cls-int1 (conj [(str rule-class "(owl:intersectionOf-1)#" (hash class-list)) cls-int1])
-               cls-int2 (conj [(str rule-class "(owl:intersectionOf-2)#" (hash class-list)) cls-int2]))))
+         cls-int1 (conj [(str rule-class "(owl:intersectionOf-1)#" (hash class-list)) cls-int1])
+         cls-int2 (conj [(str rule-class "(owl:intersectionOf-2)#" (hash class-list)) cls-int2]))))
    []
    intersection-of-statements))
 
@@ -555,7 +554,7 @@
      (let [unions            (util/unwrap-list (get union-of-statement const/iri-owl:unionOf))
            {:keys [classes has-value]} (group-by equiv-class-type unions)
            restrictions      (cond->> []
-                                      has-value (into (has-value-condition "?y" has-value)))
+                               has-value (into (has-value-condition "?y" has-value)))
            restriction-rules (map (fn [where]
                                     [(str rule-class "(owl:unionOf->owl:hasValue)#" (hash where))
                                      {"where"  where
@@ -615,15 +614,15 @@
                                                             util/unwrap-list
                                                             (group-by equiv-class-type))]
     (cond-> all-rules
-            classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
-            intersection-of (into (equiv-intersection-of c1 intersection-of inserts)) ;; cls-int1, cls-int2, scm-int
-            union-of (into (equiv-union-of c1 union-of inserts)) ;; cls-uni, scm-uni
-            one-of (into (equiv-one-of c1 one-of inserts)) ;; cls-oo
-            has-value (into (equiv-has-value c1 has-value)) ;; cls-hv1, cls-hv1
-            some-values (into (equiv-some-values c1 some-values)) ;; cls-svf1, cls-svf2
-            all-values (into (equiv-all-values c1 all-values)) ;; cls-svf1, cls-svf2
-            max-cardinality (into (equiv-max-cardinality c1 max-cardinality)) ;; cls-maxc2
-            max-qual-cardinality (into (equiv-max-qual-cardinality c1 max-qual-cardinality))))) ;; cls-maxqc3, cls-maxqc4
+      classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
+      intersection-of (into (equiv-intersection-of c1 intersection-of inserts)) ;; cls-int1, cls-int2, scm-int
+      union-of (into (equiv-union-of c1 union-of inserts)) ;; cls-uni, scm-uni
+      one-of (into (equiv-one-of c1 one-of inserts)) ;; cls-oo
+      has-value (into (equiv-has-value c1 has-value)) ;; cls-hv1, cls-hv1
+      some-values (into (equiv-some-values c1 some-values)) ;; cls-svf1, cls-svf2
+      all-values (into (equiv-all-values c1 all-values)) ;; cls-svf1, cls-svf2
+      max-cardinality (into (equiv-max-cardinality c1 max-cardinality)) ;; cls-maxc2
+      max-qual-cardinality (into (equiv-max-qual-cardinality c1 max-qual-cardinality))))) ;; cls-maxqc3, cls-maxqc4
 
 ;; rdfs:subClassOf
 (defmethod to-datalog ::cax-sco
@@ -665,8 +664,7 @@
   (throw (ex-info "Unsupported OWL statement" {:owl-statement owl-statement})))
 
 (def base-rules
-  [
-   ;; eq-sym, eq-trans, eq-rep-s covered by below rule
+  [;; eq-sym, eq-trans, eq-rep-s covered by below rule
    [(str const/iri-owl:sameAs "(eq)")
     {"where"  [{"@id"                "?s"
                 const/iri-owl:sameAs "?s'"}
@@ -711,56 +709,55 @@
             {}
             types)))
 
-
 (defn statement->datalog
   [inserts owl-statement]
   (try*
-   (let [{:keys [functional-property? inverse-functional-property?
-                 symetric-property? transitive-property?]} (property-types owl-statement)]
-     (cond
-       (contains? owl-statement const/iri-owl:sameAs) ;; TODO - can probably take this out of multi-fn
-       (to-datalog ::eq-sym inserts owl-statement [])
+    (let [{:keys [functional-property? inverse-functional-property?
+                  symetric-property? transitive-property?]} (property-types owl-statement)]
+      (cond
+        (contains? owl-statement const/iri-owl:sameAs) ;; TODO - can probably take this out of multi-fn
+        (to-datalog ::eq-sym inserts owl-statement [])
 
-       :else
-       (cond->> []
-                (contains? owl-statement const/iri-rdfs:domain)
-                (to-datalog ::prp-dom inserts owl-statement)
+        :else
+        (cond->> []
+          (contains? owl-statement const/iri-rdfs:domain)
+          (to-datalog ::prp-dom inserts owl-statement)
 
-                (contains? owl-statement const/iri-rdfs:range)
-                (to-datalog ::prp-rng inserts owl-statement)
+          (contains? owl-statement const/iri-rdfs:range)
+          (to-datalog ::prp-rng inserts owl-statement)
 
-                (contains? owl-statement const/iri-rdfs:subPropertyOf)
-                (to-datalog ::prp-spo1 inserts owl-statement)
+          (contains? owl-statement const/iri-rdfs:subPropertyOf)
+          (to-datalog ::prp-spo1 inserts owl-statement)
 
-                (contains? owl-statement const/iri-owl:propertyChainAxiom)
-                (to-datalog ::prp-spo2 inserts owl-statement)
+          (contains? owl-statement const/iri-owl:propertyChainAxiom)
+          (to-datalog ::prp-spo2 inserts owl-statement)
 
-                (contains? owl-statement const/iri-owl:inverseOf)
-                (to-datalog ::prp-inv inserts owl-statement)
+          (contains? owl-statement const/iri-owl:inverseOf)
+          (to-datalog ::prp-inv inserts owl-statement)
 
-                (contains? owl-statement const/iri-owl:hasKey)
-                (to-datalog ::prp-key inserts owl-statement)
+          (contains? owl-statement const/iri-owl:hasKey)
+          (to-datalog ::prp-key inserts owl-statement)
 
-                (contains? owl-statement const/iri-rdfs:subClassOf)
-                (to-datalog ::cax-sco inserts owl-statement)
+          (contains? owl-statement const/iri-rdfs:subClassOf)
+          (to-datalog ::cax-sco inserts owl-statement)
 
-                (contains? owl-statement const/iri-owl:equivalentClass)
-                (to-datalog ::cax-eqc inserts owl-statement)
+          (contains? owl-statement const/iri-owl:equivalentClass)
+          (to-datalog ::cax-eqc inserts owl-statement)
 
-                functional-property?
-                (to-datalog ::prp-fp inserts owl-statement)
+          functional-property?
+          (to-datalog ::prp-fp inserts owl-statement)
 
-                inverse-functional-property?
-                (to-datalog ::prp-ifp inserts owl-statement)
+          inverse-functional-property?
+          (to-datalog ::prp-ifp inserts owl-statement)
 
-                symetric-property?
-                (to-datalog ::prp-symp inserts owl-statement)
+          symetric-property?
+          (to-datalog ::prp-symp inserts owl-statement)
 
-                transitive-property?
-                (to-datalog ::prp-trp inserts owl-statement))))
-   (catch* e
-           (log/error e (str "Error processing OWL statement: " owl-statement " - skipping!"))
-           [])))
+          transitive-property?
+          (to-datalog ::prp-trp inserts owl-statement))))
+    (catch* e
+      (log/error e (str "Error processing OWL statement: " owl-statement " - skipping!"))
+      [])))
 
 (defn owl->datalog
   [inserts owl-graph]

@@ -9,23 +9,23 @@
           ledger @(fluree/create conn "stable-commit-id")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db0    @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee" context]
-                     "insert"
-                     [{:id           :ex/alice
-                       :type         :ex/User
-                       :schema/name  "Alice"
-                       :schema/email "alice@flur.ee"
-                       :schema/age   42}
-                      {:id          :ex/bob,
-                       :type        :ex/User,
-                       :schema/name "Bob"
-                       :schema/age  22}
-                      {:id           :ex/jane,
-                       :type         :ex/User,
-                       :schema/name  "Jane"
-                       :schema/email "jane@flur.ee"
-                       :schema/age   30}]})
+                   (fluree/db ledger)
+                   {"@context" ["https://ns.flur.ee" context]
+                    "insert"
+                    [{:id           :ex/alice
+                      :type         :ex/User
+                      :schema/name  "Alice"
+                      :schema/email "alice@flur.ee"
+                      :schema/age   42}
+                     {:id          :ex/bob,
+                      :type        :ex/User,
+                      :schema/name "Bob"
+                      :schema/age  22}
+                     {:id           :ex/jane,
+                      :type         :ex/User,
+                      :schema/name  "Jane"
+                      :schema/email "jane@flur.ee"
+                      :schema/age   30}]})
           db1    @(fluree/commit! ledger db0)]
       (testing "stable commit id"
         (is (= "fluree:commit:sha256:bsclmgntysvjv4kfq223egs537wrcaj3jotgnd4tlrgravfq4xkd"

@@ -1,8 +1,8 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! go]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.query.exec :as exec]
             [fluree.db.query.fql.parse :as parse]
-            [fluree.db.query.exec :as exec])
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 

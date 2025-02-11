@@ -1,44 +1,44 @@
 (ns fluree.db.query.union-query-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.api :as fluree]))
+            [fluree.db.api :as fluree]
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration union-queries
   (testing "Testing various 'union' query clauses."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/union")
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee"
-                                 test-utils/default-context
-                                 {:ex "http://example.org/ns/"}]
-                     "insert"
-                     [{:id           :ex/brian,
-                       :type         :ex/User,
-                       :schema/name  "Brian"
-                       :ex/last      "Smith"
-                       :schema/email "brian@example.org"
-                       :schema/age   50
-                       :ex/favNums   7
-                       :ex/scores    [76 80 15]}
-                      {:id           :ex/alice,
-                       :type         :ex/User,
-                       :schema/name  "Alice"
-                       :ex/last      "Smith"
-                       :schema/email "alice@example.org"
-                       :ex/favColor  "Green"
-                       :schema/age   42
-                       :ex/favNums   [42, 76, 9]
-                       :ex/scores    [102 92.5 90]}
-                      {:id          :ex/cam,
-                       :type        :ex/User,
-                       :schema/name "Cam"
-                       :ex/last     "Jones"
-                       :ex/email    "cam@example.org"
-                       :schema/age  34
-                       :ex/favNums  [5, 10]
-                       :ex/scores   [97.2 100 80]
-                       :ex/friend   [:ex/brian :ex/alice]}]})]
+                   (fluree/db ledger)
+                   {"@context" ["https://ns.flur.ee"
+                                test-utils/default-context
+                                {:ex "http://example.org/ns/"}]
+                    "insert"
+                    [{:id           :ex/brian,
+                      :type         :ex/User,
+                      :schema/name  "Brian"
+                      :ex/last      "Smith"
+                      :schema/email "brian@example.org"
+                      :schema/age   50
+                      :ex/favNums   7
+                      :ex/scores    [76 80 15]}
+                     {:id           :ex/alice,
+                      :type         :ex/User,
+                      :schema/name  "Alice"
+                      :ex/last      "Smith"
+                      :schema/email "alice@example.org"
+                      :ex/favColor  "Green"
+                      :schema/age   42
+                      :ex/favNums   [42, 76, 9]
+                      :ex/scores    [102 92.5 90]}
+                     {:id          :ex/cam,
+                      :type        :ex/User,
+                      :schema/name "Cam"
+                      :ex/last     "Jones"
+                      :ex/email    "cam@example.org"
+                      :schema/age  34
+                      :ex/favNums  [5, 10]
+                      :ex/scores   [97.2 100 80]
+                      :ex/friend   [:ex/brian :ex/alice]}]})]
 
       ;; basic combine :schema/email and :ex/email into same result variable
       (is (= [["Alice" "alice@example.org"]

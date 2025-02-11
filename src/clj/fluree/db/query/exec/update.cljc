@@ -1,12 +1,12 @@
 (ns fluree.db.query.exec.update
-  (:require [fluree.db.flake :as flake]
+  (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.db.datatype :as datatype]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util.log :as log]
-            [clojure.core.async :as async]))
+            [fluree.db.util.log :as log]))
 
 (defn assign-clause
   [clause solution]

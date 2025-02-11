@@ -1,20 +1,20 @@
 (ns fluree.db.query.exec.eval
   (:refer-clojure :exclude [compile rand concat replace max min
                             #?(:clj ratio?) #?@(:cljs [uuid -count divide])])
-  (:require [fluree.db.query.exec.group :as group]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.vector.scoring :as score]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.json-ld.iri :as iri]
+  (:require [clojure.math :as math]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :as walk :refer [postwalk]]
-            [fluree.db.datatype :as datatype]
             [fluree.crypto :as crypto]
             [fluree.db.constants :as const]
-            [clojure.math :as math])
+            [fluree.db.datatype :as datatype]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec.group :as group]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]
+            [fluree.db.vector.scoring :as score]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.time LocalDateTime OffsetDateTime LocalDate OffsetTime LocalTime
                               ZoneId ZoneOffset))))
 
@@ -35,9 +35,9 @@
         res (/ (reduce + coll)
                (count coll))]
     (where/->typed-val
-      (if (ratio? res)
-        (double res)
-        res))))
+     (if (ratio? res)
+       (double res)
+       res))))
 
 (defn median
   [coll]
@@ -49,9 +49,9 @@
                 (-> (+ (nth terms (dec med)))
                     (/ 2)))]
     (where/->typed-val
-      (if (ratio? res)
-        (double res)
-        res))))
+     (if (ratio? res)
+       (double res)
+       res))))
 
 (defn variance
   [coll]
@@ -61,19 +61,19 @@
                     (* delta delta)))
         res  (/ (:value sum) (count coll))]
     (where/->typed-val
-      (if (ratio? res)
-        (double res)
-        res))))
+     (if (ratio? res)
+       (double res)
+       res))))
 
 (defn stddev
   [coll]
   (where/->typed-val
-    (Math/sqrt (:value (variance coll)))))
+   (Math/sqrt (:value (variance coll)))))
 
 (defn count-distinct
   [coll]
   (where/->typed-val
-    (count (distinct coll))))
+   (count (distinct coll))))
 
 (defn -count
   [coll]
@@ -177,17 +177,17 @@
   [{s :value} {substr :value}]
   (let [[before :as split] (str/split s (re-pattern substr))]
     (where/->typed-val
-      (if (> (count split) 1)
-        before
-        ""))))
+     (if (> (count split) 1)
+       before
+       ""))))
 
 (defn strAfter
   [{s :value} {substr :value}]
   (let [split (str/split s (re-pattern substr))]
     (where/->typed-val
-      (if (> (count split) 1)
-        (last split)
-        ""))))
+     (if (> (count split) 1)
+       (last split)
+       ""))))
 
 (defn concat
   [& strs]
@@ -256,7 +256,6 @@
 (def comparable-time-datatypes
   #{const/iri-xsd-dateTime
     const/iri-xsd-date})
-
 
 #?(:clj (defmulti ->offset-date-time #(when-let [t (#{OffsetDateTime LocalDateTime LocalDate} (type %))] t)))
 #?(:clj (defmethod ->offset-date-time OffsetDateTime [^OffsetDateTime datetime] datetime))
@@ -334,8 +333,8 @@
 (defn less-than-or-equal
   [a b]
   (where/->typed-val
-    (or (= a b)
-        (neg? (compare* a b)))))
+   (or (= a b)
+       (neg? (compare* a b)))))
 
 (defn greater-than
   [a b]
@@ -344,8 +343,8 @@
 (defn greater-than-or-equal
   [a b]
   (where/->typed-val
-    (or (= a b)
-        (pos? (compare* a b)))))
+   (or (= a b)
+       (pos? (compare* a b)))))
 
 (defn max
   [coll]
@@ -378,83 +377,83 @@
 (defn now
   []
   (where/->typed-val
-    #?(:clj (OffsetDateTime/now (ZoneId/of "UTC"))
-       :cljs (js/Date.))
-    const/iri-xsd-dateTime))
+   #?(:clj (OffsetDateTime/now (ZoneId/of "UTC"))
+      :cljs (js/Date.))
+   const/iri-xsd-dateTime))
 
 (defn year
   [datetime]
   (where/->typed-val
-    #?(:clj  (.getYear ^OffsetDateTime (->offset-date-time (:value datetime)))
-       :cljs (.getFullYear (if (string? datetime)
-                             (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                             datetime)))))
+   #?(:clj  (.getYear ^OffsetDateTime (->offset-date-time (:value datetime)))
+      :cljs (.getFullYear (if (string? datetime)
+                            (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                            datetime)))))
 
 (defn month
   [datetime]
   (where/->typed-val
-    #?(:clj  (.getMonthValue ^OffsetDateTime (->offset-date-time (:value datetime)))
-       :cljs (.getMonth (if (string? datetime)
-                          (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                          datetime)))))
+   #?(:clj  (.getMonthValue ^OffsetDateTime (->offset-date-time (:value datetime)))
+      :cljs (.getMonth (if (string? datetime)
+                         (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                         datetime)))))
 
 (defn day
   [datetime]
   (where/->typed-val
-    #?(:clj  (.getDayOfMonth ^OffsetDateTime (->offset-date-time (:value datetime)))
-       :cljs (.getDate (if (string? datetime)
-                          (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                          datetime)))))
+   #?(:clj  (.getDayOfMonth ^OffsetDateTime (->offset-date-time (:value datetime)))
+      :cljs (.getDate (if (string? datetime)
+                        (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                        datetime)))))
 
 (defn hours
   [x]
   (where/->typed-val
-    #?(:clj
-       (condp contains? (:datatype-iri x)
-         #{const/iri-xsd-dateTime const/iri-xsd-date}
-         (.getHour ^OffsetDateTime (->offset-date-time (:value x)))
-         #{const/iri-xsd-time}
-         (.getHour ^OffsetTime (->offset-time (:value x))))
-       :cljs
-       (.getHours (if (string? x)
-                    (datatype/coerce (:value x) (:datatype-iri x))
-                    datetime)))))
+   #?(:clj
+      (condp contains? (:datatype-iri x)
+        #{const/iri-xsd-dateTime const/iri-xsd-date}
+        (.getHour ^OffsetDateTime (->offset-date-time (:value x)))
+        #{const/iri-xsd-time}
+        (.getHour ^OffsetTime (->offset-time (:value x))))
+      :cljs
+      (.getHours (if (string? x)
+                   (datatype/coerce (:value x) (:datatype-iri x))
+                   datetime)))))
 
 (defn minutes
   [x]
   (where/->typed-val
-    #?(:clj  (condp contains? (:datatype-iri x)
-               #{const/iri-xsd-dateTime const/iri-xsd-date}
-               (.getMinute ^OffsetDateTime (->offset-date-time (:value x)))
-               #{const/iri-xsd-time}
-               (.getMinute ^OffsetTime (->offset-time (:value x))))
-       :cljs (.getMinutes (if (string? x)
-                            (datatype/coerce (:value x) (:datatype-iri x))
-                            x)))))
+   #?(:clj  (condp contains? (:datatype-iri x)
+              #{const/iri-xsd-dateTime const/iri-xsd-date}
+              (.getMinute ^OffsetDateTime (->offset-date-time (:value x)))
+              #{const/iri-xsd-time}
+              (.getMinute ^OffsetTime (->offset-time (:value x))))
+      :cljs (.getMinutes (if (string? x)
+                           (datatype/coerce (:value x) (:datatype-iri x))
+                           x)))))
 
 (defn seconds
   [x]
   (where/->typed-val
-    #?(:clj (condp contains? (:datatype-iri x)
-              #{const/iri-xsd-dateTime const/iri-xsd-date}
-              (.getSecond ^OffsetDateTime (->offset-date-time (:value x)))
-              #{const/iri-xsd-time}
-              (.getSecond ^OffsetTime (->offset-time (:value x))))
-       :cljs (.getSeconds (if (string? x)
-                            (datatype/coerce (:value x) (:datatype-iri x))
-                            x)))))
+   #?(:clj (condp contains? (:datatype-iri x)
+             #{const/iri-xsd-dateTime const/iri-xsd-date}
+             (.getSecond ^OffsetDateTime (->offset-date-time (:value x)))
+             #{const/iri-xsd-time}
+             (.getSecond ^OffsetTime (->offset-time (:value x))))
+      :cljs (.getSeconds (if (string? x)
+                           (datatype/coerce (:value x) (:datatype-iri x))
+                           x)))))
 
 (defn tz
   [x]
   (where/->typed-val
-    #?(:clj (condp contains? (:datatype-iri x)
-              #{const/iri-xsd-dateTime const/iri-xsd-date}
-              (.toString (.getOffset ^OffsetDateTime (->offset-date-time (:value x))))
-              #{const/iri-xsd-time}
-              (.toString (.getOffset ^OffsetTime (->offset-time (:value x)))))
-       :cljs (.getTimeZoneOffset ^js/Date (if (string? datetime)
-                                            (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                                            datetime)))))
+   #?(:clj (condp contains? (:datatype-iri x)
+             #{const/iri-xsd-dateTime const/iri-xsd-date}
+             (.toString (.getOffset ^OffsetDateTime (->offset-date-time (:value x))))
+             #{const/iri-xsd-time}
+             (.toString (.getOffset ^OffsetTime (->offset-time (:value x)))))
+      :cljs (.getTimeZoneOffset ^js/Date (if (string? datetime)
+                                           (datatype/coerce (:value datetime) (:datatype-iri datetime))
+                                           datetime)))))
 
 (defn sha256
   [{x :value}]
@@ -479,8 +478,8 @@
 (defn isBlank
   [{x :value}]
   (where/->typed-val
-    (and (string? x)
-         (str/starts-with? x "_:"))))
+   (and (string? x)
+        (str/starts-with? x "_:"))))
 
 (defn sparql-str
   [{x :value}]
@@ -568,17 +567,17 @@
 (defn dotProduct
   [{v1 :value} {v2 :value}]
   (where/->typed-val
-    (score/dot-product v1 v2)))
+   (score/dot-product v1 v2)))
 
 (defn cosineSimilarity
   [{v1 :value} {v2 :value}]
   (where/->typed-val
-    (score/cosine-similarity v1 v2 )))
+   (score/cosine-similarity v1 v2)))
 
 (defn euclideanDistance
   [{v1 :value} {v2 :value}]
   (where/->typed-val
-    (score/euclidian-distance v1 v2 )))
+   (score/euclidian-distance v1 v2)))
 
 (def qualified-symbols
   '{!              fluree.db.query.exec.eval/-not

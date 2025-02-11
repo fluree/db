@@ -1,7 +1,7 @@
 (ns fluree.db.query.misc-queries-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
             [fluree.db.api :as fluree]
+            [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
             [test-with-files.tools :refer [with-tmp-dir]]))
 
@@ -83,25 +83,25 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/everything")
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee"
-                                 test-utils/default-context
-                                 {:ex "http://example.org/ns/"}]
-                     "insert"
-                     {:graph [{:id           :ex/alice,
-                               :type         :ex/User,
-                               :schema/name  "Alice"
-                               :schema/email "alice@flur.ee"
-                               :schema/age   42}
-                              {:id          :ex/bob,
-                               :type        :ex/User,
-                               :schema/name "Bob"
-                               :schema/age  22}
-                              {:id           :ex/jane,
-                               :type         :ex/User,
-                               :schema/name  "Jane"
-                               :schema/email "jane@flur.ee"
-                               :schema/age   30}]}})]
+                   (fluree/db ledger)
+                   {"@context" ["https://ns.flur.ee"
+                                test-utils/default-context
+                                {:ex "http://example.org/ns/"}]
+                    "insert"
+                    {:graph [{:id           :ex/alice,
+                              :type         :ex/User,
+                              :schema/name  "Alice"
+                              :schema/email "alice@flur.ee"
+                              :schema/age   42}
+                             {:id          :ex/bob,
+                              :type        :ex/User,
+                              :schema/name "Bob"
+                              :schema/age  22}
+                             {:id           :ex/jane,
+                              :type         :ex/User,
+                              :schema/name  "Jane"
+                              :schema/email "jane@flur.ee"
+                              :schema/age   30}]}})]
       (testing "Query that pulls entire database."
         (is (= [[:ex/alice :type :ex/User]
                 [:ex/alice :schema/age 42]
@@ -250,28 +250,28 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/class")
         db     @(fluree/stage
-                  (fluree/db ledger)
-                  {"@context" ["https://ns.flur.ee"
-                               test-utils/default-context
-                               {:ex "http://example.org/ns/"}]
-                   "insert"
-                   [{:id           :ex/alice,
-                     :type         :ex/User,
-                     :schema/name  "Alice"
-                     :schema/email "alice@flur.ee"
-                     :schema/age   42}
-                    {:id          :ex/bob,
-                     :type        :ex/User,
-                     :schema/name "Bob"
-                     :schema/age  22}
-                    {:id           :ex/jane,
-                     :type         :ex/User,
-                     :schema/name  "Jane"
-                     :schema/email "jane@flur.ee"
-                     :schema/age   30}
-                    {:id          :ex/dave
-                     :type        :ex/nonUser
-                     :schema/name "Dave"}]})]
+                 (fluree/db ledger)
+                 {"@context" ["https://ns.flur.ee"
+                              test-utils/default-context
+                              {:ex "http://example.org/ns/"}]
+                  "insert"
+                  [{:id           :ex/alice,
+                    :type         :ex/User,
+                    :schema/name  "Alice"
+                    :schema/email "alice@flur.ee"
+                    :schema/age   42}
+                   {:id          :ex/bob,
+                    :type        :ex/User,
+                    :schema/name "Bob"
+                    :schema/age  22}
+                   {:id           :ex/jane,
+                    :type         :ex/User,
+                    :schema/name  "Jane"
+                    :schema/email "jane@flur.ee"
+                    :schema/age   30}
+                   {:id          :ex/dave
+                    :type        :ex/nonUser
+                    :schema/name "Dave"}]})]
     (testing "type"
       (is (= [[:ex/User]]
              @(fluree/query db {:context [test-utils/default-context
@@ -288,16 +288,16 @@
                                      :where   '{:id ?s, :type ?class}})))))
     (testing "shacl targetClass"
       (let [shacl-db @(fluree/stage
-                        (fluree/db ledger)
-                        {"@context" ["https://ns.flur.ee"
-                                     test-utils/default-context
-                                     {:ex "http://example.org/ns/"}]
-                         "insert"
-                         {:id             :ex/UserShape,
-                          :type           [:sh/NodeShape],
-                          :sh/targetClass :ex/User
-                          :sh/property    [{:sh/path     :schema/name
-                                            :sh/datatype :xsd/string}]}})]
+                       (fluree/db ledger)
+                       {"@context" ["https://ns.flur.ee"
+                                    test-utils/default-context
+                                    {:ex "http://example.org/ns/"}]
+                        "insert"
+                        {:id             :ex/UserShape,
+                         :type           [:sh/NodeShape],
+                         :sh/targetClass :ex/User
+                         :sh/property    [{:sh/path     :schema/name
+                                           :sh/datatype :xsd/string}]}})]
         (is (= [[:ex/User]]
                @(fluree/query shacl-db {:context [test-utils/default-context
                                                   {:ex "http://example.org/ns/"}]

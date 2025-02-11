@@ -3,25 +3,25 @@
   (:require [clojure.core.async :as async :refer [<! go go-loop]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
-            [fluree.db.constants :as const]
             [fluree.db.commit.storage :as commit-storage]
+            [fluree.db.constants :as const]
             [fluree.db.did :as did]
+            [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.flake.flake-db :as flake-db]
+            [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.transact :as transact]
-            [fluree.db.storage :as storage]
-            [fluree.db.util.core :as util :refer [get-first-value try* catch*]]
-            [fluree.db.util.context :as context]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.ledger :as ledger])
+            [fluree.db.storage :as storage]
+            [fluree.db.transact :as transact]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.context :as context]
+            [fluree.db.util.core :as util :refer [get-first-value try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -53,11 +53,11 @@
      (binding [*out* w]
        (pr (printer-map conn))))
    :cljs
-     (extend-type Connection
-       IPrintWithWriter
-       (-pr-writer [conn w _opts]
-         (-write w "#fluree/Connection ")
-         (-write w (pr (printer-map conn))))))
+   (extend-type Connection
+     IPrintWithWriter
+     (-pr-writer [conn w _opts]
+       (-write w "#fluree/Connection ")
+       (-write w (pr (printer-map conn))))))
 
 (defmethod pprint/simple-dispatch Connection [^Connection conn]
   (pr conn))
@@ -91,8 +91,8 @@
   [{:keys [state] :as _conn} ledger-alias]
   (let [new-p-chan (async/promise-chan)
         new-state  (swap! state update-in [:ledger ledger-alias]
-                           (fn [existing]
-                             (or existing new-p-chan)))
+                          (fn [existing]
+                            (or existing new-p-chan)))
         p-chan     (get-in new-state [:ledger ledger-alias])
         cached?    (not= p-chan new-p-chan)]
     (log/debug "Registering ledger: " ledger-alias " cached? " cached?)
@@ -393,7 +393,7 @@
   (go
     (try* (<? (load-ledger* conn ledger-chan addr))
           (catch* e
-                  (log/debug e "Unable to load ledger alias" alias "at address:" addr)))))
+            (log/debug e "Unable to load ledger alias" alias "at address:" addr)))))
 
 (defn load-ledger-alias
   [conn alias]
@@ -430,16 +430,16 @@
 (defn write-transactions!
   [storage ledger-alias staged]
   (go-try
-   (loop [[next-staged & r] staged
-          results []]
-     (if next-staged
-       (let [[txn author-did annotation] next-staged
-             results* (if txn
-                        (let [{txn-id :address} (<? (write-transaction storage ledger-alias txn))]
-                          (conj results [txn-id author-did annotation]))
-                        (conj results next-staged))]
-         (recur r results*))
-       results))))
+    (loop [[next-staged & r] staged
+           results []]
+      (if next-staged
+        (let [[txn author-did annotation] next-staged
+              results* (if txn
+                         (let [{txn-id :address} (<? (write-transaction storage ledger-alias txn))]
+                           (conj results [txn-id author-did annotation]))
+                         (conj results next-staged))]
+          (recur r results*))
+        results))))
 
 (defn update-commit-address
   "Once a commit address is known, which might be after the commit is written
@@ -614,10 +614,10 @@
                :time   (util/response-time-formatted start-time)
                :fuel   (fuel/tally fuel-tracker)})
             (catch* e
-                    (throw (ex-info "Error staging database"
-                                    {:time (util/response-time-formatted start-time)
-                                     :fuel (fuel/tally fuel-tracker)}
-                                    e)))))
+              (throw (ex-info "Error staging database"
+                              {:time (util/response-time-formatted start-time)
+                               :fuel (fuel/tally fuel-tracker)}
+                              e)))))
         (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
 
 (defn transact-ledger!

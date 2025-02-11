@@ -20,7 +20,6 @@
 ;; allow large websocket frames of ~10mb
 #?(:clj (System/setProperty "org.asynchttpclient.webSocketMaxFrameSize" "10000000"))
 
-
 (defn format-error-response
   [url e]
   (let [status #?(:cljs (when-let [resp (.-response e)]
@@ -63,8 +62,7 @@
     (ex-info message
              (cond-> {:url   url
                       :error error}
-                     status (assoc :status status)))))
-
+               status (assoc :status status)))))
 
 #?(:clj
    (defn throw-if-timeout [response]
@@ -92,7 +90,7 @@
                         message
                         {:body message})]
     #?(:clj (http/post url (assoc base-req :headers headers*
-                                           :timeout request-timeout)
+                                  :timeout request-timeout)
                        (fn [{:keys [error status body] :as response}]
                          (try ;; TODO - throw-if-timeout will throw but uncaught as `post` fn returns response-chan - adding a 'try/catch' for now
                            ;; TODO - ideally throw-if-timeout should be part of the format-error-response fn to put ex on response-chan and can remove outer try/catch
@@ -100,13 +98,13 @@
                              (do
                                (throw-if-timeout response)
                                (async/put!
-                                 response-chan
-                                 (format-error-response
-                                   url
-                                   (or error (ex-info "error response"
-                                                      response)))))
+                                response-chan
+                                (format-error-response
+                                 url
+                                 (or error (ex-info "error response"
+                                                    response)))))
                              (let [data (try (cond-> (bs/to-string body)
-                                                     json? (json/parse keywordize-keys))
+                                               json? (json/parse keywordize-keys))
                                              (catch Exception e
                                                ;; don't throw, as `data` will get exception and put on response-chan
                                                (ex-info (str "JSON parsing error for xhttp post request to: " url
@@ -136,7 +134,6 @@
                        (async/put! response-chan (format-error-response url err)))))))
     response-chan))
 
-
 (defn post-json
   "Posts JSON content, returns parsed JSON response as core async channel.
   opts is a map with following optional keys:
@@ -148,7 +145,6 @@
                         (assoc message :multipart))
                    (json/stringify message))]
     (post url base-req (assoc opts :json? true))))
-
 
 (defn get
   "Returns result body as a string, or an exception.
@@ -166,12 +162,12 @@
                 output-format   :text}} opts
         response-chan (async/chan)
         headers       (cond-> {}
-                              headers (merge headers)
-                              token (assoc "Authorization" (str "Bearer " token)))]
+                        headers (merge headers)
+                        token (assoc "Authorization" (str "Bearer " token)))]
     #?(:clj  (http/get url (util/without-nils
-                             {:headers headers
-                              :timeout request-timeout
-                              :body    body})
+                            {:headers headers
+                             :timeout request-timeout
+                             :body    body})
                        (fn [{:keys [error status body] :as response}]
                          (if (or error (< 299 status))
                            (if (= :wikidata output-format)
@@ -188,9 +184,9 @@
                                (async/put! response-chan error))
                              (async/put! response-chan
                                          (format-error-response
-                                           url
-                                           (or error (ex-info "error response"
-                                                              response)))))
+                                          url
+                                          (or error (ex-info "error response"
+                                                             response)))))
                            (do
                              (throw-if-timeout response)
                              (async/put! response-chan
@@ -216,7 +212,6 @@
                            (async/put! response-chan (format-error-response url err))))))
     response-chan))
 
-
 (defn get-json
   "http get with JSON response.
 
@@ -226,7 +221,7 @@
   (let [opts* (cond-> (-> opts
                           (assoc-in [:headers "Accept"] "application/json")
                           (assoc :output-format :json))
-                      (:body opts) (assoc :body (json/stringify (:body opts))))]
+                (:body opts) (assoc :body (json/stringify (:body opts))))]
     (get url opts*)))
 
 (def ws-close-status-codes
@@ -245,8 +240,6 @@
    :service      {:code 1013 :reason "Try again later"}
    :gateway      {:code 1014 :reason "Bad gateway"}
    :tls          {:code 1015 :reason "TLS handshake"}})
-
-
 
 (defn close-websocket
   "Closes websocket with optional reason-keyword which
@@ -289,8 +282,8 @@
               (async/put! resp-chan true)
               (async/close! resp-chan))
             (catch* e
-                    (log/error e "Error sending websocket message:" msg)
-                    (async/put! resp-chan false)))
+              (log/error e "Error sending websocket message:" msg)
+              (async/put! resp-chan false)))
           (recur))))))
 
 (declare try-socket)
@@ -307,7 +300,6 @@
                     "Reported websocket exception: " (ex-message ws))
           (async/<! (async/timeout (min (* retries 500) 10000))) ;; timeout maxes at 10s
           (recur (inc retries)))))))
-
 
 (defn abnormal-socket-close?
   [status-code]

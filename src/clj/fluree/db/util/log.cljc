@@ -12,7 +12,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-
 #?(:cljs
    (def levels {:severe  Level.SEVERE
                 :warning Level.WARNING
@@ -22,26 +21,21 @@
                 :finer   Level.FINER
                 :finest  Level.FINEST}))
 
-
 #?(:cljs
    (def logger
      (glog/getLogger "app" (:info levels))))
-
 
 #?(:cljs
    (defn log-to-console! []
      (.setCapturing (Console.) true)))
 
-
 #?(:cljs
    (defn set-level! [level]
      (glog/setLevel logger (get levels level (:info levels)))))
 
-
 #?(:cljs
    (defn fmt [msgs]
      (apply str (interpose " " (map pr-str msgs)))))
-
 
 #?(:cljs
    (defn log [logger level args]
@@ -49,51 +43,48 @@
        (glog/log logger (get levels level) (-> args rest fmt) (first args))
        (glog/log logger (get levels level) (fmt args) nil))))
 
-
 #?(:clj
    (defmacro error
      {:arglists '([message & more] [throwable message & more])}
      [& args]
      `(if-cljs
-          (log logger :severe ~(vec args))
-          (log/logp :error ~@args))))
+       (log logger :severe ~(vec args))
+       (log/logp :error ~@args))))
 
 #?(:clj
    (defmacro warn
      {:arglists '([message & more] [throwable message & more])}
      [& args]
      `(if-cljs
-          (log logger :warning ~(vec args))
-          (log/logp :warn ~@args))))
+       (log logger :warning ~(vec args))
+       (log/logp :warn ~@args))))
 
 #?(:clj
    (defmacro info
      {:arglists '([message & more] [throwable message & more])}
      [& args]
      `(if-cljs
-          (log logger :info ~(vec args))
-          (log/logp :info ~@args))))
+       (log logger :info ~(vec args))
+       (log/logp :info ~@args))))
 
 #?(:clj
    (defmacro debug
      {:arglists '([message & more] [throwable message & more])}
      [& args]
      `(if-cljs
-          (log logger :fine ~(vec args))
-          (log/logp :debug ~@args))))
+       (log logger :fine ~(vec args))
+       (log/logp :debug ~@args))))
 
 #?(:clj
    (defmacro trace
      {:arglists '([message & more] [throwable message & more])}
      [& args]
      `(if-cljs
-          (log logger :finer ~(vec args))
-          (log/logp :trace ~@args))))
-
+       (log logger :finer ~(vec args))
+       (log/logp :trace ~@args))))
 
 #?(:cljs
    (set-level! :info))
-
 
 #?(:cljs
    (log-to-console!))

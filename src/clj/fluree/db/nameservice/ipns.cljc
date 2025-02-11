@@ -1,10 +1,10 @@
 (ns fluree.db.nameservice.ipns
   (:require [clojure.string :as str]
-            [fluree.db.nameservice :as nameservice]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.method.ipfs :as ipfs]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
+            [fluree.db.nameservice :as nameservice]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -15,8 +15,8 @@
   [s]
   (when s
     (cond-> s
-            (str/ends-with? s "/") (subs 0 (dec (count s)))
-            (str/starts-with? s "/") (subs 1))))
+      (str/ends-with? s "/") (subs 0 (dec (count s)))
+      (str/starts-with? s "/") (subs 1))))
 
 (defn address-parts
   "Returns three-tuple of ipfs/ipns (protocol), address, and ledger alias(directory)

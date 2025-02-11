@@ -1,13 +1,13 @@
 (ns fluree.db.ledger
-  (:require [fluree.db.transact :as transact]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.json-ld.branch :as branch]
-            [fluree.db.constants :as const]
+  (:require [clojure.string :as str]
             [fluree.db.commit.storage :as commit-storage]
-            [clojure.string :as str]
+            [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.transact :as transact]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
-            [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake]))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -174,6 +174,6 @@
           init-time      (or (:fluree.db.json-ld.migrate.sid/time opts)
                              (util/current-time-iso))
           genesis-commit (<? (commit-storage/write-genesis-commit
-                               commit-catalog alias branch publish-addresses init-time))]
+                              commit-catalog alias branch publish-addresses init-time))]
       (instantiate conn ledger-alias* primary-address branch commit-catalog index-catalog
                    publishers indexing did genesis-commit))))

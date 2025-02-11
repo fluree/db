@@ -1,7 +1,7 @@
 (ns fluree.db.query.sparql
-  (:require #?(:clj [clojure.java.io :as io])
-            #?(:clj  [instaparse.core :as insta :refer [defparser]]
+  (:require #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
+            #?(:clj [clojure.java.io :as io])
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
             [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.util.docs :as docs]
@@ -19,9 +19,9 @@
 
 (def grammar
   (str
-    #?(:clj  (slurp (io/resource "sparql.bnf"))
-       :cljs (inline-resource "sparql.bnf"))
-    PN_CHARS_BASE))
+   #?(:clj  (slurp (io/resource "sparql.bnf"))
+      :cljs (inline-resource "sparql.bnf"))
+   PN_CHARS_BASE))
 
 (defparser parser grammar)
 

@@ -1,10 +1,10 @@
 (ns fluree.db.util.filesystem
   (:refer-clojure :exclude [exists?])
-  (:require [fluree.db.util.log :as log]
-            #?(:clj [clojure.java.io :as io])
+  (:require #?(:clj [clojure.java.io :as io])
             #?@(:cljs [["fs" :as fs]
                        ["path" :as path]])
-            [clojure.core.async :as async])
+            [clojure.core.async :as async]
+            [fluree.db.util.log :as log])
   #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -122,7 +122,6 @@
   [path]
   #?(:clj  (async/thread (->> path io/file .exists))
      :cljs (async/go (fs/existsSync path))))
-
 
 (defn local-path
   "Gives absolute full local path if input path is not already absolute."

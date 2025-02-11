@@ -1,17 +1,17 @@
 (ns fluree.db.flake.index.storage
-  (:require [fluree.db.serde.protocol :as serdeproto]
-            [fluree.db.flake :as flake]
-            [clojure.string :as str]
+  (:require [clojure.core.async :as async]
             [clojure.set :refer [map-invert]]
-            [fluree.db.util.log :as log :include-macros true]
+            [clojure.string :as str]
+            [fluree.db.cache :as cache]
+            [fluree.db.flake :as flake]
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
-            [clojure.core.async :as async]
+            [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.serde.protocol :as serdeproto]
+            [fluree.db.storage :as storage]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.cache :as cache]
-            [fluree.db.storage :as storage]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -207,13 +207,13 @@
 (defn resolve-index-node
   [idx-store {:keys [leaf] :as node}]
   (go-try
-   (let [data (if leaf
-                  (<? (fetch-leaf-flakes idx-store node))
-                  (<? (fetch-child-attributes idx-store node)))
-         node* (if leaf
-                 (assoc node :flakes data)
-                 (assoc node :children data))]
-     node*)))
+    (let [data (if leaf
+                 (<? (fetch-leaf-flakes idx-store node))
+                 (<? (fetch-child-attributes idx-store node)))
+          node* (if leaf
+                  (assoc node :flakes data)
+                  (assoc node :children data))]
+      node*)))
 
 (defn resolve-empty-leaf
   [{:keys [comparator] :as node}]
@@ -248,7 +248,7 @@
       (if (= :empty id)
         (resolve-empty-node node)
         (cache/lru-lookup
-          cache
-          cache-key
-          (fn [_]
-            (resolve-index-node this node)))))))
+         cache
+         cache-key
+         (fn [_]
+           (resolve-index-node this node)))))))

@@ -2,21 +2,21 @@
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.string :as str]
-            [fluree.db.util.context :as context]
-            [fluree.db.fuel :as fuel]
-            [fluree.db.ledger :as ledger]
-            [fluree.db.time-travel :as time-travel]
+            [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
+            [fluree.db.fuel :as fuel]
+            [fluree.db.json-ld.policy :as perm]
+            [fluree.db.ledger :as ledger]
             [fluree.db.query.fql :as fql]
-            [fluree.db.util.log :as log]
+            [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.history :as history]
             [fluree.db.query.sparql :as sparql]
-            [fluree.db.query.fql.syntax :as syntax]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.reasoner :as reasoner]
+            [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.json-ld.policy :as perm]
-            [fluree.db.connection :as connection]
-            [fluree.db.reasoner :as reasoner]))
+            [fluree.db.util.context :as context]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -41,15 +41,15 @@
 (defn load-aliased-rule-dbs
   [conn rule-sources]
   (go-try
-   (loop [rule-sources rule-sources
-          rule-results []]
-     (if-let [rule-source (first rule-sources)]
-       (let [updated-rule-results (into rule-results
-                                    (if (string? rule-source)
-                                      (ledger/current-db (<? (connection/load-ledger conn rule-source)))
-                                      rule-source))]
-         (recur (rest rule-sources) updated-rule-results))
-       rule-results))))
+    (loop [rule-sources rule-sources
+           rule-results []]
+      (if-let [rule-source (first rule-sources)]
+        (let [updated-rule-results (into rule-results
+                                         (if (string? rule-source)
+                                           (ledger/current-db (<? (connection/load-ledger conn rule-source)))
+                                           rule-source))]
+          (recur (rest rule-sources) updated-rule-results))
+        rule-results))))
 
 (defn restrict-db
   ([db sanitized-query]
@@ -91,11 +91,11 @@
                :time   (util/response-time-formatted start)
                :fuel   (fuel/tally fuel-tracker)})
             (catch* e
-                    (throw (ex-info "Error executing query"
-                                    {:status (-> e ex-data :status)
-                                     :time   (util/response-time-formatted start)
-                                     :fuel   (fuel/tally fuel-tracker)}
-                                    e)))))))
+              (throw (ex-info "Error executing query"
+                              {:status (-> e ex-data :status)
+                               :time   (util/response-time-formatted start)
+                               :fuel   (fuel/tally fuel-tracker)}
+                              e)))))))
 
 (defn query-fql
   "Execute a query against a database source. Returns core async channel
@@ -114,9 +114,9 @@
                       (<? (restrict-db ds query*)))
            query**  (update query* :opts dissoc :meta :max-fuel ::track-fuel?)
            max-fuel (:max-fuel opts)]
-      (if (track-fuel? query*)
-        (<? (track-query ds* max-fuel query**))
-        (<? (fql/query ds* query**)))))))
+       (if (track-fuel? query*)
+         (<? (track-query ds* max-fuel query**))
+         (<? (fql/query ds* query**)))))))
 
 (defn query-sparql
   [db query]
@@ -151,9 +151,9 @@
        (map (fn [s]
               (str/split s #"=")))
        (reduce
-         (fn [acc [k v]]
-           (assoc acc k v))
-         {})))
+        (fn [acc [k v]]
+          (assoc acc k v))
+        {})))
 
 (defn parse-t-val
   "If t-val is an integer in string form, coerces
@@ -193,9 +193,9 @@
             query*       (assoc sanitized-query :t t*)]
         (<? (restrict-db db query* conn)))
       (catch* e
-              (throw (contextualize-ledger-400-error
-                       (str "Error loading ledger " alias ": ")
-                       e))))))
+        (throw (contextualize-ledger-400-error
+                (str "Error loading ledger " alias ": ")
+                e))))))
 
 (defn load-aliases
   [conn aliases sanitized-query]
@@ -209,14 +209,14 @@
                "must be iso-8601 wall-clock times. ")
           e)))))
   (go-try
-   (loop [[alias & r] aliases
-          db-map      {}]
-     (if alias
+    (loop [[alias & r] aliases
+           db-map      {}]
+      (if alias
        ;; TODO: allow restricting federated dataset components individually by t
-       (let [db      (<? (load-alias conn alias sanitized-query))
-             db-map* (assoc db-map alias db)]
-         (recur r db-map*))
-       db-map))))
+        (let [db      (<? (load-alias conn alias sanitized-query))
+              db-map* (assoc db-map alias db)]
+          (recur r db-map*))
+        db-map))))
 
 (defn dataset
   [named-graphs default-aliases]

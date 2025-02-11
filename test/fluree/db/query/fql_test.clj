@@ -1,8 +1,8 @@
 (ns fluree.db.query.fql-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.util.core :refer [exception?]]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
-            [fluree.db.api :as fluree]))
+            [fluree.db.util.core :refer [exception?]]))
 
 (deftest ^:integration grouping-test
   (testing "grouped queries"
@@ -364,24 +364,24 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "jobs")
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee"
-                                 {"ex"         "http://example.com/vocab/"
-                                  "occupation" {"@id"        "ex:occupation"
-                                                "@container" "@language"}}]
-                     "insert"   [{"@id"        "ex:frank"
-                                  "occupation" {"en" {"@value" "Ninja"}
-                                                "ja" "忍者"}}
-                                 {"@id"             "ex:bob"
-                                  "ex:nativeTongue" "fr"
-                                  "occupation"      {"en" "Boss"
-                                                     "fr" "Chef"
-                                                     "de" "Bossin"}}
-                                 {"@id"             "ex:jack"
-                                  "ex:nativeTongue" "de"
-                                  "occupation"      {"en" {"@value" "Chef"}
-                                                     "fr" {"@value" "Cuisinier"}
-                                                     "de" {"@value" "Köchin"}}}]})]
+                   (fluree/db ledger)
+                   {"@context" ["https://ns.flur.ee"
+                                {"ex"         "http://example.com/vocab/"
+                                 "occupation" {"@id"        "ex:occupation"
+                                               "@container" "@language"}}]
+                    "insert"   [{"@id"        "ex:frank"
+                                 "occupation" {"en" {"@value" "Ninja"}
+                                               "ja" "忍者"}}
+                                {"@id"             "ex:bob"
+                                 "ex:nativeTongue" "fr"
+                                 "occupation"      {"en" "Boss"
+                                                    "fr" "Chef"
+                                                    "de" "Bossin"}}
+                                {"@id"             "ex:jack"
+                                 "ex:nativeTongue" "de"
+                                 "occupation"      {"en" {"@value" "Chef"}
+                                                    "fr" {"@value" "Cuisinier"}
+                                                    "de" {"@value" "Köchin"}}}]})]
       (testing "with bound language tags"
         (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
                                       :select    [?job ?lang]
@@ -425,23 +425,23 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "people")
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee"
-                                 test-utils/default-context
-                                 {:ex    "http://example.org/ns/"
-                                  :value "@value"
-                                  :type  "@type"}]
-                     "insert"
-                     [{:id      :ex/homer
-                       :ex/name "Homer"
-                       :ex/age  36}
-                      {:id      :ex/marge
-                       :ex/name "Marge"
-                       :ex/age  {:value 36
-                                 :type  :xsd/int}}
-                      {:id      :ex/bart
-                       :ex/name "Bart"
-                       :ex/age  "forever 10"}]})]
+                   (fluree/db ledger)
+                   {"@context" ["https://ns.flur.ee"
+                                test-utils/default-context
+                                {:ex    "http://example.org/ns/"
+                                 :value "@value"
+                                 :type  "@type"}]
+                    "insert"
+                    [{:id      :ex/homer
+                      :ex/name "Homer"
+                      :ex/age  36}
+                     {:id      :ex/marge
+                      :ex/name "Marge"
+                      :ex/age  {:value 36
+                                :type  :xsd/int}}
+                     {:id      :ex/bart
+                      :ex/name "Bart"
+                      :ex/age  "forever 10"}]})]
       (testing "with literal values"
         (testing "specifying an explicit data type"
           (testing "compatible with the value"

@@ -1,7 +1,7 @@
 (ns fluree.db.policy.target-test
   (:require [clojure.test :as t :refer [deftest testing is]]
-            [fluree.db.api :as fluree]
-            [fluree.crypto :as crypto]))
+            [fluree.crypto :as crypto]
+            [fluree.db.api :as fluree]))
 
 (def burt
   {:id    "did:fluree:TfE2Frz2qkMjnCNJM5yPv7B8gq5Xhk5bqkm"
@@ -15,7 +15,6 @@
   {:id    "did:fluree:Tf5g1aNMuamUWW8hMSks9YsYTNSmGQBYCK1"
    :private "7804d4c1ef6f22087bd81d030c6377f6065a831627351fd9e99d845fdfd5bcd2",
    :public "02e1495d9a165732684fd17c074e99a7e236e8db90252380ec3160ecdd1a38a5ed"})
-
 
 (def wishlist-create {"@context"     {"a" "http://a.co/"
                                       "f" "https://ns.flur.ee/ledger#"}
@@ -52,7 +51,6 @@
                      "@value" {"@context" {"a" "http://a.co/"}
                                "where"    [["filter" "(= ?$this ?$identity)"]]}}})
 
-
 (def item-create {"@context"     {"a" "http://a.co/"
                                   "f" "https://ns.flur.ee/ledger#"}
                   "@id"          "a:wishlistItemCreatePolicy"
@@ -72,8 +70,8 @@
                   "f:required"   true
                   "f:exMessage"  "User can modify all but available on item."
                   "f:targetProperty" [{"@id" "a:title"}
-                                  {"@id" "a:description"}
-                                  {"@id" "a:rank"}]
+                                      {"@id" "a:description"}
+                                      {"@id" "a:rank"}]
                   "f:query"
                   {"@type"  "@json"
                    "@value" {"@context" {"a" "http://a.co/"}
@@ -84,10 +82,9 @@
                             "f" "https://ns.flur.ee/ledger#"}
                 "@id"      "a:wishlistItemViewPolicy"
 
-
                 "f:targetProperty" [{"@id" "a:title"}
-                                {"@id" "a:description"}
-                                {"@id" "a:rank"}]
+                                    {"@id" "a:description"}
+                                    {"@id" "a:rank"}]
                 "f:query"
                 {"@type"  "@json"
                  "@value" {"@context" {"a" "http://a.co/"}
@@ -235,7 +232,7 @@
               (is (= [{"a:title"       "helicopter"
                        "a:description" "for enhanced mobility in the sky",
                        "a:rank"        1,
-                       "a:available"   true,}]
+                       "a:available"   true}]
                      @(fluree/query policy-db {"@context" {"a" "http://a.co/"}
                                                "select"   {"a:burt-wish1-1" ["*"]}}))))))))))
 

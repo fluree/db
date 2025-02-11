@@ -6,32 +6,28 @@
             [fluree.db.util.log :as log]
             [goog.object]))
 
-
 (def ^:private conn-register (atom {}))
 
 (defn- postMessage
   [message]
   (.postMessage js/self (clj->js message)))
 
-
 (defn- conn-id->db
   [conn-id time]
   (let [{:keys [conn ledger]} (get @conn-register conn-id)]
     :TODO #_(l/root-db conn ledger {:block time})))
-
 
 (defn- obj->clj
   "Parses a (nested) JavaScript object into a Clojure map"
   [obj]
   (if (goog.isObject obj)
     (reduce (fn [result key]
-             (let [v (goog.object/get obj key)]
-               (if (= "function" (goog/typeOf v))
-                 result
-                 (assoc result (keyword key) (obj->clj v)))))
+              (let [v (goog.object/get obj key)]
+                (if (= "function" (goog/typeOf v))
+                  result
+                  (assoc result (keyword key) (obj->clj v)))))
             {} (goog.object/getKeys obj))
     obj))
-
 
 (defmulti ^:private worker-action (fn [conn-id event & _] event))
 
@@ -88,7 +84,6 @@
 ;                  :data  true}))
 ;  )
 
-
 (defmethod worker-action :connInit
   [_ _]
   ;; let server know we're alive
@@ -104,7 +99,6 @@
         e-map         (merge default-error (ex-data error))]
     {:error  e-map
      :status "error"}))
-
 
 (defn- process-query
   "Process a query for a specific component id and return result with a :setState call."
@@ -124,7 +118,6 @@
                     {:result res :status "loaded"})]
           (worker-action conn-id :setState id ret))))))
 
-
 (defn- process-all-queries
   "Re-execute every registered query."
   [conn-id]
@@ -133,24 +126,21 @@
     (doseq [id query-ids]
       (process-query conn-id id opts))))
 
-
 (defn- ledger-listener
   [conn ledger conn-id]
   :TODO
   #_(let [[network ledger-id] (session/resolve-ledger conn ledger)
-        cb (fn [header data]
-             (async/go
-               (async/<! (async/timeout 100))
-               (process-all-queries conn-id)))]
-    (connection/add-listener conn network ledger-id conn-id cb)))
-
+          cb (fn [header data]
+               (async/go
+                 (async/<! (async/timeout 100))
+                 (process-all-queries conn-id)))]
+      (connection/add-listener conn network ledger-id conn-id cb)))
 
 (defn- remove-conn-listener
   [conn conn-id ledger]
   :TODO
   #_(let [[network ledger-id] (session/resolve-ledger conn ledger)]
-    (connection/remove-listener conn network ledger-id conn-id)))
-
+      (connection/remove-listener conn network ledger-id conn-id)))
 
 (defn- register-connection
   "Registers new connection with all of its items."
@@ -165,7 +155,6 @@
                                    :log     log
                                    :opts    {:compact compact} ;; default query options
                                    :closed  false})))
-
 
 (defn- connect*
   "Creates a new connection from existing configuration"
@@ -199,7 +188,6 @@
                                       :message (str "Unexpected error: " (pr-str error))})]
                     (worker-action conn-id :connReset ref error-data)))))))
 
-
 (defn- close-connection*
   ([conn-id] (close-connection* conn-id false))
   ([conn-id save-config?]
@@ -220,7 +208,6 @@
          {:status  200
           :message "Connection closed."})))))
 
-
 (defn- close-connection
   [conn-id ref]
   (try
@@ -230,7 +217,6 @@
             data (or (ex-data e) {:status 500
                                   :error  :db/unexpected-error})]
         (worker-action conn-id :connClosed ref (assoc data :message msg))))))
-
 
 (defn- reset-connection
   [conn-id ref]
@@ -243,7 +229,6 @@
             data (or (ex-data e) {:status 500
                                   :error  :db/unexpected-error})]
         (worker-action conn-id :connReset ref (assoc data :message msg))))))
-
 
 (defn- connect-p
   "Open new connection to a Fluree instance"
@@ -270,18 +255,14 @@
                   (worker-action id :connStatus ref {:status  500
                                                      :message (str error)}))))))
 
-
-
 (defn- conn-closed?
   "Returns true if connection has been closed."
   [conn-id]
   (get-in @conn-register [conn-id :closed]))
 
-
 (defn- unregisterQuery
   [conn-id ref]
   (swap! conn-register update-in [conn-id :queries] dissoc ref))
-
 
 (defn- registerQuery
   "Registers a new flureeQL query. 'opts' gets merged in with the flureeQL.opts, and is there
@@ -295,7 +276,6 @@
       (swap! conn-register update-in [conn-id :queries] assoc ref flureeQL)
       (process-query conn-id ref (get-in @conn-register [conn-id :opts])))
     true))
-
 
 (defn- transact
   "Submits a transaction across a websocket to a fluree instance"
@@ -330,7 +310,6 @@
   converting individual elements."
   [js-array]
   (map #(aget js-array %) (range (.-length js-array))))
-
 
 (defn decode-message
   "Main handler function for worker events
@@ -383,7 +362,6 @@
           (= action-str "transact")
           (transact conn-id ref params)
 
-
           :else
           (throw (ex-info (str "Unknown action: " action-str) {:status 400})))))
     (catch :default e
@@ -400,7 +378,6 @@
                       :event (aget data "action")
                       :ref   (aget data "ref")
                       :data  error-data})))))
-
 
 (defn log-error
   "Log errors in this web worker"

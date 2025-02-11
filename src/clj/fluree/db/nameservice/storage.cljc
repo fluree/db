@@ -1,8 +1,8 @@
 (ns fluree.db.nameservice.storage
   (:require [clojure.core.async :refer [go]]
             [clojure.string :as str]
-            [fluree.db.storage :as storage]
             [fluree.db.nameservice :as nameservice]
+            [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
