@@ -91,9 +91,9 @@
                 query   (policy-query db sid policy)
                 result  (seq (<? (dbproto/-query (root db) query)))]
             (swap! exec-counter inc)
-            (when result (swap! allowed-counter inc))
             (if result
-              true
+              (do (swap! allowed-counter inc)
+                  true)
               (recur r)))
           ;; no more policies left to evaluate - all returned false
           (if modify?
