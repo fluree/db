@@ -53,7 +53,7 @@
   (let [opts (cond-> {:version version
                       :source-uri (str source-uri
                                        "/blob/v{version}/{filepath}#L{line}")}
-                     output-path (assoc :output-path output-path))]
+               output-path (assoc :output-path output-path))]
     (b/process {:command-args ["clojure" "-X:docs" (pr-str opts)]})))
 
 (defn deploy [_]
