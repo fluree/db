@@ -123,13 +123,13 @@ pending-tests:
 
 pt: pending-tests
 
-clj-kondo-lint: prepare
+clj-kondo-lint:
 	clj-kondo --lint src:test:build.clj
 
-clj-kondo-lint-ci: prepare
+clj-kondo-lint-ci:
 	clj-kondo --lint src:test:build.clj --config .clj-kondo/ci-config.edn
 
-cljfmt-check: prepare
+cljfmt-check:
 	cljfmt check src test build.clj
 
 test: cljtest cljstest nodejs-test browser-test
