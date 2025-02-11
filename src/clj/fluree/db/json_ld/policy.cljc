@@ -39,8 +39,8 @@
          t-p const/iri-targetProperty :as policy}]
      (cond-> policy
        q   (assoc const/iri-query {"@value" q "@type" "@json"})
-       t-s (assoc const/iri-targetSubject (if (get t-s "@id") t-s {"@value" t-s "@type" "@json"}))
-       t-p (assoc const/iri-targetProperty (if (get t-p "@id") t-p {"@value" t-p "@type" "@json"}))))
+       t-s (assoc const/iri-targetSubject  (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-s)))
+       t-p (assoc const/iri-targetProperty (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-p)))))
    query-results))
 
 (defn wrap-class-policy
