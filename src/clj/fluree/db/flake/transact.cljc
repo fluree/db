@@ -136,7 +136,7 @@
                            (commit-data/add-tt-id))
           mods         (<? (modified-subjects db-after add))
           db-after*    (-> db-after
-                           (vocab/hydrate-schema add mods)
+                           (vocab/hydrate-schema add)
                            (check-virtual-graph add remove))]
       {:add       add
        :remove    remove
