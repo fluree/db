@@ -22,7 +22,7 @@
 #?(:cljs (declare ->AsyncDB))
 (defrecord AsyncDB [alias branch commit t db-chan]
   dbproto/IFlureeDb
-  (-query [this query-map]
+  (-query [_ query-map]
     (go-try
       (let [db (<? db-chan)]
         (<? (dbproto/-query db query-map)))))
