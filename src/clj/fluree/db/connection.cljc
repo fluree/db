@@ -11,6 +11,7 @@
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
+            [fluree.db.json-ld.policy.rules :as policy.rules]
             [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.transact :as transact]
@@ -362,18 +363,12 @@
   [{:keys [commit-catalog index-catalog] :as conn}
    ledger-chan address]
   (go-try
-    (let [commit-addr  (<? (lookup-commit conn address))
-          _            (log/debug "Attempting to load from address:" address
-                                  "with commit address:" commit-addr)
-          _            (when-not commit-addr
+    (let [commit  (<? (lookup-commit conn address))
+          _            (if-not commit
                          (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
-                                         {:status 400 :error :db/invalid-commit-address})))
-          [commit _]   (<? (commit-storage/read-commit-jsonld commit-catalog commit-addr))
-          _            (when-not commit
-                         (throw (ex-info (str "Unable to load. Commit file for ledger: " address
-                                              " at location: " commit-addr " is not found.")
-                                         {:status 400 :error :db/invalid-db})))
-          _            (log/debug "load commit:" commit)
+                                         {:status 400 :error :db/invalid-db}))
+                         (log/debug "Attempting to load from address:" address
+                                    "with commit:" commit))
           ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
 
@@ -594,7 +589,7 @@
    (go-try
      (:db (<? (apply-stage! ledger staged-db opts))))))
 
-(defn track-fuel?
+(defn track?
   [parsed-opts]
   (or (:max-fuel parsed-opts)
       (:meta parsed-opts)))
@@ -604,25 +599,29 @@
    internal Fluree triples format."
   [db parsed-txn parsed-opts]
   (go-try
-    (let [identity    (:identity parsed-opts)
-          policy-db   (if (policy/policy-enforced-opts? parsed-opts)
-                        (let [parsed-context (:context parsed-opts)]
-                          (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
-                        db)]
-      (if (track-fuel? parsed-opts)
-        (let [start-time #?(:clj (System/nanoTime)
+    (let [identity  (:identity parsed-opts)
+          policy-db (if (policy/policy-enforced-opts? parsed-opts)
+                      (let [parsed-context (:context parsed-opts)]
+                        (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
+                      db)]
+      (if (track? parsed-opts)
+        (let [start-time   #?(:clj (System/nanoTime)
                             :cljs (util/current-time-millis))
-              fuel-tracker       (fuel/tracker (:max-fuel parsed-opts))]
+              fuel-tracker (fuel/tracker (:max-fuel parsed-opts))]
           (try*
-            (let [result (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))]
-              {:status 200
-               :result result
-               :time   (util/response-time-formatted start-time)
-               :fuel   (fuel/tally fuel-tracker)})
+            (let [result        (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))
+                  policy-report (policy.rules/enforcement-report result)]
+              (cond-> {:status 200
+                       :result result
+                       :time   (util/response-time-formatted start-time)
+                       :fuel   (fuel/tally fuel-tracker)}
+                policy-report (assoc :policy policy-report)))
             (catch* e
-                    (throw (ex-info "Error staging database"
-                                    {:time (util/response-time-formatted start-time)
-                                     :fuel (fuel/tally fuel-tracker)}
+                    (throw (ex-info (ex-message e)
+                                    (let [policy-report (policy.rules/enforcement-report policy-db)]
+                                      (cond-> {:time (util/response-time-formatted start-time)
+                                               :fuel (fuel/tally fuel-tracker)}
+                                        policy-report (assoc :policy policy-report)))
                                     e)))))
         (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
 
@@ -636,7 +635,7 @@
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
           cmt-opts (dissoc parsed-opts :context :identity)]
-      (if (track-fuel? parsed-opts)
+      (if (track? parsed-opts)
         (assoc staged :result (<? (commit! ledger (:result staged) cmt-opts)))
         (<? (commit! ledger staged cmt-opts))))))
 

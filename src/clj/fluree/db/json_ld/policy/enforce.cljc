@@ -80,16 +80,22 @@
   "Once narrowed to a specific set of policies, execute and return
   appropriate policy response."
   [db modify? sid policies-to-eval]
-  (go-try
-    (loop [[policy & r] policies-to-eval]
-      ;; return first truthy response, else false
-      (if policy
-        (let [query  (policy-query db sid policy)
-              result (<? (dbproto/-query (root db) query))]
-          (if (seq result)
-            true
-            (recur r)))
-        ;; no more policies left to evaluate - all returned false
-        (if modify?
-          (modify-exception policies-to-eval)
-          false)))))
+  (let [tracer (-> db :policy :trace)]
+    (go-try
+      (loop [[policy & r] policies-to-eval]
+        ;; return first truthy response, else false
+        (if policy
+          (let [{exec-counter :executed
+                 allowed-counter :allowed} (get tracer (:id policy))
+
+                query   (policy-query db sid policy)
+                result  (seq (<? (dbproto/-query (root db) query)))]
+            (swap! exec-counter inc)
+            (if result
+              (do (swap! allowed-counter inc)
+                  true)
+              (recur r)))
+          ;; no more policies left to evaluate - all returned false
+          (if modify?
+            (modify-exception policies-to-eval)
+            false))))))
