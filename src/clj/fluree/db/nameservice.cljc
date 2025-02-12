@@ -56,11 +56,9 @@
   (let [branch-iri (if branch
                      (str (get record "@id") "(" branch ")")
                      (get record "defaultBranch"))]
-    (->> (get record "branches")
-         (some #(when (= (get % "@id") branch-iri)
-                  (-> %
-                      (get "commit")
-                      (json-ld/expand)))))))
+    (some #(when (= (get % "@id") branch-iri)
+             (get % "commit"))
+          (get record "branches"))))
 
 (defn commit-address-from-record
   [record branch]
