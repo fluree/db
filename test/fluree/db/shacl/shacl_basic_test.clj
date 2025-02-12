@@ -3104,7 +3104,11 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                         "sh:maxCount" 1,
                                                         "sh:path" {"@id" "ex:term"}}],
                                         "sh:targetObjectsOf" {"@id" "ex:foo" "@type" "rdf:Property"}}]})]
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:foo" "ex:term" 123}}))))))
+          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@context" test-utils/default-str-context
+                                                                     "@graph"   [{"@id" "ex:me"
+                                                                                  "ex:foo" {"@id" "ex:you"}}
+                                                                                 {"@id" "ex:you"
+                                                                                  "ex:term" ["hello", "there"]}]}}))))))
     (testing "targetSubjectsof"
       (testing "with multiple targets"
         (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
