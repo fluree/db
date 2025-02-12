@@ -484,10 +484,10 @@
           (recur r acc*))))))
 
 (defn deserialize-preds
-  [namespace-codes pred-tuples]
-  (let [pred-keys      (mapv keyword (get pred-tuples "keys"))
-        pred-positions (map-indexed vector pred-keys)
-        pred-vals      (get pred-tuples "vals")
+  [namespace-codes serialized-pred-map]
+  (let [{pred-keys :keys
+         pred-vals :vals} serialized-pred-map
+        pred-positions (map-indexed #(vector %1 (keyword %2)) pred-keys)
         pred-maps      (map
                         (partial deserialize-pred-tuple namespace-codes pred-positions)
                         pred-vals)]
@@ -501,10 +501,9 @@
 (defn deserialize-schema
   "Deserializes the schema map from a semi-compact json."
   [serialized-schema namespace-codes]
-  (let [{pred-tuples "pred"
-         t           "t"} serialized-schema
-        pred (deserialize-preds namespace-codes pred-tuples)]
+  (let [{:keys [pred t]} serialized-schema
+        pred* (deserialize-preds namespace-codes pred)]
     (-> (base-schema)
         (assoc :t t
-               :pred pred)
+               :pred pred*)
         (refresh-subclasses))))

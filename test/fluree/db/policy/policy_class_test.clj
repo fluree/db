@@ -41,7 +41,7 @@
                                    {"@id"          "ex:ssnRestriction"
                                     "@type"        ["f:AccessPolicy" "ex:EmployeePolicy"]
                                     "f:required"   true
-                                    "f:onProperty" [{"@id" "schema:ssn"}]
+                                    "f:targetProperty" [{"@id" "schema:ssn"}]
                                     "f:action"     {"@id" "f:view"}
                                     "f:query"      {"@type"  "@json"
                                                     "@value" {"@context" {"ex" "http://example.org/ns/"}

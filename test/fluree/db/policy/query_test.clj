@@ -44,7 +44,7 @@
                      "@graph"   [{"@id"          "ex:ssnRestriction"
                                   "@type"        ["f:AccessPolicy"]
                                   "f:required"   true
-                                  "f:onProperty" [{"@id" "schema:ssn"}]
+                                  "f:targetProperty" [{"@id" "schema:ssn"}]
                                   "f:action"     {"@id" "f:view"}
                                   "f:query"      {"@type"  "@json"
                                                   "@value" {"@context" {"ex" "http://example.org/ns/"}
@@ -150,7 +150,11 @@
                            "@graph"   [{"@id"       "ex:productPropertyRestriction"
                                         "@type"     ["f:AccessPolicy"]
                                         "f:required" true
-                                        "f:onClass" [{"@id" "ex:Product"}]
+                                        "f:onSubject"
+                                        {"@type" "@json"
+                                         "@value"
+                                         {"@context" {"ex" "http://example.org/ns/"}
+                                          "where" [{"@id" "?$target" "@type" {"@id" "ex:Product"}}]}}
                                         "f:action"  {"@id" "f:view"}
                                         "f:query"   {"@type"  "@json"
                                                      "@value" {"@context" {"ex" "http://example.org/ns/"}
@@ -233,7 +237,11 @@
                          "@id"       "ex:unclassRestriction"
                          "@type"     ["f:AccessPolicy", "ex:UnclassPolicy"]
                          "f:required" true
-                         "f:onClass" [{"@id" "ex:Data"}]
+                         "f:targetSubject"
+                         {"@type" "@json"
+                          "@value"
+                          {"@context" {"ex" "http://example.org/ns/"}
+                           "where" [{"@id" "?$target" "@type" {"@id" "ex:Data"}}]}}
                          "f:action"  [{"@id" "f:view"}, {"@id" "f:modify"}]
                          "f:query"   {"@type"  "@json"
                                       "@value" {"@context" {"ex" "http://example.org/ns/"}
