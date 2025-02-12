@@ -4,7 +4,6 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [<? go-try]]
@@ -82,18 +81,6 @@
                    (if (util/exception? result)
                      result
                      [@db-vol result]))))))
-
-(defn modified-subjects
-  "Returns a map of sid to s-flakes for each modified subject."
-  [db-after flakes]
-  (go-try
-    (loop [[s-flakes & r] (partition-by flake/s flakes)
-           sid->s-flakes {}]
-      (if s-flakes
-        (let [sid        (some-> s-flakes first flake/s)
-              sid-flakes (set (<? (query-range/index-range (policy/root db-after) :spot = [sid])))]
-          (recur r (assoc sid->s-flakes sid sid-flakes)))
-        sid->s-flakes))))
 
 (defn new-virtual-graph
   "Creates a new virtual graph. If the virtual graph is invalid, an
