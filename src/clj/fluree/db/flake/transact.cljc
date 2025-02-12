@@ -134,7 +134,6 @@
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id))
-          mods         (<? (modified-subjects db-after add))
           db-after*    (-> db-after
                            (vocab/hydrate-schema add)
                            (check-virtual-graph add remove))]
@@ -142,7 +141,6 @@
        :remove    remove
        :db-after  db-after*
        :db-before db-before
-       :mods      mods
        :context   context})))
 
 (defn validate-db-update
@@ -167,5 +165,5 @@
                                  :author (or author identity)
                                  :annotation annotation)
           [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
-          updated-db (<? (final-db db** new-flakes tx-state))]
-      (<? (validate-db-update updated-db)))))
+          staged-map (<? (final-db db** new-flakes tx-state))]
+      (<? (validate-db-update staged-map)))))
