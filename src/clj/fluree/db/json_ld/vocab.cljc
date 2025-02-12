@@ -328,6 +328,7 @@
      :subclasses (delay {})}))
 
 
+;; TODO - do we need this any longer?
 (defn infer-predicate-ids
   [f]
   (let [[s p o] ((juxt flake/s flake/p flake/o) f)]

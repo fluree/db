@@ -134,6 +134,7 @@
           (swap! shapes-cache assoc shape-sid shape)
           shape)))))
 
+;; TODO - I believe we'd want to build these shapes when the shapes are initially built (in `rebuild-shapes` fn)
 (defn build-sibling-shapes
   "Construct the sibling shapes of a shape with a sh:qualifiedValueShape. Siblings are
   other qualified value shape constraints in the same property constraint."
@@ -1116,6 +1117,7 @@
           (recur r (conj all-s-flakes sid-flakes)))
         all-s-flakes))))
 
+;; TODO - this is now static, and doesn't need to be an Atom - can refactor
 (defn reset-shape-cache!
   "resets the shape cache with new shapes."
   [db new-shapes]
