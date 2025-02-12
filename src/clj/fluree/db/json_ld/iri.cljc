@@ -21,6 +21,8 @@
 (def ^:const f-ipfs-ns "fluree:ipfs://")
 (def ^:const f-s3-ns "fluree:s3://")
 
+(def ^:const shacl-ns "http://www.w3.org/ns/shacl#")
+
 (def ^:const type-iri "@type")
 (def ^:const json-iri "@json")
 (def ^:const rdf:type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
@@ -46,7 +48,7 @@
    "http://www.w3.org/2001/XMLSchema#"           2
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#" 3
    "http://www.w3.org/2000/01/rdf-schema#"       4
-   "http://www.w3.org/ns/shacl#"                 5
+   shacl-ns                                      5
    "http://www.w3.org/2002/07/owl#"              6
    "https://www.w3.org/2018/credentials#"        7
    f-ns                                          8

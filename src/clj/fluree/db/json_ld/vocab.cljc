@@ -327,23 +327,6 @@
                         :pred  {}})
      :subclasses (delay {})}))
 
-(defn modified-shape?
-  [s-flakes]
-  (some (fn [[_ p o :as _f]]
-          (or
-            ;; modified a subject with a shape type
-            (and (= p const/$rdf:type)
-                 (or (= o const/sh_NodeShape)
-                     (= o const/sh_PropertyShape)))
-            ;; most property shapes don't have a type, but do need a path
-            (= p const/sh_path)))
-        s-flakes))
-
-(defn invalidate-shape-cache!
-  "Invalidates the shape cache if _any_ shape is modified."
-  [db subject-mods]
-  (when (some modified-shape? (vals subject-mods))
-    (reset! (-> db :schema :shapes) {})))
 
 (defn infer-predicate-ids
   [f]
@@ -394,18 +377,15 @@
 (defn hydrate-schema
   "Updates the :schema key of db by processing just the vocabulary flakes out of
   the new flakes."
-  ([db new-flakes]
-   (hydrate-schema db new-flakes {}))
-  ([db new-flakes mods]
-   (let [pred-sids      (collect-predicate-ids db new-flakes)
-         vocab-flakes   (into #{}
-                              (filter (fn [f]
-                                        (or (contains? pred-sids (flake/s f))
-                                            (contains? predicate-refs (flake/p f)))))
-                              new-flakes)
-         schema         (update-schema db pred-sids vocab-flakes)]
-     (invalidate-shape-cache! db mods)
-     (assoc db :schema schema))))
+  [db new-flakes]
+  (let [pred-sids      (collect-predicate-ids db new-flakes)
+        vocab-flakes   (into #{}
+                             (filter (fn [f]
+                                       (or (contains? pred-sids (flake/s f))
+                                           (contains? predicate-refs (flake/p f)))))
+                             new-flakes)
+        schema         (update-schema db pred-sids vocab-flakes)]
+    (assoc db :schema schema)))
 
 (defn load-schema
   [{:keys [t] :as db} preds]

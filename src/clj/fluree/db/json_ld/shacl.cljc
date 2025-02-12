@@ -1103,7 +1103,9 @@
       v)))
 
 (defn modified-subjects
-  "Returns a seq of s-flakes for each modified subject."
+  "Returns a seq of s-flakes for each modified subject.
+
+  Note: SHACL validation needs to happen on the data state in db-after"
   [data-db flakes]
   (go-try
     (loop [[s-flakes & r] (partition-by flake/s flakes)
@@ -1113,6 +1115,55 @@
               sid-flakes (set (<? (query-range/index-range data-db :spot = [sid])))]
           (recur r (conj all-s-flakes sid-flakes)))
         all-s-flakes))))
+
+(defn reset-shape-cache!
+  "resets the shape cache with new shapes."
+  [db new-shapes]
+  (reset! (-> db :schema :shapes) new-shapes))
+
+(defn cached-shapes
+  "Shapes stored as map, keyed to the shacl rule's SID"
+  [db]
+  (-> db :schema :shapes deref vals))
+
+(defn shape-deactivated?
+  [shape]
+  (get shape const/sh_deactivated))
+
+(defn rebuild-shapes
+  [db]
+  (go-try
+    ;; TODO, can parallelize build-shape-node
+    (loop [[shape-sid & r] (<? (all-node-shape-ids db))
+           shapes {}]
+      (if shape-sid
+        (let [shape (<? (build-shape-node db shape-sid))]
+          (if (shape-deactivated? shape)
+            (recur r shapes)
+            (recur r (assoc shapes shape-sid shape))))
+        shapes))))
+
+(defn property-ns-code
+  "Returns namespace code for the property of the flake"
+  [flake]
+  (-> flake
+      flake/p
+      iri/get-ns-code))
+
+(def ^:const shacl-ns-code (get iri/default-namespaces iri/shacl-ns))
+
+(defn modified-shape?
+  "All SHACL rules have property IRIs in the S."
+  [flake]
+  (let [p-ns (property-ns-code flake)]
+    (= p-ns shacl-ns-code)))
+
+(defn extract-shapes
+  [db]
+  (go-try
+    (let [new-shapes (<? (rebuild-shapes db))]
+      (reset-shape-cache! db new-shapes) ;; TODO - there is really no reason this needs to be an atom any longer
+      (vals new-shapes))))
 
 (defn validate!
   "Will throw an exception if any of the modified subjects fails to conform to a shape that targets it.
@@ -1124,17 +1175,22 @@
   `modified-subjects` is a sequence of s-flakes of modified subjects."
   [shape-db data-db new-flakes context]
   (go-try
-    (let [modified-subjects (<? (modified-subjects data-db new-flakes))
-          v-ctx {:display  (make-display data-db context)
-                 :context  context
-                 :shape-db shape-db
-                 :data-db  data-db}]
-      (loop [[shape-sid & r] (<? (all-node-shape-ids shape-db))]
-        (if shape-sid
-          (let [shape (<? (build-shape shape-db shape-sid))]
-            (when (not (get shape const/sh_deactivated))
-              (doseq [s-flakes modified-subjects]
-                (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
-                  (throw-shacl-violation context results))))
-            (recur r))
-          :valid)))))
+    (let [shapes (if (some modified-shape? new-flakes)
+                   (<? (extract-shapes data-db))
+                   (cached-shapes data-db))]
+      (if (empty? shapes)
+        :valid
+        (let [modified-subjects (<? (modified-subjects data-db new-flakes))
+              v-ctx {:display  (make-display data-db context)
+                     :context  context
+                     :shape-db shape-db
+                     :data-db  data-db}]
+          (loop [[shape & r] shapes]
+            (if shape
+              (do
+                (doseq [s-flakes modified-subjects]
+                  ;; TODO - below could be done in parallel
+                  (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
+                    (throw-shacl-violation context results)))
+                (recur r))
+              :valid)))))))
