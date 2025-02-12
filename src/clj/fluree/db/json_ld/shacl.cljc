@@ -137,7 +137,7 @@
 (defn build-sibling-shapes
   "Construct the sibling shapes of a shape with a sh:qualifiedValueShape. Siblings are
   other qualified value shape constraints in the same property constraint."
-  [shape-db shape]
+  [db shape]
   (go-try
     (let [{shape-id const/$id
            [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
@@ -145,15 +145,15 @@
           shape]
       (if q-disjoint?
         (let [parent-shape-id
-              (first (<? (query-range/index-range shape-db :opst = [[shape-id const/$id] const/sh_property]
+              (first (<? (query-range/index-range db :opst = [[shape-id const/$id] const/sh_property]
                                                   {:flake-xf (map flake/s)})))
               sibling-sids
-              (<? (query-range/index-range shape-db :spot = [parent-shape-id const/sh_property]
+              (<? (query-range/index-range db :spot = [parent-shape-id const/sh_property]
                                            {:flake-xf (map flake/o)}))]
           (loop [[sib-sid & r] sibling-sids
                  sib-q-shapes []]
             (if sib-sid
-              (recur r (conj sib-q-shapes (<? (build-shape shape-db sib-sid))))
+              (recur r (conj sib-q-shapes (<? (build-shape db sib-sid))))
               (->> sib-q-shapes
                    ;; only keep the qualified value shape of the sibling shape
                    (keep #(first (get % const/sh_qualifiedValueShape)))
@@ -857,7 +857,7 @@
 
 ;; shape-based constraints
 (defmethod validate-constraint const/sh_node
-  [{:keys [display data-db shape-db] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [display data-db] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint} shape
 
@@ -904,7 +904,7 @@
         (not-empty results)))))
 
 (defmethod validate-constraint const/sh_qualifiedValueShape
-  [{:keys [display data-db shape-db] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [display data-db] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint
            [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
@@ -937,7 +937,7 @@
 
           (if q-disjoint?
             ;; disjoint requires subjects that conform to this q-shape cannot conform to any of the sibling q-shapes
-            (let [sibling-q-shapes (<? (build-sibling-shapes shape-db shape))]
+            (let [sibling-q-shapes (<? (build-sibling-shapes data-db shape))]
               (loop [[conforming-sid & r] conforming
                      non-disjoint-conformers #{}]
                 (if conforming-sid
@@ -1168,12 +1168,8 @@
 (defn validate!
   "Will throw an exception if any of the modified subjects fails to conform to a shape that targets it.
 
-  The `shape-db` is the db-before, since newly transacted shapes are not applied to the
-  transaction they appear in. The `data-db` is the db after, and it has to conform to
-  the shapes in the shape-db.
-
   `modified-subjects` is a sequence of s-flakes of modified subjects."
-  [shape-db data-db new-flakes context]
+  [data-db new-flakes context]
   (go-try
     (let [shapes (if (some modified-shape? new-flakes)
                    (<? (extract-shapes data-db))
@@ -1183,7 +1179,6 @@
         (let [modified-subjects (<? (modified-subjects data-db new-flakes))
               v-ctx {:display  (make-display data-db context)
                      :context  context
-                     :shape-db shape-db
                      :data-db  data-db}]
           (loop [[shape & r] shapes]
             (if shape
