@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.policy.modify
-  (:require [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
+  (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy.enforce :as enforce]
             [fluree.db.json-ld.policy.rules :as policy.rules]
@@ -8,14 +7,6 @@
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn classes-for-sid
-  [sid mods {:keys [schema] :as _db}]
-  ;; TODO - get parent classes
-  (->> (get mods sid)
-       (filter #(= const/$rdf:type (flake/p %)))
-       (map flake/o)
-       seq))
 
 (defn refresh-policy
   [db-after policy-values {:keys [target-subject target-property] :as policy}]
@@ -43,6 +34,7 @@
   [policy]
   (boolean (enforce/class-policy-map policy true)))
 
+;; TODO - get parent classes
 (defn subject-class-policies
   [db-after policy class-policy-cache sid]
   (go-try
