@@ -85,14 +85,14 @@
 
 (defn modified-subjects
   "Returns a map of sid to s-flakes for each modified subject."
-  [db flakes]
+  [db-after flakes]
   (go-try
     (loop [[s-flakes & r] (partition-by flake/s flakes)
            sid->s-flakes {}]
       (if s-flakes
-        (let [sid             (some-> s-flakes first flake/s)
-              existing-flakes (<? (query-range/index-range db :spot = [sid]))]
-          (recur r (assoc sid->s-flakes sid (into (set s-flakes) existing-flakes))))
+        (let [sid        (some-> s-flakes first flake/s)
+              sid-flakes (set (<? (query-range/index-range (policy/root db-after) :spot = [sid])))]
+          (recur r (assoc sid->s-flakes sid sid-flakes)))
         sid->s-flakes))))
 
 (defn new-virtual-graph
@@ -128,16 +128,15 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-          mods-ch      (modified-subjects (policy/root db) add) ;; kick off mods in background
           db-after     (-> db
                            (update :staged conj [txn author annotation])
                            (assoc :t t
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id))
-          mods         (<? mods-ch)
+          mods         (<? (modified-subjects db-after add))
           db-after*    (-> db-after
-                           (vocab/hydrate-schema add mods)
+                           (vocab/hydrate-schema add)
                            (check-virtual-graph add remove))]
       {:add       add
        :remove    remove
@@ -147,9 +146,9 @@
        :context   context})))
 
 (defn validate-db-update
-  [{:keys [db-after db-before mods context] :as staged-map}]
+  [{:keys [db-after add context] :as staged-map}]
   (go-try
-    (<? (shacl/validate! db-before (policy/root db-after) (vals mods) context))
+    (<? (shacl/validate! (policy/root db-after) add context))
     (let [allowed-db (<? (policy.modify/allowed? staged-map))]
       allowed-db)))
 
