@@ -36,7 +36,8 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serde-json]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -461,14 +462,15 @@
 
 (defn load-novelty
   [commit-storage indexed-db index-t commit-jsonld]
-  (go-try
-    (loop [[commit-tuple & r] (<? (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t)))
-           db indexed-db]
-      (if commit-tuple
-        (let [[commit-jsonld _commit-proof commit-data-jsonld] commit-tuple
-              new-db (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld))]
-          (recur r new-db))
-        db))))
+  (let [expanded-commit (json-ld/expand commit-jsonld)]
+    (go-try
+      (loop [[commit-tuple & r] (<? (commit-storage/trace-commits commit-storage expanded-commit (inc index-t)))
+             db                 indexed-db]
+        (if commit-tuple
+          (let [[commit-jsonld _commit-proof commit-data-jsonld] commit-tuple
+                new-db                                           (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld))]
+            (recur r new-db))
+          db)))))
 
 (defn add-reindex-thresholds
   "Adds reindexing thresholds to the root map.
