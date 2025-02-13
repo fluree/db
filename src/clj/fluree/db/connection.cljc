@@ -362,23 +362,22 @@
   [{:keys [commit-catalog index-catalog] :as conn}
    ledger-chan address]
   (go-try
-    (let [commit       (<? (lookup-commit conn address))
-          _            (if-not commit
-                         (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
-                                         {:status 400 :error :db/invalid-db}))
-                         (log/debug "Attempting to load from address:" address
-                                    "with commit:" commit))
-          ledger-alias (commit->ledger-alias conn address commit)
-          branch       (keyword (get-first-value commit const/iri-branch))
+    (if-let [commit (<? (lookup-commit conn address))]
+      (do (log/debug "Attempting to load from address:" address
+                     "with commit:" commit)
+          (let [ledger-alias (commit->ledger-alias conn address commit)
+                branch       (keyword (get-first-value commit const/iri-branch))
 
-          {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
+                {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 
-          pubs   (publishers conn)
-          ledger (ledger/instantiate conn ledger-alias address branch commit-catalog
-                                     index-catalog pubs indexing did commit)]
-      (subscribe-ledger conn ledger-alias)
-      (async/put! ledger-chan ledger)
-      ledger)))
+                pubs   (publishers conn)
+                ledger (ledger/instantiate conn ledger-alias address branch commit-catalog
+                                           index-catalog pubs indexing did commit)]
+            (subscribe-ledger conn ledger-alias)
+            (async/put! ledger-chan ledger)
+            ledger))
+      (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
+                      {:status 400 :error :db/invalid-db})))))
 
 (defn load-ledger-address
   [conn address]
