@@ -66,8 +66,7 @@
   nameservice/iNameService
   (lookup [_ ledger-alias]
     (when-let [address (lookup-address ipfs-endpoint ipns-key ledger-alias)]
-      (some-> (ipfs/read ipfs-endpoint address)
-              (json-ld/expand))))
+      (ipfs/read ipfs-endpoint address)))
   (alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
       alias)))
