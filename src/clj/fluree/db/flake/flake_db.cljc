@@ -492,7 +492,7 @@
                             3)] ;; default of 3 maximum old indexes not garbage collected
     (when-not (and (int? max-old-indexes)
                    (>= max-old-indexes 0))
-      (throw (ex-info (str "Invalid max-old-indexes value. Must be a non-negative integer.")
+      (throw (ex-info "Invalid max-old-indexes value. Must be a non-negative integer."
                       {:status 400, :error :db/invalid-config})))
     (assoc root-map :reindex-min-bytes reindex-min-bytes
                     :reindex-max-bytes reindex-max-bytes
