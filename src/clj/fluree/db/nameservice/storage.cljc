@@ -51,7 +51,7 @@
             filename                (local-filename alias)]
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (let [record (json/parse record-bytes false)]
-            (nameservice/commit-from-record record))
+            (nameservice/commit-from-record record))))))
 
   (alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?
