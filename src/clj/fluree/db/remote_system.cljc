@@ -78,10 +78,9 @@
   (let [server-host (pick-server system-state)]
     (go-try
       (try*
-        (let [head-commit (<? (xhttp/post-json (latest-commit-endpoint server-host)
-                                               {:resource ledger-address}
-                                               {:keywordize-keys false}))]
-          (get head-commit "address"))
+        (<? (xhttp/post-json (latest-commit-endpoint server-host)
+                             {:resource ledger-address}
+                             {:keywordize-keys false}))
         (catch* e
           (when-not (not-found-error? e) ; Return `nil` when the ledger isn't
                                          ; found in the remote system
