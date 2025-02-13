@@ -197,10 +197,9 @@
 (defn read-publisher-commit
   [conn ledger-address]
   (go-try
-    (if-let [commit-addr (<? (lookup-publisher-commit conn ledger-address))]
-      (<? (read-file-address conn commit-addr))
-      (throw (ex-info (str "No published commits exists for: " ledger-address)
-                      {:status 404 :error :db/commit-not-found})))))
+    (or (<? (lookup-publisher-commit conn ledger-address))
+        (throw (ex-info (str "No published commits exist for: " ledger-address)
+                        {:status 404 :error, :db/commit-not-found})))))
 
 (defn published-addresses
   [conn ledger-alias]
@@ -363,7 +362,7 @@
   [{:keys [commit-catalog index-catalog] :as conn}
    ledger-chan address]
   (go-try
-    (let [commit  (<? (lookup-commit conn address))
+    (let [commit       (<? (lookup-commit conn address))
           _            (if-not commit
                          (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
                                          {:status 400 :error :db/invalid-db}))
