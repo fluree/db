@@ -781,195 +781,546 @@
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?fullName
                           WHERE {?person person:handle \"jdoe\".
-                                 ?person person:fullName ?fullName.}"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [["ex:jdoe" "Jane Doe"]]
-                    results))))
+                                 ?person person:fullName ?fullName.}"]
+             (testing "output :fql"
+               (is (= [["ex:jdoe" "Jane Doe"]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["fullName" "person"]},
+                       "results"
+                       {"bindings"
+                        [{"person" {"type" "uri", "value" "ex:jdoe"},
+                          "fullName" {"value" "Jane Doe", "type" "literal"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic filter works"
            (let [query "PREFIX person: <http://example.org/Person#>
                           SELECT ?handle ?favNum
                           WHERE {?person person:handle ?handle ;
                                          person:favNums ?favNum .
                                  FILTER ( ?favNum > 10 ) .}"]
-             (is (= [["bbob" 23] ["jdoe" 42] ["jdoe" 99]]
-                    @(fluree/query db query {:format :sparql})))))
+             (testing "output :fql"
+               (is (= [["bbob" 23] ["jdoe" 42] ["jdoe" 99]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["favNum" "handle"]},
+                       "results"
+                       {"bindings"
+                        [{"handle" {"value" "bbob", "type" "literal"},
+                          "favNum"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"handle" {"value" "jdoe", "type" "literal"},
+                          "favNum"
+                          {"value" "42",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"handle" {"value" "jdoe", "type" "literal"},
+                          "favNum"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic wildcard query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT *
                           WHERE {?person person:handle ?handle;
-                                         person:favNums ?favNums.}"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= '[{?favNums 23, ?handle "bbob", ?person "ex:bbob"}
-                      {?favNums 0, ?handle "jbob", ?person "ex:jbob"}
-                      {?favNums 3, ?handle "jbob", ?person "ex:jbob"}
-                      {?favNums 5, ?handle "jbob", ?person "ex:jbob"}
-                      {?favNums 6, ?handle "jbob", ?person "ex:jbob"}
-                      {?favNums 7, ?handle "jbob", ?person "ex:jbob"}
-                      {?favNums 8, ?handle "jbob", ?person "ex:jbob"}
-                      {?favNums 9, ?handle "jbob", ?person "ex:jbob"}
-                      {?favNums 3, ?handle "jdoe", ?person "ex:jdoe"}
-                      {?favNums 7, ?handle "jdoe", ?person "ex:jdoe"}
-                      {?favNums 42, ?handle "jdoe", ?person "ex:jdoe"}
-                      {?favNums 99, ?handle "jdoe", ?person "ex:jdoe"}]
-                    results))))
+                                         person:favNums ?favNums.}"]
+             (testing "output :fql"
+               (is (= '[{?favNums 23, ?handle "bbob", ?person "ex:bbob"}
+                        {?favNums 0, ?handle "jbob", ?person "ex:jbob"}
+                        {?favNums 3, ?handle "jbob", ?person "ex:jbob"}
+                        {?favNums 5, ?handle "jbob", ?person "ex:jbob"}
+                        {?favNums 6, ?handle "jbob", ?person "ex:jbob"}
+                        {?favNums 7, ?handle "jbob", ?person "ex:jbob"}
+                        {?favNums 8, ?handle "jbob", ?person "ex:jbob"}
+                        {?favNums 9, ?handle "jbob", ?person "ex:jbob"}
+                        {?favNums 3, ?handle "jdoe", ?person "ex:jdoe"}
+                        {?favNums 7, ?handle "jdoe", ?person "ex:jdoe"}
+                        {?favNums 42, ?handle "jdoe", ?person "ex:jdoe"}
+                        {?favNums 99, ?handle "jdoe", ?person "ex:jdoe"}]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["favNums" "handle" "person"]},
+                       "results"
+                       {"bindings"
+                        [{"favNums"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "bbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:bbob"}}
+                         {"favNums"
+                          {"value" "0",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "5",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "6",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "8",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jdoe"}}
+                         {"favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jdoe"}}
+                         {"favNums"
+                          {"value" "42",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jdoe"}}
+                         {"favNums"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jdoe"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic wildcard query w/ grouping works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT *
                           WHERE {?person person:handle ?handle;
                                          person:favNums ?favNums.}
-                          GROUP BY ?person ?handle"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= '[{?favNums [23], ?handle "bbob", ?person "ex:bbob"}
-                      {?favNums [0 3 5 6 7 8 9], ?handle "jbob", ?person "ex:jbob"}
-                      {?favNums [3 7 42 99], ?handle "jdoe", ?person "ex:jdoe"}]
-                    results))))
+                          GROUP BY ?person ?handle"]
+             (testing "output :fql"
+               (is (= '[{?favNums [23], ?handle "bbob", ?person "ex:bbob"}
+                        {?favNums [0 3 5 6 7 8 9], ?handle "jbob", ?person "ex:jbob"}
+                        {?favNums [3 7 42 99], ?handle "jdoe", ?person "ex:jdoe"}]
+                      @(fluree/query db query {:format :sparql}))))
+             #_(testing "output :sparql"
+               (is (= :TODO
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic query w/ OPTIONAL works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?favNums
                           WHERE {?person person:handle ?handle.
-                                 OPTIONAL{?person person:favNums ?favNums.}}"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [["ex:bbob" 23]
-                     ["ex:fbueller" nil]
-                     ["ex:jbob" 0]
-                     ["ex:jbob" 3]
-                     ["ex:jbob" 5]
-                     ["ex:jbob" 6]
-                     ["ex:jbob" 7]
-                     ["ex:jbob" 8]
-                     ["ex:jbob" 9]
-                     ["ex:jdoe" 3]
-                     ["ex:jdoe" 7]
-                     ["ex:jdoe" 42]
-                     ["ex:jdoe" 99]]
-                    results))))
+                                 OPTIONAL{?person person:favNums ?favNums.}}"]
+             (testing "output :fql"
+               (is (= [["ex:bbob" 23]
+                       ["ex:fbueller" nil]
+                       ["ex:jbob" 0]
+                       ["ex:jbob" 3]
+                       ["ex:jbob" 5]
+                       ["ex:jbob" 6]
+                       ["ex:jbob" 7]
+                       ["ex:jbob" 8]
+                       ["ex:jbob" 9]
+                       ["ex:jdoe" 3]
+                       ["ex:jdoe" 7]
+                       ["ex:jdoe" 42]
+                       ["ex:jdoe" 99]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["favNums" "person"]},
+                       "results"
+                       {"bindings"
+                        [{"person" {"type" "uri", "value" "ex:bbob"},
+                          "favNums"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:fbueller"},
+                          "favNums" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "0",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "5",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "6",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "8",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "42",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic query w/ GROUP BY & OPTIONAL works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?favNums
                           WHERE {?person person:handle ?handle.
                                  OPTIONAL{?person person:favNums ?favNums.}}
-                          GROUP BY ?person"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [["ex:bbob" [23]]
-                     ["ex:fbueller" nil]
-                     ["ex:jbob" [0 3 5 6 7 8 9]]
-                     ["ex:jdoe" [3 7 42 99]]]
-                    results))))
+                          GROUP BY ?person"]
+             (testing "output :fql"
+               (is (= [["ex:bbob" [23]]
+                       ["ex:fbueller" nil]
+                       ["ex:jbob" [0 3 5 6 7 8 9]]
+                       ["ex:jdoe" [3 7 42 99]]]
+                      @(fluree/query db query {:format :sparql}))))
+             #_(testing "output :sparql"
+               (is (= :TODO
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic query w/ omitted subjects works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?fullName ?favNums
                           WHERE {?person person:handle \"jdoe\";
                                          person:fullName ?fullName;
-                                         person:favNums ?favNums.}"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [["ex:jdoe" "Jane Doe" 3]
-                     ["ex:jdoe" "Jane Doe" 7]
-                     ["ex:jdoe" "Jane Doe" 42]
-                     ["ex:jdoe" "Jane Doe" 99]]
-                    results))))
+                                         person:favNums ?favNums.}"]
+             (testing "output :fql"
+               (is (= [["ex:jdoe" "Jane Doe" 3]
+                       ["ex:jdoe" "Jane Doe" 7]
+                       ["ex:jdoe" "Jane Doe" 42]
+                       ["ex:jdoe" "Jane Doe" 99]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["favNums" "fullName" "person"]},
+                       "results"
+                       {"bindings"
+                        [{"person" {"type" "uri", "value" "ex:jdoe"},
+                          "fullName" {"value" "Jane Doe", "type" "literal"},
+                          "favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "fullName" {"value" "Jane Doe", "type" "literal"},
+                          "favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "fullName" {"value" "Jane Doe", "type" "literal"},
+                          "favNums"
+                          {"value" "42",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "fullName" {"value" "Jane Doe", "type" "literal"},
+                          "favNums"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "scalar fn query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (SHA512(?handle) AS ?handleHash)
-                          WHERE {?person person:handle ?handle.}"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [["f162b1f2b3a824f459164fe40ffc24a019993058061ca1bf90eca98a4652f98ccaa5f17496be3da45ce30a1f79f45d82d8b8b532c264d4455babc1359aaa461d"]
-                     ["eca2f5ab92fddbf2b1c51a60f5269086ce2415cb37964a05ae8a0b999625a8a50df876e97d34735ebae3fa3abb088fca005a596312fdf3326c4e73338f4c8c90"]
-                     ["696ba1c7597f0d80287b8f0917317a904fa23a8c25564331a0576a482342d3807c61eff8e50bf5cf09859cfdeb92d448490073f34fb4ea4be43663d2359b51a9"]
-                     ["fee256e1850ef33410630557356ea3efd56856e9045e59350dbceb6b5794041d50991093c07ad871e1124e6961f2198c178057cf391435051ac24eb8952bc401"]]
-                    results))))
+                          WHERE {?person person:handle ?handle.}"]
+             (testing "output :fql"
+               (is (= [["f162b1f2b3a824f459164fe40ffc24a019993058061ca1bf90eca98a4652f98ccaa5f17496be3da45ce30a1f79f45d82d8b8b532c264d4455babc1359aaa461d"]
+                       ["eca2f5ab92fddbf2b1c51a60f5269086ce2415cb37964a05ae8a0b999625a8a50df876e97d34735ebae3fa3abb088fca005a596312fdf3326c4e73338f4c8c90"]
+                       ["696ba1c7597f0d80287b8f0917317a904fa23a8c25564331a0576a482342d3807c61eff8e50bf5cf09859cfdeb92d448490073f34fb4ea4be43663d2359b51a9"]
+                       ["fee256e1850ef33410630557356ea3efd56856e9045e59350dbceb6b5794041d50991093c07ad871e1124e6961f2198c178057cf391435051ac24eb8952bc401"]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["handleHash"]},
+                       "results"
+                       {"bindings"
+                        [{"handleHash"
+                          {"value"
+                           "f162b1f2b3a824f459164fe40ffc24a019993058061ca1bf90eca98a4652f98ccaa5f17496be3da45ce30a1f79f45d82d8b8b532c264d4455babc1359aaa461d",
+                           "type" "literal"}}
+                         {"handleHash"
+                          {"value"
+                           "eca2f5ab92fddbf2b1c51a60f5269086ce2415cb37964a05ae8a0b999625a8a50df876e97d34735ebae3fa3abb088fca005a596312fdf3326c4e73338f4c8c90",
+                           "type" "literal"}}
+                         {"handleHash"
+                          {"value"
+                           "696ba1c7597f0d80287b8f0917317a904fa23a8c25564331a0576a482342d3807c61eff8e50bf5cf09859cfdeb92d448490073f34fb4ea4be43663d2359b51a9",
+                           "type" "literal"}}
+                         {"handleHash"
+                          {"value"
+                           "fee256e1850ef33410630557356ea3efd56856e9045e59350dbceb6b5794041d50991093c07ad871e1124e6961f2198c178057cf391435051ac24eb8952bc401",
+                           "type" "literal"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "aggregate fn query works"
            ;; Select the bound var after the AS to make sure it is bound to the result
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav) ?avgFav
-                          WHERE {?person person:favNums ?favNums.}"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [[17.66666666666667 17.66666666666667]]
-                    results))))
+                          WHERE {?person person:favNums ?favNums.}"]
+             (testing "output :fql"
+               (is (= [[17.66666666666667 17.66666666666667]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               ;; cannot have same key twice in a binding, binding isn't repeated
+               (is (= {"head" {"vars" ["avgFav"]},
+                       "results"
+                       {"bindings"
+                        [{"avgFav"
+                          {"value" "17.66666666666667",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "aggregate fn w/ GROUP BY query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav)
                           WHERE {?person person:favNums ?favNums.}
-                          GROUP BY ?person"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [[5.428571428571429] [37.75] [23]]
-                    results))))
+                          GROUP BY ?person"]
+             (testing "output :fql"
+               (is (= [[5.428571428571429] [37.75] [23]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["avgFav"]},
+                       "results"
+                       {"bindings"
+                        [{"avgFav"
+                          {"value" "5.428571428571429",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"}}
+                         {"avgFav"
+                          {"value" "37.75",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"}}
+                         {"avgFav"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "aggregate fn w/ GROUP BY ... HAVING query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav)
                           WHERE {?person person:favNums ?favNums.}
-                          GROUP BY ?person HAVING(AVG(?favNums) > 10)"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [[37.75] [23]]
-                    results))))
+                          GROUP BY ?person HAVING(AVG(?favNums) > 10)"]
+             (testing "output :fql"
+               (is (= [[37.75] [23]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["avgFav"]},
+                       "results"
+                       {"bindings"
+                        [{"avgFav"
+                          {"value" "37.75",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"}}
+                         {"avgFav"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "multi-arg fn query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (CONCAT(?handle, '-', ?fullName) AS ?hfn)
                           WHERE {?person person:handle ?handle.
-                                 ?person person:fullName ?fullName.}"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [["bbob-Billy Bob"]
-                     ["dankeshön-Ferris Bueller"]
-                     ["jbob-Jenny Bob"]
-                     ["jdoe-Jane Doe"]]
-                    results))))
+                                 ?person person:fullName ?fullName.}"]
+             (testing "output :fql"
+               (is (= [["bbob-Billy Bob"]
+                       ["dankeshön-Ferris Bueller"]
+                       ["jbob-Jenny Bob"]
+                       ["jdoe-Jane Doe"]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["hfn"]},
+                       "results"
+                       {"bindings"
+                        [{"hfn" {"value" "bbob-Billy Bob", "type" "literal"}}
+                         {"hfn" {"value" "dankeshön-Ferris Bueller", "type" "literal"}}
+                         {"hfn" {"value" "jbob-Jenny Bob", "type" "literal"}}
+                         {"hfn" {"value" "jdoe-Jane Doe", "type" "literal"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "multiple AS selections query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav) (CEIL(?avgFav) AS ?caf)
-                          WHERE {?person person:favNums ?favNums.}"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [[17.66666666666667 18]]
-                    results))))
+                          WHERE {?person person:favNums ?favNums.}"]
+             (testing "output :fql"
+               (is (= [[17.66666666666667 18]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["avgFav" "caf"]},
+                       "results"
+                       {"bindings"
+                        [{"avgFav"
+                          {"value" "17.66666666666667",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "caf"
+                          {"value" "18",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "mix of bindings and variables in SELECT query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?favNums (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
                           WHERE  {?person person:handle ?handle.
                                   ?person person:favNums ?favNums.}
-                          GROUP BY ?person ?handle"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [[[23] 23 "ex:bbob" "bbob" 23]
-                     [[0 3 5 6 7 8 9] 5.428571428571429 "ex:jbob" "jbob" 9]
-                     [[3 7 42 99] 37.75 "ex:jdoe" "jdoe" 99]]
-                    results))))
+                          GROUP BY ?person ?handle"]
+             (testing "output :fql"
+               (is (= [[[23] 23 "ex:bbob" "bbob" 23]
+                       [[0 3 5 6 7 8 9] 5.428571428571429 "ex:jbob" "jbob" 9]
+                       [[3 7 42 99] 37.75 "ex:jdoe" "jdoe" 99]]
+                      @(fluree/query db query {:format :sparql}))))
+             #_(testing "output :sparql"
+               (is (= :TODO
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "COUNT query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (COUNT(?favNums) AS ?numFavs)
                           WHERE {?person person:favNums ?favNums.}
-                          GROUP BY ?person"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [[7] [4] [1]]
-                    results))))
+                          GROUP BY ?person"]
+             (testing "output :fql"
+               (is (= [[7] [4] [1]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["numFavs"]},
+                       "results"
+                       {"bindings"
+                        [{"numFavs"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"numFavs"
+                          {"value" "4",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"numFavs"
+                          {"value" "1",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "SAMPLE query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (SAMPLE(?favNums) AS ?favNum)
                           WHERE {?person person:favNums ?favNums.}
-                          GROUP BY ?person"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= 3 (count results)))
-             (is (every? #(-> % first integer?) results))))
+                          GROUP BY ?person"]
+             (testing "output :fql"
+               (let [results @(fluree/query db query {:format :sparql})]
+                 (is (= 3 (count results)))
+                 (is (every? #(-> % first integer?) results))))
+             (testing "output :sparql"
+               (let [results @(fluree/query db query {:format :sparql :output :sparql})]
+                 (is (= 3 (-> results (get "results") (get "bindings") count)))
+                 (is (every? #(-> % (get "favNum") (get "datatype") (= "http://www.w3.org/2001/XMLSchema#integer"))
+                             (-> results (get "results") (get "bindings"))))))))
          (testing "SUM query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (SUM(?favNums) AS ?favNum)
                           WHERE {?person person:favNums ?favNums.}
-                          GROUP BY ?person"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [[38] [151] [23]]
-                    results))))
+                          GROUP BY ?person"]
+             (testing "output :fql"
+               (is (= [[38] [151] [23]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["favNum"]},
+                       "results"
+                       {"bindings"
+                        [{"favNum"
+                          {"value" "38",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNum"
+                          {"value" "151",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNum"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "ORDER BY ASC query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?handle
                           WHERE {?person person:handle ?handle.}
-                          ORDER BY ASC(?handle)"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [["bbob"] ["dankeshön"] ["jbob"] ["jdoe"]]
-                    results))))
+                          ORDER BY ASC(?handle)"]
+             (testing "output :fql"
+               (is (= [["bbob"] ["dankeshön"] ["jbob"] ["jdoe"]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["handle"]},
+                       "results"
+                       {"bindings"
+                        [{"handle" {"value" "bbob", "type" "literal"}}
+                         {"handle" {"value" "dankeshön", "type" "literal"}}
+                         {"handle" {"value" "jbob", "type" "literal"}}
+                         {"handle" {"value" "jdoe", "type" "literal"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "ORDER BY DESC query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?handle
                           WHERE {?person person:handle ?handle.}
-                          ORDER BY DESC(?handle)"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [["jdoe"] ["jbob"] ["dankeshön"] ["bbob"]]
-                    results))))
+                          ORDER BY DESC(?handle)"]
+             (testing "output :fql"
+               (is (= [["jdoe"] ["jbob"] ["dankeshön"] ["bbob"]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["handle"]},
+                       "results"
+                       {"bindings"
+                        [{"handle" {"value" "jdoe", "type" "literal"}}
+                         {"handle" {"value" "jbob", "type" "literal"}}
+                         {"handle" {"value" "dankeshön", "type" "literal"}}
+                         {"handle" {"value" "bbob", "type" "literal"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (let [book-data [{"id"                            "http://example.org/book/1"
                            "type"                          "http://example.org/Book"
                            "http://example.org/book/title" "For Whom the Bell Tolls"}
