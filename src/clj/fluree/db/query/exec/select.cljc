@@ -15,6 +15,11 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn var-name
+  "Stringify and remove q-mark prefix of var for SPARQL JSON formatting."
+  [var]
+  (subs (name var) 1))
+
 (defmulti display
   "Format a where-pattern match for presentation based on the match's datatype.
   Return an async channel that will eventually contain the formatted match."
@@ -23,20 +28,33 @@
 
 (defmethod display :default
   [match output-format _compact]
-  (where/get-value match))
+  (if (= output-format :sparql)
+    (let [v  (where/get-value match)
+          dt (where/get-datatype-iri match)]
+      (cond-> {"value" (str v) "type" "literal"}
+        (and v (not= const/iri-string dt)) (assoc "datatype" dt)))
+    (where/get-value match)))
 
 (defmethod display const/iri-rdf-json
   [match output-format _compact]
-  (-> match where/get-value (json/parse false)))
+  (if (= output-format :sparql)
+    {"value" (where/get-value match) "type" "literal" "datatype" const/iri-rdf-json}
+    (-> match where/get-value (json/parse false))))
 
 (defmethod display const/iri-id
   [match output-format compact]
-  (some-> match where/get-iri compact))
-
+  (if (= output-format :sparql)
+    (let [iri (where/get-iri match)]
+      (if (= \_ (first iri))
+        {"type" "bnode" "value" (subs iri 1)}
+        {"type" "uri" "value" iri}))
+    (some-> match where/get-iri compact)))
 
 (defmethod display const/iri-vector
   [match output-format _compact]
-  (some-> match where/get-value vec))
+  (if (= output-format :sparql)
+    {"type" "literal" "value" (some-> match where/get-value vec str) "datatype" const/iri-vector}
+    (some-> match where/get-value vec)))
 
 (defprotocol ValueSelector
   (format-value [fmt db iri-cache context output-format compact fuel-tracker error-ch solution]
@@ -55,9 +73,10 @@
     [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
     (log/trace "VariableSelector format-value var:" var "solution:" solution)
     (go (try*
-          (-> solution
-              (get var)
-              (display output-format compact))
+          (let [output (-> solution (get var) (display output-format compact))]
+            (if (= output-format :sparql)
+              {(var-name var) output}
+              output))
           (catch* e
                   (log/error e "Error formatting variable:" var)
                   (>! error-ch e)))))
@@ -82,7 +101,9 @@
                result {}]
           (if var
             (let [display-var (-> solution (get var) (display output-format compact))]
-              (recur vars (assoc result var display-var)))
+              (recur vars (if (= output-format :sparql)
+                            (assoc result (var-name var) display-var)
+                            (assoc result var display-var))))
             result))
         (catch* e
                 (log/error e "Error formatting wildcard")
@@ -128,7 +149,10 @@
   (format-value
     [_ _ _ _ output-format compact _ _ solution]
     (log/trace "AsSelector format-value solution:" solution)
-    (go (-> solution (get bind-var) (display output-format compact))))
+    (go (let [output (-> solution (get bind-var) (display output-format compact))]
+          (if (= output-format :sparql)
+            {(var-name bind-var) output}
+            output))))
   ValueAdapter
   (solution-value
     [_ _ solution]
@@ -186,7 +210,10 @@
                                       fuel-tracker error-ch solution))]
           (recur (rest selectors)
                  (conj values value)))
-        values))
+
+        (if (= output-format :sparql)
+          (apply merge values)
+          values)))
     (format-value selectors db iri-cache context output-format compact fuel-tracker
                   error-ch solution)))
 
