@@ -126,8 +126,12 @@
 (defn query-sparql
   [db query override-opts]
   (go-try
-    (let [fql (sparql/->fql query)]
-      (<? (query-fql db fql override-opts)))))
+    (let [fql     (sparql/->fql query)
+          results (<? (query-fql db fql override-opts))]
+      (if (= (:output override-opts) :sparql)
+        {"head" {"vars" (vec (sort (keys (first results))))}
+         "results" {"bindings" results}}
+        results))))
 
 (defn query
   [db query {:keys [format] :as override-opts :or {format :fql}}]
