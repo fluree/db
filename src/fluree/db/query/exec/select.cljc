@@ -119,12 +119,11 @@
   (update-solution
     [_ solution]
     (log/trace "AsSelector update-solution solution:" solution)
-    (let [result (:value (as-fn solution))
-          dt     (datatype/infer-iri result)]
-      (log/trace "AsSelector update-solution result:" result)
-      (assoc solution bind-var (-> bind-var
-                                   where/unmatched-var
-                                   (where/match-value result dt)))))
+    (let [{v :value dt :datatype-iri lang :lang} (as-fn solution)]
+      (log/trace "AsSelector update-solution result:" v)
+      (assoc solution bind-var (-> (where/unmatched-var bind-var)
+                                   (where/match-value v (or dt (datatype/infer-iri v)))
+                                   (cond-> lang (where/match-lang v lang))))))
   ValueSelector
   (format-value
     [_ _ _ _ output-format compact _ _ solution]
