@@ -4,7 +4,6 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [<? go-try]]
@@ -83,18 +82,6 @@
                      result
                      [@db-vol result]))))))
 
-(defn modified-subjects
-  "Returns a map of sid to s-flakes for each modified subject."
-  [db flakes]
-  (go-try
-    (loop [[s-flakes & r] (partition-by flake/s flakes)
-           sid->s-flakes {}]
-      (if s-flakes
-        (let [sid             (some-> s-flakes first flake/s)
-              existing-flakes (<? (query-range/index-range db :spot = [sid]))]
-          (recur r (assoc sid->s-flakes sid (into (set s-flakes) existing-flakes))))
-        sid->s-flakes))))
-
 (defn new-virtual-graph
   "Creates a new virtual graph. If the virtual graph is invalid, an
   exception will be thrown and the transaction will not complete."
@@ -128,28 +115,25 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-          mods-ch      (modified-subjects (policy/root db) add) ;; kick off mods in background
           db-after     (-> db
                            (update :staged conj [txn author annotation])
                            (assoc :t t
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id))
-          mods         (<? mods-ch)
           db-after*    (-> db-after
-                           (vocab/hydrate-schema add mods)
+                           (vocab/hydrate-schema add)
                            (check-virtual-graph add remove))]
       {:add       add
        :remove    remove
        :db-after  db-after*
        :db-before db-before
-       :mods      mods
        :context   context})))
 
 (defn validate-db-update
-  [{:keys [db-after db-before mods context] :as staged-map}]
+  [{:keys [db-after add context] :as staged-map}]
   (go-try
-    (<? (shacl/validate! db-before (policy/root db-after) (vals mods) context))
+    (<? (shacl/validate! (policy/root db-after) add context))
     (let [allowed-db (<? (policy.modify/allowed? staged-map))]
       allowed-db)))
 
@@ -168,5 +152,5 @@
                                  :author (or author identity)
                                  :annotation annotation)
           [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
-          updated-db (<? (final-db db** new-flakes tx-state))]
-      (<? (validate-db-update updated-db)))))
+          staged-map (<? (final-db db** new-flakes tx-state))]
+      (<? (validate-db-update staged-map)))))

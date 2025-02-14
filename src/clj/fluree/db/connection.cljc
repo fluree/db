@@ -197,10 +197,9 @@
 (defn read-publisher-commit
   [conn ledger-address]
   (go-try
-    (if-let [commit-addr (<? (lookup-publisher-commit conn ledger-address))]
-      (<? (read-file-address conn commit-addr))
-      (throw (ex-info (str "No published commits exists for: " ledger-address)
-                      {:status 404 :error :db/commit-not-found})))))
+    (or (<? (lookup-publisher-commit conn ledger-address))
+        (throw (ex-info (str "No published commits exist for: " ledger-address)
+                        {:status 404 :error, :db/commit-not-found})))))
 
 (defn published-addresses
   [conn ledger-alias]
@@ -363,23 +362,22 @@
   [{:keys [commit-catalog index-catalog] :as conn}
    ledger-chan address]
   (go-try
-    (let [commit  (<? (lookup-commit conn address))
-          _            (if-not commit
-                         (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
-                                         {:status 400 :error :db/invalid-db}))
-                         (log/debug "Attempting to load from address:" address
-                                    "with commit:" commit))
-          ledger-alias (commit->ledger-alias conn address commit)
-          branch       (keyword (get-first-value commit const/iri-branch))
+    (if-let [commit (<? (lookup-commit conn address))]
+      (do (log/debug "Attempting to load from address:" address
+                     "with commit:" commit)
+          (let [ledger-alias (commit->ledger-alias conn address commit)
+                branch       (keyword (get-first-value commit const/iri-branch))
 
-          {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
+                {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 
-          pubs   (publishers conn)
-          ledger (ledger/instantiate conn ledger-alias address branch commit-catalog
-                                     index-catalog pubs indexing did commit)]
-      (subscribe-ledger conn ledger-alias)
-      (async/put! ledger-chan ledger)
-      ledger)))
+                pubs   (publishers conn)
+                ledger (ledger/instantiate conn ledger-alias address branch commit-catalog
+                                           index-catalog pubs indexing did commit)]
+            (subscribe-ledger conn ledger-alias)
+            (async/put! ledger-chan ledger)
+            ledger))
+      (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
+                      {:status 400 :error :db/invalid-db})))))
 
 (defn load-ledger-address
   [conn address]

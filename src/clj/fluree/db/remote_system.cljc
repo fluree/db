@@ -69,15 +69,18 @@
   [e]
   (-> e ex-data :status (= 404)))
 
+(defn latest-commit-endpoint
+  [host]
+  (str host "/fluree/remote/latestCommit"))
+
 (defn remote-lookup
   [system-state ledger-address]
   (let [server-host (pick-server system-state)]
     (go-try
       (try*
-        (let [head-commit (<? (xhttp/post-json (str server-host "/fluree/remote/latestCommit")
-                                               {:resource ledger-address}
-                                               {:keywordize-keys false}))]
-          (get head-commit "address"))
+        (<? (xhttp/post-json (latest-commit-endpoint server-host)
+                             {:resource ledger-address}
+                             {:keywordize-keys false}))
         (catch* e
           (when-not (not-found-error? e) ; Return `nil` when the ledger isn't
                                          ; found in the remote system

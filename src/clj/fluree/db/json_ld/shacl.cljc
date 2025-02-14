@@ -134,10 +134,11 @@
           (swap! shapes-cache assoc shape-sid shape)
           shape)))))
 
+;; TODO - I believe we'd want to build these shapes when the shapes are initially built (in `rebuild-shapes` fn)
 (defn build-sibling-shapes
   "Construct the sibling shapes of a shape with a sh:qualifiedValueShape. Siblings are
   other qualified value shape constraints in the same property constraint."
-  [shape-db shape]
+  [db shape]
   (go-try
     (let [{shape-id const/$id
            [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
@@ -145,15 +146,15 @@
           shape]
       (if q-disjoint?
         (let [parent-shape-id
-              (first (<? (query-range/index-range shape-db :opst = [[shape-id const/$id] const/sh_property]
+              (first (<? (query-range/index-range db :opst = [[shape-id const/$id] const/sh_property]
                                                   {:flake-xf (map flake/s)})))
               sibling-sids
-              (<? (query-range/index-range shape-db :spot = [parent-shape-id const/sh_property]
+              (<? (query-range/index-range db :spot = [parent-shape-id const/sh_property]
                                            {:flake-xf (map flake/o)}))]
           (loop [[sib-sid & r] sibling-sids
                  sib-q-shapes []]
             (if sib-sid
-              (recur r (conj sib-q-shapes (<? (build-shape shape-db sib-sid))))
+              (recur r (conj sib-q-shapes (<? (build-shape db sib-sid))))
               (->> sib-q-shapes
                    ;; only keep the qualified value shape of the sibling shape
                    (keep #(first (get % const/sh_qualifiedValueShape)))
@@ -311,8 +312,10 @@
     (let [target-pids       (into #{} (map unpack-id) (get shape const/sh_targetObjectsOf))]
       (let [sid             (some-> s-flakes first flake/s)
             referring-pids  (not-empty (<? (query-range/index-range db :opst = [[sid const/$id]]
-                                                                    {:flake-xf (map flake/p)})))
-            p-flakes        (filterv (fn [f] (contains? target-pids (flake/p f))) s-flakes)
+                                                                    {:flake-xf (comp
+                                                                                (map flake/p)
+                                                                                (filter target-pids))})))
+            p-flakes        (filter (fn [f] (contains? target-pids (flake/p f))) s-flakes)
             focus-nodes     (mapv object-node p-flakes)]
         (cond-> focus-nodes
           referring-pids (conj (sid-node sid)))))))
@@ -855,7 +858,7 @@
 
 ;; shape-based constraints
 (defmethod validate-constraint const/sh_node
-  [{:keys [display data-db shape-db] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [display data-db] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint} shape
 
@@ -902,7 +905,7 @@
         (not-empty results)))))
 
 (defmethod validate-constraint const/sh_qualifiedValueShape
-  [{:keys [display data-db shape-db] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [display data-db] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint
            [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
@@ -935,7 +938,7 @@
 
           (if q-disjoint?
             ;; disjoint requires subjects that conform to this q-shape cannot conform to any of the sibling q-shapes
-            (let [sibling-q-shapes (<? (build-sibling-shapes shape-db shape))]
+            (let [sibling-q-shapes (<? (build-sibling-shapes data-db shape))]
               (loop [[conforming-sid & r] conforming
                      non-disjoint-conformers #{}]
                 (if conforming-sid
@@ -1100,25 +1103,91 @@
           (json-ld/compact context))
       v)))
 
+(defn modified-subjects
+  "Returns a seq of s-flakes for each modified subject.
+
+  Note: SHACL validation needs to happen on the data state in db-after"
+  [data-db flakes]
+  (go-try
+    (loop [[s-flakes & r] (partition-by flake/s flakes)
+           all-s-flakes []]
+      (if s-flakes
+        (let [sid        (some-> s-flakes first flake/s)
+              sid-flakes (set (<? (query-range/index-range data-db :spot = [sid])))]
+          (recur r (conj all-s-flakes sid-flakes)))
+        all-s-flakes))))
+
+;; TODO - this is now static, and doesn't need to be an Atom - can refactor
+(defn reset-shape-cache!
+  "resets the shape cache with new shapes."
+  [db new-shapes]
+  (reset! (-> db :schema :shapes) new-shapes))
+
+(defn cached-shapes
+  "Shapes stored as map, keyed to the shacl rule's SID"
+  [db]
+  (-> db :schema :shapes deref vals))
+
+(defn shape-deactivated?
+  [shape]
+  (get shape const/sh_deactivated))
+
+(defn rebuild-shapes
+  [db]
+  (go-try
+    ;; TODO, can parallelize build-shape-node
+    (loop [[shape-sid & r] (<? (all-node-shape-ids db))
+           shapes {}]
+      (if shape-sid
+        (let [shape (<? (build-shape-node db shape-sid))]
+          (if (shape-deactivated? shape)
+            (recur r shapes)
+            (recur r (assoc shapes shape-sid shape))))
+        shapes))))
+
+(defn property-ns-code
+  "Returns namespace code for the property of the flake"
+  [flake]
+  (-> flake
+      flake/p
+      iri/get-ns-code))
+
+(def ^:const shacl-ns-code (get iri/default-namespaces iri/shacl-ns))
+
+(defn modified-shape?
+  "All SHACL rules have property IRIs in the S."
+  [flake]
+  (let [p-ns (property-ns-code flake)]
+    (= p-ns shacl-ns-code)))
+
+(defn extract-shapes
+  [db]
+  (go-try
+    (let [new-shapes (<? (rebuild-shapes db))]
+      (reset-shape-cache! db new-shapes) ;; TODO - there is really no reason this needs to be an atom any longer
+      (vals new-shapes))))
+
 (defn validate!
   "Will throw an exception if any of the modified subjects fails to conform to a shape that targets it.
 
-  The `shape-db` is the db-before, since newly transacted shapes are not applied to the
-  transaction they appear in. The `data-db` is the db after, and it has to conform to
-  the shapes in the shape-db.
-
   `modified-subjects` is a sequence of s-flakes of modified subjects."
-  [shape-db data-db modified-subjects context]
+  [data-db new-flakes context]
   (go-try
-    (when-let [node-shape-sids (seq (<? (all-node-shape-ids shape-db)))]
-      (doseq [s-flakes modified-subjects]
-        (doseq [shape-sid node-shape-sids]
-          (let [shape   (<? (build-shape shape-db shape-sid))
-                v-ctx   {:display  (make-display data-db context)
-                         :context  context
-                         :shape-db shape-db
-                         :data-db  data-db}]
-            ;; only enforce activated shapes
-            (when (not (get shape const/sh_deactivated))
-              (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
-                (throw-shacl-violation context results)))))))))
+    (let [shapes (if (some modified-shape? new-flakes)
+                   (<? (extract-shapes data-db))
+                   (cached-shapes data-db))]
+      (if (empty? shapes)
+        :valid
+        (let [modified-subjects (<? (modified-subjects data-db new-flakes))
+              v-ctx {:display  (make-display data-db context)
+                     :context  context
+                     :data-db  data-db}]
+          (loop [[shape & r] shapes]
+            (if shape
+              (do
+                (doseq [s-flakes modified-subjects]
+                  ;; TODO - below could be done in parallel
+                  (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
+                    (throw-shacl-violation context results)))
+                (recur r))
+              :valid)))))))

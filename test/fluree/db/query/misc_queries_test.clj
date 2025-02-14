@@ -382,3 +382,21 @@
       (testing "do not become multicardinal result values"
         (is (= [{"ex:foo" 30, "@id" "ex:1"}]
                @(fluree/query db3 {"select" {"ex:1" ["*"]}})))))))
+
+(deftest ^:integration base-context
+  (let [conn @(fluree/connect-memory)
+        ledger @(fluree/create conn "base")
+        db0 (fluree/db ledger)
+        db1 @(fluree/stage db0 {"@context" {"@base" "https://flur.ee/" "ex" "http://example.com/"}
+                                "insert" [{"@id" "freddy" "@type" "Yeti" "name" "Freddy"}
+                                          {"@id" "ex:betty" "@type" "Yeti" "name" "Betty"}]})]
+    (is (= [["name" "Freddy"]
+            ["@type" "Yeti"]]
+           @(fluree/query db1 {"@context" {"@base" "https://flur.ee/"}
+                               "where" [{"@id" "freddy" "?p" "?o"}]
+                               "select" ["?p" "?o"]})))
+    (is (= [{"@id" "freddy"
+             "@type" "Yeti"
+             "name" "Freddy"}]
+           @(fluree/query db1 {"@context" {"@base" "https://flur.ee/"}
+                               "select" {"freddy" ["*"]}})))))

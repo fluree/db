@@ -1,21 +1,12 @@
 (ns fluree.db.json-ld.policy.modify
-  (:require [fluree.db.constants :as const]
-            [fluree.db.util.async :refer [<? go-try]]
+  (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [fluree.db.json-ld.policy.enforce :as enforce]
-            [fluree.db.json-ld.policy.rules :as policy.rules]))
+            [fluree.db.json-ld.policy.rules :as policy.rules]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn classes-for-sid
-  [sid mods {:keys [schema] :as _db}]
-  ;; TODO - get parent classes
-  (->> (get mods sid)
-       (filter #(= const/$rdf:type (flake/p %)))
-       (map flake/o)
-       seq))
 
 (defn refresh-policy
   [db-after policy-values {:keys [target-subject target-property] :as policy}]
@@ -39,15 +30,31 @@
               (recur r (conj refreshed policy))))
           (assoc-in db-after [:policy :modify :default] refreshed))))))
 
+(defn has-class-policies?
+  [policy]
+  (boolean (enforce/class-policy-map policy true)))
+
+;; TODO - get parent classes
+(defn subject-class-policies
+  [db-after policy class-policy-cache sid]
+  (go-try
+    (let [classes (<? (dbproto/-class-ids db-after sid))
+          policies (or (enforce/policies-for-classes classes policy true)
+                       [])]
+      (swap! class-policy-cache assoc sid policies)
+      policies)))
+
 (defn allowed?
   "Checks if all 'adds' are allowed by the policy. If so
   returns final db.
 
   If encounters a policy error, will throw with policy error
   message (if available)."
-  [{:keys [db-after add mods]}]
+  [{:keys [db-after add]}]
   (go-try
-    (let [{:keys [policy]} (<? (refresh-modify-policies db-after))]
+    (let [{:keys [policy]} (<? (refresh-modify-policies db-after))
+          class-policies? (has-class-policies? policy)
+          class-policy-cache (atom {})]
       (if (enforce/unrestricted-modify? policy)
         db-after
         (loop [[flake & r] add]
@@ -55,8 +62,9 @@
             (let [sid      (flake/s flake)
                   pid      (flake/p flake)
                   policies (concat (enforce/policies-for-property policy true pid)
-                                   (->> (classes-for-sid sid mods db-after)
-                                        (enforce/policies-for-classes policy true))
+                                   (when class-policies?
+                                     (or (get @class-policy-cache sid)
+                                         (<? (subject-class-policies db-after policy class-policy-cache sid))))
                                    (enforce/policies-for-flake db-after flake true))]
               ;; policies-allow? will throw if access forbidden
               (if-some [required-policies (not-empty (filter :required? policies))]
