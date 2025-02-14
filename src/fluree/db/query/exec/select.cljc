@@ -129,8 +129,7 @@
   (format-value
     [_ _ _ _ output-format compact _ _ solution]
     (log/trace "AsSelector format-value solution:" solution)
-    (go (let [match (get solution bind-var)]
-          (where/get-value match))))
+    (go (-> solution (get bind-var) (display output-format compact))))
   ValueAdapter
   (solution-value
     [_ _ solution]
