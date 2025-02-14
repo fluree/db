@@ -54,10 +54,10 @@
     [nil]))
 
 (defmethod select/display ::grouping
-  [match compact]
+  [match output-format compact]
   (let [group (where/get-value match)]
     (mapv (fn [grouped-val]
-            (select/display grouped-val compact))
+            (select/display grouped-val output-format compact))
           group)))
 
 (defn combine
