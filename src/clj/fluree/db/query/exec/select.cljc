@@ -78,7 +78,7 @@
     [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
     (go
       (try*
-        (loop [[var & vars] (sort (keys solution))
+        (loop [[var & vars] (sort (remove nil? (keys solution))) ; implicit grouping can introduce nil keys in solution
                result {}]
           (if var
             (let [display-var (-> solution (get var) (display output-format compact))]
