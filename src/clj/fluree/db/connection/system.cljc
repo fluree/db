@@ -79,7 +79,7 @@
 
 (defmethod ig/expand-key :fluree.db/connection
   [k config]
-  (let [cache-max-mb   (config/get-first-integer config conn-vocab/cache-max-mb)
+  (let [cache-max-mb   (config/get-first-long config conn-vocab/cache-max-mb)
         commit-storage (get-first config conn-vocab/commit-storage)
         index-storage  (get-first config conn-vocab/index-storage)
         remote-systems (get config conn-vocab/remote-systems)
@@ -218,8 +218,8 @@
 (defn parse-index-options
   [defaults]
   (when-let [index-options (get-first defaults conn-vocab/index-options)]
-    {:reindex-min-bytes (config/get-first-integer index-options conn-vocab/reindex-min-bytes)
-     :reindex-max-bytes (config/get-first-integer index-options conn-vocab/reindex-max-bytes)
+    {:reindex-min-bytes (config/get-first-long index-options conn-vocab/reindex-min-bytes)
+     :reindex-max-bytes (config/get-first-long index-options conn-vocab/reindex-max-bytes)
      :max-old-indexes   (config/get-first-integer index-options conn-vocab/max-old-indexes)}))
 
 (defn parse-defaults
