@@ -323,8 +323,7 @@
   (let [pred (build-pred-map [initial-type-map initial-class-map])]
     {:t          0
      :pred       pred
-     :shapes     (atom {:class {} ; TODO: Does this need to be an atom?
-                        :pred  {}})
+     :shapes     (atom {})
      :subclasses (delay {})}))
 
 
