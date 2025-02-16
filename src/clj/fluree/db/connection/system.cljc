@@ -218,8 +218,8 @@
 (defn parse-index-options
   [defaults]
   (when-let [index-options (get-first defaults conn-vocab/index-options)]
-    {:reindex-min-bytes (config/get-first-integer index-options conn-vocab/reindex-min-bytes)
-     :reindex-max-bytes (config/get-first-integer index-options conn-vocab/reindex-max-bytes)
+    {:reindex-min-bytes (config/get-first-long index-options conn-vocab/reindex-min-bytes)
+     :reindex-max-bytes (config/get-first-long index-options conn-vocab/reindex-max-bytes)
      :max-old-indexes   (config/get-first-integer index-options conn-vocab/max-old-indexes)}))
 
 (defn parse-defaults
