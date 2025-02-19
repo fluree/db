@@ -292,7 +292,7 @@
       (and (contains? comparable-time-datatypes dt-a)
            (contains? comparable-time-datatypes dt-b))
       #?(:clj (compare (->offset-date-time val-a) (->offset-date-time val-b))
-         :cljs (comapre val-a val-b))
+         :cljs (compare val-a val-b))
 
       ;; same types compare
       (= dt-a dt-b)
@@ -382,6 +382,7 @@
        :cljs (js/Date.))
     const/iri-xsd-dateTime))
 
+;; TODO - date functions below all look incorrect for CLJS - should (string? datetime) be (map? datetime)?
 (defn year
   [datetime]
   (where/->typed-val
@@ -444,6 +445,7 @@
                             (datatype/coerce (:value x) (:datatype-iri x))
                             x)))))
 
+;; TODO - CLJS datetime is not a variable present in the function
 (defn tz
   [x]
   (where/->typed-val

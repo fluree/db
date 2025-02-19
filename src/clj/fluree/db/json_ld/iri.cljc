@@ -1,11 +1,9 @@
 (ns fluree.db.json-ld.iri
   (:require [fluree.db.util.core :as util]
-            [fluree.db.util.bytes :as bytes]
+            [fluree.db.util.log :as log]
             [clojure.string :as str]
             [clojure.set :refer [map-invert]]
-            [nano-id.core :refer [nano-id]]
-            #?(:cljs [fluree.db.sid :refer [SID]]))
-  #?(:clj (:import (fluree.db SID))))
+            [nano-id.core :refer [nano-id]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -70,6 +68,100 @@
    "_:"                                          24
    f-idx-ns                                      25})
 
+(declare compare-SIDs sid-equiv?)
+
+;; TODO - verify sort order is same!!
+;;
+(deftype SID [namespace-code name]
+  #?@(:clj  [clojure.lang.Seqable
+             (seq [this] (list (.-namespace-code this) (.-name this)))
+
+             Object
+             (equals [this sid]
+               (sid-equiv? this sid))
+             (hashCode [this] (hash (seq this)))
+
+             clojure.lang.IHashEq
+             (hasheq [this] (hash (seq this)))
+
+             java.lang.Comparable
+             (compareTo [this other] (compare-SIDs this other))]
+
+      :cljs [ISeqable
+             (-seq [this] (list (.-namespace-code this) (.-name this)))
+
+             IHash
+             (-hash [this] (hash (seq this)))
+
+             IEquiv
+             (-equiv [this sid] (sid-equiv? this sid))
+
+             IComparable
+             (-compare [this other] (compare-SIDs this other))
+
+             IPrintWithWriter
+             (-pr-writer [^SID sid writer opts]
+                         (pr-sequential-writer writer pr-writer
+                                               "#fluree/SID [" " " "]"
+                                               opts [(.-namespace-code sid) (.-name sid)]))]))
+
+(defn sid-equiv?
+  [^SID sid ^SID other]
+  (and (instance? SID other)
+       (= (.-namespace-code sid) (.-namespace-code other))
+       (= (.-name sid) (.-name other))))
+
+(defn ->sid
+  [ns-code nme]
+  (->SID ns-code nme))
+
+(defn get-ns-code
+  [^SID sid]
+  (.-namespace-code sid))
+
+(defn get-name
+  [^SID sid]
+  (.-name sid))
+
+(defn deserialize-sid
+  [[ns-code nme]]
+  (->sid ns-code nme))
+
+(defn measure-sid
+  "Returns the size of an SID."
+  [sid]
+  (+ 12 ; 12 bytes for object header
+     4  ; 4 bytes for namespace code
+     (* 2 (count (get-name sid)))))
+
+(def serialize-sid
+  (juxt get-ns-code get-name))
+
+#?(:clj (defmethod print-method SID [^SID sid ^java.io.Writer w]
+          (doto w
+            (.write "#fluree/SID ")
+            (.write (-> sid serialize-sid pr-str)))))
+
+; TODO - verify we don't need this
+;#?(:clj (defmethod print-dup SID
+;          [^SID sid ^java.io.Writer w]
+;          (let [ns-code (get-ns-code sid)
+;                nme     (get-name sid)]
+;            (.write w (str "#=" `(->sid ~ns-code ~nme))))))
+
+(defn compare-SIDs
+  [^SID sid1 ^SID sid2]
+  (when-not (instance? SID sid2)
+    (throw (ex-info "Can't compare an SID to another type"
+                    {:status 500 :error :db/unexpected-error})))
+  (let [ns-cmp (compare (get-ns-code sid1) (get-ns-code sid2))]
+    (if-not (zero? ns-cmp)
+      ns-cmp
+      (compare (get-name sid1) (get-name sid2)))))
+
+(defn sid?
+  [x]
+  (instance? SID x))
 
 (def default-namespace-codes
   (map-invert default-namespaces))
@@ -106,34 +198,6 @@
           (decompose-by-char iri* \: length)
           ["" iri*]))))
 
-(def name-code-xf
-  (comp (partition-all 8)
-        (map bytes/UTF8->long)))
-
-#?(:clj (defn name->codes
-          [nme]
-          (->> nme
-               bytes/string->UTF8
-               (into [] name-code-xf))))
-
-#?(:clj (defn codes->name
-          [nme-codes]
-          (->> nme-codes
-               (mapcat bytes/long->UTF8)
-               bytes/UTF8->string)))
-
-(defn ->sid
-  [ns-code nme]
-  (let [ns-int (int ns-code)
-        nme*   #?(:clj (-> nme name->codes long-array)
-                  :cljs nme)]
-    (SID. ns-int nme*)))
-
-(defn get-ns-code
-  [^SID sid]
-  #?(:clj (.getNamespaceCode sid)
-     :cljs (:namespace-code sid)))
-
 (defn get-namespace
   ([sid]
    (get-namespace sid default-namespace-codes))
@@ -141,46 +205,12 @@
    (let [ns-code (get-ns-code sid)]
      (get namespace-codes ns-code))))
 
-(defn get-name
-  [^SID sid]
-  #?(:clj (->> sid .getNameCodes codes->name)
-     :cljs (:name sid)))
-
-(defn deserialize-sid
-  [[ns-code nme]]
-  (->sid ns-code nme))
-
-(defn measure-sid
-  "Returns the size of an SID."
-  [sid]
-  (+ 12 ; 12 bytes for object header
-     4  ; 4 bytes for namespace code
-     (* 2 (count (get-name sid)))))
-
-(def serialize-sid
-  (juxt get-ns-code get-name))
-
 (defn serialized-sid?
   [x]
   (and (vector? x)
        (= (count x) 2)
        (number? (nth x 0))
        (string? (nth x 1))))
-
-#?(:clj (defmethod print-method SID [^SID sid ^java.io.Writer w]
-          (doto w
-            (.write "#fluree/SID ")
-            (.write (-> sid serialize-sid pr-str)))))
-
-#?(:clj (defmethod print-dup SID
-          [^SID sid ^java.io.Writer w]
-          (let [ns-code (get-ns-code sid)
-                nme     (get-name sid)]
-            (.write w (str "#=" `(->sid ~ns-code ~nme))))))
-
-(defn sid?
-  [x]
-  (instance? SID x))
 
 (defn blank-node-sid?
   [x]

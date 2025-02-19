@@ -583,7 +583,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                    "sh:focusNode" "ex:Named",
                    "sh:constraintComponent" "sh:xone",
                    "sh:sourceShape" "ex:orShape",
-                   "sh:value" ["Washington" "George Washington" "George"],
+                   "sh:value" ["Washington" "George" "George Washington"],
                    "sh:resultMessage" "values conformed to 2 of the following sh:xone shapes: [\"ex:one-part\" \"ex:two-parts\"]; must only conform to one"}]}}
                (ex-data db2)))
         (is (= "Subject ex:Named violates constraint sh:xone of shape ex:orShape - values conformed to 2 of the following sh:xone shapes: [\"ex:one-part\" \"ex:two-parts\"]; must only conform to one."
