@@ -20,6 +20,22 @@
   [var]
   (subs (name var) 1))
 
+(defn disaggregate
+  "For SPARQL JSON results, no nesting of data is permitted - the results must be
+  tabular. This function unpacks a single result into potentially multiple 'rows' of
+  results."
+  [result]
+  (let [aggregated (filter (fn [[k v]] (sequential? v)) result)]
+    (loop [[[agg-var agg-vals] & r] aggregated
+           results [result]]
+      (if agg-var
+        (let [results* (reduce (fn [results* result]
+                                 (into results* (map (fn [v] (assoc result agg-var v)) agg-vals)))
+                               []
+                               results)]
+          (recur r results*))
+        results))))
+
 (defmulti display
   "Format a where-pattern match for presentation based on the match's datatype.
   Return an async channel that will eventually contain the formatted match."
@@ -229,8 +245,12 @@
                                 (:select-one q)
                                 (:select-distinct q))
         iri-cache           (volatile! {})
-        format-ch           (if (contains? q :select-distinct)
-                              (chan 1 (distinct))
+        format-xf           (some->> [(when (contains? q :select-distinct) (distinct))
+                                      (when (= output-format :sparql) (mapcat disaggregate))]
+                                     (remove nil?)
+                                     (apply comp))
+        format-ch           (if format-xf
+                              (chan 1 format-xf)
                               (chan))]
     (async/pipeline-async 3
                           format-ch
