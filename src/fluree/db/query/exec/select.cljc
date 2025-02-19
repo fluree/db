@@ -248,6 +248,7 @@
         format-xf           (some->> [(when (contains? q :select-distinct) (distinct))
                                       (when (= output-format :sparql) (mapcat disaggregate))]
                                      (remove nil?)
+                                     (not-empty)
                                      (apply comp))
         format-ch           (if format-xf
                               (chan 1 format-xf)
