@@ -928,8 +928,82 @@
                         {?favNums [0 3 5 6 7 8 9], ?handle "jbob", ?person "ex:jbob"}
                         {?favNums [3 7 42 99], ?handle "jdoe", ?person "ex:jdoe"}]
                       @(fluree/query db query {:format :sparql}))))
-             #_(testing "output :sparql"
-               (is (= :TODO
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["favNums" "handle" "person"]},
+                       "results"
+                       {"bindings"
+                        [{"favNums"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "bbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:bbob"}}
+                         {"favNums"
+                          {"value" "0",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "5",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "6",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "8",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jbob"}}
+                         {"favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jdoe"}}
+                         {"favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jdoe"}}
+                         {"favNums"
+                          {"value" "42",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jdoe"}}
+                         {"favNums"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "person" {"type" "uri", "value" "ex:jdoe"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic query w/ OPTIONAL works"
            (let [query   "PREFIX person: <http://example.org/Person#>
@@ -1030,8 +1104,72 @@
                        ["ex:jbob" [0 3 5 6 7 8 9]]
                        ["ex:jdoe" [3 7 42 99]]]
                       @(fluree/query db query {:format :sparql}))))
-             #_(testing "output :sparql"
-               (is (= :TODO
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["favNums" "person"]},
+                       "results"
+                       {"bindings"
+                        [{"person" {"type" "uri", "value" "ex:bbob"},
+                          "favNums"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:fbueller"},
+                          "favNums" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "0",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "5",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "6",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "8",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "42",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic query w/ omitted subjects works"
            (let [query   "PREFIX person: <http://example.org/Person#>
@@ -1220,8 +1358,178 @@
                        [[0 3 5 6 7 8 9] 5.428571428571429 "ex:jbob" "jbob" 9]
                        [[3 7 42 99] 37.75 "ex:jdoe" "jdoe" 99]]
                       @(fluree/query db query {:format :sparql}))))
-             #_(testing "output :sparql"
-               (is (= :TODO
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["avg" "favNums" "handle" "max" "person"]},
+                       "results"
+                       {"bindings"
+                        [{"favNums"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "person" {"type" "uri", "value" "ex:bbob"},
+                          "handle" {"value" "bbob", "type" "literal"},
+                          "max"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "0",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "5.428571428571429",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jbob"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "max"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "5.428571428571429",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jbob"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "max"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "5",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "5.428571428571429",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jbob"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "max"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "6",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "5.428571428571429",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jbob"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "max"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "5.428571428571429",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jbob"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "max"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "8",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "5.428571428571429",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jbob"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "max"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "5.428571428571429",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jbob"},
+                          "handle" {"value" "jbob", "type" "literal"},
+                          "max"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "37.75",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jdoe"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "max"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "37.75",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jdoe"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "max"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "42",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "37.75",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jdoe"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "max"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNums"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "avg"
+                          {"value" "37.75",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"},
+                          "person" {"type" "uri", "value" "ex:jdoe"},
+                          "handle" {"value" "jdoe", "type" "literal"},
+                          "max"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "COUNT query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
