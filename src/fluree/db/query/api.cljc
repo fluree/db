@@ -123,14 +123,18 @@
         (<? (track-query ds* max-fuel query**))
         (<? (fql/query ds* query**)))))))
 
+(defn wrap-sparql-results
+  [results]
+  {"head" {"vars" (vec (sort (keys (first results))))}
+   "results" {"bindings" results}})
+
 (defn query-sparql
   [db query override-opts]
   (go-try
     (let [fql     (sparql/->fql query)
           results (<? (query-fql db fql override-opts))]
       (if (= (:output override-opts) :sparql)
-        {"head" {"vars" (vec (sort (keys (first results))))}
-         "results" {"bindings" results}}
+        (wrap-sparql-results results)
         results))))
 
 (defn query
@@ -271,9 +275,12 @@
 (defn query-connection-sparql
   [conn query override-opts]
   (go-try
-    (let [fql (sparql/->fql query)]
-      (log/debug "query-connection SPARQL fql: " fql "override-opts:" override-opts)
-      (<? (query-connection-fql conn fql override-opts)))))
+    (let [fql     (sparql/->fql query)
+          _       (log/debug "query-connection SPARQL fql: " fql "override-opts:" override-opts)
+          results (<? (query-connection-fql conn fql override-opts))]
+      (if (= (:output override-opts) :sparql)
+        (wrap-sparql-results results)
+        results))))
 
 (defn query-connection
   [conn query {:keys [format] :as override-opts :or {format :fql}}]
