@@ -72,7 +72,8 @@
 
 ;; TODO - verify sort order is same!!
 ;;
-(deftype SID [namespace-code name]
+(deftype SID #?(:clj [^int namespace-code name]
+                :cljs [^number namespace-code name])
   #?@(:clj  [clojure.lang.Seqable
              (seq [this] (list (.-namespace-code this) (.-name this)))
 
@@ -111,9 +112,9 @@
        (= (.-namespace-code sid) (.-namespace-code other))
        (= (.-name sid) (.-name other))))
 
-(defn ->sid
+(defn ^SID ->sid
   [ns-code nme]
-  (->SID ns-code nme))
+  (->SID #?(:clj (int ns-code) :cljs ns-code) nme))
 
 (defn get-ns-code
   [^SID sid]
