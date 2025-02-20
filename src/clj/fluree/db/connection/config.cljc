@@ -76,11 +76,24 @@
        :cljs (js/parseInt x))
     (int x)))
 
+(defn get-long
+  [x]
+  (if (string? x)
+    #?(:clj (Long/parseLong x)
+       :cljs (js/parseInt x))
+    (long x)))
+
 (defn get-first-integer
   [node k]
   (some-> node
           (get-first-value k)
           get-integer))
+
+(defn get-first-long
+  [node k]
+  (some-> node
+          (get-first-value k)
+          get-long))
 
 (defn get-first-string
   [node k]
