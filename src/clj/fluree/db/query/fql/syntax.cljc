@@ -117,6 +117,8 @@
                          [:role {:optional true} ::role]
                          [:identity {:optional true} ::identity]
                          [:policy-values {:optional true} :any]
+                         [:format {:optional true} [:enum :sparql :fql]]
+                         [:output {:optional true} [:enum :sparql :fql]]
                          ;; deprecated
                          [:pretty-print {:optional true} ::pretty-print]
                          [:did {:optional true} ::identity]
