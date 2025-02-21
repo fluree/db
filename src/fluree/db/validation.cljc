@@ -324,6 +324,7 @@
     ::where                [:orn {:error/message "where clause must be a single node map pattern or a sequence of where patterns"}
                             [:single ::where-pattern]
                             [:collection [:sequential ::where-pattern]]]
+    ::construct            [:sequential ::node-map]
     ::ledger               ::iri
     ::from                 [:orn {:error/message "from must be a ledger iri or vector of ledger iris"}
                             [:single ::ledger]

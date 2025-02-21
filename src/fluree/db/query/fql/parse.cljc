@@ -528,6 +528,13 @@
         syntax/coerce-where
         (parse-where-clause vars context))))
 
+(defn parse-construct
+  [q context]
+  (when-let [construct (:construct q)]
+    (-> construct
+        syntax/coerce-where
+        (parse-where-clause nil context))))
+
 (defn parse-select-as-fn
   [f context output]
   (let [parsed-fn  (parse-code f)
@@ -681,28 +688,23 @@
   (or (get jsonld nme)
       (get jsonld (keyword nme))))
 
-(defn extract-opts
-  [q]
-  (or (get q "opts")
-      (get q :opts)))
-
 (defn parse-analytical-query
   ([q] (parse-analytical-query q nil))
   ([q parent-context]
-   (let [context  (cond->> (context/extract q)
-                           parent-context (merge parent-context))
-         [vars values] (-> (get-named q "values")
-                           (parse-values context))
-         where    (-> (get-named q "where")
-                      (parse-where vars context))
-         grouping (parse-grouping q)
-         ordering (parse-ordering q)]
+   (let [context       (cond->> (context/extract q)
+                         parent-context (merge parent-context))
+         [vars values] (parse-values (:values q) context)
+         where         (parse-where (:where q) vars context)
+         construct     (parse-construct q context )
+         grouping      (parse-grouping q)
+         ordering      (parse-ordering q)]
      (-> q
          (assoc :context context
                 :where where)
          (cond-> (seq values) (assoc :values values)
-                 grouping (assoc :group-by grouping)
-                 ordering (assoc :order-by ordering))
+                 grouping  (assoc :group-by grouping)
+                 ordering  (assoc :order-by ordering)
+                 construct (assoc :construct construct))
          (parse-having context)
          (parse-select context)
          parse-fuel))))

@@ -27,7 +27,7 @@
   (log/trace "one-select-key-present? q:" q)
   (if (map? q)
     (let [skeys (->> q keys
-                     (map #{:select :select-one :select-distinct})
+                     (map #{:select :select-one :select-distinct :construct})
                      (remove nil?))]
       (log/trace "one-select-key-present? skeys:" skeys)
       (= 1 (count skeys)))
@@ -58,7 +58,7 @@
    [:fn {:error/fn
          (fn [_ _]
            (str "Query does not have exactly one select clause. "
-                "One of 'select', 'selectOne', 'select-one', 'selectDistinct', or 'select-distinct' is required in queries. "
+                "One of 'select', 'selectOne', 'select-one', 'selectDistinct', 'select-distinct', or 'construct' is required in queries. "
                 "See documentation here for more details: "
                 docs/error-codes-page "#query-missing-select"))}
     one-select-key-present?]
@@ -73,7 +73,8 @@
   (-> common-query-schema
       (into [[:select {:optional true} ::select]
              [:select-one {:optional true} ::select]
-             [:select-distinct {:optional true} ::select]])
+             [:select-distinct {:optional true} ::select]
+             [:construct {:optional true} ::construct]])
       (into extra-kvs)
       wrap-query-map-schema))
 
@@ -206,6 +207,7 @@
     ::group-by          [:orn {:error/message "groupBy clause must be a variable or a vector of variables"}
                          [:clause ::var]
                          [:collection [:sequential ::var]]]
+    ::construct         ::v/construct
     ::filter            ::v/filter
     ::where             ::v/where
     ::values            ::v/values
