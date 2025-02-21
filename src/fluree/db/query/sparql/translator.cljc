@@ -419,6 +419,12 @@
   [[_ & construct-triples]]
   [[:construct (vec (mapcat parse-term construct-triples))]])
 
+(defmethod parse-rule :ConstructWhereTemplate
+  ;; ConstructWhereTemplate ::= <'{'> WS TriplesTemplate? <'}'>
+  [[_ & construct-triples]]
+  (let [triples (vec (mapcat parse-term construct-triples))]
+    [[:construct triples] [:where triples]]))
+
 (defmethod parse-term :DefaultGraphClause
   ;; DefaultGraphClause ::= SourceSelector
   ;; <SourceSelector> ::= iri
@@ -768,8 +774,15 @@
           []
           select-query))
 
+(defmethod parse-rule :ConstructWhereQuery
+  ;; ConstructWhereQuery ::= DatasetClause <'WHERE'> WS ConstructWhereTemplate SolutionModifier
+  [[_ & construct-query]]
+  (reduce (fn [entries rule] (into entries (parse-rule rule)))
+          []
+          construct-query))
+
 (defmethod parse-rule :ConstructQuery
-  ;; ConstructQuery    ::=  WS	<'CONSTRUCT'> WS ( ConstructTemplate DatasetClause WhereClause SolutionModifier | DatasetClause 'WHERE' '{' TriplesTemplate? '}' SolutionModifier )
+  ;; ConstructQuery   ::= WS <'CONSTRUCT'> WS ( ConstructTemplate DatasetClause WhereClause SolutionModifier | ConstructWhereQuery )
   [[_ & construct-query]]
   (reduce (fn [entries rule] (into entries (parse-rule rule)))
           []

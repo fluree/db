@@ -100,7 +100,14 @@
       (is (= [{"@id" "?x", "vcard:N" "_:v"}
               {"@id" "_:v", "vcard:givenName" "?gname"}
               {"@id" "_:v", "vcard:familyName" "?fname"}]
-             (:construct (sparql/->fql query)))))))
+             (:construct (sparql/->fql query))))))
+  (testing "CONSTRUCT WHERE"
+    (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+                 CONSTRUCT WHERE { ?x foaf:name ?name }"]
+      (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+              :construct [{"@id" "?x", "foaf:name" "?name"}],
+              :where [{"@id" "?x", "foaf:name" "?name"}]}
+             (sparql/->fql query))))))
 
 (deftest parse-where
   (testing "simple triple"
