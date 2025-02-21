@@ -528,6 +528,13 @@
         syntax/coerce-where
         (parse-where-clause vars context))))
 
+(defn parse-construct
+  [q context]
+  (when-let [construct (:construct q)]
+    (-> construct
+        syntax/coerce-where
+        (parse-where-clause nil context))))
+
 (defn parse-select-as-fn
   [f context output]
   (let [parsed-fn  (parse-code f)
@@ -679,18 +686,20 @@
 (defn parse-analytical-query
   ([q] (parse-analytical-query q nil))
   ([q parent-context]
-   (let [context  (cond->> (context/extract q)
-                           parent-context (merge parent-context))
+   (let [context       (cond->> (context/extract q)
+                         parent-context (merge parent-context))
          [vars values] (parse-values (:values q) context)
-         where    (parse-where q vars context)
-         grouping (parse-grouping q)
-         ordering (parse-ordering q)]
+         where         (parse-where q vars context)
+         construct     (parse-construct q context )
+         grouping      (parse-grouping q)
+         ordering      (parse-ordering q)]
      (-> q
          (assoc :context context
                 :where where)
          (cond-> (seq values) (assoc :values values)
-                 grouping (assoc :group-by grouping)
-                 ordering (assoc :order-by ordering))
+                 grouping  (assoc :group-by grouping)
+                 ordering  (assoc :order-by ordering)
+                 construct (assoc :construct construct))
          (parse-having context)
          (parse-select context)
          parse-fuel))))
