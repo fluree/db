@@ -718,7 +718,7 @@
   [[:limit (read-string limit)]])
 
 (defmethod parse-term :ExplicitOrderCondition
-  ;; ExplicitOrderCondition ::= ( 'ASC' | 'DESC' ) WS BrackettedExpression
+  ;; ExplicitOrderCondition ::= ( 'ASC' | 'DESC' | 'asc' | 'desc' ) WS BrackettedExpression
   [[_ order expr]]
   (list (str/lower-case order) (parse-term expr)))
 
