@@ -80,8 +80,8 @@
 (defmethod ig/expand-key :fluree.db/connection
   [k config]
   (let [cache-max-mb   (config/get-first-integer config conn-vocab/cache-max-mb)
-        commit-storage (get-first config conn-vocab/commit-storage)
-        index-storage  (get-first config conn-vocab/index-storage)
+        commit-storage (get config conn-vocab/commit-storage)
+        index-storage  (get config conn-vocab/index-storage)
         remote-systems (get config conn-vocab/remote-systems)
         config*        (-> config
                            (assoc :cache (ig/ref :fluree.db/cache)
@@ -91,13 +91,13 @@
                            (dissoc conn-vocab/cache-max-mb conn-vocab/commit-storage
                                    conn-vocab/index-storage))]
     {:fluree.db/cache          cache-max-mb
-     :fluree.db/commit-catalog {:content-stores     [commit-storage]
-                             :read-only-archives remote-systems}
-     :fluree.db/index-catalog  {:content-stores     [index-storage]
-                             :read-only-archives remote-systems
-                             :cache              (ig/ref :fluree.db/cache)
-                             :serializer         (ig/ref :fluree.db/serializer)}
-     k                      config*}))
+     :fluree.db/commit-catalog {:content-stores     commit-storage
+                                :read-only-archives remote-systems}
+     :fluree.db/index-catalog  {:content-stores     index-storage
+                                :read-only-archives remote-systems
+                                :cache              (ig/ref :fluree.db/cache)
+                                :serializer         (ig/ref :fluree.db/serializer)}
+     k                         config*}))
 
 (defmethod ig/init-key :default
   [_ component]
@@ -218,8 +218,8 @@
 (defn parse-index-options
   [defaults]
   (when-let [index-options (get-first defaults conn-vocab/index-options)]
-    {:reindex-min-bytes (config/get-first-integer index-options conn-vocab/reindex-min-bytes)
-     :reindex-max-bytes (config/get-first-integer index-options conn-vocab/reindex-max-bytes)
+    {:reindex-min-bytes (config/get-first-long index-options conn-vocab/reindex-min-bytes)
+     :reindex-max-bytes (config/get-first-long index-options conn-vocab/reindex-max-bytes)
      :max-old-indexes   (config/get-first-integer index-options conn-vocab/max-old-indexes)}))
 
 (defn parse-defaults
