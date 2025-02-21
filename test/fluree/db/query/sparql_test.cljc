@@ -672,11 +672,23 @@
                    ORDER BY ASC(?favNums)"
             {:keys [orderBy]} (sparql/->fql query)]
         (is (= [["asc" "?favNums"]]
+               orderBy)))
+      (let [query "SELECT ?favNums
+                   WHERE {?person person:favNums ?favNums}
+                   ORDER BY asc(?favNums)"
+            {:keys [orderBy]} (sparql/->fql query)]
+        (is (= [["asc" "?favNums"]]
                orderBy))))
     (testing "DESC"
       (let [query "SELECT ?favNums
                    WHERE {?person person:favNums ?favNums}
                    ORDER BY DESC(?favNums)"
+            {:keys [orderBy]} (sparql/->fql query)]
+        (is (= [["desc" "?favNums"]]
+               orderBy)))
+      (let [query "SELECT ?favNums
+                   WHERE {?person person:favNums ?favNums}
+                   ORDER BY desc(?favNums)"
             {:keys [orderBy]} (sparql/->fql query)]
         (is (= [["desc" "?favNums"]]
                orderBy)))))
