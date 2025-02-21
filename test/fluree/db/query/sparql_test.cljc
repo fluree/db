@@ -77,6 +77,31 @@
     ;;TODO: not yet supported
     #_(testing "GROUP_CONCAT")))
 
+(deftest parse-construct
+  (testing "basic construct"
+    (let [query "PREFIX foaf:    <http://xmlns.com/foaf/0.1/>
+                 PREFIX vcard:   <http://www.w3.org/2001/vcard-rdf/3.0#>
+                 CONSTRUCT   { <http://example.org/person#Alice> vcard:FN ?name }
+                 WHERE       { ?x foaf:name ?name }"]
+      (is (= [{"@id" "http://example.org/person#Alice", "vcard:FN" "?name"}]
+             (:construct (sparql/->fql query))))))
+  (testing "templates with blank nodes"
+    (let [query "PREFIX foaf:    <http://xmlns.com/foaf/0.1/>
+                 PREFIX vcard:   <http://www.w3.org/2001/vcard-rdf/3.0#>
+
+                 CONSTRUCT { ?x  vcard:N _:v .
+                             _:v vcard:givenName ?gname .
+                             _:v vcard:familyName ?fname }
+                 WHERE
+                   {
+                     { ?x foaf:firstname ?gname } UNION  { ?x foaf:givenname   ?gname } .
+                     { ?x foaf:surname   ?fname } UNION  { ?x foaf:family_name ?fname } .
+                   }"]
+      (is (= [{"@id" "?x", "vcard:N" "_:v"}
+              {"@id" "_:v", "vcard:givenName" "?gname"}
+              {"@id" "_:v", "vcard:familyName" "?fname"}]
+             (:construct (sparql/->fql query)))))))
+
 (deftest parse-where
   (testing "simple triple"
     (let [query "SELECT ?person
