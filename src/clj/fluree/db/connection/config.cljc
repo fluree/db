@@ -294,10 +294,10 @@
 
 (defn parse
   ([cfg]
-   (parse cfg (map derive-node-id)))
-  ([cfg derive-xf]
+   (parse cfg derive-node-id))
+  ([cfg derive-fn]
    (into base-config
          (comp (map keywordize-node-ids)
-               derive-xf
+               (map derive-fn)
                (map (juxt get-id identity)))
          (standardize cfg))))
