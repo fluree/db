@@ -74,10 +74,7 @@
 ;;
 (deftype SID #?(:clj [^int namespace-code name]
                 :cljs [^number namespace-code name])
-  #?@(:clj  [clojure.lang.Seqable
-             (seq [this] (list (.-namespace-code this) (.-name this)))
-
-             Object
+  #?@(:clj  [Object
              (equals [this sid]
                (sid-equiv? this sid))
              (hashCode [this] (hash (seq this)))
@@ -88,11 +85,8 @@
              java.lang.Comparable
              (compareTo [this other] (compare-SIDs this other))]
 
-      :cljs [ISeqable
-             (-seq [this] (list (.-namespace-code this) (.-name this)))
-
-             IHash
              (-hash [this] (hash (seq this)))
+      :cljs [IHash
 
              IEquiv
              (-equiv [this sid] (sid-equiv? this sid))
