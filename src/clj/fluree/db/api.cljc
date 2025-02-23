@@ -1,6 +1,7 @@
 (ns fluree.db.api
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.walk :refer [postwalk]]
+            [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
             [fluree.db.connection :as connection :refer [notify-ledger]]
             [fluree.db.util.context :as context]
@@ -64,7 +65,7 @@
   ;; TODO - do some validation
   (promise-wrap
     (go-try
-      (let [system-map (system/initialize config)
+      (let [system-map (-> config config/parse system/initialize)
             conn       (reduce-kv (fn [x k v]
                                     (if (isa? k :fluree.db/connection)
                                       (reduced v)
