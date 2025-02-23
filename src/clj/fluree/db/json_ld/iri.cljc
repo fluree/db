@@ -77,16 +77,19 @@
   #?@(:clj  [Object
              (equals [this sid]
                (sid-equiv? this sid))
-             (hashCode [this] (hash (seq this)))
+             (hashCode [_]
+               (clojure.lang.Util/hashCombine namespace-code (hash name)))
 
              clojure.lang.IHashEq
-             (hasheq [this] (hash (seq this)))
+             (hasheq [_]
+               (clojure.lang.Util/hashCombine namespace-code (hash name)))
 
              java.lang.Comparable
              (compareTo [this other] (compare-SIDs this other))]
 
-             (-hash [this] (hash (seq this)))
       :cljs [IHash
+             (-hash [_]
+                    (hash-combine namespace-code (hash name)))
 
              IEquiv
              (-equiv [this sid] (sid-equiv? this sid))
@@ -145,7 +148,7 @@
 ;            (.write w (str "#=" `(->sid ~ns-code ~nme))))))
 
 (defn compare-SIDs
-  [^SID sid1 ^SID sid2]
+  [sid1 sid2]
   (when-not (instance? SID sid2)
     (throw (ex-info "Can't compare an SID to another type"
                     {:status 500 :error :db/unexpected-error})))
