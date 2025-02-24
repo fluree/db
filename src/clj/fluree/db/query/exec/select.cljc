@@ -15,30 +15,65 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn var-name
+  "Stringify and remove q-mark prefix of var for SPARQL JSON formatting."
+  [var]
+  (subs (name var) 1))
+
+(defn disaggregate
+  "For SPARQL JSON results, no nesting of data is permitted - the results must be
+  tabular. This function unpacks a single result into potentially multiple 'rows' of
+  results."
+  [result]
+  (let [aggregated (filter (fn [[k v]] (sequential? v)) result)]
+    (loop [[[agg-var agg-vals] & r] aggregated
+           results [result]]
+      (if agg-var
+        (let [results* (reduce (fn [results* result]
+                                 (into results* (map (fn [v] (assoc result agg-var v)) agg-vals)))
+                               []
+                               results)]
+          (recur r results*))
+        results))))
+
 (defmulti display
   "Format a where-pattern match for presentation based on the match's datatype.
   Return an async channel that will eventually contain the formatted match."
-  (fn [match _compact]
+  (fn [match output-format _compact]
     (where/get-datatype-iri match)))
 
 (defmethod display :default
-  [match _]
-  (where/get-value match))
+  [match output-format _compact]
+  (if (= output-format :sparql)
+    (let [v  (where/get-value match)
+          dt (where/get-datatype-iri match)]
+      (cond-> {"value" (str v) "type" "literal"}
+        (and v (not= const/iri-string dt)) (assoc "datatype" dt)))
+    (where/get-value match)))
 
 (defmethod display const/iri-rdf-json
-  [match _compact]
-  (-> match where/get-value (json/parse false)))
+  [match output-format _compact]
+  (if (= output-format :sparql)
+    {"value" (where/get-value match) "type" "literal" "datatype" const/iri-rdf-json}
+    (-> match where/get-value (json/parse false))))
 
 (defmethod display const/iri-id
-  [match compact]
-  (some-> match where/get-iri compact))
+  [match output-format compact]
+  (if (= output-format :sparql)
+    (let [iri (where/get-iri match)]
+      (if (= \_ (first iri))
+        {"type" "bnode" "value" (subs iri 1)}
+        {"type" "uri" "value" iri}))
+    (some-> match where/get-iri compact)))
 
 (defmethod display const/iri-vector
-  [match _compact]
-  (some-> match where/get-value vec))
+  [match output-format _compact]
+  (if (= output-format :sparql)
+    {"type" "literal" "value" (some-> match where/get-value vec str) "datatype" const/iri-vector}
+    (some-> match where/get-value vec)))
 
 (defprotocol ValueSelector
-  (format-value [fmt db iri-cache context compact fuel-tracker error-ch solution]
+  (format-value [fmt db iri-cache context output-format compact fuel-tracker error-ch solution]
     "Async format a search solution (map of pattern matches) by extracting relevant match."))
 
 (defprotocol ValueAdapter
@@ -51,12 +86,13 @@
 (defrecord VariableSelector [var]
   ValueSelector
   (format-value
-    [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
+    [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
     (log/trace "VariableSelector format-value var:" var "solution:" solution)
     (go (try*
-          (-> solution
-              (get var)
-              (display compact))
+          (let [output (-> solution (get var) (display output-format compact))]
+            (if (= output-format :sparql)
+              {(var-name var) output}
+              output))
           (catch* e
                   (log/error e "Error formatting variable:" var)
                   (>! error-ch e)))))
@@ -74,14 +110,16 @@
 (defrecord WildcardSelector []
   ValueSelector
   (format-value
-    [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
+    [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
     (go
       (try*
-        (loop [[var & vars] (sort (keys solution))
+        (loop [[var & vars] (sort (remove nil? (keys solution))) ; implicit grouping can introduce nil keys in solution
                result {}]
           (if var
-            (let [display-var (-> solution (get var) (display compact))]
-              (recur vars (assoc result var display-var)))
+            (let [display-var (-> solution (get var) (display output-format compact))]
+              (recur vars (if (= output-format :sparql)
+                            (assoc result (var-name var) display-var)
+                            (assoc result var display-var))))
             result))
         (catch* e
                 (log/error e "Error formatting wildcard")
@@ -99,7 +137,7 @@
 (defrecord AggregateSelector [agg-fn]
   ValueSelector
   (format-value
-    [_ _ _ _ _ _ error-ch solution]
+    [_ _ _ _ output-format compact _ error-ch solution]
     (go (try* (:value (agg-fn solution))
               (catch* e
                       (log/error e "Error applying aggregate selector")
@@ -118,18 +156,19 @@
   (update-solution
     [_ solution]
     (log/trace "AsSelector update-solution solution:" solution)
-    (let [result (:value (as-fn solution))
-          dt     (datatype/infer-iri result)]
-      (log/trace "AsSelector update-solution result:" result)
-      (assoc solution bind-var (-> bind-var
-                                   where/unmatched-var
-                                   (where/match-value result dt)))))
+    (let [{v :value dt :datatype-iri lang :lang} (as-fn solution)]
+      (log/trace "AsSelector update-solution result:" v)
+      (assoc solution bind-var (-> (where/unmatched-var bind-var)
+                                   (where/match-value v (or dt (datatype/infer-iri v)))
+                                   (cond-> lang (where/match-lang v lang))))))
   ValueSelector
   (format-value
-    [_ _ _ _ _ _ _ solution]
+    [_ _ _ _ output-format compact _ _ solution]
     (log/trace "AsSelector format-value solution:" solution)
-    (go (let [match (get solution bind-var)]
-          (where/get-value match))))
+    (go (let [output (-> solution (get bind-var) (display output-format compact))]
+          (if (= output-format :sparql)
+            {(var-name bind-var) output}
+            output))))
   ValueAdapter
   (solution-value
     [_ _ solution]
@@ -142,7 +181,7 @@
 (defrecord SubgraphSelector [subj selection depth spec]
   ValueSelector
   (format-value
-    [_ ds iri-cache context compact fuel-tracker error-ch solution]
+    [_ ds iri-cache context _ compact fuel-tracker error-ch solution]
     (when-let [iri (if (where/variable? subj)
                      (-> solution
                          (get subj)
@@ -178,17 +217,20 @@
 (defn format-values
   "Formats the values from the specified where search solution `solution`
   according to the selector or collection of selectors specified by `selectors`"
-  [selectors db iri-cache context compact fuel-tracker error-ch solution]
+  [selectors db iri-cache context output-format compact fuel-tracker error-ch solution]
   (if (sequential? selectors)
     (go-loop [selectors selectors
               values []]
       (if-let [selector (first selectors)]
-        (let [value (<! (format-value selector db iri-cache context compact
+        (let [value (<! (format-value selector db iri-cache context output-format compact
                                       fuel-tracker error-ch solution))]
           (recur (rest selectors)
                  (conj values value)))
-        values))
-    (format-value selectors db iri-cache context compact fuel-tracker
+
+        (if (= output-format :sparql)
+          (apply merge values)
+          values)))
+    (format-value selectors db iri-cache context output-format compact fuel-tracker
                   error-ch solution)))
 
 (defn format
@@ -198,18 +240,24 @@
   (let [context             (or (:selection-context q)
                                 (:context q))
         compact             (json-ld/compact-fn context)
+        output-format       (:output (:opts q))
         selectors           (or (:select q)
                                 (:select-one q)
                                 (:select-distinct q))
         iri-cache           (volatile! {})
-        format-ch           (if (contains? q :select-distinct)
-                              (chan 1 (distinct))
+        format-xf           (some->> [(when (contains? q :select-distinct) (distinct))
+                                      (when (= output-format :sparql) (mapcat disaggregate))]
+                                     (remove nil?)
+                                     (not-empty)
+                                     (apply comp))
+        format-ch           (if format-xf
+                              (chan 1 format-xf)
                               (chan))]
     (async/pipeline-async 3
                           format-ch
                           (fn [solution ch]
                             (log/trace "select/format solution:" solution)
-                            (-> (format-values selectors db iri-cache context compact
+                            (-> (format-values selectors db iri-cache context output-format compact
                                                fuel-tracker error-ch solution)
                                 (async/pipe ch)))
                           solution-ch)
