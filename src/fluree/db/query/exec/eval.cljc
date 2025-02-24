@@ -773,7 +773,7 @@
         (mapcat (fn [var]
                   `[mch# (get ~soln-sym (quote ~var))
                     ;; convert match to TypedValue
-                    ~var (if (= ::group/grouping (::where/datatype-iri mch#))
+                    ~var (if (= ::group/grouping (where/get-datatype-iri mch#))
                            (mapv mch->typed-val (where/get-binding mch#))
                            (mch->typed-val mch#))]))
         var-syms))

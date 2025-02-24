@@ -161,7 +161,7 @@
 
 (defn type-pred-match?
   [p-mch]
-  (let [p-iri (::where/iri p-mch)]
+  (let [p-iri (where/get-iri p-mch) ]
     (contains? type-pred-iris p-iri)))
 
 (defn safe-read
@@ -377,7 +377,7 @@
 
 (defn flip-reverse-pattern
   [[s-mch p-mch o-mch :as pattern]]
-  (if (::where/reverse p-mch)
+  (if (where/get-reverse p-mch)
     [o-mch p-mch s-mch]
     pattern))
 
@@ -758,7 +758,7 @@
                        (iri/new-blank-node-id)
                        id)))
           ref-cmp (if m
-                    (assoc ref-obj ::where/meta m)
+                    (where/match-meta ref-obj m)
                     ref-obj)
           v-map*  (if (nil? id)
                     ;; project newly created bnode-id into v-map
