@@ -1,4 +1,4 @@
-.PHONY: all compile deps jar install deploy nodejs browser webworker cljtest	\
+.PHONY: all deps jar install deploy nodejs browser webworker cljtest	\
 	cljs-browser-test cljs-node-test cljstest test eastwood ci clean	\
 	js-packages sync-package-json publish-nodejs publish-browser		\
 	publish-webworker publish-js pending-tests pt
@@ -14,11 +14,6 @@ WEBWORKER_SOURCES := src/clj/fluree/sdk/webworker.cljs
 ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURCES)
 
 all: jar browser nodejs webworker js-packages docs
-
-target/classes:
-	clojure -T:build compile
-
-compile: target/classes
 
 target/fluree-db.jar: out node_modules src/clj/deps.cljs $(ALL_SOURCES) $(RESOURCES)
 	clojure -T:build jar
@@ -113,7 +108,7 @@ browser-test: out/fluree-browser-sdk.js
 
 cljstest: cljs-browser-test cljs-node-test
 
-cljtest: target/classes
+cljtest:
 	clojure -X:dev:cljtest
 
 pending-tests:
