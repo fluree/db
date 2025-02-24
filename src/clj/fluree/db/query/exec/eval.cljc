@@ -454,7 +454,7 @@
               (.toString (.getOffset ^OffsetDateTime (->offset-date-time (:value x))))
               #{const/iri-xsd-time}
               (.toString (.getOffset ^OffsetTime (->offset-time (:value x)))))
-       :cljs (.getTimeZoneOffset ^js/Date (if (string? x)
+       :cljs (.getTimeZoneOffset ^js/Date (if (string? (:value x))
                                             (datatype/coerce (:value x) (:datatype-iri x))
                                             x)))))
 
