@@ -36,3 +36,6 @@ package-lock.json
 **report.html
 test/nodejs/store
 /dev/data/*
+/.lsp/
+/.portal/
+/.clj-kondo/imports/
