@@ -5,6 +5,7 @@
             [clojure.pprint :as pprint]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
+            [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
@@ -115,7 +116,7 @@
 (defn content-write-json
   [store path data]
   (go-try
-    (let [json   (json-ld/normalize-data data)
+    (let [json   (json/stringify data)
           bytes  (bytes/string->UTF8 json)
           result (<? (-content-write-bytes store path bytes))]
       (assoc result :json json))))
