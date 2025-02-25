@@ -2,8 +2,8 @@
   (:require [fluree.crypto :as crypto]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql.parse :as q-parse]
@@ -247,14 +247,14 @@
 (defn commit-json->commit-id
   [jld]
   (let [b32-hash (-> jld
-                     json-ld/normalize-data
+                     json/stringify-UTF8
                      (crypto/sha2-256 :base32))]
     (str "fluree:commit:sha256:b" b32-hash)))
 
 (defn db-json->db-id
   [payload]
   (let [hsh (-> payload
-                json-ld/normalize-data
+                json/stringify-UTF8
                 (crypto/sha2-256 :base32))]
     (str "fluree:db:sha256:b" hsh)))
 
