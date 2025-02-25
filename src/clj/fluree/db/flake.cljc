@@ -5,15 +5,9 @@
             [fluree.db.util.core :as util]
             [fluree.db.json-ld.iri :as iri]
             #?(:clj [clojure.pprint :as pprint]))
-  #?(:clj (:import (fluree.db SID)))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-;; maximum number of subject indexes within a given collection. 44 bits - 17,592,186,044,415
-;; javascript, 44 bits - 1
-(def ^:const MAX-COLL-SUBJECTS #?(:clj  2r11111111111111111111111111111111111111111111
-                                  :cljs (- 2r11111111111111111111111111111111111111111111 1)))
 
 (declare equiv-flake assoc-flake get-flake-val nth-flake)
 
@@ -300,10 +294,9 @@
     0))
 
 (defn cmp-sid
-  [^SID sid1 ^SID sid2]
+  [sid1 sid2]
   (if (and sid1 sid2)
-    #?(:clj (SID/compare sid1 sid2)
-       :cljs (compare sid1 sid2))
+    (compare sid1 sid2)
     0))
 
 (defn cmp-subj

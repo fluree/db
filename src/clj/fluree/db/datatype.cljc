@@ -16,7 +16,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(time-literals/print-time-literals-clj!)
+#?(:clj (time-literals/print-time-literals-clj!))
 
 (def default-data-types
   {const/iri-id                     const/$id
