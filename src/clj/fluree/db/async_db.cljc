@@ -19,13 +19,21 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-#?(:cljs (declare ->AsyncDB))
+(declare ->async-db ->AsyncDB deliver!)
+
 (defrecord AsyncDB [alias branch commit t db-chan]
   dbproto/IFlureeDb
   (-query [this query-map]
     (go-try
       (let [db (<? db-chan)]
         (<? (dbproto/-query db query-map)))))
+  (-index-update [_ commit-index]
+    (let [commit* (assoc commit :index commit-index)
+          updated-db (->async-db alias branch commit* t)]
+      (go-try
+        (let [db (<? db-chan)]
+          (deliver! updated-db (dbproto/-index-update db commit-index))))
+      updated-db))
   where/Matcher
   (-match-id [_ fuel-tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
@@ -220,11 +228,18 @@
   [^AsyncDB async-db]
   (:db-chan async-db))
 
+(defn ->async-db
+  "Creates an async-db.
+  This is to be used in conjunction with `deliver!` that will deliver the
+  loaded db to the async-db."
+  [ledger-alias branch commit-map t]
+  (->AsyncDB ledger-alias branch commit-map t (async/promise-chan)))
+
 (defn load
   [ledger-alias branch commit-catalog index-catalog commit-jsonld indexing-opts]
   (let [commit-map (commit-data/jsonld->clj commit-jsonld)
         t          (-> commit-map :data :t)
-        async-db   (->AsyncDB ledger-alias branch commit-map t (async/promise-chan))]
+        async-db   (->async-db ledger-alias branch commit-map t)]
     (go
       (let [db (<! (flake-db/load ledger-alias commit-catalog index-catalog branch
                                   [commit-jsonld commit-map] indexing-opts))]

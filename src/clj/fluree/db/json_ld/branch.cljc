@@ -1,12 +1,13 @@
 (ns fluree.db.json-ld.branch
-  (:require [fluree.db.json-ld.commit-data :as commit-data]
+  (:require [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.indexer :as indexer]
             [fluree.json-ld :as json-ld]
             [fluree.db.async-db :as async-db]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log :include-macros true]
-            [clojure.core.async :as async :refer [<! go-loop]]
+            [clojure.core.async :as async :refer [go <! go-loop]]
             [fluree.db.nameservice :as nameservice]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -41,9 +42,26 @@
     (async-db/load alias branch commit-catalog index-catalog
                    commit-jsonld nil)))
 
+(defn update-index-async
+  "Returns an updated async-db with the index changes.
+
+  Because we are updating the index in an atom, we want to
+  return immediately - and for a large amount of novelty,
+  updating the db to reflect the latest index can take some time
+  which would lead to atom contention."
+  [{:keys [alias commit branch t] :as current-db} index-map]
+  (if (async-db/db? current-db)
+    (dbproto/-index-update current-db index-map)
+    (let [updated-commit (assoc commit :index index-map)
+          updated-db     (async-db/->async-db alias branch updated-commit t)]
+      (go ;; update index in the background, return updated db immediately
+        (->> (dbproto/-index-update current-db index-map)
+             (async-db/deliver! updated-db)))
+      updated-db)))
+
 (defn update-index
-  [{current-commit :commit, :as current-state}
-   {:keys [alias branch commit-catalog index-catalog], indexed-commit :commit, :as indexed-db}]
+  [{current-commit :commit, current-db :current-db, :as current-state}
+   {indexed-commit :commit, :as indexed-db}]
   (if (same-t? current-commit indexed-commit)
     (if (newer-index? indexed-commit current-commit)
       (assoc current-state
@@ -52,11 +70,9 @@
       current-state)
     (if (newer-commit? current-commit indexed-commit)
       (if (newer-index? indexed-commit current-commit)
-        (let [latest-index  (:index indexed-commit)
-              latest-commit (assoc current-commit :index latest-index)
-              latest-db     (load-db alias branch commit-catalog index-catalog latest-commit)]
+        (let [latest-db (update-index-async current-db (:index indexed-commit))]
           (assoc current-state
-                 :commit     latest-commit
+                 :commit     (:commit latest-db)
                  :current-db latest-db))
         current-state)
       (do (log/warn "Rejecting index update for future commit at transaction:"
@@ -73,8 +89,10 @@
 (defn use-latest-index
   [{db-commit :commit, :as db} idx-commit alias branch]
   (if (newer-index? idx-commit db-commit)
-    (let [latest-index  (:index idx-commit)]
-      (reload-with-index db alias branch latest-index))
+    (let [updated-db (try* (dbproto/-index-update db idx-commit)
+                           (catch* e (log/error e "Exception updating db with new index, attempting full reload. Exception:" (ex-message e))
+                             (reload-with-index db alias branch (:index idx-commit))))]
+      updated-db)
     db))
 
 (defn index-queue
@@ -84,7 +102,7 @@
     (go-loop [last-index-commit nil]
       (when-let [{:keys [db index-files-ch]} (<! queue)]
         (let [db* (use-latest-index db last-index-commit alias branch)]
-          (if-let [indexed-db (try* (<? (indexer/index db* index-files-ch))
+          (if-let [indexed-db (try* (<? (indexer/index db* index-files-ch)) ;; indexer/index always returns a FlakeDB (never AsyncDB)
                                     (catch* e
                                       (log/error e "Error updating index")))]
             (let [[{prev-commit :commit} {indexed-commit :commit}]
@@ -127,14 +145,12 @@
 
 (defn update-commit
   [{current-commit :commit, :as current-state}
-   {:keys [alias branch index-catalog commit-catalog], new-commit :commit, :as new-db}]
+   {new-commit :commit, :as new-db}]
   (if (next-commit? current-commit new-commit)
     (if (newer-index? current-commit new-commit)
-      (let [latest-index  (:index current-commit)
-            latest-commit (assoc new-commit :index latest-index)
-            latest-db     (load-db alias branch commit-catalog index-catalog latest-commit)]
+      (let [latest-db (update-index-async new-db (:index current-commit))]
         (assoc current-state
-               :commit     latest-commit
+               :commit     (:commit latest-db)
                :current-db latest-db))
       (assoc current-state
              :commit     new-commit
