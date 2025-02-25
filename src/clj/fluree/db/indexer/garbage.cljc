@@ -74,9 +74,9 @@
   [index-catalog to-clean]
   (go
     (loop [to-clean* to-clean]
-      (let [next-garbage (first to-clean*)
-            removed?     (nil? (<! (storage/read-garbage index-catalog (:address next-garbage))))]
-        (if removed?
+      (let [next-garbage (first to-clean*)]
+        (if (and next-garbage
+                 (nil? (<! (storage/read-garbage index-catalog (:address next-garbage)))))
           (recur (rest to-clean*))
           to-clean*)))))
 
