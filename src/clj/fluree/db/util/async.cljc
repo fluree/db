@@ -3,8 +3,9 @@
     [fluree.db.util.core :as util]
     [fluree.db.util.log :as log]
     [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-    [clojure.core.async :refer [go <!] :as async]
-    [clojure.core.async.impl.protocols :as async-protocols])
+    [clojure.core.async :as async]
+    [clojure.core.async.impl.protocols :as async-protocols]
+    #?(:clj [steffan-westcott.clj-otel.context :as otel-context]))
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -51,6 +52,16 @@
         [(throw-err result#) ch#])))
 
 #?(:clj
+   (defmacro go
+     "Like go but catches the first thrown error and puts it on the returned channel."
+     [& body]
+     `(if-cljs
+        (cljs.core.async/go
+          (do ~@body))
+        (clojure.core.async/go
+          (otel-context/with-bound-context! ~@body)))))
+
+#?(:clj
    (defmacro go-try
      "Like go but catches the first thrown error and puts it on the returned channel."
      [& body]
@@ -61,7 +72,7 @@
             (catch js/Error e# e#)))
         (clojure.core.async/go
           (try
-            ~@body
+            (otel-context/with-bound-context! ~@body)
             (catch Throwable t# t#))))))
 
 (defn throw-if-exception
