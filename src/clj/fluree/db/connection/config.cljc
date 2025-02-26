@@ -40,8 +40,8 @@
 (defn ipns-nameservice?
   [node]
   (and (publisher? node)
-       (contains? node conn-vocab/ipfs-endpoint)
-       (contains? node conn-vocab/ipns-key)))
+       (or (contains? node conn-vocab/ipfs-endpoint)
+           (contains? node conn-vocab/ipns-key))))
 
 (defn storage?
   [node]
