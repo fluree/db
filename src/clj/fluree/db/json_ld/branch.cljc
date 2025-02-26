@@ -89,7 +89,7 @@
 (defn use-latest-index
   [{db-commit :commit, :as db} idx-commit alias branch]
   (if (newer-index? idx-commit db-commit)
-    (let [updated-db (try* (dbproto/-index-update db idx-commit)
+    (let [updated-db (try* (dbproto/-index-update db (:index idx-commit))
                            (catch* e (log/error e "Exception updating db with new index, attempting full reload. Exception:" (ex-message e))
                              (reload-with-index db alias branch (:index idx-commit))))]
       updated-db)
