@@ -113,13 +113,16 @@
     ::identity          :any
     ::opts              [:map
                          [:max-fuel {:optional true} ::max-fuel]
-                         [:issuer {:optional true} ::issuer]
-                         [:role {:optional true} ::role]
                          [:identity {:optional true} ::identity]
+                         [:policy {:optional true} :any]
+                         [:policy-class {:optional true} :any]
                          [:policy-values {:optional true} :any]
+                         [:meta {:optional true} :boolean]
                          [:format {:optional true} [:enum :sparql :fql]]
                          [:output {:optional true} [:enum :sparql :fql]]
                          ;; deprecated
+                         [:role {:optional true} ::role]
+                         [:issuer {:optional true} ::issuer]
                          [:pretty-print {:optional true} ::pretty-print]
                          [:did {:optional true} ::identity]
                          [:default-allow? {:optional true} ::default-allow?]
