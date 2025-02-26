@@ -24,6 +24,12 @@
         indexed-t (commit-data/t indexed-commit)]
     (> current-t indexed-t)))
 
+(defn same-index?
+  [commit-x commit-y]
+  (let [x-index-t (commit-data/index-t commit-x)
+        y-index-t (commit-data/index-t commit-y)]
+    (= x-index-t y-index-t)))
+
 (defn newer-index?
   [commit-x commit-y]
   (let [x-index-t (commit-data/index-t commit-x)
@@ -86,12 +92,26 @@
   (let [indexed-commit (assoc commit :index index)]
     (load-db alias branch commit-catalog index-catalog indexed-commit)))
 
+(defn use-latest-db
+  "Returns the most recent db from branch-state if it matches
+  the target 't' and index-t values of the next index job from
+  index-queue.
+
+  Most of the time the current state already has the prepared db,
+  in the occasion there is a difference then we must build the target db."
+  [{:keys [commit] :as _db-to-index} latest-idx-commit branch-state]
+  (let [{latest-commit :commit, :as latest-db} (:current-db @branch-state)]
+    (when (and (same-t? commit latest-commit)
+               (same-index? latest-idx-commit latest-commit))
+      latest-db)))
+
 (defn use-latest-index
-  [{db-commit :commit, :as db} idx-commit alias branch]
+  [{db-commit :commit, :as db} idx-commit alias branch branch-state]
   (if (newer-index? idx-commit db-commit)
-    (let [updated-db (try* (dbproto/-index-update db (:index idx-commit))
-                           (catch* e (log/error e "Exception updating db with new index, attempting full reload. Exception:" (ex-message e))
-                             (reload-with-index db alias branch (:index idx-commit))))]
+    (let [updated-db (or (use-latest-db db idx-commit branch-state)
+                         (try* (dbproto/-index-update db (:index idx-commit))
+                               (catch* e (log/error e "Exception updating db with new index, attempting full reload. Exception:" (ex-message e))
+                                 (reload-with-index db alias branch (:index idx-commit)))))]
       updated-db)
     db))
 
@@ -101,7 +121,7 @@
         queue (async/chan buf)]
     (go-loop [last-index-commit nil]
       (when-let [{:keys [db index-files-ch]} (<! queue)]
-        (let [db* (use-latest-index db last-index-commit alias branch)]
+        (let [db* (use-latest-index db last-index-commit alias branch branch-state)]
           (if-let [indexed-db (try* (<? (indexer/index db* index-files-ch)) ;; indexer/index always returns a FlakeDB (never AsyncDB)
                                     (catch* e
                                       (log/error e "Error updating index")))]
