@@ -31,32 +31,31 @@
 
 (defn lookup-address
   "Given IPNS address, performs lookup and returns latest ledger address."
-  [ipfs-endpoint ipns-profile ledger-name]
+  [ipfs-endpoint ipns-key ledger-name]
   (go-try
     (let [ipns-address (if-let [[_proto address _ledger] (address-parts ledger-name)]
                          address
-                         (<? (ipfs-keys/address ipfs-endpoint ipns-profile)))
+                         (<? (ipfs-keys/address ipfs-endpoint ipns-key)))
           ipfs-address (str "/ipns/" ipns-address)
           ledgers      (<? (ipfs-dir/list-all ipfs-endpoint ipfs-address))]
       (log/debug "Looking up address for ledger:" ledger-name "all ledgers under ipns address are:" ledgers)
       (get ledgers ledger-name))))
 
 (defn ipns-address
-  "Returns IPNS address for a given ipns profile and ledger alias."
-  [ipfs-endpoint ipns-profile ledger-alias]
+  "Returns IPNS address for a given ipns key and ledger alias."
+  [ipfs-endpoint ipns-key ledger-alias]
   (go-try
     (log/debug "Getting address for ledger alias:" ledger-alias)
-    (let [base-address (<? (ipfs-keys/address ipfs-endpoint ipns-profile))]
-      (if base-address
-        (str "fluree:ipns://" base-address "/" ledger-alias)
-        (do
-          (log/warn "Throwing exception for IPNS get-address as provided profile does not exist: " ipns-profile
-                    ". IPNS profile keys found on server are: " (<? (ipfs-keys/list ipfs-endpoint)))
-          (throw (ex-info (str "IPNS profile: " ipns-profile " does not appear on the server. "
-                               "Therefore, unable to get address for ledger: " ledger-alias)
-                          {:status 400 :error :db/ipns-profile})))))))
+    (if-let [base-address (<? (ipfs-keys/address ipfs-endpoint ipns-key))]
+      (str "fluree:ipns://" base-address "/" ledger-alias)
+      (do
+        (log/warn "Failed to retrieve IPNS address because provided key" ipns-key
+                  "does not exist on the server.")
+        (throw (ex-info (str "Unable to get address for ledger: " ledger-alias ". "
+                             "IPNS key: " ipns-key " does not exist on the server.")
+                        {:status 400, :error :db/missing-ipns-key}))))))
 
-(defrecord IpnsNameService [ipfs-endpoint ipns-key base-address?]
+(defrecord IpnsNameService [ipfs-endpoint ipns-key]
   nameservice/Publisher
   (publish [_ commit-jsonld]
     (ipfs/push! ipfs-endpoint commit-jsonld))
@@ -73,12 +72,5 @@
 
 (defn initialize
   [ipfs-endpoint ipns-key]
-  (go-try
-    (let [base-address (<? (ipfs-keys/address ipfs-endpoint ipns-key))]
-      (when-not base-address
-        (throw (ex-info (str "IPNS publishing appears to have an issue. No corresponding ipns address found for key: "
-                             ipns-key)
-                        {:status 400 :error :db/ipfs-keys})))
-      (map->IpnsNameService {:ipfs-endpoint ipfs-endpoint
-                             :ipns-key      ipns-key
-                             :base-address  base-address}))))
+  (map->IpnsNameService {:ipfs-endpoint ipfs-endpoint
+                         :ipns-key      ipns-key}))
