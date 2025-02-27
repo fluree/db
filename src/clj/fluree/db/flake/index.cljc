@@ -11,15 +11,16 @@
 
 (def comparators
   "Map of default index comparators for the four index types"
-  {:spot flake/cmp-flakes-spot
+  (array-map ;; when using futures, can base other calcs on :spot (e.g. size), so ensure comes first
+   :spot flake/cmp-flakes-spot
    :post flake/cmp-flakes-post
    :opst flake/cmp-flakes-opst
-   :tspo flake/cmp-flakes-block})
+   :tspo flake/cmp-flakes-block))
 
 (def types
   "The four possible index orderings based on the subject, predicate, object,
   and transaction flake attributes"
-  (-> comparators keys set))
+  (-> comparators keys vec))
 
 (defn reference?
   [dt]

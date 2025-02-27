@@ -74,9 +74,9 @@
   [index-catalog to-clean]
   (go
     (loop [to-clean* to-clean]
-      (let [next-garbage (first to-clean*)
-            removed?     (nil? (<! (storage/read-garbage index-catalog (:address next-garbage))))]
-        (if removed?
+      (let [next-garbage (first to-clean*)]
+        (if (and next-garbage
+                 (nil? (<! (storage/read-garbage index-catalog (:address next-garbage)))))
           (recur (rest to-clean*))
           to-clean*)))))
 
@@ -94,10 +94,12 @@
   [{:keys [index-catalog commit] :as _db} max-indexes]
   (go
     (if (nat-int? max-indexes)
-      (let [all-garbage (<? (trace-idx-roots index-catalog commit))
-            to-clean    (->> all-garbage ;; garbage will be in order of newest to oldest
-                             (drop max-indexes)
-                             (sort-by :t)) ;; clean oldest 't' value first
+      (let [all-garbage (<! (trace-idx-roots index-catalog commit))
+            to-clean    (if (util/exception? all-garbage)
+                          (log/error all-garbage "Garbage collection error, unable to trace index roots with error:" (ex-message all-garbage))
+                          (->> all-garbage ;; garbage will be in order of newest to oldest
+                               (drop max-indexes)
+                               (sort-by :t))) ;; clean oldest 't' value first
             to-clean*   (<! (remove-cleaned index-catalog to-clean))
             start-time  (util/current-time-millis)]
         (if (empty? to-clean*)
@@ -112,5 +114,5 @@
                       (- (util/current-time-millis) start-time) "ms.")
             :done)))
       ;; Unexpected setting. In async chan, don't throw.
-      (ex-info (str "Setting for max-old-indexes should be >=0, instead received: " max-indexes)
-               {:status 500 :error :db/unexpected-error}))))
+      (log/error (str "Garbage collection: Setting for max-old-indexes should be >=0, instead received: " max-indexes
+                      "Unable to garbage collect.")))))
