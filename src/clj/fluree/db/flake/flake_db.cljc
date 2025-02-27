@@ -518,7 +518,7 @@
                                   :commit commit-map
                                   :tt-id nil
                                   :comparators index/comparators
-                                  :staged []
+                                  :staged nil
                                   :novelty (new-novelty-map index/comparators)
                                   :max-namespace-code max-ns-code)
                            map->FlakeDB
@@ -691,4 +691,4 @@
                         (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
     {:dbid        dbid
      :db-jsonld   db-json*
-     :staged-txns staged}))
+     :staged-txn  staged}))
