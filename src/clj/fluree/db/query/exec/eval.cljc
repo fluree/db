@@ -292,7 +292,7 @@
       (and (contains? comparable-time-datatypes dt-a)
            (contains? comparable-time-datatypes dt-b))
       #?(:clj (compare (->offset-date-time val-a) (->offset-date-time val-b))
-         :cljs (comapre val-a val-b))
+         :cljs (compare val-a val-b))
 
       ;; same types compare
       (= dt-a dt-b)
@@ -382,6 +382,7 @@
        :cljs (js/Date.))
     const/iri-xsd-dateTime))
 
+;; TODO - date functions below all look incorrect for CLJS - should (string? datetime) be (map? datetime)?
 (defn year
   [datetime]
   (where/->typed-val
@@ -418,7 +419,7 @@
        :cljs
        (.getHours (if (string? x)
                     (datatype/coerce (:value x) (:datatype-iri x))
-                    datetime)))))
+                    x)))))
 
 (defn minutes
   [x]
@@ -444,6 +445,7 @@
                             (datatype/coerce (:value x) (:datatype-iri x))
                             x)))))
 
+;; TODO - CLJS datetime is not a variable present in the function
 (defn tz
   [x]
   (where/->typed-val
@@ -452,9 +454,9 @@
               (.toString (.getOffset ^OffsetDateTime (->offset-date-time (:value x))))
               #{const/iri-xsd-time}
               (.toString (.getOffset ^OffsetTime (->offset-time (:value x)))))
-       :cljs (.getTimeZoneOffset ^js/Date (if (string? datetime)
-                                            (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                                            datetime)))))
+       :cljs (.getTimeZoneOffset ^js/Date (if (string? x)
+                                            (datatype/coerce (:value x) (:datatype-iri x))
+                                            x)))))
 
 (defn sha256
   [{x :value}]
