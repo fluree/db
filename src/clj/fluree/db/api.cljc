@@ -78,14 +78,6 @@
   (go-try
     (-> conn ::system-map system/terminate)))
 
-(defn connect-ipfs
-  "Forms an ipfs connection using default settings.
-  - server - (optional) IPFS http api server endpoint, defaults to http://127.0.0.1:5001/
-  - profile - (optional) IPFS stored profile to use.
-  - did - (optional) DId information to use, if storing blocks as verifiable credentials"
-  [opts]
-  (connect (assoc opts :method :ipfs)))
-
 (defn convert-config-key
   [[k v]]
   (if (#{:id :type} k)

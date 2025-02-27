@@ -82,7 +82,7 @@
   - profile - (optional) IPFS stored profile to use.
   - did - (optional) DId information to use, if storing blocks as verifiable credentials"
   [opts]
-  (log/warn "DEPRECATED function `connect-ipfs` superseded by `fluree.db.api/connect-ipfs`")
+  (log/warn "DEPRECATED function `connect-ipfs` superseded by `fluree.db.api/connect`")
   (connect (assoc opts :method :ipfs)))
 
 (defn ^{:deprecated    "3.0"
