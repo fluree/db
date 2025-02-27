@@ -481,7 +481,7 @@
         (assoc :commit new-commit
                :prev-commit prev-commit
                :max-namespace-code max-ns-code)
-        (commit-data/add-commit-flakes prev-commit))))
+        (commit-data/add-commit-flakes))))
 
 (defn sanitize-commit-options
   "Parses the commit options and removes non-public opts."

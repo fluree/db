@@ -1,7 +1,7 @@
 (ns fluree.db.flake.flake-db
   (:refer-clojure :exclude [load vswap!])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
-            [clojure.core.async :as async :refer [go]]
+            [clojure.core.async :as async :refer [go <! >! close!]]
             [clojure.set :refer [map-invert]]
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
@@ -251,49 +251,25 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
   indexes and returns updated db"
-  [{:keys [commit-catalog] :as db} commit-jsonld commit-data-jsonld]
+  [db commit-jsonld commit-data-jsonld]
   (go-try
     (let [t-new            (db-t commit-data-jsonld)
-          assert           (db-assert commit-data-jsonld)
           nses             (map :value
                                 (get commit-data-jsonld const/iri-namespaces))
           db*              (with-namespaces db nses)
-          asserted-flakes  (create-flakes true db* t-new assert)
-          retract          (db-retract commit-data-jsonld)
-          retracted-flakes (create-flakes false db* t-new retract)
+          asserted-flakes  (->> (db-assert commit-data-jsonld)
+                                (create-flakes true db* t-new))
+          retracted-flakes (->> (db-retract commit-data-jsonld)
+                                (create-flakes false db* t-new))
+          commit-metadata  (commit-data/json-ld->map commit-jsonld db*)
+          metadata-flakes  (commit-data/commit-metadata-flakes db* t-new commit-metadata)
+          all-flakes       (-> db*
+                               (get-in [:novelty :spot])
+                               empty
+                               (into metadata-flakes)
+                               (into retracted-flakes)
+                               (into asserted-flakes))]
 
-          {:keys [previous issuer message data] :as commit-metadata}
-          (commit-data/json-ld->map commit-jsonld db*)
-
-          commit-id          (:id commit-metadata)
-          commit-sid         (iri/encode-iri db* commit-id)
-          [prev-commit _]    (when-let [prev-addr (:address previous)]
-                               (<? (commit-storage/read-commit-jsonld commit-catalog prev-addr)))
-          db-sid             (iri/encode-iri db* (:id data))
-          metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
-                                                                 t-new commit-sid db-sid)
-          previous-id        (when prev-commit (:id prev-commit))
-          prev-commit-flakes (when previous-id
-                               (commit-data/prev-commit-flakes db* t-new commit-sid
-                                                               previous-id))
-          prev-data-id       (get-first-id prev-commit const/iri-data)
-          prev-db-flakes     (when prev-data-id
-                               (commit-data/prev-data-flakes db* db-sid t-new
-                                                             prev-data-id))
-          issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                               (commit-data/issuer-flakes db* t-new commit-sid issuer-iri))
-          message-flakes     (when message
-                               (commit-data/message-flakes t-new commit-sid message))
-          all-flakes         (-> db*
-                                 (get-in [:novelty :spot])
-                                 empty
-                                 (into metadata-flakes)
-                                 (into retracted-flakes)
-                                 (into asserted-flakes)
-                                 (cond-> prev-commit-flakes (into prev-commit-flakes)
-                                         prev-db-flakes (into prev-db-flakes)
-                                         issuer-flakes  (into issuer-flakes)
-                                         message-flakes (into message-flakes)))]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
@@ -460,16 +436,32 @@
      :namespace-codes iri/default-namespace-codes
      :schema          (vocab/base-schema)}))
 
+(defn add-commit-data
+  [commit-storage commits-ch]
+  (let [to (async/chan)
+        af (fn [commit-tuple res-ch]
+             (go
+               (let [[commit-jsonld _commit-proof] commit-tuple
+                     db-address       (-> commit-jsonld
+                                          (get-first const/iri-data)
+                                          (get-first-value const/iri-address))
+                     db-data-jsonld   (<? (commit-storage/read-data-jsonld commit-storage db-address))]
+                 (>! res-ch [commit-jsonld db-data-jsonld])
+                 (close! res-ch))))]
+    (async/pipeline-async 2 to af commits-ch)
+    to))
+
 (defn load-novelty
   [commit-storage indexed-db index-t commit-jsonld]
-  (go-try
-    (loop [[commit-tuple & r] (<? (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t)))
-           db                 indexed-db]
-      (if commit-tuple
-        (let [[commit-jsonld _commit-proof commit-data-jsonld] commit-tuple
-              new-db                                           (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld))]
-          (recur r new-db))
-        db))))
+  (let [commits-ch    (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t))
+        commits+data-ch (add-commit-data commit-storage commits-ch)]
+    (go
+      (loop [[commit-jsonld db-data-jsonld] (<! commits+data-ch)
+             db indexed-db]
+        (if db-data-jsonld
+          (let [new-db (<? (transact/-merge-commit db commit-jsonld db-data-jsonld))]
+            (recur (<! commits+data-ch) new-db))
+          db)))))
 
 (defn add-reindex-thresholds
   "Adds reindexing thresholds to the root map.

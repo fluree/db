@@ -41,61 +41,36 @@
   the necessary information."
   [ledger db [commit _proof db-data]]
   (go-try
-    (let [commit-id          (get-id commit)
-          t-new              (flake-db/db-t db-data)
-          _ (log/info "Migrating commit " commit-id " at t " t-new)
+    (let [commit-id        (get-id commit)
+          t-new            (flake-db/db-t db-data)
+          _                (log/info "Migrating commit " commit-id " at t " t-new)
 
           ;; the ns-mapping has all the parts of the db necessary for create-flakes to encode iris properly
-          ns-mapping         (db->namespace-mapping db)
+          ns-mapping       (db->namespace-mapping db)
 
-          assert             (flake-db/db-assert db-data)
-          asserted-flakes    (flake-db/create-flakes true ns-mapping t-new assert)
-          retract            (flake-db/db-retract db-data)
-          retracted-flakes   (flake-db/create-flakes false ns-mapping t-new retract)
-
-          {:keys [previous issuer message data] :as commit-metadata}
-          (commit-data/json-ld->map commit db)
-
-          commit-id          (:id commit-metadata)
-          commit-sid         (iri/encode-iri ns-mapping commit-id)
-
-          db-sid             (iri/encode-iri ns-mapping (:id data))
-          metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
-                                                                 t-new commit-sid db-sid)
-
-          previous-id        (when previous (:id previous))
-          prev-commit-flakes (when previous-id
-                               (commit-data/prev-commit-flakes db t-new commit-sid
-                                                               previous-id))
-          prev-data-id       (get-first-id previous const/iri-data)
-          prev-db-flakes     (when prev-data-id
-                               (commit-data/prev-data-flakes db db-sid t-new
-                                                             prev-data-id))
-          issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                               (commit-data/issuer-flakes db t-new commit-sid issuer-iri))
-          message-flakes     (when message
-                               (commit-data/message-flakes t-new commit-sid message))
-          all-flakes         (-> db
-                                 (get-in [:novelty :spot])
-                                 empty
-                                 (into metadata-flakes)
-                                 (into retracted-flakes)
-                                 (into asserted-flakes)
-                                 (cond-> prev-commit-flakes (into prev-commit-flakes)
-                                         prev-db-flakes (into prev-db-flakes)
-                                         issuer-flakes (into issuer-flakes)
-                                         message-flakes (into message-flakes)))
-          tx-state           (flake.transact/->tx-state
-                               :db db
-                               :txn (get-first-value commit const/iri-txn)
-                               :author (let [author (get-first-value commit const/iri-author)]
-                                         (when-not (str/blank? author) author))
-                               :annotation (get-first-value commit const/iri-annotation))
-          staged-db          (-> (<? (flake.transact/final-db db all-flakes tx-state))
-                                 :db-after
-                                 (set-namespaces ns-mapping))
-          committed-db       (<? (connection/commit! ledger staged-db
-                                                     {:time (get-first-value commit const/iri-time)}))]
+          asserted-flakes  (->> (flake-db/db-assert db-data)
+                                (flake-db/create-flakes true ns-mapping t-new))
+          retracted-flakes (->> (flake-db/db-retract db-data)
+                                (flake-db/create-flakes false ns-mapping t-new))
+          metadata-flakes  (->> (commit-data/json-ld->map commit db)
+                                (commit-data/commit-metadata-flakes db t-new))
+          all-flakes       (-> db
+                               (get-in [:novelty :spot])
+                               empty
+                               (into metadata-flakes)
+                               (into retracted-flakes)
+                               (into asserted-flakes))
+          tx-state         (flake.transact/->tx-state
+                            :db db
+                            :txn (get-first-value commit const/iri-txn)
+                            :author (let [author (get-first-value commit const/iri-author)]
+                                      (when-not (str/blank? author) author))
+                            :annotation (get-first-value commit const/iri-annotation))
+          staged-db        (-> (<? (flake.transact/final-db db all-flakes tx-state))
+                               :db-after
+                               (set-namespaces ns-mapping))
+          committed-db     (<? (connection/commit! ledger staged-db
+                                                   {:time (get-first-value commit const/iri-time)}))]
       (if (async-db/db? committed-db)
         (<? (async-db/deref-async committed-db))
         committed-db))))

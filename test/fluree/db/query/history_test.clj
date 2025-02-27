@@ -818,7 +818,8 @@
               conn        @(fluree/connect-file {:storage-path storage-path
                                                  :defaults     {:identity (did/private->did-map
                                                                             test-utils/default-private-key)}})
-              context     [test-utils/default-context {:ex "http://example.org/ns/"}]
+              context     [test-utils/default-context {:ex   "http://example.org/ns/"
+                                                       :cred "https://www.w3.org/2018/credentials#"}]
 
               a             @(fluree/create-with-txn conn {"@context" ["https://ns.flur.ee"
                                                                        context]
@@ -865,8 +866,7 @@
                             [#:f{:assert  [{:ex/x "foo-3"
                                             :ex/y "bar-3"
                                             :id   :ex/alice}]
-                                 :commit  {"https://www.w3.org/2018/credentials#issuer"
-                                           {:id test-utils/did?}
+                                 :commit  {:cred/issuer {:id test-utils/did?}
                                            :f/address  test-utils/address?
                                            :f/alias    ledger-name
                                            :f/branch   "main"
@@ -874,8 +874,7 @@
                                                         :f/assert   [{:ex/x "foo-3"
                                                                       :ex/y "bar-3"
                                                                       :id   :ex/alice}]
-                                                        :f/flakes   36
-                                                        :f/previous {:id test-utils/db-id?}
+                                                        :f/flakes   34
                                                         :f/retract  [{:ex/x "foo-2"
                                                                       :ex/y "bar-2"
                                                                       :id   :ex/alice}]
@@ -893,8 +892,7 @@
                              #:f{:assert  [{:ex/x "foo-cat"
                                             :ex/y "bar-cat"
                                             :id   :ex/alice}]
-                                 :commit  {"https://www.w3.org/2018/credentials#issuer"
-                                           {:id test-utils/did?}
+                                 :commit  {:cred/issuer {:id test-utils/did?}
                                            :f/address  test-utils/address?
                                            :f/alias    ledger-name
                                            :f/branch   "main"
@@ -902,8 +900,7 @@
                                                         :f/assert   [{:ex/x "foo-cat"
                                                                       :ex/y "bar-cat"
                                                                       :id   :ex/alice}]
-                                                        :f/flakes   68
-                                                        :f/previous {:id test-utils/db-id?}
+                                                        :f/flakes   64
                                                         :f/retract  [{:ex/x "foo-3"
                                                                       :ex/y "bar-3"
                                                                       :id   :ex/alice}]
