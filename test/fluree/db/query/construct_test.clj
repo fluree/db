@@ -28,13 +28,26 @@
   (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "people")
         db0     (fluree/db ledger)
-        context ["https://ns.flur.ee" test-utils/default-str-context {"person" "http://example.org/Person#"}]
+        context [test-utils/default-str-context
+                 {"person" "http://example.org/Person#"
+                  "ex" "http://example.org/"}]
         db1     @(fluree/stage db0 {"@context" context "insert" people-data})]
     (testing "basic"
-      (is (= [{"@id" "ex:bbob", "label" "Billy Bob"}
-              {"@id" "ex:fbueller", "label" "Ferris Bueller"}
-              {"@id" "ex:jdoe", "label" "Jane Doe"}
-              {"@id" "ex:jbob", "label" "Jenny Bob"}]
+      (is (= {"@context" context
+              "@graph"
+              [{"@id" "ex:bbob", "label" "Billy Bob"}
+               {"@id" "ex:fbueller", "label" "Ferris Bueller"}
+               {"@id" "ex:jdoe", "label" "Jane Doe"}
+               {"@id" "ex:jbob", "label" "Jenny Bob"}]}
              @(fluree/query db1 {"@context" context
                                  "where" [{"@id" "?s" "person:fullName" "?fullName"}]
-                                 "construct" [{"@id" "?s" "label" "?fullName"}]}))))))
+                                 "construct" [{"@id" "?s" "label" "?fullName"}]}))))
+    (testing "nil context"
+      (is (= {"@graph"
+              [{"@id" "http://example.org/bbob", "ex:label" "Billy Bob"}
+               {"@id" "http://example.org/fbueller", "ex:label" "Ferris Bueller"}
+               {"@id" "http://example.org/jdoe", "ex:label" "Jane Doe"}
+               {"@id" "http://example.org/jbob", "ex:label" "Jenny Bob"}]}
+             @(fluree/query db1 {"@context" nil
+                                 "where" [{"@id" "?s" "http://example.org/Person#fullName" "?fullName"}]
+                                 "construct" [{"@id" "?s" "ex:label" "?fullName"}]}))))))
