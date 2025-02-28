@@ -121,18 +121,19 @@
   (format-value [_ _ _ _ compact _ _ solution]
     (go
       (let [[s p o] (where/assign-matched-values (first patterns) solution)]
-        [{"@id" (where/get-iri s)
-          (where/get-iri p)
+        [{"@id" (compact (where/get-iri s))
+
+          (compact (where/get-iri p))
           (if-let [iri (where/get-iri o)]
-            {"@id" iri}
-            (let [v      (where/get-value o)
+            {"@id" (compact iri)}
+            (let [v (where/get-value o)
                   dt-iri (where/get-datatype-iri o)
-                  lang   (where/get-lang o)]
+                  lang (where/get-lang o)]
               (if (datatype/inferable-iri? dt-iri)
                 v
                 (cond-> {"@value" o}
-                  lang       (assoc "@language" lang)
-                  (not lang) (assoc "@type" dt-iri)))))}]))))
+                  lang (assoc "@language" lang)
+                  (not lang) (assoc "@type" (compact dt-iri))))))}]))))
 
 (defn construct-selector
   [patterns]
@@ -237,3 +238,13 @@
   (or (instance? AggregateSelector selector)
       (and (instance? AsSelector selector)
            (:aggregate? selector))))
+
+(defn wrap-construct
+  [{:keys [orig-context]} results]
+  (cond-> {"@graph" results}
+    orig-context (assoc "@context" orig-context)))
+
+(defn wrap-sparql
+  [results]
+  {"head" {"vars" (vec (sort (keys (first results))))}
+   "results" {"bindings" results}})

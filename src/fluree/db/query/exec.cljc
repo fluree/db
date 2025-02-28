@@ -39,16 +39,25 @@
 
 (defn collect-results
   "Returns a channel that will eventually contain the stream of results from the
-  `result-ch` channel collected into a single vector, but handles the special
-  case of `:select-one` queries by only returning the first result from
+  `result-ch` channel collected into a single vector, but handles the special cases.
+  `:select-one` queries are handled by only returning the first result from
   `result-ch` in the output channel. Note that this behavior is different from
   queries with `:limit` set to 1 as those queries will return a vector
   containing a single result to the output channel instead of the single result
-  alone."
+  alone. `:construct` and output-type `:sparql` need to be collected into a wrapper."
   [q result-ch]
-  (if (:select-one q)
-    (async/take 1 result-ch)
-    (async/into [] result-ch)))
+  (cond (:select-one q) (async/take 1 result-ch)
+
+        (:construct q)
+        (-> (async/into [] result-ch)
+            (async/pipe (async/chan 1 (map (partial select/wrap-construct q)))))
+
+        (-> q :opts :output (= :sparql))
+        (-> (async/into [] result-ch)
+            (async/pipe (async/chan 1 (map select/wrap-sparql))))
+
+        :else
+        (async/into [] result-ch)))
 
 (defn execute*
   ([ds fuel-tracker q error-ch]
