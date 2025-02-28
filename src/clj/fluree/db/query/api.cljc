@@ -125,8 +125,11 @@
 
 (defn wrap-sparql-results
   [results]
-  {"head" {"vars" (vec (sort (keys (first results))))}
-   "results" {"bindings" results}})
+  (let [format (fn [results] {"head" {"vars" (vec (sort (keys (first results))))}
+                              "results" {"bindings" results}})]
+    (if (:result results)
+      (update results :result format)
+      (format results))))
 
 (defn query-sparql
   [db query override-opts]
