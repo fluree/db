@@ -18,7 +18,7 @@
 
 (defprotocol ValueSelector
   :extend-via-metadata true
-  (format-value [fmt db iri-cache context output-format compact fuel-tracker error-ch solution]
+  (format-value [fmt db iri-cache context compact fuel-tracker error-ch solution]
     "Async format a search solution (map of pattern matches) by extracting relevant match."))
 
 (defprotocol ValueAdapter
@@ -30,7 +30,7 @@
 
 (defn format-fql-variable-selector-value
   [var]
-  (fn [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
+  (fn [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
     (go (try* (-> solution (get var) (display/fql compact))
               (catch* e
                       (log/error e "Error formatting variable:" var)
@@ -38,7 +38,7 @@
 
 (defn format-sparql-variable-selector-value
   [var]
-  (fn [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
+  (fn [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
     (go (try* {(display/var-name var)
                (-> solution (get var) (display/sparql compact))}
           (catch* e
@@ -61,7 +61,7 @@
       (with-meta selector {`format-value (format-fql-variable-selector-value variable)}))))
 
 (defn format-fql-wildcard-selector-value
-  [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
+  [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
   (go
     (try*
       (loop [[var & vars] (sort (remove nil? (keys solution))) ; implicit grouping can introduce nil keys in solution
@@ -75,7 +75,7 @@
               (>! error-ch e)))))
 
 (defn format-sparql-wildcard-selector-value
-  [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
+  [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
   (go
     (try*
       (loop [[var & vars] (sort (remove nil? (keys solution))) ; implicit grouping can introduce nil keys in solution
@@ -104,7 +104,7 @@
 (defrecord AggregateSelector [agg-fn]
   ValueSelector
   (format-value
-    [_ _ _ _ output-format compact _ error-ch solution]
+    [_ _ _ _ compact _ error-ch solution]
     (go (try* (:value (agg-fn solution))
               (catch* e
                       (log/error e "Error applying aggregate selector")
@@ -120,12 +120,12 @@
 
 (defn format-fql-as-selector-value
   [bind-var]
-  (fn [_ _ _ _ _ compact _ _ solution]
+  (fn [_ _ _ _ compact _ _ solution]
     (go (-> solution (get bind-var) (display/fql compact)))))
 
 (defn format-sparql-as-selector-value
   [bind-var]
-  (fn [_ _ _ _ _ compact _ _ solution]
+  (fn [_ _ _ _ compact _ _ solution]
     (go (let [output (-> solution (get bind-var) (display/sparql compact))]
           {(display/var-name bind-var) output}))))
 
@@ -154,7 +154,7 @@
 (defrecord SubgraphSelector [subj selection depth spec]
   ValueSelector
   (format-value
-    [_ ds iri-cache context _ compact fuel-tracker error-ch solution]
+    [_ ds iri-cache context compact fuel-tracker error-ch solution]
     (when-let [iri (if (where/variable? subj)
                      (-> solution
                          (get subj)
@@ -195,7 +195,7 @@
     (go-loop [selectors selectors
               values []]
       (if-let [selector (first selectors)]
-        (let [value (<! (format-value selector db iri-cache context output-format compact
+        (let [value (<! (format-value selector db iri-cache context compact
                                       fuel-tracker error-ch solution))]
           (recur (rest selectors)
                  (conj values value)))
@@ -203,7 +203,7 @@
         (if (= output-format :sparql)
           (apply merge values)
           values)))
-    (format-value selectors db iri-cache context output-format compact fuel-tracker
+    (format-value selectors db iri-cache context compact fuel-tracker
                   error-ch solution)))
 
 (defn format
