@@ -148,19 +148,19 @@
           ledger  @(fluree/create conn "propertypathstest")
           db0     (fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/"}]
-          db1     @(fluree/stage db0 {"@context" ["https://ns.flur.ee" context]
+          db1     @(fluree/stage db0 {"@context" context
                                       "insert"   [{"@id"            "ex:unlabeled-pred"
                                                    "ex:description" "created as a subject first"}
                                                   {"@id"            "ex:labeled-pred"
                                                    "@type"          "rdf:Property"
                                                    "ex:description" "created as a subject first, labelled as Property"}]})
-          db2     @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+          db2     @(fluree/stage db1 {"@context" context
                                       "insert"   [{"@id"               "ex:subject-as-predicate"
                                                    "ex:labeled-pred"   "labeled"
                                                    "ex:unlabeled-pred" "unlabeled"
                                                    "ex:new-pred"       {"@id"               "ex:nested"
                                                                         "ex:unlabeled-pred" "unlabeled-nested"}}]})
-          db3     @(fluree/stage db1 {"@context" ["https://ns.flur.ee" context]
+          db3     @(fluree/stage db1 {"@context" context
                                       "insert"   [{"@id"               "ex:subject-as-predicate"
                                                    "ex:labeled-pred"   "labeled"
                                                    "ex:unlabeled-pred" {"@id"               "ex:nested"
@@ -219,7 +219,7 @@
                      {"ex"  "http://example.com/"
                       "owl" "http://www.w3.org/2002/07/owl#"}]
           ledger    @(fluree/create conn ledger-id)
-          db0       (->> @(fluree/stage (fluree/db ledger) {"@context" ["https://ns.flur.ee" context]
+          db0       (->> @(fluree/stage (fluree/db ledger) {"@context" context
                                                             "insert"   {"ex:new" true}})
                          (fluree/commit! ledger)
                          (deref))
@@ -227,7 +227,7 @@
 
           db1 @(fluree/transact!
                  conn {"ledger"   ledger-id
-                       "@context" ["https://ns.flur.ee" context]
+                       "@context" context
                        "insert"
                        [{"@id"                    "ex:givenName"
                          "@type"                  "rdf:Property"
@@ -240,7 +240,7 @@
 
           db2    @(fluree/transact!
                     conn {"ledger"   ledger-id
-                          "@context" ["https://ns.flur.ee" context]
+                          "@context" context
                           "insert"   [{"@id"          "ex:andrew"
                                        "ex:firstName" "Andrew"
                                        "ex:age"       35}
