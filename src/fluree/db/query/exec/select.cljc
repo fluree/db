@@ -7,6 +7,8 @@
             [fluree.db.query.exec.eval :as-alias eval]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.select.subject :as subject]
+            [fluree.db.query.exec.project.fql :as project.fql]
+            [fluree.db.query.exec.project.sparql :as project.sparql]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
@@ -73,6 +75,7 @@
     (some-> match where/get-value vec)))
 
 (defprotocol ValueSelector
+  :extend-via-metadata true
   (format-value [fmt db iri-cache context output-format compact fuel-tracker error-ch solution]
     "Async format a search solution (map of pattern matches) by extracting relevant match."))
 
@@ -83,19 +86,24 @@
 (defprotocol SolutionModifier
   (update-solution [this solution]))
 
-(defrecord VariableSelector [var]
-  ValueSelector
-  (format-value
-    [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
-    (log/trace "VariableSelector format-value var:" var "solution:" solution)
-    (go (try*
-          (let [output (-> solution (get var) (display output-format compact))]
-            (if (= output-format :sparql)
-              {(var-name var) output}
-              output))
+(defn format-fql-variable-selector-value
+  [var]
+  (fn [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
+    (go (try* (-> solution (get var) (project.fql/display-fql compact))
+              (catch* e
+                      (log/error e "Error formatting variable:" var)
+                      (>! error-ch e))))))
+
+(defn format-sparql-variable-selector-value
+  [var]
+  (fn [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
+    (go (try* {(project.sparql/var-name var)
+               (-> solution (get var) (project.sparql/display-sparql compact))}
           (catch* e
                   (log/error e "Error formatting variable:" var)
-                  (>! error-ch e)))))
+                  (>! error-ch e))))))
+
+(defrecord VariableSelector [var]
   ValueAdapter
   (solution-value
     [_ _ solution]
@@ -104,35 +112,52 @@
 (defn variable-selector
   "Returns a selector that extracts and formats a value bound to the specified
   `variable` in where search solutions for presentation."
-  [variable]
-  (->VariableSelector variable))
+  [variable output]
+  (let [selector (->VariableSelector variable)]
+    (case output
+      :sparql (with-meta selector {`format-value (format-sparql-variable-selector-value variable) })
+      (with-meta selector {`format-value (format-fql-variable-selector-value variable)}))))
+
+(defn format-fql-wildcard-selector-value
+  [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
+  (go
+    (try*
+      (loop [[var & vars] (sort (remove nil? (keys solution))) ; implicit grouping can introduce nil keys in solution
+             result {}]
+        (if var
+          (let [output (-> solution (get var) (project.fql/display-fql compact))]
+            (recur vars (assoc result var output)))
+          result))
+      (catch* e
+              (log/error e "Error formatting wildcard")
+              (>! error-ch e)))))
+
+(defn format-sparql-wildcard-selector-value
+  [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
+  (go
+    (try*
+      (loop [[var & vars] (sort (remove nil? (keys solution))) ; implicit grouping can introduce nil keys in solution
+             result {}]
+        (if var
+          (let [output (-> solution (get var) (project.sparql/display-sparql compact))]
+            (recur vars (assoc result (project.sparql/var-name var) output)))
+          result))
+      (catch* e
+              (log/error e "Error formatting wildcard")
+              (>! error-ch e)))))
 
 (defrecord WildcardSelector []
-  ValueSelector
-  (format-value
-    [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
-    (go
-      (try*
-        (loop [[var & vars] (sort (remove nil? (keys solution))) ; implicit grouping can introduce nil keys in solution
-               result {}]
-          (if var
-            (let [display-var (-> solution (get var) (display output-format compact))]
-              (recur vars (if (= output-format :sparql)
-                            (assoc result (var-name var) display-var)
-                            (assoc result var display-var))))
-            result))
-        (catch* e
-                (log/error e "Error formatting wildcard")
-                (>! error-ch e)))))
   ValueAdapter
-  (solution-value
-    [_ _ solution]
-    solution))
+  (solution-value [_ _ solution] solution))
 
-(def wildcard-selector
+(defn wildcard-selector
   "Returns a selector that extracts and formats every bound value bound in the
   where clause."
-  (->WildcardSelector))
+  [output]
+  (let [selector (->WildcardSelector)]
+    (case output
+      :sparql (with-meta selector {`format-value format-sparql-wildcard-selector-value})
+      (with-meta selector {`format-value format-fql-wildcard-selector-value}))))
 
 (defrecord AggregateSelector [agg-fn]
   ValueSelector
@@ -151,6 +176,17 @@
   [agg-function]
   (->AggregateSelector agg-function))
 
+(defn format-fql-as-selector-value
+  [bind-var]
+  (fn [_ _ _ _ _ compact _ _ solution]
+    (go (-> solution (get bind-var) (project.fql/display-fql compact)))))
+
+(defn format-sparql-as-selector-value
+  [bind-var]
+  (fn [_ _ _ _ _ compact _ _ solution]
+    (go (let [output (-> solution (get bind-var) (project.sparql/display-sparql compact))]
+          {(project.sparql/var-name bind-var) output}))))
+
 (defrecord AsSelector [as-fn bind-var aggregate?]
   SolutionModifier
   (update-solution
@@ -161,22 +197,17 @@
       (assoc solution bind-var (-> (where/unmatched-var bind-var)
                                    (where/match-value v (or dt (datatype/infer-iri v)))
                                    (cond-> lang (where/match-lang v lang))))))
-  ValueSelector
-  (format-value
-    [_ _ _ _ output-format compact _ _ solution]
-    (log/trace "AsSelector format-value solution:" solution)
-    (go (let [output (-> solution (get bind-var) (display output-format compact))]
-          (if (= output-format :sparql)
-            {(var-name bind-var) output}
-            output))))
   ValueAdapter
   (solution-value
     [_ _ solution]
     [bind-var (get solution bind-var)]))
 
 (defn as-selector
-  [as-fn bind-var aggregate?]
-  (->AsSelector as-fn bind-var aggregate?))
+  [as-fn output bind-var aggregate?]
+  (let [selector (->AsSelector as-fn bind-var aggregate?)]
+    (case output
+      :sparql (with-meta selector {`format-value (format-sparql-as-selector-value bind-var)})
+      (with-meta selector {`format-value (format-fql-as-selector-value bind-var)}))))
 
 (defrecord SubgraphSelector [subj selection depth spec]
   ValueSelector
