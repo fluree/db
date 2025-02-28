@@ -236,9 +236,9 @@
                            (conj acc* (triples->map id triples)))
                          []
                          by-subj)
-            parsed     (->> statements
-                            json-ld/expand
-                            (fql.parse/parse-triples nil nil))]
+            parsed     (-> statements
+                           json-ld/expand
+                           (fql.parse/parse-triples nil nil))]
         (assoc acc rule-id {:insert parsed})))
     {}
     inserts))

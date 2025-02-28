@@ -365,10 +365,9 @@
           ledger @(fluree/create conn "jobs")
           db     @(fluree/stage
                     (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee"
-                                 {"ex"         "http://example.com/vocab/"
-                                  "occupation" {"@id"        "ex:occupation"
-                                                "@container" "@language"}}]
+                    {"@context" {"ex"         "http://example.com/vocab/"
+                                 "occupation" {"@id"        "ex:occupation"
+                                               "@container" "@language"}}
                      "insert"   [{"@id"        "ex:frank"
                                   "occupation" {"en" {"@value" "Ninja"}
                                                 "ja" "忍者"}}
@@ -426,8 +425,7 @@
           ledger @(fluree/create conn "people")
           db     @(fluree/stage
                     (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee"
-                                 test-utils/default-context
+                    {"@context" [test-utils/default-context
                                  {:ex    "http://example.org/ns/"
                                   :value "@value"
                                   :type  "@type"}]
@@ -524,8 +522,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "people")
           db1    @(fluree/stage (fluree/db ledger)
-                                {"@context" ["https://ns.flur.ee"
-                                             test-utils/default-context
+                                {"@context" [test-utils/default-context
                                              {:ex    "http://example.org/ns/"
                                               :value "@value"
                                               :type  "@type"}]
@@ -541,8 +538,7 @@
                                    :ex/name "Bart"
                                    :ex/age  "forever 10"}]})
           db1*   @(fluree/commit! ledger db1)
-          db2    @(fluree/stage db1* {"@context" ["https://ns.flur.ee"
-                                                  test-utils/default-context
+          db2    @(fluree/stage db1* {"@context" [test-utils/default-context
                                                   {:ex    "http://example.org/ns/"
                                                    :value "@value"
                                                    :type  "@type"}]
@@ -553,8 +549,7 @@
                                         :ex/dad        {:id :ex/homer}
                                         :ex/occupation "Getting into mischief"}]})
           db2*   @(fluree/commit! ledger db2)
-          db3    @(fluree/stage db2* {"@context" ["https://ns.flur.ee"
-                                                  test-utils/default-context
+          db3    @(fluree/stage db2* {"@context" [test-utils/default-context
                                                   {:ex    "http://example.org/ns/"
                                                    :value "@value"
                                                    :type  "@type"}]
@@ -602,15 +597,14 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "test/love")
         db     @(fluree/stage (fluree/db ledger)
-                              {"@context" ["https://ns.flur.ee"
-                                           {"id"     "@id",
-                                            "type"   "@type",
-                                            "ex"     "http://example.org/",
-                                            "f"      "https://ns.flur.ee/ledger#",
-                                            "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-                                            "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
-                                            "schema" "http://schema.org/",
-                                            "xsd"    "http://www.w3.org/2001/XMLSchema#"}]
+                              {"@context" {"id"     "@id",
+                                           "type"   "@type",
+                                           "ex"     "http://example.org/",
+                                           "f"      "https://ns.flur.ee/ledger#",
+                                           "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                           "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                                           "schema" "http://schema.org/",
+                                           "xsd"    "http://www.w3.org/2001/XMLSchema#"}
                                "insert"
                                [{"@id"                "ex:fluree",
                                  "@type"              "schema:Organization",

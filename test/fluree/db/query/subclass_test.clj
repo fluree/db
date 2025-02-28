@@ -9,8 +9,7 @@
           ledger @(fluree/create conn "query/subclass")
           db1    @(fluree/stage
                     (fluree/db ledger)
-                    {"@context" "https://ns.flur.ee"
-                     "insert"
+                    {"insert"
                      {"@context"                  "https://schema.org"
                       "id"                        "https://www.wikidata.org/wiki/Q836821"
                       "type"                      ["Movie"]
@@ -27,8 +26,7 @@
           ;; add CreativeWork class
           db2    @(fluree/stage
                     db1
-                    {"@context" "https://ns.flur.ee"
-                     "insert"
+                    {"insert"
                      {"@context"        {"schema" "http://schema.org/"
                                          "rdfs"   "http://www.w3.org/2000/01/rdf-schema#"}
                       "@id"             "schema:CreativeWork",
@@ -41,8 +39,7 @@
           ;; Make Book and Movie subclasses of CreativeWork
           db3 @(fluree/stage
                  db2
-                 {"@context" "https://ns.flur.ee"
-                  "insert"
+                 {"insert"
                   {"@context" {"schema" "http://schema.org/"
                                "rdfs"   "http://www.w3.org/2000/01/rdf-schema#"}
                    "@graph"   [{"@id"             "schema:Book",
@@ -76,7 +73,7 @@
           context     test-utils/default-str-context
           db1         @(fluree/stage
                          db0
-                         {"@context" ["https://ns.flur.ee" context]
+                         {"@context" context
                           "insert"
                           [{"@id"         "ex:freddy"
                             "@type"       "ex:Yeti"
@@ -92,7 +89,7 @@
                             "schema:name" "Andrew Johnson"}]})
           db2         @(fluree/stage
                          db1
-                         {"@context" ["https://ns.flur.ee" context]
+                         {"@context" context
                           "insert"
                           [{"@id"   "ex:Humanoid"
                             "@type" "rdfs:Class"}
@@ -125,7 +122,7 @@
           context     test-utils/default-str-context
           db1         @(fluree/stage
                          db0
-                         {"@context" ["https://ns.flur.ee" context]
+                         {"@context" context
                           "insert"
                           [{"@id"         "ex:freddy"
                             "@type"       "ex:Yeti"
@@ -141,7 +138,7 @@
                             "schema:name" "Andrew Johnson"}]})
           db2         @(fluree/stage
                          db1
-                         {"@context" ["https://ns.flur.ee" context]
+                         {"@context" context
                           "insert"
                           [{"@id"   "ex:Humanoid"
                             "@type" "rdfs:Class"}

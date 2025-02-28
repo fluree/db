@@ -15,8 +15,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "tx/delete")
           db     @(fluree/stage (fluree/db ledger)
-                                {"@context" ["https://ns.flur.ee"
-                                             test-utils/default-context
+                                {"@context" [test-utils/default-context
                                              {:ex "http://example.org/ns/"}]
                                  "insert"
                                  {:graph [{:id           :ex/alice
@@ -36,24 +35,21 @@
 
           ;; delete everything for :ex/alice
           db-subj-delete @(fluree/stage db
-                                        {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-context
+                                        {"@context" [test-utils/default-context
                                                      {:ex "http://example.org/ns/"}]
                                          "where"    '{:id :ex/alice, "?p" "?o"}
                                          "delete"   '{:id :ex/alice, "?p" "?o"}})
 
           ;; delete any :schema/age values for :ex/bob
           db-subj-pred-del @(fluree/stage db
-                                          {"@context" ["https://ns.flur.ee"
-                                                       test-utils/default-context
+                                          {"@context" [test-utils/default-context
                                                        {:ex "http://example.org/ns/"}]
                                            "delete"   {:id :ex/bob, :schema/age "?o"}
                                            "where"    {:id :ex/bob, :schema/age "?o"}})
 
           ;; delete all subjects with a :schema/email predicate
           db-all-preds @(fluree/stage db
-                                      {"@context" ["https://ns.flur.ee"
-                                                   test-utils/default-context
+                                      {"@context" [test-utils/default-context
                                                    {:ex "http://example.org/ns/"}]
                                        "delete"   {:id "?s", "?p" "?o"}
                                        "where"    {:id           "?s"
@@ -62,8 +58,7 @@
 
           ;; delete all subjects where :schema/age = 30
           db-age-delete @(fluree/stage db
-                                       {"@context" ["https://ns.flur.ee"
-                                                    test-utils/default-context
+                                       {"@context" [test-utils/default-context
                                                     {:ex "http://example.org/ns/"}]
                                         "delete"   {:id "?s", "?p" "?o"}
                                         "where"    {:id         "?s"
@@ -72,8 +67,7 @@
 
           ;; Change Bob's age - but only if his age is still 22
           db-update-bob @(fluree/stage db
-                                       {"@context" ["https://ns.flur.ee"
-                                                    test-utils/default-context
+                                       {"@context" [test-utils/default-context
                                                     {:ex "http://example.org/ns/"}]
                                         "delete"   {:id :ex/bob, :schema/age 22}
                                         "insert"   {:id :ex/bob, :schema/age 23}
@@ -81,8 +75,7 @@
 
           ;; Shouldn't change Bob's age as the current age is not a match
           db-update-bob2 @(fluree/stage db
-                                        {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-context
+                                        {"@context" [test-utils/default-context
                                                      {:ex "http://example.org/ns/"}]
                                          "delete"   {:id "?s" :schema/age 99}
                                          "insert"   {:id "?s" :schema/age 23}
@@ -90,8 +83,7 @@
 
           ;; change Jane's age regardless of its current value
           db-update-jane @(fluree/stage db
-                                        {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-context
+                                        {"@context" [test-utils/default-context
                                                      {:ex "http://example.org/ns/"}]
                                          "delete"   {:id :ex/jane, :schema/age "?current-age"}
                                          "insert"   {:id :ex/jane, :schema/age 31}
@@ -171,15 +163,13 @@
 
     (testing "hash functions"
       (with-redefs [fluree.db.query.exec.eval/now const-now]
-        (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                                          test-utils/default-str-context
+        (let [updated (-> @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                           {"ex" "http://example.com/"}]
                                               "insert"   [{"id"     "ex:create-predicates"
                                                            "ex:md5" 0 "ex:sha1" 0 "ex:sha256" 0 "ex:sha384" 0 "ex:sha512" 0}
                                                           {"id"         "ex:hash-fns"
                                                            "ex:message" "abc"}]})
-                          (fluree/stage {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-str-context
+                          (fluree/stage {"@context" [test-utils/default-str-context
                                                      {"ex" "http://example.com/"}]
                                          "delete"   []
                                          "where"    [{"id"         "ex:hash-fns"
@@ -197,8 +187,7 @@
                                           "selectOne" {"ex:hash-fns" ["ex:sha512" "ex:sha256"]}}))))))
     (testing "datetime functions"
       (with-redefs [fluree.db.query.exec.eval/now const-now]
-        (let [db2 @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                                  test-utils/default-str-context
+        (let [db2 @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                   {"ex" "http://example.com/"}]
                                       "insert"
                                       [{"id"         "ex:create-predicates"
@@ -211,8 +200,7 @@
                                                              "@type" const/iri-xsd-dateTime}
                                         "ex:utcdatetime"    {"@value" "2023-06-13T14:17:22.435Z"
                                                              "@type" const/iri-xsd-dateTime}}]})
-              db3 @(fluree/stage db2 {"@context" ["https://ns.flur.ee"
-                                                  test-utils/default-str-context
+              db3 @(fluree/stage db2 {"@context" [test-utils/default-str-context
                                                   {"ex" "http://example.com/"}]
                                       "values" ["?s" [{"@value" "ex:datetime-fns" "@type" "@id"}]]
                                       "where" [{"id" "?s"
@@ -275,8 +263,7 @@
                                                      "ex:comp>" "ex:comp>="]}}))))))
 
     (testing "numeric functions"
-      (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                                        test-utils/default-str-context
+      (let [updated (-> @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                         {"ex" "http://example.com/"}]
                                             "insert"   [{"id"     "ex:create-predicates"
                                                          "ex:abs" 0 "ex:round" 0 "ex:ceil" 0 "ex:floor" 0 "ex:rand" 0}
@@ -284,8 +271,7 @@
                                                          "ex:pos-int" 2
                                                          "ex:neg-int" -2
                                                          "ex:decimal" 1.4}]})
-                        (fluree/stage {"@context" ["https://ns.flur.ee"
-                                                   test-utils/default-str-context
+                        (fluree/stage {"@context" [test-utils/default-str-context
                                                    {"ex" "http://example.com/"}]
                                        "where"    [{"id"         "?s"
                                                     "ex:pos-int" "?pos-int"
@@ -321,8 +307,7 @@
                                            "selectOne" "?rand"})))))
 
     (testing "string functions"
-      (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                                        test-utils/default-str-context
+      (let [updated (-> @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                         {"ex" "http://example.com/"}]
                                             "insert"   [{"id"              "ex:create-predicates"
                                                          "ex:strLen"       0 "ex:subStr"    0 "ex:ucase"    0
@@ -332,8 +317,7 @@
                                                          "ex:langMatches"  0 "ex:regex"     0 "ex:replace"  0}
                                                         {"id"      "ex:string-fns"
                                                          "ex:text" "Abcdefg"}]})
-                        (fluree/stage {"@context" ["https://ns.flur.ee"
-                                                   test-utils/default-str-context
+                        (fluree/stage {"@context" [test-utils/default-str-context
                                                    {"ex" "http://example.com/"}]
                                        "where"    [{"id"      "?s"
                                                     "ex:text" "?text"}
@@ -388,8 +372,7 @@
     (testing "rdf term functions"
       (with-redefs [fluree.db.query.exec.eval/uuid    (fn [] {:value "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47" :datatype-iri "@id"})
                     fluree.db.query.exec.eval/struuid (fn [] {:value "34bdb25f-9fae-419b-9c50-203b5f306e47" :datatype-iri const/iri-string})]
-        (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                                          test-utils/default-str-context
+        (let [updated (-> @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                           {"ex" "http://example.com/"}]
                                               "insert"   [{"id"         "ex:create-predicates"
                                                            "ex:isBlank" 0 "ex:isNumeric"    0 "ex:str"        0 "ex:uuid" 0
@@ -404,8 +387,7 @@
                                                            "ex:number" 1
                                                            "ex:ref"    {"ex:bool" false}}
                                                           {"ex:foo" "bar"}]})
-                          (fluree/stage {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-str-context
+                          (fluree/stage {"@context" [test-utils/default-str-context
                                                      {"ex" "http://example.com/"}]
                                          "where"    [{"id"        "?s"
                                                       "ex:text"   "?text"
@@ -475,8 +457,7 @@
                                                                           "ex:struuid"]}}))))))
 
     (testing "functional forms"
-      (let [updated (-> @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                                        test-utils/default-str-context
+      (let [updated (-> @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                         {"ex" "http://example.com/"}]
                                             "insert"   [{"id"               "ex:create-predicates"
                                                          "ex:bound"         0
@@ -492,8 +473,7 @@
                                                          "ex:not-in"        0}
                                                         {"id"      "ex:functional-fns"
                                                          "ex:text" "Abcdefg"}]})
-                        (fluree/stage {"@context" ["https://ns.flur.ee"
-                                                   test-utils/default-str-context
+                        (fluree/stage {"@context" [test-utils/default-str-context
                                                    {"ex" "http://example.com/"}]
                                        "where"    [{"id" "?s", "ex:text" "?text"}
                                                    ["bind"
@@ -522,24 +502,21 @@
                                                                           "ex:in"
                                                                           "ex:not-in"]}})))))
     (testing "error handling"
-      (let [db2       @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                                      test-utils/default-str-context
+      (let [db2       @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                       {"ex" "http://example.com/"}]
                                           "insert"   [{"id"       "ex:create-predicates"
                                                        "ex:text"  0
                                                        "ex:error" 0}
                                                       {"id"      "ex:error"
                                                        "ex:text" "Abcdefg"}]})
-            parse-err @(fluree/stage db2 {"@context" ["https://ns.flur.ee"
-                                                      test-utils/default-str-context
+            parse-err @(fluree/stage db2 {"@context" [test-utils/default-str-context
                                                       {"ex" "http://example.com/"}]
                                           "where"    [{"id" "?s", "ex:text" "?text"}
                                                       ["bind" "?err" "(foo ?text)"]]
                                           "insert"   {"id" "?s", "ex:text" "?err"}
                                           "values"   ["?s" [{"@value" "ex:error" "@type" "@id"}]]})
 
-            run-err @(fluree/stage db2 {"@context" ["https://ns.flur.ee"
-                                                    test-utils/default-str-context
+            run-err @(fluree/stage db2 {"@context" [test-utils/default-str-context
                                                     {"ex" "http://example.com/"}]
                                         "where"    [{"id" "?s", "ex:text" "?text"}
                                                     ["bind" "?err" "(abs ?text)"]]
@@ -574,7 +551,7 @@
                    "schema" "http://schema.org/",
                    "xsd"    "http://www.w3.org/2001/XMLSchema#"}
         love      @(fluree/stage (fluree/db ledger)
-                                 {"@context" ["https://ns.flur.ee" context]
+                                 {"@context" context
                                   "insert"
                                   [{"@id"                "ex:fluree",
                                     "@type"              "schema:Organization",
@@ -601,8 +578,7 @@
             "returns all results")))
     (testing "after deletion"
       @(fluree/transact! conn
-                         {"@context" ["https://ns.flur.ee"
-                                      context
+                         {"@context" [context
                                       {:id "@id", :graph "@graph",
                                        :f  "https://ns.flur.ee/ledger#"}]
                           "ledger"   ledger-id
@@ -629,8 +605,7 @@
           db0         (fluree/db ledger)
           db1         @(fluree/stage
                          db0
-                         {"@context" ["https://ns.flur.ee"
-                                      test-utils/default-str-context]
+                         {"@context" test-utils/default-str-context
                           "ledger"   ledger-name
                           "insert"
                           [{"@id"                "ex:fluree"
@@ -644,8 +619,7 @@
                             "schema:description" "We ❤️ Human Blood"}]})
           db2         @(fluree/stage
                          db1
-                         {"@context" ["https://ns.flur.ee"
-                                      test-utils/default-str-context]
+                         {"@context" [test-utils/default-str-context]
                           "ledger"   ledger-name
                           "where"    {"@id"                "ex:mosquitos"
                                       "schema:description" "?o"}
@@ -666,8 +640,7 @@
           ledger @(fluree/create conn "update-without-insert")
           db0    (fluree/db ledger)
           db1    @(fluree/stage db0
-                                {"@context" ["https://ns.flur.ee"
-                                             test-utils/default-context
+                                {"@context" [test-utils/default-context
                                              {:ex "http://example.org/ns/"}]
                                  "insert"
                                  {:graph [{:id           :ex/rutherford
@@ -682,8 +655,7 @@
       (testing "on existing subjects"
         (let [db2 @(fluree/stage
                      db1
-                     {"@context" ["https://ns.flur.ee"
-                                  {:ex "http://example.org/ns/", :id "@id", :value "@value"}
+                     {"@context" [{:ex "http://example.org/ns/", :id "@id", :value "@value"}
                                   test-utils/default-context]
                       "where"    {:id "?s", :schema/name "?o"}
                       "delete"   {:id "?s", :schema/name "?o"}
@@ -709,8 +681,7 @@
       (testing "on nonexistent subjects"
         (let [db2 @(fluree/stage
                      db1
-                     {"@context" ["https://ns.flur.ee"
-                                  {:ex "http://example.org/ns/", :id "@id", :value "@value"}
+                     {"@context" [{:ex "http://example.org/ns/", :id "@id", :value "@value"}
                                   test-utils/default-context]
                       "where"    {:id "?s", :schema/name "?o"}
                       "delete"   {:id "?s", :schema/name "?o"}

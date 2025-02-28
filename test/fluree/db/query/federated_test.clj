@@ -16,7 +16,7 @@
                    "xsd"    "http://www.w3.org/2001/XMLSchema#"}
 
           authors @(fluree/create-with-txn conn
-                                           {"@context" ["https://ns.flur.ee" context "https://schema.org"]
+                                           {"@context" [context "https://schema.org"]
                                             "ledger"   "test/authors"
                                             "insert"   [{"@id"   "https://www.wikidata.org/wiki/Q42"
                                                          "@type" "Person"
@@ -25,7 +25,7 @@
                                                          "@type" "Person"
                                                          "name"  "Margaret Mitchell"}]})
           books   @(fluree/create-with-txn conn
-                                           {"@context" ["https://ns.flur.ee" context "https://schema.org"]
+                                           {"@context" [context "https://schema.org"]
                                             "ledger"   "test/books"
                                             "insert"   [{"id"     "https://www.wikidata.org/wiki/Q3107329",
                                                          "type"   ["Book"],
@@ -38,7 +38,7 @@
                                                          "isbn"   "0-582-41805-4",
                                                          "author" {"@id" "https://www.wikidata.org/wiki/Q173540"}}]})
           movies  @(fluree/create-with-txn conn
-                                           {"@context" ["https://ns.flur.ee" context "https://schema.org"]
+                                           {"@context" [context "https://schema.org"]
                                             "ledger"   "test/movies"
                                             "insert"   [{"id"                        "https://www.wikidata.org/wiki/Q836821",
                                                          "type"                      ["Movie"],
@@ -158,7 +158,7 @@
                         "xsd"    "http://www.w3.org/2001/XMLSchema#"}
 
           authors      @(fluree/create-with-txn conn-authors
-                                                {"@context" ["https://ns.flur.ee" context "https://schema.org"]
+                                                {"@context" [context "https://schema.org"]
                                                  "ledger"   "test/authors"
                                                  "insert"   [{"@id"   "https://www.wikidata.org/wiki/Q42"
                                                               "@type" "Person"
@@ -167,7 +167,7 @@
                                                               "@type" "Person"
                                                               "name"  "Margaret Mitchell"}]})
           books        @(fluree/create-with-txn conn-books
-                                                {"@context" ["https://ns.flur.ee" context "https://schema.org"]
+                                                {"@context" [context "https://schema.org"]
                                                  "ledger"   "test/books"
                                                  "insert"   [{"id"     "https://www.wikidata.org/wiki/Q3107329",
                                                               "type"   ["Book"],
@@ -180,7 +180,7 @@
                                                               "isbn"   "0-582-41805-4",
                                                               "author" {"@id" "https://www.wikidata.org/wiki/Q173540"}}]})
           movies       @(fluree/create-with-txn conn-movies
-                                                {"@context" ["https://ns.flur.ee" context "https://schema.org"]
+                                                {"@context" [context "https://schema.org"]
                                                  "ledger"   "test/movies"
                                                  "insert"   [{"id"                        "https://www.wikidata.org/wiki/Q836821",
                                                               "type"                      ["Movie"],

@@ -135,7 +135,7 @@
           context [test-utils/default-context {:ex "http://example.org/ns/"}]]
       (testing "define @list container in context"
         (let [db        @(fluree/stage (fluree/db movies)
-                                       {"@context" ["https://ns.flur.ee" context]
+                                       {"@context" context
                                         "insert"
                                         {:context {:id      "@id"
                                                    :ex/list {"@container" "@list"}}
@@ -149,7 +149,7 @@
               "Order of query result is different from transaction.")))
       (testing "define @list directly on subject"
         (let [db        @(fluree/stage (fluree/db movies)
-                                       {"@context" ["https://ns.flur.ee" context]
+                                       {"@context" context
                                         "insert"
                                         {:context {:id "@id"}
                                          :id      "list-test2"
@@ -167,7 +167,7 @@
         context [test-utils/default-context {:ex "http://example.org/ns/"}]
         db      @(fluree/stage
                    (fluree/db ledger)
-                   {"@context" ["https://ns.flur.ee" context]
+                   {"@context" context
                     "insert"
                     [{:id           :ex/brian,
                       :type         :ex/User,
@@ -351,8 +351,7 @@
           alias  "faux-compact-iri-query"
           ledger @(fluree/create conn alias)
           db0    @(fluree/stage (fluree/db ledger)
-                                {"@context" ["https://ns.flur.ee"
-                                             test-utils/default-str-context]
+                                {"@context" test-utils/default-str-context
                                  "insert"
                                  [{"id"      "foo"
                                    "ex:name" "Foo"}

@@ -9,8 +9,7 @@
           ledger         @(fluree/create conn "tx/retract")
           db             @(fluree/stage
                             (fluree/db ledger)
-                            {"@context" ["https://ns.flur.ee"]
-                             "insert"
+                            {"insert"
                              {:context [test-utils/default-context
                                         {:ex "http://example.org/ns/"}]
                               :graph   [{:id          :ex/alice,
@@ -28,8 +27,7 @@
           ;; retract Alice's age attribute
           db-age-retract @(fluree/stage
                             db
-                            {"@context" "https://ns.flur.ee"
-                             "delete"
+                            {"delete"
                              {:context    [test-utils/default-context
                                            {:ex "http://example.org/ns/"}]
                               :id         :ex/alice,

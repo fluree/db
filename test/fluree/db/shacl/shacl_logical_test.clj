@@ -13,7 +13,7 @@
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
                         (fluree/db ledger)
-                        {"@context" ["https://ns.flur.ee" context]
+                        {"@context" context
                          "insert"
                          {:id             :ex/UserShape
                           :type           [:sh/NodeShape]
@@ -32,7 +32,7 @@
       (testing "no violations"
         (let [db-ok      @(fluree/stage
                             db
-                            {"@context" ["https://ns.flur.ee" context]
+                            {"@context" context
                              "insert"
                              {:id              :ex/john,
                               :type            [:ex/User],
@@ -48,7 +48,7 @@
       (testing "not equal"
         (let [db-company-name @(fluree/stage
                                  db
-                                 {"@context" ["https://ns.flur.ee" context]
+                                 {"@context" context
                                   "insert"
                                   {:id                 :ex/john,
                                    :type               [:ex/User],
@@ -73,7 +73,7 @@
       (testing "conforms to minCount"
         (let [db-two-names @(fluree/stage
                               db
-                              {"@context" ["https://ns.flur.ee" context]
+                              {"@context" context
                                "insert"
                                {:id                 :ex/john,
                                 :type               [:ex/User],
@@ -98,7 +98,7 @@
       (testing "conforms to equals"
         (let [db-callsign-name @(fluree/stage
                                   db
-                                  {"@context" ["https://ns.flur.ee" context]
+                                  {"@context" context
                                    "insert"
                                    {:id              :ex/john
                                     :type            [:ex/User]
@@ -130,7 +130,7 @@
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
                         (fluree/db ledger)
-                        {"@context" ["https://ns.flur.ee" context]
+                        {"@context" context
                          "insert"
                          {:id             :ex/UserShape
                           :type           [:sh/NodeShape]
@@ -149,7 +149,7 @@
 
           db-two-probs @(fluree/stage
                           db
-                          {"@context" ["https://ns.flur.ee" context]
+                          {"@context" context
                            "insert"
                            {:id              :ex/john
                             :type            [:ex/User]
@@ -160,7 +160,7 @@
       (testing "no violations"
         (let [db-ok      @(fluree/stage
                             db
-                            {"@context" ["https://ns.flur.ee" context]
+                            {"@context" context
                              "insert"
                              {:id              :ex/john,
                               :type            [:ex/User],
@@ -180,7 +180,7 @@
       (testing "conforms to min and max"
         (let [db-too-old @(fluree/stage
                             db
-                            {"@context" ["https://ns.flur.ee" context]
+                            {"@context" context
                              "insert"
                              {:id                 :ex/john,
                               :type               [:ex/User],
@@ -214,7 +214,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
       (testing "conforms to max exclusive"
         (let [db-too-low @(fluree/stage
                             db
-                            {"@context" ["https://ns.flur.ee" context]
+                            {"@context" context
                              "insert"
                              {:id                 :ex/john,
                               :type               [:ex/User],
@@ -274,7 +274,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
                         (fluree/db ledger)
-                        {"@context" ["https://ns.flur.ee" context]
+                        {"@context" context
                          "insert"
                          {:id             :ex/UserShape
                           :type           [:sh/NodeShape]
@@ -291,7 +291,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
       (testing "no constraint violations"
         (let [db-ok @(fluree/stage
                        db
-                       {"@context" ["https://ns.flur.ee" context]
+                       {"@context" context
                         "insert"
                         {:id          :ex/jean-claude
                          :type        :ex/User,
@@ -307,7 +307,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
       (testing "name conforms"
         (let [db-name-too-short @(fluree/stage
                                    db
-                                   {"@context" ["https://ns.flur.ee" context]
+                                   {"@context" context
                                     "insert"
                                     {:id          :ex/john,
                                      :type        [:ex/User],
@@ -347,7 +347,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
       (testing "tag conforms"
         (let [db-tag-too-long @(fluree/stage
                                  db
-                                 {"@context" ["https://ns.flur.ee" context]
+                                 {"@context" context
                                   "insert"
                                   {:id     :ex/john,
                                    :type   [:ex/User],
@@ -387,7 +387,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
       (testing "greeting conforms"
         (let [db-greeting-incorrect @(fluree/stage
                                        db
-                                       {"@context" ["https://ns.flur.ee" context]
+                                       {"@context" context
                                         "insert"
                                         {:id          :ex/john,
                                          :type        [:ex/User],
@@ -428,7 +428,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 (deftest ^:integration shacl-and-tests
   (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "shacl-and")
-        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
         db1     @(fluree/stage db0 {"@context" context
                                     "insert"
@@ -476,7 +476,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 (deftest ^:integration shacl-or-tests
   (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "shacl-or")
-        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
         db1     @(fluree/stage db0 {"@context" context
                                     "insert"
@@ -523,7 +523,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 (deftest ^:integration shacl-xone-tests
   (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "shacl-or")
-        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
         db1     @(fluree/stage db0 {"@context" context
                                     "insert"

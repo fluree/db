@@ -9,8 +9,7 @@
           ledger @(fluree/create conn "query/compounda")
           db     @(fluree/stage
                     (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee"
-                                 test-utils/default-context
+                    {"@context" [test-utils/default-context
                                  {:ex "http://example.org/ns/"}]
                      "insert"
                      [{:id           :ex/brian,
