@@ -687,7 +687,8 @@
 (defn parse-analytical-query
   ([q] (parse-analytical-query q nil))
   ([q parent-context]
-   (let [context       (cond->> (context/extract q)
+   (let [orig-context  (context/extract-supplied-context q)
+         context       (cond->> (json-ld/parse-context orig-context)
                          parent-context (merge parent-context))
          [vars values] (parse-values (:values q) context)
          where         (parse-where q vars context)
@@ -698,6 +699,7 @@
          (assoc :context context
                 :where where)
          (cond-> (seq values) (assoc :values values)
+                 orig-context (assoc :orig-context orig-context)
                  grouping  (assoc :group-by grouping)
                  ordering  (assoc :order-by ordering)
                  construct (assoc :construct construct))
