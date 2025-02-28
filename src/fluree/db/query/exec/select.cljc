@@ -7,8 +7,7 @@
             [fluree.db.query.exec.eval :as-alias eval]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.select.subject :as subject]
-            [fluree.db.query.exec.project.fql :as project.fql]
-            [fluree.db.query.exec.project.sparql :as project.sparql]
+            [fluree.db.query.exec.select.display :as display]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]
@@ -16,63 +15,6 @@
             [fluree.db.util.json :as json]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn var-name
-  "Stringify and remove q-mark prefix of var for SPARQL JSON formatting."
-  [var]
-  (subs (name var) 1))
-
-(defn disaggregate
-  "For SPARQL JSON results, no nesting of data is permitted - the results must be
-  tabular. This function unpacks a single result into potentially multiple 'rows' of
-  results."
-  [result]
-  (let [aggregated (filter (fn [[k v]] (sequential? v)) result)]
-    (loop [[[agg-var agg-vals] & r] aggregated
-           results [result]]
-      (if agg-var
-        (let [results* (reduce (fn [results* result]
-                                 (into results* (map (fn [v] (assoc result agg-var v)) agg-vals)))
-                               []
-                               results)]
-          (recur r results*))
-        results))))
-
-(defmulti display
-  "Format a where-pattern match for presentation based on the match's datatype.
-  Return an async channel that will eventually contain the formatted match."
-  (fn [match output-format _compact]
-    (where/get-datatype-iri match)))
-
-(defmethod display :default
-  [match output-format _compact]
-  (if (= output-format :sparql)
-    (let [v  (where/get-value match)
-          dt (where/get-datatype-iri match)]
-      (cond-> {"value" (str v) "type" "literal"}
-        (and v (not= const/iri-string dt)) (assoc "datatype" dt)))
-    (where/get-value match)))
-
-(defmethod display const/iri-rdf-json
-  [match output-format _compact]
-  (if (= output-format :sparql)
-    {"value" (where/get-value match) "type" "literal" "datatype" const/iri-rdf-json}
-    (-> match where/get-value (json/parse false))))
-
-(defmethod display const/iri-id
-  [match output-format compact]
-  (if (= output-format :sparql)
-    (let [iri (where/get-iri match)]
-      (if (= \_ (first iri))
-        {"type" "bnode" "value" (subs iri 1)}
-        {"type" "uri" "value" iri}))
-    (some-> match where/get-iri compact)))
-
-(defmethod display const/iri-vector
-  [match output-format _compact]
-  (if (= output-format :sparql)
-    {"type" "literal" "value" (some-> match where/get-value vec str) "datatype" const/iri-vector}
-    (some-> match where/get-value vec)))
 
 (defprotocol ValueSelector
   :extend-via-metadata true
@@ -89,7 +31,7 @@
 (defn format-fql-variable-selector-value
   [var]
   (fn [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
-    (go (try* (-> solution (get var) (project.fql/display-fql compact))
+    (go (try* (-> solution (get var) (display/fql compact))
               (catch* e
                       (log/error e "Error formatting variable:" var)
                       (>! error-ch e))))))
@@ -97,8 +39,8 @@
 (defn format-sparql-variable-selector-value
   [var]
   (fn [_ _db _iri-cache _context output-format compact _fuel-tracker error-ch solution]
-    (go (try* {(project.sparql/var-name var)
-               (-> solution (get var) (project.sparql/display-sparql compact))}
+    (go (try* {(display/var-name var)
+               (-> solution (get var) (display/sparql compact))}
           (catch* e
                   (log/error e "Error formatting variable:" var)
                   (>! error-ch e))))))
@@ -125,7 +67,7 @@
       (loop [[var & vars] (sort (remove nil? (keys solution))) ; implicit grouping can introduce nil keys in solution
              result {}]
         (if var
-          (let [output (-> solution (get var) (project.fql/display-fql compact))]
+          (let [output (-> solution (get var) (display/fql compact))]
             (recur vars (assoc result var output)))
           result))
       (catch* e
@@ -139,8 +81,8 @@
       (loop [[var & vars] (sort (remove nil? (keys solution))) ; implicit grouping can introduce nil keys in solution
              result {}]
         (if var
-          (let [output (-> solution (get var) (project.sparql/display-sparql compact))]
-            (recur vars (assoc result (project.sparql/var-name var) output)))
+          (let [output (-> solution (get var) (display/sparql compact))]
+            (recur vars (assoc result (display/var-name var) output)))
           result))
       (catch* e
               (log/error e "Error formatting wildcard")
@@ -179,13 +121,13 @@
 (defn format-fql-as-selector-value
   [bind-var]
   (fn [_ _ _ _ _ compact _ _ solution]
-    (go (-> solution (get bind-var) (project.fql/display-fql compact)))))
+    (go (-> solution (get bind-var) (display/fql compact)))))
 
 (defn format-sparql-as-selector-value
   [bind-var]
   (fn [_ _ _ _ _ compact _ _ solution]
-    (go (let [output (-> solution (get bind-var) (project.sparql/display-sparql compact))]
-          {(project.sparql/var-name bind-var) output}))))
+    (go (let [output (-> solution (get bind-var) (display/sparql compact))]
+          {(display/var-name bind-var) output}))))
 
 (defrecord AsSelector [as-fn bind-var aggregate?]
   SolutionModifier
@@ -277,7 +219,7 @@
                                 (:select-distinct q))
         iri-cache           (volatile! {})
         format-xf           (some->> [(when (contains? q :select-distinct) (distinct))
-                                      (when (= output-format :sparql) (mapcat disaggregate))]
+                                      (when (= output-format :sparql) (mapcat display/disaggregate))]
                                      (remove nil?)
                                      (not-empty)
                                      (apply comp))
