@@ -116,6 +116,28 @@
   [subj selection depth spec]
   (->SubgraphSelector subj selection depth spec))
 
+(defrecord ConstructSelector [patterns]
+  ValueSelector
+  (format-value [_ _ _ _ compact _ _ solution]
+    (go
+      (let [[s p o] (where/assign-matched-values (first patterns) solution)]
+        [{"@id" (where/get-iri s)
+          (where/get-iri p)
+          (if-let [iri (where/get-iri o)]
+            {"@id" iri}
+            (let [v      (where/get-value o)
+                  dt-iri (where/get-datatype-iri o)
+                  lang   (where/get-lang o)]
+              (if (datatype/inferable-iri? dt-iri)
+                v
+                (cond-> {"@value" o}
+                  lang       (assoc "@language" lang)
+                  (not lang) (assoc "@type" dt-iri)))))}]))))
+
+(defn construct-selector
+  [patterns]
+  (->ConstructSelector patterns))
+
 (defn modify
   "Apply any modifying selectors to each solution in `solution-ch`."
   [q solution-ch]
@@ -159,11 +181,13 @@
                                 (:context q))
         compact             (json-ld/compact-fn context)
         output-format       (:output (:opts q))
-        selectors           (or (:select q)
+        selectors           (or (:construct q)
+                                (:select q)
                                 (:select-one q)
                                 (:select-distinct q))
         iri-cache           (volatile! {})
         format-xf           (some->> [(when (contains? q :select-distinct) (distinct))
+                                      (when (contains? q :construct) cat)
                                       (when (= output-format :sparql) (mapcat select.sparql/disaggregate))]
                                      (remove nil?)
                                      (not-empty)

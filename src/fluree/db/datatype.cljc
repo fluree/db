@@ -69,6 +69,12 @@
     const/$xsd:integer
     const/$xsd:double})
 
+(def JSON-LD-inferable-iris
+  #{const/iri-string
+    const/iri-xsd-boolean
+    const/iri-xsd-integer
+    const/iri-xsd-double})
+
 (defn inferable?
   "Returns true if the provided data type is one that can be inferred from the value.
   Note this is for JSON-LD inferable types only:
@@ -76,6 +82,10 @@
   Includes: xsd:string, xsd:boolean, xsd:integer, xsd:double "
   [dt]
   (contains? JSON-LD-inferable-types dt))
+
+(defn inferable-iri?
+  [dt-iri]
+  (contains? JSON-LD-inferable-iris dt-iri))
 
 (def iso8601-offset-pattern
   "(Z|(?:[+-][0-9]{2}:[0-9]{2}))?")

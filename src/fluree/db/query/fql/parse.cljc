@@ -533,7 +533,8 @@
   (when-let [construct (:construct q)]
     (-> construct
         syntax/coerce-where
-        (parse-where-clause nil context))))
+        (parse-where-clause nil context)
+        select/construct-selector)))
 
 (defn parse-select-as-fn
   [f context output]
