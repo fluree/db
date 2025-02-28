@@ -51,7 +51,7 @@
                         {:root root
                          :path dir
                          :data data})))
-      (let [hash     (crypto/sha2-256 data :hex)
+      (let [hash     (crypto/sha2-256 data :base32)
             filename (str hash ".json")
             path     (str/join "/" [dir filename])
             absolute (full-path root path)

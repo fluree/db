@@ -448,19 +448,27 @@
   [(assoc commit-map :address commit-address)
    (assoc commit-jsonld "address" commit-address)])
 
+(defn update-commit-id
+  "Once a commit address is known, which might be after the commit is written
+  if IPFS, add the final address into the commit map."
+  [[commit-map commit-jsonld] commit-hash]
+  (let [commit-id (commit-data/hash->commit-id commit-hash)]
+    [(assoc commit-map :id commit-id)
+     (assoc commit-jsonld "@id" commit-id)]))
+
 (defn write-commit
   [commit-storage alias {:keys [did private]} commit]
   (go-try
-    (let [[_ commit-jsonld :as commit-pair]
-          (commit-data/commit->jsonld commit)
+    (let [commit-jsonld (commit-data/->json-ld commit)
 
           signed-commit (if did
                           (<? (credential/generate commit-jsonld private (:id did)))
                           commit-jsonld)
           commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
 
-          [commit* commit-jsonld*]
-          (update-commit-address commit-pair (:address commit-res))]
+          [commit* commit-jsonld*] (-> [commit commit-jsonld]
+                                       (update-commit-id (:hash commit-res))
+                                       (update-commit-address (:address commit-res)))]
       {:commit-map    commit*
        :commit-jsonld commit-jsonld*
        :write-result  commit-res})))
@@ -538,7 +546,7 @@
            :or   {time (util/current-time-iso)}}
           (parse-commit-opts ledger opts)
 
-          {:keys [dbid db-jsonld staged-txns]}
+          {:keys [db-jsonld staged-txns]}
           (flake-db/db->jsonld staged-db commit-data-opts)
 
           ;; TODO - we do not support multiple "transactions" in a single
@@ -548,6 +556,7 @@
 
           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
+          dbid              (commit-data/hash->db-id (:hash data-write-result))
           keypair           {:did did, :private private}
 
           new-commit (commit-data/new-db-commit-map {:old-commit commit

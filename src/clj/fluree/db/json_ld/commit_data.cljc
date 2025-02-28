@@ -244,29 +244,27 @@
   [commit commit-id]
   (assoc commit :id commit-id))
 
+(defn hash->commit-id
+  [hsh]
+  (str "fluree:commit:sha256:b" hsh))
+
 (defn commit-json->commit-id
   [jld]
-  (let [b32-hash (-> jld
-                     json/stringify-UTF8
-                     (crypto/sha2-256 :base32))]
-    (str "fluree:commit:sha256:b" b32-hash)))
+  (-> jld
+      json/stringify-UTF8
+      (crypto/sha2-256 :base32)
+      hash->commit-id))
+
+(defn hash->db-id
+  [hsh]
+  (str "fluree:db:sha256:b" hsh))
 
 (defn db-json->db-id
   [payload]
-  (let [hsh (-> payload
-                json/stringify-UTF8
-                (crypto/sha2-256 :base32))]
-    (str "fluree:db:sha256:b" hsh)))
-
-(defn commit->jsonld
-  "Generates JSON-LD commit map, and hash to include the @id value.
-  Return a two-tuple of the updated commit map and the final json-ld document"
-  [commit]
-  (let [jld         (->json-ld commit)
-        commit-id   (commit-json->commit-id jld)
-        commit-map* (update-commit-id commit commit-id)
-        jld*        (assoc jld "id" commit-id)]
-    [commit-map* jld*]))
+  (-> payload
+      json/stringify-UTF8
+      (crypto/sha2-256 :base32)
+      hash->db-id))
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
@@ -370,7 +368,8 @@
         commit      (-> old-commit
                         (dissoc :id :address :data :issuer :time :message :tag
                                 :prev-commit)
-                        (assoc :address ""
+                        (assoc :id ""
+                               :address ""
                                :v commit-version
                                :data data-commit
                                :time time))]
