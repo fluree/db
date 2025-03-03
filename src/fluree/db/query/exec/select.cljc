@@ -119,21 +119,10 @@
 (defrecord ConstructSelector [patterns]
   ValueSelector
   (format-value [_ _ _ _ compact _ _ solution]
-    (go
-      (let [[s p o] (where/assign-matched-values (first patterns) solution)]
-        [{"@id" (compact (where/get-iri s))
-
-          (compact (where/get-iri p))
-          (if-let [iri (where/get-iri o)]
-            {"@id" (compact iri)}
-            (let [v (where/get-value o)
-                  dt-iri (where/get-datatype-iri o)
-                  lang (where/get-lang o)]
-              (if (datatype/inferable-iri? dt-iri)
-                v
-                (cond-> {"@value" o}
-                  lang (assoc "@language" lang)
-                  (not lang) (assoc "@type" (compact dt-iri))))))}]))))
+    (go (->> (mapv #(where/assign-matched-values % solution) patterns)
+             ;; partition by s-match
+             (partition-by first)
+             (mapv (partial display/json-ld-node compact))))))
 
 (defn construct-selector
   [patterns]
