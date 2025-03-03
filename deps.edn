@@ -46,7 +46,7 @@
         com.cognitect.aws/endpoints {:mvn/version "1.1.12.718"}
         com.cognitect.aws/s3        {:mvn/version "868.2.1580.0"}}
 
- :paths ["src/clj" "resources" "target/classes"]
+ :paths ["src" "resources" "target/classes"]
 
  :aliases
  {:build
@@ -107,7 +107,7 @@
   :eastwood
   {:extra-deps {jonase/eastwood {:mvn/version "1.4.3"}}
    :main-opts  ["-m" "eastwood.lint"
-                {:source-paths    ["src/clj" "src-docs"]
+                {:source-paths    ["src" "src-docs"]
                  :test-paths      ["test"]
                  ;; TODO: Un-exclude this when it stops triggering false
                  ;;       positives on "UnsupportedOperationException empty is
