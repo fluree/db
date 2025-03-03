@@ -1,5 +1,6 @@
 (ns fluree.db.query.exec.select.display
   (:require [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.json :as json]))
 
@@ -63,3 +64,23 @@
                                results)]
           (recur r results*))
         results))))
+
+(defn json-ld-object
+  [o-match compact]
+  (if-let [iri (where/get-iri o-match)]
+    {(compact const/iri-id) (compact iri)}
+    (let [v      (where/get-value o-match)
+          dt-iri (where/get-datatype-iri o-match)
+          lang   (where/get-lang o-match)]
+      (if (datatype/inferable-iri? dt-iri)
+        v
+        (cond-> {(compact const/iri-value) o-match}
+          lang       (assoc (compact const/iri-language) lang)
+          (not lang) (assoc (compact const/iri-type) (compact dt-iri)))))))
+
+(defn json-ld-node
+  [compact s-matches]
+  (reduce (fn [node [_ p o]]
+            (assoc node (compact (where/get-iri p)) (json-ld-object o compact)))
+          {(compact const/iri-id) (compact (-> s-matches ffirst where/get-iri))}
+          s-matches))
