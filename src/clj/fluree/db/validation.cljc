@@ -20,6 +20,11 @@
   (and (or (string? x) (symbol? x) (keyword? x))
        (-> x name first (= \?))))
 
+(defn bnode-variable?
+  [x]
+  (and (or (string? x) (symbol? x) (keyword? x))
+       (-> x name first (= \_))))
+
 (def value? (complement sequential?))
 
 (defn iri-key?
