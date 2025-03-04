@@ -116,17 +116,18 @@
   [subj selection depth spec]
   (->SubgraphSelector subj selection depth spec))
 
-(defrecord ConstructSelector [patterns]
+(defrecord ConstructSelector [patterns bnodes]
   ValueSelector
   (format-value [_ _ _ _ compact _ _ solution]
-    (go (->> (mapv #(where/assign-matched-values % solution) patterns)
-             ;; partition by s-match
-             (partition-by first)
-             (mapv (partial display/json-ld-node compact))))))
+    (let [bnodes (swap! bnodes inc)]
+      (go (->> (mapv #(where/assign-matched-values % solution) patterns)
+               ;; partition by s-match
+               (partition-by first)
+               (mapv (partial display/json-ld-node compact bnodes)))))))
 
 (defn construct-selector
   [patterns]
-  (->ConstructSelector patterns))
+  (->ConstructSelector patterns (atom 0)))
 
 (defn modify
   "Apply any modifying selectors to each solution in `solution-ch`."

@@ -22,7 +22,8 @@
   "Returns x as a symbol if x is a valid variable, or nil otherwise. A valid
   variable is a string, symbol, or keyword whose name starts with '?'."
   [x]
-  (when (v/variable? x)
+  (when (or (v/variable? x)
+            (v/bnode-variable? x))
     (symbol x)))
 
 (defn parse-variable
@@ -360,7 +361,8 @@
 
 (defn parse-subject
   [id context]
-  (if (v/variable? id)
+  (if (or (v/variable? id)
+          (v/bnode-variable? id))
     (parse-variable id)
     (parse-subject-iri id context)))
 
@@ -404,7 +406,8 @@
 (defn parse-statement*
   [s-mch p-mch o vars context]
   (cond
-    (v/variable? o)
+    (or (v/variable? o)
+        (v/bnode-variable? o))
     (let [o-mch (parse-variable o)]
       [(flip-reverse-pattern [s-mch p-mch o-mch])])
 
