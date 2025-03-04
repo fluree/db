@@ -268,6 +268,10 @@
    (cond-> (->predicate iri)
      reverse (assoc ::reverse true))))
 
+(defn get-reverse
+  [mch]
+  (::reverse mch))
+
 (defn ->where-clause
   "Build a pattern that matches all the patterns in the supplied `patterns`
   collection."

@@ -337,6 +337,10 @@
   [[_ iri]]
   (subs iri 1 (-> iri count dec)))
 
+(defmethod parse-term :BLANK_NODE_LABEL
+  [[_ & bnode-chars]]
+  (str/join bnode-chars))
+
 (defmethod parse-rule :PrefixDecl
   ;; PrefixDecl ::= <'PREFIX'> WS PNAME_NS WS IRIREF
   ;; [:PrefixDecl "e" "x" ":" [:IRIREF "<http://example.com/>"]]
@@ -395,6 +399,31 @@
               (= "*" term)
               (recur nil term))
         [[select-key result]]))))
+
+(defmethod parse-term :PropertyListNotEmpty
+  ;; PropertyListNotEmpty ::= Verb ObjectList ( <';'>  WS ( Verb ObjectList )? )*
+  ;; <Verb> ::= VarOrIri | Type
+  [[_ & properties]]
+  (->> (partition-all 2 properties)
+       (mapcat (fn [[p os]] (let [p (parse-term p)] (map #(vector p %) (parse-term os)))))))
+
+(defmethod parse-term :TriplesSameSubject
+  ;; TriplesSameSubject ::= VarOrTerm PropertyListNotEmpty | TriplesNode PropertyList
+  [[_ subject properties]]
+  (let [s (parse-term subject)]
+    (mapv (fn [[p o]] {"@id" s p o}) (parse-term properties))))
+
+(defmethod parse-rule :ConstructTemplate
+  ;; ConstructTemplate   ::=   <'{'> WS ConstructTriples? WS <'}'> WS
+  ;; <ConstructTriples>    ::=   TriplesSameSubject ( WS <'.'> WS ConstructTriples? )?
+  [[_ & construct-triples]]
+  [[:construct (vec (mapcat parse-term construct-triples))]])
+
+(defmethod parse-rule :ConstructWhereTemplate
+  ;; ConstructWhereTemplate ::= <'{'> WS TriplesTemplate? <'}'>
+  [[_ & construct-triples]]
+  (let [triples (vec (mapcat parse-term construct-triples))]
+    [[:construct triples] [:where triples]]))
 
 (defmethod parse-term :DefaultGraphClause
   ;; DefaultGraphClause ::= SourceSelector
@@ -695,7 +724,7 @@
   [[:limit (read-string limit)]])
 
 (defmethod parse-term :ExplicitOrderCondition
-  ;; ExplicitOrderCondition ::= ( 'ASC' | 'DESC' ) WS BrackettedExpression
+  ;; ExplicitOrderCondition ::= ( 'ASC' | 'DESC' | 'asc' | 'desc' ) WS BrackettedExpression
   [[_ order expr]]
   (list (str/lower-case order) (parse-term expr)))
 
@@ -744,6 +773,20 @@
   (reduce (fn [entries rule] (into entries (parse-rule rule)))
           []
           select-query))
+
+(defmethod parse-rule :ConstructWhereQuery
+  ;; ConstructWhereQuery ::= DatasetClause <'WHERE'> WS ConstructWhereTemplate SolutionModifier
+  [[_ & construct-query]]
+  (reduce (fn [entries rule] (into entries (parse-rule rule)))
+          []
+          construct-query))
+
+(defmethod parse-rule :ConstructQuery
+  ;; ConstructQuery   ::= WS <'CONSTRUCT'> WS ( ConstructTemplate DatasetClause WhereClause SolutionModifier | ConstructWhereQuery )
+  [[_ & construct-query]]
+  (reduce (fn [entries rule] (into entries (parse-rule rule)))
+          []
+          construct-query))
 
 (defmethod parse-rule :PrettyPrint
   [_]
