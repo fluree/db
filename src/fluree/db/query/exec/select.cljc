@@ -229,9 +229,13 @@
            (:aggregate? selector))))
 
 (defn wrap-construct
-  [{:keys [orig-context]} results]
-  (cond-> {"@graph" results}
-    orig-context (assoc "@context" orig-context)))
+  [{:keys [orig-context context]} results]
+  (let [id-key (json-ld/compact const/iri-id context)]
+    (cond-> {"@graph" (->> results
+                           (sort-by #(get % id-key))
+                           (partition-by #(get % id-key))
+                           (mapv display/nest-multicardinal-values))}
+      orig-context (assoc "@context" orig-context))))
 
 (defn wrap-sparql
   [results]
