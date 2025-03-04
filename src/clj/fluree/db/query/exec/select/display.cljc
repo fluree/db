@@ -70,6 +70,7 @@
   [compact bnodes o-match]
   [(if (where/unmatched? o-match)
      (let [var (where/get-variable o-match)]
+       ;; unbound non-bnode variable is an optional match.
        (when (v/bnode-variable? var)
          {(compact const/iri-id) (str var bnodes)}))
      (if-let [iri (where/get-iri o-match)]
@@ -90,6 +91,7 @@
     (let [var (where/get-variable s-match)]
       (if (v/bnode-variable? var)
         {(compact const/iri-id) (str var bnodes)}
+        ;; unbound non-bnode variable is an optional match.
         {(compact const/iri-id) nil}))))
 
 (defn json-ld-node
@@ -107,4 +109,3 @@
                        (into %1 %2)
                        %2)
          nodes))
-
