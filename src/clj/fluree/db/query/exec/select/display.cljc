@@ -72,11 +72,11 @@
     (let [v      (where/get-value o-match)
           dt-iri (where/get-datatype-iri o-match)
           lang   (where/get-lang o-match)]
-      (if (datatype/inferable-iri? dt-iri)
-        v
-        (cond-> {(compact const/iri-value) o-match}
-          lang       (assoc (compact const/iri-language) lang)
-          (not lang) (assoc (compact const/iri-type) (compact dt-iri)))))))
+      [(if (datatype/inferable-iri? dt-iri)
+         v
+         (cond-> {(compact const/iri-value) o-match}
+           lang       (assoc (compact const/iri-language) lang)
+           (not lang) (assoc (compact const/iri-type) (compact dt-iri))))])))
 
 (defn json-ld-node
   [compact s-matches]
@@ -84,3 +84,13 @@
             (assoc node (compact (where/get-iri p)) (json-ld-object o compact)))
           {(compact const/iri-id) (compact (-> s-matches ffirst where/get-iri))}
           s-matches))
+
+(defn nest-multicardinal-values
+  "Aggregate unique values for the same predicate into a vector."
+  [nodes]
+  (apply merge-with #(if (and (sequential? %1)
+                              (not= %1 %2))
+                       (into %1 %2)
+                       %2)
+         nodes))
+
