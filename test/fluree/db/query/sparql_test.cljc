@@ -793,7 +793,13 @@
                      {"id"              "ex:fbueller"
                       "type"            "ex:Person"
                       "person:handle"   "dankeshön"
-                      "person:fullName" "Ferris Bueller"}]]
+                      "person:fullName" "Ferris Bueller"}
+                     {"@id"              "ex:alice"
+                      "foaf:givenname"   "Alice"
+                      "foaf:family_name" "Hacker"}
+                     {"@id" "ex:bob"
+                      "foaf:firstname" "Bob"
+                      "foaf:surname" "Hacker"}]]
     #?(#_#_:cljs
        (async done
          (go
@@ -1639,6 +1645,60 @@
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
+         (testing "CONSTRUCT query works"
+           (testing "CONSTRUCT"
+             (let [query "PREFIX foaf:    <http://xmlns.com/foaf/0.1/>
+                        PREFIX vcard:   <http://www.w3.org/2001/vcard-rdf/3.0#>
+                        CONSTRUCT { ?x vcard:givenName ?gname .
+                                    ?x vcard:familyName ?fname }
+                        WHERE
+                        {
+                          { ?x foaf:firstname ?gname } UNION  { ?x foaf:givenname   ?gname } .
+                          { ?x foaf:surname   ?fname } UNION  { ?x foaf:family_name ?fname } .
+                        }"]
+               (is (= {"@context" {"foaf" "http://xmlns.com/foaf/0.1/",
+                                   "vcard" "http://www.w3.org/2001/vcard-rdf/3.0#"}
+                       "@graph"
+                       [{"@id" "ex:alice",
+                         "vcard:givenName" ["Alice"],
+                         "vcard:familyName" ["Hacker"]}
+                        {"@id" "ex:bob",
+                         "vcard:givenName" ["Bob"],
+                         "vcard:familyName" ["Hacker"]}]}
+                      @(fluree/query db query {:format :sparql})))))
+           (testing "CONSTRUCT WHERE"
+             (let [query "PREFIX foaf:    <http://xmlns.com/foaf/0.1/>
+                        PREFIX vcard:   <http://www.w3.org/2001/vcard-rdf/3.0#>
+                        CONSTRUCT WHERE { ?x foaf:firstname ?fname }"]
+               (is (= {"@context" {"foaf" "http://xmlns.com/foaf/0.1/",
+                                   "vcard" "http://www.w3.org/2001/vcard-rdf/3.0#"}
+                       "@graph" [{"@id" "ex:bob", "foaf:firstname" ["Bob"]}]}
+                      @(fluree/query db query {:format :sparql})))))
+           ;; non-deterministic output
+           #_(testing "CONSTRUCT with blank nodes"
+               (let [query "PREFIX foaf:    <http://xmlns.com/foaf/0.1/>
+                        PREFIX vcard:   <http://www.w3.org/2001/vcard-rdf/3.0#>
+                        CONSTRUCT { ?x  vcard:N _:v .
+                                    _:v vcard:givenName ?gname .
+                                    _:v vcard:familyName ?fname }
+                        WHERE
+                        {
+                          { ?x foaf:firstname ?gname } UNION  { ?x foaf:givenname   ?gname } .
+                          { ?x foaf:surname   ?fname } UNION  { ?x foaf:family_name ?fname } .
+                        }"]
+                 (is (= {"@context" {"foaf" "http://xmlns.com/foaf/0.1/",
+                                     "vcard" "http://www.w3.org/2001/vcard-rdf/3.0#"}
+                         "@graph"
+                         [{"@id" "_:v1",
+                           "vcard:givenName" ["Bob"],
+                           "vcard:familyName" ["Hacker"]}
+                          {"@id" "_:v2",
+                           "vcard:givenName" ["Alice"],
+                           "vcard:familyName" ["Hacker"]}
+                          {"@id" "ex:alice", "vcard:N" [{"@id" "_:v2"}]}
+                          {"@id" "ex:bob", "vcard:N" [{"@id" "_:v1"}]}]}
+                        @(fluree/query db query {:format :sparql}))))))
+
          (testing "ORDER BY ASC query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?handle
