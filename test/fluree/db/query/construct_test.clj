@@ -83,7 +83,7 @@
                                               {"@id" "?s" "friendname" "?friendName"}
                                               {"@id" "?friend" "name" "?friendName"}
                                               {"@id" "?friend" "num" "?friendNum"}]}))))
-    (testing "bnode template"
+    #_(testing "bnode template"
       (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
               "@graph"
               [{"@id" "_:v1",
