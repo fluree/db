@@ -5,15 +5,9 @@
             [fluree.db.util.core :as util]
             [fluree.db.json-ld.iri :as iri]
             #?(:clj [clojure.pprint :as pprint]))
-  #?(:clj (:import (fluree.db SID)))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-;; maximum number of subject indexes within a given collection. 44 bits - 17,592,186,044,415
-;; javascript, 44 bits - 1
-(def ^:const MAX-COLL-SUBJECTS #?(:clj  2r11111111111111111111111111111111111111111111
-                                  :cljs (- 2r11111111111111111111111111111111111111111111 1)))
 
 (declare equiv-flake assoc-flake get-flake-val nth-flake)
 
@@ -300,10 +294,9 @@
     0))
 
 (defn cmp-sid
-  [^SID sid1 ^SID sid2]
+  [sid1 sid2]
   (if (and sid1 sid2)
-    #?(:clj (SID/compare sid1 sid2)
-       :cljs (compare sid1 sid2))
+    (compare sid1 sid2)
     0))
 
 (defn cmp-subj
@@ -494,6 +487,12 @@
   [ss]
   (->> ss rseq first))
 
+(def ^:const flake-size-base (+ 30 ;;sid
+                                30 ;;pid
+                                30 ;;dt size
+                                8 ;; t size
+                                ))
+
 (defn size-flake
   "Base size of a flake is 38 bytes... then add size for 'o' and 'm'.
   Flakes have the following:
@@ -508,15 +507,11 @@
   it should be 'close enough'
   reference: https://www.javamex.com/tutorials/memory/string_memory_usage.shtml"
   [^Flake f]
-  (let [s-size  (-> f s iri/measure-sid)
-        p-size  (-> f p iri/measure-sid)
-        o       (o f)
-        dt      (dt f)
-        dt-size (iri/measure-sid dt)
+  (let [o       (o f)
         o-size  (#?@(:clj (util/case+)
-                     :cljs (condp =)) dt
+                     :cljs (condp =)) (dt f)
                   const/$xsd:string (* 2 (count o))
-                  const/$id (iri/measure-sid o)
+                  const/$id 30
                   const/$xsd:boolean 1
                   const/$xsd:long 8
                   const/$xsd:int 4
@@ -529,9 +524,8 @@
                     8
                     (if (string? o)
                       (* 2 (count o))
-                      (* 2 (count (pr-str o))))))
-        t-size 8]
-    (cond-> (+ s-size p-size o-size dt-size t-size)
+                      (* 2 (count (pr-str o))))))]
+    (cond-> (+ flake-size-base o-size )
             (m f) (* 2 (count (pr-str (m f)))))))
 
 

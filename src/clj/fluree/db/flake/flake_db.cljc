@@ -36,7 +36,8 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serde-json]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -463,10 +464,10 @@
   [commit-storage indexed-db index-t commit-jsonld]
   (go-try
     (loop [[commit-tuple & r] (<? (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t)))
-           db indexed-db]
+           db                 indexed-db]
       (if commit-tuple
         (let [[commit-jsonld _commit-proof commit-data-jsonld] commit-tuple
-              new-db (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld))]
+              new-db                                           (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld))]
           (recur r new-db))
         db))))
 
@@ -492,7 +493,7 @@
                             3)] ;; default of 3 maximum old indexes not garbage collected
     (when-not (and (int? max-old-indexes)
                    (>= max-old-indexes 0))
-      (throw (ex-info (str "Invalid max-old-indexes value. Must be a non-negative integer.")
+      (throw (ex-info "Invalid max-old-indexes value. Must be a non-negative integer."
                       {:status 400, :error :db/invalid-config})))
     (assoc root-map :reindex-min-bytes reindex-min-bytes
                     :reindex-max-bytes reindex-max-bytes

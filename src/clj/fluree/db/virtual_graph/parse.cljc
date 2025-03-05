@@ -4,7 +4,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
-            #?(:cljs fluree.db.query.exec.select :refer [SubgraphSelector])
+            #?(:cljs [fluree.db.query.exec.select :refer [SubgraphSelector]])
             [fluree.db.query.fql.parse :as q-parse])
   #?(:clj (:import (fluree.db.query.exec.select SubgraphSelector))))
 

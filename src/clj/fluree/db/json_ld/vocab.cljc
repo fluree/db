@@ -323,28 +323,11 @@
   (let [pred (build-pred-map [initial-type-map initial-class-map])]
     {:t          0
      :pred       pred
-     :shapes     (atom {:class {} ; TODO: Does this need to be an atom?
-                        :pred  {}})
+     :shapes     (atom {})
      :subclasses (delay {})}))
 
-(defn modified-shape?
-  [s-flakes]
-  (some (fn [[_ p o :as _f]]
-          (or
-            ;; modified a subject with a shape type
-            (and (= p const/$rdf:type)
-                 (or (= o const/sh_NodeShape)
-                     (= o const/sh_PropertyShape)))
-            ;; most property shapes don't have a type, but do need a path
-            (= p const/sh_path)))
-        s-flakes))
 
-(defn invalidate-shape-cache!
-  "Invalidates the shape cache if _any_ shape is modified."
-  [db subject-mods]
-  (when (some modified-shape? (vals subject-mods))
-    (reset! (-> db :schema :shapes) {})))
-
+;; TODO - do we need this any longer?
 (defn infer-predicate-ids
   [f]
   (let [[s p o] ((juxt flake/s flake/p flake/o) f)]
@@ -394,18 +377,15 @@
 (defn hydrate-schema
   "Updates the :schema key of db by processing just the vocabulary flakes out of
   the new flakes."
-  ([db new-flakes]
-   (hydrate-schema db new-flakes {}))
-  ([db new-flakes mods]
-   (let [pred-sids      (collect-predicate-ids db new-flakes)
-         vocab-flakes   (into #{}
-                              (filter (fn [f]
-                                        (or (contains? pred-sids (flake/s f))
-                                            (contains? predicate-refs (flake/p f)))))
-                              new-flakes)
-         schema         (update-schema db pred-sids vocab-flakes)]
-     (invalidate-shape-cache! db mods)
-     (assoc db :schema schema))))
+  [db new-flakes]
+  (let [pred-sids      (collect-predicate-ids db new-flakes)
+        vocab-flakes   (into #{}
+                             (filter (fn [f]
+                                       (or (contains? pred-sids (flake/s f))
+                                           (contains? predicate-refs (flake/p f)))))
+                             new-flakes)
+        schema         (update-schema db pred-sids vocab-flakes)]
+    (assoc db :schema schema)))
 
 (defn load-schema
   [{:keys [t] :as db} preds]
@@ -503,10 +483,10 @@
           (recur r acc*))))))
 
 (defn deserialize-preds
-  [namespace-codes pred-tuples]
-  (let [pred-keys      (mapv keyword (get pred-tuples "keys"))
-        pred-positions (map-indexed vector pred-keys)
-        pred-vals      (get pred-tuples "vals")
+  [namespace-codes serialized-pred-map]
+  (let [{pred-keys :keys
+         pred-vals :vals} serialized-pred-map
+        pred-positions (map-indexed #(vector %1 (keyword %2)) pred-keys)
         pred-maps      (map
                         (partial deserialize-pred-tuple namespace-codes pred-positions)
                         pred-vals)]
@@ -520,10 +500,9 @@
 (defn deserialize-schema
   "Deserializes the schema map from a semi-compact json."
   [serialized-schema namespace-codes]
-  (let [{pred-tuples "pred"
-         t           "t"} serialized-schema
-        pred (deserialize-preds namespace-codes pred-tuples)]
+  (let [{:keys [pred t]} serialized-schema
+        pred* (deserialize-preds namespace-codes pred)]
     (-> (base-schema)
         (assoc :t t
-               :pred pred)
+               :pred pred*)
         (refresh-subclasses))))

@@ -25,6 +25,12 @@
   "Accepts a rule and returns a sequence of entry tuples [[k v]...]."
   (fn [[tag & _]] tag))
 
+(defmethod parse-term :BooleanLiteral
+  [[_ bool]]
+  (case bool
+    "false" false
+    "true" true))
+
 (defmethod parse-term :Var
   ;; Var ::= VAR1 WS | VAR2 WS
   ;; [:Var "n" "u" "m" "s"]

@@ -5,8 +5,8 @@
             [fluree.db.method.ipfs :as ipfs]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
-            [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -65,7 +65,8 @@
 
   nameservice/iNameService
   (lookup [_ ledger-alias]
-    (lookup-address ipfs-endpoint ipns-key ledger-alias))
+    (when-let [address (lookup-address ipfs-endpoint ipns-key ledger-alias)]
+      (ipfs/read ipfs-endpoint address)))
   (alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
       alias)))
