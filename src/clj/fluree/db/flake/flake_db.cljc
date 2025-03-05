@@ -689,4 +689,4 @@
                       (:size stats)   (assoc (compact const/iri-size) (:size stats))
                       true            (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
     {:db-jsonld   db-json
-     :staged-txns staged}))
+     :staged-txn  staged}))
