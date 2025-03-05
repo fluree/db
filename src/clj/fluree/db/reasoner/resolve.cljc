@@ -68,8 +68,8 @@
                                 json-ld/parse-context)
         where           (get rule "where")
         insert          (get rule "insert")
-        rule-parsed     (q-parse/parse-txn {const/iri-where  [{:value where}]
-                                            const/iri-insert [{:value insert}]} context)
+        rule-parsed     (q-parse/parse-txn {:where  where
+                                            :insert insert} context)
         where-patterns  (extract-patterns (::exec-where/patterns (:where rule-parsed)))
         insert-patterns (extract-patterns (:insert rule-parsed))]
     {:deps        where-patterns

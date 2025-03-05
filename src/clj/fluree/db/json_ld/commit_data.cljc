@@ -512,7 +512,7 @@
   [db t commit-sid annotation]
   (if annotation
     (let [allowed-vars #{}
-          parsed       (q-parse/parse-triples allowed-vars nil (util/sequential annotation))
+          parsed       (q-parse/parse-triples (util/sequential annotation) allowed-vars nil)
           a-sid        (->> parsed ffirst where/get-iri (iri/encode-iri db))
           db-vol       (volatile! db)
           flakes       (into [(flake/create commit-sid const/$_commit:annotation a-sid const/$id t true nil)]

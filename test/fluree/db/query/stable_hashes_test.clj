@@ -10,7 +10,7 @@
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db0    @(fluree/stage
                     (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee" context]
+                    {"@context" context
                      "insert"
                      [{:id           :ex/alice
                        :type         :ex/User
