@@ -1,7 +1,7 @@
 (ns fluree.db.flake.flake-db
   (:refer-clojure :exclude [load vswap!])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
-            [clojure.core.async :as async :refer [go]]
+            [clojure.core.async :as async :refer [go <! >! close!]]
             [clojure.set :refer [map-invert]]
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
@@ -36,8 +36,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serde-json]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.util.log :as log])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -51,6 +50,11 @@
                         db index/types)]
     (assoc-in cleared [:novelty :size] 0)))
 
+(defn novelty-after-t
+  "Returns novelty after t value for provided index."
+  [db t idx]
+  (index/filter-after t (get-in db [:novelty idx])))
+
 (defn empty-novelty
   "Empties novelty @ t value and earlier. If t is null, empties all novelty."
   [db t]
@@ -60,13 +64,20 @@
     (empty-all-novelty db)
 
     (flake/t-before? t (:t db))
-    (let [cleared (reduce (fn [db* idx]
-                            (update-in db* [:novelty idx]
-                                       (fn [flakes]
-                                         (index/filter-after t flakes))))
-                          db index/types)
-          size    (flake/size-bytes (get-in cleared [:novelty :spot]))]
-      (assoc-in cleared [:novelty :size] size))
+    (let [novelty (reduce (fn [acc idx]
+                            (assoc acc idx
+                                       #?(:clj  (future (novelty-after-t db t idx))
+                                          :cljs (novelty-after-t db t idx))))
+                          {} index/types)
+          size    (flake/size-bytes #?(:clj  @(:spot novelty)
+                                       :cljs (:spot novelty)))
+          db*     (reduce
+                   (fn [db* idx]
+                     (assoc-in db* [:novelty idx] #?(:clj  @(get novelty idx)
+                                                     :cljs (get novelty idx))))
+                   (assoc-in db [:novelty :size] size)
+                   index/types)]
+      db*)
 
     :else
     (throw (ex-info (str "Request to empty novelty at t value: " t
@@ -85,10 +96,10 @@
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
-  (if (newer-index? commit commit-index)
+  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as index-map}]
+  (if (newer-index? commit index-map)
     (let [index-t (:t data-map)
-          commit* (assoc commit :index commit-index)]
+          commit* (assoc commit :index index-map)]
       (-> db
           (empty-novelty index-t)
           (assoc :commit commit*
@@ -251,49 +262,25 @@
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
   indexes and returns updated db"
-  [{:keys [commit-catalog] :as db} commit-jsonld commit-data-jsonld]
+  [db commit-jsonld commit-data-jsonld]
   (go-try
     (let [t-new            (db-t commit-data-jsonld)
-          assert           (db-assert commit-data-jsonld)
           nses             (map :value
                                 (get commit-data-jsonld const/iri-namespaces))
           db*              (with-namespaces db nses)
-          asserted-flakes  (create-flakes true db* t-new assert)
-          retract          (db-retract commit-data-jsonld)
-          retracted-flakes (create-flakes false db* t-new retract)
+          asserted-flakes  (->> (db-assert commit-data-jsonld)
+                                (create-flakes true db* t-new))
+          retracted-flakes (->> (db-retract commit-data-jsonld)
+                                (create-flakes false db* t-new))
+          commit-metadata  (commit-data/json-ld->map commit-jsonld db*)
+          metadata-flakes  (commit-data/commit-metadata-flakes db* t-new commit-metadata)
+          all-flakes       (-> db*
+                               (get-in [:novelty :spot])
+                               empty
+                               (into metadata-flakes)
+                               (into retracted-flakes)
+                               (into asserted-flakes))]
 
-          {:keys [previous issuer message data] :as commit-metadata}
-          (commit-data/json-ld->map commit-jsonld db*)
-
-          commit-id          (:id commit-metadata)
-          commit-sid         (iri/encode-iri db* commit-id)
-          [prev-commit _]    (when-let [prev-addr (:address previous)]
-                               (<? (commit-storage/read-commit-jsonld commit-catalog prev-addr)))
-          db-sid             (iri/encode-iri db* (:id data))
-          metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
-                                                                 t-new commit-sid db-sid)
-          previous-id        (when prev-commit (:id prev-commit))
-          prev-commit-flakes (when previous-id
-                               (commit-data/prev-commit-flakes db* t-new commit-sid
-                                                               previous-id))
-          prev-data-id       (get-first-id prev-commit const/iri-data)
-          prev-db-flakes     (when prev-data-id
-                               (commit-data/prev-data-flakes db* db-sid t-new
-                                                             prev-data-id))
-          issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                               (commit-data/issuer-flakes db* t-new commit-sid issuer-iri))
-          message-flakes     (when message
-                               (commit-data/message-flakes t-new commit-sid message))
-          all-flakes         (-> db*
-                                 (get-in [:novelty :spot])
-                                 empty
-                                 (into metadata-flakes)
-                                 (into retracted-flakes)
-                                 (into asserted-flakes)
-                                 (cond-> prev-commit-flakes (into prev-commit-flakes)
-                                         prev-db-flakes (into prev-db-flakes)
-                                         issuer-flakes  (into issuer-flakes)
-                                         message-flakes (into message-flakes)))]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
@@ -460,16 +447,32 @@
      :namespace-codes iri/default-namespace-codes
      :schema          (vocab/base-schema)}))
 
+(defn add-commit-data
+  [commit-storage commits-ch]
+  (let [to (async/chan)
+        af (fn [commit-tuple res-ch]
+             (go
+               (let [[commit-jsonld _commit-proof] commit-tuple
+                     db-address       (-> commit-jsonld
+                                          (get-first const/iri-data)
+                                          (get-first-value const/iri-address))
+                     db-data-jsonld   (<? (commit-storage/read-data-jsonld commit-storage db-address))]
+                 (>! res-ch [commit-jsonld db-data-jsonld])
+                 (close! res-ch))))]
+    (async/pipeline-async 2 to af commits-ch)
+    to))
+
 (defn load-novelty
   [commit-storage indexed-db index-t commit-jsonld]
-  (go-try
-    (loop [[commit-tuple & r] (<? (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t)))
-           db                 indexed-db]
-      (if commit-tuple
-        (let [[commit-jsonld _commit-proof commit-data-jsonld] commit-tuple
-              new-db                                           (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld))]
-          (recur r new-db))
-        db))))
+  (let [commits-ch    (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t))
+        commits+data-ch (add-commit-data commit-storage commits-ch)]
+    (go
+      (loop [[commit-jsonld db-data-jsonld] (<! commits+data-ch)
+             db indexed-db]
+        (if db-data-jsonld
+          (let [new-db (<? (transact/-merge-commit db commit-jsonld db-data-jsonld))]
+            (recur (<! commits+data-ch) new-db))
+          db)))))
 
 (defn add-reindex-thresholds
   "Adds reindexing thresholds to the root map.
@@ -505,7 +508,10 @@
    (load ledger-alias commit-catalog index-catalog branch commit-pair {}))
   ([ledger-alias commit-catalog index-catalog branch [commit-jsonld commit-map] indexing-opts]
    (go-try
-     (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
+     (let [commit-t    (-> commit-jsonld
+                           (get-first const/iri-data)
+                           (get-first-value const/iri-fluree-t))
+           root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
@@ -518,7 +524,7 @@
                                   :commit commit-map
                                   :tt-id nil
                                   :comparators index/comparators
-                                  :staged []
+                                  :staged nil
                                   :novelty (new-novelty-map index/comparators)
                                   :max-namespace-code max-ns-code)
                            map->FlakeDB
@@ -526,9 +532,6 @@
            indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
                          (<? (vocab/load-schema indexed-db (:preds root-map)))
                          indexed-db)
-           commit-t    (-> commit-jsonld
-                           (get-first const/iri-data)
-                           (get-first-value const/iri-fluree-t))
            index-t     (:t indexed-db*)]
        (if (= commit-t index-t)
          indexed-db*

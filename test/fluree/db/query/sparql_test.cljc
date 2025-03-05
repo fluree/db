@@ -755,7 +755,8 @@
          (go
            (let [conn   (<! (test-utils/create-conn))
                 ledger (<p! (fluree/create conn "people"))
-                db     (<p! (fluree/stage (fluree/db ledger) {"@context" "https://ns.flur.ee"
+                db     (<p! (fluree/stage (fluree/db ledger) {"@context" [test-utils/default-str-context
+                                                                          {"person" "http://example.org/Person#"}]
                                                                "insert" people-data}))]
             (testing "basic query works"
               (let [query   "SELECT ?person ?fullName
@@ -772,8 +773,7 @@
                       (fluree/create "people")
                       deref
                       fluree/db
-                      (fluree/stage {"@context" ["https://ns.flur.ee"
-                                                 test-utils/default-str-context
+                      (fluree/stage {"@context" [test-utils/default-str-context
                                                  {"person" "http://example.org/Person#"}]
                                       "insert" people-data})
                       deref)]
@@ -977,8 +977,7 @@
                            "type"                          "http://example.org/Book"
                            "http://example.org/book/title" "The Hitchhiker's Guide to the Galaxy"}]]
            (testing "BASE IRI gets prefixed onto relative IRIs"
-             (let [book-db @(fluree/stage db {"@context" ["https://ns.flur.ee"
-                                                          test-utils/default-str-context
+             (let [book-db @(fluree/stage db {"@context" [test-utils/default-str-context
                                                           {"person" "http://example.org/Person#"}]
                                                "insert" book-data})
                    query   "BASE <http://example.org/book/>
@@ -989,8 +988,7 @@
                        ["2" "The Hitchhiker's Guide to the Galaxy"]]
                       results))))
            (testing "PREFIX declarations go into the context"
-             (let [book-db @(fluree/stage db {"@context" ["https://ns.flur.ee"
-                                                          test-utils/default-str-context
+             (let [book-db @(fluree/stage db {"@context" [test-utils/default-str-context
                                                           {"person" "http://example.org/Person#"}]
                                                "insert" book-data})
                    query   "PREFIX book: <http://example.org/book/>

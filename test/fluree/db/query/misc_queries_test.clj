@@ -8,8 +8,7 @@
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query-context")
-        db     @(fluree/stage (fluree/db ledger) {"@context" ["https://ns.flur.ee"
-                                                              test-utils/default-context
+        db     @(fluree/stage (fluree/db ledger) {"@context" [test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
                                                   "insert"   [{:id :ex/dan :ex/x 1}
                                                               {:id :ex/wes :ex/x 2}]})]
@@ -84,8 +83,7 @@
           ledger @(fluree/create conn "query/everything")
           db     @(fluree/stage
                     (fluree/db ledger)
-                    {"@context" ["https://ns.flur.ee"
-                                 test-utils/default-context
+                    {"@context" [test-utils/default-context
                                  {:ex "http://example.org/ns/"}]
                      "insert"
                      {:graph [{:id           :ex/alice,
@@ -176,18 +174,9 @@
           (is (= [["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"
                    :f/address
                    "fluree:memory://tqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"]
-                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"
-                   :f/flakes
-                   11]
-                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"
-                   :f/previous
-                   "fluree:db:sha256:bbktr7nvywjwtiamogekl3gfy57di3c5b7vob4gth3dm7hwmtw5k4"]
-                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"
-                   :f/size
-                   1266]
-                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"
-                   :f/t
-                   1]
+                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/flakes 11]
+                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/size 1266]
+                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/t 1]
                   ["fluree:commit:sha256:bbs2ggy7vuaimeqgzstb35jmstqn63phlboetqnvvuatndgvigjii"
                    "https://www.w3.org/2018/credentials#issuer"
                    "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
@@ -257,8 +246,7 @@
         ledger @(fluree/create conn "query/class")
         db     @(fluree/stage
                   (fluree/db ledger)
-                  {"@context" ["https://ns.flur.ee"
-                               test-utils/default-context
+                  {"@context" [test-utils/default-context
                                {:ex "http://example.org/ns/"}]
                    "insert"
                    [{:id           :ex/alice,
@@ -295,8 +283,7 @@
     (testing "shacl targetClass"
       (let [shacl-db @(fluree/stage
                         (fluree/db ledger)
-                        {"@context" ["https://ns.flur.ee"
-                                     test-utils/default-context
+                        {"@context" [test-utils/default-context
                                      {:ex "http://example.org/ns/"}]
                          "insert"
                          {:id             :ex/UserShape,
@@ -314,8 +301,7 @@
   (let [conn   @(fluree/connect-memory)
         ledger @(fluree/create conn "type-handling")
         db0    (fluree/db ledger)
-        db1    @(fluree/stage db0 {"@context" ["https://ns.flur.ee"
-                                               test-utils/default-str-context
+        db1    @(fluree/stage db0 {"@context" [test-utils/default-str-context
                                                {"ex" "http://example.org/ns/"}]
                                    "insert"   [{"id"   "ex:ace"
                                                 "type" "ex:Spade"}
@@ -325,13 +311,11 @@
                                                 "type" "ex:Heart"}
                                                {"id"   "ex:jack"
                                                 "type" "ex:Club"}]})
-        db2    @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                               test-utils/default-str-context
+        db2    @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                {"ex" "http://example.org/ns/"}]
                                    "insert"   [{"id"       "ex:two"
                                                 "rdf:type" "ex:Diamond"}]})
-        db3    @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                               test-utils/default-str-context
+        db3    @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                {"ex" "http://example.org/ns/"}
                                                {"rdf:type" "@type"}]
                                    "insert"   {"id"       "ex:two"

@@ -426,20 +426,15 @@
     (storage/content-write-json storage path txn)))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
-;; TODO - however this is really a concern of "commit", not staging and I don' think the db should be handling any of it
-(defn write-transactions!
+;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
+(defn write-transaction!
   [storage ledger-alias staged]
   (go-try
-   (loop [[next-staged & r] staged
-          results []]
-     (if next-staged
-       (let [[txn author-did annotation] next-staged
-             results* (if txn
-                        (let [{txn-id :address} (<? (write-transaction storage ledger-alias txn))]
-                          (conj results [txn-id author-did annotation]))
-                        (conj results next-staged))]
-         (recur r results*))
-       results))))
+    (let [[txn author-did annotation] staged]
+      (if txn
+        (let [{txn-id :address} (<? (write-transaction storage ledger-alias txn))]
+          [txn-id author-did annotation])
+        staged))))
 
 (defn update-commit-address
   "Once a commit address is known, which might be after the commit is written
@@ -485,11 +480,11 @@
   [{prev-commit :commit :as staged-db} new-commit]
   (let [max-ns-code (-> staged-db :namespace-codes iri/get-max-namespace-code)]
     (-> staged-db
-        (update :staged empty)
         (assoc :commit new-commit
+               :staged nil
                :prev-commit prev-commit
                :max-namespace-code max-ns-code)
-        (commit-data/add-commit-flakes prev-commit))))
+        (commit-data/add-commit-flakes))))
 
 (defn sanitize-commit-options
   "Parses the commit options and removes non-public opts."
@@ -546,13 +541,11 @@
            :or   {time (util/current-time-iso)}}
           (parse-commit-opts ledger opts)
 
-          {:keys [db-jsonld staged-txns]}
+          {:keys [db-jsonld staged-txn]}
           (flake-db/db->jsonld staged-db commit-data-opts)
 
-          ;; TODO - we do not support multiple "transactions" in a single
-          ;; commit (although other code assumes we do which needs cleaning)
-          [[txn-id author annotation] :as _txns]
-          (<? (write-transactions! commit-catalog ledger-alias staged-txns))
+          [txn-id author annotation]
+          (<? (write-transaction! commit-catalog ledger-alias staged-txn))
 
           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file

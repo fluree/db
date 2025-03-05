@@ -16,8 +16,7 @@
         ledger @(fluree/create conn "ledger/datatype")]
     (testing "Querying predicates with mixed datatypes"
       (let [mixed-db @(fluree/stage (fluree/db ledger)
-                                     {"@context" "https://ns.flur.ee"
-                                      "insert"
+                                     {"insert"
                                       [{:context     default-context
                                         :id          :ex/coco
                                         :type        :schema/Person

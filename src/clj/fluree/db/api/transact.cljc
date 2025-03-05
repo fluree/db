@@ -11,8 +11,8 @@
             [fluree.db.query.fql.syntax :as syntax]))
 
 (defn parse-opts
-  [expanded-txn override-opts txn-context]
-  (let [txn-opts (some-> (util/get-first-value expanded-txn const/iri-opts)
+  [txn override-opts txn-context]
+  (let [txn-opts (some-> (q-parse/get-named txn "opts")
                          (syntax/coerce-txn-opts))
         opts     (merge txn-opts (some-> override-opts syntax/coerce-txn-opts))]
     (-> opts
@@ -30,32 +30,29 @@
   (go-try
    (let [txn-context (or (ctx-util/txn-context txn)
                          (:context opts))
-         expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
-         parsed-opts (parse-opts expanded opts txn-context)
-         parsed-txn  (q-parse/parse-txn expanded txn-context)]
+         parsed-opts (parse-opts txn opts txn-context)
+         parsed-txn  (q-parse/parse-txn txn txn-context)]
      (<? (connection/stage-triples db parsed-txn parsed-opts)))))
 
 (defn extract-ledger-id
   "Extracts ledger-id from expanded json-ld transaction"
-  [expanded-json-ld]
-  (if-let [ledger-id (util/get-first-value expanded-json-ld const/iri-ledger)]
-    ledger-id
-    (throw (ex-info "Invalid transaction, missing required key: ledger."
-                    {:status 400 :error :db/invalid-transaction}))))
+  [txn]
+  (or (q-parse/get-named txn "ledger")
+      (throw (ex-info "Invalid transaction, missing required key: ledger."
+                      {:status 400 :error :db/invalid-transaction}))))
 
 (defn transact!
   ([conn txn]
    (transact! conn txn nil))
   ([conn txn override-opts]
    (go-try
-     (let [expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
-           context     (or (ctx-util/txn-context txn)
+     (let [context     (or (ctx-util/txn-context txn)
                            ;; parent context might come from a Verifiable
                            ;; Credential's context
                            (:context override-opts))
-           ledger-id   (extract-ledger-id expanded)
-           triples     (q-parse/parse-txn expanded context)
-           parsed-opts (parse-opts expanded override-opts context)]
+           ledger-id   (extract-ledger-id txn)
+           triples     (q-parse/parse-txn txn context)
+           parsed-opts (parse-opts txn override-opts context)]
        (<? (connection/transact! conn ledger-id triples parsed-opts))))))
 
 (defn credential-transact!
@@ -76,18 +73,17 @@
    (create-with-txn conn txn nil))
   ([conn txn {:keys [context] :as override-opts}]
    (go-try
-    (let [expanded    (json-ld/expand (ctx-util/use-fluree-context txn))
-          txn-context (or (ctx-util/txn-context txn)
+    (let [txn-context (or (ctx-util/txn-context txn)
                           context) ;; parent context from credential if present
-          ledger-id   (extract-ledger-id expanded)
+          ledger-id   (extract-ledger-id txn)
           address     (<? (connection/primary-address conn ledger-id))
-          parsed-opts (-> (parse-opts expanded override-opts txn-context)
+          parsed-opts (-> (parse-opts txn override-opts txn-context)
                           (syntax/coerce-ledger-opts))]
       (if (<? (connection/ledger-exists? conn address))
         (throw (ex-info (str "Ledger " ledger-id " already exists")
                         {:status 409 :error :db/ledger-exists}))
         (let [ledger  (<? (connection/create-ledger conn ledger-id parsed-opts))
-              triples (q-parse/parse-txn expanded txn-context)
+              triples (q-parse/parse-txn txn txn-context)
 
               ;; commit API takes a did-map and parsed context as opts
               ;; whereas stage API takes a did IRI and unparsed context.

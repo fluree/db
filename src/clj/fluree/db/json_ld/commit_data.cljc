@@ -460,90 +460,58 @@
   "Builds and returns the commit metadata flakes for the given commit, t, and
   db-sid. Used when committing to an in-memory ledger value and when reifying
   a ledger from storage on load."
-  [{:keys [address alias branch data time v author] :as _commit} t commit-sid db-sid]
-  (let [{db-t :t db-address :address :keys [flakes size]} data]
-    [;; commit flakes
-     ;; address
-     (flake/create commit-sid const/$_address address const/$xsd:string t true nil)
-     ;; alias
-     (flake/create commit-sid const/$_ledger:alias alias const/$xsd:string t true nil)
-     ;; branch
-     (flake/create commit-sid const/$_ledger:branch branch const/$xsd:string t true nil)
-     ;; v
-     (flake/create commit-sid const/$_v v const/$xsd:int t true nil)
-     ;; time
-     (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil)
-     ;; data
-     (flake/create commit-sid const/$_commit:data db-sid const/$id t true nil)
+  [db t commit]
+  (let [{:keys [id address alias branch data time v previous author issuer message txn]} commit
+        {db-t :t, db-address :address, data-id :id, :keys [flakes size]} data
+        commit-sid (iri/encode-iri db id)
+        db-sid     (iri/encode-iri db data-id)]
+    (cond->
+     [;; commit flakes
+      ;; address
+      (flake/create commit-sid const/$_address address const/$xsd:string t true nil)
+      ;; alias
+      (flake/create commit-sid const/$_ledger:alias alias const/$xsd:string t true nil)
+      ;; branch
+      (flake/create commit-sid const/$_ledger:branch branch const/$xsd:string t true nil)
+      ;; v
+      (flake/create commit-sid const/$_v v const/$xsd:int t true nil)
+      ;; time
+      (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil)
+      ;; data
+      (flake/create commit-sid const/$_commit:data db-sid const/$id t true nil)
 
-     ;; db flakes
-     ;; t
-     (flake/create db-sid const/$_commitdata:t db-t const/$xsd:int t true nil)
-     ;; address
-     (flake/create db-sid const/$_address db-address const/$xsd:string t true nil)
-     ;; size
-     (flake/create db-sid const/$_commitdata:size size const/$xsd:int t true nil)
-     ;; flakes
-     (flake/create db-sid const/$_commitdata:flakes flakes const/$xsd:int t true nil)]))
+      ;; db flakes
+      ;; t
+      (flake/create db-sid const/$_commitdata:t db-t const/$xsd:int t true nil)
+      ;; address
+      (flake/create db-sid const/$_address db-address const/$xsd:string t true nil)
+      ;; size
+      (flake/create db-sid const/$_commitdata:size size const/$xsd:int t true nil)
+      ;; flakes
+      (flake/create db-sid const/$_commitdata:flakes flakes const/$xsd:int t true nil)]
 
-(defn prev-commit-flakes
-  "Builds and returns a channel containing the previous commit flakes for the
-  given db, t, and previous-id (the id of a commit's previous commit). Used when
-  committing to an in-memory ledger and when reifying a ledger from storage on
-  load."
-  [db t commit-sid previous-id]
-  (let [prev-sid (iri/encode-iri db previous-id)]
-    [(flake/create commit-sid const/$_previous prev-sid const/$id t true nil)]))
+     (:id previous)
+     (conj (flake/create commit-sid const/$_previous (iri/encode-iri db (:id previous)) const/$id t true nil))
 
-(defn prev-data-flakes
-  "Builds and returns a channel containing the previous data flakes for the
-  given db, db-sid, t, and prev-data-id (the id of commit's data section's
-  previous pointer). Used when committing to an in-memory ledger value and when
-  reifying a ledger from storage on load."
-  [db db-sid t prev-data-id]
-  (let [prev-sid (iri/encode-iri db prev-data-id)]
-    [(flake/create db-sid const/$_previous prev-sid const/$id t true nil)]))
+     (:id issuer)
+     (conj (flake/create commit-sid const/$_commit:signer (iri/encode-iri db (:id issuer)) const/$id t true nil))
 
-(defn issuer-flakes
-  "Builds and returns a channel containing the credential issuer's flakes for
-  the given db, t, next-sid, and issuer-iri. next-sid should be a zero-arity fn
-  that returns the next subject id to use if the issuer doesn't already exist in
-  the db and that updates some internal state to reflect that this one is now
-  used. It will only be called if needed. Used when committing to an in-memory
-  ledger value and when reifying a ledger from storage on load."
-  [db t commit-sid issuer-iri]
-  (if-let [issuer-sid (iri/encode-iri db issuer-iri)]
-    ;; create reference to existing issuer
-    [(flake/create commit-sid const/$_commit:signer issuer-sid const/$id t true
-                   nil)]
-    ;; create new issuer flake and a reference to it
-    (let [new-issuer-sid (iri/encode-iri db issuer-iri)]
-      [(flake/create commit-sid const/$_commit:signer new-issuer-sid const/$id t
-                     true nil)])))
+     message
+     (conj (flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil))
 
-(defn message-flakes
-  "Builds and returns the commit message flakes for the given t and message.
-  Used when committing to an in-memory ledger value and when reifying a ledger
-  from storage on load."
-  [t commit-sid message]
-  [(flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil)])
+     ;; TODO - author should really be an IRI, not a string
+     author
+     (conj (flake/create commit-sid const/$_commit:author author const/$xsd:string t true nil))
 
-;; TODO - txn should really be an IRI, not a string
-(defn txn-flake
-  "Builds and returns the commit txn flake for the given t and transaction id."
-  [t commit-sid txn]
-  (flake/create commit-sid const/$_commit:txn txn const/$xsd:string t true nil))
-
-(defn author-flake
-  "Builds and returns the commit txn flake for the given t and transaction id."
-  [t commit-sid author]
-  (flake/create commit-sid const/$_commit:author author const/$xsd:string t true nil))
+     ;; TODO - txn should really be an IRI, not a string
+     txn
+     (conj (flake/create commit-sid const/$_commit:txn txn const/$xsd:string t true nil)))))
 
 (defn annotation-flakes
   [db t commit-sid annotation]
   (if annotation
     (let [allowed-vars #{}
-          parsed       (q-parse/parse-triples allowed-vars nil (util/sequential annotation))
+          parsed       (q-parse/parse-triples (util/sequential annotation) allowed-vars nil)
           a-sid        (->> parsed ffirst where/get-iri (iri/encode-iri db))
           db-vol       (volatile! db)
           flakes       (into [(flake/create commit-sid const/$_commit:annotation a-sid const/$id t true nil)]
@@ -554,35 +522,17 @@
 
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
-  [{:keys [commit] :as db} prev-commit]
-  (let [{:keys [data id issuer message annotation txn author]} commit
-        {db-t :t, db-id :id} data
-        {previous-id :id prev-data :data} prev-commit
-        prev-data-id       (:id prev-data)
-
-        t                  db-t
+  [{:keys [commit] :as db}]
+  (let [{:keys [data id annotation]} commit
+        t (:t data)
         commit-sid         (iri/encode-iri db id)
-        db-sid             (iri/encode-iri db db-id)
-        base-flakes        (commit-metadata-flakes commit t commit-sid db-sid)
-        prev-commit-flakes (when previous-id
-                             (prev-commit-flakes db t commit-sid previous-id))
-        prev-db-flakes     (when prev-data-id
-                             (prev-data-flakes db db-sid t prev-data-id))
-        issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                             (issuer-flakes db t commit-sid issuer-iri))
-        message-flakes     (when message
-                             (message-flakes t commit-sid message))
+        base-flakes        (commit-metadata-flakes db t commit)
 
+        ;; TODO - if annotation flakes exist, do they also need to get created when doing a `load`?
         [db* annotation-flakes] (annotation-flakes db t commit-sid annotation)
 
         commit-flakes      (cond-> base-flakes
-                                   prev-commit-flakes (into prev-commit-flakes)
-                                   prev-db-flakes (into prev-db-flakes)
-                                   issuer-flakes (into issuer-flakes)
-                                   annotation-flakes (into annotation-flakes)
-                                   message-flakes (into message-flakes)
-                                   author (conj (author-flake t commit-sid author))
-                                   txn (conj (txn-flake t commit-sid txn)))]
+                                   annotation-flakes (into annotation-flakes))]
     (-> db*
         (update-novelty commit-flakes)
         add-tt-id)))
