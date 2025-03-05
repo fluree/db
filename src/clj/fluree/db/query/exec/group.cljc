@@ -1,6 +1,7 @@
 (ns fluree.db.query.exec.group
   (:require [clojure.core.async :as async]
             [fluree.db.query.exec.select :as select]
+            [fluree.db.query.exec.select.display :as display]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]))
@@ -53,12 +54,20 @@
   (when (some select/implicit-grouping? (util/sequential select))
     [nil]))
 
-(defmethod select/display ::grouping
+(defn display-aggregate
+  [display-fn]
+  (fn [match compact]
+    (let [group (where/get-value match)]
+      (mapv (fn [grouped-val] (display-fn grouped-val compact))
+            group))))
+
+(defmethod display/fql ::grouping
   [match compact]
-  (let [group (where/get-value match)]
-    (mapv (fn [grouped-val]
-            (select/display grouped-val compact))
-          group)))
+  ((display-aggregate display/fql) match compact))
+
+(defmethod display/sparql ::grouping
+  [match compact]
+  ((display-aggregate display/sparql) match compact))
 
 (defn combine
   "Returns a channel of solutions from `solution-ch` collected into groups defined
