@@ -12,7 +12,7 @@
 
 (defn parse-opts
   [txn override-opts txn-context]
-  (let [txn-opts (some-> (q-parse/extract-opts txn)
+  (let [txn-opts (some-> (q-parse/get-named txn "opts")
                          (syntax/coerce-txn-opts))
         opts     (merge txn-opts (some-> override-opts syntax/coerce-txn-opts))]
     (-> opts
@@ -37,11 +37,9 @@
 (defn extract-ledger-id
   "Extracts ledger-id from expanded json-ld transaction"
   [txn]
-  (if-let [ledger-id (or (get txn "ledger")
-                         (get txn :ledger))]
-    ledger-id
-    (throw (ex-info "Invalid transaction, missing required key: ledger."
-                    {:status 400 :error :db/invalid-transaction}))))
+  (or (q-parse/get-named txn "ledger")
+      (throw (ex-info "Invalid transaction, missing required key: ledger."
+                      {:status 400 :error :db/invalid-transaction}))))
 
 (defn transact!
   ([conn txn]

@@ -672,25 +672,10 @@
     (assoc q :fuel max-fuel)
     q))
 
-(defn extract-values
-  [q]
-  (or (get q "values")
-      (get q :values)))
-
-(defn extract-where
-  [q]
-  (or (get q "where")
-      (get q :where)))
-
-(defn extract-delete
-  [q]
-  (or (get q "delete")
-      (get q :delete)))
-
-(defn extract-insert
-  [q]
-  (or (get q "insert")
-      (get q :insert)))
+(defn get-named
+  [jsonld nme]
+  (or (get jsonld nme)
+      (get jsonld (keyword nme))))
 
 (defn extract-opts
   [q]
@@ -702,9 +687,9 @@
   ([q parent-context]
    (let [context  (cond->> (context/extract q)
                            parent-context (merge parent-context))
-         [vars values] (-> (extract-values q)
+         [vars values] (-> (get-named q "values")
                            (parse-values context))
-         where    (-> (extract-where q)
+         where    (-> (get-named q "where")
                       (parse-where vars context))
          grouping (parse-grouping q)
          ordering (parse-ordering q)]
@@ -830,18 +815,18 @@
 
 (defn parse-txn
   [txn context]
-  (let [[vars values] (-> (extract-values txn)
+  (let [[vars values] (-> (get-named txn "values")
                           (parse-values context))
-        where         (-> (extract-where txn)
+        where         (-> (get-named txn "where")
                           (parse-where vars context))
         bound-vars    (-> where where/bound-variables (into vars))
-        delete        (when-let [dlt (extract-delete txn)]
+        delete        (when-let [dlt (get-named txn "delete")]
                         (-> dlt
                             (json-ld/expand context)
                             util/get-graph
                             util/sequential
                             (parse-triples bound-vars context)))
-        insert        (when-let [ins (extract-insert txn)]
+        insert        (when-let [ins (get-named txn "insert")]
                         (-> ins
                             (json-ld/expand context)
                             util/get-graph
