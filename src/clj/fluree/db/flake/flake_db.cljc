@@ -51,6 +51,11 @@
                         db index/types)]
     (assoc-in cleared [:novelty :size] 0)))
 
+(defn novelty-after-t
+  "Returns novelty after t value for provided index."
+  [db t idx]
+  (index/filter-after t (get-in db [:novelty idx])))
+
 (defn empty-novelty
   "Empties novelty @ t value and earlier. If t is null, empties all novelty."
   [db t]
@@ -60,13 +65,20 @@
     (empty-all-novelty db)
 
     (flake/t-before? t (:t db))
-    (let [cleared (reduce (fn [db* idx]
-                            (update-in db* [:novelty idx]
-                                       (fn [flakes]
-                                         (index/filter-after t flakes))))
-                          db index/types)
-          size    (flake/size-bytes (get-in cleared [:novelty :spot]))]
-      (assoc-in cleared [:novelty :size] size))
+    (let [novelty (reduce (fn [acc idx]
+                            (assoc acc idx
+                                       #?(:clj  (future (novelty-after-t db t idx))
+                                          :cljs (novelty-after-t db t idx))))
+                          {} index/types)
+          size    (flake/size-bytes #?(:clj  @(:spot novelty)
+                                       :cljs (:spot novelty)))
+          db*     (reduce
+                   (fn [db* idx]
+                     (assoc-in db* [:novelty idx] #?(:clj  @(get novelty idx)
+                                                     :cljs (get novelty idx))))
+                   (assoc-in db [:novelty :size] size)
+                   index/types)]
+      db*)
 
     :else
     (throw (ex-info (str "Request to empty novelty at t value: " t
@@ -85,10 +97,10 @@
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
-  (if (newer-index? commit commit-index)
+  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as index-map}]
+  (if (newer-index? commit index-map)
     (let [index-t (:t data-map)
-          commit* (assoc commit :index commit-index)]
+          commit* (assoc commit :index index-map)]
       (-> db
           (empty-novelty index-t)
           (assoc :commit commit*
@@ -505,7 +517,10 @@
    (load ledger-alias commit-catalog index-catalog branch commit-pair {}))
   ([ledger-alias commit-catalog index-catalog branch [commit-jsonld commit-map] indexing-opts]
    (go-try
-     (let [root-map    (if-let [{:keys [address]} (:index commit-map)]
+     (let [commit-t    (-> commit-jsonld
+                           (get-first const/iri-data)
+                           (get-first-value const/iri-fluree-t))
+           root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
@@ -526,9 +541,6 @@
            indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
                          (<? (vocab/load-schema indexed-db (:preds root-map)))
                          indexed-db)
-           commit-t    (-> commit-jsonld
-                           (get-first const/iri-data)
-                           (get-first-value const/iri-fluree-t))
            index-t     (:t indexed-db*)]
        (if (= commit-t index-t)
          indexed-db*
