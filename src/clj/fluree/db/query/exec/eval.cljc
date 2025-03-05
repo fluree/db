@@ -384,28 +384,28 @@
 
 ;; TODO - date functions below all look incorrect for CLJS - should (string? datetime) be (map? datetime)?
 (defn year
-  [datetime]
+  [x]
   (where/->typed-val
-    #?(:clj  (.getYear ^OffsetDateTime (->offset-date-time (:value datetime)))
-       :cljs (.getFullYear (if (string? datetime)
-                             (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                             datetime)))))
+    #?(:clj  (.getYear ^OffsetDateTime (->offset-date-time (:value x)))
+       :cljs (.getFullYear (if (string? (:value x))
+                             (datatype/coerce (:value x) (:datatype-iri x))
+                             x)))))
 
 (defn month
-  [datetime]
+  [x]
   (where/->typed-val
-    #?(:clj  (.getMonthValue ^OffsetDateTime (->offset-date-time (:value datetime)))
-       :cljs (.getMonth (if (string? datetime)
-                          (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                          datetime)))))
+    #?(:clj  (.getMonthValue ^OffsetDateTime (->offset-date-time (:value x)))
+       :cljs (.getMonth (if (string? (:value x))
+                          (datatype/coerce (:value x) (:datatype-iri x))
+                          x)))))
 
 (defn day
-  [datetime]
+  [x]
   (where/->typed-val
-    #?(:clj  (.getDayOfMonth ^OffsetDateTime (->offset-date-time (:value datetime)))
-       :cljs (.getDate (if (string? datetime)
-                          (datatype/coerce (:value datetime) (:datatype-iri datetime))
-                          datetime)))))
+    #?(:clj  (.getDayOfMonth ^OffsetDateTime (->offset-date-time (:value x)))
+       :cljs (.getDate (if (string? (:value x))
+                          (datatype/coerce (:value x) (:datatype-iri x))
+                          x)))))
 
 (defn hours
   [x]
@@ -417,7 +417,7 @@
          #{const/iri-xsd-time}
          (.getHour ^OffsetTime (->offset-time (:value x))))
        :cljs
-       (.getHours (if (string? x)
+       (.getHours (if (string? (:value x))
                     (datatype/coerce (:value x) (:datatype-iri x))
                     x)))))
 
@@ -429,7 +429,7 @@
                (.getMinute ^OffsetDateTime (->offset-date-time (:value x)))
                #{const/iri-xsd-time}
                (.getMinute ^OffsetTime (->offset-time (:value x))))
-       :cljs (.getMinutes (if (string? x)
+       :cljs (.getMinutes (if (string? (:value x))
                             (datatype/coerce (:value x) (:datatype-iri x))
                             x)))))
 
@@ -441,7 +441,7 @@
               (.getSecond ^OffsetDateTime (->offset-date-time (:value x)))
               #{const/iri-xsd-time}
               (.getSecond ^OffsetTime (->offset-time (:value x))))
-       :cljs (.getSeconds (if (string? x)
+       :cljs (.getSeconds (if (string? (:value x))
                             (datatype/coerce (:value x) (:datatype-iri x))
                             x)))))
 
@@ -454,7 +454,7 @@
               (.toString (.getOffset ^OffsetDateTime (->offset-date-time (:value x))))
               #{const/iri-xsd-time}
               (.toString (.getOffset ^OffsetTime (->offset-time (:value x)))))
-       :cljs (.getTimeZoneOffset ^js/Date (if (string? x)
+       :cljs (.getTimeZoneOffset ^js/Date (if (string? (:value x))
                                             (datatype/coerce (:value x) (:datatype-iri x))
                                             x)))))
 
