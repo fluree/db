@@ -36,8 +36,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serde-json]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.util.log :as log])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -678,7 +677,7 @@
                       (seq assert)  (assoc-in [assert-key "@container"] "@graph")
                       (seq retract) (assoc-in [retract-key "@container"] "@graph"))
         nses        (new-namespaces db)
-        db-json     (cond-> {id-key                nil ;; comes from hash later
+        db-json     (cond-> {id-key                ""
                              type-key              [(compact const/iri-DB)]
                              (compact const/iri-fluree-t) t
                              (compact const/iri-v) data-version}
@@ -687,12 +686,7 @@
                       (seq retract)   (assoc retract-key retract)
                       (seq nses)      (assoc (compact const/iri-namespaces) nses)
                       (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
-                      (:size stats)   (assoc (compact const/iri-size) (:size stats)))
-        ;; TODO - this is re-normalized below, can try to do it just once
-        dbid        (commit-data/db-json->db-id db-json)
-        db-json*    (-> db-json
-                        (assoc id-key dbid)
-                        (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
-    {:dbid        dbid
-     :db-jsonld   db-json*
+                      (:size stats)   (assoc (compact const/iri-size) (:size stats))
+                      true            (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
+    {:db-jsonld   db-json
      :staged-txn  staged}))

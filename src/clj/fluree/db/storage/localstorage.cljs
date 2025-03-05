@@ -40,7 +40,7 @@
       (let [hashable (if (storage/hashable? v)
                        v
                        (pr-str v))
-            hash     (crypto/sha2-256 hashable)]
+            hash     (crypto/sha2-256 hashable :base32)]
         (.setItem js/localStorage k v)
         {:path    k
          :address (local-storage-address identifier k)

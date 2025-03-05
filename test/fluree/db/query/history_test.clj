@@ -317,7 +317,6 @@
                                       :f/retract  []
                                       :f/size     pos-int?
                                       :f/t        1
-                                      :f/previous {:id test-utils/db-id?}
                                       :id         test-utils/db-id?}
                           :f/time    720000
                           :f/v       1
@@ -333,8 +332,7 @@
                                                                                  :f/assert   [{:ex/x "foo-cat"
                                                                                                :ex/y "bar-cat"
                                                                                                :id   :ex/alice}]
-                                                                                 :f/flakes   62
-                                                                                 :f/previous {:id test-utils/db-id?}
+                                                                                 :f/flakes   58
                                                                                  :f/retract  [#_{:ex/x "foo-3"
                                                                                                  :ex/y "bar-3"
                                                                                                  :id   :ex/alice}]
@@ -355,8 +353,7 @@
                                                 :f/assert   [{:ex/x "foo-cat"
                                                               :ex/y "bar-cat"
                                                               :id   :ex/cat}]
-                                                :f/flakes   47
-                                                :f/previous {:id test-utils/db-id?}
+                                                :f/flakes   44
                                                 :f/retract  []
                                                 :f/size     pos-int?
                                                 :f/t        4
@@ -394,8 +391,7 @@
                                           :f/assert   [{:ex/x "foo-cat"
                                                         :ex/y "bar-cat"
                                                         :id   :ex/cat}]
-                                          :f/flakes   47
-                                          :f/previous {:id test-utils/db-id?}
+                                          :f/flakes   44
                                           :f/retract  []
                                           :f/size     pos-int?
                                           :f/t        4
@@ -415,8 +411,7 @@
                                         :f/assert   [{:ex/x "foo-3"
                                                       :ex/y "bar-3"
                                                       :id   :ex/alice}]
-                                        :f/flakes   32
-                                        :f/previous {:id test-utils/db-id?}
+                                        :f/flakes   30
                                         :f/retract  [{:ex/x "foo-2"
                                                       :ex/y "bar-2"
                                                       :id   :ex/alice}]
@@ -438,8 +433,7 @@
                                         :f/assert   [{:ex/x "foo-2"
                                                       :ex/y "bar-2"
                                                       :id   :ex/alice}]
-                                        :f/flakes   17
-                                        :f/previous {:id test-utils/db-id?}
+                                        :f/flakes   16
                                         :f/retract  [{:ex/x "foo-1"
                                                       :ex/y "bar-1"
                                                       :id   :ex/alice}]
@@ -463,7 +457,7 @@
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
                                                      :id   :ex/cat}]
-                                       :f/flakes   47
+                                       :f/flakes   44
                                        :f/previous {:id test-utils/db-id?}
                                        :f/retract  []
                                        :f/size     pos-int?
@@ -482,7 +476,7 @@
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
                                                      :id   :ex/alice}]
-                                       :f/flakes   62
+                                       :f/flakes   58
                                        :f/previous {:id test-utils/db-id?}
                                        :f/retract  [{:ex/x "foo-3"
                                                      :ex/y "bar-3"
@@ -515,7 +509,6 @@
                                        :f/retract  []
                                        :f/size     pos-int?
                                        :f/t        1
-                                       :f/previous {:id test-utils/db-id?}
                                        :id         test-utils/db-id?}
                           :f/time     720000
                           :f/v        1
@@ -538,8 +531,7 @@
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
                                                        :id   :ex/alice}]
-                                         :f/flakes   32
-                                         :f/previous {:id test-utils/db-id?}
+                                         :f/flakes   30
                                          :f/retract  [{:ex/x "foo-2"
                                                        :ex/y "bar-2"
                                                        :id   :ex/alice}]
@@ -566,8 +558,7 @@
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
                                                        :id   :ex/alice}]
-                                         :f/flakes   62
-                                         :f/previous {:id test-utils/db-id?}
+                                         :f/flakes   58
                                          :f/retract  [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
                                                        :id   :ex/alice}]
@@ -955,10 +946,10 @@
       (is (= [{"f:data" {"f:t" 1}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
                "f:data" {"f:t" 2},
-               "f:txn" "fluree:memory://b1e4f45002633e4778ad3136b3fd26fe606dbc9520c7af0116a9c4bc28d33493"}
+               "f:txn" "fluree:memory://bmpe6riaeyz6i54k2mjwwp6sn7tanw6jkighv4arnkoexqungnet"}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
                "f:data" {"f:t" 3},
-               "f:txn" "fluree:memory://5080c4ab66cf7e0153d517a79269ab8408ef7c26fe4de12f6a71ec924cb3760b"}]
+               "f:txn" "fluree:memory://ueaysvwnt36afj5kf5hsju2xbai556cn7sn4exwu4pmsjglg5ql"}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true
                                            :t              {:from 1 :to :latest}})
