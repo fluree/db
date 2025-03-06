@@ -55,46 +55,50 @@
   (async/put! error-ch (ex-info "Unsupported transitive path." {:status 400 :error :db/unsupported-transitive-path}))
   (doto (async/chan) async/close!))
 
+(defn get-match-iri
+  [var soln]
+  (-> soln (get var) where/get-iri))
+
 (defmethod resolve-transitive [:? :v :v]
   [db fuel-tracker solution [s p o] error-ch]
-  (let [tag   (where/get-transitive-property p)
-        p*    (where/remove-transitivity p)
-        s-var (where/get-variable s)]
-    (-> (go-try
-          (loop [[o* & to-visit] #{o}
-                 visited-iris    (if (= :zero+ tag) #{(where/get-iri o)} #{})
-                 solns           (if (= :zero+ tag) [{s-var o}] [])]
-            (if o*
-              (let [step-solns (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[s p* o*]] error-ch)))
-                    s-matches  (map #(get % s-var) step-solns)]
-                (recur (into to-visit (remove (fn [s-mch] (visited-iris (where/get-iri s-mch)))) s-matches)
-                       (into visited-iris (map where/get-iri) s-matches)
-                       (into solns (remove (fn [soln] (visited-iris (-> soln (get s-var) where/get-iri)))) step-solns)))
-              solns)))
+  (let [tag          (where/get-transitive-property p)
+        p*           (where/remove-transitivity p)
+        s-var        (where/get-variable s)
+        get-s-iri    (partial get-match-iri s-var)
+        initial-soln {s-var o}]
+    (-> (async/go
+          (loop [[soln & to-visit] #{initial-soln}
+                 result-solns      (if (= :zero+ tag) [initial-soln] [])
+                 visited-iris      (if (= :zero+ tag) #{(where/get-iri o)} #{})]
+            (if soln
+              (let [step-solns (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[s p* (get soln s-var)]] error-ch)))
+
+                    remove-visited-xf (remove (comp visited-iris (partial get-match-iri s-var)))]
+                (recur (into to-visit     remove-visited-xf step-solns)
+                       (into result-solns remove-visited-xf step-solns)
+                       (into visited-iris (map get-s-iri) step-solns)))
+              result-solns)))
         (async/pipe (async/chan 1 cat)))))
 
 (defmethod resolve-transitive [:v :v :?]
   [db fuel-tracker solution [s p o] error-ch]
-  (let [tag             (where/get-transitive-property p)
-        p*              (where/remove-transitivity p)
-        o-var           (where/get-variable o)
-        get-o           #(get % o-var)
-        get-soln-iri    (fn [soln] (-> soln get-o where/get-iri))
-        initial-visited (if (= :zero+ tag) #{(where/get-iri s)} #{})
-        initial-soln    {o-var s}]
-    (-> (go-try
+  (let [tag          (where/get-transitive-property p)
+        p*           (where/remove-transitivity p)
+        o-var        (where/get-variable o)
+        get-o-iri    (partial get-match-iri o-var)
+        initial-soln {o-var s}]
+    (-> (async/go
           (loop [[soln & to-visit] [initial-soln]
                  result-solns      (if (= :zero+ tag) [initial-soln] [])
-                 visited-iris      initial-visited]
+                 visited-iris      (if (= :zero+ tag) #{(where/get-iri s)} #{})]
             (if soln
-              (let [step-solns (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[(get-o soln) p* o]] error-ch)))
+              (let [step-solns (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[(get soln o-var) p* o]] error-ch)))
 
-                    remove-visited-xf (remove (fn [soln] (visited-iris (get-soln-iri soln))))
-                    visited-xf        (map get-soln-iri)]
+                    remove-visited-xf (remove (comp visited-iris get-o-iri))]
                 (recur (into to-visit     remove-visited-xf step-solns)
                        (into result-solns remove-visited-xf step-solns)
-                       (into visited-iris visited-xf        step-solns)))
-              (async/to-chan! result-solns))))
+                       (into visited-iris (map get-o-iri) step-solns)))
+              result-solns)))
         (async/pipe (async/chan 1 cat)))))
 
 (defn o-match->s-match
@@ -117,8 +121,8 @@
 
 (defn transitive-step
   [s-var o-var solns]
-  (let [get-solution-iris (juxt #(-> % (get s-var) (where/get-iri))
-                                #(-> % (get o-var) (where/get-iri)))
+  (let [get-solution-iris (juxt (partial get-match-iri s-var)
+                                (partial get-match-iri o-var))
         solution-iris     (into #{} (map get-solution-iris) solns)]
     (reduce (fn [results {o o-var s s-var :as soln}]
               (into results
