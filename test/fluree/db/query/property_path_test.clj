@@ -6,7 +6,7 @@
   (let [conn   @(fluree/connect-memory)
         ledger @(fluree/create conn "property/path")
         db0    (fluree/db ledger)]
-    (testing "transitive"
+    (testing "one+"
       (testing "no variables"
         (let [db1 @(fluree/stage db0 {"insert"
                                       [{"@id" "ex:a"
@@ -93,14 +93,14 @@
                                          "select" ["?x" "?y"]}))))
             (testing "with cycle"
               (let [db2 @(fluree/stage db1 {"insert" {"@id" "ex:3" "ex:knows" {"@id" "ex:1"}}})]
-                (is (= [["ex:1" "ex:2"]
-                        ["ex:3" "ex:2"]
-                        ["ex:2" "ex:2"]
-                        ["ex:2" "ex:1"]
+                (is (= [["ex:3" "ex:2"]
+                        ["ex:1" "ex:2"]
                         ["ex:2" "ex:3"]
+                        ["ex:1" "ex:3"]
+                        ["ex:2" "ex:2"]
                         ["ex:3" "ex:3"]
                         ["ex:3" "ex:1"]
-                        ["ex:1" "ex:3"]
+                        ["ex:2" "ex:1"]
                         ["ex:1" "ex:1"]]
                        @(fluree/query db2 {"where" [{"@id" "?x" "<ex:knows+>" "?y"}]
                                            "select" ["?x" "?y"]})))))))))
@@ -111,8 +111,8 @@
                                         "ex:y" [{"@id" "ex:b"
                                                  "ex:y" {"@id" "ex:c"
                                                          "ex:y" {"@id" "ex:d"
-                        "ex:y" {"@id" "ex:e"
-                                "ex:y" {"@id" "ex:f"}}}}}
+                                                                 "ex:y" {"@id" "ex:e"
+                                                                         "ex:y" {"@id" "ex:f"}}}}}
                                                 {"@id" "ex:g"
                                                  "ex:y" [{"@id" "ex:h"
                                                           "ex:y" {"@id" "ex:i"}}
@@ -191,7 +191,7 @@
                       ["ex:2" "ex:3"]
                       ["ex:3" "ex:3"]]
                      (sort @(fluree/query db1 {"where" [{"@id" "?x" "<ex:knows*>" "?y"}]
-                                              "select" ["?x" "?y"]})))))
+                                               "select" ["?x" "?y"]})))))
             (testing "disjoint subgraphs"
               (let [db2 @(fluree/stage db1
                                        {"insert"
