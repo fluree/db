@@ -589,16 +589,20 @@
                         {:status 400 :error :db/invalid-query}))))
 
 (defmethod parse-term :PathMod
-  ;; PathMod ::= '?' | '*' | ('+' INTEGER?) WS
+  ;; PathMod ::= '?' WS | '*' WS | ('+' INTEGER?) WS
   [[_ mod degree]]
-  ;; TODO: this does nothing in FQL
   (str mod degree))
+
+(defmethod parse-term :PathElt
+  [[_ primary mod]]
+  (if mod
+    (str "<" (parse-term primary) (parse-term mod) ">")
+    (parse-term primary)))
 
 (defmethod parse-term :PathSequence
   ;; PathSequence ::= PathEltOrInverse ( <'/'> PathEltOrInverse )*
-  ;; TODO: it may be a mistake to hide the '^'
-  ;; <PathEltOrInverse> ::= PathElt | <'^'> PathElt
-  ;; <PathElt> ::= PathPrimary PathMod?
+  ;; <PathEltOrInverse> ::= PathElt | '^' PathElt
+  ;; PathElt ::= PathPrimary PathMod?
   [[_ & elements]]
   (apply str (mapv parse-term elements)))
 
