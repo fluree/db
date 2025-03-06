@@ -60,16 +60,18 @@
   (let [tag   (where/get-transitive-property p)
         p*    (where/remove-transitivity p)
         s-var (where/get-variable s)]
-    (loop [[o* & to-visit] #{o}
-           visited-iris    (if (= :zero+ tag) #{(where/get-iri o)} #{})
-           solns           (if (= :zero+ tag) [{s-var o}] [])]
-      (if o*
-        (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[s p* o*]] error-ch)))
-              s-matches  (map #(get % s-var) step-solns)]
-          (recur (into to-visit (remove (fn [s-mch] (visited-iris (where/get-iri s-mch)))) s-matches)
-                 (into visited-iris (map where/get-iri) s-matches)
-                 (into solns (remove (fn [soln] (visited-iris (-> soln (get s-var) where/get-iri)))) step-solns)))
-        (async/to-chan! solns)))))
+    (-> (go-try
+          (loop [[o* & to-visit] #{o}
+                 visited-iris    (if (= :zero+ tag) #{(where/get-iri o)} #{})
+                 solns           (if (= :zero+ tag) [{s-var o}] [])]
+            (if o*
+              (let [step-solns (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[s p* o*]] error-ch)))
+                    s-matches  (map #(get % s-var) step-solns)]
+                (recur (into to-visit (remove (fn [s-mch] (visited-iris (where/get-iri s-mch)))) s-matches)
+                       (into visited-iris (map where/get-iri) s-matches)
+                       (into solns (remove (fn [soln] (visited-iris (-> soln (get s-var) where/get-iri)))) step-solns)))
+              solns)))
+        (async/pipe (async/chan 1 cat)))))
 
 (defmethod resolve-transitive [:v :v :?]
   [db fuel-tracker solution [s p o] error-ch]
@@ -80,18 +82,20 @@
         get-soln-iri    (fn [soln] (-> soln get-o where/get-iri))
         initial-visited (if (= :zero+ tag) #{(where/get-iri s)} #{})
         initial-soln    {o-var s}]
-    (loop [[soln & to-visit] [initial-soln]
-           result-solns      (if (= :zero+ tag) [initial-soln] [])
-           visited-iris      initial-visited]
-      (if soln
-        (let [step-solns (async/<!! (async/into [] (where/match-clause db fuel-tracker solution [[(get-o soln) p* o]] error-ch)))
+    (-> (go-try
+          (loop [[soln & to-visit] [initial-soln]
+                 result-solns      (if (= :zero+ tag) [initial-soln] [])
+                 visited-iris      initial-visited]
+            (if soln
+              (let [step-solns (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[(get-o soln) p* o]] error-ch)))
 
-              remove-visited-xf (remove (fn [soln] (visited-iris (get-soln-iri soln))))
-              visited-xf        (map get-soln-iri)]
-          (recur (into to-visit     remove-visited-xf step-solns)
-                 (into result-solns remove-visited-xf step-solns)
-                 (into visited-iris visited-xf        step-solns)))
-        (async/to-chan! result-solns)))))
+                    remove-visited-xf (remove (fn [soln] (visited-iris (get-soln-iri soln))))
+                    visited-xf        (map get-soln-iri)]
+                (recur (into to-visit     remove-visited-xf step-solns)
+                       (into result-solns remove-visited-xf step-solns)
+                       (into visited-iris visited-xf        step-solns)))
+              (async/to-chan! result-solns))))
+        (async/pipe (async/chan 1 cat)))))
 
 (defn o-match->s-match
   "Strip extra keys from a match on an o-var so taht it can be compared to a match from an
