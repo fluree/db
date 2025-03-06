@@ -67,7 +67,7 @@
         get-s-iri    (partial get-match-iri s-var)
         initial-soln {s-var o}]
     (-> (async/go
-          (loop [[soln & to-visit] #{initial-soln}
+          (loop [[soln & to-visit] [initial-soln]
                  result-solns      (if (= :zero+ tag) [initial-soln] [])
                  visited-iris      (if (= :zero+ tag) #{(where/get-iri o)} #{})]
             (if soln
