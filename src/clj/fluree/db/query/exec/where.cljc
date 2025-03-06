@@ -110,6 +110,18 @@
   [mch]
   (::t mch))
 
+(defn add-transitivity
+  [mch tag]
+  (assoc mch ::recur tag))
+
+(defn remove-transitivity
+  [mch]
+  (dissoc mch ::recur))
+
+(defn get-transitive-property
+  [mch]
+  (::recur mch))
+
 (defn matched?
   [match]
   (or (matched-value? match)
