@@ -1770,26 +1770,24 @@
                        ["book:2" "The Hitchhiker's Guide to the Galaxy"]]
                       results)))))
 
-           ;; TODO: Make these tests pass
-
-           ;; Language tags aren't supported yet (even in the BNF)
-         #_(testing "fn w/ langtag string arg query works"
-             (let [query   "SELECT (CONCAT(?fullName, \"'s handle is \"@en, ?handle) AS ?hfn)
+         (testing "fn w/ langtag string arg query works"
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (CONCAT(?fullName, \"'s handle is \"@en, ?handle) AS ?hfn)
                             WHERE {?person person:handle ?handle.
-                                   ?person person:fullName ?fullName.}"
-                   results @(fluree/query db query {:format :sparql})]
-               (is (= [["Billy Bob's handle is bbob"]
-                       ["Jane Doe's handle is jdoe"]]
-                      results))))
+                                   ?person person:fullName ?fullName.}"]
+             (is (= [["Billy Bob's handle is bbob"]
+                     ["Ferris Bueller's handle is dankeshön"]
+                     ["Jenny Bob's handle is jbob"]
+                     ["Jane Doe's handle is jdoe"]]
+                    @(fluree/query db query {:format :sparql})))))
 
-           ;; VALUES gets translated into :bind, but that expects a query fn on the right
-           ;; so this string literal doesn't work
-         #_(testing "VALUES query works"
-             (let [query   "SELECT ?handle
+         (testing "VALUES query works"
+             (let [query   "PREFIX person: <http://example.org/Person#>
+                            SELECT ?handle
                             WHERE {VALUES ?handle { \"jdoe\" }
-                                  ?person person:handle ?handle.}"
-                   results @(fluree/query db query {:format :sparql})]
-               (is (= ["jdoe"] results))))
+                                  ?person person:handle ?handle.}"]
+               (is (= [["jdoe"]]
+                      @(fluree/query db query {:format :sparql})))))
 
            ;; BIND gets translated into :bind, but that expects a query fn on the right
            ;; so this string literal doesn't work
