@@ -15,7 +15,7 @@
             ledger  @(fluree/create conn "index/datetimes")
             db      @(fluree/stage
                        (fluree/db ledger)
-                       {"@context" ["https://ns.flur.ee" context]
+                       {"@context" context
                         "insert"
                         [{"@id"   "ex:Foo",
                           "@type" "ex:Bar",

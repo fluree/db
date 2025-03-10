@@ -115,7 +115,7 @@
   storage/ContentAddressedStore
   (-content-write-bytes [_ dir data]
     (go
-      (let [hash     (crypto/sha2-256 data)
+      (let [hash     (crypto/sha2-256 data :base32)
             bytes    (if (string? data)
                        (bytes/string->UTF8 data)
                        data)

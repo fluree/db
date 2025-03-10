@@ -426,20 +426,15 @@
     (storage/content-write-json storage path txn)))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
-;; TODO - however this is really a concern of "commit", not staging and I don' think the db should be handling any of it
-(defn write-transactions!
+;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
+(defn write-transaction!
   [storage ledger-alias staged]
   (go-try
-   (loop [[next-staged & r] staged
-          results []]
-     (if next-staged
-       (let [[txn author-did annotation] next-staged
-             results* (if txn
-                        (let [{txn-id :address} (<? (write-transaction storage ledger-alias txn))]
-                          (conj results [txn-id author-did annotation]))
-                        (conj results next-staged))]
-         (recur r results*))
-       results))))
+    (let [[txn author-did annotation] staged]
+      (if txn
+        (let [{txn-id :address} (<? (write-transaction storage ledger-alias txn))]
+          [txn-id author-did annotation])
+        staged))))
 
 (defn update-commit-address
   "Once a commit address is known, which might be after the commit is written
@@ -448,19 +443,27 @@
   [(assoc commit-map :address commit-address)
    (assoc commit-jsonld "address" commit-address)])
 
+(defn update-commit-id
+  "Once a commit address is known, which might be after the commit is written
+  if IPFS, add the final address into the commit map."
+  [[commit-map commit-jsonld] commit-hash]
+  (let [commit-id (commit-data/hash->commit-id commit-hash)]
+    [(assoc commit-map :id commit-id)
+     (assoc commit-jsonld "@id" commit-id)]))
+
 (defn write-commit
   [commit-storage alias {:keys [did private]} commit]
   (go-try
-    (let [[_ commit-jsonld :as commit-pair]
-          (commit-data/commit->jsonld commit)
+    (let [commit-jsonld (commit-data/->json-ld commit)
 
           signed-commit (if did
                           (<? (credential/generate commit-jsonld private (:id did)))
                           commit-jsonld)
           commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
 
-          [commit* commit-jsonld*]
-          (update-commit-address commit-pair (:address commit-res))]
+          [commit* commit-jsonld*] (-> [commit commit-jsonld]
+                                       (update-commit-id (:hash commit-res))
+                                       (update-commit-address (:address commit-res)))]
       {:commit-map    commit*
        :commit-jsonld commit-jsonld*
        :write-result  commit-res})))
@@ -477,11 +480,11 @@
   [{prev-commit :commit :as staged-db} new-commit]
   (let [max-ns-code (-> staged-db :namespace-codes iri/get-max-namespace-code)]
     (-> staged-db
-        (update :staged empty)
         (assoc :commit new-commit
+               :staged nil
                :prev-commit prev-commit
                :max-namespace-code max-ns-code)
-        (commit-data/add-commit-flakes prev-commit))))
+        (commit-data/add-commit-flakes))))
 
 (defn sanitize-commit-options
   "Parses the commit options and removes non-public opts."
@@ -538,16 +541,15 @@
            :or   {time (util/current-time-iso)}}
           (parse-commit-opts ledger opts)
 
-          {:keys [dbid db-jsonld staged-txns]}
+          {:keys [db-jsonld staged-txn]}
           (flake-db/db->jsonld staged-db commit-data-opts)
 
-          ;; TODO - we do not support multiple "transactions" in a single
-          ;; commit (although other code assumes we do which needs cleaning)
-          [[txn-id author annotation] :as _txns]
-          (<? (write-transactions! commit-catalog ledger-alias staged-txns))
+          [txn-id author annotation]
+          (<? (write-transaction! commit-catalog ledger-alias staged-txn))
 
           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
+          dbid              (commit-data/hash->db-id (:hash data-write-result))
           keypair           {:did did, :private private}
 
           new-commit (commit-data/new-db-commit-map {:old-commit commit

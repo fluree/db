@@ -522,8 +522,8 @@
     [(where/->pattern :graph [graph* where*])]))
 
 (defn parse-where
-  [q vars context]
-  (when-let [where (:where q)]
+  [where vars context]
+  (when where
     (-> where
         syntax/coerce-where
         (parse-where-clause vars context))))
@@ -672,13 +672,25 @@
     (assoc q :fuel max-fuel)
     q))
 
+(defn get-named
+  [jsonld nme]
+  (or (get jsonld nme)
+      (get jsonld (keyword nme))))
+
+(defn extract-opts
+  [q]
+  (or (get q "opts")
+      (get q :opts)))
+
 (defn parse-analytical-query
   ([q] (parse-analytical-query q nil))
   ([q parent-context]
    (let [context  (cond->> (context/extract q)
                            parent-context (merge parent-context))
-         [vars values] (parse-values (:values q) context)
-         where    (parse-where q vars context)
+         [vars values] (-> (get-named q "values")
+                           (parse-values context))
+         where    (-> (get-named q "where")
+                      (parse-where vars context))
          grouping (parse-grouping q)
          ordering (parse-ordering q)]
      (-> q
@@ -790,7 +802,7 @@
 
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
-  [allowed-vars context expanded]
+  [expanded allowed-vars context]
   (try*
     (reduce (partial parse-subj-cmp allowed-vars context)
             []
@@ -803,21 +815,23 @@
 
 (defn parse-txn
   [txn context]
-  (let [values        (util/get-first-value txn const/iri-values)
-        [vars values] (parse-values values context)
-        where-map     {:where (util/get-first-value txn const/iri-where)}
-        where         (parse-where where-map vars context)
+  (let [[vars values] (-> (get-named txn "values")
+                          (parse-values context))
+        where         (-> (get-named txn "where")
+                          (parse-where vars context))
         bound-vars    (-> where where/bound-variables (into vars))
-        delete-clause (-> txn
-                          (util/get-first-value const/iri-delete)
-                          (json-ld/expand context)
-                          util/get-graph)
-        delete        (->> delete-clause util/sequential (parse-triples bound-vars context))
-        insert-clause (-> txn
-                          (util/get-first-value const/iri-insert)
-                          (json-ld/expand context)
-                          util/get-graph)
-        insert        (->> insert-clause util/sequential (parse-triples bound-vars context))
+        delete        (when-let [dlt (get-named txn "delete")]
+                        (-> dlt
+                            (json-ld/expand context)
+                            util/get-graph
+                            util/sequential
+                            (parse-triples bound-vars context)))
+        insert        (when-let [ins (get-named txn "insert")]
+                        (-> ins
+                            (json-ld/expand context)
+                            util/get-graph
+                            util/sequential
+                            (parse-triples bound-vars context)))
         annotation    (util/get-first-value txn const/iri-annotation)]
     (when (and (empty? insert) (empty? delete))
       (throw (ex-info (str "Invalid transaction, insert or delete clause must contain nodes with objects.")

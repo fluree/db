@@ -38,7 +38,7 @@
       (let [hashable (if (storage/hashable? v)
                        v
                        (pr-str v))
-            hash     (crypto/sha2-256 hashable)]
+            hash     (crypto/sha2-256 hashable :base32)]
         (swap! contents assoc hash v)
         {:path    hash
          :address (memory-address identifier hash)

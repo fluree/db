@@ -1,10 +1,12 @@
 (ns fluree.db.commit.storage
   (:require [clojure.string :as str]
+            [clojure.core.async :as async :refer [go <! chan]]
             [fluree.db.constants :as const]
             [fluree.db.storage :as storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :refer [get-first get-first-id get-first-value]]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.core :refer [get-first get-first-id get-first-value try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -54,47 +56,66 @@
             json-ld/expand
             verify-commit)))))
 
+(defn get-commit-t
+  [commit]
+  (-> commit
+      (get-first const/iri-data)
+      (get-first-value const/iri-fluree-t)))
+
+(defn validate-commit
+  [commit last-t]
+  (let [commit-t   (get-commit-t commit)
+        dbid       (get-first-id commit const/iri-data)
+        db-address (-> commit
+                       (get-first const/iri-data)
+                       (get-first-value const/iri-address))]
+    (when (or (nil? commit-t)
+              (and last-t (not= (dec last-t) commit-t)))
+      (throw (ex-info (str "Commit t values are inconsistent. Last commit t was: " last-t
+                           "and the prevCommit t value is: " commit-t " for commit: " commit)
+                      {:status      500
+                       :error       :db/invalid-commit
+                       :commit-data (if (> (count (str commit)) 500)
+                                      (str (subs (str commit) 0 500) "...")
+                                      (str commit))})))
+
+    (when-not (and dbid db-address)
+      (throw (ex-info (str "Commit is not a properly formatted Fluree commit, missing db id/address: "
+                           commit ".")
+                      {:status      500
+                       :error       :db/invalid-commit
+                       :commit-data (if (> (count (str commit)) 500)
+                                      (str (subs (str commit) 0 500) "...")
+                                      (str commit))})))))
+
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of `from-t` and increment from there."
   [storage latest-commit from-t]
-  (go-try
-    (loop [[commit proof] (verify-commit latest-commit)
-           last-t         nil
-           commit-tuples  (list)]
-      (let [dbid             (get-first-id commit const/iri-data)
-            db-address       (-> commit
-                                 (get-first const/iri-data)
-                                 (get-first-value const/iri-address))
-            db-data-jsonld   (<? (read-data-jsonld storage db-address))
-            prev-commit-addr (-> commit
-                                 (get-first const/iri-previous)
-                                 (get-first-value const/iri-address))
-            commit-t         (-> commit
-                                 (get-first const/iri-data)
-                                 (get-first-value const/iri-fluree-t))
-            commit-tuples*   (conj commit-tuples [commit proof db-data-jsonld])]
-        (when (or (nil? commit-t)
-                  (and last-t (not= (dec last-t) commit-t)))
-          (throw (ex-info (str "Commit t values are inconsistent. Last commit t was: " last-t
-                               "and the prevCommit t value is: " commit-t " for commit: " commit)
-                          {:status      500
-                           :error       :db/invalid-commit
-                           :commit-data (if (> (count (str commit)) 500)
-                                          (str (subs (str commit) 0 500) "...")
-                                          (str commit))})))
-        (when-not (and dbid db-address)
-          (throw (ex-info (str "Commit is not a properly formatted Fluree commit, missing db id/address: "
-                               commit ".")
-                          {:status      500
-                           :error       :db/invalid-commit
-                           :commit-data (if (> (count (str commit)) 500)
-                                          (str (subs (str commit) 0 500) "...")
-                                          (str commit))})))
-        (if (= from-t commit-t)
-          commit-tuples*
-          (let [verified-commit (<? (read-commit-jsonld storage prev-commit-addr))]
-            (recur verified-commit commit-t commit-tuples*)))))))
+  (let [resp-ch (chan)]
+    (go
+     (try*
+      (loop [[commit proof] (verify-commit latest-commit)
+             last-t        nil
+             commit-tuples (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
+        (let [prev-commit-addr (-> commit
+                                   (get-first const/iri-previous)
+                                   (get-first-value const/iri-address))
+              commit-t         (get-commit-t commit)
+              commit-tuples*   (conj commit-tuples [commit proof])]
+
+          (validate-commit commit last-t)
+
+          (if (= from-t commit-t)
+            (async/onto-chan! resp-ch commit-tuples*)
+            (let [verified-commit (<! (read-commit-jsonld storage prev-commit-addr))]
+              (if (util/exception? verified-commit)
+                (do (async/>! resp-ch verified-commit)
+                    (async/close! resp-ch))
+                (recur verified-commit commit-t commit-tuples*))))))
+      (catch* e (async/>! resp-ch e)
+        (async/close! resp-ch))))
+    resp-ch))
 
 (defn write-jsonld
   [storage ledger-alias jsonld]

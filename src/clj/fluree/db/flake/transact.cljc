@@ -129,17 +129,16 @@
                          (stage-update-novelty (get-in db [:novelty :spot]) new-flakes)
                          [new-flakes nil])
           db-after     (-> db
-                           (update :staged conj [txn author annotation])
                            (assoc :t t
+                                  :staged [txn author annotation]
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
-                           (commit-data/add-tt-id))
-          db-after*    (-> db-after
+                           (commit-data/add-tt-id)
                            (vocab/hydrate-schema add)
                            (check-virtual-graph add remove))]
       {:add       add
        :remove    remove
-       :db-after  db-after*
+       :db-after  db-after
        :db-before db-before
        :context   context})))
 
