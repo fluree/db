@@ -591,7 +591,10 @@
 (defmethod parse-term :PathMod
   ;; PathMod ::= '?' WS | '*' WS | ('+' INTEGER?) WS
   [[_ mod degree]]
-  (str mod degree))
+  (if degree
+    (throw (ex-info "Depth modifiers on transitive path elements are not supported."
+                    {:status 400 :error :db/invalid-query}))
+    (str mod degree)))
 
 (defmethod parse-term :PathElt
   [[_ primary mod]]

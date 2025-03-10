@@ -4,9 +4,10 @@
        :cljs [[cljs.test :refer-macros [deftest is testing async]]
               [clojure.core.async :refer [go <!]]
               [clojure.core.async.interop :refer [<p!]]])
+   [fluree.db.api :as fluree]
    [fluree.db.query.sparql :as sparql]
    [fluree.db.test-utils :as test-utils]
-   [fluree.db.api :as fluree])
+   [fluree.db.util.core :as util :refer [try* catch*]])
   #?(:clj (:import (clojure.lang ExceptionInfo))))
 
 (deftest parse-select
@@ -750,30 +751,24 @@
       (is (= ["?person" "?fullName"]
              selectDistinct)))))
 
-;; TODO: these expectations do not work in FQL
-#_(deftest parse-recursive
+(deftest parse-recursive
   (let [query "SELECT ?followHandle
                WHERE {?person person:handle \"anguyen\".
                       ?person person:follows+ ?follows.
                       ?follows person:handle ?followHandle.}"
         {:keys [where]} (sparql/->fql query)]
     (is (= [{"@id" "?person", "person:handle" "anguyen"}
-            {"@id" "?person", "person:follows+" "?follows"}
+            {"@id" "?person", "<person:follows+>" "?follows"}
             {"@id" "?follows", "person:handle" "?followHandle"}]
            where)))
   (testing "depth"
     (let [query "SELECT ?followHandle
                  WHERE {?person person:handle \"anguyen\".
                         ?person person:follows+3 ?follows.
-                        ?follows person:handle ?followHandle.}"
-          {:keys [where]} (sparql/->fql query)]
-      (is (= [{"@id" "?person", "person:handle" "anguyen"}
-              {"@id" "?person", "person:follows+3" "?follows"}
-              {"@id" "?follows", "person:handle" "?followHandle"}]
-             where)))))
-
-;; TODO
-#_(deftest parse-functions)
+                        ?follows person:handle ?followHandle.}"]
+      (is (= "Depth modifiers on transitive path elements are not supported."
+             (try* (sparql/->fql query)
+                  (catch* e (ex-message e))))))))
 
 (deftest parsing-error
   (testing "invalid query throws expected error"
