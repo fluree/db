@@ -171,6 +171,19 @@
   [subj selection depth spec]
   (->SubgraphSelector subj selection depth spec))
 
+(defrecord ConstructSelector [patterns bnodes]
+  ValueSelector
+  (format-value [_ _ _ _ compact _ _ solution]
+    (let [bnodes (swap! bnodes inc)]
+      (go (->> (mapv #(where/assign-matched-values % solution) patterns)
+               ;; partition by s-match
+               (partition-by first)
+               (mapv (partial display/json-ld-node compact bnodes)))))))
+
+(defn construct-selector
+  [patterns]
+  (->ConstructSelector patterns (atom 0)))
+
 (defn modify
   "Apply any modifying selectors to each solution in `solution-ch`."
   [q solution-ch]
@@ -214,11 +227,13 @@
                                 (:context q))
         compact             (json-ld/compact-fn context)
         output-format       (:output (:opts q))
-        selectors           (or (:select q)
+        selectors           (or (:construct q)
+                                (:select q)
                                 (:select-one q)
                                 (:select-distinct q))
         iri-cache           (volatile! {})
         format-xf           (some->> [(when (contains? q :select-distinct) (distinct))
+                                      (when (contains? q :construct) cat)
                                       (when (= output-format :sparql) (mapcat display/disaggregate))]
                                      (remove nil?)
                                      (not-empty)
@@ -268,3 +283,17 @@
   (or (instance? AggregateSelector selector)
       (and (instance? AsSelector selector)
            (:aggregate? selector))))
+
+(defn wrap-construct
+  [{:keys [orig-context context]} results]
+  (let [id-key (json-ld/compact const/iri-id context)]
+    (cond-> {"@graph" (->> results
+                           (sort-by #(get % id-key))
+                           (partition-by #(get % id-key))
+                           (mapv display/nest-multicardinal-values))}
+      orig-context (assoc "@context" orig-context))))
+
+(defn wrap-sparql
+  [results]
+  {"head" {"vars" (vec (sort (keys (first results))))}
+   "results" {"bindings" results}})
