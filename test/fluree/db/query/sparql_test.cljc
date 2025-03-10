@@ -1787,13 +1787,4 @@
                             WHERE {VALUES ?handle { \"jdoe\" }
                                   ?person person:handle ?handle.}"]
                (is (= [["jdoe"]]
-                      @(fluree/query db query {:format :sparql})))))
-
-           ;; BIND gets translated into :bind, but that expects a query fn on the right
-           ;; so this string literal doesn't work
-         #_(testing "BIND query works"
-             (let [query   "SELECT ?person ?handle
-                           WHERE {BIND (\"jdoe\" AS ?handle)
-                                  ?person person:handle ?handle.}"
-                   results @(fluree/query db query {:format :sparql})]
-               (is (= ["ex:jdoe" "jdoe"] results))))))))
+                      @(fluree/query db query {:format :sparql})))))))))
