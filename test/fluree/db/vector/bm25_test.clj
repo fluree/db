@@ -1,5 +1,5 @@
 (ns fluree.db.vector.bm25-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.log :as log]))
