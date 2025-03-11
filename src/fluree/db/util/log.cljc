@@ -135,4 +135,27 @@
      [msg c]
      `(debug-async->vals ~c ~msg)))
 
+#?(:clj
+   (defn with-mdc* [context f]
+     (let [original (org.slf4j.MDC/getCopyOfContextMap)]
+       (try
+         (doseq [[k v] context]
+           (org.slf4j.MDC/put (name k) (str v)))
+         (f)
+         (finally
+           (org.slf4j.MDC/clear)
+           (when original
+             (doseq [[k v] original]
+               (org.slf4j.MDC/put k v)))))))
 
+   :cljs
+   (defn with-mdc* [_context f]
+     (f)))
+
+#?(:clj
+   (defmacro with-mdc [context & body]
+     `(with-mdc* ~context (fn [] ~@body)))
+
+   :cljs
+   (defmacro with-mdc [_context & body]
+     `(do ~@body)))
