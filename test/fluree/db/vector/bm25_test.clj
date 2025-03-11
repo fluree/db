@@ -314,4 +314,24 @@
                                                     "select"   ["?x" "?author"]}}}})]
 
           (is (= "BM25 index query must be created with a subgraph selector"
+                 (ex-message ex-db)))))
+
+      (testing " the query subgraph selector must have @id as an element"
+        (let [ex-db @(fluree/stage
+                      (fluree/db ledger)
+                      {"insert"
+                       {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                          "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                          "fidx" "https://ns.flur.ee/index#"
+                                          "ex"   "http://example.org/"},
+                        "@id"            "ex:articleSearch"
+                        "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                        "f:virtualGraph" "articleSearch"
+                        "f:query"        {"@type"  "@json"
+                                          "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                    "where"    [{"@id"       "?x"
+                                                                 "ex:author" "?author"}]
+                                                    "select"   {"?x" ["ex:author" "ex:title" "ex:summary"]}}}}})]
+
+          (is (= "BM25 index query must not contain @id in the subgraph selector"
                  (ex-message ex-db))))))))

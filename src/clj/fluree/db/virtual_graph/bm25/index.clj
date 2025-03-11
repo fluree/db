@@ -266,7 +266,6 @@
 ;; TODO - VG - triggering updates only works for queries for single subject, no nested nodes
 ;; TODO - VG - prevent :select ["*"] syntax from being allowed, need to list properties explicitly
 ;; TODO - VG - prevent :selectOne from being used, or maybe just util/seq all results
-;; TODO - VG - ensure "@id" is one of the selected properties
 ;; TODO - VG - future feature - weighted properties
 (defn new-bm25-index
   [{:keys [namespaces namespace-codes alias] :as _db} index-flakes vg-opts]
