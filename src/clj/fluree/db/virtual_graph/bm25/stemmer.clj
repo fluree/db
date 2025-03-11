@@ -4,12 +4,16 @@
 
 (set! *warn-on-reflection* true)
 
-(defn stem
-  [^SnowballStemmer stemmer word]
-  (doto stemmer
-    (.setCurrent word)
-    (.stem))
-  (.getCurrent stemmer))
+(defprotocol Stemmer
+  (stem [stemmer word]))
+
+(extend-protocol Stemmer
+  SnowballStemmer
+  (stem [snowball word]
+    (doto snowball
+      (.setCurrent word)
+      (.stem))
+    (.getCurrent snowball)))
 
 ;; TODO need to add additional language support - right now everything is english
 (defn initialize

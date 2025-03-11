@@ -80,7 +80,8 @@
       where/nil-channel))
 
   (-activate-alias [ds alias]
-    (activate ds alias))
+    (go-try
+      (activate ds alias)))
 
   (-aliases [ds]
     (names ds))
