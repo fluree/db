@@ -252,13 +252,9 @@
   [parsed-config]
   (-> parsed-config convert-references ig/expand))
 
-(defn parsed-initialize
+(defn initialize
   [parsed-config]
   (-> parsed-config prepare ig/init))
-
-(defn initialize
-  [config]
-  (-> config config/parse parsed-initialize))
 
 (defn terminate
   [sys]

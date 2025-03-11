@@ -109,7 +109,7 @@
   [{:keys [state] :as _conn} ledger-alias]
   (get-in @state [:ledger ledger-alias]))
 
-(defn notify-ledger
+(defn notify-commit
   [conn commit-map]
   (go-try
     (let [expanded-commit (json-ld/expand commit-map)
@@ -120,6 +120,12 @@
           (log/debug "No cached ledger found for commit: " commit-map))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " commit-map)))))
+
+(defn notify-address
+  [{:keys [commit-catalog] :as conn} address]
+  (go-try
+    (let [commit-map (<? (commit-storage/read-commit-jsonld commit-catalog address))]
+      (<? (notify-commit conn commit-map)))))
 
 (defn publishers
   [{:keys [primary-publisher secondary-publishers] :as _conn}]
@@ -291,7 +297,7 @@
             (let [action (get msg "action")
                   data   (get msg "data")]
               (if (= "new-commit" action)
-                (notify-ledger conn data)
+                (notify-commit conn data)
                 (log/info "New subscrition message with action: " action "received, ignored.")))
             (recur)))
         :subscribed))))

@@ -1,8 +1,9 @@
 (ns fluree.db.api
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.walk :refer [postwalk]]
+            [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
-            [fluree.db.connection :as connection :refer [notify-ledger]]
+            [fluree.db.connection :as connection :refer [notify-commit]]
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
@@ -64,7 +65,7 @@
   ;; TODO - do some validation
   (promise-wrap
     (go-try
-      (let [system-map (system/initialize config)
+      (let [system-map (-> config config/parse system/initialize)
             conn       (reduce-kv (fn [x k v]
                                     (if (isa? k :fluree.db/connection)
                                       (reduced v)
@@ -76,14 +77,6 @@
   [conn]
   (go-try
     (-> conn ::system-map system/terminate)))
-
-(defn connect-ipfs
-  "Forms an ipfs connection using default settings.
-  - server - (optional) IPFS http api server endpoint, defaults to http://127.0.0.1:5001/
-  - profile - (optional) IPFS stored profile to use.
-  - did - (optional) DId information to use, if storing blocks as verifiable credentials"
-  [opts]
-  (connect (assoc opts :method :ipfs)))
 
 (defn convert-config-key
   [[k v]]
@@ -217,7 +210,7 @@
   (validate-connection conn)
   (promise-wrap
     (if (map? commit-map)
-      (notify-ledger conn commit-map)
+      (notify-commit conn commit-map)
       (go
         (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
                  {:status 400 :error :db/invalid-commit-map})))))

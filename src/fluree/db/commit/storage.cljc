@@ -5,8 +5,8 @@
             [fluree.db.storage :as storage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.core :refer [get-first get-first-id get-first-value try* catch*]]
+            [fluree.db.util.core :as util :refer [get-first get-first-id
+                                                  get-first-value try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 

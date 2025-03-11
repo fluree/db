@@ -11,7 +11,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.api :as query-api]
             [fluree.db.query.range :as query-range]
-            [fluree.db.connection :as connection :refer [notify-ledger]]
+            [fluree.db.connection :as connection :refer [notify-commit]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.json-ld.policy :as policy])
@@ -82,7 +82,7 @@
   - profile - (optional) IPFS stored profile to use.
   - did - (optional) DId information to use, if storing blocks as verifiable credentials"
   [opts]
-  (log/warn "DEPRECATED function `connect-ipfs` superseded by `fluree.db.api/connect-ipfs`")
+  (log/warn "DEPRECATED function `connect-ipfs` superseded by `fluree.db.api/connect`")
   (connect (assoc opts :method :ipfs)))
 
 (defn ^{:deprecated    "3.0"
@@ -180,7 +180,7 @@
   (log/warn "DEPRECATED function `notify` superseded by `fluree.db.api/notify`")
   (promise-wrap
     (if (map? commit-map)
-      (notify-ledger conn commit-map)
+      (notify-commit conn commit-map)
       (go
         (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
                  {:status 400 :error :db/invalid-commit-map})))))

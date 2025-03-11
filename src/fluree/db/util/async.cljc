@@ -1,9 +1,7 @@
 (ns fluree.db.util.async
   (:require
-    [fluree.db.util.core :as util]
-    [fluree.db.util.log :as log]
-    [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-    [clojure.core.async :refer [go <!] :as async]
+    [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+    [clojure.core.async :as async]
     [clojure.core.async.impl.protocols :as async-protocols])
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 

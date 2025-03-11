@@ -3,8 +3,9 @@
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [get-id get-first get-first-value
-                                                  get-value]]
+                                                  get-value try* catch*]]
             [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -40,8 +41,8 @@
 (defn ipns-nameservice?
   [node]
   (and (publisher? node)
-       (contains? node conn-vocab/ipfs-endpoint)
-       (contains? node conn-vocab/ipns-key)))
+       (or (contains? node conn-vocab/ipfs-endpoint)
+           (contains? node conn-vocab/ipns-key))))
 
 (defn storage?
   [node]
@@ -281,7 +282,11 @@
 (defn parse-string
   [cfg]
   (if (string? cfg)
-    (json/parse cfg false)
+    (try* (json/parse cfg false)
+          (catch* e
+            (let [msg (str "Invalid JSON in configuration string: " cfg)]
+              (log/error e msg)
+              (throw (ex-info msg {:status 400, :error :db/invalid-config-json} e)))))
     cfg))
 
 (defn standardize
@@ -294,10 +299,10 @@
 
 (defn parse
   ([cfg]
-   (parse cfg (map derive-node-id)))
-  ([cfg derive-xf]
+   (parse cfg derive-node-id))
+  ([cfg derive-fn]
    (into base-config
          (comp (map keywordize-node-ids)
-               derive-xf
+               (map derive-fn)
                (map (juxt get-id identity)))
          (standardize cfg))))
