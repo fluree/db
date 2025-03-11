@@ -93,3 +93,41 @@
                (assoc vg* vg-alias (vg/upsert vg-impl db add remove)))
              {} vg)]
     (assoc db :vg vg*)))
+
+(defn create-virtual-graphs
+  "Creates a new virtual graph. If the virtual graph is invalid, an
+  exception will be thrown and the transaction will not complete."
+  [db add new-vgs]
+  (loop [[new-vg & r] new-vgs
+         db db]
+    (if new-vg
+      (let [vg-flakes (filter #(= (flake/s %) new-vg) add)
+            [db* alias vg-record] (create db vg-flakes)]
+        ;; TODO - VG - ensure alias is not being used, throw if so
+        (recur r (assoc-in db* [:vg alias] vg-record)))
+      db)))
+
+(defn has-vgs?
+  [db]
+  (not-empty (:vg db)))
+
+(defn virtual-graph?
+  [f]
+  (-> f flake/o (= const/$fluree:VirtualGraph)))
+
+(defn extract-vgs
+  [fs]
+  (->> fs
+       (keep (fn [f]
+               (when (virtual-graph? f)
+                 (flake/s f))))
+       set))
+
+(defn check-virtual-graph
+  [db add rem]
+  ;; TODO - VG - should also check for retractions to "delete" virtual graph
+  ;; TODO - VG - check flakes if user updated existing virtual graph
+  (let [new-vgs (extract-vgs add)]
+    (cond-> db
+            (seq new-vgs) (create-virtual-graphs add new-vgs)
+            (has-vgs? db) (update-vgs add rem))))

@@ -257,7 +257,8 @@
   (-> db
       (assoc :t t)
       (commit-data/update-novelty flakes)
-      (vocab/hydrate-schema flakes)))
+      (vocab/hydrate-schema flakes)
+      (vg/check-virtual-graph flakes nil)))
 
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective

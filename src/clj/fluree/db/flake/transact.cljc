@@ -95,31 +95,6 @@
         (recur r (assoc-in db* [:vg alias] vg-record)))
       db)))
 
-(defn has-vgs?
-  [db]
-  (not-empty (:vg db)))
-
-(defn virtual-graph?
-  [f]
-  (-> f flake/o (= const/$fluree:VirtualGraph)))
-
-(defn extract-vgs
-  [fs]
-  (->> fs
-       (keep (fn [f]
-               (when (virtual-graph? f)
-                 (flake/s f))))
-       set))
-
-(defn check-virtual-graph
-  [db add rem]
-  ;; TODO - VG - should also check for retractions to "delete" virtual graph
-  ;; TODO - VG - check flakes if user updated existing virtual graph
-  (let [new-vgs (extract-vgs add)]
-    (cond-> db
-      (seq new-vgs) (create-virtual-graphs add new-vgs)
-      (has-vgs? db) (vg/update-vgs add rem))))
-
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
@@ -135,7 +110,7 @@
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id)
                            (vocab/hydrate-schema add)
-                           (check-virtual-graph add remove))]
+                           (vg/check-virtual-graph add remove))]
       {:add       add
        :remove    remove
        :db-after  db-after
