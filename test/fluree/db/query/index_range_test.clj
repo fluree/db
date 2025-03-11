@@ -13,7 +13,7 @@
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db      @(fluree/stage
                      (fluree/db ledger)
-                     {"@context" ["https://ns.flur.ee" context]
+                     {"@context" context
                       "insert"
                       [{:id           :ex/brian,
                         :type         :ex/User,

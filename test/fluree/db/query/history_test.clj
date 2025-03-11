@@ -15,7 +15,7 @@
         ledger-id   "historytest"
         context     [test-utils/default-context {:ex "http://example.org/ns/"}]
 
-        db1         @(fluree/create-with-txn conn {"@context" ["https://ns.flur.ee" context]
+        db1         @(fluree/create-with-txn conn {"@context" context
                                                    "ledger"   ledger-id
                                                    "insert"   [{:id   :ex/dan
                                                                 :ex/x "foo-1"
@@ -26,7 +26,7 @@
                                                                {:id   :ex/dog
                                                                 :ex/x "foo-1"
                                                                 :ex/y "bar-1"}]})
-        db2         @(fluree/transact! conn {"@context" ["https://ns.flur.ee" context]
+        db2         @(fluree/transact! conn {"@context" context
                                              "ledger"   ledger-id
                                              "delete"   {:id   :ex/dan
                                                          :ex/x "foo-1"
@@ -35,7 +35,7 @@
                                                          :ex/x "foo-2"
                                                          :ex/y "bar-2"}})
         ts2         (-> db2 :commit :time)
-        db3         @(fluree/transact! conn {"@context" ["https://ns.flur.ee" context]
+        db3         @(fluree/transact! conn {"@context" context
                                              "ledger"   ledger-id
                                              "delete"   {:id   :ex/dan
                                                          :ex/x "foo-2"
@@ -45,7 +45,7 @@
                                                          :ex/y "bar-3"}})
 
         ts3         (-> db3 :commit :time)
-        db4         @(fluree/transact! conn {"@context" ["https://ns.flur.ee" context]
+        db4         @(fluree/transact! conn {"@context" context
                                              "ledger"   ledger-id
                                              "delete"   [{:id   :ex/cat
                                                           :ex/x "foo-1"
@@ -59,7 +59,7 @@
                                                          {:id   :ex/dog
                                                           :ex/x "foo-dog"
                                                           :ex/y "bar-dog"}]})
-        db5         @(fluree/transact! conn {"@context" ["https://ns.flur.ee" context]
+        db5         @(fluree/transact! conn {"@context" context
                                              "ledger"   ledger-id
                                              "delete"   {:id   :ex/dan
                                                          :ex/x "foo-3"
@@ -243,12 +243,12 @@
             ledger-id "historycachetest"
             context   [test-utils/default-context {:ex "http://example.org/ns/"}]
 
-            db1       @(fluree/create-with-txn conn {"@context" ["https://ns.flur.ee" context]
+            db1       @(fluree/create-with-txn conn {"@context" context
                                                      "ledger"   ledger-id
                                                      "insert"   [{:id   :ex/dan
                                                                   :ex/x "foo-1"
                                                                   :ex/y "bar-1"}]})
-            db2       @(fluree/transact! conn {"@context" ["https://ns.flur.ee" context]
+            db2       @(fluree/transact! conn {"@context" context
                                                "ledger"   ledger-id
                                                "delete"   {:id   :ex/dan
                                                            :ex/x "foo-1"
@@ -270,7 +270,7 @@
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn      (test-utils/create-conn)
           ledger-id "committest"
-          context   ["https://ns.flur.ee" test-utils/default-context {:ex "http://example.org/ns/"}]
+          context   [test-utils/default-context {:ex "http://example.org/ns/"}]
 
           db1       @(fluree/create-with-txn conn {"@context" context
                                                    "ledger"   ledger-id
@@ -317,7 +317,6 @@
                                       :f/retract  []
                                       :f/size     pos-int?
                                       :f/t        1
-                                      :f/previous {:id test-utils/db-id?}
                                       :id         test-utils/db-id?}
                           :f/time    720000
                           :f/v       1
@@ -333,8 +332,7 @@
                                                                                  :f/assert   [{:ex/x "foo-cat"
                                                                                                :ex/y "bar-cat"
                                                                                                :id   :ex/alice}]
-                                                                                 :f/flakes   62
-                                                                                 :f/previous {:id test-utils/db-id?}
+                                                                                 :f/flakes   58
                                                                                  :f/retract  [#_{:ex/x "foo-3"
                                                                                                  :ex/y "bar-3"
                                                                                                  :id   :ex/alice}]
@@ -355,8 +353,7 @@
                                                 :f/assert   [{:ex/x "foo-cat"
                                                               :ex/y "bar-cat"
                                                               :id   :ex/cat}]
-                                                :f/flakes   47
-                                                :f/previous {:id test-utils/db-id?}
+                                                :f/flakes   44
                                                 :f/retract  []
                                                 :f/size     pos-int?
                                                 :f/t        4
@@ -394,8 +391,7 @@
                                           :f/assert   [{:ex/x "foo-cat"
                                                         :ex/y "bar-cat"
                                                         :id   :ex/cat}]
-                                          :f/flakes   47
-                                          :f/previous {:id test-utils/db-id?}
+                                          :f/flakes   44
                                           :f/retract  []
                                           :f/size     pos-int?
                                           :f/t        4
@@ -415,8 +411,7 @@
                                         :f/assert   [{:ex/x "foo-3"
                                                       :ex/y "bar-3"
                                                       :id   :ex/alice}]
-                                        :f/flakes   32
-                                        :f/previous {:id test-utils/db-id?}
+                                        :f/flakes   30
                                         :f/retract  [{:ex/x "foo-2"
                                                       :ex/y "bar-2"
                                                       :id   :ex/alice}]
@@ -438,8 +433,7 @@
                                         :f/assert   [{:ex/x "foo-2"
                                                       :ex/y "bar-2"
                                                       :id   :ex/alice}]
-                                        :f/flakes   17
-                                        :f/previous {:id test-utils/db-id?}
+                                        :f/flakes   16
                                         :f/retract  [{:ex/x "foo-1"
                                                       :ex/y "bar-1"
                                                       :id   :ex/alice}]
@@ -463,7 +457,7 @@
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
                                                      :id   :ex/cat}]
-                                       :f/flakes   47
+                                       :f/flakes   44
                                        :f/previous {:id test-utils/db-id?}
                                        :f/retract  []
                                        :f/size     pos-int?
@@ -482,7 +476,7 @@
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
                                                      :id   :ex/alice}]
-                                       :f/flakes   62
+                                       :f/flakes   58
                                        :f/previous {:id test-utils/db-id?}
                                        :f/retract  [{:ex/x "foo-3"
                                                      :ex/y "bar-3"
@@ -515,7 +509,6 @@
                                        :f/retract  []
                                        :f/size     pos-int?
                                        :f/t        1
-                                       :f/previous {:id test-utils/db-id?}
                                        :id         test-utils/db-id?}
                           :f/time     720000
                           :f/v        1
@@ -538,8 +531,7 @@
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
                                                        :id   :ex/alice}]
-                                         :f/flakes   32
-                                         :f/previous {:id test-utils/db-id?}
+                                         :f/flakes   30
                                          :f/retract  [{:ex/x "foo-2"
                                                        :ex/y "bar-2"
                                                        :id   :ex/alice}]
@@ -566,8 +558,7 @@
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
                                                        :id   :ex/alice}]
-                                         :f/flakes   62
-                                         :f/previous {:id test-utils/db-id?}
+                                         :f/flakes   58
                                          :f/retract  [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
                                                        :id   :ex/alice}]
@@ -609,14 +600,12 @@
       (let [ledger-name   "loaded-history-mem"
             conn          @(fluree/connect-memory)
             context       [test-utils/default-context {:ex "http://example.org/ns/"}]
-            _             @(fluree/create-with-txn conn {"@context" ["https://ns.flur.ee"
-                                                                     context]
+            _             @(fluree/create-with-txn conn {"@context" context
                                                          "ledger"   ledger-name
                                                          "insert"   {:id   :ex/alice
                                                                      :ex/x "foo-1"
                                                                      :ex/y "bar-1"}})
-            _             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                               context]
+            _             @(fluree/transact! conn {"@context" context
                                                    "ledger"   ledger-name
                                                    "delete"   {:id   :ex/alice
                                                                :ex/x "foo-1"
@@ -624,8 +613,7 @@
                                                    "insert"   {:id   :ex/alice
                                                                :ex/x "foo-2"
                                                                :ex/y "bar-2"}})
-            _             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                               context]
+            _             @(fluree/transact! conn {"@context" context
                                                    "ledger"   ledger-name
                                                    "delete"   {:id   :ex/alice
                                                                :ex/x "foo-2"
@@ -633,14 +621,12 @@
                                                    "insert"   {:id   :ex/alice
                                                                :ex/x "foo-3"
                                                                :ex/y "bar-3"}})
-            _             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                               context]
+            _             @(fluree/transact! conn {"@context" context
                                                    "ledger"   ledger-name
                                                    "insert"   {:id   :ex/cat
                                                                :ex/x "foo-cat"
                                                                :ex/y "bar-cat"}})
-            _             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                               context]
+            _             @(fluree/transact! conn {"@context" context
                                                    "ledger"   ledger-name
                                                    "delete"   {:id   :ex/alice
                                                                :ex/x "foo-3"
@@ -715,32 +701,27 @@
             conn        @(fluree/connect-memory {:defaults {:did (did/private->did-map test-utils/default-private-key)}})
             context     [test-utils/default-context {:ex "http://example.org/ns/"}]
 
-            _             @(fluree/create-with-txn conn {"@context" ["https://ns.flur.ee"
-                                                                     context]
+            _             @(fluree/create-with-txn conn {"@context" context
                                                          "ledger"   ledger-name
                                                          "insert"   {:id   :ex/alice
                                                                      :ex/x "foo-1"
                                                                      :ex/y "bar-1"}})
-            _             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                               context]
+            _             @(fluree/transact! conn {"@context" context
                                                    "ledger"   ledger-name
                                                    "insert"   {:id   :ex/alice
                                                                :ex/x "foo-2"
                                                                :ex/y "bar-2"}})
-            _             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                               context]
+            _             @(fluree/transact! conn {"@context" context
                                                    "ledger"   ledger-name
                                                    "insert"   {:id   :ex/alice
                                                                :ex/x "foo-3"
                                                                :ex/y "bar-3"}})
-            _             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                               context]
+            _             @(fluree/transact! conn {"@context" context
                                                    "ledger"   ledger-name
                                                    "insert"   {:id   :ex/cat
                                                                :ex/x "foo-cat"
                                                                :ex/y "bar-cat"}})
-            _             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                               context]
+            _             @(fluree/transact! conn {"@context" context
                                                    "ledger"   ledger-name
                                                    "insert"   {:id   :ex/alice
                                                                :ex/x "foo-cat"
@@ -818,16 +799,15 @@
               conn        @(fluree/connect-file {:storage-path storage-path
                                                  :defaults     {:identity (did/private->did-map
                                                                             test-utils/default-private-key)}})
-              context     [test-utils/default-context {:ex "http://example.org/ns/"}]
+              context     [test-utils/default-context {:ex   "http://example.org/ns/"
+                                                       :cred "https://www.w3.org/2018/credentials#"}]
 
-              a             @(fluree/create-with-txn conn {"@context" ["https://ns.flur.ee"
-                                                                       context]
+              a             @(fluree/create-with-txn conn {"@context" context
                                                            "ledger"   ledger-name
                                                            "insert"   {:id   :ex/alice
                                                                        :ex/x "foo-1"
                                                                        :ex/y "bar-1"}})
-              b             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                                 context]
+              b             @(fluree/transact! conn {"@context" context
                                                      "ledger"   ledger-name
                                                      "delete"   {:id   :ex/alice
                                                                  :ex/x "foo-1"
@@ -835,8 +815,7 @@
                                                      "insert"   {:id   :ex/alice
                                                                  :ex/x "foo-2"
                                                                  :ex/y "bar-2"}})
-              c             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                                 context]
+              c             @(fluree/transact! conn {"@context" context
                                                      "ledger"   ledger-name
                                                      "delete"   {:id   :ex/alice
                                                                  :ex/x "foo-2"
@@ -844,14 +823,12 @@
                                                      "insert"   {:id   :ex/alice
                                                                  :ex/x "foo-3"
                                                                  :ex/y "bar-3"}})
-              d             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                                 context]
+              d             @(fluree/transact! conn {"@context" context
                                                      "ledger"   ledger-name
                                                      "insert"   {:id   :ex/cat
                                                                  :ex/x "foo-cat"
                                                                  :ex/y "bar-cat"}})
-              e             @(fluree/transact! conn {"@context" ["https://ns.flur.ee"
-                                                                 context]
+              e             @(fluree/transact! conn {"@context" context
                                                      "ledger"   ledger-name
                                                      "delete"   {:id   :ex/alice
                                                                  :ex/x "foo-3"
@@ -865,8 +842,7 @@
                             [#:f{:assert  [{:ex/x "foo-3"
                                             :ex/y "bar-3"
                                             :id   :ex/alice}]
-                                 :commit  {"https://www.w3.org/2018/credentials#issuer"
-                                           {:id test-utils/did?}
+                                 :commit  {:cred/issuer {:id test-utils/did?}
                                            :f/address  test-utils/address?
                                            :f/alias    ledger-name
                                            :f/branch   "main"
@@ -874,8 +850,7 @@
                                                         :f/assert   [{:ex/x "foo-3"
                                                                       :ex/y "bar-3"
                                                                       :id   :ex/alice}]
-                                                        :f/flakes   36
-                                                        :f/previous {:id test-utils/db-id?}
+                                                        :f/flakes   34
                                                         :f/retract  [{:ex/x "foo-2"
                                                                       :ex/y "bar-2"
                                                                       :id   :ex/alice}]
@@ -893,8 +868,7 @@
                              #:f{:assert  [{:ex/x "foo-cat"
                                             :ex/y "bar-cat"
                                             :id   :ex/alice}]
-                                 :commit  {"https://www.w3.org/2018/credentials#issuer"
-                                           {:id test-utils/did?}
+                                 :commit  {:cred/issuer {:id test-utils/did?}
                                            :f/address  test-utils/address?
                                            :f/alias    ledger-name
                                            :f/branch   "main"
@@ -902,8 +876,7 @@
                                                         :f/assert   [{:ex/x "foo-cat"
                                                                       :ex/y "bar-cat"
                                                                       :id   :ex/alice}]
-                                                        :f/flakes   68
-                                                        :f/previous {:id test-utils/db-id?}
+                                                        :f/flakes   64
                                                         :f/retract  [{:ex/x "foo-3"
                                                                       :ex/y "bar-3"
                                                                       :id   :ex/alice}]
@@ -929,8 +902,8 @@
     (let [conn         @(fluree/connect-memory)
           ledger-name  "authortest"
           ledger       @(fluree/create conn ledger-name)
-          context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"
-                                                                             "f"  "https://ns.flur.ee/ledger#"}]
+          context      [test-utils/default-str-context {"ex" "http://example.org/ns/"
+                                                        "f"  "https://ns.flur.ee/ledger#"}]
           root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
           root-did     (:id (did/private->did-map root-privkey))
 
@@ -973,10 +946,10 @@
       (is (= [{"f:data" {"f:t" 1}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
                "f:data" {"f:t" 2},
-               "f:txn" "fluree:memory://ecdb35e5136082b09f10c3627982e2e1be32af4d0cf50c48ec8ee7f32467e4b7"}
+               "f:txn" "fluree:memory://bmpe6riaeyz6i54k2mjwwp6sn7tanw6jkighv4arnkoexqungnet"}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
                "f:data" {"f:t" 3},
-               "f:txn" "fluree:memory://d9130edd136b368943868d086d53f058523f6ca839acfa44d763030a0beb32e5"}]
+               "f:txn" "fluree:memory://ueaysvwnt36afj5kf5hsju2xbai556cn7sn4exwu4pmsjglg5ql"}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true
                                            :t              {:from 1 :to :latest}})
@@ -990,8 +963,8 @@
     (let [conn         @(fluree/connect-memory)
           ledger-name  "authortest"
           ledger       @(fluree/create conn ledger-name)
-          context      [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"
-                                                                             "f"  "https://ns.flur.ee/ledger#"}]
+          context      [test-utils/default-str-context {"ex" "http://example.org/ns/"
+                                                        "f"  "https://ns.flur.ee/ledger#"}]
           root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
           root-did     (:id (did/private->did-map root-privkey))
 
@@ -1324,7 +1297,7 @@
         conn          @(fluree/connect-memory)
         ledger-name   "annotationtest"
         ledger        @(fluree/create conn ledger-name)
-        context       [test-utils/default-str-context "https://ns.flur.ee" {"ex" "http://example.org/ns/"}]
+        context       [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
 
         db0           (fluree/db ledger)]
     (testing "valid annotations"
