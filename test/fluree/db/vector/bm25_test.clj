@@ -3,7 +3,8 @@
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [test-with-files.tools :refer [with-tmp-dir]]))
 
 (defn full-text-search
   "Performs a full text search and returns a couple attributes joined from the db
@@ -384,3 +385,52 @@
           (is (util/exception? ex-db))
           (is (= "BM25 index query must not contain wildcard '*' in subgraph selector"
                  (ex-message ex-db))))))))
+
+(deftest ^:integration bm25-search-persist
+  (with-tmp-dir storage-path
+    (testing "Loading bm25 from disk is identical to inital transactions"
+      (let [conn            @(fluree/connect-file {:storage-path storage-path
+                                                   :defaults     {:indexing {:reindex-min-bytes 1e2 ;; be sure to generate an index
+                                                                             :reindex-max-bytes 1e9}}})
+            ledger-name     "bm25-search-persist"
+            ledger          @(fluree/create conn ledger-name)
+            db              @(fluree/stage
+                              (fluree/db ledger)
+                              {"@context" {"ex" "http://example.org/ns/"}
+                               "insert"
+                               [{"@id"        "ex:food-article"
+                                 "ex:author"  "Jane Smith"
+                                 "ex:title"   "This is one title of a document about food"
+                                 "ex:summary" "This is a summary of the document about food including apples and oranges"}
+                                {"@id"        "ex:hobby-article"
+                                 "ex:author"  "John Doe"
+                                 "ex:title"   "This is an article about hobbies"
+                                 "ex:summary" "Hobbies include reading and hiking"}]})
+
+            db*             @(fluree/stage
+                              db
+                              {"insert"
+                               {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                                  "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                                  "fidx" "https://ns.flur.ee/index#"
+                                                  "ex"   "http://example.org/"},
+                                "@id"            "ex:articleSearch"
+                                "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                                "f:virtualGraph" "articleSearch"
+                                "fidx:stemmer"   {"@id" "fidx:snowballStemmer-en"}
+                                "fidx:stopwords" {"@id" "fidx:stopwords-en"}
+                                "f:query"        {"@type"  "@json"
+                                                  "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                            "where"    [{"@id"       "?x"
+                                                                         "ex:author" "?author"}]
+                                                            "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
+
+            db-committed    @(fluree/commit! ledger db*)
+            conn2           @(fluree/connect-file {:storage-path storage-path})
+            loaded          @(fluree/load conn2 ledger-name)
+            expected-result [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
+                             ["ex:food-article" 0.6510910594922633 "This is one title of a document about food"]]]
+        (is (= expected-result
+               (full-text-search db-committed "Apples for snacks for John")))
+        (is (= expected-result
+               (full-text-search (fluree/db loaded) "Apples for snacks for John")))))))
