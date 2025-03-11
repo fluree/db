@@ -314,10 +314,11 @@
     (match/match-class db fuel-tracker solution class-mch error-ch))
 
   (-activate-alias [db alias']
-    (cond
-      (= alias alias')              db
-      (flat-rank/flatrank-alias? alias') (flat-rank/index-graph db alias')
-      (where/virtual-graph? alias') (vg/load-virtual-graph db alias')))
+    (go
+      (cond
+        (= alias alias') db
+        (flat-rank/flatrank-alias? alias') (flat-rank/index-graph db alias')
+        (where/virtual-graph? alias') (vg/load-virtual-graph db alias'))))
 
   (-aliases [_]
     [alias])

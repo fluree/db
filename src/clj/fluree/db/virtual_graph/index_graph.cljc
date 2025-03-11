@@ -3,6 +3,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             #?(:clj [fluree.db.virtual-graph.bm25.index :as bm25])
+            #?(:clj [fluree.db.virtual-graph.bm25.storage])
             [fluree.db.virtual-graph.parse :as vg-parse]
             [fluree.db.virtual-graph :as vg]
             [fluree.db.util.json :as json]
@@ -45,10 +46,6 @@
            :id vg-id
            :alias vg-alias)))
 
-(defn bm25-idx?
-  [idx-rdf-type]
-  (some #(= % const/$fluree:index-BM25) idx-rdf-type))
-
 (defn create
   [{:keys [alias t] :as db} vg-flakes]
   (let [db-vol         (volatile! db) ;; needed to potentially add new namespace codes based on query IRIs
@@ -60,14 +57,13 @@
         db*            @db-vol
         vg             (cond
                          ;; add vector index and other types of virtual graphs here
-                         (bm25-idx? type) #?(:clj  (bm25/new-bm25-index db vg-flakes vg-opts)
-                                             :cljs (throw (ex-info "BM25 index not supported in cljs"
-                                                                  {:status 400
-                                                                   :error  :db/invalid-index}))))
-        _              (when (nil? vg)
-                         (throw (ex-info "Unrecognized virtual graph creation attempted."
-                                         {:status 400
-                                          :error  :db/invalid-index})))
+                         (bm25/bm25-iri? type) #?(:clj  (bm25/new-bm25-index db vg-flakes vg-opts)
+                                                  :cljs (throw (ex-info "BM25 index not supported in cljs"
+                                                                        {:status 400
+                                                                         :error  :db/invalid-index})))
+                         :else (throw (ex-info "Unrecognized virtual graph creation attempted."
+                                               {:status 400
+                                                :error  :db/invalid-index})))
         initialized-vg (vg/initialize vg db*)]
     [db* alias initialized-vg]))
 

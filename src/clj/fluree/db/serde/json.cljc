@@ -186,10 +186,10 @@
 
   serde/BM25Serializer
   (serialize-bm25 [_ bm25]
-    (json/stringify bm25))
+   ;; output as JSON, no additional parsing of keys/vals needed
+    bm25)
   (deserialize-bm25 [_ bm25]
     (-> bm25
-        (json/parse false)
         util/keywordize-keys
         (update :namespace-codes numerize-keys)
         (update :index-state util/keywordize-keys))))

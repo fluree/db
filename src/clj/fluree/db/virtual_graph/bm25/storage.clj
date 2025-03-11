@@ -1,6 +1,5 @@
 (ns fluree.db.virtual-graph.bm25.storage
   (:require [clojure.set :refer [map-invert]]
-            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.storage :as storage]
             [fluree.db.serde :as serde]
@@ -8,6 +7,7 @@
             [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.bm25.stemmer :as stemmer]
             [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
+            [fluree.db.virtual-graph.bm25.index :as bm25]
             [fluree.db.virtual-graph.parse :as parse]))
 
 (set! *warn-on-reflection* true)
@@ -66,18 +66,24 @@
                           terms vectors)]
     (assoc state :terms terms*)))
 
+(defn coerce-double
+  [n]
+  (double n))
+
 (defn reify-state
   [state-data]
   (let [term-vec   (:terms state-data)
         item-count (-> state-data :vectors count)
         index      (-> state-data
+                       (assoc :dimensions (count term-vec)
+                              :item-count item-count)
                        (update :terms reify-terms)
                        (update :vectors reify-vectors)
                        (update :avg-length rationalize)
-                       (assoc :dimensions (count term-vec))
-                       (assoc :item-count item-count)
                        (cross-reference-items term-vec))]
-    (atom {:index index})))
+    (atom {:index index
+           :pending-ch nil
+           :pending-status nil})))
 
 (defn vg-data
   [vg]
@@ -108,21 +114,26 @@
         (assoc :stemmer (stemmer/initialize lang))
         (assoc :stopwords (stopwords/initialize lang))
         (update :type (partial mapv iri/deserialize-sid))
-        (update :index-state reify-state))))
+        (update :index-state reify-state)
+        (update :b coerce-double)
+        (update :k1 coerce-double))))
 
 (defmethod vg/write-vg :bm25
   [{:keys [storage serializer] :as _index-catalog} {:keys [alias db-alias] :as vg}]
-  (let [data            (vg-data vg)
-        serialized-data (serde/serialize-bm25 serializer data)
-        path            (vg/storage-path const/$fluree:index-BM25 db-alias alias)]
-    (storage/content-write-json storage path serialized-data)))
+  (go-try
+    (let [data            (vg-data vg)
+          serialized-data (serde/serialize-bm25 serializer data)
+          path            (vg/storage-path :bm25 db-alias (vg/trim-alias-ref alias))
+          write-res       (<? (storage/content-write-json storage path serialized-data))]
+      (assoc write-res :type "bm25"))))
 
 (defmethod vg/read-vg :bm25
-  [{:keys [storage serializer] :as _index-catalog} vg-address]
+  [{:keys [storage serializer] :as _index-catalog} {:keys [address] :as vg-meta}]
   (go-try
-    (if-let [serialized-data (<? (storage/read-json storage vg-address true))]
-      (let [vg-data (serde/deserialize-bm25 serializer serialized-data)]
-        (reify-bm25 vg-data))
+    (if-let [serialized-data (<? (storage/read-json storage address false))]
+      (-> (serde/deserialize-bm25 serializer serialized-data)
+          reify-bm25
+          bm25/map->BM25-VirtualGraph)
       (throw (ex-info (str "Could not load bm25 index at address: "
-                           vg-address ".")
+                           address ".")
                       {:status 400, :error :db/unavailable})))))

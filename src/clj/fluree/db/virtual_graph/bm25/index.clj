@@ -256,11 +256,12 @@
   (-match-class [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
 
-  (-activate-alias [this _]
-    this)
-
   ;; return db-alias here, as it is used when encoding/decoding IRIs in the search function which is original db-dependent
   (-aliases [_] [db-alias]))
+
+(defn bm25-iri?
+  [idx-rdf-type]
+  (some #(= % const/$fluree:index-BM25) idx-rdf-type))
 
 ;; TODO - VG - triggering updates only works for queries for single subject, no nested nodes
 ;; TODO - VG - prevent :select ["*"] syntax from being allowed, need to list properties explicitly

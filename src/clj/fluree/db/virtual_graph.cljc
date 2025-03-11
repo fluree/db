@@ -7,18 +7,30 @@
   (initialize [this source-db] "Initialize a new virtual graph based on the provided db - returns promise chan of eventual result"))
 
 (defn vg-type-name
-  [vg-type]
-  (-> vg-type iri/get-name str/lower-case))
+  [vg]
+  (-> vg :type first iri/get-name str/lower-case))
+
+(defn vg-type-kw
+  [vg]
+  (keyword (vg-type-name vg)))
 
 (defmulti write-vg
-  (fn [_index-catalog vg]
-    (-> vg :type first vg-type-name keyword)))
+          (fn [_index-catalog vg]
+            (vg-type-kw vg)))
 
 (defn storage-path
-  [vg-type db-alias vg-alias]
-  (let [vg-path (vg-type-name vg-type)]
-    (str/join "/" [db-alias vg-path vg-alias])))
+  [vg-type-kw db-alias vg-alias]
+  (str/join "/" [db-alias (name vg-type-kw) vg-alias]))
 
 (defmulti read-vg
-  (fn [_index-catalog vg-address]
-    (-> vg-address (str/split #"/") second keyword)))
+  (fn [_index-catalog storage-meta]
+    (-> storage-meta :type keyword)))
+
+(defn trim-alias-ref
+  "Virtual graph aliases are prefixed by `##` to indicate they are relative virtual graphs.
+
+  When writing a virtual graph to storage, etc. we need to remove the `##` prefix to get the actual alias."
+  [vg-alias]
+  (if (str/starts-with? vg-alias "##")
+    (subs vg-alias 2)
+    vg-alias))

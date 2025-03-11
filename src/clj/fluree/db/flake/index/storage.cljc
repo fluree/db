@@ -81,8 +81,9 @@
     (loop [[[vg-alias vg] & r] vg-map
            address-map         {}]
       (if vg-alias
-        (let [address (<? (vg/write-vg index-catalog vg))]
-          (recur r (assoc address-map vg-alias address)))
+        (let [write-resp (-> (<? (vg/write-vg index-catalog vg))
+                             (select-keys [:address :size :type]))]
+          (recur r (assoc address-map vg-alias write-resp)))
         address-map))))
 
 (defn write-db-root
@@ -176,11 +177,11 @@
 (defn reify-virtual-graphs
   [index-catalog vg-address-map]
   (go-try
-    (loop [[[vg-alias address] & r] vg-address-map
+    (loop [[[vg-alias storage-meta] & r] vg-address-map
            vg-map         {}]
       (if vg-alias
-        (let [vg (<? (vg/read-vg index-catalog address))]
-          (recur r (assoc vg-map vg-alias vg)))
+        (let [vg (<? (vg/read-vg index-catalog storage-meta))]
+          (recur r (assoc vg-map (:alias vg) vg)))
         vg-map))))
 
 (defn read-db-root

@@ -613,16 +613,21 @@
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
-  (try*
-    (if-let [graph (-activate-alias ds alias)]
-      (match-clause graph fuel-tracker solution clause error-ch)
-      nil-channel)
-    (catch* e
-      (log/error e "Error activating alias" alias)
-      (>! error-ch (ex-info (str "Error activating alias: " alias
-                                 " due to exception: " (ex-message e))
-                            {:status 400, :error  :db/invalid-query}
-                            e)))))
+  (let [res-ch (async/chan)]
+    (go
+      (try*
+        (if-let [graph (async/<! (-activate-alias ds alias))]
+          (-> (match-clause graph fuel-tracker solution clause error-ch)
+              (async/pipe res-ch))
+          (async/close! res-ch))
+        (catch* e
+                (log/error e "Error activating alias" alias)
+          (async/>! error-ch (ex-info (str "Error activating alias: " alias
+                                           " due to exception: " (ex-message e))
+                                      {:status 400, :error :db/invalid-query}
+                                      e))
+          (async/close! res-ch))))
+    res-ch))
 
 (defmethod match-pattern :exists
   [ds fuel-tracker solution pattern error-ch]

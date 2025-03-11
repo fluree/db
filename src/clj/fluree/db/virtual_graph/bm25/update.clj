@@ -33,7 +33,8 @@
             (conj acc [idx frequency])
             acc))
         [])
-       (sort-by first)))
+       (sort-by first)
+       vec))
 
 (defn update-avg-len
   [avg-length item-count doc-len]
