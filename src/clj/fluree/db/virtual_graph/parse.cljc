@@ -76,19 +76,37 @@
   [parsed-query]
   (instance? SubgraphSelector (:select parsed-query)))
 
+(defn select-item->iri
+  [select-item]
+  (when (map? select-item)
+    (:iri select-item)))
+
+(defn subgraph-iris
+  "Returns only IRI string values from select spec.
+
+  e.g. for select: {?x ['@id' 'ex:name']} we'd return:
+  ['@id', 'http://example.org/name']"
+  [select-spec]
+  (->> (vals select-spec)
+       (keep select-item->iri)))
+
+(defn wildcard-select-spec?
+  [select-spec]
+  (:wildcard? select-spec))
+
 (defn get-subgraph-props
   "Returns a list of iris contained in the :select subgraph.
-  Ensures one of them is @id."
+  Ensures one of them is @id and not wildcard (select '*') exists."
   [parsed-query]
-  (let [subgraph-iris (->> parsed-query
-                           :select
-                           :spec
-                           vals
-                           (keep #(when (map? %)
-                                    (:iri %))))]
-    (if (some #{"@id"} subgraph-iris)
-      (filter #(not= "@id" %) subgraph-iris)
-      (throw (ex-info "BM25 index query must not contain @id in the subgraph selector"
+  (let [select-spec (-> parsed-query :select :spec)
+        iris        (subgraph-iris select-spec)]
+    (when (wildcard-select-spec? select-spec)
+      (throw (ex-info "BM25 index query must not contain wildcard '*' in subgraph selector"
+                      {:status 400
+                       :error  :db/invalid-index})))
+    (if (some #{"@id"} iris)
+      (filter #(not= "@id" %) iris)
+      (throw (ex-info "BM25 index query must contain @id in the subgraph selector"
                       {:status 400
                        :error  :db/invalid-index})))))
 

@@ -264,7 +264,6 @@
   (some #(= % const/$fluree:index-BM25) idx-rdf-type))
 
 ;; TODO - VG - triggering updates only works for queries for single subject, no nested nodes
-;; TODO - VG - prevent :select ["*"] syntax from being allowed, need to list properties explicitly
 ;; TODO - VG - prevent :selectOne from being used, or maybe just util/seq all results
 ;; TODO - VG - future feature - weighted properties
 (defn new-bm25-index
