@@ -3,7 +3,7 @@
             [clojure.walk :refer [postwalk]]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
-            [fluree.db.connection :as connection :refer [notify-ledger]]
+            [fluree.db.connection :as connection :refer [notify-commit]]
             [fluree.db.util.context :as context]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.iri :as iri]
@@ -210,7 +210,7 @@
   (validate-connection conn)
   (promise-wrap
     (if (map? commit-map)
-      (notify-ledger conn commit-map)
+      (notify-commit conn commit-map)
       (go
         (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
                  {:status 400 :error :db/invalid-commit-map})))))
