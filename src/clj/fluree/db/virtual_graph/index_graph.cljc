@@ -50,6 +50,7 @@
   [{:keys [alias t] :as db} vg-flakes]
   (let [db-vol         (volatile! db) ;; needed to potentially add new namespace codes based on query IRIs
         vg-opts        (-> (idx-flakes->opts vg-flakes)
+                           (update :query vg-parse/select-one->select)
                            (vg-parse/parse-document-query db-vol)
                            (add-vg-id alias)
                            (assoc :genesis-t t))

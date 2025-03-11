@@ -152,8 +152,8 @@
   (internal format) yet, because the namespaces used in the query may
   not yet exist if this index was created before data."
   [{:keys [query] :as bm25-opts} db-vol]
-  (let [parsed-query (-> (parse-query query)
-                         (ensure-select-subgraph))
+  (let [parsed-query  (-> (parse-query query)
+                          (ensure-select-subgraph))
         ;; TODO - ultimately we want a property dependency chain, so when the properties change we can
         ;; TODO - trace up the chain to the node(s) that depend on them and update the index accordingly
         query-props   (get-query-props parsed-query)
@@ -162,6 +162,16 @@
     (assoc bm25-opts
       :parsed-query parsed-query
       :property-deps property-deps)))
+
+(defn select-one->select
+  "If the virtual graph query is specified with a selectOne
+  instead of select, convert to a select."
+  [query]
+  (if-let [select-one (get query "selectOne")]
+    (-> query
+        (assoc "select" select-one)
+        (dissoc "selectOne"))
+    query))
 
 (defn finalize
   [search-af error-ch solution-ch]

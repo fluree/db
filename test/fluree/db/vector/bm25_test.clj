@@ -36,32 +36,57 @@
                      {"@id"        "ex:hobby-article"
                       "ex:author"  "John Doe"
                       "ex:title"   "This is an article about hobbies"
-                      "ex:summary" "Hobbies include reading and hiking"}]})
+                      "ex:summary" "Hobbies include reading and hiking"}]})]
 
-          db-r   @(fluree/stage
-                   db
-                   {"insert"
-                    {"@context"       {"f"    "https://ns.flur.ee/ledger#"
-                                       "fvg"  "https://ns.flur.ee/virtualgraph#"
-                                       "fidx" "https://ns.flur.ee/index#"
-                                       "ex"   "http://example.org/"},
-                     "@id"            "ex:articleSearch"
-                     "@type"          ["f:VirtualGraph" "fidx:BM25"]
-                     "f:virtualGraph" "articleSearch"
-                     ;"fidx:b"         0.75 ;; TODO - this is same as default - test with different values and verify values are picked up
-                     ;"fidx:k1"        1.2
-                     ;; TODO - I think specifying the language below was updated
-                     "fidx:stemmer"   {"@id" "fidx:snowballStemmer-en"}
-                     "fidx:stopwords" {"@id" "fidx:stopwords-en"}
-                     "f:query"        {"@type"  "@json"
-                                       "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                                 "where"    [{"@id"       "?x"
-                                                              "ex:author" "?author"}]
-                                                 "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})]
+      (testing "with a select clause"
+        (let [db-r @(fluree/stage
+                     db
+                     {"insert"
+                      {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                         "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                         "fidx" "https://ns.flur.ee/index#"
+                                         "ex"   "http://example.org/"},
+                       "@id"            "ex:articleSearch"
+                       "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                       "f:virtualGraph" "articleSearch"
+                       ;"fidx:b"         0.75 ;; TODO - this is same as default - test with different values and verify values are picked up
+                       ;"fidx:k1"        1.2
+                       ;; TODO - I think specifying the language below was updated
+                       "fidx:stemmer"   {"@id" "fidx:snowballStemmer-en"}
+                       "fidx:stopwords" {"@id" "fidx:stopwords-en"}
+                       "f:query"        {"@type"  "@json"
+                                         "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                   "where"    [{"@id"       "?x"
+                                                                "ex:author" "?author"}]
+                                                   "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})]
+          (is (= [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
+                  ["ex:food-article" 0.6510910594922633 "This is one title of a document about food"]]
+                 (full-text-search db-r "Apples for snacks for John")))))
 
-      (is (= [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
-              ["ex:food-article" 0.6510910594922633 "This is one title of a document about food"]]
-             (full-text-search db-r "Apples for snacks for John"))))))
+      (testing "with a selectOne clause"
+        (let [db-r @(fluree/stage
+                     db
+                     {"insert"
+                      {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                         "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                         "fidx" "https://ns.flur.ee/index#"
+                                         "ex"   "http://example.org/"},
+                       "@id"            "ex:articleSearch"
+                       "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                       "f:virtualGraph" "articleSearch"
+                       ;"fidx:b"         0.75 ;; TODO - this is same as default - test with different values and verify values are picked up
+                       ;"fidx:k1"        1.2
+                       ;; TODO - I think specifying the language below was updated
+                       "fidx:stemmer"   {"@id" "fidx:snowballStemmer-en"}
+                       "fidx:stopwords" {"@id" "fidx:stopwords-en"}
+                       "f:query"        {"@type"  "@json"
+                                         "@value" {"@context"  {"ex" "http://example.org/ns/"}
+                                                   "where"     [{"@id"       "?x"
+                                                                 "ex:author" "?author"}]
+                                                   "selectOne" {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})]
+          (is (= [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
+                  ["ex:food-article" 0.6510910594922633 "This is one title of a document about food"]]
+                 (full-text-search db-r "Apples for snacks for John"))))))))
 
 (deftest ^:integration bm25-index-search-before-data
   (testing "Creating and using a bm25 index before inserting data"

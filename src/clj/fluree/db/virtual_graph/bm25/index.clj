@@ -264,8 +264,8 @@
   (some #(= % const/$fluree:index-BM25) idx-rdf-type))
 
 ;; TODO - VG - triggering updates only works for queries for single subject, no nested nodes
-;; TODO - VG - prevent :selectOne from being used, or maybe just util/seq all results
 ;; TODO - VG - future feature - weighted properties
+;; TODO - VG - drop index
 (defn new-bm25-index
   [{:keys [namespaces namespace-codes alias] :as _db} index-flakes vg-opts]
   (-> (idx-flakes->opts index-flakes)
