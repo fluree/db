@@ -49,12 +49,10 @@
   (cond (:select-one q) (async/take 1 result-ch)
 
         (:construct q)
-        (-> (async/into [] result-ch)
-            (async/pipe (async/chan 1 (map (partial select/wrap-construct q)))))
+        (async/transduce identity (completing conj (partial select/wrap-construct q)) [] result-ch)
 
         (-> q :opts :output (= :sparql))
-        (-> (async/into [] result-ch)
-            (async/pipe (async/chan 1 (map select/wrap-sparql))))
+        (async/transduce identity (completing conj select/wrap-sparql) [] result-ch)
 
         :else
         (async/into [] result-ch)))
