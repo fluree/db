@@ -314,7 +314,7 @@
     (match/match-class db fuel-tracker solution class-mch error-ch))
 
   (-activate-alias [db alias']
-    (go
+    (go-try
       (cond
         (= alias alias') db
         (flat-rank/flatrank-alias? alias') (flat-rank/index-graph db alias')
