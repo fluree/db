@@ -61,13 +61,16 @@
       (mapv (fn [grouped-val] (display-fn grouped-val compact))
             group))))
 
+(def display-fql-aggregate (display-aggregate display/fql))
+(def display-sparql-aggregate (display-aggregate display/sparql))
+
 (defmethod display/fql ::grouping
   [match compact]
-  ((display-aggregate display/fql) match compact))
+  (display-fql-aggregate match compact))
 
 (defmethod display/sparql ::grouping
   [match compact]
-  ((display-aggregate display/sparql) match compact))
+  (display-sparql-aggregate match compact))
 
 (defn combine
   "Returns a channel of solutions from `solution-ch` collected into groups defined
