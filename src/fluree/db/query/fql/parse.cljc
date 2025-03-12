@@ -22,7 +22,8 @@
   "Returns x as a symbol if x is a valid variable, or nil otherwise. A valid
   variable is a string, symbol, or keyword whose name starts with '?'."
   [x]
-  (when (v/variable? x)
+  (when (or (v/variable? x)
+            (v/bnode-variable? x))
     (symbol x)))
 
 (defn parse-variable
@@ -161,7 +162,7 @@
 
 (defn type-pred-match?
   [p-mch]
-  (let [p-iri (::where/iri p-mch)]
+  (let [p-iri (where/get-iri p-mch) ]
     (contains? type-pred-iris p-iri)))
 
 (defn safe-read
@@ -360,7 +361,8 @@
 
 (defn parse-subject
   [id context]
-  (if (v/variable? id)
+  (if (or (v/variable? id)
+          (v/bnode-variable? id))
     (parse-variable id)
     (parse-subject-iri id context)))
 
@@ -377,7 +379,7 @@
 
 (defn flip-reverse-pattern
   [[s-mch p-mch o-mch :as pattern]]
-  (if (::where/reverse p-mch)
+  (if (where/get-reverse p-mch)
     [o-mch p-mch s-mch]
     pattern))
 
@@ -404,7 +406,8 @@
 (defn parse-statement*
   [s-mch p-mch o vars context]
   (cond
-    (v/variable? o)
+    (or (v/variable? o)
+        (v/bnode-variable? o))
     (let [o-mch (parse-variable o)]
       [(flip-reverse-pattern [s-mch p-mch o-mch])])
 
@@ -527,6 +530,14 @@
     (-> where
         syntax/coerce-where
         (parse-where-clause vars context))))
+
+(defn parse-construct
+  [q context]
+  (when-let [construct (:construct q)]
+    (-> construct
+        syntax/coerce-where
+        (parse-where-clause nil context)
+        select/construct-selector)))
 
 (defn parse-select-as-fn
   [f context output]
@@ -681,28 +692,25 @@
   (or (get jsonld nme)
       (get jsonld (keyword nme))))
 
-(defn extract-opts
-  [q]
-  (or (get q "opts")
-      (get q :opts)))
-
 (defn parse-analytical-query
   ([q] (parse-analytical-query q nil))
   ([q parent-context]
-   (let [context  (cond->> (context/extract q)
-                           parent-context (merge parent-context))
-         [vars values] (-> (get-named q "values")
-                           (parse-values context))
-         where    (-> (get-named q "where")
-                      (parse-where vars context))
-         grouping (parse-grouping q)
-         ordering (parse-ordering q)]
+   (let [orig-context  (:context q)
+         context       (cond->> (json-ld/parse-context orig-context)
+                         parent-context (merge parent-context))
+         [vars values] (parse-values (:values q) context)
+         where         (parse-where (:where q) vars context)
+         construct     (parse-construct q context )
+         grouping      (parse-grouping q)
+         ordering      (parse-ordering q)]
      (-> q
          (assoc :context context
                 :where where)
          (cond-> (seq values) (assoc :values values)
-                 grouping (assoc :group-by grouping)
-                 ordering (assoc :order-by ordering))
+                 orig-context (assoc :orig-context orig-context)
+                 grouping  (assoc :group-by grouping)
+                 ordering  (assoc :order-by ordering)
+                 construct (assoc :construct construct))
          (parse-having context)
          (parse-select context)
          parse-fuel))))
@@ -756,7 +764,7 @@
                        (iri/new-blank-node-id)
                        id)))
           ref-cmp (if m
-                    (assoc ref-obj ::where/meta m)
+                    (where/match-meta ref-obj m)
                     ref-obj)
           v-map*  (if (nil? id)
                     ;; project newly created bnode-id into v-map
