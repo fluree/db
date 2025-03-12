@@ -1,7 +1,8 @@
 (ns fluree.db.query.exec.group
   (:require [clojure.core.async :as async]
             [fluree.db.query.exec.select :as select]
-            [fluree.db.query.exec.select.display :as display]
+            [fluree.db.query.exec.select.fql :as select.fql]
+            [fluree.db.query.exec.select.sparql :as select.sparql]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]))
@@ -61,14 +62,14 @@
       (mapv (fn [grouped-val] (display-fn grouped-val compact))
             group))))
 
-(def display-fql-aggregate (display-aggregate display/fql))
-(def display-sparql-aggregate (display-aggregate display/sparql))
+(def display-fql-aggregate (display-aggregate select.fql/display))
+(def display-sparql-aggregate (display-aggregate select.sparql/display))
 
-(defmethod display/fql ::grouping
+(defmethod select.fql/display ::grouping
   [match compact]
   (display-fql-aggregate match compact))
 
-(defmethod display/sparql ::grouping
+(defmethod select.sparql/display ::grouping
   [match compact]
   (display-sparql-aggregate match compact))
 
