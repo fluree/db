@@ -8,6 +8,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.select.fql :as select.fql]
+            [fluree.db.query.exec.select.json-ld :as select.json-ld]
             [fluree.db.query.exec.select.sparql :as select.sparql]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -123,7 +124,7 @@
       (go (->> (mapv #(where/assign-matched-values % solution) patterns)
                ;; partition by s-match
                (partition-by first)
-               (mapv (partial display/json-ld-node compact bnodes)))))))
+               (mapv (partial select.json-ld/json-ld-node compact bnodes)))))))
 
 (defn construct-selector
   [patterns]
@@ -235,7 +236,7 @@
     (cond-> {"@graph" (->> results
                            (sort-by #(get % id-key))
                            (partition-by #(get % id-key))
-                           (mapv display/nest-multicardinal-values))}
+                           (mapv select.json-ld/nest-multicardinal-values))}
       orig-context (assoc "@context" orig-context))))
 
 (defn wrap-sparql
