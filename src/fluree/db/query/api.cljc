@@ -33,8 +33,10 @@
   [query {:keys [identity did issuer] :as override-opts}]
   (update query :opts (fn [{:keys [max-fuel meta] :as opts}]
                         ;; ensure :max-fuel key is present
-                        (-> (assoc opts :max-fuel max-fuel)
-                            (merge opts override-opts)
+                        (-> opts
+                            (assoc :max-fuel max-fuel)
+                            (merge override-opts)
+                            (update :output #(or % :fql))
                             ;; get rid of :did, :issuer opts
                             (update :identity #(or % (:did opts) (:issuer opts)))
                             (dissoc :did :issuer)))))
@@ -123,16 +125,16 @@
         (<? (fql/query ds* query**)))))))
 
 (defn query-sparql
-  [db query]
+  [db query override-opts]
   (go-try
-    (let [fql (sparql/->fql query)]
-      (<? (query-fql db fql)))))
+    (let [fql     (sparql/->fql query)]
+      (<? (query-fql db fql override-opts)))))
 
 (defn query
-  [db query {:keys [format] :as _opts :or {format :fql}}]
+  [db query {:keys [format] :as override-opts :or {format :fql}}]
   (case format
-    :fql (query-fql db query)
-    :sparql (query-sparql db query)))
+    :fql (query-fql db query override-opts)
+    :sparql (query-sparql db query override-opts)))
 
 (defn contextualize-ledger-400-error
   [info-str e]

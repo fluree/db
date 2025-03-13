@@ -22,7 +22,8 @@
   "Returns x as a symbol if x is a valid variable, or nil otherwise. A valid
   variable is a string, symbol, or keyword whose name starts with '?'."
   [x]
-  (when (v/variable? x)
+  (when (or (v/variable? x)
+            (v/bnode-variable? x))
     (symbol x)))
 
 (defn parse-variable
@@ -161,7 +162,7 @@
 
 (defn type-pred-match?
   [p-mch]
-  (let [p-iri (::where/iri p-mch)]
+  (let [p-iri (where/get-iri p-mch) ]
     (contains? type-pred-iris p-iri)))
 
 (defn safe-read
@@ -360,7 +361,8 @@
 
 (defn parse-subject
   [id context]
-  (if (v/variable? id)
+  (if (or (v/variable? id)
+          (v/bnode-variable? id))
     (parse-variable id)
     (parse-subject-iri id context)))
 
@@ -377,7 +379,7 @@
 
 (defn flip-reverse-pattern
   [[s-mch p-mch o-mch :as pattern]]
-  (if (::where/reverse p-mch)
+  (if (where/get-reverse p-mch)
     [o-mch p-mch s-mch]
     pattern))
 
@@ -404,7 +406,8 @@
 (defn parse-statement*
   [s-mch p-mch o vars context]
   (cond
-    (v/variable? o)
+    (or (v/variable? o)
+        (v/bnode-variable? o))
     (let [o-mch (parse-variable o)]
       [(flip-reverse-pattern [s-mch p-mch o-mch])])
 
@@ -528,15 +531,23 @@
         syntax/coerce-where
         (parse-where-clause vars context))))
 
+(defn parse-construct
+  [q context]
+  (when-let [construct (:construct q)]
+    (-> construct
+        syntax/coerce-where
+        (parse-where-clause nil context)
+        select/construct-selector)))
+
 (defn parse-select-as-fn
-  [f context]
+  [f context output]
   (let [parsed-fn  (parse-code f)
         fn-name    (some-> parsed-fn second first)
         bind-var   (last parsed-fn)
         aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
     (-> parsed-fn
         (eval/compile context)
-        (select/as-selector bind-var aggregate?))))
+        (select/as-selector output bind-var aggregate?))))
 
 (defn parse-select-aggregate
   [f context]
@@ -579,61 +590,65 @@
    {:depth depth} selection))
 
 (defn parse-select-map
-  [sm depth context]
+  [sm depth context output]
   (log/trace "parse-select-map:" sm)
-  (let [[subj selection] (first sm)
-        spec             (expand-selection selection depth context)]
-    (if (v/variable? subj)
-      (let [var (parse-var-name subj)]
-        (select/subgraph-selector var selection depth spec))
-      (let [iri (json-ld/expand-iri subj context false)]
-        (select/subgraph-selector iri selection depth spec)))))
+  (if (= output :fql)
+    (let [[subj selection] (first sm)
+          spec             (expand-selection selection depth context)]
+      (if (v/variable? subj)
+        (let [var (parse-var-name subj)]
+          (select/subgraph-selector var selection depth spec))
+        (let [iri (json-ld/expand-iri subj context false)]
+          (select/subgraph-selector iri selection depth spec))))
+    (throw (ex-info "Can only use subgraph selector with FQL output formatting."
+                    {:status 400 :error :db/invalid-select}))))
 
 (defn parse-selector
-  [context depth s]
+  [context depth output s]
   (if (syntax/wildcard? s)
-    select/wildcard-selector
+    (select/wildcard-selector output)
     (let [[selector-type selector-val] (syntax/parse-selector s)]
       (case selector-type
-        :var (-> selector-val symbol select/variable-selector)
+        :var (-> selector-val symbol (select/variable-selector output))
         :aggregate (case (first selector-val)
                      :string-fn (if (re-find #"^\(as " s)
-                                  (parse-select-as-fn s context)
+                                  (parse-select-as-fn s context output)
                                   (parse-select-aggregate s context))
                      :list-fn (if (= 'as (first s))
-                                (parse-select-as-fn s context)
+                                (parse-select-as-fn s context output)
                                 (parse-select-aggregate s context))
                      :vector-fn (if (= "as" (first s))
-                                  (parse-select-as-fn s context)
+                                  (parse-select-as-fn s context output)
                                   (parse-select-aggregate s context)))
-        :select-map (parse-select-map s depth context)))))
+        :select-map (parse-select-map s depth context output)))))
 
 (defn parse-select-clause
-  [clause context depth]
+  [clause context output depth]
   (cond
     ;; singular function call
     (list? clause)
-    (parse-selector context depth clause)
+    (parse-selector context depth output clause)
 
     ;; collection of selectors
     (sequential? clause)
-    (mapv (partial parse-selector context depth)
+    (mapv (partial parse-selector context depth output)
           clause)
 
     ;; singular selector
     :else
-    (parse-selector context depth clause)))
+    (parse-selector context depth output clause)))
 
 (defn parse-select
   [q context]
-  (let [depth      (or (:depth q) 0)
-        select-key (some (fn [k]
-                           (when (contains? q k) k))
-                         [:select :select-one :select-distinct])
-        select     (-> q
-                       (get select-key)
-                       (parse-select-clause context depth))]
-    (assoc q select-key select)))
+  (if-let [select-key (some (fn [k] (when (contains? q k) k))
+                            [:select :select-one :select-distinct])]
+    (let [depth  (or (:depth q) 0)
+          output (or (-> q :opts :output) :fql)
+          select (-> q
+                     (get select-key)
+                     (parse-select-clause context output depth))]
+      (assoc q select-key select))
+    q))
 
 (defn ensure-vector
   [x]
@@ -677,28 +692,25 @@
   (or (get jsonld nme)
       (get jsonld (keyword nme))))
 
-(defn extract-opts
-  [q]
-  (or (get q "opts")
-      (get q :opts)))
-
 (defn parse-analytical-query
   ([q] (parse-analytical-query q nil))
   ([q parent-context]
-   (let [context  (cond->> (context/extract q)
-                           parent-context (merge parent-context))
-         [vars values] (-> (get-named q "values")
-                           (parse-values context))
-         where    (-> (get-named q "where")
-                      (parse-where vars context))
-         grouping (parse-grouping q)
-         ordering (parse-ordering q)]
+   (let [orig-context  (:context q)
+         context       (cond->> (json-ld/parse-context orig-context)
+                         parent-context (merge parent-context))
+         [vars values] (parse-values (:values q) context)
+         where         (parse-where (:where q) vars context)
+         construct     (parse-construct q context )
+         grouping      (parse-grouping q)
+         ordering      (parse-ordering q)]
      (-> q
          (assoc :context context
                 :where where)
          (cond-> (seq values) (assoc :values values)
-                 grouping (assoc :group-by grouping)
-                 ordering (assoc :order-by ordering))
+                 orig-context (assoc :orig-context orig-context)
+                 grouping  (assoc :group-by grouping)
+                 ordering  (assoc :order-by ordering)
+                 construct (assoc :construct construct))
          (parse-having context)
          (parse-select context)
          parse-fuel))))
@@ -752,7 +764,7 @@
                        (iri/new-blank-node-id)
                        id)))
           ref-cmp (if m
-                    (assoc ref-obj ::where/meta m)
+                    (where/match-meta ref-obj m)
                     ref-obj)
           v-map*  (if (nil? id)
                     ;; project newly created bnode-id into v-map
