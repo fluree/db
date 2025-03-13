@@ -25,6 +25,11 @@
   (and (or (string? x) (symbol? x) (keyword? x))
        (-> x name first (= \_))))
 
+(defn query-variable?
+  [x]
+  (or (variable? x)
+      (bnode-variable? x)))
+
 (defn property-path?
   [x]
   (when-let [path-iri (cond (string? x)  x
