@@ -1,6 +1,6 @@
 (ns fluree.db.flake.match
   (:refer-clojure :exclude [load vswap!])
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [<! >!]]
             [fluree.db.query.exec.where :as where]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -70,20 +70,21 @@
         p*           (where/remove-transitivity p)
         s-var        (where/get-variable s)
         get-s-iri    (partial get-match-iri s-var)
-        initial-soln {s-var o}]
-    (-> (async/go
-          (loop [[soln & to-visit] [initial-soln]
-                 result-solns      (if (= :zero+ tag) [initial-soln] [])
-                 visited-iris      (if (= :zero+ tag) #{(where/get-iri o)} #{})]
-            (if soln
-              (let [step-solns        (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[s p* (get soln s-var)]] error-ch)))
-                    remove-visited-xf (remove (comp visited-iris (partial get-match-iri s-var)))
-                    visited-step      (sequence remove-visited-xf step-solns)]
-                (recur (into to-visit     visited-step)
-                       (into result-solns visited-step)
-                       (into visited-iris (map get-s-iri) step-solns)))
-              result-solns)))
-        (async/pipe (async/chan 1 cat)))))
+        initial-soln {s-var o}
+        out-ch       (async/chan)]
+    (async/go
+      (when (= :zero+ tag) (>! out-ch initial-soln))
+      (loop [[soln & to-visit] [initial-soln]
+             visited-iris      (if (= :zero+ tag) #{(where/get-iri o)} #{})]
+        (if soln
+          (let [step-solns (<! (async/into [] (where/match-clause db fuel-tracker solution [[s p* (get soln s-var)]] error-ch)))
+                remove-visited-xf (remove (comp visited-iris (partial get-match-iri s-var)))
+                visited-step      (sequence remove-visited-xf step-solns)]
+            (<! (async/onto-chan! out-ch visited-step false))
+            (recur (into to-visit visited-step)
+                   (into visited-iris (map get-s-iri) step-solns)))
+          (async/close! out-ch))))
+    out-ch))
 
 (defmethod resolve-transitive [:v :v :?]
   [db fuel-tracker solution [s p o] error-ch]
@@ -91,20 +92,21 @@
         p*           (where/remove-transitivity p)
         o-var        (where/get-variable o)
         get-o-iri    (partial get-match-iri o-var)
-        initial-soln {o-var s}]
-    (-> (async/go
-          (loop [[soln & to-visit] [initial-soln]
-                 result-solns      (if (= :zero+ tag) [initial-soln] [])
-                 visited-iris      (if (= :zero+ tag) #{(where/get-iri s)} #{})]
-            (if soln
-              (let [step-solns (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[(get soln o-var) p* o]] error-ch)))
-                    remove-visited-xf (remove (comp visited-iris get-o-iri))
-                    visited-step      (sequence remove-visited-xf step-solns)]
-                (recur (into to-visit     visited-step)
-                       (into result-solns visited-step)
-                       (into visited-iris (map get-o-iri) step-solns)))
-              result-solns)))
-        (async/pipe (async/chan 1 cat)))))
+        initial-soln {o-var s}
+        out-ch       (async/chan)]
+    (async/go
+      (when (= :zero+ tag) (>! out-ch initial-soln))
+      (loop [[soln & to-visit] [initial-soln]
+             visited-iris      (if (= :zero+ tag) #{(where/get-iri s)} #{})]
+        (if soln
+          (let [step-solns (<! (async/into [] (where/match-clause db fuel-tracker solution [[(get soln o-var) p* o]] error-ch)))
+                remove-visited-xf (remove (comp visited-iris get-o-iri))
+                visited-step      (sequence remove-visited-xf step-solns)]
+            (<! (async/onto-chan! out-ch visited-step false))
+            (recur (into to-visit visited-step)
+                   (into visited-iris (map get-o-iri) step-solns)))
+          (async/close! out-ch))))
+    out-ch))
 
 (defn o-match->s-match
   "Strip extra keys from a match on an o-var so taht it can be compared to a match from an
