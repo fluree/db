@@ -4,9 +4,10 @@
        :cljs [[cljs.test :refer-macros [deftest is testing async]]
               [clojure.core.async :refer [go <!]]
               [clojure.core.async.interop :refer [<p!]]])
+   [fluree.db.api :as fluree]
    [fluree.db.query.sparql :as sparql]
    [fluree.db.test-utils :as test-utils]
-   [fluree.db.api :as fluree])
+   [fluree.db.util.core :as util :refer [try* catch*]])
   #?(:clj (:import (clojure.lang ExceptionInfo))))
 
 (deftest parse-select
@@ -199,6 +200,19 @@
               {"@id"            "?person"
                "person:favNums" "?favNums"}]
              where))))
+  (testing "transitive property path"
+    (testing "one-or-more"
+      (let [query "SELECT ?uri ?broader
+                 WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)+ ?broader.}"]
+
+        (is (= [{"@id" "?uri", "<http://www.w3.org/2004/02/skos/core#broader+>" "?broader"}]
+               (:where (sparql/->fql query))))))
+    (testing "zero-or-more"
+      (let [query "SELECT ?uri ?broader
+                 WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)* ?broader.}"]
+
+        (is (= [{"@id" "?uri", "<http://www.w3.org/2004/02/skos/core#broader*>" "?broader"}]
+               (:where (sparql/->fql query)))))))
   (testing "UNION"
     (let [query "SELECT ?person ?age
                  WHERE {?person person:age 70 .
@@ -737,30 +751,24 @@
       (is (= ["?person" "?fullName"]
              selectDistinct)))))
 
-;; TODO: these expectations do not work in FQL
-#_(deftest parse-recursive
+(deftest parse-recursive
   (let [query "SELECT ?followHandle
                WHERE {?person person:handle \"anguyen\".
                       ?person person:follows+ ?follows.
                       ?follows person:handle ?followHandle.}"
         {:keys [where]} (sparql/->fql query)]
     (is (= [{"@id" "?person", "person:handle" "anguyen"}
-            {"@id" "?person", "person:follows+" "?follows"}
+            {"@id" "?person", "<person:follows+>" "?follows"}
             {"@id" "?follows", "person:handle" "?followHandle"}]
            where)))
   (testing "depth"
     (let [query "SELECT ?followHandle
                  WHERE {?person person:handle \"anguyen\".
                         ?person person:follows+3 ?follows.
-                        ?follows person:handle ?followHandle.}"
-          {:keys [where]} (sparql/->fql query)]
-      (is (= [{"@id" "?person", "person:handle" "anguyen"}
-              {"@id" "?person", "person:follows+3" "?follows"}
-              {"@id" "?follows", "person:handle" "?followHandle"}]
-             where)))))
-
-;; TODO
-#_(deftest parse-functions)
+                        ?follows person:handle ?followHandle.}"]
+      (is (= "Depth modifiers on transitive path elements are not supported."
+             (try* (sparql/->fql query)
+                  (catch* e (ex-message e))))))))
 
 (deftest parsing-error
   (testing "invalid query throws expected error"
@@ -1762,32 +1770,21 @@
                        ["book:2" "The Hitchhiker's Guide to the Galaxy"]]
                       results)))))
 
-           ;; TODO: Make these tests pass
-
-           ;; Language tags aren't supported yet (even in the BNF)
-         #_(testing "fn w/ langtag string arg query works"
-             (let [query   "SELECT (CONCAT(?fullName, \"'s handle is \"@en, ?handle) AS ?hfn)
+         (testing "fn w/ langtag string arg query works"
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (CONCAT(?fullName, \"'s handle is \"@en, ?handle) AS ?hfn)
                             WHERE {?person person:handle ?handle.
-                                   ?person person:fullName ?fullName.}"
-                   results @(fluree/query db query {:format :sparql})]
-               (is (= [["Billy Bob's handle is bbob"]
-                       ["Jane Doe's handle is jdoe"]]
-                      results))))
+                                   ?person person:fullName ?fullName.}"]
+             (is (= [["Billy Bob's handle is bbob"]
+                     ["Ferris Bueller's handle is dankeshön"]
+                     ["Jenny Bob's handle is jbob"]
+                     ["Jane Doe's handle is jdoe"]]
+                    @(fluree/query db query {:format :sparql})))))
 
-           ;; VALUES gets translated into :bind, but that expects a query fn on the right
-           ;; so this string literal doesn't work
-         #_(testing "VALUES query works"
-             (let [query   "SELECT ?handle
+         (testing "VALUES query works"
+             (let [query   "PREFIX person: <http://example.org/Person#>
+                            SELECT ?handle
                             WHERE {VALUES ?handle { \"jdoe\" }
-                                  ?person person:handle ?handle.}"
-                   results @(fluree/query db query {:format :sparql})]
-               (is (= ["jdoe"] results))))
-
-           ;; BIND gets translated into :bind, but that expects a query fn on the right
-           ;; so this string literal doesn't work
-         #_(testing "BIND query works"
-             (let [query   "SELECT ?person ?handle
-                           WHERE {BIND (\"jdoe\" AS ?handle)
-                                  ?person person:handle ?handle.}"
-                   results @(fluree/query db query {:format :sparql})]
-               (is (= ["ex:jdoe" "jdoe"] results))))))))
+                                  ?person person:handle ?handle.}"]
+               (is (= [["jdoe"]]
+                      @(fluree/query db query {:format :sparql})))))))))

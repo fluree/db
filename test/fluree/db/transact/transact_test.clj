@@ -521,11 +521,10 @@
     (is (test-utils/shacl-error? db3)
         "datatype constraint is restored after a load")))
 
-;; TODO - below will brick the db when first IRI char is unicode, but the test where unicode comes second works
-(deftest ^:kaocha/pending ^:integration ^:json transaction-iri-special-char
+(deftest ^:integration ^:json transaction-iri-special-char
   (testing "transaction with special iri characters in @id"
     (let [
-          conn      @(fluree/connect {:method :memory})
+          conn      @(fluree/connect-memory)
           ledger-id "transaction-iri-special-char"
           ledger    @(fluree/create conn ledger-id)
           db0       (fluree/db ledger)

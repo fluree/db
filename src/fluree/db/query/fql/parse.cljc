@@ -9,6 +9,8 @@
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.query.sparql :as sparql]
+            [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.util.context :as context]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -366,14 +368,37 @@
     (parse-variable id)
     (parse-subject-iri id context)))
 
+(declare parse-predicate)
+(defn parse-property-path
+  [path context]
+  (let [path-expr  (subs path 1 (dec (count path))) ; remove angle brackets
+        ;; TODO: the parsing is slower than it needs to be
+        [pred mod] (->>
+                     ;; parse to validate
+                     (first (sparql/parse-path-expr path-expr))
+                     ;; translate back to string
+                     (sparql.translator/parse-term)
+                     ;; separate recursion modifier
+                     (split-at (dec (count path-expr)))
+                     ;; turn back into strings
+                     (map (partial apply str)))
+        recur-mod   ({"+" :one+ "*" :zero+} mod)]
+    (cond-> (parse-predicate pred context)
+      recur-mod (where/add-transitivity recur-mod))))
+
 (defn parse-predicate
   [p context]
-  (if (v/variable? p)
-    (parse-variable p)
-    (let [[expanded {reverse :reverse}] (json-ld/details p context)]
-      (if (contains? type-pred-iris expanded)
-        (where/->predicate const/iri-rdf-type reverse)
-        (where/->predicate expanded reverse)))))
+  (cond (v/variable? p)
+        (parse-variable p)
+
+        (v/property-path? p)
+        (parse-property-path p context)
+
+        :else
+        (let [[expanded {reverse :reverse}] (json-ld/details p context)]
+          (if (contains? type-pred-iris expanded)
+            (where/->predicate const/iri-rdf-type reverse)
+            (where/->predicate expanded reverse)))))
 
 (declare parse-statement parse-statements)
 
