@@ -47,7 +47,9 @@
 
 (defrecord WildcardSelector []
   ValueAdapter
-  (solution-value [_ _ solution] solution))
+  (solution-value
+    [_ _ solution]
+    solution))
 
 (defn wildcard-selector
   "Returns a selector that extracts and formats every bound value bound in the
@@ -61,7 +63,7 @@
 (defrecord AggregateSelector [agg-fn]
   ValueSelector
   (format-value
-    [_ _ _ _ compact _ error-ch solution]
+    [_ _ _ _ _ _ error-ch solution]
     (go (try* (:value (agg-fn solution))
               (catch* e
                       (log/error e "Error applying aggregate selector")
