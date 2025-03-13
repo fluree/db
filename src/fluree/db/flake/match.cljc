@@ -76,11 +76,11 @@
                  result-solns      (if (= :zero+ tag) [initial-soln] [])
                  visited-iris      (if (= :zero+ tag) #{(where/get-iri o)} #{})]
             (if soln
-              (let [step-solns (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[s p* (get soln s-var)]] error-ch)))
-
-                    remove-visited-xf (remove (comp visited-iris (partial get-match-iri s-var)))]
-                (recur (into to-visit     remove-visited-xf step-solns)
-                       (into result-solns remove-visited-xf step-solns)
+              (let [step-solns        (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[s p* (get soln s-var)]] error-ch)))
+                    remove-visited-xf (remove (comp visited-iris (partial get-match-iri s-var)))
+                    visited-step      (sequence remove-visited-xf step-solns)]
+                (recur (into to-visit     visited-step)
+                       (into result-solns visited-step)
                        (into visited-iris (map get-s-iri) step-solns)))
               result-solns)))
         (async/pipe (async/chan 1 cat)))))
@@ -98,10 +98,10 @@
                  visited-iris      (if (= :zero+ tag) #{(where/get-iri s)} #{})]
             (if soln
               (let [step-solns (async/<! (async/into [] (where/match-clause db fuel-tracker solution [[(get soln o-var) p* o]] error-ch)))
-
-                    remove-visited-xf (remove (comp visited-iris get-o-iri))]
-                (recur (into to-visit     remove-visited-xf step-solns)
-                       (into result-solns remove-visited-xf step-solns)
+                    remove-visited-xf (remove (comp visited-iris get-o-iri))
+                    visited-step      (sequence remove-visited-xf step-solns)]
+                (recur (into to-visit     visited-step)
+                       (into result-solns visited-step)
                        (into visited-iris (map get-o-iri) step-solns)))
               result-solns)))
         (async/pipe (async/chan 1 cat)))))
