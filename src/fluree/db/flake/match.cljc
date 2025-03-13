@@ -42,16 +42,21 @@
       (async/close! matched-ch))
     matched-ch))
 
-(defn match-flakes-xf [db solution triple]
+(defn match-flakes-xf
+  [db solution triple]
   (comp cat
         (map (fn [flake] (where/match-flake solution triple db flake)))))
 
-(defn var-pattern [triple] (mapv #(if (where/get-variable %) :? :v) triple))
+(defn var-pattern
+  [triple]
+  (mapv #(if (where/get-variable %) :? :v) triple))
 
 (defmulti resolve-transitive
-  (fn [db fuel-tracker solution triple error-ch] (var-pattern triple)))
+  (fn [db fuel-tracker solution triple error-ch]
+    (var-pattern triple)))
 
-(defmethod resolve-transitive :default [_ _ _ triple error-ch]
+(defmethod resolve-transitive :default
+  [_ _ _ triple error-ch]
   (async/put! error-ch (ex-info "Unsupported transitive path." {:status 400 :error :db/unsupported-transitive-path}))
   (doto (async/chan) async/close!))
 
