@@ -259,8 +259,8 @@
 
 #?(:clj (defmulti ->offset-date-time #(when-let [t (#{OffsetDateTime LocalDateTime LocalDate} (type %))] t)))
 #?(:clj (defmethod ->offset-date-time OffsetDateTime [^OffsetDateTime datetime] datetime))
-#?(:clj (defmethod ->offset-date-time LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC))))
-#?(:clj (defmethod ->offset-date-time LocalDate [^LocalDate date] (.atOffset (.atStartOfDay date) (ZoneOffset/UTC))))
+#?(:clj (defmethod ->offset-date-time LocalDateTime [^LocalDateTime datetime] (.atOffset datetime ZoneOffset/UTC)))
+#?(:clj (defmethod ->offset-date-time LocalDate [^LocalDate date] (.atOffset (.atStartOfDay date) ZoneOffset/UTC)))
 #?(:clj (defmethod ->offset-date-time :default [x] (throw (ex-info "Cannot convert value to OffsetDateTime."
                                                                    {:value x
                                                                     :status 400
@@ -268,7 +268,7 @@
 
 #?(:clj (defmulti ->offset-time #(when-let [t (#{OffsetTime LocalTime} (type %))] t)))
 #?(:clj (defmethod ->offset-time OffsetTime [^OffsetTime time] time))
-#?(:clj (defmethod ->offset-time LocalTime [^LocalTime time] (.atOffset time (ZoneOffset/UTC))))
+#?(:clj (defmethod ->offset-time LocalTime [^LocalTime time] (.atOffset time ZoneOffset/UTC)))
 #?(:clj (defmethod ->offset-time :default [x] (throw (ex-info "Cannot convert value to OffsetTime."
                                                               {:value x
                                                                :status 400

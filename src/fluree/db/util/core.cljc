@@ -11,9 +11,9 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def ^:const max-long #?(:clj  (Long/MAX_VALUE)
+(def ^:const max-long #?(:clj  Long/MAX_VALUE
                          :cljs 9007199254740991))           ;; 2^53-1 for javascript
-(def ^:const min-long #?(:clj  (Long/MIN_VALUE)
+(def ^:const min-long #?(:clj  Long/MIN_VALUE
                          :cljs -9007199254740991))
 (def ^:const max-integer 2147483647)
 (def ^:const min-integer -2147483647)
