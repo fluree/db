@@ -240,7 +240,7 @@
     result))
 
 (def addr-regex
-  (re-pattern (str "fluree:(memory|file|ipfs)://.+")))
+  (re-pattern "fluree:(memory|file|ipfs)://.+"))
 
 (defn address?
   [s]

@@ -50,7 +50,7 @@
 
 #?(:clj
    (defmethod print-method Connection [^Connection conn, ^Writer w]
-     (.write w (str "#fluree/Connection "))
+     (.write w "#fluree/Connection ")
      (binding [*out* w]
        (pr (printer-map conn))))
    :cljs
