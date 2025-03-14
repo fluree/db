@@ -12,8 +12,7 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true])
   (:import #?@(:clj  ((org.httpkit.client TimeoutException)
-                      (java.nio HeapCharBuffer))
-               :cljs ((goog.net.ErrorCode)))))
+                      (java.nio HeapCharBuffer)))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
