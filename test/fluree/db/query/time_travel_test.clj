@@ -202,25 +202,26 @@
                                                         {"@context" context
                                                          "ledger"   "test/time-before"
                                                          "insert"   [{"@id"   "ex:time-test"
-                                                                      "ex:p1" "value"}]})]
-              (let [q            {:context context
-                                  :from    ["test/time1" "test/time-before"]
-                                  :select  '[?p1 ?time]
-                                  :where   '{"@id"     "ex:time-test"
-                                             "ex:p1"   ?p1
-                                             "ex:time" ?time}
-                                  ;;`t` is valid for "ledger-valid",
-                                  ;;but not "test/time1"
-                                  :t       "1988-05-30T12:40:44.823Z"}
-                    invalid-time (try @(fluree/query-connection conn q)
-                                      (catch Exception e e))]
-                (is (util/exception? invalid-time))
-                (is (= 400 (-> invalid-time ex-data :status)))
-                (is (str/includes? (ex-message invalid-time)
-                                   "There is no data as of"))
-                (is (str/includes? (ex-message invalid-time)
-                                   "test/time1")
-                    "message should report which ledger has an error")))))
+                                                                      "ex:p1" "value"}]})
+                  q            {:context context
+                                :from    ["test/time1" "test/time-before"]
+                                :select  '[?p1 ?time]
+                                :where   '{"@id"     "ex:time-test"
+                                           "ex:p1"   ?p1
+                                           "ex:time" ?time}
+                                ;;`t` is valid for "ledger-valid",
+                                ;;but not "test/time1"
+                                :t       "1988-05-30T12:40:44.823Z"}
+                  invalid-time (try @(fluree/query-connection conn q)
+                                    (catch Exception e e))]
+
+              (is (util/exception? invalid-time))
+              (is (= 400 (-> invalid-time ex-data :status)))
+              (is (str/includes? (ex-message invalid-time)
+                                 "There is no data as of"))
+              (is (str/includes? (ex-message invalid-time)
+                                 "test/time1")
+                  "message should report which ledger has an error"))))
         (testing "Federated queries must use wall-clock time as global `t` value"
           (with-redefs [util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
             (let [q            {:context context
