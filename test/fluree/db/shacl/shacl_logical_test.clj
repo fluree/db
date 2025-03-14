@@ -239,31 +239,30 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
           (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape2."
                  (ex-message db-too-low)))))
       (testing "conforms to min and max exclusive"
-        (let []
-          (is (= {:status 422,
-                  :error  :shacl/violation,
-                  :report
-                  {:type        :sh/ValidationReport,
-                   :sh/conforms false,
-                   :sh/result
-                   [{:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation,
-                     :sh/focusNode           :ex/john,
-                     :sh/constraintComponent :sh/not,
-                     :sh/sourceShape         :ex/UserShape,
-                     :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape1"}
-                    {:type                   :sh/ValidationResult,
-                     :sh/resultSeverity      :sh/Violation,
-                     :sh/focusNode           :ex/john,
-                     :sh/constraintComponent :sh/not,
-                     :sh/sourceShape         :ex/UserShape,
-                     :sh/value               :ex/john,
-                     :sh/resultMessage       ":ex/john conforms to shape :ex/pshape2"}]}}
-                 (ex-data db-two-probs)))
-          (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1.
+        (is (= {:status 422,
+                :error  :shacl/violation,
+                :report
+                {:type        :sh/ValidationReport,
+                 :sh/conforms false,
+                 :sh/result
+                 [{:type                   :sh/ValidationResult,
+                   :sh/resultSeverity      :sh/Violation,
+                   :sh/focusNode           :ex/john,
+                   :sh/constraintComponent :sh/not,
+                   :sh/sourceShape         :ex/UserShape,
+                   :sh/value               :ex/john,
+                   :sh/resultMessage       ":ex/john conforms to shape :ex/pshape1"}
+                  {:type                   :sh/ValidationResult,
+                   :sh/resultSeverity      :sh/Violation,
+                   :sh/focusNode           :ex/john,
+                   :sh/constraintComponent :sh/not,
+                   :sh/sourceShape         :ex/UserShape,
+                   :sh/value               :ex/john,
+                   :sh/resultMessage       ":ex/john conforms to shape :ex/pshape2"}]}}
+               (ex-data db-two-probs)))
+        (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1.
 Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape2."
-                 (ex-message db-two-probs)))))))
+               (ex-message db-two-probs))))))
 
   (testing "shacl not w/ string constraints works"
     (let [conn       (test-utils/create-conn)
