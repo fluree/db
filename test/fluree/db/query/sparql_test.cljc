@@ -1,11 +1,10 @@
 (ns fluree.db.query.sparql-test
-  (:require
-   #?@(:clj  [[clojure.test :refer [deftest is testing]]]
-       :cljs [[cljs.test :refer-macros [deftest is testing]]])
-   [fluree.db.api :as fluree]
-   [fluree.db.query.sparql :as sparql]
-   [fluree.db.test-utils :as test-utils]
-   [fluree.db.util.core :as util :refer [try* catch*]])
+  (:require #?@(:clj  [[clojure.test :refer [deftest is testing]]]
+                :cljs [[cljs.test :refer-macros [deftest is testing]]])
+            [fluree.db.api :as fluree]
+            [fluree.db.query.sparql :as sparql]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.util.core :as util :refer [try* catch*]])
   #?(:clj (:import (clojure.lang ExceptionInfo))))
 
 (deftest parse-select
@@ -777,7 +776,7 @@
              (try
                (sparql/->fql query)
                "should throw 400, :db/invalid-query"
-               (catch #?(:clj  clojure.lang.ExceptionInfo
+               (catch #?(:clj  ExceptionInfo
                          :cljs :default) e (ex-data e))))))))
 
 (deftest ^:integration query-test
