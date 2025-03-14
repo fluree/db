@@ -170,14 +170,13 @@
         opts      (assoc-in config [:keep-alive-fn] cb)]
     (-> :TODO #_(conn-handler/connect-p servers opts)
         (.then (fn [conn]
-                 (do
-                   (when jwt
-                     :TODO #_(conn-handler/check-connection conn {:jwt jwt}))
-                   (register-connection conn config queries)
-                   (ledger-listener conn ledger id)
-                   (worker-action conn-id :connReset ref {:status  200
-                                                          :message "Connection reset"})
-                   (process-all-queries conn-id))))
+                 (when jwt
+                   :TODO #_(conn-handler/check-connection conn {:jwt jwt}))
+                 (register-connection conn config queries)
+                 (ledger-listener conn ledger id)
+                 (worker-action conn-id :connReset ref {:status  200
+                                                        :message "Connection reset"})
+                 (process-all-queries conn-id)))
         (.catch (fn [error]
                   (let [error-data (if-let [ex-data (ex-data error)]
                                      (merge {:status  (or (:status ex-data) 500)
@@ -245,11 +244,10 @@
         opts    (assoc-in config* [:keep-alive-fn] cb)]
     (-> :TODO #_(conn-handler/connect-p servers opts)
         (.then (fn [conn]
-                 (do
-                   (register-connection conn config* nil)
-                   (ledger-listener conn ledger id)
-                   (worker-action id :connStatus ref {:status  200
-                                                      :message "Connection is ready."}))))
+                 (register-connection conn config* nil)
+                 (ledger-listener conn ledger id)
+                 (worker-action id :connStatus ref {:status  200
+                                                    :message "Connection is ready."})))
         (.catch (fn [error]
                   (worker-action id :connStatus ref {:status  500
                                                      :message (str error)}))))))

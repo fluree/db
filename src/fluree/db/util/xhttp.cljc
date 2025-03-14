@@ -294,11 +294,10 @@
     (let [retry-timeout (min (* retries 1000) 20000)
           ws            (async/<! (try-socket url sub-chan pub-chan timeout close-fn))]
       (when (util/exception? ws)
-        (do
-          (log/info "Unable to establish websocket connection, retrying in " retry-timeout "ms. "
-                    "Reported websocket exception: " (ex-message ws))
-          (async/<! (async/timeout (min (* retries 500) 10000))) ;; timeout maxes at 10s
-          (recur (inc retries)))))))
+        (log/info "Unable to establish websocket connection, retrying in " retry-timeout "ms. "
+                  "Reported websocket exception: " (ex-message ws))
+        (async/<! (async/timeout (min (* retries 500) 10000))) ;; timeout maxes at 10s
+        (recur (inc retries))))))
 
 (defn abnormal-socket-close?
   [status-code]
