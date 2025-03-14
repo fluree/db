@@ -1,5 +1,5 @@
 (ns fluree.db.shacl.shacl-logical-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 

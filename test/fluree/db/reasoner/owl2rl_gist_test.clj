@@ -1,6 +1,6 @@
 (ns fluree.db.reasoner.owl2rl-gist-test
   (:require [clojure.java.io :as io]
-            [clojure.test :refer :all]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
@@ -180,6 +180,3 @@
                                             :where   {"@id"   "?id"
                                                       "@type" "gist:BaseUnit"}})))
           "all items in the owl:oneOf list should now be of @type gist:BaseUnit"))))
-
-
-

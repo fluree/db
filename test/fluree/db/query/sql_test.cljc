@@ -1,6 +1,6 @@
 (ns fluree.db.query.sql-test
   (:require
-   #?@(:clj  [[clojure.test :refer :all]]
+   #?@(:clj  [[clojure.test :refer [deftest is testing]]]
        :cljs [[cljs.test :refer-macros [deftest is testing]]])
    [fluree.db.query.sql :refer [parse]]))
 

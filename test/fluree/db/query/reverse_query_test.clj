@@ -1,6 +1,6 @@
 (ns fluree.db.query.reverse-query-test
   (:require
-   [clojure.test :refer :all]
+   [clojure.test :refer [deftest is testing]]
    [fluree.db.api :as fluree]
    [fluree.db.test-utils :as test-utils]))
 
