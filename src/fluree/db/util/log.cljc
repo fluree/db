@@ -2,8 +2,7 @@
   (:require #?@(:clj  [[clojure.core.async :as async]
                        [clojure.tools.logging.readable :as log] ; readable variants use pr-str automatically
                        [fluree.db.util.core :refer [if-cljs]]]
-                :cljs [[goog.log :as glog]
-                       [fluree.db.util.core :refer-macros [if-cljs]]]))
+                :cljs [[goog.log :as glog]]))
   #?(:cljs (:require-macros [fluree.db.util.log :refer
                              [debug->val debug->>val debug-async->vals
                               debug-async->>vals]]))
@@ -125,5 +124,3 @@
      them."
      [msg c]
      `(debug-async->vals ~c ~msg)))
-
-
