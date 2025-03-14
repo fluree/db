@@ -1,6 +1,5 @@
 (ns fluree.db.flake.reasoner
-  (:require [clojure.core.async :as async]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.flake.transact :as flake.transact]

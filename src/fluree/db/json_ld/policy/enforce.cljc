@@ -4,8 +4,6 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy :refer [root]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [fluree.db.util.parse :as util.parse]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -53,7 +51,7 @@
     (get-in policy-map [:view :default])))
 
 (defn policies-for-flake
-  [{:keys [policy namespace-codes] :as db} [s p o :as flake] modify?]
+  [{:keys [policy] :as _db} [s p _o :as _flake] modify?]
   (->> (default-policies policy modify?)
        (keep (fn [{:keys [s-targets p-targets default?] :as policy}]
                (when (or (and (or (nil? s-targets) (contains? s-targets s))

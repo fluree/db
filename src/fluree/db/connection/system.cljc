@@ -1,7 +1,6 @@
 (ns fluree.db.connection.system
   (:require #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
-            [clojure.string :as str]
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]

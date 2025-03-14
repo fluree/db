@@ -10,8 +10,7 @@
             [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.storage :as storage]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

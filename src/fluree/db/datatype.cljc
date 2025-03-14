@@ -1,6 +1,7 @@
 (ns fluree.db.datatype
-  (:require #?(:clj  [fluree.db.util.clj-const :as uc]
-               :cljs [fluree.db.util.cljs-const :as uc])
+  (:require #?@(:clj  [[fluree.db.util.clj-const :as uc]
+                       [time-literals.read-write :as time-literals]]
+                :cljs [[fluree.db.util.cljs-const :as uc]])
             [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
@@ -8,11 +9,9 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.vector.scoring :as vector.score]
-            [fluree.json-ld :as json-ld]
-            [time-literals.read-write :as time-literals])
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.time LocalDate LocalTime LocalDateTime
-                              OffsetDateTime OffsetTime ZoneOffset)
-                   (java.time.format DateTimeFormatter))))
+                              OffsetDateTime OffsetTime ZoneOffset))))
 
 #?(:clj (set! *warn-on-reflection* true))
 

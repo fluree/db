@@ -1,14 +1,10 @@
 (ns fluree.db.api.transact
   (:require [fluree.db.connection :as connection]
-            [fluree.db.constants :as const]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.ledger :as ledger]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.context :as ctx-util]
-            [fluree.db.util.core :as util]
-            [fluree.json-ld :as json-ld]))
+            [fluree.db.util.context :as ctx-util]))
 
 (defn parse-opts
   [txn override-opts txn-context]
@@ -19,11 +15,6 @@
         (assoc :context txn-context)
         (update :identity #(or % (:did opts)))
         (dissoc :did))))
-
-(defn track-fuel?
-  [parsed-opts]
-  (or (:max-fuel parsed-opts)
-      (:meta parsed-opts)))
 
 (defn stage
   [db txn opts]
