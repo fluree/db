@@ -308,16 +308,16 @@
   the targeted predicate."
   [db shape s-flakes]
   (go-try
-    (let [target-pids       (into #{} (map unpack-id) (get shape const/sh_targetObjectsOf))]
-      (let [sid             (some-> s-flakes first flake/s)
-            referring-pids  (not-empty (<? (query-range/index-range db :opst = [[sid const/$id]]
-                                                                    {:flake-xf (comp
-                                                                                (map flake/p)
-                                                                                (filter target-pids))})))
-            p-flakes        (filter (fn [f] (contains? target-pids (flake/p f))) s-flakes)
-            focus-nodes     (mapv object-node p-flakes)]
-        (cond-> focus-nodes
-          referring-pids (conj (sid-node sid)))))))
+    (let [target-pids    (into #{} (map unpack-id) (get shape const/sh_targetObjectsOf))
+          sid            (some-> s-flakes first flake/s)
+          referring-pids (not-empty (<? (query-range/index-range db :opst = [[sid const/$id]]
+                                                                 {:flake-xf (comp
+                                                                             (map flake/p)
+                                                                             (filter target-pids))})))
+          p-flakes       (filter (fn [f] (contains? target-pids (flake/p f))) s-flakes)
+          focus-nodes    (mapv object-node p-flakes)]
+      (cond-> focus-nodes
+        referring-pids (conj (sid-node sid))))))
 
 (defn resolve-focus-nodes
   "Evaluate the target declarations of a NodeShape to see if the provided s-flakes contain
