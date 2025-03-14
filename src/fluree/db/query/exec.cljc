@@ -7,9 +7,7 @@
             [fluree.db.query.exec.order :as order]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.select.subject :as subject]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.query.exec.where :as where]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
