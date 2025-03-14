@@ -17,7 +17,7 @@
   "Run proof validation, if exists.
   Return actual commit data. In the case of a VerifiableCredential this is
   the `credentialSubject`."
-  [proof]
+  [_proof]
   ;; TODO - returning true for now
   true)
 
