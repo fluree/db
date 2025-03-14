@@ -222,13 +222,13 @@
           user-query      {:context [test-utils/default-context
                                      {:ex "http://example.org/ns/"}]
                            :select  '{?s [:*]}
-                           :where   '{:id ?s, :type :ex/User}}]
-      (let [users #{{:id :ex/john, :type :ex/User, :schema/name "John"}
-                    {:id :ex/alice, :type :ex/User, :schema/name "Alice"}}]
-        (is (= users
-               (set @(fluree/query db-data-first user-query))))
-        (is (= users
-               (set @(fluree/query db-policy-first user-query))))))))
+                           :where   '{:id ?s, :type :ex/User}}
+          users           #{{:id :ex/john, :type :ex/User, :schema/name "John"}
+                            {:id :ex/alice, :type :ex/User, :schema/name "Alice"}}]
+      (is (= users
+             (set @(fluree/query db-data-first user-query))))
+      (is (= users
+             (set @(fluree/query db-policy-first user-query)))))))
 
 (deftest ^:integration transact-large-dataset-test
   (with-tmp-dir storage-path
