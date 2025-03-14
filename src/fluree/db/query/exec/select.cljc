@@ -4,17 +4,17 @@
   (:refer-clojure :exclude [format])
   (:require [clojure.core.async :as async :refer [<! >! chan go go-loop]]
             [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
             [fluree.db.query.exec.eval :as-alias eval]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.select.fql :as select.fql]
             [fluree.db.query.exec.select.json-ld :as select.json-ld]
             [fluree.db.query.exec.select.sparql :as select.sparql]
+            [fluree.db.query.exec.select.subject :as subject]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.util.core :as util :refer [catch* try*]]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.datatype :as datatype]
-            [fluree.db.util.json :as json]))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -42,7 +42,7 @@
   [variable output]
   (let [selector (->VariableSelector variable)]
     (case output
-      :sparql (with-meta selector {`format-value (select.sparql/format-variable-selector-value variable) })
+      :sparql (with-meta selector {`format-value (select.sparql/format-variable-selector-value variable)})
       (with-meta selector {`format-value (select.fql/format-variable-selector-value variable)}))))
 
 (defrecord WildcardSelector []
@@ -66,8 +66,8 @@
     [_ _ _ _ _ _ error-ch solution]
     (go (try* (:value (agg-fn solution))
               (catch* e
-                      (log/error e "Error applying aggregate selector")
-                      (>! error-ch e))))))
+                (log/error e "Error applying aggregate selector")
+                (>! error-ch e))))))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
@@ -141,10 +141,10 @@
         modifying-selectors (filter #(satisfies? SolutionModifier %) (util/sequential selectors))
         mods-xf             (map (fn [solution]
                                    (reduce
-                                     (fn [sol sel]
-                                       (log/trace "Updating solution:" sol)
-                                       (update-solution sel sol))
-                                     solution modifying-selectors)))
+                                    (fn [sol sel]
+                                      (log/trace "Updating solution:" sol)
+                                      (update-solution sel sol))
+                                    solution modifying-selectors)))
         modify-ch               (chan 1 mods-xf)]
     (async/pipe solution-ch modify-ch)))
 

@@ -1,13 +1,13 @@
 (ns fluree.db.flake.match
   (:refer-clojure :exclude [load vswap!])
   (:require [clojure.core.async :as async :refer [<! >!]]
-            [fluree.db.query.exec.where :as where]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [ vswap!]]
             [fluree.db.json-ld.policy :as policy]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [vswap!]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -171,7 +171,6 @@
                                 (async/pipe ch)))
                           step-ch)
     soln-ch))
-
 
 (defn match-triple
   [db fuel-tracker solution tuple error-ch]

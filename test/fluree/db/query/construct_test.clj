@@ -84,24 +84,24 @@
                                               {"@id" "?friend" "name" "?friendName"}
                                               {"@id" "?friend" "num" "?friendNum"}]}))))
     #_(testing "bnode template"
-      (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
-              "@graph"
-              [{"@id" "_:v1",
-                "vcard:givenName" ["Bob"],
-                "vcard:familyName" ["Hacker"]}
-               {"@id" "_:v2",
-                "vcard:givenName" ["Alice"],
-                "vcard:familyName" ["Hacker"]}
-               {"@id" "ex:alice", "vcard:N" [{"@id" "_:v2"}]}
-               {"@id" "ex:bob", "vcard:N" [{"@id" "_:v1"}]}]}
-             @(fluree/query db1
-                            {:context context
-                             :where [[:union
-                                      [{"@id" "?x", "foaf:firstname" "?gname"}]
-                                      [{"@id" "?x", "foaf:givenname" "?gname"}]]
-                                     [:union
-                                      [{"@id" "?x", "foaf:surname" "?fname"}]
-                                      [{"@id" "?x", "foaf:family_name" "?fname"}]]]
-                             :construct [{"@id" "?x", "vcard:N" "_:v"}
-                                         {"@id" "_:v", "vcard:givenName" "?gname"}
-                                         {"@id" "_:v", "vcard:familyName" "?fname"}]}))))))
+        (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
+                "@graph"
+                [{"@id" "_:v1",
+                  "vcard:givenName" ["Bob"],
+                  "vcard:familyName" ["Hacker"]}
+                 {"@id" "_:v2",
+                  "vcard:givenName" ["Alice"],
+                  "vcard:familyName" ["Hacker"]}
+                 {"@id" "ex:alice", "vcard:N" [{"@id" "_:v2"}]}
+                 {"@id" "ex:bob", "vcard:N" [{"@id" "_:v1"}]}]}
+               @(fluree/query db1
+                              {:context context
+                               :where [[:union
+                                        [{"@id" "?x", "foaf:firstname" "?gname"}]
+                                        [{"@id" "?x", "foaf:givenname" "?gname"}]]
+                                       [:union
+                                        [{"@id" "?x", "foaf:surname" "?fname"}]
+                                        [{"@id" "?x", "foaf:family_name" "?fname"}]]]
+                               :construct [{"@id" "?x", "vcard:N" "_:v"}
+                                           {"@id" "_:v", "vcard:givenName" "?gname"}
+                                           {"@id" "_:v", "vcard:familyName" "?fname"}]}))))))

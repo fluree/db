@@ -1,11 +1,11 @@
 (ns fluree.db.virtual-graph.parse
-  (:require [clojure.core.async :as async :refer [>! go]]
+  (:require #?(:cljs [fluree.db.query.exec.select :refer [SubgraphSelector]])
+            [clojure.core.async :as async :refer [>! go]]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.update :as exec.update]
-            [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.where :as exec.where]
-            #?(:cljs [fluree.db.query.exec.select :refer [SubgraphSelector]])
+            [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.parse :as q-parse])
   #?(:clj (:import (fluree.db.query.exec.select SubgraphSelector))))
 
@@ -134,8 +134,8 @@
                             (into #{}))]
 
     (assoc bm25-opts :query query
-                     :query-parsed (assoc query-parsed :selection-context {})
-                     :property-deps property-deps)))
+           :query-parsed (assoc query-parsed :selection-context {})
+           :property-deps property-deps)))
 
 (defn finalize
   [search-af error-ch solution-ch]
@@ -167,11 +167,11 @@
                           const/iri-vector)]
     (map (fn [result]
            (cond-> solution
-                   id-var (assoc id-var (-> (where/unmatched-var id-var)
-                                            (where/match-iri (iri/decode-sid iri-codec (:id result)))
-                                            (where/match-sid db-alias (:id result))))
-                   score-var (assoc score-var (-> (where/unmatched-var score-var)
-                                                  (where/match-value (:score result) const/iri-xsd-float)))
-                   vector-var (assoc vector-var (-> (where/unmatched-var vector-var)
-                                                    (where/match-value (:vec result) vec-result-dt)))))
+             id-var (assoc id-var (-> (where/unmatched-var id-var)
+                                      (where/match-iri (iri/decode-sid iri-codec (:id result)))
+                                      (where/match-sid db-alias (:id result))))
+             score-var (assoc score-var (-> (where/unmatched-var score-var)
+                                            (where/match-value (:score result) const/iri-xsd-float)))
+             vector-var (assoc vector-var (-> (where/unmatched-var vector-var)
+                                              (where/match-value (:vec result) vec-result-dt)))))
          search-results)))

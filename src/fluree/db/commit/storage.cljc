@@ -1,6 +1,6 @@
 (ns fluree.db.commit.storage
-  (:require [clojure.string :as str]
-            [clojure.core.async :as async :refer [go <! chan]]
+  (:require [clojure.core.async :as async :refer [go <! chan]]
+            [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.storage :as storage]
@@ -94,27 +94,27 @@
   [storage latest-commit from-t]
   (let [resp-ch (chan)]
     (go
-     (try*
-      (loop [[commit proof] (verify-commit latest-commit)
-             last-t        nil
-             commit-tuples (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
-        (let [prev-commit-addr (-> commit
-                                   (get-first const/iri-previous)
-                                   (get-first-value const/iri-address))
-              commit-t         (get-commit-t commit)
-              commit-tuples*   (conj commit-tuples [commit proof])]
+      (try*
+        (loop [[commit proof] (verify-commit latest-commit)
+               last-t        nil
+               commit-tuples (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
+          (let [prev-commit-addr (-> commit
+                                     (get-first const/iri-previous)
+                                     (get-first-value const/iri-address))
+                commit-t         (get-commit-t commit)
+                commit-tuples*   (conj commit-tuples [commit proof])]
 
-          (validate-commit commit last-t)
+            (validate-commit commit last-t)
 
-          (if (= from-t commit-t)
-            (async/onto-chan! resp-ch commit-tuples*)
-            (let [verified-commit (<! (read-commit-jsonld storage prev-commit-addr))]
-              (if (util/exception? verified-commit)
-                (do (async/>! resp-ch verified-commit)
-                    (async/close! resp-ch))
-                (recur verified-commit commit-t commit-tuples*))))))
-      (catch* e (async/>! resp-ch e)
-        (async/close! resp-ch))))
+            (if (= from-t commit-t)
+              (async/onto-chan! resp-ch commit-tuples*)
+              (let [verified-commit (<! (read-commit-jsonld storage prev-commit-addr))]
+                (if (util/exception? verified-commit)
+                  (do (async/>! resp-ch verified-commit)
+                      (async/close! resp-ch))
+                  (recur verified-commit commit-t commit-tuples*))))))
+        (catch* e (async/>! resp-ch e)
+                (async/close! resp-ch))))
     resp-ch))
 
 (defn write-jsonld

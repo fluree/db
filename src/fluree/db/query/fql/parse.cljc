@@ -163,7 +163,7 @@
 
 (defn type-pred-match?
   [p-mch]
-  (let [p-iri (where/get-iri p-mch) ]
+  (let [p-iri (where/get-iri p-mch)]
     (contains? type-pred-iris p-iri)))
 
 (defn safe-read
@@ -373,13 +373,13 @@
         ;; TODO: the parsing is slower than it needs to be
         [pred mod] (->>
                      ;; parse to validate
-                     (first (sparql/parse-path-expr path-expr))
+                    (first (sparql/parse-path-expr path-expr))
                      ;; translate back to string
-                     (sparql.translator/parse-term)
+                    (sparql.translator/parse-term)
                      ;; separate recursion modifier
-                     (split-at (dec (count path-expr)))
+                    (split-at (dec (count path-expr)))
                      ;; turn back into strings
-                     (map (partial apply str)))
+                    (map (partial apply str)))
         recur-mod   ({"+" :one+ "*" :zero+} mod)]
     (cond-> (parse-predicate pred context)
       recur-mod (where/add-transitivity recur-mod))))
@@ -595,7 +595,7 @@
                       (dec depth))
              spec*  (-> spec
                         (assoc :spec (expand-selection v depth* context)
-                          :as k))]
+                               :as k))]
          (if (reverse? context k)
            (assoc-in acc [:reverse iri] spec*)
            (assoc acc iri spec*)))
@@ -722,7 +722,7 @@
                          parent-context (merge parent-context))
          [vars values] (parse-values (:values q) context)
          where         (parse-where (:where q) vars context)
-         construct     (parse-construct q context )
+         construct     (parse-construct q context)
          grouping      (parse-grouping q)
          ordering      (parse-ordering q)]
      (-> q
@@ -769,31 +769,31 @@
                 (map vector (range) list))
 
     ;; literal object
-    (some? value)
-    (let [m*      (cond-> m
-                    language (assoc :lang language))
-          obj-cmp (if (v/variable? value)
-                    (parse-variable-if-allowed allowed-vars value)
-                    (parse-object-value value type context m*))]
-      (conj triples [subj-cmp pred-cmp obj-cmp]))
+        (some? value)
+        (let [m*      (cond-> m
+                        language (assoc :lang language))
+              obj-cmp (if (v/variable? value)
+                        (parse-variable-if-allowed allowed-vars value)
+                        (parse-object-value value type context m*))]
+          (conj triples [subj-cmp pred-cmp obj-cmp]))
 
     ;; ref object
-    :else
-    (let [ref-obj (if (v/variable? id)
-                    (parse-variable-if-allowed allowed-vars id)
-                    (where/match-iri
-                     (if (nil? id)
-                       (iri/new-blank-node-id)
-                       id)))
-          ref-cmp (if m
-                    (where/match-meta ref-obj m)
-                    ref-obj)
-          v-map*  (if (nil? id)
+        :else
+        (let [ref-obj (if (v/variable? id)
+                        (parse-variable-if-allowed allowed-vars id)
+                        (where/match-iri
+                         (if (nil? id)
+                           (iri/new-blank-node-id)
+                           id)))
+              ref-cmp (if m
+                        (where/match-meta ref-obj m)
+                        ref-obj)
+              v-map*  (if (nil? id)
                     ;; project newly created bnode-id into v-map
-                    (assoc v-map :id (where/get-iri ref-cmp))
-                    v-map)]
-      (conj (parse-subj-cmp allowed-vars context triples v-map*)
-            [subj-cmp pred-cmp ref-cmp]))))
+                        (assoc v-map :id (where/get-iri ref-cmp))
+                        v-map)]
+          (conj (parse-subj-cmp allowed-vars context triples v-map*)
+                [subj-cmp pred-cmp ref-cmp]))))
 
 (defn parse-pred-cmp
   [allowed-vars context subj-cmp triples [pred values]]
@@ -842,10 +842,10 @@
             []
             expanded)
     (catch* e
-            (throw (ex-info (str "Parsing failure due to: " (ex-message e)
-                                 ". Query: " expanded)
-                            (or (ex-data e) {})
-                            e)))))
+      (throw (ex-info (str "Parsing failure due to: " (ex-message e)
+                           ". Query: " expanded)
+                      (or (ex-data e) {})
+                      e)))))
 
 (defn parse-txn
   [txn context]

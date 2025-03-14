@@ -1,20 +1,20 @@
 (ns fluree.db.connection.system
-  (:require [clojure.string :as str]
+  (:require #?(:clj  [fluree.db.storage.s3 :as s3-storage]
+               :cljs [fluree.db.storage.localstorage :as localstorage-store])
+            [clojure.string :as str]
+            [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.vocab :as conn-vocab]
-            [fluree.db.cache :as cache]
-            [fluree.db.storage :as storage]
-            [fluree.db.remote-system :as remote-system]
-            [fluree.db.storage.file :as file-storage]
-            [fluree.db.storage.memory :as memory-storage]
-            [fluree.db.storage.ipfs :as ipfs-storage]
-            [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.nameservice.storage :as storage-nameservice]
-            [fluree.db.nameservice.ipns :as ipns-nameservice]
             [fluree.db.flake.index.storage :as index-storage]
-            #?(:clj  [fluree.db.storage.s3 :as s3-storage]
-               :cljs [fluree.db.storage.localstorage :as localstorage-store])
+            [fluree.db.nameservice.ipns :as ipns-nameservice]
+            [fluree.db.nameservice.storage :as storage-nameservice]
+            [fluree.db.remote-system :as remote-system]
+            [fluree.db.serde.json :refer [json-serde]]
+            [fluree.db.storage :as storage]
+            [fluree.db.storage.file :as file-storage]
+            [fluree.db.storage.ipfs :as ipfs-storage]
+            [fluree.db.storage.memory :as memory-storage]
             [fluree.db.util.core :as util :refer [get-id get-first get-first-value]]
             [integrant.core :as ig]))
 
@@ -47,7 +47,6 @@
 (derive :fluree.db.nameservice/ipns :fluree.db/nameservice)
 
 (derive :fluree.db.serializer/json :fluree.db/serializer)
-
 
 (defn reference?
   [node]

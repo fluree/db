@@ -5,7 +5,6 @@
 ;; helper functions that allow you to find/view commits sitting on disk for
 ;; debugging purposes
 
-
 (defn list-files
   "List all files in a directory"
   [source-dir]
@@ -48,20 +47,15 @@
              (= t (get % "f:t")))
           commits))
 
-
-
-
 (comment
 
- (def source-dir "data/redshift/test/main/commit")
- (list-files source-dir)
+  (def source-dir "data/redshift/test/main/commit")
+  (list-files source-dir)
 
- (->> (parsed-files source-dir)
-      (only-commit-files)
-      first)
+  (->> (parsed-files source-dir)
+       (only-commit-files)
+       first)
 
- (->> (parsed-files source-dir)
-      (for-t 156)
-      only-commit-files)
-
- )
+  (->> (parsed-files source-dir)
+       (for-t 156)
+       only-commit-files))

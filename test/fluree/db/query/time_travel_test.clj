@@ -1,6 +1,6 @@
 (ns fluree.db.query.time-travel-test
-  (:require [clojure.test :refer [deftest is testing]]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]))
@@ -52,10 +52,10 @@
                                                   (fn [] start-iso)}
                                    (fn []
                                      (let [db1 @(fluree/stage
-                                                  (fluree/db ledger)
-                                                  {"@context" [test-utils/default-context
-                                                               {:ex "http://example.org/ns/"}]
-                                                   "insert"   (first test-utils/movies)})]
+                                                 (fluree/db ledger)
+                                                 {"@context" [test-utils/default-context
+                                                              {:ex "http://example.org/ns/"}]
+                                                  "insert"   (first test-utils/movies)})]
                                        @(fluree/commit! ledger db1))))
           _                      (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] three-loaded-millis)
@@ -63,10 +63,10 @@
                                                   (fn [] three-loaded-iso)}
                                    (fn []
                                      (let [db2 @(fluree/stage
-                                                  (fluree/db ledger)
-                                                  {"@context" [test-utils/default-context
-                                                               {:ex "http://example.org/ns/"}]
-                                                   "insert"   (second test-utils/movies)})]
+                                                 (fluree/db ledger)
+                                                 {"@context" [test-utils/default-context
+                                                              {:ex "http://example.org/ns/"}]
+                                                  "insert"   (second test-utils/movies)})]
                                        @(fluree/commit! ledger db2))))
           _                      (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] all-loaded-millis)
@@ -74,10 +74,10 @@
                                                   (fn [] all-loaded-iso)}
                                    (fn []
                                      (let [db3 @(fluree/stage
-                                                  (fluree/db ledger)
-                                                  {"@context" [test-utils/default-context
-                                                               {:ex "http://example.org/ns/"}]
-                                                   "insert"   (nth test-utils/movies 2)})]
+                                                 (fluree/db ledger)
+                                                 {"@context" [test-utils/default-context
+                                                              {:ex "http://example.org/ns/"}]
+                                                  "insert"   (nth test-utils/movies 2)})]
                                        @(fluree/commit! ledger db3))))
           db                     (fluree/db ledger)
           base-query             {:context test-utils/default-context

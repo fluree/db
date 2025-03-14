@@ -3,18 +3,18 @@
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index.novelty :as novelty]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.json-ld.policy :as policy]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.fuel :as fuel]
-            [fluree.db.json-ld.shacl :as shacl]
-            [fluree.db.json-ld.policy.modify :as policy.modify]
-            [fluree.db.query.exec.update :as update]
             [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.json-ld.policy :as policy]
+            [fluree.db.json-ld.policy.modify :as policy.modify]
+            [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.virtual-graph.index-graph :as vg]
-            [fluree.db.util.log :as log]))
+            [fluree.db.query.exec.update :as update]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph.index-graph :as vg]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -103,9 +103,8 @@
                           (flake/s %)) add)
         has-vgs? (not-empty (:vg db))]
     (cond-> db
-            (seq new-vgs) (new-virtual-graph add (set new-vgs))
-            has-vgs? (vg/update-vgs add rem))))
-
+      (seq new-vgs) (new-virtual-graph add (set new-vgs))
+      has-vgs? (vg/update-vgs add rem))))
 
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an

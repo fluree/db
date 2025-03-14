@@ -66,8 +66,8 @@
     (flake/t-before? t (:t db))
     (let [novelty (reduce (fn [acc idx]
                             (assoc acc idx
-                                       #?(:clj  (future (novelty-after-t db t idx))
-                                          :cljs (novelty-after-t db t idx))))
+                                   #?(:clj  (future (novelty-after-t db t idx))
+                                      :cljs (novelty-after-t db t idx))))
                           {} index/types)
           size    (flake/size-bytes #?(:clj  @(:spot novelty)
                                        :cljs (:spot novelty)))

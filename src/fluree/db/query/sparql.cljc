@@ -25,9 +25,9 @@
 
 (def property-path-grammar
   (str
-    #?(:clj  (slurp (io/resource "sparql-property-path.bnf"))
-       :cljs (inline-resource "sparql-property-path.bnf"))
-    PN_CHARS_BASE))
+   #?(:clj  (slurp (io/resource "sparql-property-path.bnf"))
+      :cljs (inline-resource "sparql-property-path.bnf"))
+   PN_CHARS_BASE))
 
 (defparser parser grammar)
 

@@ -54,8 +54,8 @@
   (fn [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
     (go (try* {(var-name var) (-> solution (get var) (display compact))}
               (catch* e
-                      (log/error e "Error formatting variable:" var)
-                      (>! error-ch e))))))
+                (log/error e "Error formatting variable:" var)
+                (>! error-ch e))))))
 
 (defn format-wildcard-selector-value
   [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
@@ -68,8 +68,8 @@
             (recur vars (assoc result (var-name var) output)))
           result))
       (catch* e
-              (log/error e "Error formatting wildcard")
-              (>! error-ch e)))))
+        (log/error e "Error formatting wildcard")
+        (>! error-ch e)))))
 
 (defn format-as-selector-value
   [bind-var]

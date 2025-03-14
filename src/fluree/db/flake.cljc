@@ -1,10 +1,10 @@
 (ns fluree.db.flake
   (:refer-clojure :exclude [partition-by remove split-at sorted-set-by sorted-map-by take last])
-  (:require [clojure.data.avl :as avl]
+  (:require #?(:clj [clojure.pprint :as pprint])
+            [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
-            [fluree.db.util.core :as util]
             [fluree.db.json-ld.iri :as iri]
-            #?(:clj [clojure.pprint :as pprint]))
+            [fluree.db.util.core :as util])
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -23,7 +23,6 @@
 (def ^:const max-op true)
 (def ^:const min-meta util/min-integer)
 (def ^:const max-meta util/max-integer)
-
 
 (deftype Flake [s p o dt t op m -clj-meta]
   #?@(:clj  [clojure.lang.Seqable
@@ -66,22 +65,22 @@
 
              java.lang.Iterable
              (iterator [this]
-               (let [xs (clojure.lang.Box. (seq this))]
-                 (reify java.util.Iterator
-                   (next [this]
-                     (locking xs
-                       (if-let [v (.-val xs)]
-                         (let [x (first v)]
-                           (set! (.-val xs) (next v))
-                           x)
-                         (throw
-                           (java.util.NoSuchElementException.
-                             "no more elements in VecSeq iterator")))))
-                   (hasNext [this]
-                     (locking xs
-                       (not (nil? (.-val xs)))))
-                   (remove [this]
-                     (throw (UnsupportedOperationException. "remove is not supported on Flake"))))))
+                       (let [xs (clojure.lang.Box. (seq this))]
+                         (reify java.util.Iterator
+                           (next [this]
+                             (locking xs
+                               (if-let [v (.-val xs)]
+                                 (let [x (first v)]
+                                   (set! (.-val xs) (next v))
+                                   x)
+                                 (throw
+                                  (java.util.NoSuchElementException.
+                                   "no more elements in VecSeq iterator")))))
+                           (hasNext [this]
+                             (locking xs
+                               (not (nil? (.-val xs)))))
+                           (remove [this]
+                             (throw (UnsupportedOperationException. "remove is not supported on Flake"))))))
 
              java.util.Collection
              (contains [this o] (boolean (some #(= % o) this)))
@@ -120,7 +119,6 @@
                          (pr-sequential-writer writer pr-writer
                                                "#fluree/Flake [" " " "]"
                                                opts [(.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)]))]))
-
 
 #?(:clj (defmethod print-method Flake [^Flake f, ^java.io.Writer w]
           (.write w (str "#fluree/Flake "))
@@ -237,21 +235,20 @@
     :m (m flake) "m" (m flake)
     not-found))
 
-
 (defn- nth-flake
   "Gets position i in flake."
   [flake i not-found]
   (let [ii (int i)]
     (case ii 0 (s flake)
-             1 (p flake)
-             2 (o flake)
-             3 (dt flake)
-             4 (t flake)
-             5 (op flake)
-             6 (m flake)
-             (or not-found
-                 #?(:clj  (throw (IndexOutOfBoundsException.))
-                    :cljs (throw (js/Error. (str "Index " ii " out of bounds for flake: " flake))))))))
+          1 (p flake)
+          2 (o flake)
+          3 (dt flake)
+          4 (t flake)
+          5 (op flake)
+          6 (m flake)
+          (or not-found
+              #?(:clj  (throw (IndexOutOfBoundsException.))
+                 :cljs (throw (js/Error. (str "Index " ii " out of bounds for flake: " flake))))))))
 
 #?(:clj
    (defmacro combine-cmp [& comps]
@@ -259,13 +256,12 @@
             res   (num 0)]
        (if (not-empty comps)
          (recur
-           (next comps)
-           `(let [c# ~(first comps)]
-              (if (== 0 c#)
-                ~res
-                c#)))
+          (next comps)
+          `(let [c# ~(first comps)]
+             (if (== 0 c#)
+               ~res
+               c#)))
          res))))
-
 
 (defn cmp-bool [b1 b2]
   (if (and (some? b1) (some? b2))
@@ -286,7 +282,6 @@
   (let [m1h (hash-meta m1)
         m2h (hash-meta m2)]
     #?(:clj (Integer/compare m1h m2h) :cljs (- m1h m2h))))
-
 
 (defn cmp-long [l1 l2]
   (if (and l1 l2)
@@ -351,51 +346,48 @@
       (cmp-dt dt1 dt2))
     0))
 
-
 (defn cmp-op
   [op1 op2]
   (cmp-bool op1 op2))
 
 (defn cmp-flakes-spot [f1 f2]
   (combine-cmp
-    (cmp-subj (s f1) (s f2))
-    (cmp-pred (p f1) (p f2))
-    (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
-    (cmp-tx (t f1) (t f2))
-    (cmp-op (op f1) (op f2))
-    (cmp-meta (m f1) (m f2))))
+   (cmp-subj (s f1) (s f2))
+   (cmp-pred (p f1) (p f2))
+   (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
+   (cmp-tx (t f1) (t f2))
+   (cmp-op (op f1) (op f2))
+   (cmp-meta (m f1) (m f2))))
 
 (defn cmp-flakes-post [f1 f2]
   (combine-cmp
-    (cmp-pred (p f1) (p f2))
-    (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
-    (cmp-subj (s f1) (s f2))
-    (cmp-tx (t f1) (t f2))
-    (cmp-op (op f1) (op f2))
-    (cmp-meta (m f1) (m f2))))
-
+   (cmp-pred (p f1) (p f2))
+   (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
+   (cmp-subj (s f1) (s f2))
+   (cmp-tx (t f1) (t f2))
+   (cmp-op (op f1) (op f2))
+   (cmp-meta (m f1) (m f2))))
 
 (defn cmp-flakes-opst [f1 f2]
   (combine-cmp
-    (cmp-subj (o f1) (o f2))
-    (cmp-pred (p f1) (p f2))
-    (cmp-subj (s f1) (s f2))
-    (cmp-tx (t f1) (t f2))
-    (cmp-op (op f1) (op f2))
-    (cmp-meta (m f1) (m f2))))
-
+   (cmp-subj (o f1) (o f2))
+   (cmp-pred (p f1) (p f2))
+   (cmp-subj (s f1) (s f2))
+   (cmp-tx (t f1) (t f2))
+   (cmp-op (op f1) (op f2))
+   (cmp-meta (m f1) (m f2))))
 
 (defn cmp-flakes-block
   "Comparison for flakes in blocks. Like cmp-flakes-spot, but with 't'
   moved up front."
   [f1 f2]
   (combine-cmp
-    (cmp-tx (t f1) (t f2))
-    (cmp-subj (s f1) (s f2))
-    (cmp-pred (p f1) (p f2))
-    (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
-    (cmp-op (op f1) (op f2))
-    (cmp-meta (m f1) (m f2))))
+   (cmp-tx (t f1) (t f2))
+   (cmp-subj (s f1) (s f2))
+   (cmp-pred (p f1) (p f2))
+   (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
+   (cmp-op (op f1) (op f2))
+   (cmp-meta (m f1) (m f2))))
 
 (defn flip-flake
   "Takes a flake and returns one with the provided block and op flipped from true/false.
@@ -510,24 +502,23 @@
   (let [o       (o f)
         o-size  (#?@(:clj (util/case+)
                      :cljs (condp =)) (dt f)
-                  const/$xsd:string (* 2 (count o))
-                  const/$id 30
-                  const/$xsd:boolean 1
-                  const/$xsd:long 8
-                  const/$xsd:int 4
-                  const/$xsd:short 2
-                  const/$xsd:double 8
-                  const/$xsd:float 4
-                  const/$xsd:byte 1
+                                      const/$xsd:string (* 2 (count o))
+                                      const/$id 30
+                                      const/$xsd:boolean 1
+                                      const/$xsd:long 8
+                                      const/$xsd:int 4
+                                      const/$xsd:short 2
+                                      const/$xsd:double 8
+                                      const/$xsd:float 4
+                                      const/$xsd:byte 1
                   ;; else
-                  (if (number? o)
-                    8
-                    (if (string? o)
-                      (* 2 (count o))
-                      (* 2 (count (pr-str o))))))]
-    (cond-> (+ flake-size-base o-size )
-            (m f) (* 2 (count (pr-str (m f)))))))
-
+                                      (if (number? o)
+                                        8
+                                        (if (string? o)
+                                          (* 2 (count o))
+                                          (* 2 (count (pr-str o))))))]
+    (cond-> (+ flake-size-base o-size)
+      (m f) (* 2 (count (pr-str (m f)))))))
 
 (defn size-bytes
   "Returns approx number of bytes in a collection of flakes."

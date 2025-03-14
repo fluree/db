@@ -1,20 +1,20 @@
 (ns fluree.db.flake.reasoner
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
-            [fluree.db.flake :as flake]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.reasoner.util :refer [parse-rules-graph]]
-            [fluree.db.util.log :as log]
-            [fluree.db.query.exec :as exec]
-            [fluree.db.flake.transact :as flake.transact]
-            [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.reasoner.resolve :as resolve]
             [fluree.db.constants :as const]
-            [fluree.json-ld :as json-ld]
+            [fluree.db.flake :as flake]
+            [fluree.db.flake.transact :as flake.transact]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec :as exec]
             [fluree.db.query.fql.parse :as fql.parse]
+            [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]
             [fluree.db.reasoner.owl-datalog :as owl-datalog]
-            [fluree.db.reasoner.graph :refer [task-queue add-rule-dependencies]]))
+            [fluree.db.reasoner.resolve :as resolve]
+            [fluree.db.reasoner.util :refer [parse-rules-graph]]
+            [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -78,12 +78,12 @@
   [rule-id new-flakes]
   (if (str/starts-with? rule-id (str const/iri-owl:sameAs "(trans)"))
     (reduce
-      (fn [acc new-flake]
-        (if (= (flake/s new-flake) (flake/o new-flake))
-          acc
-          (conj acc new-flake)))
-      (empty new-flakes)
-      new-flakes)
+     (fn [acc new-flake]
+       (if (= (flake/s new-flake) (flake/o new-flake))
+         acc
+         (conj acc new-flake)))
+     (empty new-flakes)
+     new-flakes)
     new-flakes))
 
 (defn execute-reasoner-rule
@@ -146,17 +146,17 @@
 (defmethod rules-from-graph :datalog
   [_ _ graph]
   (reduce
-    (fn [acc rule]
-      (if (map? rule)
-        (let [id   (:id rule)
-              rule (util/get-first-value rule const/iri-rule)]
-          (if rule
-            (conj acc [(or id (iri/new-blank-node-id)) rule])
-            acc))
+   (fn [acc rule]
+     (if (map? rule)
+       (let [id   (:id rule)
+             rule (util/get-first-value rule const/iri-rule)]
+         (if rule
+           (conj acc [(or id (iri/new-blank-node-id)) rule])
+           acc))
         ;; else already in two-tuple form
-        (conj acc rule)))
-    []
-    graph))
+       (conj acc rule)))
+   []
+   graph))
 
 (defmethod rules-from-graph :owl2rl
   [_ inserts graph]
@@ -171,9 +171,9 @@
            rules []]
       (if db
         (let [updated-rules (into rules
-                     (as-> db $
-                       (<? (resolve/rules-from-db $ method))
-                       (rules-from-graph method inserts $)))]
+                                  (as-> db $
+                                    (<? (resolve/rules-from-db $ method))
+                                    (rules-from-graph method inserts $)))]
           (recur remaining-dbs updated-rules))
         rules))))
 
@@ -195,8 +195,8 @@
           parsed-rule-graphs    (try*
                                   (map parse-rules-graph rule-graphs)
                                   (catch* e
-                                          (log/error e "Error parsing supplied rules graph:")
-                                          (throw e)))
+                                    (log/error e "Error parsing supplied rules graph:")
+                                    (throw e)))
           all-rules-from-graphs (mapcat (fn [method]
                                           (mapcat (fn [parsed-rules-graph]
                                                     (rules-from-graph method inserts parsed-rules-graph))
@@ -215,13 +215,13 @@
   into fluree/stage standard format."
   [id triples]
   (reduce
-    (fn [acc [_ p v]]
-      (update acc p (fn [ev]
-                      (if ev
-                        (conj ev v)
-                        [v]))))
-    {"@id" id}
-    triples))
+   (fn [acc [_ p v]]
+     (update acc p (fn [ev]
+                     (if ev
+                       (conj ev v)
+                       [v]))))
+   {"@id" id}
+   triples))
 
 (defn inserts-by-rule
   "Creates fluree/stage insert statements for each individual rule that created
@@ -229,19 +229,19 @@
   graph (e.g. owl:sameAs)"
   [inserts]
   (reduce-kv
-    (fn [acc rule-id triples]
-      (let [by-subj    (group-by first triples)
-            statements (reduce-kv
-                         (fn [acc* id triples]
-                           (conj acc* (triples->map id triples)))
-                         []
-                         by-subj)
-            parsed     (-> statements
-                           json-ld/expand
-                           (fql.parse/parse-triples nil nil))]
-        (assoc acc rule-id {:insert parsed})))
-    {}
-    inserts))
+   (fn [acc rule-id triples]
+     (let [by-subj    (group-by first triples)
+           statements (reduce-kv
+                       (fn [acc* id triples]
+                         (conj acc* (triples->map id triples)))
+                       []
+                       by-subj)
+           parsed     (-> statements
+                          json-ld/expand
+                          (fql.parse/parse-triples nil nil))]
+       (assoc acc rule-id {:insert parsed})))
+   {}
+   inserts))
 
 (defn process-inserts
   "Processes any raw inserts that originate from the reasoning
@@ -277,7 +277,7 @@
           duplicate-id-freqs (find-duplicate-ids raw-rules)
           deduplicated-rules (when (not (empty? duplicate-id-freqs))
                                (log/warn "Duplicate ids detected. Some rules will be overwritten:" (apply str (map first duplicate-id-freqs))))
-          reasoning-rules    (-> raw-rules 
+          reasoning-rules    (-> raw-rules
                                  resolve/rules->graph
                                  add-rule-dependencies)
           db**               (if-let [inserts* @inserts]

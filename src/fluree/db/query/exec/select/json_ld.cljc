@@ -1,8 +1,8 @@
 (ns fluree.db.query.exec.select.json-ld
-  (:require [fluree.db.query.exec.where :as where]
-            [fluree.db.validation :as v]
-            [fluree.db.constants :as const]
-            [fluree.db.datatype :as datatype]))
+  (:require [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.validation :as v]))
 
 (defn json-ld-object
   [compact bnodes o-match]

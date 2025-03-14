@@ -35,8 +35,8 @@
   (when-let [path-iri (cond (string? x)  x
                             (keyword? x) (str x))]
     (and
-      (= \< (nth path-iri 0))
-      (= \> (nth path-iri (dec (count path-iri)))))))
+     (= \< (nth path-iri 0))
+     (= \> (nth path-iri (dec (count path-iri)))))))
 
 (def value? (complement sequential?))
 
