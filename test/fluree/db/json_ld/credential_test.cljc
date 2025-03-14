@@ -1,10 +1,12 @@
 (ns fluree.db.json-ld.credential-test
   (:require #?(:clj  [clojure.test :as t :refer [deftest testing is]]
-               :cljs [cljs.test :as t :refer [deftest is] :include-macros true])
+               :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])
             [clojure.core.async :as async]
+            [fluree.crypto :as crypto]
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
             [fluree.db.json-ld.credential :as cred]
+            [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]))
 
 (def kp
@@ -98,8 +100,7 @@
                 (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                   (let [wrong-cred (assoc example-credential "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
                     (is (= "Verification failed, invalid credential."
-                           (-> (async/<! (cred/verify wrong-cred))
-                               (.-message e))))
+                           (.-message (async/<! (cred/verify wrong-cred)))))
                     (done)))))))
 #?(:cljs
    (deftest verify-non-credential
