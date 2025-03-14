@@ -1,10 +1,9 @@
 (ns fluree.db.test-utils
-  (:require #?@(:cljs [[clojure.core.async.interop :refer [<p!]]])
-            [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]
+  (:require #?@(:cljs [[clojure.core.async.interop :refer [<p!]]
+                       [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]])
             [clojure.string :as str]
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 

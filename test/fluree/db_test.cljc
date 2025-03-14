@@ -1,15 +1,14 @@
 (ns fluree.db-test
-  (:require #?(:clj  [clojure.test :refer [deftest is testing use-fixtures]]
-               :cljs [cljs.test :refer-macros [deftest is testing async]])
-            #?(:clj  [test-with-files.tools :refer [with-tmp-dir]
-                      :as twf]
-               :cljs [test-with-files.tools :as-alias twf])
-            #?@(:clj ([fluree.db.async-db :as async-db]
-                      [clojure.core.async :as async]))
-            #?@(:cljs [[clojure.core.async :refer [go <!]]
+  (:require #?@(:clj  [[clojure.test :refer [deftest is testing]]
+                       [fluree.db.did :as did]
+                       [test-with-files.tools :refer [with-tmp-dir] :as twf]
+                       [fluree.db.async-db :as async-db]
+                       [clojure.core.async :as async]]
+                :cljs [[cljs.test :refer-macros [deftest is testing async]]
+                       [test-with-files.tools :as-alias twf]
+                       [clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]])
             [fluree.db.api :as fluree]
-            [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]))
 

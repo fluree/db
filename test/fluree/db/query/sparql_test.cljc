@@ -1,9 +1,7 @@
 (ns fluree.db.query.sparql-test
   (:require
-   #?@(:clj  [[clojure.test :refer :all]]
-       :cljs [[cljs.test :refer-macros [deftest is testing async]]
-              [clojure.core.async :refer [go <!]]
-              [clojure.core.async.interop :refer [<p!]]])
+   #?@(:clj  [[clojure.test :refer [deftest is testing]]]
+       :cljs [[cljs.test :refer-macros [deftest is testing]]])
    [fluree.db.api :as fluree]
    [fluree.db.query.sparql :as sparql]
    [fluree.db.test-utils :as test-utils]

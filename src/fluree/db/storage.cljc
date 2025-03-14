@@ -8,6 +8,11 @@
             [fluree.db.util.json :as json])
   #?(:clj (:import (java.io Writer))))
 
+(defn hashable?
+  [x]
+  (or (string? x)
+      #?(:clj (bytes? x))))
+
 (defn build-location
   ([ns identifier method]
    (build-location ns identifier method []))

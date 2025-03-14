@@ -7,8 +7,7 @@
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.serde.protocol :as serdeproto]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.json :as json])
+            [fluree.db.util.core :as util])
   #?(:clj (:import (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
 

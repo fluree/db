@@ -11,7 +11,6 @@
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.sparql.translator :as sparql.translator]
-            [fluree.db.util.context :as context]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.parse :as util.parse]

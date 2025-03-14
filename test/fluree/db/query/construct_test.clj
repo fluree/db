@@ -1,7 +1,6 @@
 (ns fluree.db.query.construct-test
   (:require [clojure.test :as test :refer [deftest testing is]]
-            [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]))
+            [fluree.db.api :as fluree]))
 
 (def people-data
   [{"@id"             "ex:jdoe"

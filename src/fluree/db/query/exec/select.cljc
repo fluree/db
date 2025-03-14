@@ -12,7 +12,6 @@
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.core :as util :refer [catch* try*]]
-            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]))
 

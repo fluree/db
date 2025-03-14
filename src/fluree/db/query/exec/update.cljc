@@ -2,11 +2,9 @@
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.util.log :as log]))
+            [fluree.db.query.exec.where :as where]))
 
 (defn assign-clause
   [clause solution]

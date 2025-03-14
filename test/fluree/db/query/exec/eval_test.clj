@@ -1,10 +1,8 @@
 (ns fluree.db.query.exec.eval-test
   (:require [clojure.test :as t :refer [deftest testing is]]
             [fluree.db.constants :as const]
-            [fluree.db.datatype :as datatype]
             [fluree.db.query.exec.eval :as fun]
-            [fluree.db.query.exec.where :as where])
-  (:import [java.time OffsetDateTime LocalDateTime LocalDate LocalTime OffsetTime]))
+            [fluree.db.query.exec.where :as where]))
 
 (deftest equality
   (testing "type-indifferent equal"

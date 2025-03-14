@@ -1,8 +1,7 @@
 (ns fluree.db.vector.bm25-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.log :as log]))
+            [fluree.db.test-utils :as test-utils]))
 
 (defn full-text-search
   "Performs a full text search and returns a couple attributes joined from the db

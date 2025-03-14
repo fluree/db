@@ -1,10 +1,9 @@
 (ns fluree.db.policy.tx-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.core :as util]))
 
 ;; TODO - test with multiple properties and classes on same policy
 

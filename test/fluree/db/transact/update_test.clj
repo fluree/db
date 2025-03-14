@@ -1,8 +1,9 @@
 (ns fluree.db.transact.update-test
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.constants :as const]
-            [fluree.db.test-utils :as test-utils])
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.query.exec.eval :as eval])
   (:import [java.time OffsetDateTime]))
 
 (defn const-now
@@ -162,7 +163,7 @@
         db1    (fluree/db ledger)]
 
     (testing "hash functions"
-      (with-redefs [fluree.db.query.exec.eval/now const-now]
+      (with-redefs [eval/now const-now]
         (let [updated (-> @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                           {"ex" "http://example.com/"}]
                                               "insert"   [{"id"     "ex:create-predicates"

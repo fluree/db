@@ -1,6 +1,5 @@
 (ns fluree.db.policy.target-test
   (:require [clojure.test :as t :refer [deftest testing is]]
-            [fluree.crypto :as crypto]
             [fluree.db.api :as fluree]))
 
 (def burt
