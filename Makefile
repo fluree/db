@@ -125,7 +125,10 @@ clj-kondo-lint-ci:
 	clj-kondo --lint src:test:build.clj --config .clj-kondo/ci-config.edn
 
 cljfmt-check:
-	cljfmt check src test build.clj
+	cljfmt check src dev test build.clj
+
+cljfmt-fix:
+	cljfmt fix src dev test build.clj
 
 test: cljtest cljstest nodejs-test browser-test
 
