@@ -2,7 +2,6 @@
   (:require [clojure.set :refer [map-invert]]
             [clojure.string :as str]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [nano-id.core :refer [nano-id]]))
 
 #?(:clj (set! *warn-on-reflection* true))

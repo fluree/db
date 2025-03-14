@@ -2,7 +2,6 @@
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.log :as log]
             [fluree.db.virtual-graph.bm25.stemmer :as stm]))
 
 (set! *warn-on-reflection* true)

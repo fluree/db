@@ -13,7 +13,6 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [fluree.db.virtual-graph.index-graph :as vg]))
 
 #?(:clj (set! *warn-on-reflection* true))

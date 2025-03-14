@@ -5,7 +5,7 @@
             [fluree.crypto :as crypto]
             [fluree.db.did :as did]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
             [fluree.json-ld.processor.api :as jld-processor]))

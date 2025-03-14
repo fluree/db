@@ -1,7 +1,7 @@
 (ns fluree.db.indexer.garbage
   (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.flake.index.storage :as storage]
-            [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
+            [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
 
@@ -11,7 +11,7 @@
   "Garbage file metadata that will be passed to the
   garbage cleaning function that allows it to report
   on status and have filename addresses."
-  [{:keys [prev-index garbage] :as idx-root}]
+  [{:keys [prev-index garbage] :as _idx-root}]
   (when garbage ;; first index will not have garbage
     (assoc garbage
       ;; retain not the current index file, but the previous one
