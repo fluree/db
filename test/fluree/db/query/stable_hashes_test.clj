@@ -1,10 +1,11 @@
 (ns fluree.db.query.stable-hashes-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]))
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.util.core :as util]))
 
 (deftest stable-hashes-test
-  (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [util/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "stable-commit-id")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]

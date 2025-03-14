@@ -2,8 +2,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.constants :as const]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.query.exec.eval :as eval])
+            [fluree.db.query.exec.eval :as eval]
+            [fluree.db.test-utils :as test-utils])
   (:import [java.time OffsetDateTime]))
 
 (defn const-now
