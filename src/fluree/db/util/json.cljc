@@ -4,9 +4,7 @@
             #?(:clj [cheshire.parse :as cparse])
             #?(:cljs [fluree.db.util.core :as util])
             #?(:cljs [goog.object :as gobject])
-            [fluree.db.flake :as flake]
-            [fluree.db.util.bytes :as butil]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.bytes :as butil])
   #?(:clj
      (:import (fluree.db.flake Flake)
               (java.io ByteArrayInputStream)
