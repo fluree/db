@@ -55,7 +55,7 @@
     {:ipns-address     ipns-address
      :relative-address relative-address}))
 
-(def ipns-queue-atom {})
+(def ipns-queue-atom (atom {}))
 
 (defn ipns-queue-pending
   [ipns-addr t dag-map]
