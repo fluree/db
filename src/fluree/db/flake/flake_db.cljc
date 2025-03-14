@@ -33,7 +33,7 @@
             [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-value get-first-id]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph.flat-rank :as flat-rank]
             [fluree.db.virtual-graph.index-graph :as vg])
