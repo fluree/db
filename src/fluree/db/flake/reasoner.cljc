@@ -159,9 +159,8 @@
 
 (defmethod rules-from-graph :owl2rl
   [_ inserts graph]
-  (let []
-    (log/debug "Reasoner - source OWL rules: " graph)
-    (owl-datalog/owl->datalog inserts graph)))
+  (log/debug "Reasoner - source OWL rules: " graph)
+  (owl-datalog/owl->datalog inserts graph))
 
 (defn extract-rules-from-dbs
   [method inserts dbs]
@@ -267,21 +266,21 @@
 (defn reason
   [db methods rule-sources fuel-tracker reasoner-max]
   (go-try
-    (let [db*                (update db :reasoner #(into methods %))
-          tx-state           (flake.transact/->tx-state :db db*)
-          inserts            (atom nil)
+    (let [db*                 (update db :reasoner #(into methods %))
+          tx-state            (flake.transact/->tx-state :db db*)
+          inserts             (atom nil)
           ;; TODO - rules can be processed in parallel
-          raw-rules          (<? (all-rules methods db* inserts rule-sources))
-          _                  (log/debug "Reasoner - extracted rules: " raw-rules)
-          duplicate-id-freqs (find-duplicate-ids raw-rules)
-          deduplicated-rules (when (not (empty? duplicate-id-freqs))
-                               (log/warn "Duplicate ids detected. Some rules will be overwritten:" (apply str (map first duplicate-id-freqs))))
-          reasoning-rules    (-> raw-rules
-                                 resolve/rules->graph
-                                 add-rule-dependencies)
-          db**               (if-let [inserts* @inserts]
-                               (<? (process-inserts db* fuel-tracker inserts*))
-                               db*)]
+          raw-rules           (<? (all-rules methods db* inserts rule-sources))
+          _                   (log/debug "Reasoner - extracted rules: " raw-rules)
+          duplicate-id-freqs  (find-duplicate-ids raw-rules)
+          _deduplicated-rules (when (seq duplicate-id-freqs)
+                                (log/warn "Duplicate ids detected. Some rules will be overwritten:" (apply str (map first duplicate-id-freqs))))
+          reasoning-rules     (-> raw-rules
+                                  resolve/rules->graph
+                                  add-rule-dependencies)
+          db**                (if-let [inserts* @inserts]
+                                (<? (process-inserts db* fuel-tracker inserts*))
+                                db*)]
       (log/trace "Reasoner - parsed rules: " reasoning-rules)
       (if (empty? reasoning-rules)
         db**
