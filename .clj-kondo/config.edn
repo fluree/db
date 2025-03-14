@@ -1,4 +1,5 @@
 {:source-paths #{"src"}
- :linters      {:unresolved-symbol {:exclude [(fluree.db.util.core/catch*)]}}
+ :linters      {:unresolved-symbol {:exclude [(fluree.db.util.core/catch*)
+                                              (test-with-files.tools/with-tmp-dir)]}}
  :lint-as      {instaparse.core/defparser clojure.core/def}
  :output       {:pattern "::{{level}} file={{filename}},line={{row}},col={{col}}::{{message}}"}}
