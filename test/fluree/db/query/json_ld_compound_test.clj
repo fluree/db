@@ -1,37 +1,36 @@
 (ns fluree.db.query.json-ld-compound-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]))
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.api :as fluree]))
 
 (deftest ^:integration simple-compound-queries
   (testing "Simple compound queries."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/compounda")
           db     @(fluree/stage
-                   (fluree/db ledger)
-                   {"@context" ["https://ns.flur.ee"
-                                test-utils/default-context
-                                {:ex "http://example.org/ns/"}]
-                    "insert"
-                    [{:id           :ex/brian,
-                      :type         :ex/User,
-                      :schema/name  "Brian"
-                      :schema/email "brian@example.org"
-                      :schema/age   50
-                      :ex/favNums   7}
-                     {:id           :ex/alice,
-                      :type         :ex/User,
-                      :schema/name  "Alice"
-                      :schema/email "alice@example.org"
-                      :schema/age   50
-                      :ex/favNums   [42, 76, 9]}
-                     {:id           :ex/cam,
-                      :type         :ex/User,
-                      :schema/name  "Cam"
-                      :schema/email "cam@example.org"
-                      :schema/age   34
-                      :ex/favNums   [5, 10]
-                      :ex/friend    [:ex/brian :ex/alice]}]})
+                    (fluree/db ledger)
+                    {"@context" [test-utils/default-context
+                                 {:ex "http://example.org/ns/"}]
+                     "insert"
+                     [{:id           :ex/brian,
+                       :type         :ex/User,
+                       :schema/name  "Brian"
+                       :schema/email "brian@example.org"
+                       :schema/age   50
+                       :ex/favNums   7}
+                      {:id           :ex/alice,
+                       :type         :ex/User,
+                       :schema/name  "Alice"
+                       :schema/email "alice@example.org"
+                       :schema/age   50
+                       :ex/favNums   [42, 76, 9]}
+                      {:id           :ex/cam,
+                       :type         :ex/User,
+                       :schema/name  "Cam"
+                       :schema/email "cam@example.org"
+                       :schema/age   34
+                       :ex/favNums   [5, 10]
+                       :ex/friend    [:ex/brian :ex/alice]}]})
 
           two-tuple-select-with-crawl
           @(fluree/query db {:context [test-utils/default-context
@@ -154,7 +153,9 @@
              [["Alice" [9 42 76]] ["Brian" [7]] ["Cam" [5 10]]])
           "Sums of favNums by person are not accurate.")
 
-;; checking s, p, o values all pulled correctly and all IRIs are resolved from sid integer & compacted
+
+
+      ;; checking s, p, o values all pulled correctly and all IRIs are resolved from sid integer & compacted
       (is (= [[:ex/cam :type :ex/User]
               [:ex/cam :schema/age 34]
               [:ex/cam :schema/email "cam@example.org"]

@@ -1,7 +1,7 @@
 (ns fluree.db.query.json-ld-basic-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]))
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.api :as fluree]))
 
 (deftest ^:integration json-ld-basic-query
   (testing "json-ld"
@@ -127,6 +127,7 @@
                  query-res)
               "Standard bootstrap data isn't matching."))))))
 
+
 (deftest ^:integration json-ld-list-order-preservation
   (testing "json-ld @container @list option"
     (let [conn    (test-utils/create-conn)
@@ -134,7 +135,7 @@
           context [test-utils/default-context {:ex "http://example.org/ns/"}]]
       (testing "define @list container in context"
         (let [db        @(fluree/stage (fluree/db movies)
-                                       {"@context" ["https://ns.flur.ee" context]
+                                       {"@context" context
                                         "insert"
                                         {:context {:id      "@id"
                                                    :ex/list {"@container" "@list"}}
@@ -148,13 +149,13 @@
               "Order of query result is different from transaction.")))
       (testing "define @list directly on subject"
         (let [db        @(fluree/stage (fluree/db movies)
-                                       {"@context" ["https://ns.flur.ee" context]
+                                       {"@context" context
                                         "insert"
                                         {:context {:id "@id"}
                                          :id      "list-test2"
                                          :ex/list {"@list" [42 2 88 1]}}})
               query-res @(fluree/query db {:context   context,
-                                           :selectOne {"list-test2" [:*]}})]
+                                           :selectOne {"list-test2" [:*]},})]
           (is (= {:id      "list-test2"
                   :ex/list [42 2 88 1]}
                  query-res)
@@ -165,42 +166,42 @@
         ledger  @(fluree/create conn "query/simple-subject-crawl")
         context [test-utils/default-context {:ex "http://example.org/ns/"}]
         db      @(fluree/stage
-                  (fluree/db ledger)
-                  {"@context" ["https://ns.flur.ee" context]
-                   "insert"
-                   [{:id           :ex/brian,
-                     :type         :ex/User,
-                     :schema/name  "Brian"
-                     :ex/last      "Smith"
-                     :schema/email "brian@example.org"
-                     :schema/age   50
-                     :ex/favColor  "Green"
-                     :ex/favNums   7}
-                    {:id           :ex/alice,
-                     :type         :ex/User,
-                     :schema/name  "Alice"
-                     :ex/last      "Smith"
-                     :schema/email "alice@example.org"
-                     :ex/favColor  "Green"
-                     :schema/age   42
-                     :ex/favNums   [42, 76, 9]}
-                    {:id           :ex/cam,
-                     :type         :ex/User,
-                     :schema/name  "Cam"
-                     :ex/last      "Jones"
-                     :schema/email "cam@example.org"
-                     :schema/age   34
-                     :ex/favColor  "Blue"
-                     :ex/favNums   [5, 10]
-                     :ex/friend    [:ex/brian :ex/alice]}
-                    {:id           :ex/david,
-                     :type         :ex/User,
-                     :schema/name  "David"
-                     :ex/last      "Jones"
-                     :schema/email "david@example.org"
-                     :schema/age   46
-                     :ex/favNums   [15 70]
-                     :ex/friend    [:ex/cam]}]})]
+                   (fluree/db ledger)
+                   {"@context" context
+                    "insert"
+                    [{:id           :ex/brian,
+                      :type         :ex/User,
+                      :schema/name  "Brian"
+                      :ex/last      "Smith"
+                      :schema/email "brian@example.org"
+                      :schema/age   50
+                      :ex/favColor  "Green"
+                      :ex/favNums   7}
+                     {:id           :ex/alice,
+                      :type         :ex/User,
+                      :schema/name  "Alice"
+                      :ex/last      "Smith"
+                      :schema/email "alice@example.org"
+                      :ex/favColor  "Green"
+                      :schema/age   42
+                      :ex/favNums   [42, 76, 9]}
+                     {:id           :ex/cam,
+                      :type         :ex/User,
+                      :schema/name  "Cam"
+                      :ex/last      "Jones"
+                      :schema/email "cam@example.org"
+                      :schema/age   34
+                      :ex/favColor  "Blue"
+                      :ex/favNums   [5, 10]
+                      :ex/friend    [:ex/brian :ex/alice]}
+                     {:id           :ex/david,
+                      :type         :ex/User,
+                      :schema/name  "David"
+                      :ex/last      "Jones"
+                      :schema/email "david@example.org"
+                      :schema/age   46
+                      :ex/favNums   [15 70]
+                      :ex/friend    [:ex/cam]}]})]
     (testing "direct id"
       ;;TODO not getting reparsed as ssc
       (is (= [{:id           :ex/brian,
@@ -350,8 +351,7 @@
           alias  "faux-compact-iri-query"
           ledger @(fluree/create conn alias)
           db0    @(fluree/stage (fluree/db ledger)
-                                {"@context" ["https://ns.flur.ee"
-                                             test-utils/default-str-context]
+                                {"@context" test-utils/default-str-context
                                  "insert"
                                  [{"id"      "foo"
                                    "ex:name" "Foo"}

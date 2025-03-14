@@ -118,7 +118,7 @@
            ledger-id "credentialtest"
            context   (merge test-utils/default-str-context
                             {"ct" "ledger:credentialtest/"})
-           db0       @(fluree/create-with-txn conn {"@context" ["https://ns.flur.ee" context]
+           db0       @(fluree/create-with-txn conn {"@context" context
                                                     "ledger"   ledger-id
                                                     "insert"   {"@id" "ct:open" "ct:foo" "bar"}})
 
@@ -154,11 +154,11 @@
                                   "@value" {}}}
            tx        [root-user pleb-user policy d-policy]
            ;; can't use credentials until after an identity with a role has been created
-           db1       @(fluree/transact! conn {"@context" ["https://ns.flur.ee" context]
+           db1       @(fluree/transact! conn {"@context" context
                                               "ledger"   ledger-id
                                               "insert"   tx})
 
-           mdfn {"@context" ["https://ns.flur.ee" context]
+           mdfn {"@context" context
                  "ledger"   ledger-id
                  "delete"   {"@id"        (:id auth)
                              "ct:name"    "Daniel"

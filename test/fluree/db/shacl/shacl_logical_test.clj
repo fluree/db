@@ -12,32 +12,32 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                       (fluree/db ledger)
-                       {"@context" ["https://ns.flur.ee" context]
-                        "insert"
-                        {:id             :ex/UserShape
-                         :type           [:sh/NodeShape]
-                         :sh/targetClass :ex/User
-                         :sh/not         [{:id          :ex/pshape1
-                                           :sh/path     :schema/companyName
-                                           :sh/minCount 1}
-                                          {:id        :ex/pshape2
-                                           :sh/path   :schema/name
-                                           :sh/equals :schema/callSign}]
-                         :sh/property    [{:id          :ex/pshape3
-                                           :sh/path     :schema/callSign
-                                           :sh/minCount 1
-                                           :sh/maxCount 1
-                                           :sh/datatype :xsd/string}]}})]
+                        (fluree/db ledger)
+                        {"@context" context
+                         "insert"
+                         {:id             :ex/UserShape
+                          :type           [:sh/NodeShape]
+                          :sh/targetClass :ex/User
+                          :sh/not         [{:id          :ex/pshape1
+                                            :sh/path     :schema/companyName
+                                            :sh/minCount 1}
+                                           {:id        :ex/pshape2
+                                            :sh/path   :schema/name
+                                            :sh/equals :schema/callSign}]
+                          :sh/property    [{:id          :ex/pshape3
+                                            :sh/path     :schema/callSign
+                                            :sh/minCount 1
+                                            :sh/maxCount 1
+                                            :sh/datatype :xsd/string}]}})]
       (testing "no violations"
         (let [db-ok      @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id              :ex/john,
-                             :type            [:ex/User],
-                             :schema/name     "John"
-                             :schema/callSign "j-rock"}})
+                            db
+                            {"@context" context
+                             "insert"
+                             {:id              :ex/john,
+                              :type            [:ex/User],
+                              :schema/name     "John"
+                              :schema/callSign "j-rock"}})
               ok-results @(fluree/query db-ok user-query)]
           (is (= [{:id              :ex/john,
                    :type            :ex/User,
@@ -47,13 +47,13 @@
               (str "unexpected query result: " (pr-str ok-results)))))
       (testing "not equal"
         (let [db-company-name @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id                 :ex/john,
-                                  :type               [:ex/User],
-                                  :schema/companyName "WrongCo"
-                                  :schema/callSign    "j-rock"}})]
+                                 db
+                                 {"@context" context
+                                  "insert"
+                                  {:id                 :ex/john,
+                                   :type               [:ex/User],
+                                   :schema/companyName "WrongCo"
+                                   :schema/callSign    "j-rock"}})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -72,13 +72,13 @@
                  (ex-message db-company-name)))))
       (testing "conforms to minCount"
         (let [db-two-names @(fluree/stage
-                             db
-                             {"@context" ["https://ns.flur.ee" context]
-                              "insert"
-                              {:id                 :ex/john,
-                               :type               [:ex/User],
-                               :schema/companyName ["John", "Johnny"]
-                               :schema/callSign    "j-rock"}})]
+                              db
+                              {"@context" context
+                               "insert"
+                               {:id                 :ex/john,
+                                :type               [:ex/User],
+                                :schema/companyName ["John", "Johnny"]
+                                :schema/callSign    "j-rock"}})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -97,13 +97,13 @@
                  (ex-message db-two-names)))))
       (testing "conforms to equals"
         (let [db-callsign-name @(fluree/stage
-                                 db
-                                 {"@context" ["https://ns.flur.ee" context]
-                                  "insert"
-                                  {:id              :ex/john
-                                   :type            [:ex/User]
-                                   :schema/name     "Johnny Boy"
-                                   :schema/callSign "Johnny Boy"}})]
+                                  db
+                                  {"@context" context
+                                   "insert"
+                                   {:id              :ex/john
+                                    :type            [:ex/User]
+                                    :schema/name     "Johnny Boy"
+                                    :schema/callSign "Johnny Boy"}})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -129,45 +129,45 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                       (fluree/db ledger)
-                       {"@context" ["https://ns.flur.ee" context]
-                        "insert"
-                        {:id             :ex/UserShape
-                         :type           [:sh/NodeShape]
-                         :sh/targetClass :ex/User
-                         :sh/not         [{:id              :ex/pshape1
-                                           :sh/path         :schema/age
-                                           :sh/minInclusive 130}
-                                          {:id              :ex/pshape2
-                                           :sh/path         :schema/favNums
-                                           :sh/maxExclusive 9000}]
-                         :sh/property    [{:id          :ex/pshape3
-                                           :sh/path     :schema/age
-                                           :sh/minCount 1
-                                           :sh/maxCount 1
-                                           :sh/datatype :xsd/integer}]}})
+                        (fluree/db ledger)
+                        {"@context" context
+                         "insert"
+                         {:id             :ex/UserShape
+                          :type           [:sh/NodeShape]
+                          :sh/targetClass :ex/User
+                          :sh/not         [{:id              :ex/pshape1
+                                            :sh/path         :schema/age
+                                            :sh/minInclusive 130}
+                                           {:id              :ex/pshape2
+                                            :sh/path         :schema/favNums
+                                            :sh/maxExclusive 9000}]
+                          :sh/property    [{:id          :ex/pshape3
+                                            :sh/path     :schema/age
+                                            :sh/minCount 1
+                                            :sh/maxCount 1
+                                            :sh/datatype :xsd/integer}]}})
 
           db-two-probs @(fluree/stage
-                         db
-                         {"@context" ["https://ns.flur.ee" context]
-                          "insert"
-                          {:id              :ex/john
-                           :type            [:ex/User]
-                           :schema/name     "Johnny Boy"
-                           :schema/callSign "Johnny Boy"
-                           :schema/age      900
-                           :schema/favNums  [4 8 15 16 23 42]}})]
+                          db
+                          {"@context" context
+                           "insert"
+                           {:id              :ex/john
+                            :type            [:ex/User]
+                            :schema/name     "Johnny Boy"
+                            :schema/callSign "Johnny Boy"
+                            :schema/age      900
+                            :schema/favNums  [4 8 15 16 23 42]}})]
       (testing "no violations"
         (let [db-ok      @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id              :ex/john,
-                             :type            [:ex/User],
-                             :schema/name     "John"
-                             :schema/callSign "j-rock"
-                             :schema/age      42
-                             :schema/favNums  [9004 9008 9015 9016 9023 9042]}})
+                            db
+                            {"@context" context
+                             "insert"
+                             {:id              :ex/john,
+                              :type            [:ex/User],
+                              :schema/name     "John"
+                              :schema/callSign "j-rock"
+                              :schema/age      42
+                              :schema/favNums  [9004 9008 9015 9016 9023 9042]}})
               ok-results @(fluree/query db-ok user-query)]
           (is (= [{:id              :ex/john,
                    :type            :ex/User,
@@ -179,14 +179,14 @@
               (str "unexpected query result: " (pr-str ok-results)))))
       (testing "conforms to min and max"
         (let [db-too-old @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id                 :ex/john,
-                             :type               [:ex/User],
-                             :schema/companyName "WrongCo"
-                             :schema/callSign    "j-rock"
-                             :schema/age         131}})]
+                            db
+                            {"@context" context
+                             "insert"
+                             {:id                 :ex/john,
+                              :type               [:ex/User],
+                              :schema/companyName "WrongCo"
+                              :schema/callSign    "j-rock"
+                              :schema/age         131}})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -213,15 +213,15 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                  (ex-message db-too-old)))))
       (testing "conforms to max exclusive"
         (let [db-too-low @(fluree/stage
-                           db
-                           {"@context" ["https://ns.flur.ee" context]
-                            "insert"
-                            {:id                 :ex/john,
-                             :type               [:ex/User],
-                             :schema/companyName ["John", "Johnny"]
-                             :schema/callSign    "j-rock"
-                             :schema/age         27
-                             :schema/favNums     [4 8 15 16 23 42]}})]
+                            db
+                            {"@context" context
+                             "insert"
+                             {:id                 :ex/john,
+                              :type               [:ex/User],
+                              :schema/companyName ["John", "Johnny"]
+                              :schema/callSign    "j-rock"
+                              :schema/age         27
+                              :schema/favNums     [4 8 15 16 23 42]}})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -273,31 +273,31 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/stage
-                       (fluree/db ledger)
-                       {"@context" ["https://ns.flur.ee" context]
-                        "insert"
-                        {:id             :ex/UserShape
-                         :type           [:sh/NodeShape]
-                         :sh/targetClass :ex/User
-                         :sh/not         [{:id           :ex/pshape1
-                                           :sh/path      :ex/tag
-                                           :sh/minLength 4}
-                                          {:id           :ex/pshape2
-                                           :sh/path      :schema/name
-                                           :sh/maxLength 10}
-                                          {:id         :ex/pshape3
-                                           :sh/path    :ex/greeting
-                                           :sh/pattern "hello.*"}]}})]
+                        (fluree/db ledger)
+                        {"@context" context
+                         "insert"
+                         {:id             :ex/UserShape
+                          :type           [:sh/NodeShape]
+                          :sh/targetClass :ex/User
+                          :sh/not         [{:id           :ex/pshape1
+                                            :sh/path      :ex/tag
+                                            :sh/minLength 4}
+                                           {:id           :ex/pshape2
+                                            :sh/path      :schema/name
+                                            :sh/maxLength 10}
+                                           {:id         :ex/pshape3
+                                            :sh/path    :ex/greeting
+                                            :sh/pattern "hello.*"}]}})]
       (testing "no constraint violations"
         (let [db-ok @(fluree/stage
-                      db
-                      {"@context" ["https://ns.flur.ee" context]
-                       "insert"
-                       {:id          :ex/jean-claude
-                        :type        :ex/User,
-                        :schema/name "Jean-Claude"
-                        :ex/tag      1
-                        :ex/greeting "HOWDY"}})]
+                       db
+                       {"@context" context
+                        "insert"
+                        {:id          :ex/jean-claude
+                         :type        :ex/User,
+                         :schema/name "Jean-Claude"
+                         :ex/tag      1
+                         :ex/greeting "HOWDY"}})]
           (is (= [{:id          :ex/jean-claude
                    :type        :ex/User,
                    :schema/name "Jean-Claude"
@@ -306,12 +306,12 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                  @(fluree/query db-ok user-query)))))
       (testing "name conforms"
         (let [db-name-too-short @(fluree/stage
-                                  db
-                                  {"@context" ["https://ns.flur.ee" context]
-                                   "insert"
-                                   {:id          :ex/john,
-                                    :type        [:ex/User],
-                                    :schema/name "John"}})]
+                                   db
+                                   {"@context" context
+                                    "insert"
+                                    {:id          :ex/john,
+                                     :type        [:ex/User],
+                                     :schema/name "John"}})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -346,12 +346,12 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                  (ex-message db-name-too-short)))))
       (testing "tag conforms"
         (let [db-tag-too-long @(fluree/stage
-                                db
-                                {"@context" ["https://ns.flur.ee" context]
-                                 "insert"
-                                 {:id     :ex/john,
-                                  :type   [:ex/User],
-                                  :ex/tag 12345}})]
+                                 db
+                                 {"@context" context
+                                  "insert"
+                                  {:id     :ex/john,
+                                   :type   [:ex/User],
+                                   :ex/tag 12345}})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -386,12 +386,12 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                  (ex-message db-tag-too-long)))))
       (testing "greeting conforms"
         (let [db-greeting-incorrect @(fluree/stage
-                                      db
-                                      {"@context" ["https://ns.flur.ee" context]
-                                       "insert"
-                                       {:id          :ex/john,
-                                        :type        [:ex/User],
-                                        :ex/greeting "hello!"}})]
+                                       db
+                                       {"@context" context
+                                        "insert"
+                                        {:id          :ex/john,
+                                         :type        [:ex/User],
+                                         :ex/greeting "hello!"}})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -428,7 +428,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 (deftest ^:integration shacl-and-tests
   (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "shacl-and")
-        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
         db1     @(fluree/stage db0 {"@context" context
                                     "insert"
@@ -476,7 +476,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 (deftest ^:integration shacl-or-tests
   (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "shacl-or")
-        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
         db1     @(fluree/stage db0 {"@context" context
                                     "insert"
@@ -523,7 +523,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 (deftest ^:integration shacl-xone-tests
   (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "shacl-or")
-        context ["https://ns.flur.ee" test-utils/default-str-context {"ex" "http://example.org/ns/"}]
+        context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
         db1     @(fluree/stage db0 {"@context" context
                                     "insert"
@@ -583,7 +583,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                    "sh:focusNode" "ex:Named",
                    "sh:constraintComponent" "sh:xone",
                    "sh:sourceShape" "ex:orShape",
-                   "sh:value" ["Washington" "George Washington" "George"],
+                   "sh:value" ["George" "George Washington" "Washington"],
                    "sh:resultMessage" "values conformed to 2 of the following sh:xone shapes: [\"ex:one-part\" \"ex:two-parts\"]; must only conform to one"}]}}
                (ex-data db2)))
         (is (= "Subject ex:Named violates constraint sh:xone of shape ex:orShape - values conformed to 2 of the following sh:xone shapes: [\"ex:one-part\" \"ex:two-parts\"]; must only conform to one."
