@@ -1,2 +1,3 @@
 {:source-paths #{"src"}
- :output {:pattern "::{{level}} file={{filename}},line={{row}},col={{col}}::{{message}}"}}
+ :linters      {:unresolved-symbol {:exclude [(fluree.db.util.core/catch*)]}}
+ :output       {:pattern "::{{level}} file={{filename}},line={{row}},col={{col}}::{{message}}"}}
