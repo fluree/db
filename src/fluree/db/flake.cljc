@@ -38,13 +38,9 @@
 
              clojure.lang.IPersistentCollection
              (equiv [f o] (and (instance? Flake o) (equiv-flake f o)))
-             (empty [f] (throw (UnsupportedOperationException. "empty is not supported on Flake")))
-             (count [f] 7)
+             (empty [_f] (throw (UnsupportedOperationException. "empty is not supported on Flake")))
+             (count [_f] 7)
              (cons [f [k v]] (assoc-flake f k v))
-
-             clojure.lang.IPersistentMap
-             (assocEx [f k v] (UnsupportedOperationException. "assocEx is not supported on Flake"))
-             (without [f k] (UnsupportedOperationException. "without is not supported on Flake"))
 
              clojure.lang.Associative
              (entryAt [f k] (some->> (get f k nil) (clojure.lang.MapEntry k)))
@@ -67,7 +63,7 @@
              (iterator [this]
                        (let [xs (clojure.lang.Box. (seq this))]
                          (reify java.util.Iterator
-                           (next [this]
+                           (next [_this]
                              (locking xs
                                (if-let [v (.-val xs)]
                                  (let [x (first v)]
@@ -76,10 +72,10 @@
                                  (throw
                                   (java.util.NoSuchElementException.
                                    "no more elements in VecSeq iterator")))))
-                           (hasNext [this]
+                           (hasNext [_this]
                              (locking xs
                                (not (nil? (.-val xs)))))
-                           (remove [this]
+                           (remove [_this]
                              (throw (UnsupportedOperationException. "remove is not supported on Flake"))))))
 
              java.util.Collection
@@ -109,7 +105,7 @@
              (-assoc [this k v] (assoc-flake this k v))
 
              IMeta
-             (-meta [this] -clj-meta)
+             (-meta [_this] -clj-meta)
 
              IWithMeta
              (-with-meta [f clj-meta] (Flake. (.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f) clj-meta))
