@@ -445,7 +445,8 @@
   [db idx s p o o-fn]
   (if (and (#{:spot} idx)
            (nil? p)
-           (and s o))
+           s
+           o)
     (let [f (if o-fn
               (fn [mch]
                 (and (#{o} (or (get-value mch)
