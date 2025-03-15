@@ -1,7 +1,5 @@
 (ns fluree.db.json-ld.shacl
-  (:require #?(:clj  [fluree.db.util.clj-const :as uc]
-               :cljs [fluree.db.util.cljs-const :as uc])
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
             [clojure.set :as set]
             [clojure.string :as str]
             [fluree.db.constants :as const]
@@ -9,8 +7,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.util.regex Pattern))))
 

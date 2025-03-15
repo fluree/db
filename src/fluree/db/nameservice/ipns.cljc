@@ -5,8 +5,7 @@
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

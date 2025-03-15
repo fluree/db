@@ -1,13 +1,11 @@
 (ns fluree.db.json-ld.policy.rules
-  (:require [clojure.core.async :as async :refer [<! go]]
+  (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.reasoner.util :refer [parse-rules-graph]]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
