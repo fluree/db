@@ -1,9 +1,12 @@
 (ns fluree.db.util.json
-  (:require #?(:clj [cheshire.core :as cjson])
-            #?(:clj [cheshire.generate :refer [add-encoder encode-seq remove-encoder]])
-            #?(:clj [cheshire.parse :as cparse])
-            #?(:cljs [fluree.db.util.core :as util])
-            #?(:cljs [goog.object :as gobject])
+  (:require #?@(:clj
+                [[cheshire.core :as cjson]
+                 [cheshire.generate :refer [add-encoder encode-seq remove-encoder]]
+                 [cheshire.parse :as cparse]
+                 [fluree.db.util.log :as log]]
+                :cljs
+                [[fluree.db.util.core :as util]
+                 [goog.object :as gobject]])
             [fluree.db.util.bytes :as butil])
   #?(:clj
      (:import (fluree.db.flake Flake)
