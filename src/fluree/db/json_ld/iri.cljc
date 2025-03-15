@@ -107,7 +107,7 @@
        (= (.-namespace-code sid) (.-namespace-code other))
        (= (.-name sid) (.-name other))))
 
-(defn ^SID ->sid
+(defn ->sid ^SID
   [ns-code nme]
   (->SID #?(:clj (int ns-code) :cljs ns-code) nme))
 
