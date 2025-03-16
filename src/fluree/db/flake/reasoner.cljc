@@ -127,8 +127,8 @@
                   maxed?              (when reasoner-max
                                         (= (:iterations summary*) reasoner-max))]
 
-              (log/debug "Total reasoned flakes:" (:total-flakes summary*))
-              "completed in:" (:iterations summary*) "iteration(s)."
+              (log/debug "Total reasoned flakes:" (:total-flakes summary*)
+                         "completed in:" (:iterations summary*) "iteration(s).")
 
               (if (and new-flakes? (not maxed?))
                 (recur rule-schedule nil reasoned-db summary*)
