@@ -3,7 +3,7 @@
                        [fluree.crypto :as crypto]
                        [fluree.db.api :as fluree]
                        [fluree.db.test-utils :as test-utils]]
-                :cljs [[cljs.test :as t :refer [deftest testing is] :include-macros true]])
+                :cljs [[cljs.test :as t :refer [deftest is] :include-macros true]])
             [clojure.core.async :as async]
             [fluree.db.did :as did]
             [fluree.db.json-ld.credential :as cred]
