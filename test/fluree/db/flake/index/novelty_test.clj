@@ -32,10 +32,10 @@
                                                "@value" "12:42:00Z"}
                          "ex:localTime"       {"@type"  "xsd:time"
                                                "@value" "12:42:00"}}]})
-            db-commit @(fluree/commit! ledger db)
-            loaded    (test-utils/retry-load conn (:alias ledger) 100)
-            q         {"@context" context
-                       "select"   {"?s" ["*"]}
-                       "where"    {"@id" "?s", "type" "ex:Bar"}}]
+            _db-commit @(fluree/commit! ledger db)
+            loaded     (test-utils/retry-load conn (:alias ledger) 100)
+            q          {"@context" context
+                        "select"   {"?s" ["*"]}
+                        "where"    {"@id" "?s", "type" "ex:Bar"}}]
         (is (= @(fluree/query (fluree/db loaded) q)
                @(fluree/query db q)))))))

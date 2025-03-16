@@ -77,9 +77,9 @@
 
 (defn migrate-commits
   "Reduce over each commmit and integrate its data into the ledger's db."
-  [ledger branch tuples-chans]
+  [ledger _branch tuples-chans]
   (go-try
-    (loop [[[commit-tuple ch] & r] tuples-chans
+    (loop [[[commit-tuple _ch] & r] tuples-chans
            db (let [current-db (ledger/current-db ledger)]
                 (if (async-db/db? current-db)
                   (<? (async-db/deref-async current-db))

@@ -185,7 +185,7 @@
                           :else
                           :ignore-flakes))
                       t-flakes)
-            [assert-flakes* annotation-flakes] (extract-annotation-flakes commit-wrapper-flakes assert-flakes)
+            [_ annotation-flakes] (extract-annotation-flakes commit-wrapper-flakes assert-flakes)
 
             commit-wrapper-chan (jld-format/format-subject-flakes db cache context compact
                                                                   {:wildcard? true, :depth 0}

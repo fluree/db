@@ -112,34 +112,34 @@
                       "schema" "http://schema.org/",
                       "xsd"    "http://www.w3.org/2001/XMLSchema#"}
 
-          ledger1 (with-redefs [util/current-time-iso (fn [] t1)]
-                    @(fluree/create-with-txn conn
-                                             {"@context" context
+          _ledger1 (with-redefs [util/current-time-iso (fn [] t1)]
+                     @(fluree/create-with-txn conn
+                                              {"@context" context
+                                               "ledger"   "test/time1"
+                                               "insert"   [{"@id"     "ex:time-test"
+                                                            "@type"   "ex:foo"
+                                                            "ex:time" 1}]}))
+          _ledger2 (with-redefs [util/current-time-iso (fn [] t1)]
+                     @(fluree/create-with-txn conn
+                                              {"@context" context
+                                               "ledger"   "test/time2"
+                                               "insert"   [{"@id"   "ex:time-test"
+                                                            "ex:p1" "value1"}
+                                                           {"@id"   "ex:foo"
+                                                            "ex:p2" "t1"}]}))
+          _        (with-redefs [util/current-time-iso (fn [] t2)]
+                     @(fluree/transact! conn {"@context" context
                                               "ledger"   "test/time1"
                                               "insert"   [{"@id"     "ex:time-test"
-                                                           "@type"   "ex:foo"
-                                                           "ex:time" 1}]}))
-          ledger2 (with-redefs [util/current-time-iso (fn [] t1)]
-                    @(fluree/create-with-txn conn
-                                             {"@context" context
-                                              "ledger"   "test/time2"
-                                              "insert"   [{"@id"   "ex:time-test"
-                                                           "ex:p1" "value1"}
-                                                          {"@id"   "ex:foo"
-                                                           "ex:p2" "t1"}]}))
-          _       (with-redefs [util/current-time-iso (fn [] t2)]
-                    @(fluree/transact! conn {"@context" context
-                                             "ledger"   "test/time1"
-                                             "insert"   [{"@id"     "ex:time-test"
-                                                          "ex:time" 2}]}))
-          _       (with-redefs [util/current-time-iso (fn [] t2)]
-                    @(fluree/transact! conn
-                                       {"@context" context
-                                        "ledger"   "test/time2"
-                                        "insert"   [{"@id"   "ex:time-test"
-                                                     "ex:p1" "value2"}
-                                                    {"@id"   "ex:foo"
-                                                     "ex:p2" "t2"}]}))]
+                                                           "ex:time" 2}]}))
+          _        (with-redefs [util/current-time-iso (fn [] t2)]
+                     @(fluree/transact! conn
+                                        {"@context" context
+                                         "ledger"   "test/time2"
+                                         "insert"   [{"@id"   "ex:time-test"
+                                                      "ex:p1" "value2"}
+                                                     {"@id"   "ex:foo"
+                                                      "ex:p2" "t2"}]}))]
       (testing "Single ledger"
         (let [q {:context context
                  :from    "test/time1"
@@ -198,22 +198,22 @@
                 "should be results as of `t` = 1 for both ledgers")))
         (testing "Not all ledgers have data for given `t`"
           (with-redefs [util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
-            (let [ledger-valid @(fluree/create-with-txn conn
-                                                        {"@context" context
-                                                         "ledger"   "test/time-before"
-                                                         "insert"   [{"@id"   "ex:time-test"
-                                                                      "ex:p1" "value"}]})
-                  q            {:context context
-                                :from    ["test/time1" "test/time-before"]
-                                :select  '[?p1 ?time]
-                                :where   '{"@id"     "ex:time-test"
-                                           "ex:p1"   ?p1
-                                           "ex:time" ?time}
-                                ;;`t` is valid for "ledger-valid",
-                                ;;but not "test/time1"
-                                :t       "1988-05-30T12:40:44.823Z"}
-                  invalid-time (try @(fluree/query-connection conn q)
-                                    (catch Exception e e))]
+            (let [_ledger-valid @(fluree/create-with-txn conn
+                                                         {"@context" context
+                                                          "ledger"   "test/time-before"
+                                                          "insert"   [{"@id"   "ex:time-test"
+                                                                       "ex:p1" "value"}]})
+                  q             {:context context
+                                 :from    ["test/time1" "test/time-before"]
+                                 :select  '[?p1 ?time]
+                                 :where   '{"@id"     "ex:time-test"
+                                            "ex:p1"   ?p1
+                                            "ex:time" ?time}
+                                 ;;`t` is valid for "ledger-valid",
+                                 ;;but not "test/time1"
+                                 :t       "1988-05-30T12:40:44.823Z"}
+                  invalid-time  (try @(fluree/query-connection conn q)
+                                     (catch Exception e e))]
 
               (is (util/exception? invalid-time))
               (is (= 400 (-> invalid-time ex-data :status)))

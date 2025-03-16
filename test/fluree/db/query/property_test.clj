@@ -219,23 +219,23 @@
                      {"ex"  "http://example.com/"
                       "owl" "http://www.w3.org/2002/07/owl#"}]
           ledger    @(fluree/create conn ledger-id)
-          db0       (->> @(fluree/stage (fluree/db ledger) {"@context" context
+          _db0      (->> @(fluree/stage (fluree/db ledger) {"@context" context
                                                             "insert"   {"ex:new" true}})
                          (fluree/commit! ledger)
                          (deref))
 
-          db1 @(fluree/transact!
-                conn {"ledger"   ledger-id
-                      "@context" context
-                      "insert"
-                      [{"@id"                    "ex:givenName"
-                        "@type"                  "rdf:Property"
-                        "owl:equivalentProperty" {"@id"   "ex:firstName"
-                                                  "@type" "rdf:Property"}
-                        "ex:preds"               {"@list" [{"@id"   "ex:cool"
-                                                            "@type" "rdf:Property"}
-                                                           {"@id"   "ex:fool"
-                                                            "@type" "rdf:Property"}]}}]})
+          _db1 @(fluree/transact!
+                 conn {"ledger"   ledger-id
+                       "@context" context
+                       "insert"
+                       [{"@id"                    "ex:givenName"
+                         "@type"                  "rdf:Property"
+                         "owl:equivalentProperty" {"@id"   "ex:firstName"
+                                                   "@type" "rdf:Property"}
+                         "ex:preds"               {"@list" [{"@id"   "ex:cool"
+                                                             "@type" "rdf:Property"}
+                                                            {"@id"   "ex:fool"
+                                                             "@type" "rdf:Property"}]}}]})
 
           db2    @(fluree/transact!
                    conn {"ledger"   ledger-id

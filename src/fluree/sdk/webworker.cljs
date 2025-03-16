@@ -28,7 +28,9 @@
             {} (goog.object/getKeys obj))
     obj))
 
-(defmulti ^:private worker-action (fn [conn-id event & _] event))
+(defmulti ^:private worker-action
+  (fn [_conn-id event & _]
+    event))
 
 (defmethod worker-action :setState
   [conn-id _ id state-update]

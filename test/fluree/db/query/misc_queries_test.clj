@@ -348,7 +348,7 @@
   (with-tmp-dir storage-path
     (let [conn0     @(fluree/connect-file {:storage-path storage-path})
           ledger-id "new3"
-          ledger    @(fluree/create-with-txn conn0 {"@context" {"ex" {"ex" "http://example.org/ns/"}}
+          _ledger    @(fluree/create-with-txn conn0 {"@context" {"ex" {"ex" "http://example.org/ns/"}}
                                                     "ledger"   ledger-id
                                                     "insert"   {"ex:createdAt" "now"}})
 

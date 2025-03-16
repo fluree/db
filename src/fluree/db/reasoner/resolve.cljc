@@ -18,7 +18,7 @@
 
   Input is the original rule set, and a list/set of newly generated
   flakes from the last rules run."
-  [rules post-flakes]
+  [_rules _post-flakes]
   :TODO)
 
 (defn extract-pattern
