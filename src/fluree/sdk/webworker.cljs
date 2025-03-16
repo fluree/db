@@ -201,7 +201,7 @@
                         :error  :db/invalid-connection}))
        (do
          (remove-conn-listener conn conn-id ledger)
-         :TODO #_(conn-handler/close conn)
+         ;; (conn-handler/close conn) ; TODO
          (swap! conn-register assoc conn-id new-config)
          {:status  200
           :message "Connection closed."})))))
