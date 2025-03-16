@@ -1,5 +1,5 @@
 (ns fluree.db.reasoner.graph
-  (:require [clojure.set :as set :refer [difference union intersection]]))
+  (:require [clojure.set :as set :refer [intersection]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -51,4 +51,3 @@
         remove-non-dependent-rules ;; any rule that has run and has no dependencies can be removed
         (keep-last-run-matches result-summary)
         (task-queue rules)))) ;; sort based on dependencies
-

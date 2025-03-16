@@ -1,6 +1,5 @@
 (ns fluree.db.util.context
-  (:require [fluree.db.util.core :as util]
-            [fluree.json-ld :as json-ld]))
+  (:require [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

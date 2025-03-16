@@ -1,5 +1,5 @@
 (ns fluree.db.datatype-test
-  (:require [clojure.test :refer [deftest testing are is]]
+  (:require [clojure.test :refer [deftest testing is]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :refer [coerce]])
   #?(:clj (:import (java.time LocalDate LocalTime OffsetDateTime OffsetTime

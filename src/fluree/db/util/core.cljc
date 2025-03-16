@@ -3,7 +3,7 @@
                       [fluree.db.util.cljs-exceptions :as cljs-exceptions]])
             [clojure.string :as str])
   #?(:cljs (:require-macros [fluree.db.util.core :refer [case+]]))
-  #?(:clj (:import (java.util UUID Date)
+  #?(:clj (:import (java.util Date)
                    (java.time Instant OffsetDateTime ZoneId)
                    (java.time.format DateTimeFormatter)
                    (java.net URLEncoder URLDecoder)))

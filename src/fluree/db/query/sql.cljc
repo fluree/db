@@ -1,7 +1,7 @@
 (ns fluree.db.query.sql
   (:require #?(:clj  [clojure.java.io :as io]
                :cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
-            #?(:clj  [instaparse.core :as insta :refer [defparser]]
+            #?(:clj  [instaparse.core :as insta]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
             [clojure.string :as str]
             [fluree.db.query.sql.template :as template]))
