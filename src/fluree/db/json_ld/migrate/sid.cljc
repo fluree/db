@@ -12,7 +12,7 @@
             [fluree.db.ledger :as ledger]
             [fluree.db.query.exec.update :as update]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-id get-first-id get-first-value]]
+            [fluree.db.util.core :as util :refer [get-first get-id get-first-value]]
             [fluree.db.util.log :as log]))
 
 (defrecord NamespaceMapping [mapping]
