@@ -307,46 +307,76 @@
                                       :error  :db/invalid-value})))))
        :cljs nil)))
 
-(defn- coerce-int-fn
-  "Returns a fn for coercing int-like values (e.g. short, long) from strings and
-  integers. Arguments are CLJ-only parse-str and cast-num fns (CLJS is always
-  the same because in JS it's all just Numbers)."
-  [parse-str cast-num]
-  (fn [value]
-    (cond
-      (string? value)
-      #?(:clj  (try (parse-str value) (catch Exception _ nil))
-         :cljs (when-not (str/includes? value ".")
-                 (let [n (js/parseInt value)] (if (js/Number.isNaN n) nil n))))
+#?(:clj
+   (defn- coerce-int-fn
+     "Returns a fn for coercing int-like values (e.g. short, long) from strings and
+     integers. Arguments are CLJ-only parse-str and cast-num fns (CLJS is always
+     the same because in JS it's all just Numbers)."
+     [parse-str cast-num]
+     (fn [value]
+       (cond
+         (string? value)
+         (try (parse-str value)
+              (catch Exception _
+                nil))
 
-      (integer? value)
-      #?(:clj (try (cast-num value) (catch Exception _ nil)) :cljs value)
+         (integer? value)
+         (try (cast-num value)
+              (catch Exception _
+                nil))
 
-      :else nil)))
+         :else nil)))
+
+   :cljs
+   (defn- coerce-int
+     [value]
+     (cond
+       (string? value)
+       (when-not (str/includes? value ".")
+         (let [n (js/parseInt value)]
+           (when-not (js/Number.isNaN n)
+             n)))
+
+       (integer? value)
+       value
+
+       :else nil)))
 
 (defn- coerce-integer
   [value]
-  (let [coerce-fn (coerce-int-fn #?(:clj #(Integer/parseInt %) :cljs nil)
-                                 #?(:clj int :cljs nil))]
-    (coerce-fn value)))
+  #?(:clj
+     (let [coerce-fn (coerce-int-fn #(Integer/parseInt %) int)]
+       (coerce-fn value))
+
+     :cljs
+     (coerce-int value)))
 
 (defn- coerce-long
   [value]
-  (let [coerce-fn (coerce-int-fn #?(:clj #(Long/parseLong %) :cljs nil)
-                                 #?(:clj long :cljs nil))]
-    (coerce-fn value)))
+  #?(:clj
+     (let [coerce-fn (coerce-int-fn #(Long/parseLong %) long)]
+       (coerce-fn value))
+
+     :cljs
+     (coerce-int value)))
 
 (defn- coerce-short
   [value]
-  (let [coerce-fn (coerce-int-fn #?(:clj #(Short/parseShort %) :cljs nil)
-                                 #?(:clj short :cljs nil))]
-    (coerce-fn value)))
+  #?(:clj
+     (let [coerce-fn (coerce-int-fn #(Short/parseShort %) short)]
+       (coerce-fn value))
+
+     :cljs
+     (coerce-int value)))
 
 (defn- coerce-byte
   [value]
-  (let [coerce-fn (coerce-int-fn #?(:clj #(Byte/parseByte %) :cljs nil)
-                                 #?(:clj byte :cljs nil))]
-    (coerce-fn value)))
+  #?(:clj
+     (let [coerce-fn (coerce-int-fn  #(Byte/parseByte %) byte)]
+       (coerce-fn value))
+
+     :cljs
+     (coerce-int value)))
 
 (defn- coerce-normalized-string
   [value]
