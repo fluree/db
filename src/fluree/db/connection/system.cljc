@@ -101,17 +101,27 @@
   [_ component]
   component)
 
-(defn get-java-prop
-  [java-prop]
-  #?(:clj (System/getProperty java-prop)
-     :cljs (throw (ex-info "Java system properties are not supported on this platform"
-                           {:status 400, :error :db/unsupported-config}))))
+#?(:clj
+   (defn get-java-prop
+     [java-prop]
+     (System/getProperty java-prop))
 
-(defn get-env
-  [env-var]
-  #?(:clj (System/getenv env-var)
-     :cljs (throw (ex-info "Environment variables are not supported on this platform"
-                           {:status 400, :error :db/unsupported-config}))))
+   :cljs
+   (defn get-java-prop
+     [_]
+     (throw (ex-info "Java system properties are not supported on this platform"
+                     {:status 400, :error :db/unsupported-config}))))
+
+#?(:clj
+   (defn get-env
+     [env-var]
+     (System/getenv env-var))
+
+   :cljs
+   (defn get-env
+     [_]
+     (throw (ex-info "Environment variables are not supported on this platform"
+                     {:status 400, :error :db/unsupported-config}))))
 
 (defn missing-config-error
   [env-var java-prop]
