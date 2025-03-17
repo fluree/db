@@ -667,7 +667,7 @@
 
 (defmethod parse-term :TriplesBlock
   ;; TriplesBlock ::= WS TriplesSameSubjectPath WS ( <'.'> TriplesBlock? WS )?
-  [[_ subject-path triples-block :as r]]
+  [[_ subject-path triples-block]]
   (cond-> (parse-term subject-path)
     triples-block (concat (parse-term triples-block))))
 

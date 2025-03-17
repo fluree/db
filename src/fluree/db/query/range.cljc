@@ -124,16 +124,13 @@
        (async/map (fn [& fs]
                     (into [] (remove unauthorized?) fs)))))
 
-(defn filter-authorized
-  "Returns a channel that will eventually return a stream of flake slices
-  containing only the schema flakes and the flakes validated by
-  allow-flake? function for the database `db`
-  from the `flake-slices` channel"
-  [db error-ch flake-slices]
-  #?(:cljs
-     flake-slices ; Note this bypasses all permissions in CLJS for now!
-
-     :clj
+#?(:clj
+   (defn filter-authorized
+     "Returns a channel that will eventually return a stream of flake slices
+     containing only the schema flakes and the flakes validated by
+     allow-flake? function for the database `db`
+     from the `flake-slices` channel"
+     [db error-ch flake-slices]
      (if (policy/unrestricted? db)
        flake-slices
        (let [auth-fn (fn [flakes ch]
@@ -141,13 +138,21 @@
                            (async/pipe ch)))
              out-ch  (chan)]
          (async/pipeline-async 2 out-ch auth-fn flake-slices)
-         out-ch))))
+         out-ch)))
+
+   :cljs
+   (defn filter-authorized
+     "Returns the unfiltered channel `flake-slices`.
+
+     Note: this bypasses all permissions in CLJS for now!"
+     [_ _ flake-slices]
+     flake-slices))
 
 (defn resolve-flake-slices
   "Returns a channel that will contain a stream of chunked flake collections that
   contain the flakes between `start-flake` and `end-flake` and are within the
   transaction range starting at `from-t` and ending at `to-t`."
-  [{:keys [index-catalog t] :as db} idx error-ch
+  [{:keys [index-catalog] :as db} idx error-ch
    {:keys [to-t start-flake end-flake] :as opts}]
   (let [root      (get db idx)
         novelty   (get-in db [:novelty idx])

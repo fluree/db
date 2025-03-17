@@ -217,11 +217,15 @@
   "Takes milliseconds since the epoch and returns an ISO-8601 formatted string
   for that datetime. Optionally takes a ZoneId string (e.g. 'America/Denver')."
   ([millis] (epoch-ms->iso-8601-str millis "Z"))
-  ([millis zone-id]
-   #?(:clj  (-> millis Instant/ofEpochMilli
-                (OffsetDateTime/ofInstant (ZoneId/of zone-id))
-                (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME))
-      :cljs (-> millis js/Date. .toISOString))))
+  #?(:clj
+     ([millis zone-id]
+      (-> millis Instant/ofEpochMilli
+          (OffsetDateTime/ofInstant (ZoneId/of zone-id))
+          (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME)))
+
+     :cljs
+     ([millis _]
+      (-> millis js/Date. .toISOString))))
 
 (defn trunc
   "Truncate string s to n characters."
@@ -266,9 +270,13 @@
 
 (defn url-decode
   ([string] (url-decode string "UTF-8"))
-  ([string ^String encoding]
-   #?(:clj  (some-> string str (URLDecoder/decode encoding))
-      :cljs (some-> string str (js/decodeURIComponent)))))
+  #?(:clj
+     ([string ^String encoding]
+      (some-> string str (URLDecoder/decode encoding)) )
+
+     :cljs
+     ([string _]
+      (some-> string str (js/decodeURIComponent)))))
 
 (defn map-invert
   [m]
