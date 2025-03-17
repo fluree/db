@@ -137,7 +137,7 @@
 
 #?(:clj
    (defmethod print-method Catalog [^Catalog clg, ^Writer w]
-     (.write w (str "#fluree/Catalog "))
+     (.write w "#fluree/Catalog ")
      (binding [*out* w]
        (pr (display-catalog clg))))
    :cljs

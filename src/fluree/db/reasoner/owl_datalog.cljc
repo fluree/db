@@ -660,7 +660,7 @@
     (conj all-rules [(str class "(owl:hasKey)#" (hash prop-list)) rule])))
 
 (defmethod to-datalog :default
-  [_ _ owl-statement all-rules]
+  [_ _ owl-statement _all-rules]
   (throw (ex-info "Unsupported OWL statement" {:owl-statement owl-statement})))
 
 (def base-rules
@@ -764,4 +764,3 @@
   (->> owl-graph
        (mapcat (partial statement->datalog inserts))
        (into base-rules)))
-

@@ -158,7 +158,8 @@
   (and (valid-coordinates? 4 (:coordinates geometry))
        (every? #(every? linear-ring? %) (:coordinates geometry))))
 
-(defmethod valid-geojson? :default [geometry] false)
+(defmethod valid-geojson? :default [_geometry]
+  false)
 
 (comment
 

@@ -382,7 +382,7 @@
             "FULL"  ::full)))
 
 (defmethod rule-parser :join-type
-  [[_ t & rst]]
+  [[_ t & _rst]]
   (bounce (case t
             "INNER" ::inner
             "UNION" ::union
