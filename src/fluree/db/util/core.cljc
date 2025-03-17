@@ -36,7 +36,7 @@
    Does not (yet) support finally, and does not need or want an exception class."
      [& body]
      (let [try-body (butlast body)
-           [catch sym & catch-body :as catch-form] (last body)]
+           [catch sym & catch-body :as _catch-form] (last body)]
        (assert (= catch 'catch))
        (assert (symbol? sym))
        `(if-cljs
