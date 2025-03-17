@@ -1,9 +1,5 @@
 (ns fluree.sdk.webworker
-  (:require [cljs.core.async :as async]
-            [fluree.db.query.api :as q]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
-            [goog.object]))
+  (:require [goog.object]))
 
 (def ^:private conn-register (atom {}))
 
