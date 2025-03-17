@@ -349,8 +349,8 @@
     (let [conn0     @(fluree/connect-file {:storage-path storage-path})
           ledger-id "new3"
           _ledger    @(fluree/create-with-txn conn0 {"@context" {"ex" {"ex" "http://example.org/ns/"}}
-                                                    "ledger"   ledger-id
-                                                    "insert"   {"ex:createdAt" "now"}})
+                                                     "ledger"   ledger-id
+                                                     "insert"   {"ex:createdAt" "now"}})
 
           conn1 @(fluree/connect-file {:storage-path storage-path})]
       (is (= [{"ex:createdAt" "now"}]

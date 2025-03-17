@@ -116,10 +116,10 @@
             "syntactic form is parsed correctly"))
       (testing "federated"
         (let [_db3 @(fluree/create-with-txn conn
-                                           {"@context" context
-                                            "ledger" "other-ledger"
-                                            "insert" [{"@id" "ex:khris"
-                                                       "schema:name" "Khris"}]})]
+                                            {"@context" context
+                                             "ledger" "other-ledger"
+                                             "insert" [{"@id" "ex:khris"
+                                                        "schema:name" "Khris"}]})]
           (is (= [["Khris"] ["Nikola"]]
                  @(fluree/query-connection conn
                                            {"@context" context

@@ -272,7 +272,7 @@
   ([string] (url-decode string "UTF-8"))
   #?(:clj
      ([string ^String encoding]
-      (some-> string str (URLDecoder/decode encoding)) )
+      (some-> string str (URLDecoder/decode encoding)))
 
      :cljs
      ([string _]

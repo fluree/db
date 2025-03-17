@@ -809,20 +809,20 @@
                       "foaf:surname" "Hacker"}]]
     #?(:cljs
        (async done
-         (go
-           (let [conn   (<! (test-utils/create-conn))
-                 ledger (<p! (fluree/create conn "people"))
-                 db     (<p! (fluree/stage (fluree/db ledger) {"@context" [test-utils/default-str-context
-                                                                           {"person" "http://example.org/Person#"}]
-                                                               "insert"   people-data}))]
-             (testing "basic query works"
-               (let [query   "SELECT ?person ?fullName
+              (go
+                (let [conn   (<! (test-utils/create-conn))
+                      ledger (<p! (fluree/create conn "people"))
+                      db     (<p! (fluree/stage (fluree/db ledger) {"@context" [test-utils/default-str-context
+                                                                                {"person" "http://example.org/Person#"}]
+                                                                    "insert"   people-data}))]
+                  (testing "basic query works"
+                    (let [query   "SELECT ?person ?fullName
                              WHERE {?person person:handle \"jdoe\".
                                     ?person person:fullName ?fullName.}"
-                     results (<p! (fluree/query db query {:format :sparql}))]
-                 (is (= [["ex:jdoe" "Jane Doe"]]
-                        results))
-                 (done))))))
+                          results (<p! (fluree/query db query {:format :sparql}))]
+                      (is (= [["ex:jdoe" "Jane Doe"]]
+                             results))
+                      (done))))))
 
        :clj
        (let [conn @(fluree/connect-memory)

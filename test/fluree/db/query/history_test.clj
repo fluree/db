@@ -929,20 +929,20 @@
                                                      "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
                                                      "f:query"  {"@type"  "@json"
                                                                  "@value" {}}}]})
-                             (fluree/commit! ledger)
-                             (deref))
+                    (fluree/commit! ledger)
+                    (deref))
 
           _db3 @(fluree/credential-transact! conn (crypto/create-jws
                                                    (json/stringify {"@context" context
                                                                     "ledger"   ledger-name
                                                                     "insert"   {"ex:foo" 3}})
-                                                            root-privkey))
+                                                   root-privkey))
 
           _db4 @(fluree/credential-transact! conn (crypto/create-jws
                                                    (json/stringify {"@context" context
                                                                     "ledger"   ledger-name
                                                                     "insert"   {"ex:foo" 5}})
-                                                            root-privkey))]
+                                                   root-privkey))]
       (is (= [{"f:data" {"f:t" 1}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
                "f:data"   {"f:t" 2},
@@ -990,21 +990,21 @@
                                                      "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
                                                      "f:query"  {"@type"  "@json"
                                                                  "@value" {}}}]})
-                             (fluree/commit! ledger)
-                             (deref))
+                    (fluree/commit! ledger)
+                    (deref))
 
           jws1 (crypto/create-jws
                 (json/stringify {"@context" context
                                  "ledger"   ledger-name
                                  "insert"   {"ex:foo" 3}})
-                        root-privkey)
+                root-privkey)
           _db3 @(fluree/credential-transact! conn jws1)
 
           jws2 (crypto/create-jws
                 (json/stringify {"@context" context
                                  "ledger"   ledger-name
                                  "insert"   {"ex:foo" 5}})
-                        root-privkey)
+                root-privkey)
           _db4 @(fluree/credential-transact! conn jws2)]
 
       (testing ":txn returns the raw transaction"
