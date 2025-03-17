@@ -178,11 +178,15 @@
         NB: If you don't supply a timezone JS will assume it's in your current,
         local timezone according to your device."
   [s]
-  (when-let [matches (re-matches iso8601-time-re s)]
-    #?(:clj  (if-let [offset     (peek matches)]
-               (OffsetTime/parse s)
-               (LocalTime/parse s))
-       :cljs (js/Date. (str "1970-01-01T" s)))))
+  #?(:clj
+     (when-let [matches (re-matches iso8601-time-re s)]
+       (if (peek matches)
+         (OffsetTime/parse s)
+         (LocalTime/parse s)))
+
+     :cljs
+     (when (re-matches iso8601-time-re s)
+       (js/Date. (str "1970-01-01T" s)))))
 
 (defn- parse-iso8601-datetime
   "Parses string s into one of the following:
@@ -191,12 +195,14 @@
   - JS: a Javascript Date object. NB: If you don't supply a timezone JS will
         assume it's in your current, local timezone according to your device."
   [s]
-  (when-let [matches (re-matches iso8601-datetime-re s)]
-    #?(:clj
-       (if-let [offset         (peek matches)]
+  #?(:clj
+     (when-let [matches (re-matches iso8601-datetime-re s)]
+       (if (peek matches)
          (OffsetDateTime/parse s)
-         (LocalDateTime/parse s))
-       :cljs
+         (LocalDateTime/parse s)))
+
+     :cljs
+     (when (re-matches iso8601-datetime-re s)
        (js/Date. s))))
 
 (defn- coerce-boolean
