@@ -559,7 +559,7 @@
 
 (defn filter-exception
   "Reformats raw filter exception to try to provide more useful feedback."
-  [e solution f]
+  [e f]
   (let [fn-str (->> f meta :fns (str/join " "))
         ex-msg (or (ex-message e)
                    ;; note: NullPointerException is common but has no ex-message, create one
@@ -592,7 +592,7 @@
         (let [result (f solution)]
           (when result
             solution))
-        (catch* e (>! error-ch (filter-exception e solution f)))))))
+        (catch* e (>! error-ch (filter-exception e f)))))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
@@ -712,7 +712,7 @@
     out-ch))
 
 (defmethod match-pattern :values
-  [db fuel-tracker solution pattern error-ch]
+  [_db _fuel-tracker solution pattern _error-ch]
   (let [inline-solutions (pattern-data pattern)
         ;; transform a match into its identity for equality checks
         match-identity   (juxt get-iri get-value get-datatype-iri (comp get-meta :lang))
@@ -734,7 +734,7 @@
                    (reduce (fn [solution new-var] (assoc solution new-var (get inline-solution new-var)))
                            solution
                            new-vars))))
-         (async/to-chan!))))
+         async/to-chan!)))
 
 (defn with-default
   "Return a transducer that transforms an input stream of solutions to include the
