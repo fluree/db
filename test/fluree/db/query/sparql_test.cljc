@@ -1,6 +1,8 @@
 (ns fluree.db.query.sparql-test
   (:require #?@(:clj  [[clojure.test :refer [deftest is testing]]]
-                :cljs [[cljs.test :refer-macros [deftest is testing]]])
+                :cljs [[cljs.test :refer-macros [async deftest is testing]]
+                       [clojure.core.async :refer [<! go]]
+                       [clojure.core.async.interop :refer [<p!]]])
             [fluree.db.api :as fluree]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.test-utils :as test-utils]
@@ -805,22 +807,22 @@
                      {"@id" "ex:bob"
                       "foaf:firstname" "Bob"
                       "foaf:surname" "Hacker"}]]
-    #?(#_#_:cljs
-         (async done
-                (go
-                  (let [conn   (<! (test-utils/create-conn))
-                        ledger (<p! (fluree/create conn "people"))
-                        db     (<p! (fluree/stage (fluree/db ledger) {"@context" [test-utils/default-str-context
-                                                                                  {"person" "http://example.org/Person#"}]
-                                                                      "insert" people-data}))]
-                    (testing "basic query works"
-                      (let [query   "SELECT ?person ?fullName
+    #?(:cljs
+       (async done
+         (go
+           (let [conn   (<! (test-utils/create-conn))
+                 ledger (<p! (fluree/create conn "people"))
+                 db     (<p! (fluree/stage (fluree/db ledger) {"@context" [test-utils/default-str-context
+                                                                           {"person" "http://example.org/Person#"}]
+                                                               "insert"   people-data}))]
+             (testing "basic query works"
+               (let [query   "SELECT ?person ?fullName
                              WHERE {?person person:handle \"jdoe\".
                                     ?person person:fullName ?fullName.}"
-                            results (<p! (fluree/query db query {:format :sparql}))]
-                        (is (= [["ex:jdoe" "Jane Doe"]]
-                               results))
-                        (done))))))
+                     results (<p! (fluree/query db query {:format :sparql}))]
+                 (is (= [["ex:jdoe" "Jane Doe"]]
+                        results))
+                 (done))))))
 
        :clj
        (let [conn @(fluree/connect-memory)
