@@ -30,8 +30,8 @@
       (<? (history/query db context query)))))
 
 (defn sanitize-query-options
-  [query {:keys [identity did issuer] :as override-opts}]
-  (update query :opts (fn [{:keys [max-fuel meta] :as opts}]
+  [query override-opts]
+  (update query :opts (fn [{:keys [max-fuel] :as opts}]
                         ;; ensure :max-fuel key is present
                         (-> opts
                             (assoc :max-fuel max-fuel)
