@@ -170,7 +170,6 @@
           ledger-name "subclass-nested-stage-test"
           ledger      @(fluree/create conn ledger-name)
           db0         (fluree/db ledger)
-          context     test-utils/default-str-context
           db1         @(fluree/stage
                         db0
                         {"@context" {"ex" "http://example.org/"}

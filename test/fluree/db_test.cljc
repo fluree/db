@@ -24,8 +24,8 @@
                                          {"@context" ["https://ns.flur.ee"
                                                       test-utils/default-context]
                                           "insert"
-                                          [{:id :f/me
-                                            :type :schema/Person
+                                          [{:id           :f/me
+                                            :type         :schema/Person
                                             :schema/fname "Me"}]})
              check3       @(fluree/exists? conn ledger-alias)]
          (is (every? false? [check1 check2 check3])))))
@@ -91,20 +91,20 @@
                                  :schema/age   34
                                  :ex/favNums   5
                                  :ex/friend    :ex/brian}]})
-               db           @(fluree/commit! ledger db)
-               db           @(fluree/stage
-                              db
-                              {"@context" ["https://ns.flur.ee"
-                                           test-utils/default-context
-                                           {:ex "http://example.org/ns/"}]
-                               "insert"
-                               {:id         :ex/brian
-                                :ex/favNums 7}})
-               db           @(fluree/commit! ledger db)
-               target-t     (:t db)
-                           ;; TODO: Replace this w/ :syncTo equivalent once we have it
-               loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
-               loaded-db    (fluree/db loaded)]
+               db        @(fluree/commit! ledger db)
+               db        @(fluree/stage
+                           db
+                           {"@context" ["https://ns.flur.ee"
+                                        test-utils/default-context
+                                        {:ex "http://example.org/ns/"}]
+                            "insert"
+                            {:id         :ex/brian
+                             :ex/favNums 7}})
+               db        @(fluree/commit! ledger db)
+               target-t  (:t db)
+               ;; TODO: Replace this w/ :syncTo equivalent once we have it
+               loaded    (test-utils/load-to-t conn ledger-alias target-t 100)
+               loaded-db (fluree/db loaded)]
            (is (= target-t (:t loaded-db))))))
 
      (testing "can load a file ledger with multi-cardinality predicates"
@@ -139,21 +139,21 @@
                                  :schema/age   34
                                  :ex/favNums   [5 10]
                                  :ex/friend    [:ex/brian :ex/alice]}]})
-               db           @(fluree/commit! ledger db)
-               db           @(fluree/stage
-                              db
-                                          ;; test a multi-cardinality retraction
-                              {"@context" ["https://ns.flur.ee"
-                                           test-utils/default-context
-                                           {:ex "http://example.org/ns/"}]
-                               "insert"
-                               [{:id         :ex/alice
-                                 :ex/favNums [42 76 9]}]})
-               db           @(fluree/commit! ledger db)
-               target-t     (:t db)
-                           ;; TODO: Replace this w/ :syncTo equivalent once we have it
-               loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
-               loaded-db    (fluree/db loaded)]
+               db        @(fluree/commit! ledger db)
+               db        @(fluree/stage
+                           db
+                           ;; test a multi-cardinality retraction
+                           {"@context" ["https://ns.flur.ee"
+                                        test-utils/default-context
+                                        {:ex "http://example.org/ns/"}]
+                            "insert"
+                            [{:id         :ex/alice
+                              :ex/favNums [42 76 9]}]})
+               db        @(fluree/commit! ledger db)
+               target-t  (:t db)
+               ;; TODO: Replace this w/ :syncTo equivalent once we have it
+               loaded    (test-utils/load-to-t conn ledger-alias target-t 100)
+               loaded-db (fluree/db loaded)]
            (is (= target-t (:t loaded-db))))))
 
      (testing "query returns the correct results from a loaded ledger"
@@ -298,35 +298,35 @@
 
      (testing "Can load a ledger with time values"
        (with-tmp-dir storage-path
-         (let [conn      @(fluree/connect-file {:storage-path storage-path})
-               ledger    @(fluree/create conn "index/datetimes")
-               db        @(fluree/stage
-                           (fluree/db ledger)
-                           {"@context" ["https://ns.flur.ee"
-                                        test-utils/default-str-context
-                                        {"ex" "http://example.org/ns/"}]
-                            "insert"
-                            [{"@id"                "ex:Foo",
-                              "@type"              "ex:Bar",
+         (let [conn   @(fluree/connect-file {:storage-path storage-path})
+               ledger @(fluree/create conn "index/datetimes")
+               db     @(fluree/stage
+                        (fluree/db ledger)
+                        {"@context" ["https://ns.flur.ee"
+                                     test-utils/default-str-context
+                                     {"ex" "http://example.org/ns/"}]
+                         "insert"
+                         [{"@id"   "ex:Foo",
+                           "@type" "ex:Bar",
 
-                              "ex:offsetDateTime"  {"@type"  "xsd:dateTime"
-                                                    "@value" "2023-04-01T00:00:00.000Z"}
-                              "ex:localDateTime"   {"@type"  "xsd:dateTime"
-                                                    "@value" "2021-09-24T11:14:32.833"}
-                              "ex:offsetDateTime2" {"@type"  "xsd:date"
-                                                    "@value" "2022-01-05Z"}
-                              "ex:localDate"       {"@type"  "xsd:date"
-                                                    "@value" "2024-02-02"}
-                              "ex:offsetTime"      {"@type"  "xsd:time"
-                                                    "@value" "12:42:00Z"}
-                              "ex:localTime"       {"@type"  "xsd:time"
-                                                    "@value" "12:42:00"}}]})
-               db-commit @(fluree/commit! ledger db)
-               loaded    (test-utils/retry-load conn (:alias ledger) 100)
-               q         {"@context" [test-utils/default-str-context
-                                      {"ex" "http://example.org/ns/"}]
-                          "select"   {"?s" ["*"]}
-                          "where"    {"@id" "?s", "type" "ex:Bar"}}]
+                           "ex:offsetDateTime"  {"@type"  "xsd:dateTime"
+                                                 "@value" "2023-04-01T00:00:00.000Z"}
+                           "ex:localDateTime"   {"@type"  "xsd:dateTime"
+                                                 "@value" "2021-09-24T11:14:32.833"}
+                           "ex:offsetDateTime2" {"@type"  "xsd:date"
+                                                 "@value" "2022-01-05Z"}
+                           "ex:localDate"       {"@type"  "xsd:date"
+                                                 "@value" "2024-02-02"}
+                           "ex:offsetTime"      {"@type"  "xsd:time"
+                                                 "@value" "12:42:00Z"}
+                           "ex:localTime"       {"@type"  "xsd:time"
+                                                 "@value" "12:42:00"}}]})
+               _db-commit @(fluree/commit! ledger db)
+               loaded     (test-utils/retry-load conn (:alias ledger) 100)
+               q          {"@context" [test-utils/default-str-context
+                                       {"ex" "http://example.org/ns/"}]
+                           "select"   {"?s" ["*"]}
+                           "where"    {"@id" "?s", "type" "ex:Bar"}}]
            (is (= @(fluree/query (fluree/db loaded) q)
                   @(fluree/query db q))))))))
 
@@ -356,20 +356,20 @@
                                :schema/age   34
                                :ex/favNums   5
                                :ex/friend    :ex/brian}]})
-             db           @(fluree/commit! ledger db)
-             db           @(fluree/stage
-                            db
-                            {"@context" ["https://ns.flur.ee"
-                                         test-utils/default-context
-                                         {:ex "http://example.org/ns/"}]
-                             "insert"
-                             {:id         :ex/brian
-                              :ex/favNums 7}})
-             db           @(fluree/commit! ledger db)
-             target-t     (:t db)
+             db        @(fluree/commit! ledger db)
+             db        @(fluree/stage
+                         db
+                         {"@context" ["https://ns.flur.ee"
+                                      test-utils/default-context
+                                      {:ex "http://example.org/ns/"}]
+                          "insert"
+                          {:id         :ex/brian
+                           :ex/favNums 7}})
+             db        @(fluree/commit! ledger db)
+             target-t  (:t db)
              ;; TODO: Replace this w/ :syncTo equivalent once we have it
-             loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
-             loaded-db    (fluree/db loaded)]
+             loaded    (test-utils/load-to-t conn ledger-alias target-t 100)
+             loaded-db (fluree/db loaded)]
          (is (= target-t (:t loaded-db)))))
 
      (testing "can load a memory ledger with multi-cardinality predicates"
@@ -403,21 +403,21 @@
                                :schema/age   34
                                :ex/favNums   [5 10]
                                :ex/friend    [:ex/brian :ex/alice]}]})
-             db           @(fluree/commit! ledger db)
-             db           @(fluree/stage
-                            db
-                            ;; test a multi-cardinality retraction
-                            {"@context" ["https://ns.flur.ee"
-                                         test-utils/default-context
-                                         {:ex "http://example.org/ns/"}]
-                             "insert"
-                             [{:id         :ex/alice
-                               :ex/favNums [42 76 9]}]})
-             db           @(fluree/commit! ledger db)
-             target-t     (:t db)
+             db        @(fluree/commit! ledger db)
+             db        @(fluree/stage
+                         db
+                         ;; test a multi-cardinality retraction
+                         {"@context" ["https://ns.flur.ee"
+                                      test-utils/default-context
+                                      {:ex "http://example.org/ns/"}]
+                          "insert"
+                          [{:id         :ex/alice
+                            :ex/favNums [42 76 9]}]})
+             db        @(fluree/commit! ledger db)
+             target-t  (:t db)
              ;; TODO: Replace this w/ :syncTo equivalent once we have it
-             loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
-             loaded-db    (fluree/db loaded)]
+             loaded    (test-utils/load-to-t conn ledger-alias target-t 100)
+             loaded-db (fluree/db loaded)]
          (is (= target-t (:t loaded-db)))))
 
      (testing "query returns the correct results from a loaded ledger"
@@ -583,7 +583,7 @@
                   "sh:property"    {"sh:path" {"id" "schema:familyName"}, "sh:datatype" {"id" "xsd:string"}}}]
                 @(fluree/query (fluree/db loaded1) property-query)))
          (testing "load ref retracts"
-           (let [db2     @(fluree/transact! conn
+           (let [_db2    @(fluree/transact! conn
                                             {"@context" ["https://ns.flur.ee"
                                                          test-utils/default-str-context
                                                          {"ex" "http://example.org/ns/"}]
@@ -837,97 +837,97 @@
            ledger    @(fluree/create conn ledger-id)
            db0       (fluree/db ledger)
 
-           db1       @(fluree/stage db0 {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-str-context
-                                                     {"ex" "ns:ex/"}]
-                                         "insert"   [{"@id"       "ex:dp"
-                                                      "ex:name"   "Dan"
-                                                      "ex:child"  [{"@id" "ex:ap" "ex:name" "AP"}
-                                                                   {"@id" "ex:np" "ex:name" "NP"}]
-                                                      "ex:spouse" [{"@id"       "ex:kp" "ex:name" "KP"
-                                                                    "ex:spouse" {"@id" "ex:dp"}}]}]})
+           db1 @(fluree/stage db0 {"@context" ["https://ns.flur.ee"
+                                               test-utils/default-str-context
+                                               {"ex" "ns:ex/"}]
+                                   "insert"   [{"@id"       "ex:dp"
+                                                "ex:name"   "Dan"
+                                                "ex:child"  [{"@id" "ex:ap" "ex:name" "AP"}
+                                                             {"@id" "ex:np" "ex:name" "NP"}]
+                                                "ex:spouse" [{"@id"       "ex:kp" "ex:name" "KP"
+                                                              "ex:spouse" {"@id" "ex:dp"}}]}]})
 
-           db2       @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-str-context
-                                                     {"ex" "ns:ex/"}]
-                                         "where"    {"id" "?s", "ex:name" "?name"}
-                                         "delete"   {"@id" "?s" "ex:name" "?name"}
-                                         "insert"   {"@graph"
-                                                     [{"@id" "?s" "ex:name" "BORG"}
-                                                      {"@id"         "ex:mp"
-                                                       "@type"       "ex:Cat"
-                                                       "ex:isPerson" false
-                                                       "ex:isOrange" true
-                                                       "ex:nickname" {"@language" "en" "@value" "The Wretch"}
-                                                       "ex:name"     "Murray"
-                                                       "ex:address"
-                                                       {"ex:street" "55 Bashford"
-                                                        "ex:city"   "St. Paul"
-                                                        "ex:zip"    {"@value" 55105 "@type" "ex:PostalCode"}
-                                                        "ex:state"  "MN"}
-                                                       "ex:favs"     {"@list" ["Persey" {"@id" "ex:dp"}]}}]}})
-           db3       @(fluree/stage db2 {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-str-context
-                                                     {"ex" "ns:ex/"}]
-                                         "insert"   {"@type"          "sh:NodeShape"
-                                                     "sh:targetClass" {"@id" "ex:Friend"}
-                                                     "sh:property"
-                                                     [{"sh:path"     {"@id" "ex:nickname"}
-                                                       "sh:maxCount" 1
-                                                       "sh:datatype" {"@id" "xsd:string"}}]}})
+           db2 @(fluree/stage db1 {"@context" ["https://ns.flur.ee"
+                                               test-utils/default-str-context
+                                               {"ex" "ns:ex/"}]
+                                   "where"    {"id" "?s", "ex:name" "?name"}
+                                   "delete"   {"@id" "?s" "ex:name" "?name"}
+                                   "insert"   {"@graph"
+                                               [{"@id" "?s" "ex:name" "BORG"}
+                                                {"@id"         "ex:mp"
+                                                 "@type"       "ex:Cat"
+                                                 "ex:isPerson" false
+                                                 "ex:isOrange" true
+                                                 "ex:nickname" {"@language" "en" "@value" "The Wretch"}
+                                                 "ex:name"     "Murray"
+                                                 "ex:address"
+                                                 {"ex:street" "55 Bashford"
+                                                  "ex:city"   "St. Paul"
+                                                  "ex:zip"    {"@value" 55105 "@type" "ex:PostalCode"}
+                                                  "ex:state"  "MN"}
+                                                 "ex:favs"     {"@list" ["Persey" {"@id" "ex:dp"}]}}]}})
+           db3 @(fluree/stage db2 {"@context" ["https://ns.flur.ee"
+                                               test-utils/default-str-context
+                                               {"ex" "ns:ex/"}]
+                                   "insert"   {"@type"          "sh:NodeShape"
+                                               "sh:targetClass" {"@id" "ex:Friend"}
+                                               "sh:property"
+                                               [{"sh:path"     {"@id" "ex:nickname"}
+                                                 "sh:maxCount" 1
+                                                 "sh:datatype" {"@id" "xsd:string"}}]}})
 
-           db4       @(fluree/stage db3 {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-str-context
-                                                     {"ex" "ns:ex/"}]
-                                         "insert"   {"@id"         "ex:mp"
-                                                     "@type"       "ex:Friend"
-                                                     "ex:nickname" "Murrseph Gordon-Levitt"}})
+           db4 @(fluree/stage db3 {"@context" ["https://ns.flur.ee"
+                                               test-utils/default-str-context
+                                               {"ex" "ns:ex/"}]
+                                   "insert"   {"@id"         "ex:mp"
+                                               "@type"       "ex:Friend"
+                                               "ex:nickname" "Murrseph Gordon-Levitt"}})
 
            root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
            alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
 
-           db5       @(fluree/stage db3 {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-str-context
-                                                     {"ex" "ns:ex/"}]
-                                         "insert"   {"@graph"
-                                                     [{"@id" root-did "f:role" {"@id" "ex:rootRole"}}
-                                                      {"@id" alice-did "f:role" {"@id" "ex:userRole"} "ex:user" {"@id" "ex:alice"}}
-                                                      {"@id"              "ex:alice"
-                                                       "@type"            "ex:User"
-                                                       "schema:name"      "Alice"
-                                                       "schema:email"     "alice@flur.ee"
-                                                       "schema:birthDate" "2022-08-17"
-                                                       "schema:ssn"       "111-11-1111"
-                                                       "ex:address"       {"ex:state" "NC" "ex:country" "USA"}}
-                                                      {"@id"              "ex:john"
-                                                       "@type"            "ex:User"
-                                                       "schema:name"      "John"
-                                                       "schema:email"     "john@flur.ee"
-                                                       "schema:birthDate" "2022-08-17"
-                                                       "schema:ssn"       "222-22-2222"
-                                                       "ex:address"       {"ex:state" "SC" "ex:country" "USA"}}]}})
+           db5 @(fluree/stage db3 {"@context" ["https://ns.flur.ee"
+                                               test-utils/default-str-context
+                                               {"ex" "ns:ex/"}]
+                                   "insert"   {"@graph"
+                                               [{"@id" root-did "f:role" {"@id" "ex:rootRole"}}
+                                                {"@id" alice-did "f:role" {"@id" "ex:userRole"} "ex:user" {"@id" "ex:alice"}}
+                                                {"@id"              "ex:alice"
+                                                 "@type"            "ex:User"
+                                                 "schema:name"      "Alice"
+                                                 "schema:email"     "alice@flur.ee"
+                                                 "schema:birthDate" "2022-08-17"
+                                                 "schema:ssn"       "111-11-1111"
+                                                 "ex:address"       {"ex:state" "NC" "ex:country" "USA"}}
+                                                {"@id"              "ex:john"
+                                                 "@type"            "ex:User"
+                                                 "schema:name"      "John"
+                                                 "schema:email"     "john@flur.ee"
+                                                 "schema:birthDate" "2022-08-17"
+                                                 "schema:ssn"       "222-22-2222"
+                                                 "ex:address"       {"ex:state" "SC" "ex:country" "USA"}}]}})
 
-           db6       @(fluree/stage db5 {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-str-context
-                                                     {"ex" "ns:ex/"}],
-                                         "insert"   [{"@id" "schema:givenName", "@type" "rdf:Property"}
-                                                     {"@id"                    "ex:firstName",
-                                                      "@type"                  "rdf:Property",
-                                                      "owl:equivalentProperty" {"@id" "schema:givenName"}}
-                                                     {"@id"                    "foaf:name",
-                                                      "@type"                  "rdf:Property",
-                                                      "owl:equivalentProperty" {"@id" "ex:firstName"}}]})
+           db6 @(fluree/stage db5 {"@context" ["https://ns.flur.ee"
+                                               test-utils/default-str-context
+                                               {"ex" "ns:ex/"}],
+                                   "insert"   [{"@id" "schema:givenName", "@type" "rdf:Property"}
+                                               {"@id"                    "ex:firstName",
+                                                "@type"                  "rdf:Property",
+                                                "owl:equivalentProperty" {"@id" "schema:givenName"}}
+                                               {"@id"                    "foaf:name",
+                                                "@type"                  "rdf:Property",
+                                                "owl:equivalentProperty" {"@id" "ex:firstName"}}]})
 
-           db7       @(fluree/stage db6 {"@context" ["https://ns.flur.ee"
-                                                     test-utils/default-str-context
-                                                     {"ex" "ns:ex/"}],
-                                         "insert"   [{"@id" "ex:andrew", "schema:givenName" "Andrew"}
-                                                     {"@id" "ex:freddy", "foaf:name" "Freddy"}
-                                                     {"@id" "ex:letty", "ex:firstName" "Leticia"}
-                                                     {"@id" "ex:betty", "ex:firstName" "Betty"}]})
+           db7 @(fluree/stage db6 {"@context" ["https://ns.flur.ee"
+                                               test-utils/default-str-context
+                                               {"ex" "ns:ex/"}],
+                                   "insert"   [{"@id" "ex:andrew", "schema:givenName" "Andrew"}
+                                               {"@id" "ex:freddy", "foaf:name" "Freddy"}
+                                               {"@id" "ex:letty", "ex:firstName" "Leticia"}
+                                               {"@id" "ex:betty", "ex:firstName" "Betty"}]})
 
-           committed @(fluree/commit! ledger db7)
-           loaded    @(fluree/load conn ledger-id)]
+           _committed @(fluree/commit! ledger db7)
+           loaded     @(fluree/load conn ledger-id)]
        (is (= #{"AP" "Dan" "KP" "NP"}
               (into #{} @(fluree/query db1 {"@context" [test-utils/default-str-context
                                                         {"ex" "ns:ex/"}]
@@ -981,14 +981,14 @@
 #?(:clj
    (deftest novelty-max-test
      (let [conn @(fluree/connect-memory nil)
-           db @(fluree/create-with-txn conn {"@context" test-utils/default-str-context
-                                             "ledger" "novelty/test"
-                                             "opts" {"indexing" {"reindex-min-bytes" 0 "reindex-max-bytes" 1}}
-                                             "insert" [{"@id" "ex:1",
-                                                        "ex:intro" "A long time ago in a galaxy far, far away..."}]})]
+           db   @(fluree/create-with-txn conn {"@context" test-utils/default-str-context
+                                               "ledger"   "novelty/test"
+                                               "opts"     {"indexing" {"reindex-min-bytes" 0 "reindex-max-bytes" 1}}
+                                               "insert"   [{"@id"      "ex:1",
+                                                            "ex:intro" "A long time ago in a galaxy far, far away..."}]})]
        (is (> (-> db :novelty :size) (:reindex-max-bytes db)))
        (is (= {:status 503 :error :db/max-novelty-exceeded}
               (ex-data @(fluree/stage db {"@context" test-utils/default-str-context
-                                          "ledger" "novelty/test"
-                                          "insert" [{"@id" "ex:1",
-                                                     "ex:crawl" "It is a period of civil war."}]})))))))
+                                          "ledger"   "novelty/test"
+                                          "insert"   [{"@id"      "ex:1",
+                                                       "ex:crawl" "It is a period of civil war."}]})))))))
