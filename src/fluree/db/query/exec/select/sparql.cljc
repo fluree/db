@@ -10,27 +10,30 @@
   [var]
   (subs (name var) 1))
 
-(defmulti display (fn [match compact] (where/get-datatype-iri match)))
+(defmulti display
+  (fn [match _compact]
+    (where/get-datatype-iri match)))
+
 (defmethod display :default
-  [match compact]
+  [match _compact]
   (let [v  (where/get-value match)
         dt (where/get-datatype-iri match)]
     (cond-> {"value" (str v) "type" "literal"}
       (and v (not= const/iri-string dt)) (assoc "datatype" dt))))
 
 (defmethod display const/iri-rdf-json
-  [match compact]
+  [match _compact]
   {"value" (where/get-value match) "type" "literal" "datatype" const/iri-rdf-json})
 
 (defmethod display const/iri-id
-  [match compact]
+  [match _compact]
   (let [iri (where/get-iri match)]
     (if (= \_ (first iri))
       {"type" "bnode" "value" (subs iri 1)}
       {"type" "uri" "value" iri})))
 
 (defmethod display const/iri-vector
-  [match compact]
+  [match _compact]
   {"type" "literal" "value" (some-> match where/get-value vec str) "datatype" const/iri-vector})
 
 (defn disaggregate
