@@ -991,10 +991,10 @@
 (defmethod validate-constraint const/sh_closed
   [{:keys [data-db display] :as v-ctx} shape constraint focus-node _value-nodes]
   (go-try
-    (let [{expect constraint ignored const/sh_ignoredProperties
-           properties const/sh_property} shape
+    (let [{ignored    const/sh_ignoredProperties
+           properties const/sh_property}
+          shape
 
-          [closed?]   expect
           s-flakes    (<? (query-range/index-range data-db :spot = [(first focus-node)]))
           constrained (into #{} (map #(-> % (get const/sh_path) first) properties))
           allowed     (into constrained ignored)
