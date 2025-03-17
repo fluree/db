@@ -1,101 +1,100 @@
-(ns fluree.sdk.webworker
-  (:require [goog.object]))
+(ns fluree.sdk.webworker)
 
-(def ^:private conn-register (atom {}))
+;; (def ^:private conn-register (atom {}))
 
-(defn- postMessage
-  [message]
-  (.postMessage js/self (clj->js message)))
+;; (defn- postMessage
+;;   [message]
+;;   (.postMessage js/self (clj->js message)))
 
 ;; (defn- conn-id->db
 ;;   [conn-id time]
 ;;   (let [{:keys [conn ledger]} (get @conn-register conn-id)]
 ;;     (l/root-db conn ledger {:block time})))
 
-(defn- obj->clj
-  "Parses a (nested) JavaScript object into a Clojure map"
-  [obj]
-  (if (goog.isObject obj)
-    (reduce (fn [result key]
-              (let [v (goog.object/get obj key)]
-                (if (= "function" (goog/typeOf v))
-                  result
-                  (assoc result (keyword key) (obj->clj v)))))
-            {} (goog.object/getKeys obj))
-    obj))
+;; (defn- obj->clj
+;;   "Parses a (nested) JavaScript object into a Clojure map"
+;;   [obj]
+;;   (if (goog.isObject obj)
+;;     (reduce (fn [result key]
+;;               (let [v (goog.object/get obj key)]
+;;                 (if (= "function" (goog/typeOf v))
+;;                   result
+;;                   (assoc result (keyword key) (obj->clj v)))))
+;;             {} (goog.object/getKeys obj))
+;;     obj))
 
-(defmulti ^:private worker-action
-  (fn [_conn-id event & _]
-    event))
+;; (defmulti ^:private worker-action
+;;   (fn [_conn-id event & _]
+;;     event))
 
-(defmethod worker-action :setState
-  [conn-id _ id state-update]
+;; (defmethod worker-action :setState
+;;   [conn-id _ id state-update]
 
-  (postMessage {:conn  conn-id
-                :event "setState"
-                :ref   id
-                :data  (clj->js state-update)}))
+;;   (postMessage {:conn  conn-id
+;;                 :event "setState"
+;;                 :ref   id
+;;                 :data  (clj->js state-update)}))
 
-(defmethod worker-action :connStatus
-  [conn-id _ id response]
-  (postMessage {:conn  conn-id
-                :event "connStatus"
-                :ref   id
-                :data  (clj->js response)}))
+;; (defmethod worker-action :connStatus
+;;   [conn-id _ id response]
+;;   (postMessage {:conn  conn-id
+;;                 :event "connStatus"
+;;                 :ref   id
+;;                 :data  (clj->js response)}))
 
-(defmethod worker-action :connClosed
-  [conn-id _ ref response]
-  (postMessage {:conn  conn-id
-                :event "connClosed"
-                :ref   ref
-                :data  response}))
+;; (defmethod worker-action :connClosed
+;;   [conn-id _ ref response]
+;;   (postMessage {:conn  conn-id
+;;                 :event "connClosed"
+;;                 :ref   ref
+;;                 :data  response}))
 
-(defmethod worker-action :connReset
-  [conn-id _ ref response]
-  (postMessage {:conn  conn-id
-                :event "connReset"
-                :ref   ref
-                :data  response}))
+;; (defmethod worker-action :connReset
+;;   [conn-id _ ref response]
+;;   (postMessage {:conn  conn-id
+;;                 :event "connReset"
+;;                 :ref   ref
+;;                 :data  response}))
 
-(defmethod worker-action :setTransact
-  [conn-id _ ref response]
-  (postMessage {:conn  conn-id
-                :event "setTransact"
-                :ref   ref
-                :data  (clj->js response)}))
+;; (defmethod worker-action :setTransact
+;;   [conn-id _ ref response]
+;;   (postMessage {:conn  conn-id
+;;                 :event "setTransact"
+;;                 :ref   ref
+;;                 :data  (clj->js response)}))
 
-;(defmethod worker-action :connLogout
-;  [conn _ ref]
-;  (let [conn-id  (:id conn)
-;        settings (-> (get-in @conn-register [conn-id :settings]))]
-;    ;; first close connection
-;    (close conn-id)
-;    ;; then use original settings to establish a new connection, but first clear out
-;    ;; any credentials
-;    (aset settings "anonymous" true)
-;    (aset settings "token" nil)
-;    (connect settings)
-;    (postMessage {:conn  conn-id
-;                  :event "connLogout"
-;                  :ref   ref
-;                  :data  true}))
-;  )
+;; (defmethod worker-action :connLogout
+;;  [conn _ ref]
+;;  (let [conn-id  (:id conn)
+;;        settings (-> (get-in @conn-register [conn-id :settings]))]
+;;    ;; first close connection
+;;    (close conn-id)
+;;    ;; then use original settings to establish a new connection, but first clear out
+;;    ;; any credentials
+;;    (aset settings "anonymous" true)
+;;    (aset settings "token" nil)
+;;    (connect settings)
+;;    (postMessage {:conn  conn-id
+;;                  :event "connLogout"
+;;                  :ref   ref
+;;                  :data  true}))
+;;  )
 
-(defmethod worker-action :connInit
-  [_ _]
-  ;; let server know we're alive
-  (postMessage {:conn  0
-                :event "connInit"}))
+;; (defmethod worker-action :connInit
+;;   [_ _]
+;;   ;; let server know we're alive
+;;   (postMessage {:conn  0
+;;                 :event "connInit"}))
 
-(defn- error-return-map
-  "Send an error map back to the worker invoker"
-  [error]
-  (let [default-error {:message (or (ex-message error) "Unknown Error.")
-                       :status  500
-                       :error   :db/unexpected-error}
-        e-map         (merge default-error (ex-data error))]
-    {:error  e-map
-     :status "error"}))
+;; (defn- error-return-map
+;;   "Send an error map back to the worker invoker"
+;;   [error]
+;;   (let [default-error {:message (or (ex-message error) "Unknown Error.")
+;;                        :status  500
+;;                        :error   :db/unexpected-error}
+;;         e-map         (merge default-error (ex-data error))]
+;;     {:error  e-map
+;;      :status "error"}))
 
 ;; (defn- process-query
 ;;   "Process a query for a specific component id and return result with a :setState call."
@@ -137,19 +136,19 @@
 ;;   (let [[network ledger-id] (session/resolve-ledger conn ledger)]
 ;;     (connection/remove-listener conn network ledger-id conn-id)))
 
-(defn- register-connection
-  "Registers new connection with all of its items."
-  [conn config queries]
-  (let [{:keys [servers ledger id log compact private]} config]
-    (swap! conn-register assoc id {:conn    conn
-                                   :config  config
-                                   :servers servers
-                                   :ledger  ledger
-                                   :private private
-                                   :queries (or queries {})
-                                   :log     log
-                                   :opts    {:compact compact} ;; default query options
-                                   :closed  false})))
+;; (defn- register-connection
+;;   "Registers new connection with all of its items."
+;;   [conn config queries]
+;;   (let [{:keys [servers ledger id log compact private]} config]
+;;     (swap! conn-register assoc id {:conn    conn
+;;                                    :config  config
+;;                                    :servers servers
+;;                                    :ledger  ledger
+;;                                    :private private
+;;                                    :queries (or queries {})
+;;                                    :log     log
+;;                                    :opts    {:compact compact} ;; default query options
+;;                                    :closed  false})))
 
 ;; (defn- connect*
 ;;   "Creates a new connection from existing configuration"
@@ -202,15 +201,15 @@
 ;;          {:status  200
 ;;           :message "Connection closed."})))))
 
-(defn- close-connection
-  [conn-id ref]
-  (try
-    (worker-action conn-id :connClosed ref (close-connection* conn-id))
-    (catch :default e
-      (let [msg  (or (ex-message e) "Unexpected error.")
-            data (or (ex-data e) {:status 500
-                                  :error  :db/unexpected-error})]
-        (worker-action conn-id :connClosed ref (assoc data :message msg))))))
+;; (defn- close-connection
+;;   [conn-id ref]
+;;   (try
+;;     (worker-action conn-id :connClosed ref (close-connection* conn-id))
+;;     (catch :default e
+;;       (let [msg  (or (ex-message e) "Unexpected error.")
+;;             data (or (ex-data e) {:status 500
+;;                                   :error  :db/unexpected-error})]
+;;         (worker-action conn-id :connClosed ref (assoc data :message msg))))))
 
 ;; (defn- reset-connection
 ;;   [conn-id ref]
@@ -248,14 +247,14 @@
 ;;                   (worker-action id :connStatus ref {:status  500
 ;;                                                      :message (str error)}))))))
 
-(defn- conn-closed?
-  "Returns true if connection has been closed."
-  [conn-id]
-  (get-in @conn-register [conn-id :closed]))
+;; (defn- conn-closed?
+;;   "Returns true if connection has been closed."
+;;   [conn-id]
+;;   (get-in @conn-register [conn-id :closed]))
 
-(defn- unregisterQuery
-  [conn-id ref]
-  (swap! conn-register update-in [conn-id :queries] dissoc ref))
+;; (defn- unregisterQuery
+;;   [conn-id ref]
+;;   (swap! conn-register update-in [conn-id :queries] dissoc ref))
 
 ;; (defn- registerQuery
 ;;   "Registers a new flureeQL query. 'opts' gets merged in with the flureeQL.opts, and is there
@@ -297,11 +296,11 @@
 ;;             (worker-action conn-id :setTransact ref {:result result
 ;;                                                      :status 200}))))))
 
-(defn- js-array->clj-list
-  "Takes javascript array and move it into a clojurescript list without
-  converting individual elements."
-  [js-array]
-  (map #(aget js-array %) (range (.-length js-array))))
+;; (defn- js-array->clj-list
+;;   "Takes javascript array and move it into a clojurescript list without
+;;   converting individual elements."
+;;   [js-array]
+;;   (map #(aget js-array %) (range (.-length js-array))))
 
 ;; (defn decode-message
 ;;   "Main handler function for worker events
@@ -371,10 +370,10 @@
 ;;                       :ref   (aget data "ref")
 ;;                       :data  error-data})))))
 
-(defn log-error
-  "Log errors in this web worker"
-  [error]
-  (js/console.error error))
+;; (defn log-error
+;;   "Log errors in this web worker"
+;;   [error]
+;;   (js/console.error error))
 
 ;; (defn init
 ;;   []
