@@ -867,7 +867,7 @@
                             (parse-triples bound-vars context)))
         annotation    (util/get-first-value txn const/iri-annotation)]
     (when (and (empty? insert) (empty? delete))
-      (throw (ex-info (str "Invalid transaction, insert or delete clause must contain nodes with objects.")
+      (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
                       {:status 400 :error :db/invalid-transaction})))
     (cond-> {}
       context      (assoc :context context)

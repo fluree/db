@@ -24,7 +24,7 @@
                (.write out val))
              (catch Exception e
                (log/error e "Unable to create storage directory:" path ".")
-               (log/error (str "Fatal Error, shutting down!"))
+               (log/error "Fatal Error, shutting down!")
                (System/exit 1))))
          (catch Exception e (throw e))))
      :cljs
@@ -47,7 +47,7 @@
                    (js/process.exit 1)))
                (catch :default e
                  (log/error e "Unable to create storage directory:" path ".")
-                 (log/error (str "Fatal Error, shutting down!"))
+                 (log/error "Fatal Error, shutting down!")
                  (js/process.exit 1)))
              (throw (ex-info "Error writing file."
                              {"errno"   ^String (.-errno e)
