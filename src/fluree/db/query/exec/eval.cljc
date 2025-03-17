@@ -20,10 +20,15 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn ratio?
-  [x]
-  #?(:clj  (clojure.core/ratio? x)
-     :cljs false)) ; ClojureScript doesn't support ratios
+#?(:clj
+   (defn ratio?
+     [x]
+     (clojure.core/ratio? x))
+
+   :cljs  ; ClojureScript doesn't support ratios)
+   (defn ratio?
+     [_]
+     false))
 
 (defn sum
   [coll]
@@ -257,28 +262,46 @@
   #{const/iri-xsd-dateTime
     const/iri-xsd-date})
 
-#?(:clj (defmulti ->offset-date-time #(when-let [t (#{OffsetDateTime LocalDateTime LocalDate} (type %))] t)))
-#?(:clj (defmethod ->offset-date-time OffsetDateTime [^OffsetDateTime datetime] datetime))
-#?(:clj (defmethod ->offset-date-time LocalDateTime [^LocalDateTime datetime] (.atOffset datetime ZoneOffset/UTC)))
-#?(:clj (defmethod ->offset-date-time LocalDate [^LocalDate date] (.atOffset (.atStartOfDay date) ZoneOffset/UTC)))
-#?(:clj (defmethod ->offset-date-time :default [x] (throw (ex-info "Cannot convert value to OffsetDateTime."
-                                                                   {:value x
-                                                                    :status 400
-                                                                    :error :db/invalid-fn-call}))))
+#?(:clj (defmulti ->offset-date-time
+          #(when-let [t (#{OffsetDateTime LocalDateTime LocalDate} (type %))]
+             t)))
+#?(:clj (defmethod ->offset-date-time OffsetDateTime
+          [^OffsetDateTime datetime]
+          datetime))
+#?(:clj (defmethod ->offset-date-time LocalDateTime
+          [^LocalDateTime datetime]
+          (.atOffset datetime ZoneOffset/UTC)))
+#?(:clj (defmethod ->offset-date-time LocalDate
+          [^LocalDate date]
+          (.atOffset (.atStartOfDay date) ZoneOffset/UTC)))
+#?(:clj (defmethod ->offset-date-time :default
+          [x]
+          (throw (ex-info "Cannot convert value to OffsetDateTime."
+                          {:value  x
+                           :status 400
+                           :error  :db/invalid-fn-call}))))
 
-#?(:clj (defmulti ->offset-time #(when-let [t (#{OffsetTime LocalTime} (type %))] t)))
-#?(:clj (defmethod ->offset-time OffsetTime [^OffsetTime time] time))
-#?(:clj (defmethod ->offset-time LocalTime [^LocalTime time] (.atOffset time ZoneOffset/UTC)))
-#?(:clj (defmethod ->offset-time :default [x] (throw (ex-info "Cannot convert value to OffsetTime."
-                                                              {:value x
-                                                               :status 400
-                                                               :error :db/invalid-fn-call}))))
+#?(:clj (defmulti ->offset-time
+          #(when-let [t (#{OffsetTime LocalTime} (type %))]
+             t)))
+#?(:clj (defmethod ->offset-time OffsetTime
+          [^OffsetTime time]
+          time))
+#?(:clj (defmethod ->offset-time LocalTime
+          [^LocalTime time]
+          (.atOffset time ZoneOffset/UTC)))
+#?(:clj (defmethod ->offset-time :default
+          [x]
+          (throw (ex-info "Cannot convert value to OffsetTime."
+                          {:value  x
+                           :status 400
+                           :error  :db/invalid-fn-call}))))
 
 (defn compare*
   [{val-a :value dt-a :datatype-iri}
    {val-b :value dt-b :datatype-iri}]
-  (let [dt-a  (or dt-a (datatype/infer-iri val-a))
-        dt-b  (or dt-b (datatype/infer-iri val-b))]
+  (let [dt-a (or dt-a (datatype/infer-iri val-a))
+        dt-b (or dt-b (datatype/infer-iri val-b))]
     (cond
       ;; can compare across types
       (or (and (contains? comparable-numeric-datatypes dt-a)
@@ -305,8 +328,10 @@
                        :error  :db/invalid-query})))))
 
 (defn typed-equal
-  ([x]  (where/->typed-val true))
-  ([x y] (where/->typed-val (zero? (compare* x y))))
+  ([_]
+   (where/->typed-val true))
+  ([x y]
+   (where/->typed-val (zero? (compare* x y))))
   ([x y & more]
    (reduce (fn [result [a b]]
              (if (:value result)
@@ -316,7 +341,8 @@
            (partition 2 1 (into [y] more)))))
 
 (defn typed-not-equal
-  ([x]  (where/->typed-val false))
+  ([_]
+   (where/->typed-val false))
   ([x y] (where/->typed-val (not (zero? (compare* x y)))))
   ([x y & more]
    (reduce (fn [result [a b]]
@@ -537,13 +563,13 @@
   (where/->typed-val (quot num div)))
 
 (defn untyped-equal
-  ([{x :value}]  (where/->typed-val true))
+  ([_]  (where/->typed-val true))
   ([{x :value} {y :value}] (where/->typed-val (= x y)))
   ([{x :value} {y :value} & more]
    (where/->typed-val (apply = x y (mapv :value more)))))
 
 (defn untyped-not-equal
-  ([{x :value}]  (where/->typed-val false))
+  ([_]  (where/->typed-val false))
   ([{x :value} {y :value}] (where/->typed-val (not= x y)))
   ([{x :value} {y :value} & more]
    (where/->typed-val (apply not= x y (mapv :value more)))))
