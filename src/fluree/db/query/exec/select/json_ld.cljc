@@ -24,7 +24,7 @@
 
 (defn json-ld-subject
   [compact bnodes s-match]
-  (if-let [iri (where/get-iri s-match)]
+  (if (where/get-iri s-match)
     {(compact const/iri-id) (compact (where/get-iri s-match))}
     (let [var (where/get-variable s-match)]
       (if (v/bnode-variable? var)

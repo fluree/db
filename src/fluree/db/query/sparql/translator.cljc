@@ -384,7 +384,7 @@
       (if term
         ;; either multiple terms or a single wildcard
         (cond (rule? term)
-              (let [[tag & body] term]
+              (let [[tag & _body] term]
                 (if (= tag :Var)
                   (recur r (conj result (parse-term term)))
                   ;; :Expression
@@ -625,7 +625,7 @@
   ;; TriplesNode ::= Collection | BlankNodePropertyList
   ;; Collection ::=  '(' GraphNode+ ')'
   ;; BlankNodePropertyList ::= '[' PropertyListNotEmpty ']'
-  [[_ & path :as obj-path]]
+  [[_ & path]]
   (mapv parse-term path))
 
 (defmethod parse-term :ObjectPath
@@ -748,7 +748,7 @@
 
 (defmethod parse-term :GroupCondition
   ;; GroupCondition ::= BuiltInCall | FunctionCall | <'('> Expression ( WS 'AS' WS Var )? <')'> | Var
-  [[_ expr as var :as condition]]
+  [[_ expr as var]]
   (if (= as [:As])
     (str "(as " (parse-term expr) " " (parse-term var) ")")
     (parse-term expr)))

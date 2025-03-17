@@ -67,7 +67,7 @@
     (flake/create sid pid oid dt t true m)))
 
 (defn create-scalar-flake
-  [db-vol p-iri sid pid o-mch t m]
+  [db-vol _p-iri sid pid o-mch t m]
   (let [v  (where/get-value o-mch)
         dt (or (some-> o-mch
                        where/get-datatype-iri

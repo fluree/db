@@ -41,7 +41,9 @@
   tabular. This function unpacks a single result into potentially multiple 'rows' of
   results."
   [result]
-  (let [aggregated (filter (fn [[k v]] (sequential? v)) result)]
+  (let [aggregated (filter (fn [[_k v]]
+                             (sequential? v))
+                           result)]
     (loop [[[agg-var agg-vals] & r] aggregated
            results [result]]
       (if agg-var
